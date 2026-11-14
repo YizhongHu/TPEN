@@ -225,19 +225,22 @@ def test_assert_amplitude_risk_thresholds_is_a_noop_without_the_callback() -> No
 
 
 def test_assert_amplitude_risk_thresholds_accepts_the_frozen_list() -> None:
-    config = protocol.training_config()
-    config["callbacks"].append(
-        {"_target_": "tpen.callback.AmplitudeRiskFraction", "thresholds": [-3, -4, -5, -7, -10]}
-    )
+    config, _ = protocol.science_training_config("L1", 0)
+    for target in protocol.candidate_modules_to_append():
+        protocol.append_candidate_module(config, target)
     protocol.assert_amplitude_risk_thresholds(config)
     protocol.assert_hydrogen_contract(config)
 
 
 def test_assert_amplitude_risk_thresholds_refuses_a_drifted_list() -> None:
-    config = protocol.training_config()
-    config["callbacks"].append(
-        {"_target_": "tpen.callback.AmplitudeRiskFraction", "thresholds": [-1, -2]}
+    config, _ = protocol.science_training_config("L1", 0)
+    for target in protocol.candidate_modules_to_append():
+        protocol.append_candidate_module(config, target)
+    amplitude = next(
+        callback for callback in config["callbacks"]
+        if callback["_target_"] == "tpen.callback.AmplitudeRiskFraction"
     )
+    amplitude["thresholds"] = [-1, -2]
     with pytest.raises(ValueError, match="frozen"):
         protocol.assert_amplitude_risk_thresholds(config)
     with pytest.raises(ValueError, match="frozen"):

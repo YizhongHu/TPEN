@@ -34,6 +34,7 @@ from ..environments import PreparedPythonEnvironment, SourceScript
 from ..placement import BindingError, PlacementRefusal, WorkerBinding, bindings_from_allocation, physical_slots_from_allocation, slots_from_allocation
 from ..programs import WorkerProgram
 from .._records import frozen_record
+from .._codec import canonical_bytes
 from ..results import RunManifest
 from ..contracts import ReadyGroup
 from ..lifecycle.attached import AttachedAllocation
@@ -155,6 +156,7 @@ class AttachedTransportSpec:
     mpiexec_bind_cmd: str = "--bind-to"
     mpiexec_overrides: str = ""
     preflight_timeout: int | float = 120
+    teardown_timeout: int | float = 30
 
     def __post_init__(self) -> None:
         for name in ("executor", "provider", "launcher", "label", "worker_init", "mpiexec_bind_cmd", "mpiexec_overrides"):
@@ -173,9 +175,10 @@ class AttachedTransportSpec:
                 raise ValueError(f"{name} must be a positive integer")
         if self.address is not None and (type(self.address) is not str or not self.address):
             raise TypeError("address must be a non-empty string or None")
-        timeout = self.preflight_timeout
-        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("preflight_timeout must be finite and positive")
+        for name in ("preflight_timeout", "teardown_timeout"):
+            timeout = getattr(self, name)
+            if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError(f"{name} must be finite and positive")
 
     @property
     def workers(self) -> int:
@@ -396,9 +399,57 @@ class _RemoteLeaf:
 
     def __init__(self, request: LeafRequest) -> None:
         self.request = request
+        self.future: Any = None
 
     def request_kill(self) -> None:
-        """Do nothing; a remote PID is not a local process group."""
+        """Request leaf-owned cancellation without signalling a remote PID.
+
+        Parsl does not expose a portable remote-PID signal operation.  The
+        attached transport therefore treats this as a transport cancellation
+        request; only the leaf's returned teardown receipt can settle it.
+        """
+
+        self.request_cancel()
+
+    def request_cancel(self) -> None:
+        """Create the identity-bound marker observed by the remote leaf."""
+
+        path = os.path.join(self.request.output_dir, "cancel.json")
+        payload = canonical_bytes({"schema": "tpen-executor/leaf-cancel-v1",
+                                   "group_digest": self.request.group_digest,
+                                   "task_id": self.request.task_id,
+                                   "attempt_id": self.request.attempt_id,
+                                   "allocation_id": self.request.allocation_id,
+                                   "backend_job_id": self.request.backend_job_id})
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def bind_future(self, future: Any) -> None:
+        self.future = future
+
+    def wait_for_teardown(self, bound: float) -> bool:
+        """Wait for a leaf result and accept only its validated teardown ack."""
+
+        deadline = time.monotonic() + bound
+        while self.future is not None and not self.future.done() and time.monotonic() < deadline:
+            _poll_sleep(min(0.01, max(deadline - time.monotonic(), 0)))
+        if self.future is None or not self.future.done():
+            return False
+        try:
+            payload = self.future.result(None)
+            # Reached only after this same controller already requested this
+            # attempt's cancellation: a real cancellation legitimately skips
+            # inspection (review P2-4).
+            result = validate_leaf_result(self.request, LeafResult.decode(payload), cancellation_expected=True)
+        except BaseException:
+            return False
+        return result.teardown.get("child_group_reaped") is True
 
     def resolve(self, payload: Any) -> tuple[ProcessOutcome, dict[str, Any]]:
         """Validate the returned bytes and adapt them to the completion path.
@@ -817,6 +868,10 @@ class ParslDispatcher(DispatcherContract):
         active: dict[Any, dict[str, Any]] = {}
         begin_error: Exception | None = None
         finish_error: Exception | None = None
+        # B1: a remote loss or crossed reply closes admission for the whole
+        # run, not just its own slot -- never admit another queued member
+        # once set, even into a different, healthy binding.
+        admission_closed = False
 
         def launch(member: Any, binding: WorkerBinding) -> None:
             nonlocal begin_error, finish_error
@@ -907,6 +962,8 @@ class ParslDispatcher(DispatcherContract):
             active[future] = {"member": member, "configured": configured, "fence": fence, "materialized": materialized, "environment": environment, "binding": binding, "handle": handle}
 
         def fill() -> None:
+            if admission_closed:
+                return
             while available:
                 try:
                     member = next(queued)
@@ -924,10 +981,12 @@ class ParslDispatcher(DispatcherContract):
                     continue
                 record = active.pop(completed)
                 binding = record["binding"]
+                is_remote = isinstance(record["handle"], _RemoteLeaf)
                 completion_started = False
+                remote_unconfirmed = False
                 try:
                     result = completed.result(None)
-                    if isinstance(record["handle"], _RemoteLeaf):
+                    if is_remote:
                         # Validated leaf facts replace controller inspection;
                         # the controller still publishes every record.
                         try:
@@ -956,10 +1015,53 @@ class ParslDispatcher(DispatcherContract):
                     )
                     if completion_error is not None and finish_error is None:
                         finish_error = completion_error
+                except (PlacementRefusal, RemoteLeafLaunchError) as refusal:
+                    # A validated leaf fact: the leaf's own ack already
+                    # proved no live work remains (a clean typed placement
+                    # refusal, or an ordinary launch error whose teardown
+                    # receipt confirmed the reap).  Publish and recycle the
+                    # binding exactly as any other launch failure.
+                    completion_error = self._complete_member(
+                        group,
+                        record["member"],
+                        record["configured"],
+                        lifecycle,
+                        record["fence"],
+                        record["materialized"],
+                        record["environment"],
+                        None,
+                        timeout,
+                        error=refusal,
+                    )
+                    if completion_error is not None and finish_error is None:
+                        finish_error = completion_error
                 except Exception as error:
                     if completion_started:
                         if finish_error is None:
                             finish_error = error
+                    elif is_remote:
+                        # A terminal remote future with no validated ack
+                        # (transport failure/worker loss, or a well-formed
+                        # but crossed/stale reply): never an ordinary launch
+                        # failure, because there is no proof the leaf's
+                        # child group was ever reaped.  Close admission and
+                        # never recycle this slot's binding (review P1-2).
+                        remote_unconfirmed = True
+                        admission_closed = True
+                        try:
+                            lifecycle.finish(record["fence"], "remote-quiescence-unconfirmed", self._utc_now(), None)
+                        except BaseException as finish_write_error:
+                            if finish_error is None:
+                                finish_error = finish_write_error
+                        # B1: closing admission is not enough on its own --
+                        # every other still-live record (remote or local)
+                        # must be cancelled and bounded-settled under one
+                        # shared deadline too, before anything else runs,
+                        # exactly as an owner cancellation would.  _active
+                        # no longer holds this record (already popped
+                        # above); every remaining entry is swept.
+                        self._cancel_slot_pool(active, lifecycle, error)
+                        active.clear()
                     else:
                         completion_error = self._complete_member(
                             group,
@@ -977,25 +1079,36 @@ class ParslDispatcher(DispatcherContract):
                             finish_error = completion_error
                 except BaseException as cancellation:
                     if not completion_started:
-                        completion_error = self._complete_member(
-                            group,
-                            record["member"],
-                            record["configured"],
-                            lifecycle,
-                            record["fence"],
-                            record["materialized"],
-                            record["environment"],
-                            None,
-                            timeout,
-                            error=cancellation,
-                        )
-                        if completion_error is not None:
+                        if is_remote:
+                            remote_unconfirmed = True
                             try:
-                                cancellation.add_note(f"slot {record['member'].task_id} finish unresolved: {completion_error!r}")
-                            except BaseException:
-                                pass
+                                lifecycle.finish(record["fence"], "remote-quiescence-unconfirmed", self._utc_now(), None)
+                            except BaseException as finish_write_error:
+                                try:
+                                    cancellation.add_note(f"slot {record['member'].task_id} finish unresolved: {finish_write_error!r}")
+                                except BaseException:
+                                    pass
+                        else:
+                            completion_error = self._complete_member(
+                                group,
+                                record["member"],
+                                record["configured"],
+                                lifecycle,
+                                record["fence"],
+                                record["materialized"],
+                                record["environment"],
+                                None,
+                                timeout,
+                                error=cancellation,
+                            )
+                            if completion_error is not None:
+                                try:
+                                    cancellation.add_note(f"slot {record['member'].task_id} finish unresolved: {completion_error!r}")
+                                except BaseException:
+                                    pass
                     raise
-                available.append(binding)
+                if not remote_unconfirmed:
+                    available.append(binding)
                 fill()
         except BaseException as cancellation:
             self._cancel_slot_pool(active, lifecycle, cancellation)
@@ -1019,24 +1132,46 @@ class ParslDispatcher(DispatcherContract):
     def _cancel_slot_pool(self, active: Mapping[Any, Mapping[str, Any]], lifecycle: AttachedAllocation, cancellation: BaseException) -> None:
         """Kill and reap every started child before failed cancellation finishes."""
 
+        def _note(record: Mapping[str, Any], error: BaseException) -> None:
+            try:
+                cancellation.add_note(f"slot {record['member'].task_id} finish unresolved: {error!r}")
+            except BaseException:
+                pass
+
+        remote_records = [record for record in active.values() if isinstance(record["handle"], _RemoteLeaf)]
+        # Fix the one shared deadline before touching any record (review
+        # P1-3), so a failure isolated to one record never shrinks or skips
+        # another's bound.
+        remote_deadline = time.monotonic() + (
+            float(getattr(self.transport, "teardown_timeout", 30)) if remote_records else 0
+        )
+        for record in remote_records:
+            try:
+                record["handle"].request_cancel()
+            except BaseException as error:
+                # One record's marker write/fsync failure must never stop
+                # the remaining records from being asked to cancel too.
+                _note(record, error)
         for record in active.values():
-            record["handle"].request_kill()
+            if not isinstance(record["handle"], _RemoteLeaf):
+                record["handle"].request_kill()
         for future, record in active.items():
             if isinstance(record["handle"], _RemoteLeaf):
                 # A remote leaf is neither signalled nor awaited here; its
-                # attempt is finished failed and never accepted.  Bounded
-                # remote teardown acknowledgement is S3 Layer C.
+                # attempt is finished failed only with a validated ack, and
+                # never accepted otherwise.  Bounded remote teardown
+                # acknowledgement is S3 Layer C.
+                handle = record["handle"]
                 try:
-                    cancellation.add_note(f"slot {record['member'].task_id} remote quiescence unconfirmed")
-                except BaseException:
-                    pass
-                try:
-                    lifecycle.finish(record["fence"], "failed", self._utc_now(), None)
+                    acknowledged = handle.wait_for_teardown(max(remote_deadline - time.monotonic(), 0))
                 except BaseException as error:
-                    try:
-                        cancellation.add_note(f"slot {record['member'].task_id} finish unresolved: {error!r}")
-                    except BaseException:
-                        pass
+                    acknowledged = False
+                    _note(record, error)
+                try:
+                    status = "failed" if acknowledged else "remote-quiescence-unconfirmed"
+                    lifecycle.finish(record["fence"], status, self._utc_now(), None)
+                except BaseException as error:
+                    _note(record, error)
                 continue
             reap_errors: list[BaseException] = []
             while True:
@@ -1219,7 +1354,10 @@ class ParslDispatcher(DispatcherContract):
             cache=False,
             executors=list(self._active_executor_labels),
         )(run_leaf)
-        return app(request.encode()), _RemoteLeaf(request)
+        handle = _RemoteLeaf(request)
+        future = app(request.encode())
+        handle.bind_future(future)
+        return future, handle
 
     def _validate_executor_config(self, config: Any, required_threads: int | None = None) -> tuple[str, ...]:
         """Refuse non-ThreadPool Parsl configs before any lifecycle begin."""

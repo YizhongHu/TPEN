@@ -8,7 +8,7 @@ import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from omegaconf import OmegaConf
 
@@ -22,6 +22,16 @@ from .payload import CheckpointPayload, ModelOnly, TrainResume
 from .receipt import publication_receipt_path, record_publication_receipt
 from .reference import CheckpointRef
 from .rng import rng_state_dict, runtime_device
+
+
+def _raise_tagged_publication_failure(exc: BaseException, stage: str) -> NoReturn:
+    """Retain an original publication error while identifying its failed stage."""
+
+    exc.tpen_publication_stage = stage
+    add_note = getattr(exc, "add_note", None)
+    if add_note is not None:
+        add_note(f"checkpoint publication failed during {stage}")
+    raise exc
 
 
 def save_checkpoint(
@@ -208,7 +218,10 @@ def save_checkpoint(
         )
         manifest.write(tmp_dir / "manifest.json")
         (tmp_dir / "COMPLETE").write_text("complete\n", encoding="utf-8")
-        tmp_dir.rename(final_dir)
+        try:
+            tmp_dir.rename(final_dir)
+        except BaseException as exc:
+            _raise_tagged_publication_failure(exc, "rename")
         write_end = time.perf_counter()
         # The rename is the checkpoint commit.  Publication is deliberately
         # after it, so a catalog can never name a tmp or partially written
@@ -223,10 +236,16 @@ def save_checkpoint(
                 else publication_catalog
             )
         )
-        catalog.publish(ref)
+        try:
+            catalog.publish(ref)
+        except BaseException as exc:
+            _raise_tagged_publication_failure(exc, "catalog")
         # `latest.json` stays minimal: a pointer plus the directory's own step
         # number. The manifest is the place that carries both counters.
-        write_latest(root, final_dir, step=int(next_iteration), created_at_unix=created_at)
+        try:
+            write_latest(root, final_dir, step=int(next_iteration), created_at_unix=created_at)
+        except BaseException as exc:
+            _raise_tagged_publication_failure(exc, "latest")
         publish_end = time.perf_counter()
         # Additive last step: appends a new index entry after the existing
         # rename -> publish -> write_latest sequence without altering it.

@@ -35,7 +35,8 @@ from tpen.data.batch.geometry import electron_nuclear_displacements
 from tpen.data.equivariant_state import compare_tensor_blocks
 from tpen.data.indices import permutation_index, permute_particle_axis
 from tpen.data.permutation import Permutation
-from tpen.evaluation.trajectory_records import TrajectoryRecordArtifact
+from tpen.evaluation.trajectory_records import TrajectoryRecordArtifact, TrajectoryRecordArtifactV2
+from tpen.physics.receipt import ExecutionReceipt
 from tpen.trace import Trace
 
 
@@ -51,7 +52,7 @@ class GeneratedConfigurations:
 
     batch: ElectronBatch
     metadata: Mapping[str, Any]
-    trajectory_records: TrajectoryRecordArtifact | None = None
+    trajectory_records: TrajectoryRecordArtifact | TrajectoryRecordArtifactV2 | None = None
 
 
 @dataclass(frozen=True)
@@ -65,11 +66,18 @@ class WavefunctionValues:
 
 @dataclass(frozen=True)
 class LocalEnergyValues:
-    """Local-energy values evaluated on generated configurations."""
+    """Local-energy values evaluated on generated configurations.
+
+    ``receipt`` is the declared execution receipt of the evaluator that
+    actually produced ``local_energy``, when that evaluator records one (see
+    `tpen.physics.hamiltonian.RecordingLocalEnergyEvaluator`). ``None`` when
+    the producing evaluator does not record a receipt.
+    """
 
     local_energy: torch.Tensor
     finite_mask: torch.Tensor
     term_energies: Mapping[str, torch.Tensor] | None = None
+    receipt: ExecutionReceipt | None = None
 
 
 @dataclass(frozen=True)

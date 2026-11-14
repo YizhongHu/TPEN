@@ -10,6 +10,76 @@ Hydra configurations, an independent standard-library scalar oracle, strict
 record collection, and tests beside those sources. It does not contain a
 science launcher, science output, or qualification result.
 
+## Packed evaluation validation
+
+The eval-fanout route accepts ``--pack-k 1..6``. ``1`` is the original
+single-stream path; values above one run independent ``run_from_config``
+subprocesses concurrently in one GPU allocation. Each generation has its own
+seed, run directory, verified checkpoint snapshot, and append-on-completion
+receipt entry. A failed generation is isolated, but the job exits non-zero
+after all siblings settle.
+
+For GPU validation, run the same checkpoint/seed roster once with
+``--pack-k 1`` and once with the selected packed value. Compare each pair with
+``eval_job.compare_packed_single_stream``. Calibrate from at least three
+same-seed, same-checkpoint **single-stream** repeats only. The calibration
+population is the consecutive single-minus-single repeat differences; a
+packed-minus-single row is not a calibration input. The helper returns one
+``variance_reference`` denominator and the comparator reuses it. Energy is
+bounded by ``3 x sample_stdev(single-minus-single energy differences)`` and
+relative variance by ``3 x sample_stdev(single-minus-single variance
+differences) / variance_reference``. Record the repeat measurements, derived
+tolerances, GPU model, and both job IDs in the validation receipt; this is
+validation evidence, not science admission.
+
+The executable validation roster is the following. Every repeat has a
+distinct root, and every row extracts metrics only from that run's immutable
+trajectory CSV and metadata sidecar:
+
+| checkpoint | seeds | single-stream roots | packed root | extracted metrics |
+| --- | --- | --- | --- | --- |
+| 1,000 | `83001` | `validation/ck001000/single/repeat-1`, `repeat-2`, `repeat-3` | `validation/ck001000/packed` | mean of `local_energy` in `sampled_eval_table.csv`; variance from and reconciled with `.metadata.json` |
+| 50,000 | `83001` | `validation/ck050000/single/repeat-1`, `repeat-2`, `repeat-3` | `validation/ck050000/packed` | same CSV/sidecar extraction |
+| 100,000 | `83001` | `validation/ck100000/single/repeat-1`, `repeat-2`, `repeat-3` | `validation/ck100000/packed` | same CSV/sidecar extraction |
+
+For the bounded validation, select exactly these records before launching:
+
+```bash
+CHECKPOINTS=(1000 50000 100000)
+SEED=83001
+for repeat in 1 2 3; do
+  for update in "${CHECKPOINTS[@]}"; do
+    ROOT="$VALIDATION_ROOT/single/repeat-$repeat/ck$(printf '%06d' "$update")"
+    mkdir -p "$ROOT"
+    # The producer config binds this checkpoint, seed, lineage, and ROOT;
+    # never glob a checkpoint directory or reuse ROOT for another repeat.
+    "$SCIENCE_PYTHON" -c 'from tpen.run import run_from_config; import sys, yaml; cfg=yaml.safe_load(open(sys.argv[1])); cfg["run"].update(root=sys.argv[2], run_id="repeat-"+sys.argv[3]+"-ck"+sys.argv[4]); raise SystemExit(run_from_config(cfg, config_path=sys.argv[1], command="h-v2 validation single"))' \
+      "$CONFIG_DIR/eval-ck$(printf '%06d' "$update")-seed$SEED.yaml" "$ROOT" "$repeat" "$update"
+  done
+done
+```
+
+The normal bounded packed invocation uses the same three checkpoint/seed
+bindings and a unique packed root; the full 101-generation pilot invocation
+is explicit and therefore cannot silently become a different roster:
+
+```bash
+uv run python "$TPEN_CHECKOUT/experiments/atomistic/h-v2/launch.py" \
+  --run-root "$VALIDATION_ROOT/packed" --run-root-prefix "$VALIDATION_ROOT" \
+  --payload capacity-pilot-100k --stage eval --pilot-stage 1 \
+  --expected-train-commit "$TRAIN_SHA" --commit "$EVAL_SHA" \
+  --pack-k 6 --eval-count 101 --measured-batch-time 00:15:00 \
+  --science-python "$SCIENCE_PYTHON" --executor-python "$EXECUTOR_PY"
+```
+
+The packed wall-time request is ``measured_batch_time x ceil(n / k) + 15
+minutes``. Here ``n=101`` and one measured batch is 15 minutes, so the
+derived minimum is 4:30:00; ``launch.py`` refuses a shorter explicit
+``--time``. For ``k=1`` the packed minimum is not applied and the established
+explicit ``--time`` remains in force. Retain Slurm job IDs, command lines,
+checkpoint and artifact hashes, process intervals, and the comparator receipt
+for every row.
+
 The executable route is the normal TPEN entrypoint (the ``tpen`` console
 script, or ``tpen.run.run_from_config`` from a test). Do not use
 ``python -m tpen.run``: that module has no ``__main__`` guard.
@@ -203,11 +273,9 @@ to 7 (nuclear curvature, lineage count, model/optimizer/sampler, horizon and
 walker budget, science venue) were decided directly by the operator. Item 8
 (the four-stream design) was decided after one round of clarification.
 
-The science design is 50,000 completed updates, retaining update zero and
-every 1,000 updates (51 retained checkpoints) while fresh-evaluating a
-separate 27-checkpoint set; both the checkpoint counts (2026-11-06, "27 makes
-sense. especially if evaluation is expensive") and the horizon itself
-(2026-11-07, "you already decided") are decided. It uses three independent
+The science design is 100,000 completed updates, retaining update zero and
+every 1,000 updates (101 retained checkpoints) while fresh-evaluating a
+separate 37-checkpoint set. It uses three independent
 lineages (operator, quoted "3") with initialization seeds `73001..73003` and
 sampler seeds `83001..83003`, four fresh streams per evaluated checkpoint,
 4,096 walkers, 256 draws, burn-in 1,000, and stride 20 (operator, "you
@@ -316,15 +384,18 @@ second electron.
 ### Science venue (item 7)
 
 Cannon, using long jobs, not packed Polaris (operator, "cannon with long
-jobs"). Science submits to both FASRC Cannon production GPU partitions in one
-job: `kozinsky_gpu` (wall limit `7-00:00:00`, `gpu:nvidia_a100-sxm4-80gb:4`)
-and `seas_gpu` (wall limit `2-00:00:00`, mixed `gpu:nvidia_h200:4` and
-`gpu:nvidia_a100-sxm4-80gb:4`), pinned with `--constraint=a100` for a
-comparable stratum, per the Cannon partition-naming policy (node counts as of
-the 2026-08-15 hardware note; they drift -- re-measure with `sinfo` rather
-than citing this date). At most 32
-GPU-hours per lineage fits comfortably inside even the tighter `seas_gpu`
-ceiling. Polaris is not used for H-v2 science. D6/D5 restatement (operator
+jobs"). Science submits to the FASRC Cannon production GPU partition set
+`seas_gpu,kozinsky_gpu,gpu` in one job: `kozinsky_gpu` (wall limit
+`7-00:00:00`, `gpu:nvidia_a100-sxm4-80gb:4`), `seas_gpu` (wall limit
+`2-00:00:00`, mixed `gpu:nvidia_h200:4` and
+`gpu:nvidia_a100-sxm4-80gb:4`), and `gpu`, pinned with `--constraint=a100`
+for the A100-SXM4-80GB stratum, per the Cannon partition-naming policy (node
+counts as of the 2026-08-15 hardware note; they drift -- re-measure with
+`sinfo` rather than citing this date). The existing ceiling remains 96 GPU-h
+total (32 GPU-h per lineage); the new 100k science estimate is approximately
+66 GPU-h. TRAIN is projected at approximately 10.5 h with
+`T_WALL=13:30:00`, and TRAIN plus EVAL at approximately 28.2 h against the
+32 h lineage cap. Polaris is not used for H-v2 science. D6/D5 restatement (operator
 decisions, `operator-decisions-pilot-geometry-design-target-20261107` and
 `operator-answers-design-target-d1-d6-20261107` on `fffc313a`, 2026-11-07):
 the operator, quoted, "Gpu test goes on cannon" -- the pipeline check's
@@ -375,6 +446,14 @@ exclude a late absolute increase of at least its own margin in
 evaluated reference checkpoint through update 20,000 and excludes the declared
 late count reaching `max(2 W(k), W(k) + 0.01 Ha)`. A flat MAD is not
 equivalence.
+
+The primary late comparison window for both recurrence and bounded-null is
+`40,000 / 45,000 / 50,000` updates (`decision_rules.parameters.late_updates`).
+The `90,000 / 95,000 / 100,000` window is a clearly labelled
+**secondary, descriptive-only look**; it has no role in the primary recurrence
+or bounded-null decision. This follows operator decision
+`operator-decision-late-window-20261113` on item
+`3c13ba74-d052-4482-a510-3b654d965261`.
 
 The gating instrument is W, the high quantiles, and the exceedance
 probabilities, provided complete records and qualified dependence are present.
@@ -467,6 +546,15 @@ a core metric that always gets logged. This is an old, established design.").
 The modules, and the stack layer that provides each one, are listed
 machine-readably in `contract_inputs.json` under `logging.modules`.
 
+`AmplitudeRiskFraction` is implemented in the science TRAIN route only. It
+fires every 100 completed iteration steps with `start_step` omitted (equivalent
+to zero), so step 0 is included, and writes descriptive metrics to
+`metrics.jsonl` under the `train/amplitude_risk` namespace. Pilot TRAIN
+payloads omit this callback. The statistic is descriptive only: it raises no
+alarm and is not a science gate. The measured serial A100-SXM4-40GB MIG
+comparison found 7.952% overhead at every update; under a linear cadence
+assumption, cadence 100 is approximately 0.08% overhead.
+
 Cadence: scalar diagnostics log every completed update. Raw training batches
 are captured on the iteration-step coordinate, every 50th step including step
 0 (operator: "50 makes more sense here"), in partitions of 1,000 iteration
@@ -482,10 +570,9 @@ and the partition ranges), the completed-update count after the iteration,
 and whether the update was applied. Skipped updates are recorded, not
 dropped.
 
-All 51 checkpoints per lineage are retained (update 0 and every 1,000 through
-50,000). Fresh evaluation stays at the predeclared 27 per lineage (operator,
-2026-11-06: "27 makes sense. especially if evaluation is expensive"). Both
-counts are now **decided**, not proposed.
+All 101 checkpoints per lineage are retained (update 0 and every 1,000 through
+100,000). Fresh evaluation uses the predeclared 37 per lineage. Both counts
+are now **decided**, not proposed.
 
 Storage lifecycle: the working location is Cannon netscratch, not scratch,
 which is purged after 90 days, so the HPSS archive must be made inside that
@@ -499,17 +586,17 @@ without a Task Orchestrator lifecycle disposition naming the exact paths and
 a passed recovery verification of the archive.
 
 Storage figures, recomputed at the science scale of 4,096 training walkers:
-fresh evaluation is `3 x 27 x 4 x 4,096 x 256 = 339,738,624` rows, about 28.1
+fresh evaluation is `3 x 37 x 4 x 4,096 x 256 = 465,567,744` rows, about 38.6
 GiB compact at 89 bytes per row (the conservative envelope); raw training
-batches, captured every 50th iteration step including step 0 through 50,000
-(1,001 batches per lineage), is `3 x 1,001 x 4,096 = 12,300,288` rows, about
-0.928 GiB compact at 81 primitive bytes per row, before container and
-compression. At 20 batches per 1,000-step partition, 1,001 batches per
-lineage gives 50 full partitions plus one single-batch partition (holding
-only step 50,000), 51 partitions per lineage, `3 x 51 = 153` data objects
-total, not the 150 the storage proposal costed. Both byte-per-row figures and
-their source are recorded in `contract_inputs.json`. Compression ratios are
-unmeasured and are labelled so in `contract_inputs.json`.
+batches, captured every 50th iteration step including step 0 through 100,000
+(2,001 batches per lineage), is `3 x 2,001 x 4,096 = 24,588,288` rows, about
+1.855 GiB compact at 81 primitive bytes per row, before container and
+compression. At 20 batches per 1,000-step partition, 2,001 batches per
+lineage gives 100 full partitions plus one single-batch partition (holding
+only step 100,000), 101 partitions per lineage, `3 x 101 = 303` data objects
+total. Both byte-per-row figures and their source are recorded in
+`contract_inputs.json`. Compression ratios are unmeasured and are labelled so
+in `contract_inputs.json`.
 
 ## Tail characterization
 
@@ -599,9 +686,9 @@ unmeasured at the contract's 4096 x 256", and `-10` is "rare or unresolved; a
 zero is not a healthy zero". The
 spike found the exact, imperfect, untrained and trained states all fall in
 the same narrow band, confirming the module cannot classify state quality.
-It remains descriptive only: no alarm and no science gate. Implementation
-(layer `fa3c35a8`) and independent verification against the frozen list
-still remain.
+It remains descriptive only: no alarm and no science gate. The implementation
+is present in the science TRAIN route at the documented cadence, while pilot
+TRAIN remains unchanged.
 
 Every `lane_proposals` entry is now decided (2026-11-07 operator review; see
 "Lane proposals: operator-reviewed 2026-11-07" above). That does not lift the

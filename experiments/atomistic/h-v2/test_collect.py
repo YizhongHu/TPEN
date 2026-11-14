@@ -429,6 +429,20 @@ def test_sampler_draw_receipt_bad_acceptance_refuses(tmp_path: Path) -> None:
         collect.validate_sampler_draw_receipt(paths["sampler_diagnostics_path"], spec)
 
 
+def test_sampler_draw_receipt_transition_count_corruption_refuses_and_valid_control_accepts(
+    tmp_path: Path,
+) -> None:
+    paths, spec = _full_fixture(tmp_path)
+    valid_sidecar = paths["sampler_diagnostics_path"].read_text(encoding="utf-8")
+    collect.validate_sampler_draw_receipt(paths["sampler_diagnostics_path"], spec)
+
+    sidecar = json.loads(valid_sidecar)
+    sidecar["retained_draws"][0]["transition_count"] += 1
+    paths["sampler_diagnostics_path"].write_text(json.dumps(sidecar), encoding="utf-8")
+    with pytest.raises(collect.RecordIntegrityError, match="draw settings differ from its own envelope"):
+        collect.validate_sampler_draw_receipt(paths["sampler_diagnostics_path"], spec)
+
+
 def _training_run_fixture(tmp_path: Path, *, expected_updates: int = 1000) -> Path:
     """Write a minimal clean, complete training run with one checkpoint.
 

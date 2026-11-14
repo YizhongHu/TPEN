@@ -220,10 +220,29 @@ def test_science_pipeline_check_train_dispatch_reaches_real_store_reservation(
 
     monkeypatch.setattr(run_job, "check_identity", lambda *a, **kw: None)
 
+    real_build_h_v2_train_plan = attached.build_h_v2_train_plan
+    captured_plan_sizes: dict[str, object] = {}
+
+    def _stub_build_h_v2_train_plan(**kwargs):
+        # Keep this store-reservation probe small and deterministic. The
+        # default pipeline config is a 256-walker, 1000-step training run,
+        # which can exceed the real executor's 180-second child timeout on
+        # Cannon even though this test does not measure training throughput.
+        kwargs["n_walkers"] = 4
+        kwargs["max_steps"] = 2
+        captured_plan_sizes.update(
+            n_walkers=kwargs["n_walkers"],
+            max_steps=kwargs["max_steps"],
+        )
+        return real_build_h_v2_train_plan(**kwargs)
+
+    monkeypatch.setattr(attached, "build_h_v2_train_plan", _stub_build_h_v2_train_plan)
+
     real_run_executor_cli = attached.run_executor_cli
     captured: dict[str, object] = {}
 
     def _stub_activate(prepared, *, store, **_kwargs):
+        assert captured_plan_sizes == {"n_walkers": 4, "max_steps": 2}
         store_path = Path(store)
         assert not store_path.exists(), "store must still be absent when activation begins -- the fix must not pre-create it"
         allocation_path, worker_path = _real_cli_allocation_and_worker(
@@ -264,6 +283,7 @@ def test_science_pipeline_check_train_dispatch_reaches_real_store_reservation(
 
     run_job.run("train", "L2", pipeline_check=True)
 
+    assert captured_plan_sizes == {"n_walkers": 4, "max_steps": 2}
     sibling_dispatch = captured["dispatch"]
     assert sibling_dispatch.returncode == 0, (
         sibling_dispatch.returncode, sibling_dispatch.stdout, sibling_dispatch.stderr

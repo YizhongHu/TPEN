@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pytest
 
 from tpen.physics.context import ContextKey, ReadOnlyContext, requirements
 from tpen.physics.operators import OperatorId, register_operator
-from tpen.physics.planner import LocalEnergyPlanner, OperatorLoweringRegistry
+from tpen.physics.planner import LocalEnergyPlanner, OperatorLoweringRegistry, emit_receipt
 
 
 @register_operator(OperatorId("tests.planner", "first"))
@@ -35,6 +35,20 @@ THIRD = ThirdOperator.operator_id
 
 @dataclass(frozen=True)
 class Kernel:
+    claimed_operator_ids: frozenset[OperatorId]
+    requirements: frozenset[ContextKey[object]] = frozenset()
+    value: int = 0
+    method_tokens: dict = field(default_factory=dict)
+
+    def evaluate(self, context: ReadOnlyContext) -> int:
+        del context
+        return self.value
+
+
+@dataclass(frozen=True)
+class UndeclaredKernel:
+    """A kernel that omits the required `method_tokens` declaration."""
+
     claimed_operator_ids: frozenset[OperatorId]
     requirements: frozenset[ContextKey[object]] = frozenset()
     value: int = 0
@@ -228,3 +242,112 @@ def test_plan_manifest_and_provider_graph_are_immutable() -> None:
         plan.manifest[FIRST] = kernel  # type: ignore[index]
     with pytest.raises(TypeError):
         plan.provider_graph[key] = plan.providers[0]  # type: ignore[index]
+
+
+# --- S1-E review-r1 finding 5: planner-to-receipt handoff --------------------
+
+
+def test_emit_receipt_distinguishes_plans_by_identity_not_manifest_shape() -> None:
+    # Two lowering classes produce an identical manifest shape (same single
+    # kernel, same claimed operator) but a distinct plan.identity (S1-D's
+    # test_plan_identity_changes_when_lowering_class_changes already proves
+    # this at the plan level). A receipt recipe that only mirrored the
+    # manifest, without retaining plan.identity, could not tell these two
+    # lowerings apart.
+    kernel = Kernel(frozenset({FIRST}), value=1)
+    plans = [
+        LocalEnergyPlanner(OperatorLoweringRegistry([kind(FirstOperator, kernel)])).plan(
+            [FirstOperator()]
+        )
+        for kind in (Lowering, AlternateLowering)
+    ]
+    assert plans[0].identity != plans[1].identity
+
+    receipts = [emit_receipt(plan, system_id="same-system") for plan in plans]
+
+    assert receipts[0].method_id() != receipts[1].method_id()
+    assert emit_receipt(plans[0], system_id="same-system") == receipts[0]
+
+
+def test_emit_receipt_fused_kernel_shares_one_column_across_claimed_ids() -> None:
+    # GREEN companion: one kernel claiming two operators reports one stable
+    # column name under both ids, never a stringified kernel or an invented
+    # per-operator diagnostic.
+    kernel = Kernel(frozenset({FIRST, SECOND}), value=1)
+    plan = LocalEnergyPlanner(
+        OperatorLoweringRegistry(
+            [Lowering(FirstOperator, kernel), Lowering(SecondOperator, kernel)]
+        )
+    ).plan([FirstOperator(), SecondOperator()])
+
+    receipt = emit_receipt(plan, system_id="same-system")
+
+    assert receipt.manifest[FIRST] == receipt.manifest[SECOND]
+    assert len(receipt.manifest[FIRST]) == 1
+    assert receipt.manifest[FIRST][0] != str(kernel)
+    assert receipt.diagnostics == {}
+
+
+# --- S1-E review-r2 finding 1: same-class configuration must be declared ----
+
+
+def test_emit_receipt_rejects_kernel_missing_method_tokens_declaration() -> None:
+    # review-r2 finding 1: a kernel that does not declare `method_tokens` at
+    # all (not even an empty mapping) is rejected rather than silently
+    # issued an incomplete receipt.
+    kernel = UndeclaredKernel(frozenset({FIRST}), value=1)
+    plan = LocalEnergyPlanner(
+        OperatorLoweringRegistry([Lowering(FirstOperator, kernel)])
+    ).plan([FirstOperator()])
+
+    with pytest.raises(ValueError, match="method_tokens"):
+        emit_receipt(plan, system_id="same-system")
+
+
+def test_emit_receipt_distinguishes_same_class_configuration_by_declared_tokens() -> None:
+    # review-r2 finding 1 RED counterexample: two instances of the same
+    # kernel/lowering classes, differing only in a configured numerical
+    # setting (`value` stands in for e.g. a finite-difference step), share
+    # `plan.identity` by design -- but once that setting is declared through
+    # `method_tokens`, their receipts must still disagree.
+    plans = [
+        LocalEnergyPlanner(
+            OperatorLoweringRegistry(
+                [
+                    Lowering(
+                        FirstOperator,
+                        Kernel(frozenset({FIRST}), value=value, method_tokens={"value": value}),
+                    )
+                ]
+            )
+        ).plan([FirstOperator()])
+        for value in (1, 2)
+    ]
+    assert plans[0].identity == plans[1].identity  # documented structural ID
+    assert [p.evaluate(ReadOnlyContext({})) for p in plans] == [1, 2]
+
+    receipts = [emit_receipt(plan, system_id="same-system") for plan in plans]
+
+    assert receipts[0].method_id() != receipts[1].method_id()
+
+
+def test_emit_receipt_identical_declared_tokens_produce_identical_method_id() -> None:
+    # Identical-token stability companion: two independently built plans
+    # with the same declared `method_tokens` agree on method_id.
+    plans = [
+        LocalEnergyPlanner(
+            OperatorLoweringRegistry(
+                [
+                    Lowering(
+                        FirstOperator,
+                        Kernel(frozenset({FIRST}), value=1, method_tokens={"value": 1}),
+                    )
+                ]
+            )
+        ).plan([FirstOperator()])
+        for _ in range(2)
+    ]
+
+    receipts = [emit_receipt(plan, system_id="same-system") for plan in plans]
+
+    assert receipts[0].method_id() == receipts[1].method_id()

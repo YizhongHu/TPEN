@@ -78,6 +78,66 @@ def test_science_both_default_dry_run_is_exactly_six_lines(tmp_path: Path, capsy
     assert result.stdout.count("--dependency=afterok:") == 3, result.stdout
 
 
+def test_packed_eval_scales_host_resources_and_passes_pack_k(tmp_path: Path) -> None:
+    """Packing is explicit and requests one CPU/memory slice per stream."""
+
+    command = launch.build_eval_fanout_sbatch_command(
+        "science",
+        lineage="L1",
+        expected_train_commit=TRAIN_SHA,
+        science_python=sys.executable,
+        executor_python=sys.executable,
+        run_root=tmp_path / "runs" / "h-v2" / "science",
+        checkout_root=tmp_path / "checkout",
+        time_value="08:45:00",
+        dependency=None,
+        commit=SHA,
+        resources=launch_config.RESOURCES,
+        pack_k=3,
+        eval_count=101,
+        measured_batch_time="00:15:00",
+    )
+    assert "--cpus-per-task=12" in command
+    assert "--mem=96G" in command
+    assert "--gres=gpu:1" in command
+    assert "--pack-k 3" in next(flag for flag in command if flag.startswith("--wrap="))
+
+
+def test_packed_eval_rejects_out_of_range_pack_k(tmp_path: Path) -> None:
+    with pytest.raises(launch.LaunchError, match="between 1 and 6"):
+        launch.build_eval_fanout_sbatch_command(
+            "science",
+            lineage="L1",
+            expected_train_commit=TRAIN_SHA,
+            science_python=sys.executable,
+            executor_python=sys.executable,
+            run_root=tmp_path,
+            checkout_root=tmp_path / "checkout",
+            time_value="04:00:00",
+            dependency=None,
+            commit=SHA,
+            resources=launch_config.RESOURCES,
+            pack_k=7,
+        )
+
+
+def test_packed_eval_submitted_time_scales_with_the_101_generation_roster(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_root = tmp_path / "runs" / "h-v2" / "capacity-pilot-100k" / "P"
+    code = launch.main(
+        [
+            "--run-root", str(run_root), "--run-root-prefix", str(tmp_path / "runs"),
+            "--commit", SHA, "--payload", "capacity-pilot-100k", "--stage", "eval", "--pilot-stage", "1",
+            "--expected-train-commit", TRAIN_SHA, "--pack-k", "6", "--eval-count", "101",
+            "--measured-batch-time", "00:15:00", "--science-python", sys.executable,
+            "--executor-python", sys.executable, "--dry-run",
+        ]
+    )
+    assert code == 0
+    assert "--time=04:30:00" in capsys.readouterr().out
+
+
 def test_science_stage_train_dry_run_is_exactly_three_lines_no_eval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -182,6 +242,56 @@ def test_science_both_chains_eval_via_afterok_on_the_just_submitted_train_id(tmp
     assert "science" in eval_wrap
     assert "L1" in eval_wrap
     assert SHA in eval_wrap  # --expected-train-commit == this invocation's own commit
+
+
+def test_submit_lineage_forwards_pack_k_on_the_submitted_eval_line(tmp_path: Path) -> None:
+    """The production lineage submitter preserves packing on its EVAL command."""
+
+    calls: list[list[str]] = []
+    train_id, eval_id = launch.submit_lineage(
+        "L1",
+        payload="science",
+        science_python=sys.executable,
+        executor_python=sys.executable,
+        run_root=tmp_path,
+        checkout_root=tmp_path / "checkout",
+        t_wall="08:00:00",
+        e_wall="24:00:00",
+        commit=SHA,
+        pack_k=3,
+        eval_count=101,
+        measured_batch_time="00:15:00",
+        runner=_runner(calls, ["train-1", "eval-1"]),
+    )
+
+    assert (train_id, eval_id) == ("train-1", "eval-1")
+    eval_wrap = next(flag for flag in calls[1] if flag.startswith("--wrap="))
+    assert "--pack-k 3" in eval_wrap
+
+
+def test_submit_all_forwards_pack_k_on_each_submitted_eval_line(tmp_path: Path) -> None:
+    """The production all-lineage submitter preserves packing on EVAL commands."""
+
+    calls: list[list[str]] = []
+    result = launch.submit_all(
+        payload="science",
+        science_python=sys.executable,
+        executor_python=sys.executable,
+        run_root=tmp_path,
+        checkout_root=tmp_path / "checkout",
+        t_wall="08:00:00",
+        e_wall="24:00:00",
+        commit=SHA,
+        lineages=("L1",),
+        pack_k=4,
+        eval_count=101,
+        measured_batch_time="00:15:00",
+        runner=_runner(calls, ["train-1", "eval-1"]),
+    )
+
+    assert result == {"L1": ("train-1", "eval-1")}
+    eval_wrap = next(flag for flag in calls[1] if flag.startswith("--wrap="))
+    assert "--pack-k 4" in eval_wrap
 
 
 # --- part (g): standalone EVAL-only job -------------------------------------

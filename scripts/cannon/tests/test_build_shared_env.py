@@ -584,6 +584,26 @@ def test_interpreter_query_failure_blocks_publication(tmp_path: Path, envs_root:
     assert (envs_root / target).is_dir()
 
 
+def test_malformed_version_metadata_exits_zero_but_blocks_publication(
+    tmp_path: Path, envs_root: Path, cache_dir: Path
+) -> None:
+    """Killer for mutant m6 (drop the pre-publication manifest_is_valid call;
+    A1 review c6ee8bcc, declined as fail-safe for that slice with a follow-up
+    to add this test, carried to this item's carried-follow-ups note): unlike
+    test_interpreter_query_failure_blocks_publication (the query itself
+    fails), the metadata query here exits 0 with a non-empty but malformed
+    version string, so only the strict manifest_is_valid check -- not the
+    `-n` emptiness check -- can catch it before publication."""
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path, python_version="not-a-version")
+    target = env_name_for(checkout)
+    result = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "REFUSE" in result.stderr
+    assert not (envs_root / target / ".complete").exists()
+    assert (envs_root / target).is_dir()
+
+
 # --- T6 (failed builds remain counted; expected green) ---------------------
 
 

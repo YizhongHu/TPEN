@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -41,6 +42,15 @@ attached = _h_v2_module("attached")
 launch_config = _h_v2_module("launch_config")
 launch = _h_v2_module("launch")
 run_job = _h_v2_module("run_job")
+eval_job = run_job.eval_job
+
+_REVIEW_HELPERS_SPEC = importlib.util.spec_from_file_location(
+    "h_v2_pr673_review_helpers", HERE / "test_review_eval_job_r1.py"
+)
+assert _REVIEW_HELPERS_SPEC is not None and _REVIEW_HELPERS_SPEC.loader is not None
+_review_helpers = importlib.util.module_from_spec(_REVIEW_HELPERS_SPEC)
+sys.modules[_REVIEW_HELPERS_SPEC.name] = _review_helpers
+_REVIEW_HELPERS_SPEC.loader.exec_module(_review_helpers)
 
 _SEED_ROSTER = json.loads((HERE / "contract_inputs.json").read_text(encoding="utf-8"))["measurement"]["seed_roster"]
 _NON_SCIENCE = _SEED_ROSTER["non_science_seed_namespaces"]
@@ -79,6 +89,10 @@ def test_pilot_training_config_matches_a1_field_by_field(payload: str, max_steps
     # Payload overlay: only trainer.max_steps and A1 cadence differ by payload.
     assert config["trainer"]["max_steps"] == max_steps
     assert config["trainer"]["log_every_n_steps"] == protocol.PILOT_A1_CADENCE
+    assert not any(
+        callback.get("_target_") == "tpen.callback.AmplitudeRiskFraction"
+        for callback in config["callbacks"]
+    )
     data_integrity = next(cb for cb in config["callbacks"] if cb["_target_"] == "tpen.callback.DataIntegrity")
     gradient_stats = next(cb for cb in config["callbacks"] if cb["_target_"] == "tpen.callback.GradientStats")
     assert data_integrity["every_n_steps"] == protocol.PILOT_A1_CADENCE
@@ -163,6 +177,52 @@ def test_candidate_modules_to_append_excludes_base_config_leaves() -> None:
     assert "tpen.callback.SamplerHealth" in candidates
     assert "tpen.callback.FactorScalars" in candidates
     assert "tpen.callback.RawTrainingBatchRecorder" in candidates
+    assert "tpen.callback.AmplitudeRiskFraction" in candidates
+    assert "tpen.callback.AmplitudeRiskFraction" not in protocol.candidate_modules_to_append(
+        include_amplitude_risk=False
+    )
+
+
+def test_amplitude_risk_candidate_copies_frozen_entry_and_measured_cadence() -> None:
+    entry = protocol._build_candidate_callback("tpen.callback.AmplitudeRiskFraction")
+    assert entry == {
+        "_target_": "tpen.callback.AmplitudeRiskFraction",
+        "thresholds": [-3, -4, -5, -7, -10],
+        "every_n_steps": 100,
+    }
+    assert "start_step" not in entry
+
+
+def test_science_candidate_set_requires_amplitude_risk_module() -> None:
+    config, _ = protocol.science_training_config("L1", 0)
+    for target in protocol.candidate_modules_to_append():
+        protocol.append_candidate_module(config, target)
+    protocol.assert_hydrogen_contract(config)
+    amplitude = next(
+        callback for callback in config["callbacks"]
+        if callback["_target_"] == "tpen.callback.AmplitudeRiskFraction"
+    )
+    assert amplitude["thresholds"] == list(protocol.AMPLITUDE_RISK_THRESHOLDS)
+    assert amplitude["every_n_steps"] == protocol.AMPLITUDE_RISK_CADENCE
+
+    protocol.remove_candidate_module(config, "tpen.callback.AmplitudeRiskFraction")
+    with pytest.raises(ValueError, match="AmplitudeRiskFraction"):
+        protocol.assert_hydrogen_contract(config)
+
+
+def test_science_contract_rejects_nonzero_amplitude_risk_start_step() -> None:
+    config, _ = protocol.science_training_config("L1", 0)
+    for target in protocol.candidate_modules_to_append():
+        protocol.append_candidate_module(config, target)
+    amplitude = next(
+        callback
+        for callback in config["callbacks"]
+        if callback["_target_"] == "tpen.callback.AmplitudeRiskFraction"
+    )
+    amplitude["start_step"] = 100_000
+
+    with pytest.raises(ValueError, match="start_step"):
+        protocol.assert_hydrogen_contract(config)
 
 
 def test_endq_candidate_carries_quantiles_not_output_path() -> None:
@@ -195,9 +255,9 @@ def test_h_v2_logging_builders_pin_cadences_and_groups() -> None:
 
 def test_health_and_abort_callbacks_precede_checkpoint() -> None:
     config, _ = protocol.pilot_training_config("gpu-route-g")
-    for target in protocol.candidate_modules_to_append():
+    for target in protocol.candidate_modules_to_append(include_amplitude_risk=False):
         protocol.append_candidate_module(config, target)
-    protocol.assert_hydrogen_contract(config)
+    protocol.assert_hydrogen_contract(config, allow_missing_amplitude_risk=True)
     targets = [entry["_target_"] for entry in config["callbacks"]]
     checkpoint = targets.index("tpen.callback.Checkpoint")
     for target in {
@@ -212,13 +272,13 @@ def test_health_and_abort_callbacks_precede_checkpoint() -> None:
 
 def test_contract_rejects_logging_mutants() -> None:
     config, _ = protocol.pilot_training_config("gpu-route-g")
-    for target in protocol.candidate_modules_to_append():
+    for target in protocol.candidate_modules_to_append(include_amplitude_risk=False):
         protocol.append_candidate_module(config, target)
     for entry in config["callbacks"]:
         if entry["_target_"] == "tpen.callback.RawTrainingBatchRecorder":
             entry["every_n_steps"] = 10
     with pytest.raises(ValueError, match="cadence"):
-        protocol.assert_hydrogen_contract(config)
+        protocol.assert_hydrogen_contract(config, allow_missing_amplitude_risk=True)
 
 
 def test_short_run_from_config_writes_logging_outputs(tmp_path: Path) -> None:
@@ -227,7 +287,7 @@ def test_short_run_from_config_writes_logging_outputs(tmp_path: Path) -> None:
     from tpen.run import run_from_config
 
     config = protocol.training_config()
-    for target in protocol.candidate_modules_to_append():
+    for target in protocol.candidate_modules_to_append(include_amplitude_risk=False):
         protocol.append_candidate_module(config, target)
     config["run"].update(root=str(tmp_path / "runs"), run_id="h-v2-log-check")
     config["runtime"].update(device="cpu")
@@ -272,7 +332,7 @@ def test_pilot_payload_100k_real_cpu_run_generalizes_the_checkpoint_inventory(tm
     from tpen.run import run_from_config
 
     config, _ = protocol.pilot_training_config("capacity-pilot-100k")
-    for target in protocol.candidate_modules_to_append():
+    for target in protocol.candidate_modules_to_append(include_amplitude_risk=False):
         protocol.append_candidate_module(config, target)
     config["run"].update(root=str(tmp_path / "runs"), run_id="h-v2-100k-inventory-check")
     config["runtime"].update(device="cpu")
@@ -289,6 +349,97 @@ def test_pilot_payload_100k_real_cpu_run_generalizes_the_checkpoint_inventory(tm
     run_dir = next((tmp_path / "runs").rglob("metrics.jsonl")).parent
     inventory = attached.build_checkpoint_inventory(run_dir / "checkpoints")
     assert [entry["update"] for entry in inventory] == [0, 2, 4, 6]
+
+    # Feed the producer's actual inventory to the consumer, including the
+    # terminal update.  The manifest's completed_updates is the scientific
+    # coordinate; next_iteration is only the resume cursor.
+    terminal = eval_job.select_checkpoint(
+        {"checkpoint_inventory": inventory}, update=6
+    )
+    terminal_manifest = json.loads(
+        (Path(terminal["path"]) / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert terminal_manifest["completed_updates"] == 6
+    assert terminal_manifest["next_iteration"] == 6
+    snapshot = eval_job.resolve_checkpoint(
+        {"checkpoint_inventory": inventory},
+        update=6,
+        snapshot_dir=tmp_path / "terminal-snapshot",
+    )
+    assert snapshot.is_dir()
+    for relative, expected_sha256 in terminal["files"].items():
+        copied = snapshot / relative
+        assert copied.is_file()
+        assert hashlib.sha256(copied.read_bytes()).hexdigest() == expected_sha256
+
+
+def test_pilot_100k_real_fanout_receipt_round_trips_through_sel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise the real 101-generation producer loop and its SEL consumer.
+
+    Numerical generation is faked at the established subprocess boundary only:
+    receipt construction, checkpoint selection/snapshotting, artifact hashes,
+    receipt reading, and SEL remain real.  W decreases through ordinal 100, so
+    the generalized 3..99 window selects its upper edge (99), which must not
+    be reported as an interior minimum.
+    """
+
+    _review_helpers._train(tmp_path, payload="capacity-pilot-100k", updates=range(0, 101000, 1000))
+    _review_helpers._fake_compute(monkeypatch)
+    fake_run = eval_job.subprocess.run
+
+    def _fake_decreasing_energy(argv, **kwargs):
+        result = fake_run(argv, **kwargs)
+        config = yaml.safe_load(Path(argv[-1]).read_text(encoding="utf-8"))
+        run_dir = Path(config["run"]["root"]) / config["run"]["run_id"]
+        ordinal = int(re.search(r"ck(\d+)-", config["run"]["run_id"]).group(1)) // 1000
+        width = 101 - ordinal
+        csv_path = next(run_dir.rglob("sampled_eval_table.csv"))
+        csv_path.write_text(f"local_energy\n-{width}\n0\n{width}\n", encoding="utf-8")
+        metadata_path = csv_path.with_name("sampled_eval_table.metadata.json")
+        metadata_path.write_text(
+            json.dumps({"csv_sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest()}),
+            encoding="utf-8",
+        )
+        return result
+
+    monkeypatch.setattr(eval_job.subprocess, "run", _fake_decreasing_energy)
+    monkeypatch.setattr(run_job, "check_identity", lambda *args, **kwargs: None)
+    monkeypatch.setenv("RUN", str(tmp_path))
+    monkeypatch.setenv("SHA", _review_helpers.EVAL_SHA)
+    monkeypatch.setenv("SCIENCE_PYTHON", sys.executable)
+
+    run_job.run_eval_fanout(
+        run_root=tmp_path,
+        expected_commit=_review_helpers.EVAL_SHA,
+        science_python=sys.executable,
+        payload="capacity-pilot-100k",
+        lineage="P",
+        expected_train_commit=_review_helpers.TRAIN_SHA,
+        pilot_stage="1",
+    )
+    stage1_path = run_job._eval_receipt_path(tmp_path, "h-v2-eval-capacity-pilot-100k-stage1")
+    receipt, receipt_sha256 = eval_job.read_eval_receipt_with_hash(stage1_path)
+    generations = receipt["generations"]
+    assert len(generations) == 101
+    assert [(g["ordinal"], g["update"], g["stream"]) for g in generations] == [
+        (ordinal, ordinal * 1000, 0) for ordinal in range(101)
+    ]
+    assert [g["seed"] for g in generations] == [
+        protocol.pilot_eval_seed(ordinal, 0) for ordinal in range(101)
+    ]
+    assert generations[-1]["update"] == 100000
+    assert generations[-1]["checkpoint_files"]
+    for generation in generations:
+        trajectory = generation["artifacts"]["trajectory_csv"]
+        assert hashlib.sha256(Path(trajectory["path"]).read_bytes()).hexdigest() == trajectory["sha256"]
+        assert generation["checkpoint_files"]
+
+    run_job.run_pilot_sel(tmp_path, payload="capacity-pilot-100k")
+    selection_path = tmp_path / "attached/receipts/h-v2-eval-capacity-pilot-100k-selection.json"
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    assert selection["b1_eval_receipt_sha256"] == receipt_sha256
+    assert selection["c1"] == 99
+    assert selection["interior_minimum"] is False
 
 
 def test_append_and_remove_candidate_module_round_trips() -> None:
@@ -334,12 +485,12 @@ def test_probe_admitted_a1_modules_keeps_only_admitted_candidates(
     monkeypatch.setattr(attached, "assert_candidate_instantiates", lambda *args, **kwargs: None)
     enabled, skipped = attached.probe_admitted_a1_modules(
         config,
-        protocol.candidate_modules_to_append(),
+        protocol.candidate_modules_to_append(include_amplitude_risk=False),
         science_python=sys.executable,
         probe_config_path=tmp_path / "probe.yaml",
     )
     assert set(enabled) == admitted
-    assert set(skipped) == set(protocol.candidate_modules_to_append()) - admitted
+    assert set(skipped) == set(protocol.candidate_modules_to_append(include_amplitude_risk=False)) - admitted
     targets_in_config = {cb["_target_"] for cb in config["callbacks"]}
     assert admitted <= targets_in_config
     assert not (set(skipped) & targets_in_config)
@@ -368,12 +519,12 @@ def test_probe_admitted_a1_modules_admits_none(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(attached, "check_profile", _refuse_added_candidates)
     enabled, skipped = attached.probe_admitted_a1_modules(
         config,
-        protocol.candidate_modules_to_append(),
+        protocol.candidate_modules_to_append(include_amplitude_risk=False),
         science_python=sys.executable,
         probe_config_path=tmp_path / "probe.yaml",
     )
     assert enabled == []
-    assert set(skipped) == set(protocol.candidate_modules_to_append())
+    assert set(skipped) == set(protocol.candidate_modules_to_append(include_amplitude_risk=False))
 
 
 def test_probe_propagates_non_refusal_error_from_a_later_candidate(
@@ -391,7 +542,7 @@ def test_probe_propagates_non_refusal_error_from_a_later_candidate(
     """
 
     config, _ = protocol.pilot_training_config("gpu-route-g")
-    candidates = protocol.candidate_modules_to_append()
+    candidates = protocol.candidate_modules_to_append(include_amplitude_risk=False)
     failure = attached.ActivationRefusal("profile-unavailable", "malformed checker response")
     calls = {"count": 0}
 
@@ -454,7 +605,7 @@ def test_probe_raises_on_instantiation_failure_not_swallowed_as_skip(
     with pytest.raises(attached.HV2ReceiptRefusal) as excinfo:
         attached.probe_admitted_a1_modules(
             config,
-            protocol.candidate_modules_to_append(),
+            protocol.candidate_modules_to_append(include_amplitude_risk=False),
             science_python=sys.executable,
             probe_config_path=tmp_path / "probe.yaml",
         )
@@ -585,6 +736,16 @@ def test_build_checkpoint_inventory_lists_every_committed_checkpoint_with_sha256
         model_path = Path(entry["path"]) / "model.pt"
         expected = hashlib.sha256(model_path.read_bytes()).hexdigest()
         assert entry["files"]["model.pt"] == expected
+
+
+def test_build_checkpoint_inventory_carries_the_100k_science_roster(tmp_path: Path) -> None:
+    root = tmp_path / "checkpoints"
+    for update in range(0, 100001, 1000):
+        _write_fake_checkpoint(root, update)
+
+    inventory = attached.build_checkpoint_inventory(root)
+    assert len(inventory) == 101
+    assert [entry["update"] for entry in inventory] == list(range(0, 100001, 1000))
 
 
 def test_build_checkpoint_inventory_omits_an_incomplete_checkpoint_mutant(tmp_path: Path) -> None:
@@ -763,11 +924,11 @@ def test_gpu_test_resources_carry_no_a100_constraint_and_the_gpu_test_partition(
 
 
 def test_capacity_pilot_uses_the_approved_a100_resources() -> None:
-    assert launch_config.PILOT_PAYLOAD_RESOURCES["capacity-pilot"] is launch_config.RESOURCES
+    assert launch_config.PILOT_PAYLOAD_RESOURCES["capacity-pilot"] is launch_config.PILOT_RESOURCES
 
 
 def test_capacity_pilot_100k_uses_the_approved_a100_resources_and_12_hour_cap() -> None:
-    assert launch_config.PILOT_PAYLOAD_RESOURCES["capacity-pilot-100k"] is launch_config.RESOURCES
+    assert launch_config.PILOT_PAYLOAD_RESOURCES["capacity-pilot-100k"] is launch_config.PILOT_RESOURCES
     assert launch_config.PILOT_PAYLOAD_LINEAGES["capacity-pilot-100k"] == "P"
     assert launch_config.PILOT_PAYLOAD_GPU_STRATA["capacity-pilot-100k"] == launch_config.APPROVED_GPU_STRATUM
     assert launch_config.PILOT_PAYLOAD_MAX_WALL_SECONDS["capacity-pilot-100k"] == 12 * 60 * 60

@@ -34,6 +34,16 @@ PUBLICATION_RECORD_SCHEMA = "tpen.checkpoint-publication/v1"
 _MODEL_CONFIG_HASH = re.compile(r"[0-9a-f]{64}\Z")
 
 
+def _raise_tagged_publication_failure(exc: Exception, stage: str) -> None:
+    """Retain a reconciliation error while identifying its write stage."""
+
+    exc.tpen_publication_stage = stage
+    add_note = getattr(exc, "add_note", None)
+    if add_note is not None:
+        add_note(f"checkpoint publication failed during {stage}")
+    raise exc
+
+
 @dataclass(frozen=True, slots=True)
 class _ValidatedLatestTarget:
     """The ordering fields needed from an already-published latest target."""
@@ -230,17 +240,23 @@ def reconcile_publication(
     root = Path(checkpoint_root)
     directory = Path(checkpoint_dir)
     ref = CheckpointRef.from_directory(directory)
-    CheckpointCatalog(publication_catalog_path(root)).publish(ref)
+    try:
+        CheckpointCatalog(publication_catalog_path(root)).publish(ref)
+    except Exception as exc:
+        _raise_tagged_publication_failure(exc, "catalog")
 
     manifest = read_manifest(directory / "manifest.json", mode="model_only")
     latest_state = _validated_latest_target(root)
     if latest_state is None:
-        write_latest(
-            root,
-            directory,
-            step=ref.next_iteration,
-            created_at_unix=manifest.created_at_unix,
-        )
+        try:
+            write_latest(
+                root,
+                directory,
+                step=ref.next_iteration,
+                created_at_unix=manifest.created_at_unix,
+            )
+        except Exception as exc:
+            _raise_tagged_publication_failure(exc, "latest")
     else:
         latest_target, latest_pointer = latest_state
         if latest_target.next_iteration < ref.next_iteration or (
@@ -252,12 +268,15 @@ def reconcile_publication(
                 "created_at_unix": manifest.created_at_unix,
             }
         ):
-            write_latest(
-                root,
-                directory,
-                step=ref.next_iteration,
-                created_at_unix=manifest.created_at_unix,
-            )
+            try:
+                write_latest(
+                    root,
+                    directory,
+                    step=ref.next_iteration,
+                    created_at_unix=manifest.created_at_unix,
+                )
+            except Exception as exc:
+                _raise_tagged_publication_failure(exc, "latest")
     backfill_publication_receipt(
         ref, directory, manifest.files, publication_receipt_path(root)
     )

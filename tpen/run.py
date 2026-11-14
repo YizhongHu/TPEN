@@ -12,19 +12,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from hydra.utils import instantiate
+from hydra.utils import get_class, instantiate
 from hydra.errors import InstantiationException
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from tpen.accelerator import TorchAllocatorPeakProbe, seed_all as accelerator_seed_all
 from tpen.artifacts import (
+    ArtifactDestination,
     ArtifactManager,
+    ArtifactRoutingError,
     RunContext,
     RunResult,
     build_run_metadata,
     resolve_run_clock,
     resolve_run_id,
+    write_artifact_routing_receipt,
     write_error_artifact,
+    write_run_outcome_artifact,
     write_run_start_artifact,
 )
 from tpen.distributed import (
@@ -44,6 +48,40 @@ from tpen.runner import Runner
 # Register custom OmegaConf resolvers (e.g. tpen.basis_feature_dim) before any
 # config is loaded or resolved on the run path.
 register_resolvers()
+
+PLANNED_YIELD_EXIT_CODE = 2
+
+
+def __getattr__(name: str) -> object:
+    """Lazily preserve callback names formerly imported at module scope."""
+
+    if name == "PlannedYield":
+        from tpen.callback.planned_yield import PlannedYield
+
+        return PlannedYield
+    if name == "PlannedYieldSignal":
+        from tpen.callback.planned_yield import PlannedYieldSignal
+
+        return PlannedYieldSignal
+    if name == "CheckpointPublicationError":
+        from tpen.callback.checkpoint import CheckpointPublicationError
+
+        return CheckpointPublicationError
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _status_to_exit_code(status: str) -> int:
+    """Map a public run status to the documented process exit code.
+
+    ``completed`` is 0, ``planned_yield`` is 2, and every refusal, unknown,
+    or failure is 1.  The mapping is shared by returned and signalled results.
+    """
+
+    if status == "completed":
+        return 0
+    if status == "planned_yield":
+        return PLANNED_YIELD_EXIT_CODE
+    return 1
 
 # Bootstrap diagnostics get their own channel so a run's logging configuration can
 # silence or route fatal pre-context errors independently. Spelled once: the channel
@@ -116,12 +154,37 @@ def prepare_run_context(
     command: str | None = None,
     bootstrap: _BootstrapState | None = None,
     topology: ExecutionTopology | None = None,
+    artifact_destination: ArtifactDestination | None = None,
+    runtime_callbacks: Sequence[object] = (),
 ) -> RunContext:
     """Resolve run metadata, artifact paths, callbacks, and loggers.
 
     Callbacks and loggers are configured at the config root and owned by the
     `RunContext`; runners dispatch into ``context.callbacks`` and log through
     ``context.log``.
+
+    Parameters
+    ----------
+    artifact_destination : tpen.artifacts.ArtifactDestination or None, optional
+        Operational, launcher-supplied physical leaf this run's artifact
+        sinks must write beneath, outside ``cfg``. When ``None`` (the
+        default), sinks write under the logical ``run.root``/``run.dir`` tree
+        exactly as before. When supplied, the recorded ``run.dir`` and every
+        sink a known operational-slot registry covers are routed to the
+        claimed physical leaf while the resolved config `cfg` records and
+        other callers see stays logically unchanged -- see
+        :func:`_route_artifact_sinks`.
+    runtime_callbacks : sequence of objects, optional
+        Operational observers. In routed mode (`artifact_destination`
+        supplied), they are admitted, routed, validated, and appended into
+        ``context.callbacks`` here, before this context is returned, so a
+        launcher-supplied observer is bound before `RunStarted` is ever
+        emitted (F4) -- see :func:`run_from_config`, whose docstring
+        describes this argument's purpose. Without a destination, they are
+        NOT appended here (review-r3 R3.4, restoring the original legacy
+        ordering): `run_from_config` validates and appends them itself,
+        after this context already exists, so a failing legacy list appends
+        none of them rather than all of them regardless of outcome.
 
     Raises
     ------
@@ -144,6 +207,11 @@ def prepare_run_context(
     # `run_from_config` path costs one extra sweep and removes the possibility
     # that the two paths ever disagree about what is admissible.
     validate_hi_train_config(cfg)
+    # (A) review-r2: a routed destination must be fresh -- absent, or a real,
+    # empty, non-symlinked directory -- checked before anything below
+    # constructs a directory, a logger, or a callback (R2.1, R2.3).
+    if artifact_destination is not None:
+        artifact_destination.require_fresh()
 
     run_clock = resolve_run_clock(cfg)
     source_cfg = _rerunnable_config(
@@ -186,20 +254,95 @@ def prepare_run_context(
     sector = str(OmegaConf.select(resolved_cfg, "experiment.sector", default="default"))
     root = Path(str(OmegaConf.select(resolved_cfg, "run.root", default="outputs")))
     layout = str(OmegaConf.select(resolved_cfg, "run.layout", default="nested"))
-    artifact_manager = ArtifactManager(root, experiment_name, sector, str(run_id), layout=layout)
+    # The ADMITTED logical `run.dir`, read before anything below overwrites
+    # it. In routed mode only, this -- not a directory recomputed from
+    # root/experiment/sector/run_id -- is what every eagerly-resolved HI sink
+    # was already baked against (F1): HI can resolve a layout whose directory
+    # does not match what `root`/`experiment`/`sector`/`run_id` alone would
+    # recompute (for example an intermediate path segment under a `flat`
+    # layout). Legacy (no destination) behavior is unaffected: it always
+    # recomputes, exactly as before -- and (D) review-r2 R2.5: the read
+    # itself is gated on routed mode, so a legacy caller's unresolved,
+    # discarded `run.dir` placeholder never has to resolve at all.
+    admitted_run_dir = (
+        _nonempty_text(OmegaConf.select(resolved_cfg, "run.dir", default=None))
+        if artifact_destination is not None
+        else None
+    )
+    artifact_manager = ArtifactManager(
+        root,
+        experiment_name,
+        sector,
+        str(run_id),
+        layout=layout,
+        destination=artifact_destination,
+        logical_run_dir=(
+            Path(admitted_run_dir)
+            if artifact_destination is not None and admitted_run_dir is not None
+            else None
+        ),
+    )
     if bootstrap is not None:
         bootstrap.run_dir = artifact_manager.run_dir
-    OmegaConf.update(resolved_cfg, "run.dir", str(artifact_manager.run_dir), merge=False, force_add=True)
+    # `run.dir` is recorded as the LOGICAL path, never the physical one, even
+    # when `artifact_destination` is supplied: several allocations of one
+    # scientific cell must record the same constant C. `artifact_manager.run_dir`
+    # (physical when a destination is bound) is reserved for actual disk writes
+    # below -- see `_route_artifact_sinks` for the already-instantiated sinks
+    # whose output paths were baked from this same logical value before this
+    # function ever ran (HI resolves its config eagerly).
+    logical_run_dir = artifact_manager.logical_run_dir
+    OmegaConf.update(resolved_cfg, "run.dir", str(logical_run_dir), merge=False, force_add=True)
     OmegaConf.resolve(resolved_cfg)
     artifact_manager.make_dirs()
     _configure_terminal_logging(resolved_cfg)
 
-    loggers = _instantiate_sequence(OmegaConf.select(resolved_cfg, "loggers", default=[]))
-    callbacks = _instantiate_sequence(OmegaConf.select(resolved_cfg, "callbacks", default=[]))
-    # Fail-loud interface validation only: confirm the configured objects expose
-    # the lifecycle methods, without invoking any behavior (no handle/log/finish).
+    routed = artifact_destination is not None
+    # (B) review-r2 R2.2: in routed mode, each configured sink's `_target_`
+    # class is resolved and admitted BEFORE `instantiate()` ever constructs
+    # it -- an unregistered writer or subclass can no longer write to its
+    # logical destination before a later, construction-side probe refuses
+    # it. Legacy (no destination) construction is unchanged.
+    loggers = _instantiate_sequence(
+        OmegaConf.select(resolved_cfg, "loggers", default=[]), routed=routed
+    )
+    callbacks = _instantiate_sequence(
+        OmegaConf.select(resolved_cfg, "callbacks", default=[]), routed=routed
+    )
+    # CONFIGURED validation is unconditional and happens here, before this
+    # context (or anything else below) is constructed (review-r3 R3.4,
+    # restoring the original pre-S3 legacy ordering): fail-loud interface
+    # validation only, confirming these objects expose the lifecycle methods
+    # without invoking any behavior (no handle/log/finish). A refusal here
+    # leaves no `RunContext` bound at all, so `run_from_config`'s `finally`
+    # teardown (which calls `logger.finish()` on every context logger) can
+    # never reach an invalid configured logger -- gating this validation on
+    # `routed`, or deferring it until after the context existed, let exactly
+    # that AttributeError mask the original, already-handled refusal.
     _validate_callbacks(callbacks)
     _validate_loggers(loggers)
+    runtime_callbacks_list = list(runtime_callbacks)
+    if routed:
+        # Runtime callbacks have no `_target_` to resolve ahead of
+        # construction -- they already exist -- so admission checks their
+        # exact type instead (F3/F4). In routed mode only, runtime callbacks
+        # must also be validated and merged here, strictly before
+        # `RunStarted` (F4): legacy (no-destination) runtime validation and
+        # merging is restored to `run_from_config` instead (E/R3.4) -- see
+        # its docstring -- so a legacy runtime-callback failure appends none
+        # of them, rather than merging first and validating after.
+        for runtime_callback in runtime_callbacks_list:
+            _admit_runtime_sink(runtime_callback)
+        _validate_callbacks(runtime_callbacks_list)
+        # Runtime callbacks join the list -- and are routed along with every
+        # configured callback (F4) -- before this context, and therefore
+        # `RunStarted`, exists at all.
+        callbacks = [*callbacks, *runtime_callbacks_list]
+    routed_sinks: dict[str, str] = {}
+    if routed:
+        routed_sinks = _route_artifact_sinks(
+            [*callbacks, *loggers], logical_run_dir=logical_run_dir, destination=artifact_destination
+        )
     metadata = build_run_metadata(resolved_cfg, command=command, config_path=config_path, clock=run_clock)
     if topology is None:
         try:
@@ -223,10 +366,23 @@ def prepare_run_context(
         profile_writer=(
             None
             if topology.global_rank is None
-            else RankLocalJSONLWriter(artifact_manager.run_dir, topology)
+            else RankLocalJSONLWriter(
+                artifact_manager.run_dir,
+                topology,
+                path=artifact_manager.path(
+                    "profiles", topology.rank_path_component, "resources.jsonl"
+                ),
+            )
         ),
     )
     write_run_start_artifact(context)
+    if artifact_destination is not None:
+        write_artifact_routing_receipt(
+            context,
+            destination=artifact_destination,
+            logical_run_dir=logical_run_dir,
+            routed=routed_sinks,
+        )
     return context
 
 
@@ -239,6 +395,7 @@ def run_from_config(
     topology: ExecutionTopology | Mapping[str, object] | None = None,
     runtime_callbacks: Sequence[object] = (),
     restore_request: Any = None,
+    artifact_destination: ArtifactDestination | None = None,
 ) -> int:
     """Instantiate and execute the configured runner.
 
@@ -274,12 +431,17 @@ def run_from_config(
         or silently preferred. Typed only as ``Any`` here so that importing
         ``tpen.run`` never pulls in ``tpen.execution`` (and its backend
         adapters) for callers that never pass this argument.
+    artifact_destination : tpen.artifacts.ArtifactDestination or None, optional
+        Operational, launcher-supplied physical leaf this run's artifact
+        sinks must write beneath, outside ``cfg``. Forwarded to
+        :func:`prepare_run_context`; see its docstring for the routing
+        contract. ``cfg`` and the recorded ``run.dir`` are unaffected.
 
     Returns
     -------
     int
-        ``0`` on success, ``1`` on a handled failure (when
-        ``raise_exceptions=False``). A runner that RETURNS
+        ``0`` on completed, ``2`` on planned yield, and ``1`` on a handled
+        refusal, unknown, or failure (when ``raise_exceptions=False``). A runner that RETURNS
         ``RunResult(status="failed")`` -- an evaluation suite whose tasks
         failed, which raises nothing -- is a handled failure too and also
         returns ``1``. It used to return ``0``, so a failed evaluation exited
@@ -287,10 +449,16 @@ def run_from_config(
         a success.
     """
 
+    # Keep the callback and checkpoint exception imports off the module import
+    # path. Their owner modules transitively load the eager training package.
+    from tpen.callback.checkpoint import CheckpointPublicationError
+    from tpen.callback.planned_yield import PlannedYield, PlannedYieldSignal
+
     _install_bootstrap_stderr_logger()
     bootstrap = _BootstrapState()
     context: RunContext | None = None
     runner: Runner | None = None
+    evidence_result: RunResult | None = None
     try:
         # PRECONSTRUCTION FIREWALL. This is the first statement in the try on
         # purpose: `prepare_run_context` below already creates the run
@@ -316,6 +484,8 @@ def run_from_config(
                 config_path=config_path,
                 command=command,
                 bootstrap=bootstrap,
+                artifact_destination=artifact_destination,
+                runtime_callbacks=runtime_callbacks,
             )
         else:
             context = prepare_run_context(
@@ -324,15 +494,34 @@ def run_from_config(
                 command=command,
                 bootstrap=bootstrap,
                 topology=topology,
+                artifact_destination=artifact_destination,
+                runtime_callbacks=runtime_callbacks,
             )
-        _validate_callbacks(list(runtime_callbacks))
-        context.callbacks.extend(runtime_callbacks)
+        if artifact_destination is None:
+            # (E)/(R3.4) legacy runtime-callback phase: configured callbacks
+            # and loggers were already validated inside `prepare_run_context`
+            # (unconditionally, before `context` existed). Runtime callbacks
+            # are validated here instead -- restoring the original ordering --
+            # and merged into `context.callbacks` only once validation
+            # succeeds, so a failing runtime-callback list appends NONE of
+            # them, rather than all of them having already been merged inside
+            # `prepare_run_context` regardless of outcome. A refusal here
+            # still runs through the `except` branch below with `context`
+            # bound: the failure artifact is written and every logger's
+            # `finish()` still runs in the `finally` clause, instead of
+            # escaping with the context only half-reported.
+            _validate_callbacks(list(runtime_callbacks))
+            context.callbacks.extend(runtime_callbacks)
         _seed_runtime_rngs(context.cfg)
         context.emit(RunStarted())
         runner = _instantiate_runner(context)
         if restore_request is not None:
             runner = _apply_operational_restore(context.cfg, runner, restore_request)
+        for callback in context.callbacks:
+            if isinstance(callback, PlannedYield):
+                callback.validate_target(runner)
         result = runner.run(context)
+        evidence_result = result if isinstance(result, RunResult) else None
         # The harness owns the whole run lifecycle, including this boundary,
         # which the runners emitted the ``run_end`` string for. See
         # `tpen.run_events` for why one emitter rather than three.
@@ -343,63 +532,143 @@ def run_from_config(
         # itself while handling this event and would otherwise overwrite a
         # failed suite's status with the boundary's own name.
         status = result.status if isinstance(result, RunResult) else "completed"
-        context.emit(RunCompleted(status=status))
+        if isinstance(result, RunResult):
+            write_run_outcome_artifact(context, result)
+        context.emit(RunCompleted(status=status, result=result if isinstance(result, RunResult) else None))
         if isinstance(result, RunResult):
             context.metadata.status = result.status
         # A failed suite raises nothing -- the runner returned -- but the process
         # must not claim success. Same exit code as the raising path: no caller
         # distinguishes between nonzero codes, and inventing a second one would
         # be a new contract for no consumer.
-        return 1 if status == "failed" else 0
-    except Exception as exc:
-        phase = _failure_phase(exc, context=context, runner=runner)
-        traceback_text = traceback.format_exc()
-        payload = {
-            "exception": exc,
-            "exception_type": type(exc).__name__,
-            "exception_message": str(exc),
-            "phase": phase,
-            "traceback": traceback_text,
-        }
+        return _status_to_exit_code(status)
+    except PlannedYieldSignal as signal:
+        result = signal.result
         if context is not None:
-            context.metadata.status = "failed"
-            _write_error_if_possible(context, exc, phase=phase, traceback_text=traceback_text)
-            # ONE typed event for the two legacy strings below, which carry the
-            # same payload and are distinguished by no consumer -- see `RunFailed`.
-            # Guarded exactly as they are: this runs while the context may be
-            # half-constructed, and an emit that raised here would mask the
-            # original exception.
-            _emit_typed_event_if_possible(
-                context,
-                RunFailed(
-                    exception_type=str(payload["exception_type"]),
-                    exception_message=str(payload["exception_message"]),
-                ),
-            )
-        elif bootstrap.run_dir is not None:
-            _write_error_if_possible(
-                bootstrap.run_dir,
-                exc,
-                phase=phase,
-                traceback_text=traceback_text,
-                command=command,
-                config_path=config_path,
-            )
-        _print_fatal(
+            try:
+                context.metadata.status = result.status
+                write_run_outcome_artifact(context, result)
+                context.emit(RunCompleted(status=result.status, result=result))
+            except Exception as exc:
+                return _handle_run_failure(
+                    exc,
+                    context=context,
+                    runner=runner,
+                    bootstrap=bootstrap,
+                    raise_exceptions=raise_exceptions,
+                    evidence=result,
+                    command=command,
+                    config_path=config_path,
+                )
+        return _status_to_exit_code(result.status)
+    except CheckpointPublicationError as exc:
+        result = RunResult(
+            status="unknown", error=str(exc.original),
+            next_iteration=exc.next_iteration, completed_updates=exc.completed_updates,
+            target_iterations=exc.target_iterations,
+            exception_type=type(exc.original).__name__, publication_stage=exc.stage,
+        )
+        if context is not None:
+            try:
+                context.metadata.status = result.status
+                write_run_outcome_artifact(context, result)
+                context.emit(RunCompleted(status=result.status, result=result))
+            except Exception as finalization_error:
+                return _handle_run_failure(
+                    finalization_error,
+                    context=context,
+                    runner=runner,
+                    bootstrap=bootstrap,
+                    raise_exceptions=raise_exceptions,
+                    evidence=result,
+                    command=command,
+                    config_path=config_path,
+                )
+        return _status_to_exit_code(result.status)
+    except Exception as exc:
+        return _handle_run_failure(
             exc,
-            phase=phase,
-            traceback_text=traceback_text,
-            run_dir=context.run_dir if context is not None else bootstrap.run_dir,
+            context=context,
+            runner=runner,
+            bootstrap=bootstrap,
+            raise_exceptions=raise_exceptions,
+            evidence=evidence_result,
             command=command,
             config_path=config_path,
         )
-        if raise_exceptions:
-            raise
-        return 1
     finally:
         if context is not None:
             for logger in context.loggers:
                 logger.finish()
+
+
+def _handle_run_failure(
+    exc: Exception,
+    *,
+    context: RunContext | None,
+    runner: Runner | None,
+    bootstrap: _BootstrapState,
+    raise_exceptions: bool,
+    evidence: RunResult | None = None,
+    command: str | None = None,
+    config_path: str | None = None,
+) -> int:
+    """Apply the one guarded failure finalization path for every new handler."""
+
+    phase = _failure_phase(exc, context=context, runner=runner)
+    traceback_text = traceback.format_exc()
+    exception_type = type(exc).__name__
+    exception_message = str(exc)
+    if context is not None:
+        context.metadata.status = "failed"
+        failed = RunResult(
+            status="failed",
+            error=exception_message,
+            checkpoint_ref=None if evidence is None else evidence.checkpoint_ref,
+            next_iteration=None if evidence is None else evidence.next_iteration,
+            completed_updates=None if evidence is None else evidence.completed_updates,
+            target_iterations=None if evidence is None else evidence.target_iterations,
+            exception_type=exception_type,
+            publication_stage=(None if evidence is None else evidence.publication_stage),
+        )
+        try:
+            write_run_outcome_artifact(context, failed)
+        except Exception as outcome_exc:  # pragma: no cover - injected I/O failure
+            logging.getLogger(_BOOTSTRAP_LOGGER_NAME).error(
+                "FATAL: failed to write failed run outcome: %s: %s",
+                type(outcome_exc).__name__, outcome_exc,
+            )
+        _write_error_if_possible(
+            context,
+            exc,
+            phase=phase,
+            traceback_text=traceback_text,
+            command=command,
+            config_path=config_path,
+        )
+        _emit_typed_event_if_possible(
+            context, RunFailed(exception_type=exception_type, exception_message=exception_message)
+        )
+    elif bootstrap.run_dir is not None:
+        _write_error_if_possible(
+            bootstrap.run_dir,
+            exc,
+            phase=phase,
+            traceback_text=traceback_text,
+            command=command,
+            config_path=config_path,
+        )
+    _print_fatal(
+        exc,
+        phase=phase,
+        traceback_text=traceback_text,
+        run_dir=context.run_dir if context is not None else bootstrap.run_dir,
+        command=command,
+        config_path=config_path,
+    )
+    if raise_exceptions:
+        raise exc
+    return 1
 
 
 def _validate_callbacks(callbacks: list[object]) -> None:
@@ -435,10 +704,215 @@ def _validate_loggers(loggers: list[object]) -> None:
             )
 
 
-def _instantiate_sequence(items: ListConfig | list | tuple | None) -> list:
+#: Closed registry of operational output-path fields a destination may rebind.
+#: Keyed by the defining module's qualified class name -- the same shape as
+#: `tpen.checkpoint.hashing._CALLBACK_OUTPUT_FIELDS`, which independently
+#: excludes these same slots from the science-identity hash because they are
+#: operational rather than scientific. Matching is by EXACT qualified type
+#: name only (review-r3 R3.1): a subclass of one of these registered writers
+#: is refused, not silently admitted through its ancestor, because a subclass
+#: can add its own unaudited constructor- or method-side write that this
+#: registry's field list would never see. core-owned writes that instead go
+#: through `RunContext.path`/`ArtifactManager.path` are already physical
+#: because `ArtifactManager.run_dir` itself is bound to the destination.
+_ARTIFACT_SINK_FIELDS: dict[str, tuple[str, ...]] = {
+    "tpen.callback.snapshot.ConfigSnapshot": ("output_path",),
+    "tpen.callback.snapshot.ResolvedConfigSnapshot": ("output_path",),
+    "tpen.callback.metadata.Metadata": ("output_path",),
+    "tpen.callback.status.Status": ("output_path",),
+    "tpen.callback.checkpoint.Checkpoint": ("output_dir",),
+    "tpen.callback.initial_checkpoint.InitialCheckpoint": ("output_dir",),
+    "tpen.callback.evaluation.ArtifactIndex": ("path",),
+    "tpen.callback.evaluation.FailureLog": ("path",),
+    "tpen.callback.parameter_activity.ParameterActivity": ("output_path",),
+    "tpen.callback.equivariance.RuntimeEquivariance": ("artifact_dir",),
+    "tpen.callback.raw_training_batch_recorder.RawTrainingBatchRecorder": ("path",),
+    "tpen.logging.csv.CSV": ("path",),
+    "tpen.logging.jsonl.JSONL": ("path",),
+}
+
+#: Closed registry of callback/logger types known to own NO constructor-side
+#: output path at all (review-r2 B/R2.2). Membership is checked by EXACT
+#: qualified type name, never by MRO: a subclass of one of these might add
+#: its own output attribute, and inferring sink-freedom from the absence of
+#: an attribute is exactly the heuristic this registry replaces. Every
+#: core callback/logger reachable from `experiments/atomistic/he-importance`
+#: or `tests/integration/artifacts/training/vmc_smoke.yaml` that is not a
+#: registered writer above is listed here; anything else is refused.
+_SINK_FREE_TYPES: frozenset[str] = frozenset(
+    {
+        "tpen.callback.amplitude_risk.AmplitudeRiskFraction",
+        "tpen.callback.electron_nucleus_distance.ElectronNucleusDistanceQuantiles",
+        "tpen.callback.factor_scalars.FactorScalars",
+        "tpen.callback.module_norms.ModuleNorms",
+        "tpen.callback.optimizer_state.OptimizerState",
+        "tpen.callback.resource_usage.ResourceUsage",
+        "tpen.callback.health.data_integrity.DataIntegrity",
+        "tpen.callback.health.gradient_stats.GradientStats",
+        "tpen.callback.health.sampler_health.SamplerHealth",
+        "tpen.callback.timing.diagnostic_timing.DiagnosticTiming",
+        "tpen.callback.timing.evaluation_component_timing.EvaluationComponentTiming",
+        "tpen.callback.timing.evaluation_timing.EvaluationTiming",
+        "tpen.callback.timing.run_timing.RunTiming",
+        "tpen.callback.timing.train_phase_timing.TrainPhaseTiming",
+        "tpen.callback.timing.train_step_timing.TrainStepTiming",
+        "tpen.callback.planned_yield.PlannedYield",
+    }
+)
+
+
+def _registered_sink_fields(sink: object) -> tuple[str, ...] | None:
+    """Return the registered output fields for ``sink``'s EXACT type, if any.
+
+    Matched by exact qualified type name only (review-r3 R3.1): no MRO walk,
+    so a subclass of a registered writer is not matched through its ancestor.
+    """
+
+    qualified = f"{type(sink).__module__}.{type(sink).__qualname__}"
+    return _ARTIFACT_SINK_FIELDS.get(qualified)
+
+
+def _class_is_admitted_sink(klass: type) -> bool:
+    """Return whether ``klass`` is an EXACT closed-admission sink type.
+
+    Both the registered-writer registry and the sink-free allowlist are
+    matched by EXACT qualified type name only (review-r3 R3.1): a subclass
+    of either -- which might add its own unaudited constructor- or
+    method-side write this check cannot see -- is refused, not silently
+    admitted through its ancestor.
+    """
+
+    qualified = f"{klass.__module__}.{klass.__qualname__}"
+    return qualified in _ARTIFACT_SINK_FIELDS or qualified in _SINK_FREE_TYPES
+
+
+def _admit_configured_target(target: str) -> None:
+    """Refuse an unregistered configured sink BEFORE it is constructed (B).
+
+    Resolves ``target`` (a configured ``_target_`` dotted path) to its class
+    without instantiating it, and admits it only when
+    :func:`_class_is_admitted_sink` accepts that EXACT class. An unregistered
+    type, or an unregistered subclass of a registered or sink-free type, is
+    refused here -- before construction can write anything to its logical
+    destination.
+    """
+
+    klass = get_class(target)
+    if not _class_is_admitted_sink(klass):
+        raise ArtifactRoutingError(
+            f"{target} is not a registered routed writer or a known sink-free "
+            "type; refusing to admit it to a routed run before construction"
+        )
+
+
+def _admit_runtime_sink(sink: object) -> None:
+    """Refuse an unregistered, already-constructed runtime sink (F3/F4/R3.1).
+
+    Runtime callbacks have no ``_target_`` to resolve ahead of construction,
+    so admission is checked against the sink's EXACT type instead: a
+    registered-writer type or a sink-free type, matched by exact qualified
+    name only, with no MRO/subclass admission and no inference from the
+    presence or absence of an output-path-shaped attribute (review-r3 R3.1
+    rejects both as open sink admission). A genuinely sink-free runtime
+    observer must be an exact member of one of the two closed registries --
+    for example a registered sink-free callback type -- not merely an ad hoc
+    object lacking a path attribute.
+    """
+
+    qualified = f"{type(sink).__module__}.{type(sink).__qualname__}"
+    if qualified in _ARTIFACT_SINK_FIELDS or qualified in _SINK_FREE_TYPES:
+        return
+    raise ArtifactRoutingError(
+        f"{qualified} is not a registered routed writer or a known sink-free "
+        "type; refusing to admit it to a routed run"
+    )
+
+
+def _route_artifact_sinks(
+    sinks: list[object],
+    *,
+    logical_run_dir: Path,
+    destination: ArtifactDestination,
+) -> dict[str, str]:
+    """Rebind every known concrete sink field from the logical leaf to the physical one.
+
+    A field is rebound only when it is currently set to a concrete value
+    falling under ``logical_run_dir`` -- exactly the shape HI's eager
+    ``${run.dir}`` resolution bakes into these constructors before
+    `run_from_config` ever runs. `ArtifactDestination.bind` refuses a value
+    that does not fall under ``logical_run_dir`` (an unsupported or unknown
+    destination) and refuses a mapped path that would not stay under the
+    claimed physical root (an escape).
+
+    CLOSED SINK CONTRACT (F3, closed by construction-side admission per
+    review-r2 B, exact-type only per review-r3 R3.1): by the time a sink
+    reaches here, every configured sink already passed
+    :func:`_admit_configured_target` before it was constructed, and every
+    runtime sink already passed :func:`_admit_runtime_sink`. This function's
+    own check -- a sink whose EXACT type is not in `_ARTIFACT_SINK_FIELDS` is
+    admitted only when it is an exact member of `_SINK_FREE_TYPES` -- is
+    therefore a second, cheap confirmation rather than the admission's first
+    line of defense; it exists so this function stays correct for any direct
+    caller that bypasses those gates (as several unit tests do).
+
+    A field whose registered writer exposes an owner-defined
+    ``rebind_<field>`` method (for example `tpen.logging.csv.CSV.rebind_path`,
+    which also resets destination-dependent header state, F6) is rebound
+    through that method instead of a bare ``setattr``.
+
+    Returns
+    -------
+    dict of str to str
+        ``"<qualified type name>.<field>"`` to the physical path it was
+        rebound to, for every field actually rebound.
+
+    Raises
+    ------
+    tpen.artifacts.ArtifactRoutingError
+        When a sink's exact type is not a registered routed writer and is
+        not a known sink-free type.
+    """
+
+    routed: dict[str, str] = {}
+    for sink in sinks:
+        qualified = f"{type(sink).__module__}.{type(sink).__qualname__}"
+        fields = _registered_sink_fields(sink)
+        if fields is None:
+            if qualified not in _SINK_FREE_TYPES:
+                raise ArtifactRoutingError(
+                    f"{qualified} is not a registered routed writer or a known "
+                    "sink-free type; refusing to admit it to a routed run before "
+                    "it can write outside the claimed physical destination"
+                )
+            continue
+        for field in fields:
+            current = getattr(sink, field, None)
+            if current is None:
+                continue
+            physical = destination.bind(logical_run_dir, Path(current))
+            rebind = getattr(sink, f"rebind_{field}", None)
+            if callable(rebind):
+                rebind(physical)
+            else:
+                setattr(sink, field, physical)
+            routed[f"{qualified}.{field}"] = str(physical)
+    return routed
+
+
+def _instantiate_sequence(items: ListConfig | list | tuple | None, *, routed: bool = False) -> list:
+    """Instantiate each configured ``_target_`` item.
+
+    When ``routed`` is true (B, review-r2), each item's ``_target_`` class is
+    resolved and admission-checked via :func:`_admit_configured_target`
+    BEFORE ``instantiate()`` constructs it -- an unregistered writer never
+    gets to run its constructor, let alone write anything, in a routed run.
+    """
+
     instantiated = []
     for item in items or []:
         if isinstance(item, DictConfig) and "_target_" in item:
+            if routed:
+                _admit_configured_target(str(item["_target_"]))
             instantiated.append(instantiate(item))
         else:
             instantiated.append(item)

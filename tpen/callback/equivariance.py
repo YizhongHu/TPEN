@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, ClassVar
 
-from tpen.artifacts import RunContext, write_json
+from tpen.artifacts import ArtifactRoutingError, RunContext, write_json
 from tpen.events import DomainState
 from tpen.events import Event as TypedEvent
 from tpen.events import Occurrence, Subscription
@@ -118,7 +118,14 @@ class RuntimeEquivariance(StatefulCallback[TrainerState]):
         self.checkers = checkers
         self.fail_fast = bool(fail_fast)
         self.artifact_dir = Path(artifact_dir) if artifact_dir is not None else None
+        self._artifact_routing_bound = False
         self._checker_log_names = _assign_checker_log_names(self.checkers)
+
+    def rebind_artifact_dir(self, artifact_dir: str | Path) -> None:
+        """Bind this callback to an operationally routed artifact destination."""
+
+        self.artifact_dir = Path(artifact_dir)
+        self._artifact_routing_bound = True
 
     def handle_occurrence_impl(
         self,
@@ -155,6 +162,7 @@ class RuntimeEquivariance(StatefulCallback[TrainerState]):
                     checker_name=log_name,
                     step=step,
                     artifact=result.artifact,
+                    enforce_containment=self._artifact_routing_bound,
                 )
                 metrics["artifact_path"] = str(artifact_path)
 
@@ -221,10 +229,30 @@ def _write_equivariance_artifact(
     checker_name: str,
     step: int,
     artifact: Mapping[str, Any],
+    enforce_containment: bool = False,
 ) -> Path:
-    """Write a failure artifact under ``root/<checker_name>/step_<step>/failure.json``."""
+    """Write a failure artifact under ``root/<checker_name>/step_<step>/failure.json``.
+
+    ``checker_name`` is derived from a checker's own, caller-controlled
+    ``name`` attribute (``_checker_base_name``), not from anything this
+    callback validates. In routed mode, an absolute or traversal name would
+    otherwise discard or escape ``root`` through plain ``Path`` joining
+    (review-r3 R3.2), so the resolved path is checked beneath ``root`` before
+    writing. Legacy callers intentionally retain their existing filesystem
+    behavior, including following an existing directory link.
+    """
 
     path = root / checker_name / f"step_{int(step):06d}" / "failure.json"
+    if enforce_containment:
+        resolved_root = root.resolve()
+        resolved_path = path.resolve()
+        try:
+            resolved_path.relative_to(resolved_root)
+        except ValueError as exc:
+            raise ArtifactRoutingError(
+                f"RuntimeEquivariance checker name {checker_name!r} would write "
+                f"to {resolved_path!s}, outside artifact_dir {root!s}; refusing"
+            ) from exc
     write_json(path, dict(artifact))
     return path
 

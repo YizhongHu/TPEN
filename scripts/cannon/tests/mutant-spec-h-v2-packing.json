@@ -1,0 +1,46 @@
+{
+  "mutants": [
+    {
+      "id": "packed-resource-scaling",
+      "target": "experiments/atomistic/h-v2/launch.py",
+      "old": "resources = launch_config.packed_eval_resources(resources, pack_k)",
+      "new": "resources = resources  # mutant: packed resource scaling omitted",
+      "killer": "experiments/atomistic/h-v2/test_eval_fanout_launch.py::test_packed_eval_scales_host_resources_and_passes_pack_k"
+    },
+    {
+      "id": "pack-k-not-forwarded",
+      "target": "experiments/atomistic/h-v2/launch.py",
+      "old": "            science_python=science_python,\n            executor_python=executor_python,\n            pack_k=pack_k,\n",
+      "new": "            science_python=science_python,\n            executor_python=executor_python,\n            pack_k=1,  # mutant: requested packing not forwarded\n",
+      "killer": "experiments/atomistic/h-v2/test_eval_fanout_launch.py::test_packed_eval_scales_host_resources_and_passes_pack_k"
+    },
+    {
+      "id": "packed-identity-gate-removed",
+      "target": "experiments/atomistic/h-v2/eval_job.py",
+      "old": "    if packed.get(\"seed\") != single_stream.get(\"seed\") or packed.get(\"checkpoint\") != single_stream.get(\"checkpoint\"):",
+      "new": "    if False:  # mutant: packed/single identity gate removed",
+      "killer": "experiments/atomistic/h-v2/test_eval_job.py::test_packed_validation_refuses_identity_or_metric_mismatch"
+    },
+    {
+      "id": "packed-metric-gate-removed",
+      "target": "experiments/atomistic/h-v2/eval_job.py",
+      "old": "    if energy_delta > float(tolerance[\"energy_abs\"]) or variance_delta > float(tolerance[\"variance_relative\"]):",
+      "new": "    if False:  # mutant: packed/single metric tolerance gate removed",
+      "killer": "experiments/atomistic/h-v2/test_eval_job.py::test_packed_validation_refuses_identity_or_metric_mismatch"
+    },
+    {
+      "id": "pack-k-dropped-submit-lineage",
+      "target": "experiments/atomistic/h-v2/launch.py",
+      "old": "                commit=expected_commit,\n                resources=launch_config.RESOURCES,\n                pack_k=pack_k,\n",
+      "new": "                commit=expected_commit,\n                resources=launch_config.RESOURCES,\n                pack_k=1,  # mutant: lineage submit drops requested packing\n",
+      "killer": "experiments/atomistic/h-v2/test_eval_fanout_launch.py::test_submit_lineage_forwards_pack_k_on_the_submitted_eval_line"
+    },
+    {
+      "id": "pack-k-dropped-submit-all",
+      "target": "experiments/atomistic/h-v2/launch.py",
+      "old": "            runner=runner,\n            dry_run=dry_run,\n            pack_k=pack_k,\n",
+      "new": "            runner=runner,\n            dry_run=dry_run,\n            pack_k=1,  # mutant: all-lineage submit drops requested packing\n",
+      "killer": "experiments/atomistic/h-v2/test_eval_fanout_launch.py::test_submit_all_forwards_pack_k_on_each_submitted_eval_line"
+    }
+  ]
+}

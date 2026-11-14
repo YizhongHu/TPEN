@@ -30,11 +30,52 @@ class JobResources:
     gpu_model: str = ""
 
 
+def packed_eval_resources(base: JobResources, pack_k: int) -> JobResources:
+    """Scale host-side concurrency resources for a packed EVAL job.
+
+    The GPU request is intentionally unchanged: the measured pilot budget is
+    about 2.3 GB per stream on one GPU.  CPU and host-memory requests scale
+    with the number of independent evaluator subprocesses.
+    """
+
+    if not 1 <= pack_k <= 6:
+        raise ValueError(f"pack_k must be between 1 and 6, got {pack_k}")
+    if pack_k == 1:
+        return base
+    if not base.mem.endswith("G"):
+        raise ValueError(f"cannot scale non-GiB memory request {base.mem!r}")
+    return JobResources(
+        partition=base.partition,
+        constraint=base.constraint,
+        gpus=base.gpus,
+        nodes=base.nodes,
+        ntasks=base.ntasks,
+        cpus_per_task=base.cpus_per_task * pack_k,
+        mem=f"{int(base.mem[:-1]) * pack_k}G",
+        no_requeue=base.no_requeue,
+        gpu_model=base.gpu_model,
+    )
+
+
 #: Approved for both the TRAIN and EVAL job of every lineage (D1): one A100,
 #: one node, 4 CPU cores, 32 GiB host memory.  Only wall time differs by
 #: stage, and that is supplied per submission (T_WALL/E_WALL, section C3),
 #: not carried here.
 RESOURCES = JobResources(
+    partition="seas_gpu,kozinsky_gpu,gpu",
+    constraint="a100",
+    gpus=1,
+    nodes=1,
+    ntasks=1,
+    cpus_per_task=4,
+    mem="32G",
+)
+
+# Pilot payloads retain their historical scheduler request bytes.  The science
+# resource profile above is the single operator-facing partition parameter;
+# pilots intentionally use this separate profile so the science expansion does
+# not alter pilot payloads.
+PILOT_RESOURCES = JobResources(
     partition="seas_gpu,kozinsky_gpu",
     constraint="a100",
     gpus=1,
@@ -108,8 +149,8 @@ APPROVED_GPU_TEST_STRATUM = "NVIDIA A100-SXM4-40GB MIG 3g.20gb"
 #: lineage instead.
 PILOT_PAYLOAD_RESOURCES: dict[str, JobResources] = {
     "gpu-route-g": GPU_TEST_RESOURCES,
-    "capacity-pilot": RESOURCES,
-    "capacity-pilot-100k": RESOURCES,
+    "capacity-pilot": PILOT_RESOURCES,
+    "capacity-pilot-100k": PILOT_RESOURCES,
 }
 PILOT_PAYLOAD_LINEAGES: dict[str, str] = {
     "gpu-route-g": "G",
@@ -149,6 +190,8 @@ __all__ = [
     "PILOT_PAYLOAD_LINEAGES",
     "PILOT_PAYLOAD_MAX_WALL_SECONDS",
     "PILOT_PAYLOAD_RESOURCES",
+    "PILOT_RESOURCES",
     "PILOT_RUN_ROOT_PREFIX_ENV",
     "RESOURCES",
+    "packed_eval_resources",
 ]

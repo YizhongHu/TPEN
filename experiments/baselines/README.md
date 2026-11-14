@@ -307,6 +307,7 @@ experiments/baselines/
   adapters/tpen.py          # wraps tpen.run.run_from_config (the one sanctioned import)
   records.py                # the common (system, code, run) results record (landed)
   collect.py                # scan run roots -> results.jsonl (landed)
+  spread.py                 # across-seed mean, range, sample std and SEM (landed)
   test_records.py           # record schema + collector tests (landed)
   compare.py                # per-system table + E-vs-cost plots
   local_energy/harmonic.py  # make_local_energy for FermiNet-family trap runs
@@ -323,7 +324,29 @@ path and makes the run exit non-zero rather than shrinking the output file.
 ```
 uv run python -m pytest experiments/baselines
 uv run python -m experiments.baselines.collect --run-root <dir> --output results.jsonl
+python -m experiments.baselines.spread --results results.jsonl \
+  --output seed-spread.json --markdown-output seed-spread.md
 ```
+
+### Across-seed spread
+
+`spread.py` groups records by `(system_id, code, ansatz, estimator)`. It counts
+seedless records but excludes them from the statistics, and reports the mean,
+minimum, maximum, range, sample standard deviation (`ddof=1`), and standard
+error of the mean across distinct seeds. Fewer than three seeds are retained
+with an `insufficient_seeds` flag: the program rule for a seed-spread claim is
+at least three independent seeds. Duplicate seeds are rejected loudly rather
+than averaged, and estimator values are never pooled.
+
+Callers must curate a comparable cohort before interpreting a spread. An
+`insufficient_seeds=False` value certifies the seed-count rule only; it does
+not establish matching configuration or provenance. The reported SEM is the
+run-level SEM across seeds, not a within-run blocking error, and it is not
+combined from `energy_stderr_hartree`.
+
+The input may instead be a run root (`--run-root`); it uses the existing
+collector validation and record reader. The JSON output is suitable for later
+comparison tooling, while `--markdown-output` produces a short review table.
 
 Use `python -m pytest` rather than bare `pytest` under `experiments/`: the test
 modules import `experiments.<package>`, which needs the repository root on

@@ -1,0 +1,22 @@
+{
+  "atomic_configuration_id": "e16d9fcab35e27bae5c7a878ce47c39fe4e3727d49a989324547dcb4ceab82bc",
+  "byte_count": 638,
+  "config_hash": "882f976ae737d5e3fe7e40aa6378547304b1286c6b77a78cc2809bc40d192959",
+  "csv_sha256": "05f17a98e0e3d3f668484d1dc59da337d0fee589ede27f3a705f54b8290861ee",
+  "executed_writer_source_sha256": "98b876471e1668a42eb4507580c30a9ef1ad9fe8cef073d59978ea57cb09e94c",
+  "fixture": "he_like_frozen_main",
+  "frozen_commit_writer_source_sha256": "98b876471e1668a42eb4507580c30a9ef1ad9fe8cef073d59978ea57cb09e94c",
+  "frozen_writer_commit": "2630ea7b30dcb23db5df6aae3be1b55c5e7778cd",
+  "generated_at_utc": "2026-11-12T21:06:13.360813+00:00",
+  "generated_by": "tests/integration/artifacts/trajectory_records/generate_v1_fixtures.py",
+  "generating_commit": "57ed8969542807ca955d490849a822ae46d80aa4",
+  "generation_command": "uv run --extra cpu python tests/integration/artifacts/trajectory_records/generate_v1_fixtures.py <output_dir>",
+  "generator_source_sha256": "5a05d7b660a923418b4bd6889706ed9dbc63fddcd7a38347bf833a4c004419a3",
+  "metadata_sha256": "edf80b463a229decec776bb7ab88036e28744654e8f3add9d3da3fe4a57befeb",
+  "n_draws": 2,
+  "n_electrons": 2,
+  "n_walkers": 3,
+  "nuclear_charge": 2.0,
+  "writer_matches_frozen_commit": true,
+  "writer_module_path": "tpen/evaluation/trajectory_records.py"
+}

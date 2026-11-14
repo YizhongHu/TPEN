@@ -59,6 +59,29 @@ def test_no_contract_status_remains_pending_operator_review() -> None:
     assert not pending, f"pending operator-review statuses: {pending}"
 
 
+def test_amplitude_risk_module_is_implemented_science_only_and_ungated() -> None:
+    inputs = load_inputs()
+    module = next(
+        item for item in inputs["logging"]["modules"] if item["name"] == "amplitude_risk_fraction"
+    )
+    cadence = inputs["logging"]["cadence"]["amplitude_risk"]
+    assert module["status"] == "implemented"
+    assert module["kind"] == "training_callback"
+    assert module["scope"] == "science_only"
+    assert module["metrics_namespace"] == "train/amplitude_risk"
+    assert cadence == {
+        "scope": "science_only",
+        "every_n_steps": 100,
+        "start_step": 0,
+        "includes_step_zero": True,
+        "metrics_namespace": "train/amplitude_risk",
+        "pilot": "omitted",
+        "interpretation": "descriptive_only",
+    }
+    risk = inputs["measurement"]["amplitude_risk"]
+    assert risk["interpretation"] == "descriptive only; introduces no alarm and no science gate"
+
+
 def test_zero_event_bound_fits_declared_margins_and_documents_bonferroni_dependence() -> None:
     inputs = load_inputs()
     measurement = inputs["measurement"]["fresh_evaluation"]

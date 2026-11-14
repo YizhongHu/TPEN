@@ -71,6 +71,110 @@ _EventT = TypeVar("_EventT", bound=TypedEvent)
 _OperationT = TypeVar("_OperationT", bound=Operation)
 
 
+class ArtifactRoutingError(RuntimeError):
+    """Raised when an artifact sink cannot be safely routed to a destination.
+
+    Covers a sink path that does not fall under the logical run directory
+    (unknown destination) and a resolved physical path that would not stay
+    under the claimed physical root (escape, including through a symlink).
+    """
+
+
+@dataclass(frozen=True)
+class ArtifactDestination:
+    """A pre-claimed physical location for one allocation's artifact sinks.
+
+    Operational data, supplied by a launcher outside the immutable science
+    configuration: it never changes ``cfg`` or anything derived from it. It
+    exists so that several allocations of the same scientific cell can share
+    one constant, byte-identical resolved config -- including every
+    ``${run.dir}``-derived sink path HI bakes into callback/logger configs
+    before ``run_from_config`` ever runs -- while each allocation's actual
+    bytes land in its own exclusively claimed leaf.
+
+    Parameters
+    ----------
+    physical_root : pathlib.Path
+        The exact, already-claimed physical directory this allocation owns.
+        Must be absolute: a relative root would be ambiguous about which
+        process's working directory it is claimed relative to.
+    """
+
+    physical_root: Path
+
+    def __post_init__(self) -> None:
+        root = Path(self.physical_root)
+        if not root.is_absolute():
+            raise ArtifactRoutingError(
+                f"artifact destination physical_root must be absolute, got {root!s}"
+            )
+        object.__setattr__(self, "physical_root", root)
+
+    def require_fresh(self) -> None:
+        """Refuse a destination that is not a fresh, empty, non-symlinked directory.
+
+        Checked at preparation, before any sink is constructed or any write
+        happens. A pre-existing destination may hold planted links or stale
+        files from a prior occupant -- for example a bootstrap error write
+        following an `error.json` symlink, or a registered writer's default
+        filename (``diagnostics/index.json``, ``FailureLog``'s path) following
+        one planted beneath an already-populated directory (review-r2 R2.1,
+        R2.3). A destination that does not exist yet, or that is a real
+        directory with no entries, cannot hold either, so no per-writer
+        patching is required: this one check at the root closes both.
+        """
+
+        root = self.physical_root
+        if not root.exists():
+            return
+        if root.is_symlink():
+            raise ArtifactRoutingError(
+                f"artifact destination {root!s} is a symlink; refusing a routed "
+                "run against a destination that is not a real directory"
+            )
+        if not root.is_dir():
+            raise ArtifactRoutingError(
+                f"artifact destination {root!s} exists and is not a directory; "
+                "refusing to route a run beneath it"
+            )
+        try:
+            next(root.iterdir())
+        except StopIteration:
+            return
+        raise ArtifactRoutingError(
+            f"artifact destination {root!s} already exists and is not empty; "
+            "refusing a routed run against a non-fresh destination"
+        )
+
+    def bind(self, logical_root: Path, path: Path) -> Path:
+        """Map one logical sink path under ``logical_root`` to its physical path.
+
+        Refuses, rather than guesses, when ``path`` does not resolve beneath
+        ``logical_root`` (an unsupported or unknown destination) or when the
+        mapped physical path would not resolve beneath ``physical_root`` (an
+        escape, including one hidden behind a symlink).
+        """
+
+        resolved_logical_root = Path(logical_root).resolve()
+        resolved_path = Path(path).resolve()
+        try:
+            relative = resolved_path.relative_to(resolved_logical_root)
+        except ValueError as exc:
+            raise ArtifactRoutingError(
+                f"artifact sink path {path!s} does not fall under the logical "
+                f"run directory {logical_root!s}; refusing an unknown destination"
+            ) from exc
+        physical = (self.physical_root / relative).resolve()
+        try:
+            physical.relative_to(self.physical_root.resolve())
+        except ValueError as exc:
+            raise ArtifactRoutingError(
+                f"artifact sink path {path!s} would resolve to {physical!s}, "
+                f"outside the claimed physical destination {self.physical_root!s}"
+            ) from exc
+        return self.physical_root / relative
+
+
 class ArtifactManager:
     """Own the standard artifact layout for one run.
 
@@ -88,6 +192,22 @@ class ArtifactManager:
     layout : {"nested", "flat"}
         Directory layout. ``nested`` writes
         ``root/experiment/sector/run_id``; ``flat`` writes ``root/run_id``.
+    destination : ArtifactDestination or None, optional
+        When supplied, every path this manager returns is physically routed
+        beneath ``destination.physical_root`` instead of the logical
+        ``root/experiment/sector/run_id`` tree, while :attr:`logical_run_dir`
+        still reports the untouched logical path for science-identity
+        purposes. ``None`` (the default) preserves the plain logical layout.
+    logical_run_dir : pathlib.Path or None, optional
+        Override for :attr:`logical_run_dir`, used only in routed mode. HI
+        eagerly resolves ``${run.dir}`` into every sink before this manager
+        is ever constructed; recomputing ``root/experiment/sector/run_id``
+        from scratch can disagree with that already-admitted value (for
+        example a ``flat`` layout with an intermediate path segment). When
+        supplied, this exact path is used as the logical directory instead
+        of the computed one, so the destination binds against the value
+        every eagerly-resolved sink already carries. ``None`` (the default)
+        preserves the computed logical path.
     """
 
     def __init__(
@@ -98,6 +218,8 @@ class ArtifactManager:
         run_id: str,
         *,
         layout: str = "nested",
+        destination: ArtifactDestination | None = None,
+        logical_run_dir: Path | None = None,
     ) -> None:
         root_path = Path(root)
         self.root = root_path if root_path.is_absolute() else ROOT / root_path
@@ -107,14 +229,42 @@ class ArtifactManager:
         self.layout = str(layout)
         if self.layout not in {"nested", "flat"}:
             raise ValueError(f"unsupported artifact layout {self.layout!r}; expected 'nested' or 'flat'")
+        self.destination = destination
+        self._logical_run_dir_override = (
+            None if logical_run_dir is None else Path(logical_run_dir)
+        )
 
     @property
-    def run_dir(self) -> Path:
-        """Return the run directory path."""
+    def logical_run_dir(self) -> Path:
+        """Return the logical run directory path, ignoring any destination.
 
+        This is the path every allocation of one scientific cell computes
+        identically from ``root``/``experiment``/``sector``/``run_id`` -- the
+        value recorded in the resolved science config and the one every
+        ``${run.dir}``-derived sink was already baked against before
+        ``run_from_config`` runs. When this manager was constructed with an
+        explicit ``logical_run_dir`` override, that admitted value is
+        returned unchanged instead of being recomputed.
+        """
+
+        if self._logical_run_dir_override is not None:
+            return self._logical_run_dir_override
         if self.layout == "flat":
             return self.root / self.run_id
         return self.root / self.experiment / self.sector / self.run_id
+
+    @property
+    def run_dir(self) -> Path:
+        """Return the physical run directory path actual sinks write beneath.
+
+        Identical to :attr:`logical_run_dir` when no destination is bound;
+        otherwise the claimed physical leaf the destination maps it to.
+        """
+
+        logical = self.logical_run_dir
+        if self.destination is None:
+            return logical
+        return self.destination.bind(logical, logical)
 
     def make_dirs(self) -> None:
         """Create the run directory and standard child directories."""
@@ -124,9 +274,30 @@ class ArtifactManager:
             self.path(name).mkdir(parents=True, exist_ok=True)
 
     def path(self, *parts: str) -> Path:
-        """Return a path under this run directory."""
+        """Return a path under this run directory.
 
-        return self.run_dir.joinpath(*parts)
+        When a destination is bound, the full joined path -- not only the
+        run-directory root -- is checked to resolve beneath the claimed
+        physical root, including through a symlink planted inside the
+        destination. Every manager-owned write (run-start, snapshot,
+        occurrence/event, failure, and profile artifacts) goes through this
+        method or :attr:`run_dir`, so this is the one choke point that keeps
+        all of them from escaping through a child path the root-only bind
+        in :attr:`run_dir` does not see.
+        """
+
+        candidate = self.run_dir.joinpath(*parts)
+        if self.destination is not None:
+            resolved = candidate.resolve()
+            physical_root = self.destination.physical_root.resolve()
+            try:
+                resolved.relative_to(physical_root)
+            except ValueError as exc:
+                raise ArtifactRoutingError(
+                    f"artifact path {candidate!s} would resolve to {resolved!s}, "
+                    f"outside the claimed physical destination {physical_root!s}"
+                ) from exc
+        return candidate
 
 
 @dataclass
@@ -165,6 +336,27 @@ class RunResult:
     status: str
     run_dir: Path | None = None
     error: str | None = None
+    checkpoint_ref: Any | None = None
+    next_iteration: int | None = None
+    completed_updates: int | None = None
+    target_iterations: int | None = None
+    exception_type: str | None = None
+    publication_stage: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the JSON-safe public run outcome."""
+        ref = self.checkpoint_ref
+        return {
+            "status": self.status,
+            "run_dir": None if self.run_dir is None else str(self.run_dir),
+            "error": self.error,
+            "checkpoint_ref": None if ref is None else ref.to_dict(),
+            "next_iteration": self.next_iteration,
+            "completed_updates": self.completed_updates,
+            "target_iterations": self.target_iterations,
+            "exception_type": self.exception_type,
+            "publication_stage": self.publication_stage,
+        }
 
 
 @dataclass(frozen=True)
@@ -852,11 +1044,16 @@ def write_error_artifact(
         run_id = target.metadata.run_id
         command = target.metadata.command if command is None else command
         config_path = target.metadata.config_path if config_path is None else config_path
+        # Route through the manager, not a bare join: a bound destination's
+        # full-path containment check (see `ArtifactManager.path`) must cover
+        # this failure artifact exactly as it covers every other
+        # manager-owned write.
+        path = target.path("error.json")
     else:
         run_dir = Path(target)
         now = datetime.now(UTC).isoformat()
         run_id = None
-    path = run_dir / "error.json"
+        path = run_dir / "error.json"
     write_json(
         path,
         {
@@ -872,6 +1069,13 @@ def write_error_artifact(
             "traceback": traceback_text,
         },
     )
+    return path
+
+
+def write_run_outcome_artifact(context: RunContext, result: RunResult) -> Path:
+    """Persist the typed public outcome through the active artifact manager."""
+    path = context.path("run-outcome.json")
+    write_json(path, result.to_dict())
     return path
 
 
@@ -925,6 +1129,41 @@ def write_run_start_artifact(context: RunContext) -> None:
         "start_time_unix": context.now().timestamp(),
     }
     write_json(context.path("run_start.json"), data)
+
+
+def write_artifact_routing_receipt(
+    context: RunContext,
+    *,
+    destination: ArtifactDestination,
+    logical_run_dir: Path,
+    routed: Mapping[str, str],
+) -> None:
+    """Record the physical destinations this run's sinks were routed to.
+
+    The resolved science config and its snapshot keep the fixed logical
+    ``run.dir`` C shares across every allocation; this separate artifact is
+    where the actual physical execution plan lives, so the identical science
+    snapshot is never misrepresented as a complete physical record of where
+    bytes landed.
+
+    Parameters
+    ----------
+    routed : mapping of str to str
+        ``"<qualified type name>.<field>"`` to the physical path it was
+        rebound to, for every sink this run actually rebound.
+    """
+
+    write_json(
+        context.path("artifact_routing.json"),
+        {
+            "logical_run_dir": str(logical_run_dir),
+            "physical_run_dir": str(context.run_dir),
+            "destination_physical_root": str(destination.physical_root),
+            "routed_sinks": dict(routed),
+            "run_id": context.metadata.run_id,
+            "time": context.now_iso(),
+        },
+    )
 
 
 def _jsonable(value: Any) -> Any:
@@ -1194,7 +1433,9 @@ def _collect_allowed_environment() -> dict[str, str]:
 
 
 __all__ = [
+    "ArtifactDestination",
     "ArtifactManager",
+    "ArtifactRoutingError",
     "DEFAULT_RUN_TIMEZONE",
     "MULTIPLICITY_ANNOUNCEMENT_KEYS",
     "REQUIRED_RUN_DIRS",
@@ -1211,7 +1452,9 @@ __all__ = [
     "resolve_run_clock",
     "resolve_run_id",
     "write_json",
+    "write_artifact_routing_receipt",
     "write_error_artifact",
+    "write_run_outcome_artifact",
     "write_occurrence_artifact",
     "write_typed_event_artifact",
     "write_run_start_artifact",

@@ -32,6 +32,14 @@ def __getattr__(name: str) -> object:
         from .checkpoint import Checkpoint
 
         return Checkpoint
+    if name == "PlannedYield":
+        from .planned_yield import PlannedYield
+
+        return PlannedYield
+    if name == "PlannedYieldSignal":
+        from .planned_yield import PlannedYieldSignal
+
+        return PlannedYieldSignal
     if name == "InitialCheckpoint":
         from .initial_checkpoint import InitialCheckpoint
 
@@ -121,6 +129,8 @@ __all__ = [
     "CadenceGate",
     "Callback",
     "Checkpoint",
+    "PlannedYield",
+    "PlannedYieldSignal",
     "ConfigSnapshot",
     "DataIntegrity",
     "DiagnosticTiming",

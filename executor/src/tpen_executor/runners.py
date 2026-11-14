@@ -312,6 +312,8 @@ class TPENEvidence:
         stdout_path: str | os.PathLike[str],
         stderr_path: str | os.PathLike[str],
         timeout: float | None = None,
+        cancel_path: str | os.PathLike[str] | None = None,
+        cancel_identity: Mapping[str, str] | None = None,
     ) -> CoreRunEvidence:
         """Launch inspection and decode exactly one JSON object.
 
@@ -362,6 +364,8 @@ class TPENEvidence:
                 stderr_path=stderr_path,
                 timeout=timeout,
                 purpose=LaunchPurpose.INSPECTION,
+                cancel_path=cancel_path,
+                cancel_identity=cancel_identity,
             )
         except OSError as exc:
             raise EvidenceUnavailable("inspection process could not be launched") from exc

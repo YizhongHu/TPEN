@@ -23,7 +23,7 @@ never left to whatever the submitting shell happened to export):
     Absolute executor environment Python (``cd executor && uv sync --locked``,
     separate from the science environment).
 
-NOT YET COMPLETE. Section C2 schedules 27 checkpoints x 4 streams (108
+NOT YET COMPLETE. Section C2 schedules the contract checkpoint roster x 4 streams
 evaluations) per lineage EVAL job, run one after another inside the same
 allocation. This script invokes exactly one EVAL generation (stream 0
 against the lineage's single recorded TRAIN checkpoint): ``attached.py``'s
@@ -47,6 +47,8 @@ import json
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -314,6 +316,7 @@ def run_eval_fanout(
     expected_train_commit: str,
     lineage_index: int | None = None,
     pilot_stage: str | None = None,
+    pack_k: int = 1,
 ) -> None:
     """Dispatch one EVAL fan-out job (item E, acceptance-contract 8a5e926f).
 
@@ -337,6 +340,8 @@ def run_eval_fanout(
 
     if payload not in _EVAL_FANOUT_PAYLOADS:
         raise JobError(f"eval fan-out payload must be one of {_EVAL_FANOUT_PAYLOADS!r}, got {payload!r}")
+    if not 1 <= pack_k <= 6:
+        raise JobError(f"--pack-k must be between 1 and 6, got {pack_k}")
 
     selection_record: dict | None = None
     if payload == "science":
@@ -398,7 +403,9 @@ def run_eval_fanout(
     receipt_path = _eval_receipt_path(run_root, task_label)
     records: list[dict] = []
     checkpoint_snapshot_root = run_root / "attached" / "checkpoint-snapshots" / task_label
-    for generation in generations:
+    receipt_lock = Lock()
+
+    def complete_generation(generation: dict) -> dict:
         gen_task_id = f"{task_label}-ck{generation['update']:06d}-s{generation['stream']}"
         # F2: core loads from a job-local verified snapshot of the
         # inventoried checkpoint bytes, never the original (shared,
@@ -421,32 +428,56 @@ def run_eval_fanout(
             expected_source_commit=expected_commit,
             cwd=run_root / "checkout",
         )
-        records.append(
-            eval_job.generation_record(
-                ordinal=generation["ordinal"],
-                update=generation["update"],
-                stream=generation["stream"],
-                seed=generation["seed"],
-                task_id=gen_task_id,
-                run_result=run_result,
-                checkpoint_files=checkpoint_entry.get("files"),
+        return eval_job.generation_record(
+            ordinal=generation["ordinal"],
+            update=generation["update"],
+            stream=generation["stream"],
+            seed=generation["seed"],
+            task_id=gen_task_id,
+            run_result=run_result,
+            checkpoint_files=checkpoint_entry.get("files"),
+        )
+
+    def publish(record: dict) -> None:
+        """Append one completed generation and atomically publish its receipt."""
+
+        with receipt_lock:
+            records.append(record)
+            # E3/K2: serialize append-on-completion so concurrent workers
+            # cannot lose a sibling's receipt entry. The writer uses an
+            # atomic replace, so readers never see a partial receipt.
+            eval_job.write_eval_receipt(
+                receipt_path,
+                eval_commit=expected_commit,
+                train_commit=expected_train_commit,
+                train_receipt_path=train_receipt_path,
+                train_receipt_sha256=train_receipt_sha256,
+                payload=payload,
+                generations=records,
+                readout_generator_enabled=readout_available,
+                selection=selection_record,
             )
-        )
-        # E3: written on every generation's completion, so a wall-killed job
-        # leaves every already-completed generation's output sha256s
-        # verifiable even though the job still exits non-zero overall if it
-        # does not finish the whole schedule.
-        eval_job.write_eval_receipt(
-            receipt_path,
-            eval_commit=expected_commit,
-            train_commit=expected_train_commit,
-            train_receipt_path=train_receipt_path,
-            train_receipt_sha256=train_receipt_sha256,
-            payload=payload,
-            generations=records,
-            readout_generator_enabled=readout_available,
-            selection=selection_record,
-        )
+
+    failures: list[BaseException] = []
+    if pack_k == 1:
+        # Packing-off behavior remains the original sequential route.
+        for generation in generations:
+            publish(complete_generation(generation))
+    else:
+        # Workers only coordinate independent run_from_config subprocesses;
+        # no model, RNG, checkpoint, or output directory is shared.
+        with ThreadPoolExecutor(max_workers=min(pack_k, len(generations))) as pool:
+            futures = {pool.submit(complete_generation, generation): generation for generation in generations}
+            for future in as_completed(futures):
+                try:
+                    publish(future.result())
+                except BaseException as error:  # noqa: BLE001 - isolate siblings, fail aggregate job
+                    failures.append(error)
+        if failures:
+            raise JobError(
+                f"packed eval had {len(failures)} failed generation(s); "
+                f"{len(records)} completed generations remain in {receipt_path}: {failures[0]}"
+            )
     print(f"[h-v2] {task_label}: {len(records)} generation(s) accepted (readout_generator={readout_available})")
 
 
@@ -662,7 +693,7 @@ def run(
         probe_path.parent.mkdir(parents=True, exist_ok=True)
         enabled_modules, skipped_not_admitted = attached.probe_admitted_a1_modules(
             config,
-            protocol.candidate_modules_to_append(),
+            protocol.candidate_modules_to_append(include_amplitude_risk=False),
             science_python=science_python,
             probe_config_path=probe_path,
             cwd=run_root / "checkout",
@@ -817,6 +848,7 @@ def _main_eval_fanout(argv: list[str]) -> int:
     parser.add_argument("lineage", nargs="?", default=None, help="Required, science only.")
     parser.add_argument("--expected-train-commit", required=True)
     parser.add_argument("--pilot-stage", choices=("1", "2", "2-core"), default=None)
+    parser.add_argument("--pack-k", type=int, default=1, help="Run up to six eval generations concurrently (default: 1).")
     args = parser.parse_args(argv)
 
     if args.payload == "science":
@@ -849,6 +881,7 @@ def _main_eval_fanout(argv: list[str]) -> int:
             lineage=lineage,
             expected_train_commit=args.expected_train_commit,
             pilot_stage=args.pilot_stage,
+            pack_k=args.pack_k,
         )
     except Exception as error:  # noqa: BLE001 - this is the job's own top-level boundary
         print(f"[h-v2] job failed: {error}", file=sys.stderr)

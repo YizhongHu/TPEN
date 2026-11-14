@@ -104,10 +104,11 @@ def test_all_seed_namespaces_and_evaluation_seeds_are_globally_distinct() -> Non
     explicit_seed_values = _integer_seeds(own_assignments)
     explicit_seeds = set(explicit_seed_values)
     evaluation_seeds = _evaluation_seeds(inputs)
-    assert len(evaluation_seeds) == 324
+    expected_evaluation_count = 3 * len(inputs["measurement"]["evaluated_checkpoints"]["updates"]) * 4
+    assert len(evaluation_seeds) == expected_evaluation_count
     assert len(explicit_seed_values) == len(explicit_seeds)
     assert explicit_seeds.isdisjoint(evaluation_seeds)
-    assert len(explicit_seeds | evaluation_seeds) == len(explicit_seeds) + 324
+    assert len(explicit_seeds | evaluation_seeds) == len(explicit_seeds) + expected_evaluation_count
     assert inputs["decision_rules"]["categories"] == [
         "recurrence",
         "bounded_null",
@@ -139,8 +140,11 @@ def test_all_eight_lane_proposals_are_visible() -> None:
 
 def test_retention_and_evaluation_sets_are_distinct() -> None:
     measurement = load_inputs()["measurement"]
-    assert measurement["checkpoint_retention"]["count_per_lineage"] == 51
-    assert measurement["evaluated_checkpoints"]["count_per_lineage"] == 27
+    assert measurement["checkpoint_retention"]["count_per_lineage"] == 101
+    assert measurement["evaluated_checkpoints"]["count_per_lineage"] == 37
+    assert measurement["evaluated_checkpoints"]["updates"] == list(range(0, 20001, 1000)) + list(
+        range(25000, 100001, 5000)
+    )
     assert measurement["checkpoint_retention"]["updates"].startswith(
         "0 and every 1000"
     )
@@ -198,8 +202,8 @@ def test_checkpoint_retention_and_evaluation_counts_are_decided() -> None:
     evaluated = measurement["evaluated_checkpoints"]
     assert retention["status"] == "decided"
     assert evaluated["status"] == "decided"
-    assert retention["count_per_lineage"] == 51
-    assert evaluated["count_per_lineage"] == 27
+    assert retention["count_per_lineage"] == len(range(0, 100001, 1000))
+    assert evaluated["count_per_lineage"] == len(evaluated["updates"])
     assert "operator" in retention["decided_by"].lower()
     assert "operator" in evaluated["decided_by"].lower()
 
@@ -240,7 +244,9 @@ def test_logging_is_an_optional_module_not_an_always_on_core_metric() -> None:
     assert "amplitude_risk_fraction" in module_names
     assert "raw_training_batch_recorder" in module_names
     held = [m for m in logging_block["modules"] if m["name"] == "amplitude_risk_fraction"]
-    assert held[0]["status"] == "thresholds_frozen_implementation_pending"
+    assert held[0]["status"] == "implemented"
+    assert held[0]["scope"] == "science_only"
+    assert held[0]["metrics_namespace"] == "train/amplitude_risk"
     kinds = {"training_callback", "evaluation_generator", "one_shot_callback"}
     assert all(module["kind"] in kinds for module in logging_block["modules"])
 
@@ -268,8 +274,8 @@ def test_storage_row_counts_match_their_declared_formulas() -> None:
     scale = figures["scale"]
     fresh = figures["fresh_evaluation"]
     raw = figures["raw_training_batches"]
-    assert fresh["rows"] == 3 * 27 * 4 * scale["training_walkers"] * 256
-    assert raw["batches_per_lineage"] == 1001
+    assert fresh["rows"] == 3 * len(load_inputs()["measurement"]["evaluated_checkpoints"]["updates"]) * 4 * scale["training_walkers"] * 256
+    assert raw["batches_per_lineage"] == 2001
     assert raw["rows"] == scale["lineages"] * raw["batches_per_lineage"] * scale["training_walkers"]
     assert fresh["compact_gib"] == pytest.approx(
         fresh["rows"] * fresh["bytes_per_row_compact"] / 2**30, rel=0.01
@@ -281,7 +287,7 @@ def test_storage_row_counts_match_their_declared_formulas() -> None:
     full_partitions, remainder = divmod(raw["batches_per_lineage"], 20)
     assert raw["partitions_per_lineage"] == full_partitions + (1 if remainder else 0)
     assert raw["data_objects_total"] == scale["lineages"] * raw["partitions_per_lineage"]
-    assert raw["data_objects_total"] == 153
+    assert raw["data_objects_total"] == 303
     assert cadence["partition_size_steps"] == 1000
     assert figures["compression_ratio"] == (
         "unmeasured; a pilot block must measure it before a Holystore budget promises it"

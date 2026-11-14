@@ -10,6 +10,7 @@ does not otherwise consume the global CPU stream during its training loop.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -135,6 +136,26 @@ class NativeTrace:
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _trace_refusal(path: Path) -> dict[str, str] | None:
+    """Read a typed restore refusal recorded in a worker trace, if any."""
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload.get("refusal")
+
+
+def _snapshot_leaf(root: Path) -> dict[Path, tuple[str, int]]:
+    """Snapshot every file under a predecessor leaf."""
+
+    return {
+        path.relative_to(root): (
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+            path.stat().st_mtime_ns,
+        )
+        for path in root.rglob("*")
+        if path.is_file()
+    }
 
 
 def install_native_trace(trace: NativeTrace) -> ExitStack:
@@ -289,6 +310,8 @@ def skip_restore_owner(owner: str | None) -> Iterator[None]:
 
 __all__ = [
     "NativeTrace",
+    "_snapshot_leaf",
+    "_trace_refusal",
     "install_native_trace",
     "skip_restore_owner",
     "skip_restore_owners",

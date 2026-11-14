@@ -1000,7 +1000,7 @@ class SlotLease:
         no quarantine directory (a direct worker use outside a dispatcher).
     """
 
-    __slots__ = ("slot", "marker", "sampler", "settled", "child_unknown")
+    __slots__ = ("slot", "marker", "sampler", "settled", "child_unknown", "science_unconfirmed")
 
     def __init__(self, slot: str, marker: str | None) -> None:
         self.slot = slot
@@ -1010,6 +1010,11 @@ class SlotLease:
         self.settled = False
         # True when the spawn was interrupted and a child may exist unowned.
         self.child_unknown = False
+        # True until the owner reports an OBSERVED, bounded confirmation
+        # that the science process group (distinct from the sampler's own
+        # command group) is empty (review B2).  A sampler whose own
+        # commands are clean never releases the marker while this is true.
+        self.science_unconfirmed = True
 
     def outstanding(self) -> str:
         """Describe why this lease still holds its slot."""
@@ -1018,6 +1023,8 @@ class SlotLease:
             return "a sampled launch on this slot is still owned by its worker"
         if self.child_unknown:
             return "an interrupted spawn may have left an unowned child"
+        if self.science_unconfirmed:
+            return "the science process group is not confirmed quiescent"
         if self.sampler is not None and not self.sampler.cleanup_confirmed():
             return self.sampler.outstanding()
         return f"its durable quarantine marker {self.marker!r} could not be removed"
@@ -1112,7 +1119,7 @@ def _release_locked(lease: SlotLease) -> bool:
     confirmed gone.  A marker that cannot be removed keeps the lease.
     """
 
-    if not lease.settled or lease.child_unknown:
+    if not lease.settled or lease.child_unknown or lease.science_unconfirmed:
         return False
     if lease.sampler is not None and not lease.sampler.cleanup_confirmed():
         return False
@@ -1214,7 +1221,9 @@ def acquire_slot_lease(slot: str, quarantine_dir: str | None, identity: Mapping[
     return lease
 
 
-def settle_slot_lease(lease: SlotLease | None, sampler: GpuSampler | None, *, child_known: bool = True) -> None:
+def settle_slot_lease(
+    lease: SlotLease | None, sampler: GpuSampler | None, *, child_known: bool = True, group_reaped: bool = False,
+) -> None:
     """Record that the owner is done with its launch and release it if clean.
 
     Parameters
@@ -1226,6 +1235,12 @@ def settle_slot_lease(lease: SlotLease | None, sampler: GpuSampler | None, *, ch
     child_known : bool, default=True
         False when the spawn was interrupted and a child may exist without
         an owner; such a lease is never released by this process.
+    group_reaped : bool, default=False
+        The caller's own OBSERVED, bounded confirmation that the science
+        process group is empty (review B2).  Defaults to the conservative
+        "not confirmed" so a caller that forgets to pass it never releases
+        the marker; every real call site in :mod:`tpen_executor.workers`
+        passes an explicit value.
     """
 
     if lease is None:
@@ -1233,6 +1248,7 @@ def settle_slot_lease(lease: SlotLease | None, sampler: GpuSampler | None, *, ch
     with _FENCE_LOCK:
         lease.sampler = sampler
         lease.child_unknown = not child_known
+        lease.science_unconfirmed = not group_reaped
         lease.settled = True
         # Bounded is not clean: stop any further launch of an unconfirmed sampler.
         if sampler is not None and not sampler.cleanup_confirmed():
@@ -1245,7 +1261,9 @@ def settle_slot_lease(lease: SlotLease | None, sampler: GpuSampler | None, *, ch
                 _FENCED.pop(lease.slot, None)
 
 
-def finish_gpu_sampler(sampler: GpuSampler | None, path: str | None, lease: SlotLease | None = None) -> list[BaseException]:
+def finish_gpu_sampler(
+    sampler: GpuSampler | None, path: str | None, lease: SlotLease | None = None, *, group_reaped: bool = False,
+) -> list[BaseException]:
     """Finish the sampler, confirm its groups, publish the record, and settle the lease.
 
     The worker calls this after reaping the science child on every path.  An
@@ -1254,7 +1272,9 @@ def finish_gpu_sampler(sampler: GpuSampler | None, path: str | None, lease: Slot
     abandon command-group cleanup.  The slot was quarantined by ``lease``
     before the child was spawned; the lease is settled on every exit,
     including an interruption of the evidence publication, and is released
-    only if cleanup is confirmed.
+    only if cleanup is confirmed AND ``group_reaped`` is true (review B2):
+    the sampler's own command cleanup says nothing about whether the
+    science child's own process group is empty.
 
     Parameters
     ----------
@@ -1264,6 +1284,12 @@ def finish_gpu_sampler(sampler: GpuSampler | None, path: str | None, lease: Slot
         Evidence path owned by this worker.
     lease : SlotLease or None, default=None
         Slot lease acquired before spawn.
+    group_reaped : bool, default=False
+        The caller's own observed, bounded confirmation that the science
+        process group is empty.  Defaults to "not confirmed"; the caller in
+        :mod:`tpen_executor.workers` always passes an explicit value,
+        computed BEFORE this call so the marker is never released ahead of
+        that confirmation.
 
     Returns
     -------
@@ -1293,7 +1319,7 @@ def finish_gpu_sampler(sampler: GpuSampler | None, path: str | None, lease: Slot
     finally:
         # Publication may fail or be interrupted; the slot stays quarantined
         # until cleanup is confirmed either way (review delta-3 F2).
-        settle_slot_lease(lease, sampler)
+        settle_slot_lease(lease, sampler, group_reaped=group_reaped)
     return interruptions
 
 

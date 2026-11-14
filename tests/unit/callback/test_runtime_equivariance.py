@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from tpen.artifacts import ArtifactRoutingError
 from tpen.callback import RuntimeEquivariance
 from tpen.equivariance.checks import EquivarianceCheckResult
 from tests.unit.callback.support import (
@@ -107,6 +108,106 @@ def test_writes_artifact_and_adds_artifact_path_metric(tmp_path: Path) -> None:
     assert artifact_path == tmp_path / "fake_failing" / "step_000012" / "failure.json"
     assert artifact_path.exists()
     assert json.loads(artifact_path.read_text())["checker_class"] == "FakeFailingChecker"
+
+
+class FakeFailingCheckerWithName(FakeFailingChecker):
+    """A failing checker with an explicit, caller-controlled ``name``.
+
+    ``_checker_base_name`` reads this verbatim, so it stands in for a
+    checker whose registered owner cannot validate what the checker chose
+    to call itself (review-r3 R3.2)."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.name = name
+
+
+def test_r3_2_an_absolute_checker_name_is_refused_and_predecessor_evidence_is_untouched(
+    tmp_path: Path,
+) -> None:
+    """(R3.2) regression: an absolute checker ``name`` would otherwise
+    discard ``artifact_dir`` entirely under plain ``Path`` joining
+    (``root / "/absolute/predecessor/checks"`` resolves to the absolute
+    path alone), letting a registered callback overwrite a predecessor file
+    outside its claimed destination. The derived path is checked to resolve
+    beneath ``artifact_dir`` before any write, refusing this instead."""
+
+    root = tmp_path / "artifact_root"
+    root.mkdir()
+    predecessor_dir = tmp_path / "predecessor"
+    predecessor_file = predecessor_dir / "checks" / "step_000012" / "failure.json"
+    predecessor_file.parent.mkdir(parents=True)
+    predecessor_file.write_text('{"predecessor": true}')
+
+    checker = FakeFailingCheckerWithName(name=str(predecessor_dir / "checks"))
+    callback = RuntimeEquivariance(checkers=[checker], fail_fast=False, artifact_dir=root)
+    callback.rebind_artifact_dir(root)
+
+    with pytest.raises(ArtifactRoutingError):
+        _handle(callback, RecordingContext(), step=12)
+
+    assert predecessor_file.read_text() == '{"predecessor": true}'
+    assert list(root.rglob("*")) == []
+
+
+def test_r3_2_a_traversal_checker_name_is_refused(tmp_path: Path) -> None:
+    """(R3.2) regression: a ``..``-bearing checker name also escapes
+    ``artifact_dir`` through plain ``Path`` joining; refused the same way."""
+
+    root = tmp_path / "artifact_root"
+    root.mkdir()
+    checker = FakeFailingCheckerWithName(name="../escape")
+    callback = RuntimeEquivariance(checkers=[checker], fail_fast=False, artifact_dir=root)
+    callback.rebind_artifact_dir(root)
+
+    with pytest.raises(ArtifactRoutingError):
+        _handle(callback, RecordingContext(), step=12)
+
+    assert list(root.rglob("*")) == []
+
+
+def test_r3_2_a_normal_checker_name_still_publishes(tmp_path: Path) -> None:
+    """(R3.2) negative: an ordinary checker name is unaffected -- the
+    containment check is a floor, not a new restriction on legitimate
+    names."""
+
+    root = tmp_path / "artifact_root"
+    checker = FakeFailingCheckerWithName(name="custom_checker")
+    callback = RuntimeEquivariance(checkers=[checker], fail_fast=False, artifact_dir=root)
+
+    _handle(callback, RecordingContext(), step=12)
+
+    artifact_path = root / "custom_checker" / "step_000012" / "failure.json"
+    assert artifact_path.exists()
+    assert json.loads(artifact_path.read_text())["checker_class"] == "FakeFailingChecker"
+
+
+def test_legacy_no_destination_follows_checker_directory_symlink(tmp_path: Path) -> None:
+    """Legacy callbacks retain their existing directory-layout semantics."""
+
+    root = tmp_path / "artifact_root"
+    root.mkdir()
+    external = tmp_path / "external_storage" / "custom_checker"
+    external.mkdir(parents=True)
+    (root / "custom_checker").symlink_to(external, target_is_directory=True)
+    context = RecordingContext()
+    callback = RuntimeEquivariance(
+        checkers=[FakeFailingCheckerWithName(name="custom_checker")],
+        fail_fast=False,
+        artifact_dir=root,
+    )
+
+    _handle(callback, context, step=12)
+
+    metrics = context.latest("checks/equivariance/custom_checker")
+    artifact_path = Path(metrics["artifact_path"])
+    assert artifact_path == root / "custom_checker" / "step_000012" / "failure.json"
+    assert (external / "step_000012" / "failure.json").exists()
+    assert (
+        json.loads((external / "step_000012" / "failure.json").read_text())["checker_class"]
+        == "FakeFailingChecker"
+    )
+    assert metrics["passed"] is False
 
 
 def test_no_artifact_written_without_artifact_dir() -> None:

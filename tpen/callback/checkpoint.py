@@ -25,6 +25,7 @@ from tpen.checkpoint import (
 )
 from tpen.checkpoint.artifact import is_complete_checkpoint_dir
 from tpen.checkpoint.schema import read_manifest
+from tpen.checkpoint.reference import CheckpointRef
 from tpen.events import DomainState
 from tpen.events import Event as TypedEvent
 from tpen.events import Occurrence, Subscription
@@ -39,6 +40,25 @@ from .base import StatefulCallback
 from .cadence import StepCadenceGate, SubscriptionGroup, pop_step_cadence
 
 _LOGGER = logging.getLogger("tpen")
+
+
+class CheckpointPublicationError(RuntimeError):
+    """A load-bearing publication step failed after a checkpoint boundary."""
+
+    def __init__(
+        self,
+        error: Exception,
+        *,
+        next_iteration: int,
+        completed_updates: int,
+        target_iterations: int | None = None,
+    ) -> None:
+        super().__init__(str(error))
+        self.original = error
+        self.next_iteration = next_iteration
+        self.completed_updates = completed_updates
+        self.target_iterations = target_iterations
+        self.stage = getattr(error, "tpen_publication_stage", "unknown")
 
 
 class Checkpoint(StatefulCallback[TrainerState]):
@@ -211,6 +231,9 @@ class Checkpoint(StatefulCallback[TrainerState]):
         # so it is self-clearing: a later iteration that skipped its update
         # simply never matches, and no explicit per-iteration reset is required.
         self._updated_iteration_step: int | None = None
+        self.published_ref: CheckpointRef | None = None
+        self.published_payload_profile: str | None = None
+        self.published_context_token: int | None = None
 
     def handle_occurrence_impl(
         self,
@@ -284,33 +307,80 @@ class Checkpoint(StatefulCallback[TrainerState]):
         next_iteration: int,
         completed_updates: int,
     ) -> None:
+        self._active_context_callbacks = tuple(getattr(context, "callbacks", ()))
         final_dir = self.output_dir / checkpoint_step_dir_name(next_iteration)
         if is_complete_checkpoint_dir(final_dir):
             self._validate_existing_publication(final_dir)
-            reconcile_publication(self.output_dir, final_dir)
+            try:
+                reconcile_publication(self.output_dir, final_dir)
+            except Exception as exc:
+                self._raise_publication_error_if_active(
+                    exc, next_iteration=next_iteration, completed_updates=completed_updates
+                )
+                raise
+            self._record_published(context, final_dir)
             return
         model = state.model
         if model is None:
             raise ValueError("Checkpoint callback requires state.model")
-        save_checkpoint(
-            output_dir=self.output_dir,
+        try:
+            save_checkpoint(
+                output_dir=self.output_dir,
+                next_iteration=next_iteration,
+                completed_updates=completed_updates,
+                model=model,
+                optimizer=state.optimizer,
+                trainer=state.trainer,
+                sampler=state.sampler,
+                context=context,
+                payload=self.payload,
+                save_optimizer=self.save_optimizer,
+                save_trainer=self.save_trainer,
+                save_sampler=self.save_sampler,
+                save_rng=self.save_rng,
+            )
+        except Exception as exc:
+            self._raise_publication_error_if_active(
+                exc, next_iteration=next_iteration, completed_updates=completed_updates
+            )
+            raise
+        self._record_published(context, final_dir)
+
+    def _raise_publication_error_if_active(
+        self, exc: Exception, *, next_iteration: int, completed_updates: int
+    ) -> None:
+        """Convert tagged publication errors only for an admitted yield."""
+
+        if getattr(exc, "tpen_publication_stage", None) is None:
+            return
+        # Import lazily: PlannedYield depends on the callback base and this
+        # callback is part of the public callback import surface.
+        from .planned_yield import PlannedYield
+
+        planned = next(
+            (callback for callback in self._context_callbacks if type(callback) is PlannedYield),
+            None,
+        )
+        target = None if planned is None else planned.target_iterations
+        if planned is None:
+            return
+        raise CheckpointPublicationError(
+            exc,
             next_iteration=next_iteration,
             completed_updates=completed_updates,
-            model=model,
-            # The composed payload owns which components are written. Passing
-            # the available state through lets an explicit TrainResume payload
-            # use its defaults (the legacy flags are still honoured by the
-            # saver when they are explicitly set to False).
-            optimizer=state.optimizer,
-            trainer=state.trainer,
-            sampler=state.sampler,
-            context=context,
-            payload=self.payload,
-            save_optimizer=self.save_optimizer,
-            save_trainer=self.save_trainer,
-            save_sampler=self.save_sampler,
-            save_rng=self.save_rng,
+            target_iterations=target,
+        ) from exc
+
+    def _record_published(self, context: RunContext, final_dir: Path) -> None:
+        """Expose a ref only after the complete publication sequence returns."""
+
+        ref = CheckpointRef.from_directory(final_dir)
+        manifest = read_manifest(final_dir / "manifest.json", mode="model_only")
+        self.published_ref = ref
+        self.published_payload_profile = (
+            None if manifest.payload is None else manifest.payload.get("profile")
         )
+        self.published_context_token = id(context)
 
     def _validate_existing_publication(self, final_dir: Path) -> None:
         """Allow only an equivalent re-publication at this stream root.
@@ -341,6 +411,16 @@ class Checkpoint(StatefulCallback[TrainerState]):
         """Drop the armed update when the owning RunContext identity changes."""
 
         self._updated_iteration_step = None
+        self.published_ref = None
+        self.published_payload_profile = None
+        self.published_context_token = None
+        self._active_context_callbacks = ()
+
+    @property
+    def _context_callbacks(self) -> tuple[object, ...]:
+        """Return callbacks for the active context during publication handling."""
+
+        return getattr(self, "_active_context_callbacks", ())
 
 
 def _trainer_progress(state: TrainerState) -> tuple[int, int]:
@@ -444,4 +524,5 @@ def _payload_label(components: frozenset[str] | None) -> str | None:
 
 __all__ = [
     "Checkpoint",
+    "CheckpointPublicationError",
 ]

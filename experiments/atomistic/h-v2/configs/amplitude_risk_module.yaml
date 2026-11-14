@@ -1,12 +1,12 @@
 # Frozen amplitude-risk fraction callback entry for H-v2.
 #
-# Not spliced into train.yaml's callbacks list by this change: the thresholds
-# are frozen (note amplitude-risk-call-20261106), but the training cadence is
-# not -- item 69c5a5a6 turns this module on at the decided contract cadence.
+# This entry is copied into the science TRAIN callback list by the protocol
+# builder.  The measured cadence is applied there because it is a property of
+# the science-scale overhead decision, not a free-standing config default.
 # `protocol.assert_hydrogen_contract` checks any `callbacks` entry targeting
 # `tpen.callback.AmplitudeRiskFraction` against `protocol.AMPLITUDE_RISK_THRESHOLDS`;
-# this file is the single source a future splice must copy verbatim so the
-# config, the contract, and the protocol module agree.
+# this file is the single source copied by the splice so the config, contract,
+# and protocol module agree.
 amplitude_risk_callback:
   _target_: tpen.callback.AmplitudeRiskFraction
   thresholds: [-3, -4, -5, -7, -10]

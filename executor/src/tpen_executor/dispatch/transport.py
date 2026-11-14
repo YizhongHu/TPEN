@@ -44,6 +44,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import math
 import os
+from pathlib import Path
 import socket
 import sys
 from types import MappingProxyType
@@ -90,7 +91,13 @@ _REQUEST_PLAIN_FIELDS = (
 )
 _SCIENCE_KEYS = {"argv", "returncode", "timed_out", "pid", "proc_start_ticks", "stdout_path", "stderr_path"}
 _ERROR_KEYS = {"type", "message"}
-_TEARDOWN_KEYS = {"leaders_reaped"}
+TEARDOWN_SCHEMA = "tpen-executor/leaf-teardown-v1"
+_TEARDOWN_KEYS = {
+    "schema", "group_digest", "task_id", "attempt_id", "allocation_id",
+    "backend_job_id", "child_group_reaped", "inspection",
+}
+_TEARDOWN_INSPECTIONS = frozenset({"complete", "not-run"})
+_CANCEL_MARKER = "cancel.json"
 _PHASES = ((), ("science",), ("science", "inspection"))
 INSPECTION_STATES = frozenset({"not-run", "evidence", "unavailable", "error"})
 # Typed placement refusals a leaf reports, before science, for the CPUs of its
@@ -130,6 +137,48 @@ class LeafPlacementRefused(LeafRefused):
 
 class LeafResultRejected(ValueError):
     """Raised by the controller when a leaf result does not answer its request."""
+
+
+@frozen_record
+class LeafTeardownReceipt:
+    """Leaf-authored proof that its child group is quiescent.
+
+    This is deliberately plain data.  A controller future, scheduler state,
+    worker exit, or DFK cleanup can never manufacture this acknowledgement.
+    """
+
+    schema: ClassVar[str] = TEARDOWN_SCHEMA
+    group_digest: str
+    task_id: str
+    attempt_id: str
+    allocation_id: str
+    backend_job_id: str
+    child_group_reaped: bool
+    inspection: str
+
+    def __post_init__(self) -> None:
+        for name in ("group_digest", "task_id", "attempt_id", "allocation_id", "backend_job_id"):
+            _text(getattr(self, name), name)
+        if type(self.child_group_reaped) is not bool or self.inspection not in _TEARDOWN_INSPECTIONS:
+            raise ValueError("invalid leaf teardown facts")
+
+    @classmethod
+    def for_request(cls, request: "LeafRequest", *, inspection: str, child_group_reaped: bool) -> "LeafTeardownReceipt":
+        return cls(request.group_digest, request.task_id, request.attempt_id,
+                   request.allocation_id, request.backend_job_id, child_group_reaped, inspection)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"schema": self.schema, "group_digest": self.group_digest,
+                "task_id": self.task_id, "attempt_id": self.attempt_id,
+                "allocation_id": self.allocation_id, "backend_job_id": self.backend_job_id,
+                "child_group_reaped": self.child_group_reaped, "inspection": self.inspection}
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "LeafTeardownReceipt":
+        fields(data, _TEARDOWN_KEYS, cls.schema, "leaf teardown receipt")
+        return cls(*(data[name] for name in (
+            "group_digest", "task_id", "attempt_id", "allocation_id", "backend_job_id",
+            "child_group_reaped", "inspection")))
 
 
 def _require_plain(value: Any, path: str) -> None:
@@ -226,6 +275,24 @@ def _error_fact(error: BaseException) -> dict[str, str]:
     """Return the plain type/message fact recorded for one leaf-side error."""
 
     return {"type": type(error).__name__, "message": str(error)}
+
+
+def _cancel_path(request: "LeafRequest") -> str:
+    return os.path.join(request.output_dir, _CANCEL_MARKER)
+
+
+def _cancel_identity(request: "LeafRequest") -> dict[str, str]:
+    return {"schema": "tpen-executor/leaf-cancel-v1",
+            **{name: getattr(request, name) for name in
+               ("group_digest", "task_id", "attempt_id", "allocation_id", "backend_job_id")}}
+
+
+def _cancel_requested(request: "LeafRequest") -> bool:
+    try:
+        marker = decode_json(Path(_cancel_path(request)).read_bytes())
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return False
+    return isinstance(marker, Mapping) and all(marker.get(key) == value for key, value in _cancel_identity(request).items())
 
 
 @frozen_record
@@ -576,10 +643,9 @@ class LeafResult:
     inspection_error : mapping or None
         ``{"type", "message"}`` for ``unavailable`` or ``error`` inspection.
     teardown : mapping
-        ``{"leaders_reaped": bool}``.  The leaf returns a result only after
-        every worker launch returned or raised, and the worker reaps its child
-        leader before either; this is not a remote-cancellation
-        acknowledgement (Layer C).
+        Versioned, identity-bound :class:`LeafTeardownReceipt` facts authored
+        by the leaf after child-group reaping and inspection completion (or
+        explicit non-execution).
 
     Raises
     ------
@@ -635,8 +701,9 @@ class LeafResult:
             except EvidenceUnavailable as error:
                 raise ValueError(f"evidence is not valid public core evidence: {error}") from error
             object.__setattr__(self, "evidence", _freeze(self.evidence, "evidence"))
-        if not isinstance(self.teardown, Mapping) or set(self.teardown) != _TEARDOWN_KEYS or type(self.teardown["leaders_reaped"]) is not bool:
-            raise ValueError("teardown must be {'leaders_reaped': bool}")
+        if not isinstance(self.teardown, Mapping):
+            raise ValueError("teardown must be a leaf teardown receipt")
+        LeafTeardownReceipt.from_mapping(thaw(self.teardown))
         object.__setattr__(self, "teardown", _freeze(self.teardown, "teardown"))
         # Freezing keeps builtin subclasses at any depth; every retained key
         # and leaf must be exact wire data.
@@ -783,7 +850,7 @@ class LeafResult:
         return "completed" if self.science["returncode"] == 0 else "failed"
 
 
-def validate_leaf_result(request: LeafRequest, result: LeafResult) -> LeafResult:
+def validate_leaf_result(request: LeafRequest, result: LeafResult, *, cancellation_expected: bool = False) -> LeafResult:
     """Check on the controller that ``result`` answers exactly ``request``.
 
     Parameters
@@ -792,6 +859,17 @@ def validate_leaf_result(request: LeafRequest, result: LeafResult) -> LeafResult
         Request the controller sent for one begun attempt.
     result : LeafResult
         Decoded leaf result.
+    cancellation_expected : bool, optional
+        Only ``True`` for the controller's own teardown-ack check
+        (:meth:`~tpen_executor.dispatch.parsl._RemoteLeaf.wait_for_teardown`),
+        which is reached only after this same controller already requested
+        this attempt's cancellation.  A real cancellation (pre-spawn or
+        during science) skips inspection by design, so a result reporting
+        ``inspection == 'not-run'`` is accepted as an alternative to the
+        ordinary inspection-required rule below; every other check,
+        including the teardown reap fact, is unchanged.  Never set this for
+        the ordinary completion path: it must not relax what can be
+        published as a successful, segment-worthy outcome.
 
     Returns
     -------
@@ -806,9 +884,10 @@ def validate_leaf_result(request: LeafRequest, result: LeafResult) -> LeafResult
         If the request digest, any echoed identity, the science argv or log
         paths, or the evidence run or checkpoint directory cross the
         request; if a science outcome without a pre-core refusal lacks the
-        inspection phase; or if the leaf did not confirm its reaped children.
-        Every echoed field is compared; the request digest alone is not
-        trusted.
+        inspection phase (unless ``cancellation_expected`` and the result
+        reports ``not-run``); or if the leaf did not confirm its reaped
+        children. Every echoed field is compared; the request digest alone
+        is not trusted.
 
     Notes
     -----
@@ -833,10 +912,15 @@ def validate_leaf_result(request: LeafRequest, result: LeafResult) -> LeafResult
     if result.science is not None:
         checks["argv"] = tuple(result.science["argv"]) == (request.environment.python, *request.science_args())
         checks["logs"] = (result.science["stdout_path"], result.science["stderr_path"]) == (stdout_path, stderr_path)
-    # Every science outcome without a pre-core refusal is inspected in the
-    # leaf, as in a local completion; a result that skipped inspection is
-    # never published as that outcome.
-    checks["inspection"] = ("inspection" in result.phases) == (result.science is not None and result.child_refusal is None)
+    if cancellation_expected and result.inspection == "not-run":
+        # A genuine cancellation (requested by this same controller) never
+        # runs inspection; that is not a skipped-inspection forgery.
+        checks["inspection"] = True
+    else:
+        # Every science outcome without a pre-core refusal is inspected in
+        # the leaf, as in a local completion; a result that skipped
+        # inspection is never published as that outcome.
+        checks["inspection"] = ("inspection" in result.phases) == (result.science is not None and result.child_refusal is None)
     if result.evidence is not None:
         # Evidence must describe this attempt's core run, not a foreign one.
         real_core = os.path.realpath(core_dir)
@@ -844,7 +928,15 @@ def validate_leaf_result(request: LeafRequest, result: LeafResult) -> LeafResult
         checks["evidence"] = os.path.realpath(result.evidence["run_dir"]) == real_core and (
             checkpoint is None or _inside(real_core, os.path.realpath(checkpoint["checkpoint_dir"]))
         )
-    checks["teardown"] = result.teardown["leaders_reaped"] is True
+    teardown = LeafTeardownReceipt.from_mapping(thaw(result.teardown))
+    checks["teardown"] = (
+        teardown.group_digest == request.group_digest
+        and teardown.task_id == request.task_id
+        and teardown.attempt_id == request.attempt_id
+        and teardown.allocation_id == request.allocation_id
+        and teardown.backend_job_id == request.backend_job_id
+        and teardown.child_group_reaped
+    )
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
         raise LeafResultRejected(f"leaf result crosses its request: {','.join(failed)}")
@@ -907,6 +999,52 @@ def _require_worker_cpus(environment: PreparedPythonEnvironment) -> None:
         )
 
 
+class _ReapObserver:
+    """Aggregate the worker-observed group-reaped fact across one leaf's launches.
+
+    The teardown receipt's ``child_group_reaped`` must reflect what the
+    worker actually confirmed, for every launch it ran (science and, when it
+    ran, inspection) -- not a heuristic derived from the science outcome's
+    pid or return code alone.  Starts ``True`` (vacuously: nothing has been
+    attempted yet) and is ANDed down by every launch, including one that
+    never returned an outcome at all -- an uncertain exit is never silently
+    true.
+    """
+
+    def __init__(self) -> None:
+        self.confirmed = True
+
+    def record(self, outcome: Any) -> None:
+        if not outcome.group_reaped:
+            self.confirmed = False
+
+    def record_uncertain(self) -> None:
+        """A launch that raised before returning any outcome: never a true ack."""
+
+        self.confirmed = False
+
+
+class _ReapObservingWorker:
+    """Wrap a :class:`SubprocessWorker` to feed every launch to a :class:`_ReapObserver`."""
+
+    def __init__(self, inner: SubprocessWorker, observer: _ReapObserver) -> None:
+        self._inner = inner
+        self._observer = observer
+
+    def run(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            outcome = self._inner.run(*args, **kwargs)
+        except BaseException as error:
+            # A pre-spawn refusal (no child ever existed) tags itself
+            # ``group_reaped = True`` (trivially quiescent); anything else
+            # that escaped after a real spawn is a genuinely uncertain exit.
+            if not getattr(error, "group_reaped", False):
+                self._observer.record_uncertain()
+            raise
+        self._observer.record(outcome)
+        return outcome
+
+
 def run_leaf(payload: bytes) -> bytes:
     """Run one fenced member on this worker and return plain result bytes.
 
@@ -948,7 +1086,8 @@ def run_leaf(payload: bytes) -> bytes:
     request = LeafRequest.decode(payload)
     environment = request.environment
     output_dir, core_dir, stdout_path, stderr_path, evidence_stdout, evidence_stderr = request.paths()
-    worker = SubprocessWorker()
+    reap_observer = _ReapObserver()
+    worker = _ReapObservingWorker(SubprocessWorker(), reap_observer)
     phases: list[str] = []
     science: dict[str, Any] | None = None
     launch_error: dict[str, str] | None = None
@@ -974,9 +1113,14 @@ def run_leaf(payload: bytes) -> bytes:
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             timeout=request.timeout,
+            cancel_path=_cancel_path(request),
+            cancel_identity=_cancel_identity(request),
         )
-    except Exception as error:
-        # Same classification as a local launch error: a launch failure fact.
+    except BaseException as error:
+        # The cancellation marker is intentionally handled inside the leaf's
+        # worker, which reaps its group before returning.  Catching the
+        # cancellation here lets that leaf author the required teardown ack;
+        # it is not a controller-side conversion of an arbitrary interrupt.
         launch_error = _error_fact(error)
     else:
         phases.append("science")
@@ -994,7 +1138,7 @@ def run_leaf(payload: bytes) -> bytes:
         refusal = _child_precore_refusal(environment, outcome)
         if refusal is not None:
             child_refusal = refusal.to_dict()
-    if science is not None and child_refusal is None:
+    if science is not None and child_refusal is None and not _cancel_requested(request):
         phases.append("inspection")
         try:
             # The reader launches with LaunchPurpose.INSPECTION; the
@@ -1007,10 +1151,12 @@ def run_leaf(payload: bytes) -> bytes:
                 stdout_path=evidence_stdout,
                 stderr_path=evidence_stderr,
                 timeout=request.timeout,
+                cancel_path=_cancel_path(request),
+                cancel_identity=_cancel_identity(request),
             )
         except EvidenceUnavailable as error:
             inspection, inspection_error = "unavailable", _error_fact(error)
-        except Exception as error:
+        except BaseException as error:
             inspection, inspection_error = "error", _error_fact(error)
         else:
             inspection, evidence = "evidence", _evidence_payload(decoded)
@@ -1027,7 +1173,17 @@ def run_leaf(payload: bytes) -> bytes:
         inspection,
         evidence,
         inspection_error,
-        {"leaders_reaped": True},
+        LeafTeardownReceipt.for_request(
+            request, inspection="not-run" if inspection == "not-run" else "complete",
+            # An observed fact from the worker's own reap of every launch it
+            # attempted (science and, when it ran, inspection) -- not
+            # derived from the science outcome's pid or return code alone.
+            # reap_observer starts True (nothing attempted yet, e.g. a
+            # pre-spawn refusal) and is ANDed down by every attempted
+            # launch, including one that raised before returning any
+            # outcome (review P1-1: an uncertain exit is never true).
+            child_group_reaped=reap_observer.confirmed,
+        ).to_dict(),
     )
     return result.encode()
 
@@ -1036,11 +1192,13 @@ __all__ = [
     "INSPECTION_STATES",
     "LEAF_REQUEST_SCHEMA",
     "LEAF_RESULT_SCHEMA",
+    "TEARDOWN_SCHEMA",
     "LeafPlacementRefused",
     "LeafRefused",
     "LeafRequest",
     "LeafResult",
     "LeafResultRejected",
+    "LeafTeardownReceipt",
     "run_leaf",
     "validate_leaf_result",
     "WORKER_AFFINITY_REFUSAL_CODES",
