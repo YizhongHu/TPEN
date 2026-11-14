@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from contextlib import contextmanager
 from pathlib import Path
+import signal
 import sys
+import time
 from copy import deepcopy
 
 import pytest
@@ -16,6 +19,41 @@ assert spec is not None and spec.loader is not None
 manifest_module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = manifest_module
 spec.loader.exec_module(manifest_module)
+
+_PER_TEST_TIMEOUT_SECONDS = 120
+
+
+@contextmanager
+def _timeout_guard(seconds: int, nodeid: str):
+    """Bound one test without adding a pytest-timeout dependency."""
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_alarm = signal.alarm(0)
+
+    def raise_timeout(_signum: int, _frame: object) -> None:
+        raise TimeoutError(f"per-test timeout ({seconds}s): {nodeid}")
+
+    signal.signal(signal.SIGALRM, raise_timeout)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_alarm:
+            signal.alarm(previous_alarm)
+
+
+@pytest.fixture(autouse=True)
+def _per_test_timeout(request: pytest.FixtureRequest):
+    with _timeout_guard(_PER_TEST_TIMEOUT_SECONDS, request.node.nodeid):
+        yield
+
+
+def test_per_test_timeout_fires() -> None:
+    with pytest.raises(TimeoutError, match="test_per_test_timeout_fires"):
+        with _timeout_guard(1, "test_per_test_timeout_fires"):
+            time.sleep(2)
 
 
 def test_committed_manifest_regenerates_byte_identically() -> None:
