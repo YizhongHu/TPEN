@@ -205,7 +205,14 @@ updated matrix. Existing v1/v2 readers remain read-only compatible with their
 own records; no consumer may silently reinterpret a newer record as an older
 one. The fixture generator is `tests/contracts/_regen_fixtures.py`; it creates
 a real status/checkpoint/run-start artifact set, calls `inspect_run`, then
-normalizes only absolute run paths.
+normalizes only absolute paths under the temporary producer root. Planned-yield
+runs execute with that temporary root as cwd so checkpoint provenance is
+normalized by the same prefix-only rule. The canonical planned-yield fixture
+replaces exactly `checkpoint_ref.content_id` with `<sha256:content_id>` and
+`checkpoint_ref.manifest_sha256` with `<sha256:manifest>`, after asserting each
+producer value is a 64-hex SHA-256 string. Live tests compare those fields with
+`CheckpointRef` computed from the checkpoint bytes; the placeholders are only
+for cross-clone fixture stability and do not change product hashing.
 
 | Producer record | Consumer v1 | Consumer v2 | Consumer v3 |
 |---|---|---|---|

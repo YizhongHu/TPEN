@@ -38,22 +38,22 @@ def test_planned_yield_fixture_regenerates_from_real_s4_entry() -> None:
     assert PLANNED_YIELD_FIXTURE_PATH.exists(), "Cannon-generated planned-yield v3 fixture is missing"
     fixture = json.loads(PLANNED_YIELD_FIXTURE_PATH.read_text(encoding="utf-8"))
     assert regenerate_planned_yield() == fixture
-    evidence = RunEvidence.from_mapping(fixture)
-    assert evidence.schema == RUN_EVIDENCE_SCHEMA_V3
-    assert evidence.outcome == "planned_yield"
-    assert evidence.continuation_eligible is True
+    assert fixture["schema"] == RUN_EVIDENCE_SCHEMA_V3
+    assert fixture["outcome"] == "planned_yield"
+    assert fixture["checkpoint_ref"]["profile"] == "train_resume"
+    assert fixture["checkpoint_ref"]["content_id"] == "<sha256:content_id>"
+    assert fixture["checkpoint_ref"]["manifest_sha256"] == "<sha256:manifest>"
 
 
 def test_v3_round_trip_preserves_full_checkpoint_binding() -> None:
-    # The fixture generator supplies the computed content_id; this test never
-    # invents one.
+    # The canonical fixture validates the identity shape; the live test below
+    # binds these values to the checkpoint bytes.
     assert PLANNED_YIELD_FIXTURE_PATH.exists(), "Cannon-generated planned-yield v3 fixture is missing"
     fixture = json.loads(PLANNED_YIELD_FIXTURE_PATH.read_text(encoding="utf-8"))
-    evidence = RunEvidence.from_mapping(fixture)
-    assert evidence.checkpoint_ref is not None
-    assert evidence.checkpoint_ref["schema"] == "tpen.checkpoint-ref/v1"
-    assert evidence.checkpoint_ref["content_id"]
-    assert evidence.checkpoint_ref["profile"] == "train_resume"
+    assert fixture["checkpoint_ref"]["schema"] == "tpen.checkpoint-ref/v1"
+    assert fixture["checkpoint_ref"]["content_id"] == "<sha256:content_id>"
+    assert fixture["checkpoint_ref"]["manifest_sha256"] == "<sha256:manifest>"
+    assert fixture["checkpoint_ref"]["profile"] == "train_resume"
 
 
 def test_outcome_status_mismatch_is_refused(tmp_path: Path) -> None:
@@ -115,6 +115,26 @@ def test_real_planned_yield_public_entry_produces_v3_evidence(tmp_path: Path) ->
     assert evidence.checkpoint_ref is not None
     assert evidence.checkpoint_ref["profile"] == "train_resume"
     assert evidence.continuation_eligible is True
+
+
+def test_live_planned_yield_ref_binds_checkpoint_bytes(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path / "logical", "planned-yield-live-ref")
+    destination = ArtifactDestination(tmp_path / "physical")
+    assert (
+        run_from_config(
+            cfg,
+            artifact_destination=destination,
+            runtime_callbacks=(PlannedYield(1, 3),),
+            raise_exceptions=True,
+        )
+        == PLANNED_YIELD_EXIT_CODE
+    )
+
+    evidence = inspect_run(destination.physical_root)
+    assert evidence.checkpoint_ref is not None
+    live_ref = CheckpointRef.from_directory(evidence.checkpoint_ref["checkpoint_dir"])
+    assert evidence.checkpoint_ref["content_id"] == live_ref.content_id
+    assert evidence.checkpoint_ref["manifest_sha256"] == live_ref.manifest_sha256
 
 
 def test_pre_cx01_run_outcome_without_schema_marker_is_read_only(tmp_path: Path) -> None:
