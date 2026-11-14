@@ -48,6 +48,30 @@ def _runtime_torch_signature(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
 
+@pytest.fixture(autouse=True)
+def _launch_boundary_firewall(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevent an unstubbed runner test from entering real training.
+
+    Tests that exercise the launch handoff explicitly replace this boundary
+    with their recording or sentinel implementation.  Keeping the default
+    blocked makes a newly added non-dry test fail immediately instead of
+    constructing a model or training on a worker.
+    """
+
+    def refuse_unstubbed_launch(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        raise AssertionError("test crossed the run_from_config launch boundary")
+
+    monkeypatch.setattr(runner.launch, "run_from_config", refuse_unstubbed_launch)
+
+
+def test_launch_boundary_firewall_is_active() -> None:
+    """The default test harness must fail closed at the training boundary."""
+
+    with pytest.raises(AssertionError, match="run_from_config launch boundary"):
+        runner.launch.run_from_config(object(), topology={})
+
+
 def _cells(tmp_path: Path, stage_code: str = "Q") -> tuple[object, ...]:
     return stage_coordinate.materialize_intended_configurations(
         tmp_path, availability=optimizer_grid.roster_availability(), stages=(stage_code,)
