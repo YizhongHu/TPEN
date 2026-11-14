@@ -67,6 +67,97 @@ def test_happy_path_statistics_and_four_stream_aggregate(monkeypatch, tmp_path: 
     assert result["records"][0]["reference"]["error"] == pytest.approx(5.4)
 
 
+def test_stream_aggregate_requires_the_complete_four_stream_set(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A partial stream set must not be reported as a science aggregate."""
+    document = _manifest(tmp_path, streams=3)
+    identity = {"schema": "tpen-config-identity-v1", "sha256": "b" * 64}
+    monkeypatch.setattr(
+        collector,
+        "inspect_run",
+        lambda path: {
+            "verdict": "completed",
+            "resolved_config_identity": identity,
+            "source_git_sha": "a" * 40,
+        },
+    )
+
+    def inspect(path, **kwargs):
+        index = int(Path(path).name.rsplit("-", 1)[-1])
+        return SimpleNamespace(
+            record_schema="trajectory_records/v2",
+            draw_count=2,
+            walker_count=2,
+            row_count=4,
+            finite_count=4,
+            mean=float(index + 1),
+            variance=1.25,
+            csv_sha256="d" * 64,
+            system_id="he_atom",
+            path=Path(f"m-{index}"),
+            execution_method_id="method",
+            resolved_config_identity=identity,
+            model_provenance="checkpoint",
+            checkpoint_sha256="c" * 64,
+            record_content_id="e" * 64,
+        )
+
+    monkeypatch.setattr(collector, "_record_path", lambda path: path / ("m-" + path.name))
+    monkeypatch.setattr(collector, "inspect_trajectory_record", inspect)
+    monkeypatch.setattr(collector, "read_energy_grid", lambda record: [[1.0, 2.0], [3.0, 4.0]])
+    monkeypatch.setattr(collector, "_reference", lambda system_id, registry_path: (-2.9, "transcribed"))
+
+    with pytest.raises(collector.CollectionError, match="four streams"):
+        collector.collect(document)
+
+
+def test_duplicate_record_sidecars_are_refused(monkeypatch, tmp_path: Path) -> None:
+    """A fixed-path lookup must not silently choose among duplicate records."""
+    document = _manifest(tmp_path, streams=1)
+    run_dir = tmp_path / "run-0"
+    task_dir = run_dir / "mcmc_energy"
+    task_dir.mkdir(parents=True)
+    (task_dir / "sampled_eval_table.metadata.json").write_text("{}", encoding="utf-8")
+    (task_dir / "sampled_eval_table.duplicate.metadata.json").write_text("{}", encoding="utf-8")
+    identity = {"schema": "tpen-config-identity-v1", "sha256": "b" * 64}
+    monkeypatch.setattr(
+        collector,
+        "inspect_run",
+        lambda path: {
+            "verdict": "completed",
+            "resolved_config_identity": identity,
+            "source_git_sha": "a" * 40,
+        },
+    )
+    monkeypatch.setattr(
+        collector,
+        "inspect_trajectory_record",
+        lambda path, **kwargs: SimpleNamespace(
+            record_schema="trajectory_records/v2",
+            draw_count=2,
+            walker_count=2,
+            row_count=4,
+            finite_count=4,
+            mean=2.5,
+            variance=1.25,
+            csv_sha256="d" * 64,
+            system_id="he_atom",
+            path=Path("values.csv"),
+            execution_method_id="method",
+            resolved_config_identity=identity,
+            model_provenance="checkpoint",
+            checkpoint_sha256="c" * 64,
+            record_content_id="e" * 64,
+        ),
+    )
+    monkeypatch.setattr(collector, "read_energy_grid", lambda record: [[1.0, 2.0], [3.0, 4.0]])
+    monkeypatch.setattr(collector, "_reference", lambda system_id, registry_path: (-2.9, "transcribed"))
+
+    with pytest.raises(collector.CollectionError, match="duplicate"):
+        collector.collect(document)
+
+
 @pytest.mark.parametrize("identity", [None, {"schema": "wrong", "sha256": "b" * 64}])
 def test_missing_or_malformed_run_identity_is_refused(monkeypatch, tmp_path: Path, identity) -> None:
     document = _manifest(tmp_path, streams=1)
