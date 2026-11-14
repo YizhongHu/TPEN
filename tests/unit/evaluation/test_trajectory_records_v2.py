@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 import torch
 
+import tpen.evaluation.trajectory_records as trajectory_records
 import tpen.inspection as inspection_module
 from tpen.checkpoint.hashing import RESOLVED_CONFIG_IDENTITY_SCHEMA
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
@@ -308,6 +309,7 @@ def test_swapped_execution_receipt_is_rejected(tmp_path: Path) -> None:
     metadata = _read_metadata(artifact)
     metadata["execution_receipt"] = _serialize_execution_receipt(other_receipt)
     metadata["execution_receipt_method_id"] = other_receipt.method_id()
+    metadata["record_content_id"] = trajectory_records._record_content_id(metadata)
     _rewrite_metadata(artifact, metadata)
     with pytest.raises(TamperedTrajectoryRecordError, match="system_id"):
         inspect_trajectory_record(artifact.metadata_path)
@@ -387,6 +389,7 @@ def test_v2_reader_rejects_a_missing_resource_payload(tmp_path: Path) -> None:
     metadata = _read_metadata(artifact)
     metadata["system_descriptor"]["terms"][0]["resource_id"] = "missing"
     metadata["system_descriptor"]["resources"] = {}
+    metadata["record_content_id"] = trajectory_records._record_content_id(metadata)
     _rewrite_metadata(artifact, metadata)
     with pytest.raises(
         TamperedTrajectoryRecordError, match="resource_id and resource must be provided together"
@@ -420,6 +423,7 @@ def test_v2_public_reader_rejects_a_tampered_finite_count(tmp_path: Path) -> Non
     metadata = _read_metadata(artifact)
     metadata["finite_count"] -= 1
     metadata["nonfinite_count"] += 1
+    metadata["record_content_id"] = trajectory_records._record_content_id(metadata)
     _rewrite_metadata(artifact, metadata)
 
     with pytest.raises(TamperedTrajectoryRecordError, match="finite_count"):
@@ -451,6 +455,7 @@ def test_v2_public_reader_rejects_receipt_contribution_csv_column_mismatch(
     metadata = _read_metadata(artifact)
     metadata["execution_receipt"] = _serialize_execution_receipt(renamed_receipt)
     metadata["execution_receipt_method_id"] = renamed_receipt.method_id()
+    metadata["record_content_id"] = trajectory_records._record_content_id(metadata)
     _rewrite_metadata(artifact, metadata)
 
     with pytest.raises(TamperedTrajectoryRecordError, match="contributions"):
