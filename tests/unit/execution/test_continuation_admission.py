@@ -179,6 +179,18 @@ def test_wire_model_only_profile_is_refused_by_admission(tmp_path: Path) -> None
     assert result.refusal.code is AdmissionRefusalCode.MODEL_ONLY
 
 
+def test_wire_planned_yield_without_checkpoint_summary_is_ambiguous(tmp_path: Path) -> None:
+    ref = _checkpoint(tmp_path)
+    wire = _request(ref).to_dict()
+    wire["core_evidence"]["checkpoint"] = None
+
+    decoded = decode_successor_admission_request(wire)
+    result = select_successor_admission(_intent(), decoded)
+
+    assert result.refusal is not None
+    assert result.refusal.code is AdmissionRefusalCode.AMBIGUOUS_YIELD
+
+
 def test_model_only_profile_is_refused_before_restore(tmp_path: Path) -> None:
     ref = _checkpoint(tmp_path)
     evidence = _evidence(ref)

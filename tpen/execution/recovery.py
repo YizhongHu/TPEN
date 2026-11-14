@@ -283,14 +283,15 @@ class SuccessorAdmissionRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class _AdmissionDecodeEnvelope:
+class SuccessorAdmissionDecodeRefusal:
     """Preserve a typed semantic refusal found while decoding wire evidence.
 
     ``RunEvidence`` intentionally rejects a model-only planned yield during
     construction.  The admission boundary still needs to expose its stable
     refusal code, so the wire decoder carries that one semantic fact until the
     admission profile gate can make the decision.  Other malformed request
-    shapes continue to raise from the strict decoder.
+    shapes continue to raise from the strict decoder.  This is public because
+    the decoder may return it to the public admission selector.
     """
 
     code: AdmissionRefusalCode
@@ -298,7 +299,7 @@ class _AdmissionDecodeEnvelope:
     profile: str | None = None
 
 
-def _wire_decode_refusal(data: Any) -> _AdmissionDecodeEnvelope | None:
+def _wire_decode_refusal(data: Any) -> SuccessorAdmissionDecodeRefusal | None:
     """Classify semantic v3 evidence errors that the core decoder can name."""
 
     if not isinstance(data, Mapping):
@@ -309,29 +310,29 @@ def _wire_decode_refusal(data: Any) -> _AdmissionDecodeEnvelope | None:
 
     outcome = evidence.get("outcome")
     if outcome == "planned_yield":
+        if evidence.get("checkpoint") is None or evidence.get("checkpoint_ref") is None:
+            return SuccessorAdmissionDecodeRefusal(
+                AdmissionRefusalCode.AMBIGUOUS_YIELD,
+                "planned-yield evidence does not carry both checkpoint bindings",
+            )
         checkpoint_ref = evidence.get("checkpoint_ref")
         if isinstance(checkpoint_ref, Mapping) and checkpoint_ref.get("profile") == "model_only":
-            return _AdmissionDecodeEnvelope(
+            return SuccessorAdmissionDecodeRefusal(
                 AdmissionRefusalCode.NON_ELIGIBLE_OUTCOME,
                 "core evidence is not a non-refused continuation-eligible planned yield",
                 profile="model_only",
             )
-        if checkpoint_ref is None:
-            return _AdmissionDecodeEnvelope(
-                AdmissionRefusalCode.AMBIGUOUS_YIELD,
-                "planned-yield evidence does not carry both checkpoint bindings",
-            )
         if evidence.get("verdict") != "refused" and evidence.get("run_status") != outcome:
-            return _AdmissionDecodeEnvelope(
+            return SuccessorAdmissionDecodeRefusal(
                 AdmissionRefusalCode.AMBIGUOUS_YIELD,
                 "planned-yield evidence status disagrees with its typed outcome",
             )
-        return _AdmissionDecodeEnvelope(
+        return SuccessorAdmissionDecodeRefusal(
             AdmissionRefusalCode.CORRUPT_REF,
             "planned-yield checkpoint_ref is malformed",
         )
     if outcome in {"completed", "failed", "unknown", "refused"}:
-        return _AdmissionDecodeEnvelope(
+        return SuccessorAdmissionDecodeRefusal(
             AdmissionRefusalCode.NON_ELIGIBLE_OUTCOME,
             "core evidence is not a non-refused continuation-eligible planned yield",
         )
@@ -340,7 +341,7 @@ def _wire_decode_refusal(data: Any) -> _AdmissionDecodeEnvelope | None:
 
 def decode_successor_admission_request(
     data: bytes | str | Mapping[str, Any],
-) -> SuccessorAdmissionRequest | _AdmissionDecodeEnvelope:
+) -> SuccessorAdmissionRequest | SuccessorAdmissionDecodeRefusal:
     """Decode one closed successor-admission request mapping or JSON payload."""
 
     if isinstance(data, (bytes, str)):
@@ -348,6 +349,37 @@ def decode_successor_admission_request(
             data = json.loads(data)
         except (TypeError, json.JSONDecodeError) as exc:
             raise ValueError("successor admission request is not valid JSON") from exc
+
+    # Validate the request envelope before catching semantic RunEvidence
+    # errors.  Otherwise a malformed outer request could be misclassified as
+    # a typed admission refusal merely because it still carried evidence.
+    request_mapping = decode_fields(
+        data,
+        {
+            "predecessor": Mapping,
+            "successor": Mapping,
+            "science_input_digest": str,
+            "target_iterations": int,
+            "core_evidence": Mapping,
+        },
+        schema=SUCCESSOR_ADMISSION_SCHEMA,
+        name="successor admission request",
+    )
+    decode_fields(
+        request_mapping["predecessor"],
+        {
+            "task_id": str,
+            "attempt_id": str,
+            "core_outcome_digest": str,
+            "resolved_config_identity": Mapping,
+        },
+        name="successor admission predecessor",
+    )
+    decode_fields(
+        request_mapping["successor"],
+        {"task_id": str, "attempt_id": str},
+        name="successor admission successor",
+    )
 
     try:
         return SuccessorAdmissionRequest.from_mapping(data)
@@ -1013,9 +1045,19 @@ def _admission_refusal(code: AdmissionRefusalCode, message: str) -> SuccessorAdm
 
 
 def _request_and_intent(
-    first: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
-    second: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
-) -> tuple[ScienceIntent, SuccessorAdmissionRequest | None, _AdmissionDecodeEnvelope | None]:
+    first: ScienceIntent
+    | SuccessorAdmissionRequest
+    | SuccessorAdmissionDecodeRefusal
+    | Mapping[str, Any],
+    second: ScienceIntent
+    | SuccessorAdmissionRequest
+    | SuccessorAdmissionDecodeRefusal
+    | Mapping[str, Any],
+) -> tuple[
+    ScienceIntent,
+    SuccessorAdmissionRequest | None,
+    SuccessorAdmissionDecodeRefusal | None,
+]:
     """Accept either intent-first or request-first adapter call order."""
 
     if isinstance(first, ScienceIntent):
@@ -1026,17 +1068,23 @@ def _request_and_intent(
         raise TypeError("one admission adapter argument must be a ScienceIntent")
     if isinstance(request_value, SuccessorAdmissionRequest):
         return intent, request_value, None
-    if isinstance(request_value, _AdmissionDecodeEnvelope):
+    if isinstance(request_value, SuccessorAdmissionDecodeRefusal):
         return intent, None, request_value
     decoded = decode_successor_admission_request(request_value)
-    if isinstance(decoded, _AdmissionDecodeEnvelope):
+    if isinstance(decoded, SuccessorAdmissionDecodeRefusal):
         return intent, None, decoded
     return intent, decoded, None
 
 
 def select_successor_admission(
-    intent: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
-    request: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
+    intent: ScienceIntent
+    | SuccessorAdmissionRequest
+    | SuccessorAdmissionDecodeRefusal
+    | Mapping[str, Any],
+    request: ScienceIntent
+    | SuccessorAdmissionRequest
+    | SuccessorAdmissionDecodeRefusal
+    | Mapping[str, Any],
 ) -> SuccessorAdmissionResult:
     """Validate a successor request and select its existing restore boundary.
 
@@ -1208,8 +1256,14 @@ def select_successor_admission(
 
 
 def admit_successor(
-    first: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
-    second: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
+    first: ScienceIntent
+    | SuccessorAdmissionRequest
+    | SuccessorAdmissionDecodeRefusal
+    | Mapping[str, Any],
+    second: ScienceIntent
+    | SuccessorAdmissionRequest
+    | SuccessorAdmissionDecodeRefusal
+    | Mapping[str, Any],
 ) -> SuccessorAdmissionResult:
     """Alias for :func:`select_successor_admission`."""
 
@@ -1217,8 +1271,14 @@ def admit_successor(
 
 
 def operational_restore_request_from_admission(
-    first: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
-    second: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
+    first: ScienceIntent
+    | SuccessorAdmissionRequest
+    | SuccessorAdmissionDecodeRefusal
+    | Mapping[str, Any],
+    second: ScienceIntent
+    | SuccessorAdmissionRequest
+    | SuccessorAdmissionDecodeRefusal
+    | Mapping[str, Any],
 ) -> OperationalRestoreRequest:
     """Return the admitted restore request or raise its typed refusal."""
 
@@ -1258,6 +1318,7 @@ __all__ = [
     "RefusalCode",
     "ScienceIntent",
     "SUCCESSOR_ADMISSION_SCHEMA",
+    "SuccessorAdmissionDecodeRefusal",
     "SuccessorAdmissionError",
     "SuccessorAdmissionDecision",
     "SuccessorAdmissionPredecessor",
