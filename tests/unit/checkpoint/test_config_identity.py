@@ -470,8 +470,8 @@ def test_golden_identity_vector() -> None:
 @pytest.mark.parametrize(
     ("relative_path", "expected_sha256"),
     [
-        # Cannon test job 60514113 computed this at base fce3de22; the base
-        # and implementation-head digests were identical.
+        # Golden computed by an independent verification job at base fce3de22
+        # and re-checked identical at the CX-03 head; receipt: Task Orchestrator note orch-golden-probe-60514113 on item cd093a8e.
         (
             "experiments/atomistic/he-importance/configs/train.yaml",
             "eca06e9ab1796dca1a192c2cfd3de7fb62cfa07c47eb1020784470060304d713",
