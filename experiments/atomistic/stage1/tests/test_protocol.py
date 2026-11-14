@@ -72,3 +72,12 @@ def test_manifest_rejects_placeholder_identity(field: str, value: str) -> None:
                        checkpoint_sha256={(s, l, 7): SHA256 for s in ("hooke1", "he", "h2")
                                           for l in range(3)},
                        results_root="/external/stage1", **kwargs)
+
+
+def test_manifest_rejects_placeholder_config_sha256() -> None:
+    with pytest.raises(ProtocolError, match="config_sha256"):
+        build_manifest(protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256="tiny",
+                       checkpoints=[7], lineage_seeds=[11, 12, 13],
+                       checkpoint_sha256={(s, l, 7): SHA256 for s in ("hooke1", "he", "h2")
+                                          for l in range(3)},
+                       results_root="/external/stage1")
