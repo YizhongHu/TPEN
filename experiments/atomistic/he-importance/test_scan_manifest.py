@@ -86,8 +86,20 @@ def test_manifest_counts_sources_and_admission_reason() -> None:
     assert manifest["counts"] == {"rows": 1920, "admitted": 128, "unavailable": 1792}
     assert manifest["horizon"] == 50000
     assert manifest["walkers"] == 4096
-    assert manifest["checkpoint_cadence"]["identity"] is False
+    assert manifest["checkpoint_cadence"] == {
+        "operational": True, "recorded_per_run": True, "in_identity": False
+    }
     assert manifest["provenance"]["design_document"]["sha256"] == manifest_module.DESIGN_DOC_SHA256
+    assert manifest["provenance"]["design_document"]["path"] == (
+        "2026-09-04-tpen-helium-importance-scan-consolidated.md"
+    )
+    assert manifest["provenance"]["design_document"]["tracked"] is False
+    assert manifest["provenance"]["design_document"]["location"] == (
+        "operator checkout (untracked; commit decision pending with operator)"
+    )
+    assert manifest["provenance"]["lane_plan_approval"]["citation"] == (
+        "TO note operator-approved-materialization-2026-09-05 on 67987933"
+    )
     assert len(manifest["cells"]) == 120
     assert len(manifest["contexts"]) == 2
     rendered = manifest_module.render_manifest()
@@ -102,6 +114,8 @@ def test_manifest_counts_sources_and_admission_reason() -> None:
         assert set(aliases[ref] for ref in row["approval_sources"].split(",")) == set(aliases.values()) - {"cadence"}
     for cell in manifest["cells"]:
         assert set(cell["approval_sources"]) == {"optimizer", "admission", "horizon", "walkers"}
+        assert cell["horizon"] == manifest["horizon"]
+        assert cell["walkers"] == manifest["walkers"]
     for context in manifest["contexts"]:
         assert context["approval_sources"] == ["context"]
     roster = manifest_module._materialized_rows()
@@ -112,6 +126,8 @@ def test_manifest_counts_sources_and_admission_reason() -> None:
                 for candidate in roster["rows"]
                 if candidate["row_id"] == row["row_id"]
             )
+        assert row["horizon"] == manifest["horizon"]
+        assert row["walkers"] == manifest["walkers"]
 
 
 def test_manifest_tampering_and_unknown_rows_refuse(tmp_path: Path) -> None:
@@ -261,7 +277,7 @@ def test_every_admitted_manifest_row_consumes_materialized_w4096(
     assert len(admitted_rows) == 128
     for row in admitted_rows:
         cell = cells_by_row_id[row["row_id"]]
-        assert runner.stage_coordinate.walker_count(cell.manifest) == 4096
+        assert runner.stage_coordinate.walker_count(cell.manifest) == row["walkers"] == 4096
         assert runner.execute(
             _args(runner, HERE / "o1_scan_manifest_v1.json", row["row_id"], tmp_path / row["row_id"])
         ) == 0
@@ -293,6 +309,17 @@ def test_cadence_is_operational_not_identity() -> None:
     manifest = manifest_module.load_manifest()
     identity = [(row["row_id"], row["cell_id"], row["context"], row["seed_label"], row["status"]) for row in manifest["rows"]]
     altered = deepcopy(manifest)
-    altered["checkpoint_cadence"]["updates"] = 777
+    altered["checkpoint_cadence"] = manifest_module.checkpoint_cadence_declaration(updates=777)
     assert identity == [(row["row_id"], row["cell_id"], row["context"], row["seed_label"], row["status"]) for row in altered["rows"]]
+    assert manifest_module.checkpoint_cadence_declaration(updates=1000) == manifest_module.checkpoint_cadence_declaration(updates=777)
+    assert manifest_module.content_hash(manifest_module._body_without_hash(manifest)) == manifest["content_hash"]
+
+
+def test_manifest_cadence_value_cannot_enter_rendered_identity() -> None:
+    baseline = manifest_module.render_manifest_text()
+    for cadence in (1, 777, 50_000):
+        assert manifest_module.checkpoint_cadence_declaration(updates=cadence) == {
+            "operational": True, "recorded_per_run": True, "in_identity": False
+        }
+    assert baseline == manifest_module.render_manifest_text()
 

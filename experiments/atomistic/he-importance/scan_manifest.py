@@ -38,6 +38,13 @@ class ScanManifestError(ValueError):
     """A manifest is malformed, tampered, stale, or selects an unavailable row."""
 
 
+def checkpoint_cadence_declaration(*, updates: int | None = None) -> dict[str, bool]:
+    """Describe per-run cadence without admitting its operational value to identity."""
+
+    del updates
+    return {"operational": True, "recorded_per_run": True, "in_identity": False}
+
+
 def _canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
@@ -79,6 +86,14 @@ def _materialized_rows() -> dict[str, Any]:
         cells = stage.materialize_intended_configurations(
             Path(root), availability=availability, stages=("O1",)
         )
+        horizons = {cell.manifest["payload"]["updates"] for cell in cells}
+        walkers = {stage.walker_count(cell.manifest) for cell in cells}
+        if len(horizons) != 1:
+            raise ScanManifestError(f"O1 materialized horizons are not uniform: {sorted(horizons)!r}")
+        if len(walkers) != 1:
+            raise ScanManifestError(f"O1 materialized walker counts are not uniform: {sorted(walkers)!r}")
+        horizon = next(iter(horizons))
+        walker_count = next(iter(walkers))
         rows = []
         for cell in cells:
             identity = cell.manifest["scientific_identity"]
@@ -93,6 +108,8 @@ def _materialized_rows() -> dict[str, Any]:
                     "seed_label": cell.manifest["seed_identity"]["label"],
                     "status": optimizer_cell["status"],
                     "approval_sources": _ROW_SOURCE_REFS,
+                    "horizon": horizon,
+                    "walkers": walker_count,
                     **(
                         {"unavailable_reason": optimizer_cell["unavailable_reason"]}
                         if "unavailable_reason" in optimizer_cell
@@ -105,10 +122,18 @@ def _materialized_rows() -> dict[str, Any]:
             "cell_id": cell.cell_id,
             "optimizer": {"method": cell.family, "levels": dict(cell.levels)},
             "approval_sources": ["optimizer", "admission", "horizon", "walkers"],
+            "horizon": horizon,
+            "walkers": walker_count,
         }
         for cell in grid.declared_cells()
     ]
-    return {"rows": tuple(rows), "cells": tuple(cells), "contexts": tuple(contexts)}
+    return {
+        "rows": tuple(rows),
+        "cells": tuple(cells),
+        "contexts": tuple(contexts),
+        "horizon": horizon,
+        "walkers": walker_count,
+    }
 
 
 def render_manifest() -> dict[str, Any]:
@@ -122,17 +147,23 @@ def render_manifest() -> dict[str, Any]:
     body: dict[str, Any] = {
         "schema": MANIFEST_SCHEMA,
         "stage": "O1",
-        "horizon": 50000,
-        "walkers": 4096,
-        "checkpoint_cadence": {"updates": 1000, "identity": False},
+        "horizon": materialized["horizon"],
+        "walkers": materialized["walkers"],
+        "checkpoint_cadence": checkpoint_cadence_declaration(),
         "provenance": {
             "design_document": {
-                "path": "main.typ",
+                "path": "2026-09-04-tpen-helium-importance-scan-consolidated.md",
                 "sha256": DESIGN_DOC_SHA256,
                 "sections": ["2.7", "2.8", "2.9"],
+                "tracked": False,
+                "location": "operator checkout (untracked; commit decision pending with operator)",
             },
             "authority_sha256": _authority_hashes(),
             "manager_ruling": MANAGER_RULING,
+            "lane_plan_approval": {
+                "citation": "TO note operator-approved-materialization-2026-09-05 on 67987933",
+                "evidence_class": "RELAYED",
+            },
             "source_aliases": _SOURCE_ALIASES,
             "coordinate_sources": _COORDINATE_SOURCES,
         },
