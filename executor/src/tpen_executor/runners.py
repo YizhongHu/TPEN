@@ -103,17 +103,6 @@ RUN_SHIM = (
     "from tpen.run import main\n"
     "raise SystemExit(main(sys.argv[1:]))"
 )
-REFUSAL_CODES = frozenset(
-    {
-        "missing-run-dir", "missing-status", "multiple-status", "malformed-status",
-        "status-io-error", "malformed-run-identity", "incomplete-checkpoint", "corrupt-checkpoint",
-        "checkpoint-io-error", "corrupt-publication-catalog", "torn-publication-catalog",
-        "missing-checkpoint", "no-train-resume-checkpoint",
-        "unsupported-callback-cadence",
-    }
-)
-
-
 class EvidenceUnavailable(RuntimeError):
     """Raised when a child cannot provide trustworthy public evidence."""
 
@@ -147,13 +136,27 @@ class CoreRunEvidence:
     SCHEMA_V3: ClassVar[str] = RUN_EVIDENCE_SCHEMA_V3
     VERDICTS: ClassVar[frozenset[str]] = frozenset({"completed", "incomplete", "failed", "refused"})
     OUTCOMES: ClassVar[frozenset[str]] = RUN_EVIDENCE_OUTCOMES
-    REFUSAL_CODES: ClassVar[frozenset[str]] = REFUSAL_CODES
-
     def __post_init__(self) -> None:
+        if self.schema not in {RUN_EVIDENCE_SCHEMA, RUN_EVIDENCE_SCHEMA_V2, RUN_EVIDENCE_SCHEMA_V3}:
+            raise EvidenceUnavailable(f"unsupported run-evidence schema {self.schema!r}")
+        if type(self.run_dir) is not str:
+            raise EvidenceUnavailable("run_dir must be a string")
+        if self.run_status is not None and not isinstance(self.run_status, str):
+            raise EvidenceUnavailable("run_status must be a string or null")
+        if self.verdict not in self.VERDICTS:
+            raise EvidenceUnavailable(f"unsupported run-evidence verdict {self.verdict!r}")
         object.__setattr__(self, "checkpoint", self._checkpoint(self.checkpoint))
         object.__setattr__(self, "refusal", self._refusal(self.refusal))
         object.__setattr__(self, "resolved_config_identity", self._identity(self.resolved_config_identity))
         object.__setattr__(self, "checkpoint_ref", self._checkpoint_ref(self.checkpoint_ref))
+        if self.verdict == "completed":
+            if self.checkpoint is None or self.refusal is not None:
+                raise EvidenceUnavailable("completed evidence requires checkpoint and no refusal")
+        elif self.verdict == "refused":
+            if self.refusal is None or self.checkpoint is not None:
+                raise EvidenceUnavailable("refused evidence requires refusal and no checkpoint")
+        elif self.refusal is not None:
+            raise EvidenceUnavailable(f"{self.verdict} evidence cannot contain a refusal")
         if self.schema == RUN_EVIDENCE_SCHEMA_V3:
             if self.resolved_config_identity is None:
                 raise EvidenceUnavailable("v3 evidence requires a non-null resolved_config_identity")
@@ -192,8 +195,8 @@ class CoreRunEvidence:
             If the schema, keys, types, or verdict invariants are invalid.
         """
 
-        if type(value) is not dict:
-            raise EvidenceUnavailable("evidence is not a JSON object")
+        if not isinstance(value, Mapping):
+            raise EvidenceUnavailable("evidence is not a mapping")
         schema = value.get("schema")
         expected = {"schema", "run_dir", "verdict", "run_status", "checkpoint", "refusal"}
         if schema == RUN_EVIDENCE_SCHEMA_V2:
@@ -206,8 +209,8 @@ class CoreRunEvidence:
             raise EvidenceUnavailable(f"{schema.rsplit('/', 1)[-1]} evidence requires a non-null resolved_config_identity")
         if value["schema"] not in {RUN_EVIDENCE_SCHEMA, RUN_EVIDENCE_SCHEMA_V2, RUN_EVIDENCE_SCHEMA_V3}:
             raise EvidenceUnavailable("unknown evidence schema")
-        if type(value["run_dir"]) is not str or not value["run_dir"]:
-            raise EvidenceUnavailable("run_dir must be a non-empty string")
+        if type(value["run_dir"]) is not str:
+            raise EvidenceUnavailable("run_dir must be a string")
         verdict = value["verdict"]
         if type(verdict) is not str or verdict not in cls.VERDICTS:
             raise EvidenceUnavailable("unknown evidence verdict")
@@ -258,14 +261,6 @@ class CoreRunEvidence:
         keys = {"checkpoint_dir", "schema_version", "next_iteration", "completed_updates"}
         if not isinstance(value, Mapping) or set(value) != keys:
             raise EvidenceUnavailable("checkpoint has invalid keys")
-        if type(value["checkpoint_dir"]) is not str:
-            raise EvidenceUnavailable("checkpoint text fields have invalid types")
-        if type(value["schema_version"]) is not int:
-            raise EvidenceUnavailable("checkpoint schema_version must be an integer")
-        if type(value["next_iteration"]) is not int or type(value["completed_updates"]) is not int:
-            raise EvidenceUnavailable("checkpoint counters have invalid types")
-        if value["next_iteration"] < 0 or value["completed_updates"] < 0:
-            raise EvidenceUnavailable("checkpoint counters must be nonnegative")
         return MappingProxyType(dict(value))
 
     @classmethod
@@ -274,11 +269,7 @@ class CoreRunEvidence:
             return None
         if not isinstance(value, Mapping) or set(value) != {"code", "reason"}:
             raise EvidenceUnavailable("refusal has invalid keys")
-        if type(value["code"]) is not str or value["code"] not in cls.REFUSAL_CODES:
-            raise EvidenceUnavailable("unknown refusal code")
-        if type(value["reason"]) is not str:
-            raise EvidenceUnavailable("refusal reason must be a string")
-        return MappingProxyType({"code": value["code"], "reason": value["reason"]})
+        return MappingProxyType({str(key): str(item) for key, item in value.items()})
 
     @staticmethod
     def _identity(value: Any) -> MappingProxyType | None:
@@ -469,4 +460,4 @@ class TPENEvidence:
         return CoreRunEvidence.from_mapping(decoded)
 
 
-__all__ = ["CHILD_CONTEXT_KEYS_ENV", "CHILD_OBSERVATION_FILENAME", "CONTEXT_ENV_KEY_PATTERN", "CoreRunEvidence", "EvidenceUnavailable", "REFUSAL_CODES", "RUN_EVIDENCE_SCHEMA", "RUN_EVIDENCE_SCHEMA_V2", "RUN_EVIDENCE_SCHEMA_V3", "TPENCommand", "TPENEvidence"]
+__all__ = ["CHILD_CONTEXT_KEYS_ENV", "CHILD_OBSERVATION_FILENAME", "CONTEXT_ENV_KEY_PATTERN", "CoreRunEvidence", "EvidenceUnavailable", "RUN_EVIDENCE_SCHEMA", "RUN_EVIDENCE_SCHEMA_V2", "RUN_EVIDENCE_SCHEMA_V3", "TPENCommand", "TPENEvidence"]

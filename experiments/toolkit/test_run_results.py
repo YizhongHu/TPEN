@@ -18,7 +18,7 @@ import sys
 
 import pytest
 
-from experiments.toolkit.run_results import ManifestRefusal, OUTCOME_STATUSES, read
+from experiments.toolkit.run_results import ManifestRefusal, OUTCOME_STATUSES, _core_outcome, read
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "run-manifest-v2.json"
@@ -220,6 +220,86 @@ def test_p8_reader_refuses_core_evidence_mismatch(tmp_path: Path) -> None:
     path, _ = _materialized_manifest(tmp_path)
     with pytest.raises(ManifestRefusal, match="disagrees"):
         read(path, lambda _: {"verdict": "completed", "checkpoint": {"checkpoint_dir": "wrong", "schema_version": 1, "next_iteration": 1, "completed_updates": 1}})
+
+
+def _v3_completed_evidence(core_dir: str, checkpoint_dir: str) -> dict[str, object]:
+    return {
+        "schema": "tpen.run-evidence/v3",
+        "run_dir": core_dir,
+        "verdict": "completed",
+        "run_status": "completed",
+        "checkpoint": {"checkpoint_dir": checkpoint_dir, "schema_version": 1, "next_iteration": 1, "completed_updates": 1},
+        "refusal": None,
+        "resolved_config_identity": {"schema": "tpen-config-identity-v1", "sha256": "a" * 64},
+        "outcome": "completed",
+        "checkpoint_ref": None,
+    }
+
+
+def test_p8_reader_accepts_completed_v3_inspection(tmp_path: Path) -> None:
+    path, core_dir = _materialized_manifest(tmp_path)
+    checkpoint_dir = str(tmp_path / "attempt-1" / "core" / "checkpoint" / "step_000001")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    completed = _v3_completed_evidence(core_dir, checkpoint_dir)
+    payload["attempts"][0]["schema"] = "tpen-executor/manifest-attempt-v2"
+    payload["attempts"][0]["core_outcome"] = {
+        "schema": "tpen-executor/core-outcome-v1", "task_id": "task-a", "attempt_id": "attempt-1",
+        "evidence": completed, "continuation_eligible": False,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    result = read(path, lambda _: completed)
+    assert len(result.chains) == 1
+
+
+def test_p8_reader_refuses_planned_yield_inspection_without_core_outcome(tmp_path: Path) -> None:
+    path, core_dir = _materialized_manifest(tmp_path)
+    checkpoint_dir = str(tmp_path / "attempt-1" / "core" / "checkpoint" / "step_000001")
+    planned = _v3_completed_evidence(core_dir, checkpoint_dir)
+    planned["run_status"] = "planned_yield"
+    planned["outcome"] = "planned_yield"
+    planned["verdict"] = "incomplete"
+    planned["checkpoint_ref"] = {
+        "schema": "tpen.checkpoint-ref/v1", "checkpoint_dir": checkpoint_dir, "schema_version": 1,
+        "kind": "tpen.checkpoint", "next_iteration": 1, "completed_updates": 1,
+        "manifest_sha256": "b" * 64, "model_sha256": "c" * 64, "provenance": {},
+        "content_id": "d" * 64, "profile": "train_resume",
+    }
+    with pytest.raises(ManifestRefusal, match="outcome is not completed"):
+        read(path, lambda _: planned)
+
+
+def test_p8_reader_refuses_planned_yield_committed_with_core_outcome(tmp_path: Path) -> None:
+    path, core_dir = _materialized_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    checkpoint_dir = str(tmp_path / "attempt-1" / "core" / "checkpoint" / "step_000001")
+    planned = _v3_completed_evidence(core_dir, checkpoint_dir)
+    planned["run_status"] = "planned_yield"
+    planned["outcome"] = "planned_yield"
+    planned["verdict"] = "incomplete"
+    planned["checkpoint_ref"] = {
+        "schema": "tpen.checkpoint-ref/v1", "checkpoint_dir": checkpoint_dir, "schema_version": 1,
+        "kind": "tpen.checkpoint", "next_iteration": 1, "completed_updates": 1,
+        "manifest_sha256": "b" * 64, "model_sha256": "c" * 64, "provenance": {},
+        "content_id": "d" * 64, "profile": "train_resume",
+    }
+    payload["attempts"][0]["schema"] = "tpen-executor/manifest-attempt-v2"
+    payload["attempts"][0]["core_outcome"] = {
+        "schema": "tpen-executor/core-outcome-v1", "task_id": "task-a", "attempt_id": "attempt-1",
+        "evidence": planned, "continuation_eligible": True,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ManifestRefusal, match="planned_yield core outcome cannot have a completed operational receipt"):
+        read(path, lambda _: planned)
+
+
+def test_p8_core_outcome_mirrors_completed_and_refused_checkpoint_invariants() -> None:
+    evidence = _v3_completed_evidence("/core", "/core/checkpoint")
+    base = {"schema": "tpen-executor/core-outcome-v1", "task_id": "task-a", "attempt_id": "attempt-1", "continuation_eligible": False}
+    with pytest.raises(ManifestRefusal, match="completed core outcome requires checkpoint"):
+        _core_outcome(dict(base, evidence=dict(evidence, checkpoint=None)), {"task_id": "task-a", "attempt_id": "attempt-1"})
+    refused = dict(evidence, verdict="refused", outcome="unknown", refusal={"code": "refused", "reason": "no"})
+    with pytest.raises(ManifestRefusal, match="refused core outcome requires refusal and no checkpoint"):
+        _core_outcome(dict(base, evidence=refused), {"task_id": "task-a", "attempt_id": "attempt-1"})
 
 
 def test_p8_reader_accepts_optional_placement_receipt_and_surfaces_it(tmp_path: Path) -> None:

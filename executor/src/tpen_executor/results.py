@@ -968,6 +968,8 @@ class ManifestAttempt:
     """
 
     schema: ClassVar[str] = "tpen-executor/manifest-attempt-v1"
+    V1_SCHEMA: ClassVar[str] = schema
+    V2_SCHEMA: ClassVar[str] = "tpen-executor/manifest-attempt-v2"
     task_id: str
     attempt_id: AttemptId
     start_receipt: StartReceipt
@@ -1003,7 +1005,7 @@ class ManifestAttempt:
         object.__setattr__(self, "output_dir", text(self.output_dir, "output_dir"))
 
     def to_dict(self) -> dict[str, Any]:
-        result = {"schema": self.schema, "task_id": self.task_id, "attempt_id": self.attempt_id.value, "start_receipt": self.start_receipt.to_dict(), "outcome_receipt": None if self.outcome_receipt is None else self.outcome_receipt.to_dict(), "output_dir": self.output_dir}
+        result = {"schema": self.V2_SCHEMA if self.core_outcome is not None else self.V1_SCHEMA, "task_id": self.task_id, "attempt_id": self.attempt_id.value, "start_receipt": self.start_receipt.to_dict(), "outcome_receipt": None if self.outcome_receipt is None else self.outcome_receipt.to_dict(), "output_dir": self.output_dir}
         if self.placement_receipt is not None:
             result["placement_receipt"] = self.placement_receipt.to_dict()
         if self.core_outcome is not None:
@@ -1017,11 +1019,23 @@ class ManifestAttempt:
     def from_mapping(cls, data: Any) -> "ManifestAttempt":
         legacy = {"schema", "task_id", "attempt_id", "start_receipt", "outcome_receipt", "output_dir"}
         current = legacy | {"placement_receipt"}
-        core_outcome_only = legacy | {"core_outcome"}
-        current_with_core_outcome = current | {"core_outcome"}
-        if not isinstance(data, Mapping) or set(data) not in (legacy, current, core_outcome_only, current_with_core_outcome):
+        if not isinstance(data, Mapping):
             raise ValueError("ManifestAttempt keys differ")
-        fields(data, set(data), cls.schema, "ManifestAttempt")
+        schema = data.get("schema")
+        if schema == cls.V1_SCHEMA:
+            if set(data) not in (legacy, current):
+                raise ValueError("ManifestAttempt keys differ")
+            fields(data, set(data), cls.V1_SCHEMA, "ManifestAttempt")
+            if "core_outcome" in data:
+                raise ValueError("manifest-attempt-v1 cannot carry core_outcome")
+        elif schema == cls.V2_SCHEMA:
+            if set(data) not in (legacy | {"core_outcome"}, current | {"core_outcome"}):
+                raise ValueError("ManifestAttempt keys differ")
+            fields(data, set(data), cls.V2_SCHEMA, "ManifestAttempt")
+            if data["core_outcome"] is None:
+                raise ValueError("manifest-attempt-v2 requires core_outcome")
+        else:
+            raise ValueError("ManifestAttempt schema is unknown")
         if any(type(data[key]) is not str for key in ("task_id", "attempt_id", "output_dir")): raise TypeError("ManifestAttempt has an invalid scalar field")
         outcome = None if data["outcome_receipt"] is None else OutcomeReceipt.from_mapping(data["outcome_receipt"])
         placement_data = data.get("placement_receipt")

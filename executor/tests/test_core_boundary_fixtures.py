@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from tpen.inspection import RunEvidence
 from tpen_executor.runners import CoreRunEvidence, EvidenceUnavailable
 
 
@@ -19,6 +20,14 @@ FIXTURE_PATHS = (
 V3_FIXTURE_PATHS = (
     REPO_ROOT / "tests" / "contracts" / "fixtures" / "core-run-evidence-v3-planned-yield.json",
     REPO_ROOT / "tests" / "contracts" / "fixtures" / "core-run-evidence-v3-unknown.json",
+)
+CORE_REFUSAL_CODES = (
+    "missing-run-dir", "missing-status", "multiple-status", "malformed-status", "status-io-error",
+    "malformed-run-outcome", "status-outcome-mismatch", "missing-run-identity", "checkpoint-selection-mismatch",
+    "missing-checkpoint-ref", "stale-checkpoint-ref", "model-only-checkpoint", "outcome-checkpoint-mismatch",
+    "unpublished-checkpoint-ref", "unknown-checkpoint-profile", "malformed-run-identity", "missing-checkpoint",
+    "incomplete-checkpoint", "no-train-resume-checkpoint", "checkpoint-io-error", "corrupt-checkpoint",
+    "corrupt-publication-catalog", "torn-publication-catalog",
 )
 
 
@@ -99,3 +108,48 @@ def test_v3_eligibility_requires_planned_yield() -> None:
     payload["verdict"] = "completed"
     evidence = CoreRunEvidence.from_mapping(payload)
     assert evidence.continuation_eligible is False
+
+
+@pytest.mark.parametrize("code", CORE_REFUSAL_CODES)
+def test_v3_refusal_codes_match_core(code: str) -> None:
+    payload = {
+        "schema": "tpen.run-evidence/v3",
+        "run_dir": "/normalized/core",
+        "verdict": "refused",
+        "run_status": "completed",
+        "checkpoint": None,
+        "refusal": {"code": code, "reason": 17},
+        "resolved_config_identity": {"schema": "tpen-config-identity-v1", "sha256": "a" * 64},
+        "outcome": "unknown",
+        "checkpoint_ref": None,
+    }
+    core = RunEvidence.from_mapping(payload)
+    executor = CoreRunEvidence.from_mapping(payload)
+    assert dict(executor.refusal) == core.refusal
+    assert executor.schema == core.schema
+    assert executor.run_dir == core.run_dir
+    assert executor.verdict == core.verdict
+    assert executor.run_status == core.run_status
+    assert executor.checkpoint is None
+    assert dict(executor.resolved_config_identity) == core.resolved_config_identity
+    assert executor.outcome == core.outcome
+    assert executor.checkpoint_ref is None
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: {**payload, "checkpoint": []},
+        lambda payload: {**payload, "checkpoint": {"unexpected": 1}},
+        lambda payload: {**payload, "run_dir": 3},
+        lambda payload: {**payload, "verdict": "completed", "checkpoint": None, "refusal": None, "outcome": "completed", "run_status": "completed"},
+        lambda payload: {**payload, "verdict": "refused", "checkpoint": dict(payload["checkpoint"]), "refusal": {"code": "x", "reason": "y"}},
+    ],
+    ids=["nested-type", "nested-keys", "run-dir-type", "completed-without-checkpoint", "refused-with-checkpoint"],
+)
+def test_v3_malformed_cases_have_core_and_executor_same_verdict(mutate) -> None:
+    payload = _fixture(V3_FIXTURE_PATHS[0])
+    with pytest.raises(Exception):
+        RunEvidence.from_mapping(mutate(payload))
+    with pytest.raises(EvidenceUnavailable):
+        CoreRunEvidence.from_mapping(mutate(payload))

@@ -21,6 +21,8 @@ from typing import Any, Callable, Mapping
 RUN_MANIFEST_V1 = "tpen-executor/run-manifest-v1"
 RUN_MANIFEST_V2 = "tpen-executor/run-manifest-v2"
 RUN_MANIFEST_V3 = "tpen-executor/run-manifest-v3"
+MANIFEST_ATTEMPT_V1 = "tpen-executor/manifest-attempt-v1"
+MANIFEST_ATTEMPT_V2 = "tpen-executor/manifest-attempt-v2"
 ACCEPTED_SEGMENT_SCHEMA = "tpen-executor/accepted-segment-v1"
 SCIENCE_PLACEMENT_RECEIPT_SCHEMA = "tpen-executor/science-placement-receipt-v1"
 SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2 = "tpen-executor/science-placement-receipt-v2"
@@ -984,6 +986,119 @@ def _config_identity(value: Any) -> Mapping[str, str] | None:
     return MappingProxyType({"schema": value["schema"], "sha256": digest})
 
 
+def _evidence_mapping(value: Any, label: str) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    to_dict = getattr(value, "to_dict", None)
+    if not callable(to_dict):
+        raise ManifestRefusal("core-evidence-mismatch", f"{label} is not a mapping")
+    mapped = to_dict()
+    if not isinstance(mapped, Mapping):
+        raise ManifestRefusal("core-evidence-mismatch", f"{label} is not a mapping")
+    return dict(mapped)
+
+
+def _v3_evidence(value: Any, label: str) -> tuple[dict[str, Any], bool]:
+    evidence = dict(_fields(
+        _evidence_mapping(value, label),
+        {
+            "schema", "run_dir", "verdict", "run_status", "checkpoint", "refusal",
+            "resolved_config_identity", "outcome", "checkpoint_ref",
+        },
+        label,
+    ))
+    if evidence["schema"] != "tpen.run-evidence/v3":
+        raise ManifestRefusal("unknown-schema", f"{label} schema is unsupported")
+    _text(evidence["run_dir"], f"{label}.run_dir")
+    _text(evidence["verdict"], f"{label}.verdict")
+    if evidence["verdict"] not in {"completed", "incomplete", "failed", "refused"}:
+        raise ManifestRefusal("malformed-record", f"{label}.verdict is invalid")
+    if evidence["run_status"] is not None:
+        _text(evidence["run_status"], f"{label}.run_status")
+    _text(evidence["outcome"], f"{label}.outcome")
+    if evidence["outcome"] not in {"completed", "planned_yield", "failed", "unknown", "refused"}:
+        raise ManifestRefusal("malformed-record", f"{label}.outcome is invalid")
+    if evidence["verdict"] != "refused" and evidence["run_status"] != evidence["outcome"]:
+        raise ManifestRefusal("malformed-record", f"{label} status disagrees with outcome")
+
+    refusal = evidence["refusal"]
+    if evidence["verdict"] == "refused" and refusal is None:
+        raise ManifestRefusal("malformed-record", f"{label} refused evidence requires refusal")
+    if evidence["verdict"] != "refused" and refusal is not None:
+        raise ManifestRefusal("malformed-record", f"{label} non-refused evidence cannot contain refusal")
+    if refusal is not None:
+        refusal = dict(_fields(refusal, {"code", "reason"}, f"{label}.refusal"))
+        _text(refusal["code"], f"{label}.refusal.code")
+        _text(refusal["reason"], f"{label}.refusal.reason")
+
+    checkpoint = evidence["checkpoint"]
+    if checkpoint is not None:
+        checkpoint = dict(_fields(
+            checkpoint,
+            {"checkpoint_dir", "schema_version", "next_iteration", "completed_updates"},
+            f"{label}.checkpoint",
+        ))
+        _text(checkpoint["checkpoint_dir"], f"{label}.checkpoint.checkpoint_dir")
+        if type(checkpoint["schema_version"]) is not int:
+            raise ManifestRefusal("malformed-record", f"{label}.checkpoint.schema_version must be an integer")
+        _nonnegative_int(checkpoint["next_iteration"], f"{label}.checkpoint.next_iteration")
+        _nonnegative_int(checkpoint["completed_updates"], f"{label}.checkpoint.completed_updates")
+
+    if evidence["verdict"] == "completed" and (checkpoint is None or refusal is not None):
+        raise ManifestRefusal("malformed-record", f"{label} completed evidence requires checkpoint and no refusal")
+    if evidence["verdict"] == "refused" and (refusal is None or checkpoint is not None):
+        raise ManifestRefusal("malformed-record", f"{label} refused evidence requires refusal and no checkpoint")
+
+    identity = _config_identity(evidence["resolved_config_identity"])
+    if identity is None:
+        raise ManifestRefusal("malformed-record", f"{label} requires resolved config identity")
+
+    checkpoint_ref = evidence["checkpoint_ref"]
+    if checkpoint_ref is not None:
+        checkpoint_ref = dict(_fields(
+            checkpoint_ref,
+            {
+                "schema", "checkpoint_dir", "schema_version", "kind", "next_iteration", "completed_updates",
+                "manifest_sha256", "model_sha256", "provenance", "content_id", "profile",
+            },
+            f"{label}.checkpoint_ref",
+        ))
+        if checkpoint_ref["schema"] != "tpen.checkpoint-ref/v1":
+            raise ManifestRefusal("unknown-schema", f"{label}.checkpoint_ref schema is unsupported")
+        _text(checkpoint_ref["checkpoint_dir"], f"{label}.checkpoint_ref.checkpoint_dir")
+        _text(checkpoint_ref["kind"], f"{label}.checkpoint_ref.kind")
+        for key in ("schema_version", "next_iteration", "completed_updates"):
+            _nonnegative_int(checkpoint_ref[key], f"{label}.checkpoint_ref.{key}")
+        for key in ("manifest_sha256", "model_sha256", "content_id"):
+            _sha256(checkpoint_ref[key], f"{label}.checkpoint_ref.{key}")
+        if not isinstance(checkpoint_ref["provenance"], dict):
+            raise ManifestRefusal("malformed-record", f"{label}.checkpoint_ref.provenance must be an object")
+        if checkpoint_ref["profile"] not in {"train_resume", "model_only"}:
+            raise ManifestRefusal("malformed-record", f"{label}.checkpoint_ref.profile is invalid")
+
+    if evidence["outcome"] == "planned_yield" and evidence["verdict"] != "refused":
+        if checkpoint is None or checkpoint_ref is None or checkpoint_ref["profile"] != "train_resume":
+            raise ManifestRefusal("malformed-record", f"{label} planned_yield requires a train_resume checkpoint_ref")
+        if any(checkpoint_ref[key] != checkpoint[key] for key in ("checkpoint_dir", "next_iteration", "completed_updates")):
+            raise ManifestRefusal("malformed-record", f"{label} planned_yield checkpoint_ref does not match checkpoint summary")
+    eligible = (
+        evidence["verdict"] != "refused"
+        and refusal is None
+        and evidence["outcome"] == "planned_yield"
+        and checkpoint is not None
+        and checkpoint_ref is not None
+        and checkpoint_ref["profile"] == "train_resume"
+        and checkpoint_ref["checkpoint_dir"] == checkpoint["checkpoint_dir"]
+        and checkpoint_ref["next_iteration"] == checkpoint["next_iteration"]
+        and checkpoint_ref["completed_updates"] == checkpoint["completed_updates"]
+    )
+    evidence["refusal"] = refusal
+    evidence["checkpoint"] = checkpoint
+    evidence["checkpoint_ref"] = checkpoint_ref
+    evidence["resolved_config_identity"] = dict(identity)
+    return evidence, eligible
+
+
 def _core_outcome(value: Any, attempt: Mapping[str, Any]) -> dict[str, Any]:
     expected = {"schema", "task_id", "attempt_id", "evidence", "continuation_eligible"}
     record = dict(_fields(value, expected, "core outcome record"))
@@ -1025,6 +1140,10 @@ def _core_outcome(value: Any, attempt: Mapping[str, Any]) -> dict[str, Any]:
     if identity is None:
         raise ManifestRefusal("malformed-record", "v3 core outcome requires resolved config identity")
     checkpoint = evidence["checkpoint"]
+    if evidence["verdict"] == "completed" and (checkpoint is None or refusal is not None):
+        raise ManifestRefusal("malformed-record", "completed core outcome requires checkpoint and no refusal")
+    if evidence["verdict"] == "refused" and (refusal is None or checkpoint is not None):
+        raise ManifestRefusal("malformed-record", "refused core outcome requires refusal and no checkpoint")
     if checkpoint is not None:
         checkpoint = dict(_fields(checkpoint, {"checkpoint_dir", "schema_version", "next_iteration", "completed_updates"}, "core outcome checkpoint"))
         _text(checkpoint["checkpoint_dir"], "core_outcome.checkpoint.checkpoint_dir")
@@ -1077,10 +1196,14 @@ def _attempt(value: Any, group_digest: str) -> dict[str, Any]:
     expected = {"schema", "task_id", "attempt_id", "start_receipt", "outcome_receipt", "output_dir"}
     if isinstance(value, dict) and "placement_receipt" in value:
         expected.add("placement_receipt")
-    if isinstance(value, dict) and "core_outcome" in value:
-        expected.add("core_outcome")
-    record = dict(_fields(value, expected, "manifest attempt"))
-    if record["schema"] != "tpen-executor/manifest-attempt-v1":
+    schema = value.get("schema") if isinstance(value, Mapping) else None
+    if schema == MANIFEST_ATTEMPT_V1:
+        record = dict(_fields(value, expected, "manifest attempt"))
+    elif schema == MANIFEST_ATTEMPT_V2:
+        record = dict(_fields(value, expected | {"core_outcome"}, "manifest attempt"))
+        if record["core_outcome"] is None:
+            raise ManifestRefusal("malformed-record", "manifest-attempt-v2 requires core_outcome")
+    else:
         raise ManifestRefusal("unknown-schema", "manifest attempt schema is unsupported")
     for key in ("task_id", "attempt_id", "output_dir"):
         _text(record[key], f"attempt.{key}")
@@ -1297,13 +1420,13 @@ def _check_segments(attempts: tuple[dict[str, Any], ...], segments: tuple[dict[s
         previous[segment["task_id"]] = segment
 
 
-def _public_evidence(value: Any) -> tuple[str, Mapping[str, Any] | None, dict[str, str] | None]:
-    if isinstance(value, Mapping):
-        verdict = value.get("verdict")
-        checkpoint = value.get("checkpoint")
-    else:
-        verdict = getattr(value, "verdict", None)
-        checkpoint = getattr(value, "checkpoint", None)
+def _public_evidence(value: Any) -> tuple[str, Mapping[str, Any] | None, dict[str, str] | None, dict[str, Any] | None]:
+    mapped = _evidence_mapping(value, "core inspection result")
+    if mapped.get("schema") == "tpen.run-evidence/v3":
+        evidence, _eligible = _v3_evidence(mapped, "core inspection evidence")
+        return evidence["verdict"], evidence["checkpoint"], evidence["resolved_config_identity"], evidence
+    verdict = mapped.get("verdict")
+    checkpoint = mapped.get("checkpoint")
     if type(verdict) is not str or verdict not in {"completed", "incomplete"}:
         raise ManifestRefusal("core-evidence-mismatch", "core inspection did not report completed or incomplete evidence")
     if not isinstance(checkpoint, Mapping):
@@ -1316,8 +1439,7 @@ def _public_evidence(value: Any) -> tuple[str, Mapping[str, Any] | None, dict[st
         raise ManifestRefusal("core-evidence-mismatch", "core.schema_version must be an integer")
     _nonnegative_int(checkpoint["next_iteration"], "core.next_iteration")
     _nonnegative_int(checkpoint["completed_updates"], "core.completed_updates")
-    raw_identity = value.get("resolved_config_identity") if isinstance(value, Mapping) else getattr(value, "resolved_config_identity", None)
-    return verdict, checkpoint, _config_identity(raw_identity)
+    return verdict, checkpoint, _config_identity(mapped.get("resolved_config_identity")), None
 
 
 def _default_inspect_run(path: str | Path) -> Any:
@@ -1373,7 +1495,18 @@ def read(
             raise
         except Exception as error:
             raise ManifestRefusal("core-evidence-unavailable", f"core inspection failed for {run_dir}: {error}") from error
-        _, checkpoint, evidence_identity = _public_evidence(evidence)
+        _, checkpoint, evidence_identity, inspected_v3 = _public_evidence(evidence)
+        if inspected_v3 is not None and inspected_v3["outcome"] != "completed":
+            raise ManifestRefusal("segment-on-noncompleted-core-outcome", "accepted segment inspection outcome is not completed")
+        core_outcome = attempt.get("core_outcome")
+        if core_outcome is not None and inspected_v3 is None:
+            raise ManifestRefusal("core-evidence-mismatch", "core outcome requires a v3 inspection result")
+        if core_outcome is not None and inspected_v3 is not None:
+            if core_outcome["evidence"] != inspected_v3:
+                raise ManifestRefusal("core-evidence-mismatch", f"core outcome disagrees with inspected evidence {segment['attempt_id']!r}")
+            _inspected_eligible = _v3_evidence(inspected_v3, "core inspection evidence")[1]
+            if core_outcome["continuation_eligible"] != _inspected_eligible:
+                raise ManifestRefusal("core-evidence-mismatch", f"core outcome eligibility disagrees with inspected evidence {segment['attempt_id']!r}")
         if dict(checkpoint) != {
             "checkpoint_dir": segment["checkpoint_dir"],
             "schema_version": checkpoint["schema_version"],
@@ -1421,6 +1554,8 @@ __all__ = [
     "CommittedSegment",
     "ManifestReadError",
     "ManifestRefusal",
+    "MANIFEST_ATTEMPT_V1",
+    "MANIFEST_ATTEMPT_V2",
     "PreservedAttempt",
     "RUN_MANIFEST_V1",
     "RUN_MANIFEST_V2",
