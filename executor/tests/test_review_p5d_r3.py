@@ -142,6 +142,6 @@ def test_r3_t3_already_reaped_leader_does_not_require_another_wait(tmp_path, mon
     assert observed.value is original
     assert child.returncode == -9
     assert len(waits) == 1
-    # The owned-group kill and the cleanup quiescence step are both SIGKILL;
-    # membership observation is signal-free.
-    assert kills == [(child.pid, signal.SIGKILL), (child.pid, signal.SIGKILL)]
+    # The first owner SIGKILL is followed by ChildProcessError at the second
+    # observation, so cleanup conservatively skips a second signal after reap.
+    assert kills == [(child.pid, signal.SIGKILL)]
