@@ -33,6 +33,9 @@ def test_manifest_counts_sources_and_admission_reason() -> None:
     assert manifest["provenance"]["design_document"]["sha256"] == manifest_module.DESIGN_DOC_SHA256
     assert len(manifest["cells"]) == 120
     assert len(manifest["contexts"]) == 2
+    rendered = manifest_module.render_manifest()
+    assert rendered["counts"] == manifest["counts"]
+    assert [row["status"] for row in rendered["rows"]] == [row["status"] for row in manifest["rows"]]
     sources = manifest["provenance"]["coordinate_sources"]
     assert set(sources) >= {"stage", "optimizer", "context", "seed", "horizon", "walkers", "admission"}
     assert {sources[key]["evidence_class"] if isinstance(sources[key]["evidence_class"], str) else tuple(sources[key]["evidence_class"]) for key in sources} >= {"RELAYED"}
