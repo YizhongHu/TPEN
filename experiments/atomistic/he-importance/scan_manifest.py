@@ -108,8 +108,6 @@ def _materialized_rows() -> dict[str, Any]:
                     "seed_label": cell.manifest["seed_identity"]["label"],
                     "status": optimizer_cell["status"],
                     "approval_sources": _ROW_SOURCE_REFS,
-                    "horizon": horizon,
-                    "walkers": walker_count,
                     **(
                         {"unavailable_reason": optimizer_cell["unavailable_reason"]}
                         if "unavailable_reason" in optimizer_cell

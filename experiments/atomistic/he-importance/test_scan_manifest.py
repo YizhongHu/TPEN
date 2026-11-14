@@ -126,8 +126,6 @@ def test_manifest_counts_sources_and_admission_reason() -> None:
                 for candidate in roster["rows"]
                 if candidate["row_id"] == row["row_id"]
             )
-        assert row["horizon"] == manifest["horizon"]
-        assert row["walkers"] == manifest["walkers"]
 
 
 def test_manifest_tampering_and_unknown_rows_refuse(tmp_path: Path) -> None:
@@ -277,7 +275,8 @@ def test_every_admitted_manifest_row_consumes_materialized_w4096(
     assert len(admitted_rows) == 128
     for row in admitted_rows:
         cell = cells_by_row_id[row["row_id"]]
-        assert runner.stage_coordinate.walker_count(cell.manifest) == row["walkers"] == 4096
+        cell_record = next(candidate for candidate in manifest["cells"] if candidate["cell_id"] == row["cell_id"])
+        assert runner.stage_coordinate.walker_count(cell.manifest) == cell_record["walkers"] == 4096
         assert runner.execute(
             _args(runner, HERE / "o1_scan_manifest_v1.json", row["row_id"], tmp_path / row["row_id"])
         ) == 0
