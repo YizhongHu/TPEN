@@ -248,6 +248,78 @@ def test_manifest_positive_consumes_same_runner_limbs_and_horizon(
     assert manifest_report_json["resolved_config"]["runner"]["trainer"] == flag_report_json["resolved_config"]["runner"]["trainer"]
 
 
+def test_rehashed_referenced_cell_optimizer_drift_refuses_before_output_or_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A row must not authorize a different optimizer cell under the same cell id."""
+
+    runner = _runner()
+    manifest = manifest_module.load_manifest()
+    row = _row(manifest, status="available", method="adam")
+    forged = deepcopy(manifest)
+    cell = next(candidate for candidate in forged["cells"] if candidate["cell_id"] == row["cell_id"])
+    levels = cell["optimizer"]["levels"]
+    original_lr = levels["lr"]
+    levels["lr"] = next(
+        candidate
+        for candidate in (0.0005, 0.0015, 0.005, 0.015)
+        if candidate != original_lr
+    )
+    forged["content_hash"] = manifest_module.content_hash(manifest_module._body_without_hash(forged))
+    path = tmp_path / "forged-cell.json"
+    path.write_text(json.dumps(forged), encoding="utf-8")
+    output_root = tmp_path / "forged-cell-out"
+
+    try:
+        runner.execute(_args(runner, path, row["row_id"], output_root))
+    except runner.scan_manifest.ScanManifestError as error:
+        assert "stale or tampered" in str(error)
+    else:
+        report = json.loads(capsys.readouterr().out)
+        pytest.fail(
+            "rehashed cell drift was accepted: "
+            f"requested_row_id={row['row_id']} "
+            f"requested_cell_id={row['cell_id']} "
+            f"selected_content_hash={report['train_packet']['content_hash']} "
+            f"selected_optimizer={report['selection']['selected']['optimizer']} "
+            f"requested_lr={original_lr!r} forged_lr={levels['lr']!r} "
+            f"consumed_lr={report['resolved_config']['optimizer']['lr']!r}"
+        )
+    assert not output_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_fragment"),
+    [
+        ("horizon", "horizon"),
+        ("provenance", "provenance"),
+    ],
+)
+def test_rehashed_frozen_manifest_metadata_drift_refuses_before_output_or_model(
+    tmp_path: Path,
+    mutation: str,
+    expected_fragment: str,
+) -> None:
+    """Frozen scientific metadata must be authenticated beyond the selected row."""
+
+    runner = _runner()
+    manifest = manifest_module.load_manifest()
+    row = _row(manifest, status="available", method="adam")
+    forged = deepcopy(manifest)
+    if mutation == "horizon":
+        forged["horizon"] = 1
+    else:
+        forged["provenance"]["manager_ruling"] += " (forged citation)"
+    forged["content_hash"] = manifest_module.content_hash(manifest_module._body_without_hash(forged))
+    path = tmp_path / f"forged-{mutation}.json"
+    path.write_text(json.dumps(forged), encoding="utf-8")
+    output_root = tmp_path / f"forged-{mutation}-out"
+
+    with pytest.raises(runner.scan_manifest.ScanManifestError, match=expected_fragment):
+        runner.execute(_args(runner, path, row["row_id"], output_root))
+    assert not output_root.exists()
+
+
 def test_every_admitted_manifest_row_consumes_materialized_w4096(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
