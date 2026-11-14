@@ -1,0 +1,127 @@
+"""Contract tests for Stage-1 protocol identity and seed injectivity."""
+
+from __future__ import annotations
+
+import pytest
+
+from experiments.atomistic.stage1.protocol import (
+    _encode_seed,
+    Protocol,
+    ProtocolError,
+    STAGE1_PROTOCOL,
+    build_manifest,
+    evaluation_seed,
+    identity_expectations,
+    smoke_seed,
+    stable_row_id,
+    training_seed,
+)
+
+
+SHA1 = "a" * 40
+SHA256 = "b" * 64
+
+
+def _manifest(checkpoints: list[int] = [7, 101]) -> list[dict[str, object]]:
+    bindings = {(system, lineage, checkpoint): SHA256
+                for system in ("hooke1", "he", "h2")
+                for lineage in range(3)
+                for checkpoint in checkpoints}
+    return build_manifest(protocol=STAGE1_PROTOCOL, source_sha=SHA1,
+                          config_sha256=SHA256, checkpoints=checkpoints,
+                          lineage_seeds=[11, 12, 13], checkpoint_sha256=bindings,
+                          results_root="/external/stage1")
+
+
+def test_protocol_has_no_implicit_partial_defaults() -> None:
+    with pytest.raises(TypeError):
+        Protocol()  # type: ignore[call-arg]
+
+
+def test_seed_and_row_identity_are_injective_for_non_default_coordinates() -> None:
+    coords = [(system, lineage, checkpoint, stream)
+              for system in ("hooke1", "he", "h2")
+              for lineage in (0, 1, 7)
+              for checkpoint in (7, 101, 100003)
+              for stream in (0, 3)]
+    assert len({evaluation_seed(system=s, lineage=l, checkpoint=c, stream=t)
+                for s, l, c, t in coords}) == len(coords)
+    assert len({stable_row_id(system=s, kind="eval", lineage=l, checkpoint=c, stream=t)
+                for s, l, c, t in coords}) == len(coords)
+    assert len({training_seed(system=s, lineage=l, lineage_seed=17)
+                for s in ("hooke1", "he", "h2") for l in (0, 1, 7)}) == 9
+
+
+def test_seed_encoding_covers_field_maxima_and_old_collision_boundaries() -> None:
+    rows = [
+        (kind, system, 0, 0, 0, 0)
+        for kind in ("smoke", "train", "eval")
+        for system in ("hooke1", "he", "h2")
+    ] + [
+        (kind, system, 999_999, 999_999, 999_999, 999_999_999)
+        for kind in ("train", "eval")
+        for system in ("hooke1", "he", "h2")
+    ]
+    seeds = {
+        (smoke_seed(system=system) if kind == "smoke" else
+         training_seed(system=system, lineage=lineage, lineage_seed=lineage_seed)
+         if kind == "train" else
+         evaluation_seed(system=system, lineage=lineage, checkpoint=checkpoint, stream=stream))
+        for kind, system, lineage, checkpoint, stream, lineage_seed in rows
+    }
+    assert len(seeds) == len(rows)
+    for system in ("hooke1", "he", "h2"):
+        maxima = {
+            _encode_seed(kind=kind, system=system, lineage=999_999,
+                         checkpoint=999_999, stream=999_999,
+                         lineage_seed=999_999_999)
+            for kind in ("smoke", "train", "eval")
+        }
+        assert len(maxima) == 3
+    assert evaluation_seed(system="hooke1", lineage=0, checkpoint=400_000, stream=0) != smoke_seed(system="hooke1")
+    assert evaluation_seed(system="hooke1", lineage=0, checkpoint=500_000, stream=0) != smoke_seed(system="he")
+
+
+def test_manifest_binds_real_identity_and_checkpoint_expectations() -> None:
+    rows = _manifest()
+    assert len(rows) == 84
+    assert len({row["row_id"] for row in rows}) == 84
+    assert all("seed" in row for row in rows)
+    assert len({row["seed"] for row in rows}) == 84
+    eval_row = next(row for row in rows if row["kind"] == "eval")
+    assert eval_row["source_sha"] == SHA1
+    assert eval_row["config_sha256"] == SHA256
+    expected = identity_expectations(eval_row)
+    assert set(expected) == {"expected_checkpoint_sha256"}
+    assert expected["expected_checkpoint_sha256"] == SHA256
+    assert "resolved_config_identity" not in eval_row
+
+
+@pytest.mark.parametrize("field,value", [("source_sha", "tiny"), ("config_sha256", "tiny")])
+def test_manifest_rejects_placeholder_identity(field: str, value: str) -> None:
+    kwargs = {"source_sha": SHA1, "config_sha256": SHA256, field: value}
+    with pytest.raises(ProtocolError):
+        build_manifest(protocol=STAGE1_PROTOCOL, checkpoints=[7], lineage_seeds=[11, 12, 13],
+                       checkpoint_sha256={(s, l, 7): SHA256 for s in ("hooke1", "he", "h2")
+                                          for l in range(3)},
+                       results_root="/external/stage1", **kwargs)
+
+
+def test_manifest_rejects_placeholder_config_sha256() -> None:
+    with pytest.raises(ProtocolError, match="config_sha256"):
+        build_manifest(protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256="tiny",
+                       checkpoints=[7], lineage_seeds=[11, 12, 13],
+                       checkpoint_sha256={(s, l, 7): SHA256 for s in ("hooke1", "he", "h2")
+                                          for l in range(3)},
+                       results_root="/external/stage1")
+
+
+def test_manifest_rejects_relative_results_root() -> None:
+    with pytest.raises(ProtocolError, match="results_root must be an absolute"):
+        build_manifest(
+            protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256=SHA256,
+            checkpoints=[7], lineage_seeds=[11, 12, 13],
+            checkpoint_sha256={(s, l, 7): SHA256 for s in ("hooke1", "he", "h2")
+                               for l in range(3)},
+            results_root="relative/stage1",
+        )
