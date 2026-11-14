@@ -11,6 +11,7 @@ from experiments.atomistic.stage1.protocol import (
     build_manifest,
     evaluation_seed,
     identity_expectations,
+    smoke_seed,
     stable_row_id,
     training_seed,
 )
@@ -48,6 +49,27 @@ def test_seed_and_row_identity_are_injective_for_non_default_coordinates() -> No
                 for s, l, c, t in coords}) == len(coords)
     assert len({training_seed(system=s, lineage=l, lineage_seed=17)
                 for s in ("hooke1", "he", "h2") for l in (0, 1, 7)}) == 9
+
+
+def test_seed_encoding_covers_field_maxima_and_old_collision_boundaries() -> None:
+    rows = [
+        ("smoke", system, 0, 0, 0, 0)
+        for system in ("hooke1", "he", "h2")
+    ] + [
+        (kind, system, 999_999, 999_999, 999_999, 999_999_999)
+        for kind in ("train", "eval")
+        for system in ("hooke1", "he", "h2")
+    ]
+    seeds = {
+        (smoke_seed(system=system) if kind == "smoke" else
+         training_seed(system=system, lineage=lineage, lineage_seed=lineage_seed)
+         if kind == "train" else
+         evaluation_seed(system=system, lineage=lineage, checkpoint=checkpoint, stream=stream))
+        for kind, system, lineage, checkpoint, stream, lineage_seed in rows
+    }
+    assert len(seeds) == len(rows)
+    assert evaluation_seed(system="hooke1", lineage=0, checkpoint=400_000, stream=0) != smoke_seed(system="hooke1")
+    assert evaluation_seed(system="hooke1", lineage=0, checkpoint=500_000, stream=0) != smoke_seed(system="he")
 
 
 def test_manifest_binds_real_identity_and_v2_expectations() -> None:

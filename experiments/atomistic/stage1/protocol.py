@@ -9,6 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import base64
+import binascii
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -17,8 +19,13 @@ SYSTEMS = ("hooke1", "he", "h2")
 KINDS = ("smoke", "train", "eval")
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-EVAL_SEED_BASE = 10**9
-_SYSTEM_SEED_STRIDE = 10**18
+# Seed coordinates are encoded as fixed-width mixed-radix fields.  The kind
+# and system fields lead every seed, so no coordinate in one namespace can
+# alias a coordinate in another namespace.
+_KIND_RADIX = len(KINDS)
+_SYSTEM_RADIX = len(SYSTEMS)
+_COORDINATE_RADIX = 10**6
+_LINEAGE_SEED_RADIX = 10**9
 
 
 class ProtocolError(ValueError):
@@ -116,8 +123,8 @@ def training_seed(*, system: str, lineage: int, lineage_seed: int) -> int:
     if (system not in SYSTEMS or lineage < 0 or lineage >= 10**6
             or lineage_seed < 0 or lineage_seed >= 10**9):
         raise ProtocolError("invalid training seed coordinates")
-    return (SYSTEMS.index(system) * _SYSTEM_SEED_STRIDE
-            + lineage * 10**9 + lineage_seed)
+    return _encode_seed(kind="train", system=system, lineage=lineage,
+                        lineage_seed=lineage_seed)
 
 
 def smoke_seed(*, system: str) -> int:
@@ -125,7 +132,7 @@ def smoke_seed(*, system: str) -> int:
 
     if system not in SYSTEMS:
         raise ProtocolError("invalid smoke seed system")
-    return SYSTEMS.index(system) * _SYSTEM_SEED_STRIDE + 9 * 10**17
+    return _encode_seed(kind="smoke", system=system)
 
 
 def evaluation_seed(*, system: str, lineage: int, checkpoint: int, stream: int) -> int:
@@ -135,9 +142,29 @@ def evaluation_seed(*, system: str, lineage: int, checkpoint: int, stream: int) 
             or lineage >= 10**6 or checkpoint >= 10**6 or stream >= 10**6):
         raise ProtocolError("invalid evaluation seed coordinates")
     # The checkpoint is a coordinate, not an array index, so non-default lists
-    # cannot alias one another.  The system namespace also separates studies.
-    return (SYSTEMS.index(system) * _SYSTEM_SEED_STRIDE + 5 * 10**17
-            + checkpoint * 10**12 + lineage * 10**6 + stream)
+    # cannot alias one another.  The leading kind/system fields separate all
+    # three row kinds and all three systems.
+    return _encode_seed(kind="eval", system=system, lineage=lineage,
+                        checkpoint=checkpoint, stream=stream)
+
+
+def _encode_seed(*, kind: str, system: str, lineage: int = 0,
+                 checkpoint: int = 0, stream: int = 0,
+                 lineage_seed: int = 0) -> int:
+    """Encode the bounded seed coordinates with documented fixed radices."""
+
+    if kind not in KINDS or system not in SYSTEMS:
+        raise ProtocolError("invalid seed namespace")
+    fields = (lineage, checkpoint, stream, lineage_seed)
+    limits = (_COORDINATE_RADIX, _COORDINATE_RADIX,
+              _COORDINATE_RADIX, _LINEAGE_SEED_RADIX)
+    if any(value < 0 or value >= limit for value, limit in zip(fields, limits)):
+        raise ProtocolError("seed coordinate exceeds its fixed field width")
+    namespace = KINDS.index(kind) * _SYSTEM_RADIX + SYSTEMS.index(system)
+    encoded = namespace
+    for value, radix in zip(fields, limits):
+        encoded = encoded * radix + value
+    return encoded
 
 
 def identity_expectations(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -158,6 +185,53 @@ def identity_expectations(row: Mapping[str, Any]) -> dict[str, Any]:
             row.get("checkpoint_sha256"), length=64, field="checkpoint_sha256"
         ),
     }
+
+
+def decode_binding(token: str) -> dict[str, Any]:
+    """Decode the launcher's complete row binding before loading a config."""
+
+    try:
+        padding = "=" * (-len(token) % 4)
+        value = json.loads(base64.urlsafe_b64decode(token + padding))
+    except (ValueError, TypeError, binascii.Error, json.JSONDecodeError) as exc:
+        raise ProtocolError("binding is not valid URL-safe JSON") from exc
+    if not isinstance(value, dict):
+        raise ProtocolError("binding must decode to a row object")
+    return value
+
+
+def validate_gateway_binding(*, binding: str, overrides: list[str], kind: str,
+                             expected_identity: str | None = None,
+                             expected_checkpoint_sha256: str | None = None) -> dict[str, Any]:
+    """Validate that gateway arguments still match the rendered row binding."""
+
+    row = decode_binding(binding)
+    if row.get("kind") != kind:
+        raise ProtocolError("binding kind does not match gateway")
+    expected = {f"runtime.seed={row['seed']}"}
+    if kind == "eval":
+        expected.update({
+            f"evaluation_sampler.n_walkers={row['walkers']}",
+            f"evaluation_tasks.mcmc_energy.generator.n_draws={row['draws']}",
+            f"load.path={row['checkpoint_path']}", "load.mode=model_only",
+            "load.strict=true",
+        })
+        if expected_identity is None or expected_checkpoint_sha256 is None:
+            raise ProtocolError("eval requires strict restore and expected identity")
+        identity = decode_binding(expected_identity).get("resolved_config_identity")
+        if identity != row.get("resolved_config_identity"):
+            raise ProtocolError("expected resolved-config identity does not match binding")
+        _require_sha(expected_checkpoint_sha256, length=64,
+                     field="expected_checkpoint_sha256")
+        if expected_checkpoint_sha256 != row.get("checkpoint_sha256"):
+            raise ProtocolError("expected checkpoint sha256 does not match binding")
+    else:
+        expected.update({f"sampler.n_walkers={row['walkers']}",
+                         f"trainer.max_steps={row['updates']}"})
+    if not expected.issubset(set(overrides)):
+        missing = sorted(expected.difference(overrides))
+        raise ProtocolError(f"binding overrides are incomplete: {missing}")
+    return row
 
 
 def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,

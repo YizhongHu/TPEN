@@ -15,10 +15,10 @@ if [[ "$SLURM_JOB_PARTITION" != "$REQUESTED_PARTITION" ]]; then
   echo "STAGE1_GUARD partition delivered=$SLURM_JOB_PARTITION requested=$REQUESTED_PARTITION" >&2
   exit 2
 fi
-SCRATCH_BASE="${STAGE1_SCRATCH_BASE:-/scratch}"
+SCRATCH_BASE='__SCRATCH_BASE__'
 JOB_ROOT="$SCRATCH_BASE/$USER/$SLURM_JOB_ID"
-RESULTS_ROOT="__RESULTS_ROOT__"
-HEAD_SHA="__HEAD_SHA__"
+RESULTS_ROOT='__RESULTS_ROOT__'
+HEAD_SHA='__HEAD_SHA__'
 if [[ "$RESULTS_ROOT" != "/n/netscratch/kozinsky_lab/Lab/rhu/"* ]]; then
   echo "STAGE1_GUARD results root outside /n/netscratch/kozinsky_lab/Lab/rhu/" >&2
   exit 2
