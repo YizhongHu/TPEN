@@ -289,6 +289,7 @@ def test_swapped_system_descriptor_is_rejected(tmp_path: Path, key: str) -> None
         metadata[key] = _serialize_system_descriptor(other)
     else:
         metadata[key] = other.system_id()
+    metadata["record_content_id"] = trajectory_records._record_content_id(metadata)
     _rewrite_metadata(artifact, metadata)
     with pytest.raises(TamperedTrajectoryRecordError):
         inspect_trajectory_record(artifact.metadata_path)
