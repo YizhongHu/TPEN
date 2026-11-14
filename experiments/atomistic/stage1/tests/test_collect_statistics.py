@@ -112,6 +112,54 @@ def test_stream_aggregate_requires_the_complete_four_stream_set(
         collector.collect(document)
 
 
+@pytest.mark.parametrize("stream_indices", [[0, 1, 2, 2], [0, 1, 2, 4]])
+def test_stream_aggregate_rejects_duplicate_or_gapped_indices(
+    monkeypatch, tmp_path: Path, stream_indices
+) -> None:
+    """Duplicate or gapped stream indices must not form an aggregate."""
+    document = _manifest(tmp_path)
+    rows = document["rows"]
+    for row, stream in zip(rows, stream_indices):
+        row["stream"] = stream
+    document["manifest_hash"] = manifest_hash(rows)
+    identity = {"schema": "tpen-config-identity-v1", "sha256": "b" * 64}
+    monkeypatch.setattr(
+        collector,
+        "inspect_run",
+        lambda path: {
+            "verdict": "completed",
+            "resolved_config_identity": identity,
+            "source_git_sha": "a" * 40,
+        },
+    )
+    monkeypatch.setattr(collector, "_record_path", lambda path: path / "m.json")
+    monkeypatch.setattr(
+        collector,
+        "inspect_trajectory_record",
+        lambda path, **kwargs: SimpleNamespace(
+            record_schema="trajectory_records/v2",
+            draw_count=2,
+            walker_count=2,
+            row_count=4,
+            finite_count=4,
+            mean=2.5,
+            variance=1.25,
+            csv_sha256="d" * 64,
+            system_id="he_atom",
+            execution_method_id="method",
+            resolved_config_identity=identity,
+            model_provenance="checkpoint",
+            checkpoint_sha256="c" * 64,
+            record_content_id="e" * 64,
+        ),
+    )
+    monkeypatch.setattr(collector, "read_energy_grid", lambda record: [[1.0, 2.0], [3.0, 4.0]])
+    monkeypatch.setattr(collector, "_reference", lambda system_id, registry_path: (-2.9, "transcribed"))
+
+    with pytest.raises(collector.CollectionError, match="four streams"):
+        collector.collect(document)
+
+
 def test_duplicate_record_sidecars_are_refused(monkeypatch, tmp_path: Path) -> None:
     """A fixed-path lookup must not silently choose among duplicate records."""
     document = _manifest(tmp_path, streams=1)

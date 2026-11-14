@@ -27,7 +27,29 @@ def _load(value: Mapping[str, Any] | str | Path) -> Mapping[str, Any]:
 
 
 def _record_path(run_dir: Path) -> Path:
-    """Resolve evaluator's fixed task output path (task ``mcmc_energy``)."""
+    """Resolve the sole evaluator metadata sidecar.
+
+    Parameters
+    ----------
+    run_dir
+        Completed evaluation run directory containing the ``mcmc_energy``
+        task output.
+
+    Returns
+    -------
+    pathlib.Path
+        The evaluator-owned ``sampled_eval_table.metadata.json`` path.
+
+    Raises
+    ------
+    CollectionError
+        If the fixed sidecar is missing or duplicate metadata sidecars are
+        present.
+    """
+    task_dir = run_dir / "mcmc_energy"
+    sidecars = sorted(task_dir.glob("*.metadata.json"))
+    if len(sidecars) > 1:
+        raise CollectionError(f"duplicate trajectory metadata sidecars in {task_dir}")
     path = run_dir / "mcmc_energy" / "sampled_eval_table.metadata.json"
     if not path.is_file():
         raise CollectionError(f"missing trajectory metadata sidecar {path}")
@@ -151,11 +173,22 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
             "reference": {"energy_hartree": reference, "confidence": confidence,
                           "error": mean - reference, "absolute_error": abs(mean - reference)},
         })
-    aggregates: dict[tuple[str, int, int], list[float]] = defaultdict(list)
+    aggregates: dict[tuple[str, int, int], list[tuple[int, float]]] = defaultdict(list)
     for record in records:
-        aggregates[(record["system_id"], record["lineage"], record["checkpoint"])].append(record["statistics"]["mean"])
+        aggregates[(record["system_id"], record["lineage"], record["checkpoint"])].append(
+            (record["stream"], record["statistics"]["mean"])
+        )
     aggregate_rows = []
-    for (system_id, lineage, checkpoint), means in sorted(aggregates.items()):
+    for (system_id, lineage, checkpoint), stream_records in sorted(aggregates.items()):
+        stream_indices = [stream for stream, _ in stream_records]
+        # Aggregates are science outputs only when all planned streams are present.
+        stream_count = len(stream_indices)
+        if stream_count < 4 or set(stream_indices) != set(range(stream_count)):
+            raise CollectionError(
+                f"{system_id}/{lineage}/{checkpoint}: aggregate requires four streams "
+                f"with contiguous unique indices, got {stream_indices}"
+            )
+        means = [mean for _, mean in stream_records]
         average = sum(means) / len(means)
         aggregate_rows.append({"system_id": system_id, "lineage": lineage, "checkpoint": checkpoint,
                                "kind": "stream_mean_aggregate", "stream_count": len(means),
