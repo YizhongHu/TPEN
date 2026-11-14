@@ -1,8 +1,13 @@
-"""CX-04a core continuation admission gates."""
+"""CX-04a core continuation admission gates.
+
+The ``fork`` refusal is executor-owned by CX-04b; this core slice exposes the
+stable code but does not detect executor admission-ledger conflicts.
+"""
 
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -114,6 +119,11 @@ def test_decode_and_admit_real_published_checkpoint(tmp_path: Path) -> None:
     assert result.accepted
     assert result.restore_request is not None
     assert result.restore_request.ref == ref
+    assert result.restore_request.ref.content_id == ref.content_id
+    assert result.restore_request.load["mode"] == "train_resume"
+    assert result.restore_request.target_iterations == _TARGET
+    assert result.restore_request.next_iteration == ref.next_iteration
+    assert result.restore_request.completed_updates == ref.completed_updates
     assert result.restore_request.load == {"mode": "train_resume", "path": str(ref.checkpoint_dir)}
     assert decoded.to_dict() == request.to_dict()
     assert decoded.to_dict()["schema"] == SUCCESSOR_ADMISSION_SCHEMA
@@ -148,11 +158,23 @@ def test_non_eligible_outcomes_are_refused(tmp_path: Path, outcome: str) -> None
     assert result.refusal.code is AdmissionRefusalCode.NON_ELIGIBLE_OUTCOME
 
 
-def test_false_eligibility_is_refused(tmp_path: Path) -> None:
+def test_false_eligibility_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ref = _checkpoint(tmp_path)
     evidence = _evidence(ref)
-    evidence.checkpoint_ref["profile"] = "model_only"
+    monkeypatch.setattr(RunEvidence, "continuation_eligible", property(lambda _evidence: False))
     result = select_successor_admission(_intent(), _request(ref, evidence=evidence))
+    assert result.refusal is not None
+    assert result.refusal.code is AdmissionRefusalCode.NON_ELIGIBLE_OUTCOME
+
+
+def test_wire_model_only_profile_is_refused_by_admission(tmp_path: Path) -> None:
+    ref = _checkpoint(tmp_path)
+    wire = _request(ref).to_dict()
+    wire["core_evidence"]["checkpoint_ref"]["profile"] = "model_only"
+
+    decoded = decode_successor_admission_request(json.dumps(wire).encode())
+    result = select_successor_admission(_intent(), decoded)
+
     assert result.refusal is not None
     assert result.refusal.code is AdmissionRefusalCode.MODEL_ONLY
 
@@ -200,6 +222,18 @@ def test_content_id_mutation_is_corrupt_ref(tmp_path: Path) -> None:
     assert result.refusal.code is AdmissionRefusalCode.CORRUPT_REF
 
 
+@pytest.mark.parametrize("field", ["manifest_sha256", "model_sha256", "provenance"])
+def test_ref_manifest_provenance_hash_corruption_is_corrupt_ref(tmp_path: Path, field: str) -> None:
+    ref = _checkpoint(tmp_path)
+    evidence = _evidence(ref)
+    evidence.checkpoint_ref[field] = {"tampered": True} if field == "provenance" else "0" * 64
+
+    result = select_successor_admission(_intent(), _request(ref, evidence=evidence))
+
+    assert result.refusal is not None
+    assert result.refusal.code is AdmissionRefusalCode.CORRUPT_REF
+
+
 def test_live_model_mutation_is_stale_ref(tmp_path: Path) -> None:
     ref = _checkpoint(tmp_path)
     model_path = ref.checkpoint_dir / "model.pt"
@@ -227,3 +261,67 @@ def test_identity_mismatch_is_refused(tmp_path: Path) -> None:
     result = select_successor_admission(wrong_intent, request)
     assert result.refusal is not None
     assert result.refusal.code is AdmissionRefusalCode.IDENTITY_MISMATCH
+
+
+def test_config_identity_mismatch_is_refused(tmp_path: Path) -> None:
+    ref = _checkpoint(tmp_path)
+    request = _request(ref)
+    predecessor = replace(
+        request.predecessor,
+        resolved_config_identity={
+            "schema": request.predecessor.resolved_config_identity["schema"],
+            "sha256": "0" * 64,
+        },
+    )
+
+    result = select_successor_admission(
+        _intent(), replace(request, predecessor=predecessor)
+    )
+
+    assert result.refusal is not None
+    assert result.refusal.code is AdmissionRefusalCode.IDENTITY_MISMATCH
+
+
+def test_predecessor_successor_task_id_mismatch_is_refused(tmp_path: Path) -> None:
+    ref = _checkpoint(tmp_path)
+    request = _request(ref)
+    successor = replace(request.successor, task_id="task-2")
+
+    result = select_successor_admission(_intent(), replace(request, successor=successor))
+
+    assert result.refusal is not None
+    assert result.refusal.code is AdmissionRefusalCode.IDENTITY_MISMATCH
+
+
+def test_checkpoint_counter_overflow_is_identity_mismatch(tmp_path: Path) -> None:
+    ref = _checkpoint(tmp_path)
+    request = replace(_request(ref), target_iterations=2)
+    intent = ScienceIntent({"input": "cx04"}, target_iterations=2)
+
+    result = select_successor_admission(intent, request)
+
+    assert result.refusal is not None
+    assert result.refusal.code is AdmissionRefusalCode.IDENTITY_MISMATCH
+
+
+def test_checkpoint_counter_mismatch_with_summary_is_identity_mismatch(tmp_path: Path) -> None:
+    ref = _checkpoint(tmp_path)
+    evidence = _evidence(ref)
+    evidence.checkpoint["completed_updates"] += 1
+
+    result = select_successor_admission(_intent(), _request(ref, evidence=evidence))
+
+    assert result.refusal is not None
+    assert result.refusal.code is AdmissionRefusalCode.IDENTITY_MISMATCH
+
+
+def test_status_ref_disagreement_is_ambiguous_yield(tmp_path: Path) -> None:
+    ref = _checkpoint(tmp_path)
+    wire = _request(ref).to_dict()
+    wire["core_evidence"]["run_status"] = "failed"
+
+    decoded = decode_successor_admission_request(wire)
+    result = select_successor_admission(_intent(), decoded)
+
+    assert result.refusal is not None
+    assert result.refusal.code is AdmissionRefusalCode.AMBIGUOUS_YIELD

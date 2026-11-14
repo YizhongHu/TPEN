@@ -282,9 +282,65 @@ class SuccessorAdmissionRequest:
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class _AdmissionDecodeEnvelope:
+    """Preserve a typed semantic refusal found while decoding wire evidence.
+
+    ``RunEvidence`` intentionally rejects a model-only planned yield during
+    construction.  The admission boundary still needs to expose its stable
+    refusal code, so the wire decoder carries that one semantic fact until the
+    admission profile gate can make the decision.  Other malformed request
+    shapes continue to raise from the strict decoder.
+    """
+
+    code: AdmissionRefusalCode
+    message: str
+    profile: str | None = None
+
+
+def _wire_decode_refusal(data: Any) -> _AdmissionDecodeEnvelope | None:
+    """Classify semantic v3 evidence errors that the core decoder can name."""
+
+    if not isinstance(data, Mapping):
+        return None
+    evidence = data.get("core_evidence")
+    if not isinstance(evidence, Mapping) or evidence.get("schema") != RUN_EVIDENCE_SCHEMA_V3:
+        return None
+
+    outcome = evidence.get("outcome")
+    if outcome == "planned_yield":
+        checkpoint_ref = evidence.get("checkpoint_ref")
+        if isinstance(checkpoint_ref, Mapping) and checkpoint_ref.get("profile") == "model_only":
+            return _AdmissionDecodeEnvelope(
+                AdmissionRefusalCode.NON_ELIGIBLE_OUTCOME,
+                "core evidence is not a non-refused continuation-eligible planned yield",
+                profile="model_only",
+            )
+        if checkpoint_ref is None:
+            return _AdmissionDecodeEnvelope(
+                AdmissionRefusalCode.AMBIGUOUS_YIELD,
+                "planned-yield evidence does not carry both checkpoint bindings",
+            )
+        if evidence.get("verdict") != "refused" and evidence.get("run_status") != outcome:
+            return _AdmissionDecodeEnvelope(
+                AdmissionRefusalCode.AMBIGUOUS_YIELD,
+                "planned-yield evidence status disagrees with its typed outcome",
+            )
+        return _AdmissionDecodeEnvelope(
+            AdmissionRefusalCode.CORRUPT_REF,
+            "planned-yield checkpoint_ref is malformed",
+        )
+    if outcome in {"completed", "failed", "unknown", "refused"}:
+        return _AdmissionDecodeEnvelope(
+            AdmissionRefusalCode.NON_ELIGIBLE_OUTCOME,
+            "core evidence is not a non-refused continuation-eligible planned yield",
+        )
+    return None
+
+
 def decode_successor_admission_request(
     data: bytes | str | Mapping[str, Any],
-) -> SuccessorAdmissionRequest:
+) -> SuccessorAdmissionRequest | _AdmissionDecodeEnvelope:
     """Decode one closed successor-admission request mapping or JSON payload."""
 
     if isinstance(data, (bytes, str)):
@@ -293,7 +349,13 @@ def decode_successor_admission_request(
         except (TypeError, json.JSONDecodeError) as exc:
             raise ValueError("successor admission request is not valid JSON") from exc
 
-    return SuccessorAdmissionRequest.from_mapping(data)
+    try:
+        return SuccessorAdmissionRequest.from_mapping(data)
+    except (KeyError, TypeError, ValueError):
+        refusal = _wire_decode_refusal(data)
+        if refusal is not None:
+            return refusal
+        raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -953,7 +1015,7 @@ def _admission_refusal(code: AdmissionRefusalCode, message: str) -> SuccessorAdm
 def _request_and_intent(
     first: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
     second: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
-) -> tuple[ScienceIntent, SuccessorAdmissionRequest]:
+) -> tuple[ScienceIntent, SuccessorAdmissionRequest | None, _AdmissionDecodeEnvelope | None]:
     """Accept either intent-first or request-first adapter call order."""
 
     if isinstance(first, ScienceIntent):
@@ -962,12 +1024,14 @@ def _request_and_intent(
         intent, request_value = second, first
     else:
         raise TypeError("one admission adapter argument must be a ScienceIntent")
-    request = (
-        request_value
-        if isinstance(request_value, SuccessorAdmissionRequest)
-        else SuccessorAdmissionRequest.from_mapping(request_value)
-    )
-    return intent, request
+    if isinstance(request_value, SuccessorAdmissionRequest):
+        return intent, request_value, None
+    if isinstance(request_value, _AdmissionDecodeEnvelope):
+        return intent, None, request_value
+    decoded = decode_successor_admission_request(request_value)
+    if isinstance(decoded, _AdmissionDecodeEnvelope):
+        return intent, None, decoded
+    return intent, decoded, None
 
 
 def select_successor_admission(
@@ -991,29 +1055,41 @@ def select_successor_admission(
         create a successor directory, or write any ledger.
     """
 
-    intent, request = _request_and_intent(intent, request)
-    predecessor = request.predecessor
-    successor = request.successor
-    evidence = request.core_evidence
-
-    if (
-        evidence.schema == RUN_EVIDENCE_SCHEMA_V3
-        and evidence.outcome == "planned_yield"
-        and (evidence.checkpoint is None or evidence.checkpoint_ref is None)
-    ):
-        return _admission_refusal(
-            AdmissionRefusalCode.AMBIGUOUS_YIELD,
-            "planned-yield evidence does not carry both checkpoint bindings",
-        )
-    if (
-        evidence.schema == RUN_EVIDENCE_SCHEMA_V3
-        and evidence.checkpoint_ref is not None
-        and evidence.checkpoint_ref.get("profile") == "model_only"
-    ):
+    intent, request, decode_refusal = _request_and_intent(intent, request)
+    if decode_refusal is not None:
+        checkpoint_profile = decode_refusal.profile
+    else:
+        assert request is not None
+        evidence = request.core_evidence
+        if (
+            evidence.schema == RUN_EVIDENCE_SCHEMA_V3
+            and evidence.outcome == "planned_yield"
+            and (evidence.checkpoint is None or evidence.checkpoint_ref is None)
+        ):
+            return _admission_refusal(
+                AdmissionRefusalCode.AMBIGUOUS_YIELD,
+                "planned-yield evidence does not carry both checkpoint bindings",
+            )
+        checkpoint_profile = None if evidence.checkpoint_ref is None else evidence.checkpoint_ref.get("profile")
+    if checkpoint_profile is not None and checkpoint_profile != "train_resume":
         return _admission_refusal(
             AdmissionRefusalCode.MODEL_ONLY,
             "successor admission requires a train_resume checkpoint profile",
         )
+    if decode_refusal is not None:
+        return _admission_refusal(decode_refusal.code, decode_refusal.message)
+    assert request is not None
+    predecessor = request.predecessor
+    successor = request.successor
+    evidence = request.core_evidence
+
+    if evidence.schema == RUN_EVIDENCE_SCHEMA_V3 and evidence.checkpoint is not None and evidence.checkpoint_ref is not None:
+        for key in ("checkpoint_dir", "next_iteration", "completed_updates"):
+            if evidence.checkpoint.get(key) != evidence.checkpoint_ref.get(key):
+                return _admission_refusal(
+                    AdmissionRefusalCode.IDENTITY_MISMATCH,
+                    f"core checkpoint summary disagrees with checkpoint_ref.{key}",
+                )
     if (
         evidence.schema != RUN_EVIDENCE_SCHEMA_V3
         or evidence.verdict != "incomplete"
@@ -1049,11 +1125,6 @@ def select_successor_admission(
         )
 
     ref_mapping = dict(evidence.checkpoint_ref)
-    if ref_mapping.get("profile") != "train_resume":
-        return _admission_refusal(
-            AdmissionRefusalCode.MODEL_ONLY,
-            "successor admission requires a train_resume checkpoint profile",
-        )
     ref_fields = {key: value for key, value in ref_mapping.items() if key != "profile"}
     try:
         ref = CheckpointRef.from_mapping(ref_fields)
