@@ -250,7 +250,11 @@ def test_manifest_positive_consumes_same_runner_limbs_and_horizon(
     assert runner.execute(flag_args) == 0
     flag_report_json = json.loads(capsys.readouterr().out)
     assert manifest_report_json["walkers"] == 4096
-    assert manifest_report_json["selection"]["selected"]["content_hash"] == row["row_id"]
+    selected = manifest_report_json["selection"]["selected"]
+    assert selected["context"] == row["context"]
+    assert selected["seed_label"] == row["seed_label"]
+    assert selected["optimizer"]["method"] == cell["optimizer"]["method"]
+    assert selected["optimizer"]["levels"] == cell["optimizer"]["levels"]
     assert manifest_report_json["train_packet"]["content_hash"] == row["row_id"]
     assert manifest_report_json["resolved_config"]["runner"]["trainer"]["max_steps"] == 50000
     assert manifest_report_json["resolved_config"]["runner"]["sampler"] == flag_report_json["resolved_config"]["runner"]["sampler"]
