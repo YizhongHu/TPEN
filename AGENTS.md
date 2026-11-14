@@ -154,8 +154,8 @@ For each TO implementation slice:
 2. The worker claims before editing with a short renewable TTL.
 3. The worker pushes the PR, records its full head, releases the claim, then finishes.
 4. The orchestrator confirms release and preserved work before worker archival.
-5. A separate verifier checks the current PR head with the `pr-verification` skill; archive only after its receipt. On a passing receipt, advance the item to `review`; this unblocks downstream slices with `unblockAt: review`.
-6. Run tiered review with the `pr-review-loop` skill; ready requires verification at the current head.
+5. A separate verifier checks the current PR head with the `pr-verification` skill; record its receipt before tiered review and archive only after its receipt.
+6. Run tiered review with the `pr-review-loop` skill; review-loop notes are work-role notes. After recording the review summary and marking the PR ready for human merge, advance the item to `review`; `unblockAt: review` therefore fires at ready.
 7. Any new commit returns the PR to draft unless the new head's git tree equals the verified head's tree (record both SHAs and the tree hash).
 8. After confirmed merge, delete the merged branch and worktree; record both deletions in `pr-disposition`.
 9. Complete/cancel only after that disposition.
