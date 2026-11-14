@@ -1127,11 +1127,11 @@ class ManifestAttempt:
                 raise ValueError("manifest-attempt-v1 cannot carry core_outcome")
         elif schema == cls.V2_SCHEMA:
             allowed = {
-                base | optional
+                frozenset(base | optional)
                 for base in (legacy, current)
                 for optional in ({"core_outcome"}, {"successor_admission"}, v2_optional)
             }
-            if set(data) not in allowed:
+            if frozenset(data) not in allowed:
                 raise ValueError("ManifestAttempt keys differ")
             fields(data, set(data), cls.V2_SCHEMA, "ManifestAttempt")
             if data.get("core_outcome") is None and data.get("successor_admission") is None:

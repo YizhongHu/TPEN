@@ -9,11 +9,11 @@ import pytest
 
 from tpen_executor.contracts import AttemptId
 from tpen_executor._codec import digest
+from tpen_executor.results import CoreOutcomeRecord, ManifestAttempt
 from tpen_executor.storage import AdmissionFork, FenceRejected
 
 from test_review_p8_executor_r1 import setup_store
 from test_core_evidence_v3 import _planned_evidence, _typed_evidence
-from tpen_executor.results import CoreOutcomeRecord
 
 
 def _planned_attempt(tmp_path: Path):
@@ -52,6 +52,19 @@ def test_identical_successor_admission_replay_is_idempotent_and_fork_is_rejected
     fork_request = store.build_successor_admission_request(fence, AttemptId("successor-2"), "a" * 64, 10)
     with pytest.raises(AdmissionFork, match="fork"):
         store.record_successor_admission(fence, fork_request, "d" * 64)
+
+
+def test_manifest_attempt_v2_round_trips_core_only_and_core_plus_admission(tmp_path: Path) -> None:
+    store, group, fence = _planned_attempt(tmp_path)
+    request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+    core_only = store.manifest(group).attempts[0]
+    assert core_only.successor_admission is None
+    assert ManifestAttempt.decode(core_only.encode()) == core_only
+
+    store.record_successor_admission(fence, request, "b" * 64)
+    core_and_admission = store.manifest(group).attempts[0]
+    assert core_and_admission.successor_admission is not None
+    assert ManifestAttempt.decode(core_and_admission.encode()) == core_and_admission
 
 
 def test_noneligible_outcome_writes_no_admission_or_segment(tmp_path: Path) -> None:
