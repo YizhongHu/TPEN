@@ -181,6 +181,119 @@ class OutcomeReceipt:
 
 
 @frozen_record
+class RemoteTeardownReceipt:
+    """Durable controller record of one validated remote leaf teardown.
+
+    The leaf-authored wire acknowledgement remains in the transport result;
+    this executor-owned record is the controller's attempt-bound proof that
+    the acknowledgement was validated before terminal publication.
+
+    Parameters
+    ----------
+    task_id : str
+        Logical task identity.
+    attempt_id : AttemptId
+        Attempt identity bound to the receipt.
+    allocation_id : AllocationId
+        Allocation identity echoed by the leaf.
+    backend_job_id : BackendJobId
+        Backend job identity echoed by the leaf.
+    group_digest : str
+        Digest of the issuing ready group.
+    child_group_reaped : bool
+        Leaf-confirmed child-group reap fact.
+    inspection : str
+        Leaf teardown inspection state, either ``complete`` or ``not-run``.
+    leaf_result_digest : str
+        Digest of the canonical, already validated leaf result bytes/data.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/remote-teardown-v1"
+    task_id: str
+    attempt_id: AttemptId
+    allocation_id: AllocationId
+    backend_job_id: BackendJobId
+    group_digest: str
+    child_group_reaped: bool
+    inspection: str
+    leaf_result_digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
+        _identity(self.attempt_id, AttemptId, "attempt_id")
+        _identity(self.allocation_id, AllocationId, "allocation_id")
+        _identity(self.backend_job_id, BackendJobId, "backend_job_id")
+        object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
+        if type(self.child_group_reaped) is not bool:
+            raise TypeError("child_group_reaped must be a boolean")
+        if type(self.inspection) is not str or self.inspection not in {"complete", "not-run"}:
+            raise ValueError("inspection must be complete or not-run")
+        object.__setattr__(self, "leaf_result_digest", sha256_text(self.leaf_result_digest, "leaf_result_digest"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "task_id": self.task_id,
+            "attempt_id": self.attempt_id.value,
+            "allocation_id": self.allocation_id.value,
+            "backend_job_id": self.backend_job_id.value,
+            "group_digest": self.group_digest,
+            "child_group_reaped": self.child_group_reaped,
+            "inspection": self.inspection,
+            "leaf_result_digest": self.leaf_result_digest,
+        }
+
+    @property
+    def result_digest(self) -> str:
+        """Return the canonical validated leaf-result digest."""
+
+        return self.leaf_result_digest
+
+    def encode(self) -> bytes:
+        """Encode the receipt as canonical JSON bytes."""
+
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "RemoteTeardownReceipt":
+        """Decode one receipt from its exact closed mapping shape."""
+
+        fields(
+            data,
+            {
+                "schema", "task_id", "attempt_id", "allocation_id", "backend_job_id",
+                "group_digest", "child_group_reaped", "inspection", "leaf_result_digest",
+            },
+            cls.schema,
+            cls.__name__,
+        )
+        if any(
+            type(data[key]) is not str
+            for key in (
+                "task_id", "attempt_id", "allocation_id", "backend_job_id",
+                "group_digest", "inspection", "leaf_result_digest",
+            )
+        ) or type(data["child_group_reaped"]) is not bool:
+            raise TypeError("RemoteTeardownReceipt has an invalid field type")
+        return cls(
+            data["task_id"],
+            AttemptId(data["attempt_id"]),
+            AllocationId(data["allocation_id"]),
+            BackendJobId(data["backend_job_id"]),
+            data["group_digest"],
+            data["child_group_reaped"],
+            data["inspection"],
+            data["leaf_result_digest"],
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "RemoteTeardownReceipt":
+        """Decode one receipt from JSON-shaped data."""
+
+        return cls.from_mapping(decode_json(data))
+
+
+@frozen_record
 class CoreOutcomeRecord:
     """Typed v3 core outcome retained beside the operational receipt.
 
@@ -1409,7 +1522,7 @@ class RunManifest:
 
 
 __all__ = [
-    "AcceptedSegment", "AllocationObservation", "CoreOutcomeRecord", "ManifestAttempt", "OutcomeReceipt", "OUTCOME_STATUSES",
+    "AcceptedSegment", "AllocationObservation", "CoreOutcomeRecord", "ManifestAttempt", "OutcomeReceipt", "RemoteTeardownReceipt", "OUTCOME_STATUSES",
     "PLACEMENT_NOT_SAMPLED_MESSAGE", "PLACEMENT_RECEIPT_TYPES", "PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE",
     "PLACEMENT_UNQUALIFIED_MESSAGE", "PLACEMENT_V3_WARNINGS", "RunManifest", "SciencePlacementReceipt",
     "SciencePlacementReceiptV2", "SciencePlacementReceiptV3", "StartReceipt", "SuccessorAdmission", "SuccessorAdmissionRecord", "decode_placement_receipt",

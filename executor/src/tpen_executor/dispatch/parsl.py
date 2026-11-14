@@ -34,7 +34,7 @@ from ..environments import PreparedPythonEnvironment, SourceScript
 from ..placement import BindingError, PlacementRefusal, WorkerBinding, bindings_from_allocation, physical_slots_from_allocation, slots_from_allocation
 from ..programs import WorkerProgram
 from .._records import frozen_record
-from .._codec import canonical_bytes
+from .._codec import canonical_bytes, digest
 from ..results import RunManifest
 from ..contracts import ReadyGroup
 from ..lifecycle.attached import AttachedAllocation
@@ -400,6 +400,7 @@ class _RemoteLeaf:
     def __init__(self, request: LeafRequest) -> None:
         self.request = request
         self.future: Any = None
+        self.validated_result: LeafResult | None = None
 
     def request_kill(self) -> None:
         """Request leaf-owned cancellation without signalling a remote PID.
@@ -447,6 +448,7 @@ class _RemoteLeaf:
             # attempt's cancellation: a real cancellation legitimately skips
             # inspection (review P2-4).
             result = validate_leaf_result(self.request, LeafResult.decode(payload), cancellation_expected=True)
+            self.validated_result = result
         except BaseException:
             return False
         return result.teardown.get("child_group_reaped") is True
@@ -473,6 +475,7 @@ class _RemoteLeaf:
         if type(payload) is not bytes:
             raise TypeError("remote leaf returned non-bytes")
         result = validate_leaf_result(self.request, LeafResult.decode(payload))
+        self.validated_result = result
         if result.science is None:
             error = result.launch_error or {"type": "unknown", "message": ""}
             if error["type"] == LeafPlacementRefused.__name__:
@@ -493,6 +496,30 @@ class _RemoteLeaf:
             science["proc_start_ticks"],
         )
         return outcome, {"process": None, "evidence": _LeafEvidence(result)}
+
+
+class _RemoteCompletionLifecycle:
+    """Route shared completion publication through the remote terminal gate."""
+
+    def __init__(self, lifecycle: AttachedAllocation, handle: _RemoteLeaf) -> None:
+        self._lifecycle = lifecycle
+        self._handle = handle
+        self.store = lifecycle.store
+        self.allocation = lifecycle.allocation
+
+    def finish(self, fence: Any, status: str, finished_at_utc: str, result_digest: str | None = None) -> Any:
+        """Publish only after the handle retained a validated leaf result."""
+        result = self._handle.validated_result
+        if result is None:
+            raise RuntimeError("remote completion lacks a validated leaf result")
+        return self._lifecycle.finish_remote(
+            fence,
+            result.teardown,
+            digest(result.to_dict()),
+            status,
+            finished_at_utc,
+            result_digest,
+        )
 
 
 def _poll_sleep(seconds: float) -> None:
@@ -982,6 +1009,10 @@ class ParslDispatcher(DispatcherContract):
                 record = active.pop(completed)
                 binding = record["binding"]
                 is_remote = isinstance(record["handle"], _RemoteLeaf)
+                completion_lifecycle = (
+                    _RemoteCompletionLifecycle(lifecycle, record["handle"])
+                    if is_remote else lifecycle
+                )
                 completion_started = False
                 remote_unconfirmed = False
                 try:
@@ -1006,7 +1037,7 @@ class ParslDispatcher(DispatcherContract):
                         group,
                         record["member"],
                         record["configured"],
-                        lifecycle,
+                        completion_lifecycle,
                         record["fence"],
                         record["materialized"],
                         record["environment"],
@@ -1025,7 +1056,7 @@ class ParslDispatcher(DispatcherContract):
                         group,
                         record["member"],
                         record["configured"],
-                        lifecycle,
+                        completion_lifecycle,
                         record["fence"],
                         record["materialized"],
                         record["environment"],
@@ -1168,8 +1199,20 @@ class ParslDispatcher(DispatcherContract):
                     acknowledged = False
                     _note(record, error)
                 try:
-                    status = "failed" if acknowledged else "remote-quiescence-unconfirmed"
-                    lifecycle.finish(record["fence"], status, self._utc_now(), None)
+                    if acknowledged:
+                        result = handle.validated_result
+                        if result is None:
+                            raise RuntimeError("remote teardown acknowledgement lacks validated result")
+                        lifecycle.finish_remote(
+                            record["fence"],
+                            result.teardown,
+                            digest(result.to_dict()),
+                            "failed",
+                            self._utc_now(),
+                            result.result_digest(),
+                        )
+                    else:
+                        lifecycle.finish(record["fence"], "remote-quiescence-unconfirmed", self._utc_now(), None)
                 except BaseException as error:
                     _note(record, error)
                 continue

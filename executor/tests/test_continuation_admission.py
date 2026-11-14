@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 
 from tpen_executor.contracts import AttemptId
-from tpen_executor._codec import digest
-from tpen_executor.results import CoreOutcomeRecord, ManifestAttempt
+from tpen_executor._codec import canonical_bytes, digest
+from tpen_executor.results import CoreOutcomeRecord, ManifestAttempt, RemoteTeardownReceipt
 from tpen_executor.storage import AdmissionFork, FenceRejected
 
 from test_review_p8_executor_r1 import setup_store
@@ -21,13 +21,32 @@ def _planned_attempt(tmp_path: Path):
     fence = store.begin_attempt(group, "a", allocation, "2026-11-14T00:00:00Z")
     core_dir = Path(fence.output_dir) / "core"
     core_dir.mkdir()
-    store.finish_attempt(fence, "failed", "2026-11-14T00:01:00Z")
+    store.finish_remote_attempt(
+        fence,
+        {
+            "schema": "tpen-executor/leaf-teardown-v1",
+            "group_digest": fence.group_digest,
+            "task_id": fence.task_id,
+            "attempt_id": fence.attempt_id.value,
+            "allocation_id": fence.allocation_id,
+            "backend_job_id": allocation.backend_job_id.value,
+            "child_group_reaped": True,
+            "inspection": "complete",
+        },
+        "c" * 64,
+        "failed",
+        "2026-11-14T00:01:00Z",
+    )
     store.record_core_outcome(fence, _planned_evidence(core_dir))
     return store, group, fence
 
 
 def test_build_and_record_successor_admission_uses_canonical_core_record(tmp_path: Path) -> None:
     store, group, fence = _planned_attempt(tmp_path)
+    receipt_path = Path(fence.output_dir, "remote-teardown.json")
+    receipt = RemoteTeardownReceipt.decode(receipt_path.read_bytes())
+    assert receipt_path.read_bytes() == receipt.encode()
+    assert receipt.child_group_reaped is True and receipt.inspection == "complete"
     request = store.build_successor_admission_request(
         fence, AttemptId("successor-1"), "a" * 64, 10,
     )
@@ -111,4 +130,99 @@ def test_noneligible_outcome_writes_no_admission_or_segment(tmp_path: Path) -> N
         store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
     assert not (Path(fence.output_dir).parent / "successor-admissions").exists()
     assert not (Path(fence.output_dir) / "segment.json").exists()
+
+
+def test_missing_positive_remote_receipt_refuses_without_request_or_ledger(tmp_path: Path) -> None:
+    store, _group, fence = _planned_attempt(tmp_path)
+    Path(fence.output_dir, "remote-teardown.json").unlink()
+    with pytest.raises(FenceRejected, match="teardown-unconfirmed"):
+        store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+    assert not (Path(fence.output_dir).parent / "successor-admissions").exists()
+
+
+def test_unconfirmed_remote_outcome_refuses_and_writes_no_ledger(tmp_path: Path) -> None:
+    store, group, allocation = setup_store(tmp_path)
+    fence = store.begin_attempt(group, "a", allocation, "2026-11-14T00:00:00Z")
+    core_dir = Path(fence.output_dir) / "core"
+    core_dir.mkdir()
+    store.finish_attempt(fence, "remote-quiescence-unconfirmed", "2026-11-14T00:01:00Z")
+    store.record_core_outcome(fence, _planned_evidence(core_dir))
+    with pytest.raises(FenceRejected, match="teardown-unconfirmed"):
+        store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+    assert not (Path(fence.output_dir).parent / "successor-admissions").exists()
+
+
+def test_unconfirmed_status_is_refused_even_with_a_positive_receipt(tmp_path: Path) -> None:
+    store, _group, fence = _planned_attempt(tmp_path)
+    outcome_path = Path(fence.output_dir, "outcome.json")
+    payload = json.loads(outcome_path.read_text(encoding="utf-8"))
+    payload["status"] = "remote-quiescence-unconfirmed"
+    outcome_path.write_bytes(canonical_bytes(payload))
+    with pytest.raises(FenceRejected, match="teardown-unconfirmed"):
+        store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+    assert not (Path(fence.output_dir).parent / "successor-admissions").exists()
+
+
+@pytest.mark.parametrize("mutation", ["task", "attempt", "allocation", "backend", "false-reaped", "not-run", "noncanonical"])
+def test_invalid_remote_receipt_refuses_the_same_admission_gate(tmp_path: Path, mutation: str) -> None:
+    store, _group, fence = _planned_attempt(tmp_path)
+    receipt_path = Path(fence.output_dir, "remote-teardown.json")
+    receipt = RemoteTeardownReceipt.decode(receipt_path.read_bytes())
+    payload = receipt.to_dict()
+    if mutation == "task":
+        payload["task_id"] = "crossed-task"
+    elif mutation == "attempt":
+        payload["attempt_id"] = "crossed-attempt"
+    elif mutation == "allocation":
+        payload["allocation_id"] = "crossed-allocation"
+    elif mutation == "backend":
+        payload["backend_job_id"] = "crossed-backend"
+    elif mutation == "false-reaped":
+        payload["child_group_reaped"] = False
+    elif mutation == "not-run":
+        payload["inspection"] = "not-run"
+    else:
+        receipt_path.write_bytes(b"{" + b"\"schema\": \"tpen-executor/remote-teardown-v1\"}")
+        payload = None
+    if payload is not None:
+        replacement = RemoteTeardownReceipt.from_mapping(payload)
+        receipt_path.write_bytes(replacement.encode())
+    with pytest.raises(FenceRejected, match="teardown-unconfirmed"):
+        store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+    assert not (Path(fence.output_dir).parent / "successor-admissions").exists()
+
+
+def test_fresh_store_reads_positive_receipt_and_preserves_replay_fork_rules(tmp_path: Path) -> None:
+    store, group, fence = _planned_attempt(tmp_path)
+    request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+    reopened = type(store)(store.root)
+    first = reopened.record_successor_admission(fence, request, "b" * 64)
+    assert reopened.record_successor_admission(fence, request, "b" * 64) == first
+    with pytest.raises(AdmissionFork, match="fork"):
+        reopened.record_successor_admission(
+            fence,
+            reopened.build_successor_admission_request(fence, AttemptId("successor-2"), "a" * 64, 10),
+            "d" * 64,
+        )
+    assert reopened.manifest(group).segments == ()
+
+
+def test_record_successor_admission_rechecks_teardown_under_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store, _group, fence = _planned_attempt(tmp_path)
+    request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+    original = store._continuation_predecessor_locked
+    calls = 0
+
+    def remove_after_record_build(current_store, current_fence, task_dir):
+        nonlocal calls
+        calls += 1
+        result = original(current_fence, task_dir)
+        if calls == 2:
+            Path(current_fence.output_dir, "remote-teardown.json").unlink()
+        return result
+
+    monkeypatch.setattr(type(store), "_continuation_predecessor_locked", remove_after_record_build)
+    with pytest.raises(FenceRejected, match="teardown-unconfirmed"):
+        store.record_successor_admission(fence, request, "b" * 64)
+    assert not (Path(fence.output_dir).parent / "successor-admissions").exists()
 

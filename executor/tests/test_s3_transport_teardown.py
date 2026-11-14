@@ -27,6 +27,7 @@ import pytest
 import time
 
 from tpen_executor.contracts import AllocationId, BackendJobId
+from tpen_executor._codec import digest
 from tpen_executor.dispatch import parsl as parsl_dispatch
 from tpen_executor.dispatch.parsl import _RemoteLeaf
 from tpen_executor.dispatch.transport import (
@@ -40,6 +41,7 @@ from tpen_executor.dispatch.transport import (
 from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.placement import AllocationSlot
 from tpen_executor.storage import DirectoryStore
+from tpen_executor.results import RemoteTeardownReceipt
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.workers import SubprocessWorker
@@ -351,6 +353,47 @@ def test_wait_for_teardown_accepts_a_real_cancelled_leafs_uninspected_ack(tmp_pa
     assert handle.wait_for_teardown(1.0) is True
 
 
+def test_validated_remote_leaf_persists_receipt_before_terminal_outcome(tmp_path: Path) -> None:
+    """A validated leaf ack is the only producer of positive remote proof."""
+    request, (_group, _allocation, lifecycle, _configured, fence) = _request(tmp_path)
+    result = _synthetic_result(request)
+    handle = _RemoteLeaf(request)
+    future: Future[bytes] = Future()
+    handle.bind_future(future)
+    future.set_result(result.encode())
+    assert handle.wait_for_teardown(0.1) is True
+    assert handle.validated_result == result
+
+    lifecycle.finish_remote(
+        fence,
+        result.teardown,
+        digest(result.to_dict()),
+        "failed",
+        "2026-11-11T00:00:01+00:00",
+        result.result_digest(),
+    )
+    receipt_path = Path(fence.output_dir, "remote-teardown.json")
+    outcome_path = Path(fence.output_dir, "outcome.json")
+    receipt = RemoteTeardownReceipt.decode(receipt_path.read_bytes())
+    assert receipt_path.read_bytes() == receipt.encode()
+    assert receipt.leaf_result_digest == digest(result.to_dict())
+    assert receipt.child_group_reaped is True and receipt.inspection == "complete"
+    assert outcome_path.exists() and receipt_path.stat().st_mtime_ns <= outcome_path.stat().st_mtime_ns
+
+
+def test_crossed_remote_leaf_ack_persists_only_unconfirmed_outcome(tmp_path: Path) -> None:
+    """A decoded but crossed reply never reaches the remote receipt helper."""
+    request, (_group, _allocation, lifecycle, _configured, fence) = _request(tmp_path)
+    handle = _RemoteLeaf(request)
+    future: Future[bytes] = Future()
+    handle.bind_future(future)
+    crossed = dataclasses.replace(_synthetic_result(request), attempt_id="crossed-attempt")
+    future.set_result(crossed.encode())
+    assert handle.wait_for_teardown(0.1) is False
+    lifecycle.finish(fence, "remote-quiescence-unconfirmed", "2026-11-11T00:00:01+00:00", None)
+    assert not Path(fence.output_dir, "remote-teardown.json").exists()
+
+
 
 # ------------------------------------------------- dispatcher-level M1-M4
 
@@ -511,6 +554,13 @@ def test_dispatcher_cancel_settles_every_leaf_before_dfk_cleanup(
         return real_finish(self, fence, status, *args, **kwargs)
 
     monkeypatch.setattr(AttachedAllocation, "finish", spying_finish)
+    real_finish_remote = AttachedAllocation.finish_remote
+
+    def spying_finish_remote(self, fence, teardown, leaf_result_digest, status, *args, **kwargs):
+        fake_parsl.events.append(("finish", fence.task_id, status))
+        return real_finish_remote(self, fence, teardown, leaf_result_digest, status, *args, **kwargs)
+
+    monkeypatch.setattr(AttachedAllocation, "finish_remote", spying_finish_remote)
 
     # Open the ack gate from inside the interrupt itself -- synchronously,
     # the same call that raises -- rather than racing a timed background

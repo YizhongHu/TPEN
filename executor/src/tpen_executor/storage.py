@@ -16,9 +16,9 @@ from uuid import uuid4
 
 from ._codec import canonical_bytes, decode_json, digest, fields, sha256_text, text, thaw
 from .allocations import ConfiguredAllocation
-from .contracts import AttemptId, ReadyGroup
+from .contracts import AllocationId, AttemptId, BackendJobId, ReadyGroup
 from .results import (
-    AcceptedSegment, CoreOutcomeRecord, ManifestAttempt, OutcomeReceipt, PLACEMENT_RECEIPT_TYPES, RunManifest,
+    AcceptedSegment, CoreOutcomeRecord, ManifestAttempt, OutcomeReceipt, PLACEMENT_RECEIPT_TYPES, RemoteTeardownReceipt, RunManifest,
     SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3, StartReceipt,
     SuccessorAdmissionRecord, decode_placement_receipt,
 )
@@ -117,6 +117,9 @@ _SUCCESSOR_ADMISSIONS = "successor-admissions"
 _SUCCESSOR_ADMISSION_FILENAME = "successor-admission.json"
 _SUCCESSOR_ADMISSION_TEMP_PREFIX = ".tmp-admission-"
 _SUCCESSOR_ADMISSION_SCHEMA = "tpen.execution/successor-admission-request-v1"
+_REMOTE_TEARDOWN_FILENAME = "remote-teardown.json"
+_TEARDOWN_UNCONFIRMED_REASON = "teardown-unconfirmed"
+_LEAF_TEARDOWN_SCHEMA = "tpen-executor/leaf-teardown-v1"
 
 
 def _fsync_directory(path: str) -> None:
@@ -405,6 +408,114 @@ class DirectoryStore:
                 raise FenceRejected("outcome could not be written") from error
             return outcome
 
+    def finish_remote_attempt(
+        self,
+        fence: AttemptFence,
+        teardown: Mapping[str, Any],
+        leaf_result_digest: str,
+        status: str,
+        finished_at_utc: str,
+        result_digest: str | None = None,
+    ) -> OutcomeReceipt:
+        """Persist a validated remote teardown before its terminal outcome.
+
+        Parameters
+        ----------
+        fence : AttemptFence
+            Store-owned fence returned by :meth:`begin_attempt`.
+        teardown : mapping
+            Primitive leaf teardown facts that were already validated against
+            the transport request by the controller.
+        leaf_result_digest : str
+            Digest of the canonical validated leaf result.
+        status, finished_at_utc : str
+            Operational terminal status and UTC completion timestamp.
+        result_digest : str or None, optional
+            Core evidence digest for the matching operational outcome.
+
+        Returns
+        -------
+        OutcomeReceipt
+            The terminal outcome written after ``remote-teardown.json``.
+
+        Raises
+        ------
+        FenceRejected
+            If the fence, teardown identities, or write-once ordering is not
+            valid.  The method refuses before creating an outcome or ledger.
+
+        Notes
+        -----
+        This is deliberately separate from :meth:`finish_attempt`: local and
+        ThreadPool paths cannot manufacture a remote teardown proof.
+        """
+        if not isinstance(teardown, Mapping):
+            raise TypeError("remote teardown must be a mapping")
+        try:
+            if set(teardown) != {
+                "schema", "group_digest", "task_id", "attempt_id", "allocation_id",
+                "backend_job_id", "child_group_reaped", "inspection",
+            } or teardown.get("schema") != _LEAF_TEARDOWN_SCHEMA:
+                raise ValueError("remote teardown has an invalid shape")
+            if any(
+                type(teardown[key]) is not str
+                for key in ("group_digest", "task_id", "attempt_id", "allocation_id", "backend_job_id", "inspection")
+            ) or type(teardown["child_group_reaped"]) is not bool:
+                raise TypeError("remote teardown has an invalid field type")
+            receipt = RemoteTeardownReceipt(
+                teardown["task_id"],
+                AttemptId(teardown["attempt_id"]),
+                AllocationId(teardown["allocation_id"]),
+                BackendJobId(teardown["backend_job_id"]),
+                teardown["group_digest"],
+                teardown["child_group_reaped"],
+                teardown["inspection"],
+                leaf_result_digest,
+            )
+        except (TypeError, ValueError) as error:
+            raise FenceRejected(_TEARDOWN_UNCONFIRMED_REASON) from error
+        if not receipt.child_group_reaped:
+            raise FenceRejected(_TEARDOWN_UNCONFIRMED_REASON)
+        task_dir = self._task_dir_for_fence(fence)
+        lock_path = os.path.join(task_dir, _TASK_LOCK)
+        _existing(lock_path, "task lock") if os.path.lexists(lock_path) else None
+        with _task_lock(lock_path):
+            start = self._validate_fence(fence, task_dir)
+            output_dir = _lexical(fence.output_dir)
+            receipt_path = os.path.join(output_dir, _REMOTE_TEARDOWN_FILENAME)
+            outcome_path = os.path.join(output_dir, "outcome.json")
+            if os.path.lexists(receipt_path):
+                _require_regular(receipt_path, "remote teardown receipt")
+                raise FenceRejected("remote teardown receipt already exists")
+            if os.path.lexists(outcome_path):
+                _require_regular(outcome_path, "outcome receipt")
+                raise FenceRejected("attempt is already finished")
+            if (
+                receipt.task_id != start.task_id
+                or receipt.attempt_id != start.attempt_id
+                or receipt.group_digest != start.group_digest
+                or receipt.allocation_id != AllocationId(start.allocation_id)
+                or receipt.backend_job_id != start.backend_job_id
+            ):
+                raise FenceRejected(_TEARDOWN_UNCONFIRMED_REASON)
+            try:
+                outcome = OutcomeReceipt(
+                    fence.task_id,
+                    fence.attempt_id,
+                    fence.group_digest,
+                    finished_at_utc,
+                    status,
+                    start.output_dir,
+                    result_digest,
+                )
+                _write_new(receipt_path, receipt.encode())
+                _write_new(outcome_path, outcome.encode())
+            except (OSError, ValueError, TypeError) as error:
+                if isinstance(error, (ValueError, TypeError, FenceRejected)):
+                    raise
+                raise FenceRejected("remote teardown outcome could not be written") from error
+            return outcome
+
     def accept_segment(
         self,
         fence: AttemptFence,
@@ -613,6 +724,105 @@ class DirectoryStore:
             raise TypeError("core_evidence must be a mapping")
         return request
 
+    def _continuation_predecessor_locked(
+        self, fence: AttemptFence, task_dir: str,
+    ) -> tuple[StartReceipt, CoreOutcomeRecord]:
+        """Read the complete continuation predicate while the task is locked."""
+        start = self._validate_fence(fence, task_dir)
+        output_dir = _lexical(fence.output_dir)
+        core_path = _lexical(os.path.join(output_dir, "core"))
+        _require_directory(core_path, "core evidence directory")
+        outcome_path = os.path.join(output_dir, "outcome.json")
+        _require_regular(outcome_path, "outcome receipt")
+        try:
+            outcome = OutcomeReceipt.decode(Path(outcome_path).read_bytes())
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise FenceRejected("outcome receipt is unavailable") from error
+        if (
+            outcome.task_id != start.task_id
+            or outcome.attempt_id != start.attempt_id
+            or outcome.group_digest != start.group_digest
+            or outcome.output_dir != start.output_dir
+        ):
+            raise FenceRejected("outcome receipt crosses the attempt fence")
+        if outcome.status != "failed":
+            raise FenceRejected(_TEARDOWN_UNCONFIRMED_REASON)
+
+        # The positive remote proof is a separate canonical, write-once fact;
+        # the operational ``failed`` status alone is never sufficient.
+        teardown_path = os.path.join(output_dir, _REMOTE_TEARDOWN_FILENAME)
+        try:
+            _require_regular(teardown_path, "remote teardown receipt")
+            encoded_teardown = Path(teardown_path).read_bytes()
+            teardown = RemoteTeardownReceipt.decode(encoded_teardown)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise FenceRejected(_TEARDOWN_UNCONFIRMED_REASON) from error
+        if encoded_teardown != teardown.encode():
+            raise FenceRejected(_TEARDOWN_UNCONFIRMED_REASON)
+        if (
+            teardown.task_id != start.task_id
+            or teardown.attempt_id != start.attempt_id
+            or teardown.group_digest != start.group_digest
+            or teardown.allocation_id != start.allocation_id
+            or teardown.backend_job_id != start.backend_job_id
+            or not teardown.child_group_reaped
+            or teardown.inspection != "complete"
+        ):
+            raise FenceRejected(_TEARDOWN_UNCONFIRMED_REASON)
+
+        record_path = os.path.join(output_dir, "core-outcome.json")
+        _require_regular(record_path, "core outcome record")
+        try:
+            encoded = Path(record_path).read_bytes()
+            record = CoreOutcomeRecord.decode(encoded)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise FenceRejected("core outcome record is unavailable") from error
+        if encoded != record.encode():
+            raise FenceRejected("core outcome record is not canonical")
+        try:
+            record_core_dir = _strict_real_directory(record.evidence.get("run_dir"))
+            expected_core_dir = _strict_real_directory(core_path)
+        except (OSError, TypeError, ValueError) as error:
+            raise FenceRejected(_CORE_EVIDENCE_FENCE_REASON) from error
+        if (
+            record.task_id != start.task_id
+            or record.attempt_id != start.attempt_id
+            or record_core_dir != expected_core_dir
+        ):
+            raise FenceRejected("core outcome record crosses the attempt fence")
+        if not record.continuation_eligible or record.outcome != "planned_yield":
+            raise FenceRejected("core outcome is not a continuation-eligible planned yield")
+        checkpoint_ref = record.evidence.get("checkpoint_ref")
+        config_identity = record.evidence.get("resolved_config_identity")
+        if not isinstance(checkpoint_ref, Mapping) or type(checkpoint_ref.get("content_id")) is not str:
+            raise FenceRejected("planned-yield core outcome lacks a checkpoint content identity")
+        if not isinstance(config_identity, Mapping):
+            raise FenceRejected("core outcome lacks resolved config identity")
+        return start, record
+
+    @staticmethod
+    def _successor_request_from_record(
+        record: CoreOutcomeRecord,
+        successor_attempt_id: AttemptId,
+        science_input_digest: str,
+        target_iterations: int,
+    ) -> dict[str, Any]:
+        """Build a successor request from an already validated core record."""
+        config_identity = record.evidence["resolved_config_identity"]
+        return {
+            "schema": _SUCCESSOR_ADMISSION_SCHEMA,
+            "predecessor": {
+                "task_id": record.task_id,
+                "attempt_id": record.attempt_id.value,
+                "core_outcome_digest": digest(record.to_dict()),
+                "resolved_config_identity": thaw(config_identity),
+            },
+            "successor": {"task_id": record.task_id, "attempt_id": successor_attempt_id.value},
+            "science_input_digest": science_input_digest,
+            "target_iterations": target_iterations,
+            "core_evidence": thaw(record.evidence),
+        }
+
     def build_successor_admission_request(
         self,
         fence: AttemptFence,
@@ -639,64 +849,10 @@ class DirectoryStore:
         lock_path = os.path.join(task_dir, _TASK_LOCK)
         _existing(lock_path, "task lock") if os.path.lexists(lock_path) else None
         with _task_lock(lock_path):
-            start = self._validate_fence(fence, task_dir)
-            output_dir = _lexical(fence.output_dir)
-            core_path = _lexical(os.path.join(output_dir, "core"))
-            _require_directory(core_path, "core evidence directory")
-            outcome_path = os.path.join(output_dir, "outcome.json")
-            _require_regular(outcome_path, "outcome receipt")
-            try:
-                outcome = OutcomeReceipt.decode(Path(outcome_path).read_bytes())
-            except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-                raise FenceRejected("outcome receipt is unavailable") from error
-            if (
-                outcome.task_id != start.task_id
-                or outcome.attempt_id != start.attempt_id
-                or outcome.group_digest != start.group_digest
-                or outcome.output_dir != start.output_dir
-            ):
-                raise FenceRejected("outcome receipt crosses the attempt fence")
-            record_path = os.path.join(output_dir, "core-outcome.json")
-            _require_regular(record_path, "core outcome record")
-            try:
-                encoded = Path(record_path).read_bytes()
-                record = CoreOutcomeRecord.decode(encoded)
-            except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-                raise FenceRejected("core outcome record is unavailable") from error
-            if encoded != record.encode():
-                raise FenceRejected("core outcome record is not canonical")
-            try:
-                record_core_dir = _strict_real_directory(record.evidence.get("run_dir"))
-                expected_core_dir = _strict_real_directory(core_path)
-            except (OSError, TypeError, ValueError) as error:
-                raise FenceRejected(_CORE_EVIDENCE_FENCE_REASON) from error
-            if (
-                record.task_id != start.task_id
-                or record.attempt_id != start.attempt_id
-                or record_core_dir != expected_core_dir
-            ):
-                raise FenceRejected("core outcome record crosses the attempt fence")
-            if not record.continuation_eligible or record.outcome != "planned_yield":
-                raise FenceRejected("core outcome is not a continuation-eligible planned yield")
-            checkpoint_ref = record.evidence.get("checkpoint_ref")
-            config_identity = record.evidence.get("resolved_config_identity")
-            if not isinstance(checkpoint_ref, Mapping) or type(checkpoint_ref.get("content_id")) is not str:
-                raise FenceRejected("planned-yield core outcome lacks a checkpoint content identity")
-            if not isinstance(config_identity, Mapping):
-                raise FenceRejected("core outcome lacks resolved config identity")
-            return {
-                "schema": _SUCCESSOR_ADMISSION_SCHEMA,
-                "predecessor": {
-                    "task_id": record.task_id,
-                    "attempt_id": record.attempt_id.value,
-                    "core_outcome_digest": digest(record.to_dict()),
-                    "resolved_config_identity": thaw(config_identity),
-                },
-                "successor": {"task_id": record.task_id, "attempt_id": successor_attempt_id.value},
-                "science_input_digest": science_input_digest,
-                "target_iterations": target_iterations,
-                "core_evidence": thaw(record.evidence),
-            }
+            _start, record = self._continuation_predecessor_locked(fence, task_dir)
+            return self._successor_request_from_record(
+                record, successor_attempt_id, science_input_digest, target_iterations,
+            )
 
     def record_successor_admission(
         self,
@@ -729,8 +885,14 @@ class DirectoryStore:
         lock_path = os.path.join(task_dir, _TASK_LOCK)
         _existing(lock_path, "task lock") if os.path.lexists(lock_path) else None
         with _task_lock(lock_path):
-            start = self._validate_fence(fence, task_dir)
-            if digest(built) != request_digest or built != request:
+            start, record = self._continuation_predecessor_locked(fence, task_dir)
+            rebuilt = self._successor_request_from_record(
+                record,
+                AttemptId(request["successor"]["attempt_id"]),
+                request["science_input_digest"],
+                request["target_iterations"],
+            )
+            if digest(rebuilt) != request_digest or rebuilt != request or digest(built) != request_digest:
                 raise FenceRejected("successor admission request does not match fenced core outcome")
             segment_path = os.path.join(_lexical(fence.output_dir), "segment.json")
             if os.path.lexists(segment_path):

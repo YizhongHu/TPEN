@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 from ..allocations import ConfiguredAllocation
 from ..contracts import ReadyGroup
 from ..results import AllocationObservation, OutcomeReceipt
@@ -91,6 +94,34 @@ class AttachedAllocation:
         if isinstance(fence, AttemptFence) and fence.allocation_id != self.allocation.allocation_id.value:
             raise FenceRejected("fence belongs to another attached allocation")
         return self.store.finish_attempt(fence, status, finished_at_utc, result_digest)
+
+    def finish_remote(
+        self,
+        fence: AttemptFence,
+        teardown: Mapping[str, Any],
+        leaf_result_digest: str,
+        status: str,
+        finished_at_utc: str,
+        result_digest: str | None = None,
+    ) -> OutcomeReceipt:
+        """Forward one validated remote teardown to the fenced store.
+
+        The allocation check remains at this adapter boundary so a receipt
+        from another attached allocation cannot reach the terminal helper.
+        ``teardown`` contains only primitive facts retained from a validated
+        remote leaf result; this adapter never imports or stores transport
+        wire types.
+        """
+        if isinstance(fence, AttemptFence) and fence.allocation_id != self.allocation.allocation_id.value:
+            raise FenceRejected("fence belongs to another attached allocation")
+        return self.store.finish_remote_attempt(
+            fence,
+            teardown,
+            leaf_result_digest,
+            status,
+            finished_at_utc,
+            result_digest,
+        )
 
 
 __all__ = ["AttachedAllocation"]
