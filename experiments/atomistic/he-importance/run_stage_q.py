@@ -21,6 +21,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 import hashlib
 import importlib
+import importlib.util
 import inspect
 import json
 import os
@@ -42,6 +43,14 @@ stage_coordinate = importlib.import_module("experiments.atomistic.he-importance.
 launch = importlib.import_module("experiments.atomistic.he-importance.launch")
 optimizer_grid = importlib.import_module("experiments.atomistic.he-importance.optimizer_grid")
 train_config = importlib.import_module("experiments.atomistic.he-importance.train_config")
+_MANIFEST_SPEC = importlib.util.spec_from_file_location(
+    "he_importance_scan_manifest", Path(__file__).with_name("scan_manifest.py")
+)
+if _MANIFEST_SPEC is None or _MANIFEST_SPEC.loader is None:  # pragma: no cover
+    raise RuntimeError("could not load scan_manifest.py")
+scan_manifest = importlib.util.module_from_spec(_MANIFEST_SPEC)
+sys.modules[_MANIFEST_SPEC.name] = scan_manifest
+_MANIFEST_SPEC.loader.exec_module(scan_manifest)
 
 DEFAULT_STAGE = "Q"
 DEFAULT_CONTEXT = "O-raw"
@@ -1476,6 +1485,25 @@ def execute(
         truthful admitted cell, or the walker count is not declared.
     """
 
+    manifest_path = getattr(args, "manifest", None)
+    row_id = getattr(args, "row", None)
+    if (manifest_path is None) != (row_id is None):
+        raise StageQSelectionError("--manifest and --row must be supplied together")
+    if manifest_path is not None:
+        manifest = scan_manifest.load_manifest(Path(manifest_path).expanduser().resolve())
+        row = scan_manifest.validate_live_row(manifest, str(row_id))
+        cell = next(
+            cell for cell in manifest["cells"] if cell["cell_id"] == row["cell_id"]
+        )
+        levels = cell["optimizer"]["levels"]
+        if cell["optimizer"]["method"] != "adam":
+            raise StageQSelectionError("manifest admitted a non-Adam row unexpectedly")
+        args.stage = "O1"
+        args.context = row["context"]
+        args.optimizer = "adam"
+        args.lr = levels["lr"]
+        args.beta2 = levels["beta2"]
+        args.seed_label = row["seed_label"]
     _require_executable_stage(args.stage)
     output_root = Path(args.output_root).expanduser().resolve()
     # Materialize only the requested stage so the selection receipt's discard
@@ -1586,6 +1614,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path, default=Path(__file__).with_name("outputs"))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--literal-configuration", type=json.loads)
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--row")
     return parser
 
 
