@@ -130,13 +130,16 @@ def test_render_ignores_hostile_scratch_environment(tmp_path: Path, monkeypatch:
 
 def test_forced_template_metacharacter_fails_without_side_effect(tmp_path: Path) -> None:
     marker = tmp_path / "marker"
-    script = _rendered_script(str(tmp_path)).replace(
-        "RESULTS_ROOT='/n/netscratch/kozinsky_lab/Lab/rhu/stage1'",
-        f'RESULTS_ROOT="$(touch {marker})"',
-    )
-    result = _run(script, tmp_path, SLURM_JOB_ID="123", SLURM_JOB_PARTITION="test")
-    assert result.returncode == 2
-    assert not marker.exists()
+    original = "RESULTS_ROOT='/n/netscratch/kozinsky_lab/Lab/rhu/stage1'"
+    for hostile in (f"$(touch {marker})", f"`touch {marker}`"):
+        script = _rendered_script(str(tmp_path)).replace(
+            original, f"RESULTS_ROOT='{hostile}'",
+        )
+        assert script != _rendered_script(str(tmp_path))
+        result = _run(script, tmp_path, SLURM_JOB_ID="123", SLURM_JOB_PARTITION="test")
+        assert result.returncode == 2
+        assert "STAGE1_GUARD results root outside" in result.stderr
+        assert not marker.exists()
 
 
 def test_gateway_rejects_omitted_or_altered_binding_before_run() -> None:
