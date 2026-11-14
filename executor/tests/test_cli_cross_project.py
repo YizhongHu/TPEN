@@ -50,7 +50,6 @@ stub.mkdir(parents=True)
 import json
 import sys
 from pathlib import Path
-import tpen.run as tpen_run
 def main(argv):
     config = Path(argv[argv.index('--config') + 1])
     values = dict(item.split('=', 1) for item in argv if '=' in item)
@@ -59,7 +58,7 @@ def main(argv):
         return 9
     run_dir.mkdir(parents=True, exist_ok=True)
     stub_root = Path(__file__).resolve().parent
-    selected_module = Path(tpen_run.__file__).resolve()
+    selected_module = Path(__file__).resolve()
     assert selected_module.is_relative_to(stub_root)
     assert selected_module != (stub_root / '__init__.py').resolve()
     (run_dir / 'selected-tpen-module.txt').write_text(str(selected_module))

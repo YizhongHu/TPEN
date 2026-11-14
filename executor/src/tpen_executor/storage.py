@@ -17,7 +17,7 @@ from ._codec import canonical_bytes, decode_json, fields, text
 from .allocations import ConfiguredAllocation
 from .contracts import AttemptId, ReadyGroup
 from .results import (
-    AcceptedSegment, ManifestAttempt, OutcomeReceipt, PLACEMENT_RECEIPT_TYPES, RunManifest,
+    AcceptedSegment, CoreOutcomeRecord, ManifestAttempt, OutcomeReceipt, PLACEMENT_RECEIPT_TYPES, RunManifest,
     SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3, StartReceipt,
     decode_placement_receipt,
 )
@@ -433,6 +433,10 @@ class DirectoryStore:
 
         if not isinstance(evidence, CoreRunEvidence):
             raise TypeError("evidence must be CoreRunEvidence")
+        if evidence.schema == "tpen.run-evidence/v3" and (
+            evidence.outcome != "completed" or evidence.verdict != "completed"
+        ):
+            raise FenceRejected("v3 non-completed evidence cannot be accepted as a completed segment")
         if evidence.verdict not in {"completed", "incomplete"} or evidence.checkpoint is None:
             raise FenceRejected("accepted segment requires core evidence with a checkpoint")
         task_dir = self._task_dir_for_fence(fence)
@@ -497,6 +501,56 @@ class DirectoryStore:
                 raise FenceRejected("first accepted segment must have no predecessor")
             _write_new(segment_path, segment.encode())
             return segment
+
+    def record_core_outcome(self, fence: AttemptFence, evidence: CoreRunEvidence) -> CoreOutcomeRecord:
+        """Persist typed v3 evidence without turning it into a segment.
+
+        A planned yield is deliberately recorded in ``core-outcome.json`` and
+        remains operationally non-completed.  Successor admission is outside
+        this method and belongs to the continuation slice.
+        """
+        if not isinstance(evidence, CoreRunEvidence):
+            raise TypeError("evidence must be CoreRunEvidence")
+        if evidence.schema != "tpen.run-evidence/v3":
+            raise FenceRejected("typed core outcome requires v3 evidence")
+        task_dir = self._task_dir_for_fence(fence)
+        lock_path = os.path.join(task_dir, _TASK_LOCK)
+        _existing(lock_path, "task lock") if os.path.lexists(lock_path) else None
+        with _task_lock(lock_path):
+            start = self._validate_fence(fence, task_dir)
+            output_dir = _lexical(fence.output_dir)
+            attempt_dir = _strict_real_directory(output_dir)
+            core_path = os.path.join(attempt_dir, "core")
+            try:
+                _require_directory(core_path, "core evidence directory")
+            except FenceRejected as error:
+                raise FenceRejected(_CORE_EVIDENCE_FENCE_REASON) from error
+            expected_core_dir = _strict_real_directory(core_path)
+            evidence_core_dir = _strict_real_directory(evidence.run_dir)
+            if evidence_core_dir != expected_core_dir:
+                raise FenceRejected(_CORE_EVIDENCE_FENCE_REASON)
+            outcome_path = os.path.join(output_dir, "outcome.json")
+            _require_regular(outcome_path, "outcome receipt")
+            try:
+                outcome = OutcomeReceipt.decode(Path(outcome_path).read_bytes())
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+                raise FenceRejected("outcome receipt is unavailable") from error
+            if (
+                outcome.task_id != start.task_id
+                or outcome.attempt_id != start.attempt_id
+                or outcome.group_digest != start.group_digest
+                or outcome.output_dir != start.output_dir
+            ):
+                raise FenceRejected("outcome receipt crosses the attempt fence")
+            if evidence.outcome == "planned_yield" and outcome.status == "completed":
+                raise FenceRejected("planned_yield cannot be recorded as a completed attempt")
+            record = CoreOutcomeRecord.from_evidence(fence.task_id, fence.attempt_id, evidence)
+            record_path = os.path.join(output_dir, "core-outcome.json")
+            if os.path.lexists(record_path):
+                _require_regular(record_path, "core outcome record")
+                raise FenceRejected("attempt already has a core outcome record")
+            _write_new(record_path, record.encode())
+            return record
 
     def publish_placement(
         self,
@@ -751,6 +805,14 @@ class DirectoryStore:
                         raise ValueError("foreign placement receipt in group store")
                 else:
                     placement = None
+                core_outcome_path = os.path.join(output_dir, "core-outcome.json")
+                if os.path.lexists(core_outcome_path):
+                    _require_regular(core_outcome_path, "core outcome record", ValueError)
+                    core_outcome = CoreOutcomeRecord.decode(Path(core_outcome_path).read_bytes())
+                    if core_outcome.task_id != task_id or core_outcome.attempt_id.value != attempt_id:
+                        raise ValueError("foreign core outcome record in group store")
+                else:
+                    core_outcome = None
                 segment_path = os.path.join(output_dir, "segment.json")
                 if os.path.lexists(segment_path):
                     _require_regular(segment_path, "accepted segment", ValueError)
@@ -758,7 +820,7 @@ class DirectoryStore:
                     if segment.task_id != task_id or segment.attempt_id.value != attempt_id:
                         raise ValueError("foreign accepted segment in group store")
                     segments.append(segment)
-                attempts.append(ManifestAttempt(task_id, start.attempt_id, start, outcome, start.output_dir, placement))
+                attempts.append(ManifestAttempt(task_id, start.attempt_id, start, outcome, start.output_dir, placement, core_outcome))
         segments.sort(key=lambda item: (item.task_id, item.next_iteration, item.completed_updates))
         return RunManifest(group.group_id, group.identity, tuple(attempts), tuple(segments))
 
