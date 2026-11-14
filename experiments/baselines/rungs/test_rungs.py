@@ -6,6 +6,7 @@ rather than coverage.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import io
 import json
@@ -17,6 +18,40 @@ from pathlib import Path
 import pytest
 
 HERE = Path(__file__).resolve().parent
+
+
+def test_makeplan_does_not_insert_an_absolute_path_into_sys_path() -> None:
+    """The builder must resolve imports from the documented checkout.
+
+    A committed absolute path can silently import ``experiments`` from a
+    different checkout on Polaris. Keep this check focused on the builder's
+    AST so it fails on the historical hardcoded-path line without constraining
+    unrelated experiment loaders that intentionally derive a checkout root.
+    """
+
+    tree = ast.parse((HERE / "rung_makeplan.py").read_text(encoding="utf-8"))
+    violations = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        target = node.func.value
+        if not (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "sys"
+            and target.attr == "path"
+        ):
+            continue
+        if node.func.attr not in {"insert", "append", "extend"} or not node.args:
+            continue
+        value = node.args[-1]
+        if (
+            isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+            and Path(value.value).is_absolute()
+        ):
+            violations.append((node.lineno, value.value))
+    assert violations == []
 
 
 def _load(name: str):

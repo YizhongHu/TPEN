@@ -23,7 +23,6 @@ independently on four distinct GPUs with four distinct seeds.
 import json, sys
 from pathlib import Path
 
-sys.path.insert(0, "/home/rhu/src/TPEN-l0-dev")
 from experiments.toolkit.dispatch import StagePlanV2, LogicalTaskSpec, CompletionSpec, logical_task_id_from_parts
 from experiments.toolkit.executor_inputs import ready_group, write_additive_ready_group
 from experiments.toolkit.resources import ResourceSpec
