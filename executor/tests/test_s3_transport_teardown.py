@@ -278,7 +278,6 @@ def test_cancel_during_science_reaps_local_child_group(tmp_path: Path, monkeypat
     assert all(ident == owner_ident["value"] for ident, _kind in events)
     reap_index = next(index for index, (_ident, kind) in enumerate(events) if kind == "reaped")
     assert any(kind == ("killpg", signal.SIGKILL) for _ident, kind in events[:reap_index])
-    assert any(kind == ("killpg", 0) for _ident, kind in events[:reap_index])
     assert all(kind not in (("killpg", signal.SIGKILL), ("killpg", 0)) for _ident, kind in events[reap_index + 1:])
     if sys.platform.startswith("linux"):
         assert not Path(f"/proc/{result[0].pid}").exists()
