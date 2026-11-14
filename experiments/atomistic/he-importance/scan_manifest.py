@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib
 import importlib.util
 import json
 from pathlib import Path
@@ -22,15 +21,17 @@ DESIGN_DOC_SHA256 = "76e6b7bcaf5454da120750e353fb268bbce07e6aeda6d2a601c86ddf7cc
 MANAGER_RULING = "Paseo msg c92c3a08 (2026-11-14): SR/CAD/DOC"
 
 _COORDINATE_SOURCES = {
-    "stage": "consolidated design sections 2.8 stage table; optimizer_grid_authority.json",
-    "optimizer": "consolidated design section 2.7; optimizer_grid_authority.json",
-    "context": "consolidated design section 2.8; optimizer_grid_authority.json",
-    "seed": "operator-relayed eight seeds in consolidated design section 2.8; labels inferred in section 2.9 via stage_coordinate.seed_labels",
-    "horizon": "committed stage_coordinate_authority.json payload.updates; consolidated design section 2.8",
-    "walkers": "operator ruling 2026-10-24, clause 2: 4096 stays the literal control for later scientific stages",
-    "admission": "tpen.hi_schema.HI_METHOD_ROSTER; consolidated design section 2.8; manager ruling c92c3a08",
-    "cadence": "manager ruling c92c3a08: checkpoint cadence is operational and excluded from identity",
+    "stage": {"citation": "consolidated design sections 2.8 stage table; optimizer_grid_authority.json", "evidence_class": "RELAYED"},
+    "optimizer": {"citation": "consolidated design section 2.7; optimizer_grid_authority.json", "evidence_class": "RELAYED"},
+    "context": {"citation": "consolidated design section 2.8; optimizer_grid_authority.json", "evidence_class": "RELAYED"},
+    "seed": {"citation": "operator-relayed eight seeds in consolidated design section 2.8; labels implemented in stage_coordinate.seed_labels", "evidence_class": ["RELAYED", "INFERRED"]},
+    "horizon": {"citation": "committed stage_coordinate_authority.json payload.updates; consolidated design section 2.8", "evidence_class": "RELAYED"},
+    "walkers": {"citation": "operator ruling 2026-10-24, clause 2: 4096 stays the literal control for later scientific stages", "evidence_class": "RELAYED"},
+    "admission": {"citation": "tpen.hi_schema.HI_METHOD_ROSTER; consolidated design section 2.8; manager ruling c92c3a08", "evidence_class": "RELAYED"},
+    "cadence": {"citation": "manager ruling c92c3a08: checkpoint cadence is operational and excluded from identity", "evidence_class": "RELAYED"},
 }
+_SOURCE_ALIASES = {"s": "stage", "o": "optimizer", "c": "context", "d": "seed", "h": "horizon", "w": "walkers", "a": "admission"}
+_ROW_SOURCE_REFS = "s,o,c,d,h,w,a"
 
 
 class ScanManifestError(ValueError):
@@ -91,6 +92,7 @@ def _materialized_rows() -> dict[str, Any]:
                     "context": identity["context"]["name"],
                     "seed_label": cell.manifest["seed_identity"]["label"],
                     "status": optimizer_cell["status"],
+                    "approval_sources": _ROW_SOURCE_REFS,
                     **(
                         {"unavailable_reason": optimizer_cell["unavailable_reason"]}
                         if "unavailable_reason" in optimizer_cell
@@ -131,6 +133,7 @@ def render_manifest() -> dict[str, Any]:
             },
             "authority_sha256": _authority_hashes(),
             "manager_ruling": MANAGER_RULING,
+            "source_aliases": _SOURCE_ALIASES,
             "coordinate_sources": _COORDINATE_SOURCES,
         },
         "counts": {"rows": len(rows), "admitted": admitted, "unavailable": len(rows) - admitted},
@@ -191,7 +194,7 @@ def validate_live_row(manifest: Mapping[str, Any], row_id: str) -> Mapping[str, 
         raise ScanManifestError("manifest row identity is stale or tampered")
     if row.get("status") != "available":
         reason = row.get("unavailable_reason", "method not admitted by HI_METHOD_ROSTER")
-        raise ScanManifestError(f"manifest row is unavailable: {reason}")
+        raise ScanManifestError(f"manifest row {row_id!r} is unavailable: {reason}")
     return row
 
 
