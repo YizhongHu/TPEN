@@ -44,14 +44,30 @@ from tpen.events import Event as TypedEvent
 from tpen.hi_schema import validate_hi_train_config
 from tpen.run_events import RunCompleted, RunFailed, RunStarted
 from tpen.runner import Runner
-from tpen.callback.planned_yield import PlannedYield, PlannedYieldSignal
-from tpen.callback.checkpoint import CheckpointPublicationError
 
 # Register custom OmegaConf resolvers (e.g. tpen.basis_feature_dim) before any
 # config is loaded or resolved on the run path.
 register_resolvers()
 
 PLANNED_YIELD_EXIT_CODE = 2
+
+
+def __getattr__(name: str) -> object:
+    """Lazily preserve callback names formerly imported at module scope."""
+
+    if name == "PlannedYield":
+        from tpen.callback.planned_yield import PlannedYield
+
+        return PlannedYield
+    if name == "PlannedYieldSignal":
+        from tpen.callback.planned_yield import PlannedYieldSignal
+
+        return PlannedYieldSignal
+    if name == "CheckpointPublicationError":
+        from tpen.callback.checkpoint import CheckpointPublicationError
+
+        return CheckpointPublicationError
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _status_to_exit_code(status: str) -> int:
@@ -432,6 +448,11 @@ def run_from_config(
         successfully and every launcher that reads an exit code recorded it as
         a success.
     """
+
+    # Keep the callback and checkpoint exception imports off the module import
+    # path. Their owner modules transitively load the eager training package.
+    from tpen.callback.checkpoint import CheckpointPublicationError
+    from tpen.callback.planned_yield import PlannedYield, PlannedYieldSignal
 
     _install_bootstrap_stderr_logger()
     bootstrap = _BootstrapState()
