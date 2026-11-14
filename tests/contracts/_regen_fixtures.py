@@ -33,9 +33,9 @@ PLANNED_YIELD_FIXTURE_PATH = Path(__file__).with_name("fixtures") / "core-run-ev
 UNKNOWN_FIXTURE_PATH = Path(__file__).with_name("fixtures") / "core-run-evidence-v3-unknown.json"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _CHECKPOINT_REF_PLACEHOLDERS = {
-    "content_id": "<sha256:content_id>",
-    "manifest_sha256": "<sha256:manifest>",
-    "model_sha256": "<sha256:model>",
+    "content_id": hashlib.sha256(b"cx01-placeholder:content_id").hexdigest(),
+    "manifest_sha256": hashlib.sha256(b"cx01-placeholder:manifest").hexdigest(),
+    "model_sha256": hashlib.sha256(b"cx01-placeholder:model").hexdigest(),
 }
 _EXPECTED_PROVENANCE_KEYS = frozenset(
     {

@@ -14,12 +14,14 @@ from tpen.checkpoint import CheckpointRef, ModelOnly, TrainResume, append_public
 from tpen.checkpoint.manifest import CheckpointManifest
 from tpen.inspection import RUN_EVIDENCE_SCHEMA_V3, RunEvidence, inspect_run
 from tpen.run import PLANNED_YIELD_EXIT_CODE, run_from_config
+from tpen.run_events import RunOutcome, RunOutcomeDecodeError
 
 from tests.integration.test_s4_planned_yield_public_entry import _cfg
 
 from ._regen_fixtures import (
     PLANNED_YIELD_FIXTURE_PATH,
     UNKNOWN_FIXTURE_PATH,
+    _CHECKPOINT_REF_PLACEHOLDERS,
     _make_run,
     normalize,
     regenerate_planned_yield,
@@ -41,8 +43,8 @@ def test_planned_yield_fixture_regenerates_from_real_s4_entry() -> None:
     assert fixture["schema"] == RUN_EVIDENCE_SCHEMA_V3
     assert fixture["outcome"] == "planned_yield"
     assert fixture["checkpoint_ref"]["profile"] == "train_resume"
-    assert fixture["checkpoint_ref"]["content_id"] == "<sha256:content_id>"
-    assert fixture["checkpoint_ref"]["manifest_sha256"] == "<sha256:manifest>"
+    assert fixture["checkpoint_ref"]["content_id"] == _CHECKPOINT_REF_PLACEHOLDERS["content_id"]
+    assert fixture["checkpoint_ref"]["manifest_sha256"] == _CHECKPOINT_REF_PLACEHOLDERS["manifest_sha256"]
 
 
 def test_v3_round_trip_preserves_full_checkpoint_binding() -> None:
@@ -51,10 +53,19 @@ def test_v3_round_trip_preserves_full_checkpoint_binding() -> None:
     assert PLANNED_YIELD_FIXTURE_PATH.exists(), "Cannon-generated planned-yield v3 fixture is missing"
     fixture = json.loads(PLANNED_YIELD_FIXTURE_PATH.read_text(encoding="utf-8"))
     assert fixture["checkpoint_ref"]["schema"] == "tpen.checkpoint-ref/v1"
-    assert fixture["checkpoint_ref"]["content_id"] == "<sha256:content_id>"
-    assert fixture["checkpoint_ref"]["manifest_sha256"] == "<sha256:manifest>"
-    assert fixture["checkpoint_ref"]["model_sha256"] == "<sha256:model>"
+    assert fixture["checkpoint_ref"]["content_id"] == _CHECKPOINT_REF_PLACEHOLDERS["content_id"]
+    assert fixture["checkpoint_ref"]["manifest_sha256"] == _CHECKPOINT_REF_PLACEHOLDERS["manifest_sha256"]
+    assert fixture["checkpoint_ref"]["model_sha256"] == _CHECKPOINT_REF_PLACEHOLDERS["model_sha256"]
     assert fixture["checkpoint_ref"]["profile"] == "train_resume"
+
+
+def test_both_v3_fixtures_decode_through_wire_boundary() -> None:
+    for fixture_path in (UNKNOWN_FIXTURE_PATH, PLANNED_YIELD_FIXTURE_PATH):
+        assert fixture_path.exists(), f"Cannon-generated fixture is missing: {fixture_path}"
+        evidence = RunEvidence.from_mapping(
+            json.loads(fixture_path.read_text(encoding="utf-8"))
+        )
+        assert evidence.schema == RUN_EVIDENCE_SCHEMA_V3
 
 
 def test_outcome_status_mismatch_is_refused(tmp_path: Path) -> None:
@@ -139,18 +150,95 @@ def test_live_planned_yield_ref_binds_checkpoint_bytes(tmp_path: Path) -> None:
     assert evidence.checkpoint_ref["model_sha256"] == live_ref.model_sha256
 
 
-def test_pre_cx01_run_outcome_without_schema_marker_is_read_only(tmp_path: Path) -> None:
+def test_pre_cx01_run_outcome_without_schema_marker_is_byte_identical(tmp_path: Path) -> None:
     run_dir = _make_run(tmp_path)
+    before = inspect_run(run_dir)
     legacy_outcome = RunResult(status="completed").to_dict()
     legacy_outcome.pop("schema")
     (run_dir / "run-outcome.json").write_text(
         json.dumps(legacy_outcome) + "\n", encoding="utf-8"
     )
 
+    after = inspect_run(run_dir)
+    assert after.to_dict() == before.to_dict()
+    assert after.schema == "tpen.run-evidence/v2"
+
+
+def _planned_yield_mapping(root: Path) -> dict[str, object]:
+    """Build a structurally valid v3 mapping for decoder-boundary tests."""
+
+    run_dir = _make_run(root)
     evidence = inspect_run(run_dir)
-    assert evidence.schema == RUN_EVIDENCE_SCHEMA_V3
-    assert evidence.outcome == "completed"
-    assert evidence.verdict == "completed"
+    assert evidence.checkpoint is not None
+    ref = CheckpointRef.from_directory(evidence.checkpoint["checkpoint_dir"])
+    mapping = evidence.to_dict()
+    mapping.update(
+        {
+            "schema": RUN_EVIDENCE_SCHEMA_V3,
+            "run_status": "planned_yield",
+            "outcome": "planned_yield",
+            "verdict": "incomplete",
+            "checkpoint_ref": {**ref.to_dict(), "profile": "train_resume"},
+        }
+    )
+    return mapping
+
+
+def test_v3_mapping_rejects_status_outcome_mismatch(tmp_path: Path) -> None:
+    mapping = _planned_yield_mapping(tmp_path)
+    mapping["run_status"] = "completed"
+
+    with pytest.raises(ValueError, match="run_status must equal outcome"):
+        RunEvidence.from_mapping(mapping)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("profile", "model_only"), ("next_iteration", 99), ("completed_updates", 99)],
+)
+def test_v3_mapping_rejects_unbound_planned_yield(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    mapping = _planned_yield_mapping(tmp_path / field)
+    mapping["checkpoint_ref"][field] = value
+
+    with pytest.raises(ValueError, match="planned_yield checkpoint_ref"):
+        RunEvidence.from_mapping(mapping)
+
+
+def test_v3_mapping_requires_resolved_config_identity(tmp_path: Path) -> None:
+    mapping = _planned_yield_mapping(tmp_path)
+    mapping["resolved_config_identity"] = None
+
+    with pytest.raises(ValueError, match="v3 run evidence requires"):
+        RunEvidence.from_mapping(mapping)
+
+
+def test_planned_yield_without_run_identity_is_refused(tmp_path: Path) -> None:
+    run_dir, _ = _planned_yield_fixture_run(tmp_path)
+    (run_dir / "run_start.json").unlink()
+
+    evidence = inspect_run(run_dir)
+    assert evidence.verdict == "refused"
+    assert evidence.refusal is not None
+    assert evidence.refusal["code"] == "missing-run-identity"
+    assert evidence.continuation_eligible is False
+    assert evidence.schema != RUN_EVIDENCE_SCHEMA_V3
+
+
+def test_run_outcome_rejects_unknown_checkpoint_ref_field(tmp_path: Path) -> None:
+    run_dir, ref = _planned_yield_fixture_run(tmp_path)
+    payload = RunResult(
+        status="planned_yield",
+        checkpoint_ref=ref,
+        next_iteration=ref.next_iteration,
+        completed_updates=ref.completed_updates,
+        target_iterations=10,
+    ).to_dict()
+    payload["checkpoint_ref"]["unexpected"] = "field"
+
+    with pytest.raises(RunOutcomeDecodeError, match="invalid key set"):
+        RunOutcome.from_mapping(payload)
 
 
 def _planned_yield_fixture_run(

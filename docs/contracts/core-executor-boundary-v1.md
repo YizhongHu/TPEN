@@ -99,12 +99,12 @@ The refusal `reason` embeds the Python JSON parser message, so fixture parity is
 ## 4.1 Core evidence v3
 
 CX-01 defines `tpen.run-evidence/v3` as the v2 object plus `outcome` and
-`checkpoint_ref`. The producer selects v3 when the run has the S4
-`run-outcome.json` artifact and decodes it through `tpen.run_events.read_run_outcome`;
-inspection never infers the typed result from `status.json` or the process exit
-code. The S4 artifact is the closed `tpen.run-outcome/v1` mapping emitted from
-`RunResult.to_dict`; the decoder also accepts the pre-CX-01 byte shape as a
-read-only implicit-v1 record.
+`checkpoint_ref`. The producer selects v3 only when `run-outcome.json` carries
+the explicit `tpen.run-outcome/v1` schema marker and decodes it through
+`tpen.run_events.read_run_outcome`; inspection never infers the typed result
+from `status.json` or the process exit code. A pre-CX-01 run-outcome without
+the marker is decoded read-only and remains on the exact previous v1/v2
+inspection path, preserving its evidence bytes and semantics.
 
 `outcome` is exactly one of `completed`, `planned_yield`, `failed`, `unknown`,
 or `refused`. `run_status` remains the operational status written by core and
@@ -132,8 +132,8 @@ eligible iff outcome == planned_yield
 ```
 
 `completed`, `failed`, `unknown`, and `refused` are never continuation-eligible.
-The v1/v2 producer and decoder remain read-only and byte unchanged when no
-typed outcome artifact is present.
+The v1/v2 producer and decoder remain read-only and byte unchanged when the
+run-outcome artifact is absent or lacks the explicit schema marker.
 
 ## 5. Checkpoint publication and recovery
 
@@ -211,14 +211,14 @@ normalized by the same prefix-only rule. The normalizer asserts the expected
 top-level provenance and `slurm` key sets. It retains only structural
 `run_id`, `run_dir`, and `cwd` (the latter two normalized); all other
 environment/run-specific provenance values, including nested scheduler values,
-become `<env>`. The canonical planned-yield fixture replaces exactly
-`checkpoint_ref.content_id` with `<sha256:content_id>`,
-`checkpoint_ref.manifest_sha256` with `<sha256:manifest>`, and
-`checkpoint_ref.model_sha256` with `<sha256:model>`, after asserting each
-producer value is a 64-hex SHA-256 string. Live tests compare all three fields
-with `CheckpointRef` computed from the checkpoint bytes; the placeholders are
-only for cross-environment fixture stability and do not change product
-hashing.
+become `<env>`. Provenance has no typed scalar validator beyond its mapping
+shape, so `<env>` remains decode-safe. The canonical planned-yield fixture
+replaces exactly `checkpoint_ref.content_id`, `checkpoint_ref.manifest_sha256`,
+and `checkpoint_ref.model_sha256` with deterministic 64-hex SHA-256 sentinels,
+after asserting each producer value has that shape. Live tests compare all
+three fields with `CheckpointRef` computed from the checkpoint bytes; the
+sentinels are only for cross-environment fixture stability and do not change
+product hashing.
 
 | Producer record | Consumer v1 | Consumer v2 | Consumer v3 |
 |---|---|---|---|
