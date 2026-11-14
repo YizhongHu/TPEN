@@ -8,6 +8,7 @@ Checkpoint acceptance remains delegated to :mod:`tpen.checkpoint`.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -21,6 +22,8 @@ from ._codec import decode_fields
 
 from tpen.checkpoint.payload import TRAIN_RESUME_PAYLOAD
 from tpen.checkpoint.artifact import require_complete_checkpoint_dir
+from tpen.checkpoint.catalog import publication_catalog_path, read_publications
+from tpen.checkpoint.receipt import has_publication_receipt, publication_receipt_path
 from tpen.checkpoint.reference import (
     CheckpointRef,
     deserialize_checkpoint_ref,
@@ -32,6 +35,7 @@ from tpen.checkpoint.schema import (
     read_manifest,
 )
 from tpen.checkpoint.hashing import stable_config_hash
+from tpen.inspection import RUN_EVIDENCE_SCHEMA_V3, RunEvidence
 
 
 class RecoveryPhase(str, Enum):
@@ -59,6 +63,276 @@ class RefusalCode(str, Enum):
     MODEL_ONLY = "model_only"
     INCOMPATIBLE = "incompatible"
     NO_CHECKPOINT = "no_checkpoint"
+
+
+class AdmissionRefusalCode(str, Enum):
+    """Stable refusal reasons for successor continuation admission."""
+
+    FORK = "fork"
+    MISSING_PUBLICATION = "missing-publication"
+    MODEL_ONLY = "model-only"
+    STALE_REF = "stale-ref"
+    CORRUPT_REF = "corrupt-ref"
+    AMBIGUOUS_YIELD = "ambiguous-yield"
+    NON_ELIGIBLE_OUTCOME = "non-eligible-outcome"
+    IDENTITY_MISMATCH = "identity-mismatch"
+
+
+@dataclass(frozen=True, slots=True)
+class SuccessorAdmissionRefusal:
+    """Typed refusal returned when a successor cannot be admitted."""
+
+    code: AdmissionRefusalCode
+    message: str
+
+    def to_dict(self) -> dict[str, str]:
+        """Return a JSON-safe refusal mapping."""
+
+        return {"code": self.code.value, "message": self.message}
+
+
+def _admission_text(value: Any, name: str) -> str:
+    """Validate one non-empty text field in an admission request."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def _admission_digest(value: Any, name: str) -> str:
+    """Validate one lowercase SHA-256 digest in an admission request."""
+
+    value = _admission_text(value, name)
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _admission_identity(value: Any, name: str) -> dict[str, str]:
+    """Validate the closed resolved-configuration identity mapping."""
+
+    decode_fields(value, {"schema": str, "sha256": str}, name=name)
+    if set(value) != {"schema", "sha256"}:
+        raise ValueError(f"{name} must contain exactly schema and sha256")
+    return {
+        "schema": _admission_text(value["schema"], f"{name}.schema"),
+        "sha256": _admission_digest(value["sha256"], f"{name}.sha256"),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class SuccessorAdmissionPredecessor:
+    """Immutable predecessor identity carried by a continuation request."""
+
+    task_id: str
+    attempt_id: str
+    core_outcome_digest: str
+    resolved_config_identity: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "task_id", _admission_text(self.task_id, "predecessor.task_id"))
+        object.__setattr__(self, "attempt_id", _admission_text(self.attempt_id, "predecessor.attempt_id"))
+        object.__setattr__(
+            self,
+            "core_outcome_digest",
+            _admission_digest(self.core_outcome_digest, "predecessor.core_outcome_digest"),
+        )
+        object.__setattr__(
+            self,
+            "resolved_config_identity",
+            MappingProxyType(
+                _admission_identity(
+                    self.resolved_config_identity,
+                    "predecessor.resolved_config_identity",
+                )
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the serialized predecessor identity."""
+
+        return {
+            "task_id": self.task_id,
+            "attempt_id": self.attempt_id,
+            "core_outcome_digest": self.core_outcome_digest,
+            "resolved_config_identity": dict(self.resolved_config_identity),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SuccessorAdmissionSuccessor:
+    """Immutable reserved successor identity carried by a continuation request."""
+
+    task_id: str
+    attempt_id: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "task_id", _admission_text(self.task_id, "successor.task_id"))
+        object.__setattr__(self, "attempt_id", _admission_text(self.attempt_id, "successor.attempt_id"))
+
+    def to_dict(self) -> dict[str, str]:
+        """Return the serialized successor identity."""
+
+        return {"task_id": self.task_id, "attempt_id": self.attempt_id}
+
+
+SUCCESSOR_ADMISSION_SCHEMA = "tpen.execution/successor-admission-request-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class SuccessorAdmissionRequest:
+    """Closed request to admit one typed planned-yield successor."""
+
+    predecessor: SuccessorAdmissionPredecessor
+    successor: SuccessorAdmissionSuccessor
+    science_input_digest: str
+    target_iterations: int
+    core_evidence: RunEvidence
+    schema: str = SUCCESSOR_ADMISSION_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema != SUCCESSOR_ADMISSION_SCHEMA:
+            raise ValueError(f"unsupported successor admission schema {self.schema!r}")
+        if not isinstance(self.predecessor, SuccessorAdmissionPredecessor):
+            raise TypeError("predecessor must be a SuccessorAdmissionPredecessor")
+        if not isinstance(self.successor, SuccessorAdmissionSuccessor):
+            raise TypeError("successor must be a SuccessorAdmissionSuccessor")
+        object.__setattr__(
+            self,
+            "science_input_digest",
+            _admission_digest(self.science_input_digest, "science_input_digest"),
+        )
+        object.__setattr__(
+            self,
+            "target_iterations",
+            _require_nonnegative_int(self.target_iterations, "target_iterations"),
+        )
+        if not isinstance(self.core_evidence, RunEvidence):
+            raise TypeError("core_evidence must be RunEvidence")
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "SuccessorAdmissionRequest":
+        """Decode a closed successor-admission request mapping."""
+
+        decode_fields(
+            data,
+            {
+                "predecessor": Mapping,
+                "successor": Mapping,
+                "science_input_digest": str,
+                "target_iterations": int,
+                "core_evidence": Mapping,
+            },
+            schema=SUCCESSOR_ADMISSION_SCHEMA,
+            name="successor admission request",
+        )
+        decode_fields(
+            data["predecessor"],
+            {
+                "task_id": str,
+                "attempt_id": str,
+                "core_outcome_digest": str,
+                "resolved_config_identity": Mapping,
+            },
+            name="successor admission predecessor",
+        )
+        decode_fields(
+            data["successor"],
+            {"task_id": str, "attempt_id": str},
+            name="successor admission successor",
+        )
+        try:
+            evidence = RunEvidence.from_mapping(data["core_evidence"])
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError("core_evidence is not a valid run-evidence mapping") from exc
+        return cls(
+            predecessor=SuccessorAdmissionPredecessor(**dict(data["predecessor"])),
+            successor=SuccessorAdmissionSuccessor(**dict(data["successor"])),
+            science_input_digest=data["science_input_digest"],
+            target_iterations=data["target_iterations"],
+            core_evidence=evidence,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the canonical JSON-shaped request mapping."""
+
+        return {
+            "schema": self.schema,
+            "predecessor": self.predecessor.to_dict(),
+            "successor": self.successor.to_dict(),
+            "science_input_digest": self.science_input_digest,
+            "target_iterations": self.target_iterations,
+            "core_evidence": self.core_evidence.to_dict(),
+        }
+
+    def encode(self) -> bytes:
+        """Return canonical UTF-8 JSON bytes for durable transport."""
+
+        return json.dumps(
+            self.to_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+
+    @property
+    def digest(self) -> str:
+        """Return the SHA-256 digest of the canonical request mapping."""
+
+        encoded = json.dumps(
+            self.to_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def decode_successor_admission_request(
+    data: bytes | str | Mapping[str, Any],
+) -> SuccessorAdmissionRequest:
+    """Decode one closed successor-admission request mapping or JSON payload."""
+
+    if isinstance(data, (bytes, str)):
+        try:
+            data = json.loads(data)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("successor admission request is not valid JSON") from exc
+
+    return SuccessorAdmissionRequest.from_mapping(data)
+
+
+@dataclass(frozen=True, slots=True)
+class SuccessorAdmissionResult:
+    """Result of core admission, carrying either restore or refusal."""
+
+    restore_request: "OperationalRestoreRequest | None" = None
+    refusal: SuccessorAdmissionRefusal | None = None
+
+    def __post_init__(self) -> None:
+        if (self.restore_request is None) == (self.refusal is None):
+            raise ValueError("admission result requires exactly one restore request or refusal")
+
+    @property
+    def accepted(self) -> bool:
+        """Return whether a successor restore request was admitted."""
+
+        return self.restore_request is not None
+
+    @property
+    def request(self) -> "OperationalRestoreRequest | None":
+        """Return the admitted operational restore request, if any."""
+
+        return self.restore_request
+
+
+class SuccessorAdmissionError(ValueError):
+    """Raised by the strict adapter when admission is refused."""
+
+    def __init__(self, refusal: SuccessorAdmissionRefusal) -> None:
+        super().__init__(f"{refusal.code.value}: {refusal.message}")
+        self.refusal = refusal
+        self.code = refusal.code
+
+
+# These descriptive aliases keep the public boundary discoverable without
+# introducing a second set of values for the same refusal codes.
+SuccessorAdmissionRefusalCode = AdmissionRefusalCode
+SuccessorAdmissionDecision = SuccessorAdmissionResult
 
 
 def _freeze(value: Any, *, path: str = "value") -> Any:
@@ -670,6 +944,220 @@ class OperationalRestoreRequest:
         return dict(self._load)
 
 
+def _admission_refusal(code: AdmissionRefusalCode, message: str) -> SuccessorAdmissionResult:
+    """Build a refused successor-admission result."""
+
+    return SuccessorAdmissionResult(refusal=SuccessorAdmissionRefusal(code, message))
+
+
+def _request_and_intent(
+    first: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
+    second: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
+) -> tuple[ScienceIntent, SuccessorAdmissionRequest]:
+    """Accept either intent-first or request-first adapter call order."""
+
+    if isinstance(first, ScienceIntent):
+        intent, request_value = first, second
+    elif isinstance(second, ScienceIntent):
+        intent, request_value = second, first
+    else:
+        raise TypeError("one admission adapter argument must be a ScienceIntent")
+    request = (
+        request_value
+        if isinstance(request_value, SuccessorAdmissionRequest)
+        else SuccessorAdmissionRequest.from_mapping(request_value)
+    )
+    return intent, request
+
+
+def select_successor_admission(
+    intent: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
+    request: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
+) -> SuccessorAdmissionResult:
+    """Validate a successor request and select its existing restore boundary.
+
+    Parameters
+    ----------
+    intent : ScienceIntent
+        Immutable science identity supplied by the caller.
+    request : SuccessorAdmissionRequest or mapping
+        Closed request carrying the predecessor evidence and reserved successor.
+
+    Returns
+    -------
+    SuccessorAdmissionResult
+        Either a typed :class:`OperationalRestoreRequest` or one stable
+        continuation-admission refusal.  This function does not launch work,
+        create a successor directory, or write any ledger.
+    """
+
+    intent, request = _request_and_intent(intent, request)
+    predecessor = request.predecessor
+    successor = request.successor
+    evidence = request.core_evidence
+
+    if (
+        evidence.schema == RUN_EVIDENCE_SCHEMA_V3
+        and evidence.outcome == "planned_yield"
+        and (evidence.checkpoint is None or evidence.checkpoint_ref is None)
+    ):
+        return _admission_refusal(
+            AdmissionRefusalCode.AMBIGUOUS_YIELD,
+            "planned-yield evidence does not carry both checkpoint bindings",
+        )
+    if (
+        evidence.schema == RUN_EVIDENCE_SCHEMA_V3
+        and evidence.checkpoint_ref is not None
+        and evidence.checkpoint_ref.get("profile") == "model_only"
+    ):
+        return _admission_refusal(
+            AdmissionRefusalCode.MODEL_ONLY,
+            "successor admission requires a train_resume checkpoint profile",
+        )
+    if (
+        evidence.schema != RUN_EVIDENCE_SCHEMA_V3
+        or evidence.verdict != "incomplete"
+        or evidence.run_status != "planned_yield"
+        or evidence.refusal is not None
+        or evidence.outcome != "planned_yield"
+        or not evidence.continuation_eligible
+    ):
+        return _admission_refusal(
+            AdmissionRefusalCode.NON_ELIGIBLE_OUTCOME,
+            "core evidence is not a non-refused continuation-eligible planned yield",
+        )
+
+    if predecessor.task_id != successor.task_id:
+        return _admission_refusal(
+            AdmissionRefusalCode.IDENTITY_MISMATCH,
+            "predecessor and successor task identities differ",
+        )
+    if predecessor.resolved_config_identity != evidence.resolved_config_identity:
+        return _admission_refusal(
+            AdmissionRefusalCode.IDENTITY_MISMATCH,
+            "request config identity differs from core evidence",
+        )
+    if request.science_input_digest != intent.science_input_digest:
+        return _admission_refusal(
+            AdmissionRefusalCode.IDENTITY_MISMATCH,
+            "request science input digest differs from the supplied intent",
+        )
+    if request.target_iterations != intent.target_iterations:
+        return _admission_refusal(
+            AdmissionRefusalCode.IDENTITY_MISMATCH,
+            "request target horizon differs from the supplied intent",
+        )
+
+    ref_mapping = dict(evidence.checkpoint_ref)
+    if ref_mapping.get("profile") != "train_resume":
+        return _admission_refusal(
+            AdmissionRefusalCode.MODEL_ONLY,
+            "successor admission requires a train_resume checkpoint profile",
+        )
+    ref_fields = {key: value for key, value in ref_mapping.items() if key != "profile"}
+    try:
+        ref = CheckpointRef.from_mapping(ref_fields)
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        return _admission_refusal(
+            AdmissionRefusalCode.CORRUPT_REF,
+            f"checkpoint ref is malformed or has an invalid content_id: {exc}",
+        )
+
+    summary = evidence.checkpoint
+    for key in ("checkpoint_dir", "next_iteration", "completed_updates"):
+        if summary.get(key) != ref.to_dict()[key]:
+            return _admission_refusal(
+                AdmissionRefusalCode.IDENTITY_MISMATCH,
+                f"core checkpoint summary disagrees with checkpoint_ref.{key}",
+            )
+    try:
+        ref.validate()
+    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
+        return _admission_refusal(
+            AdmissionRefusalCode.STALE_REF,
+            f"checkpoint bytes no longer match checkpoint ref: {exc}",
+        )
+    if (
+        ref.next_iteration > request.target_iterations
+        or ref.completed_updates > request.target_iterations
+    ):
+        return _admission_refusal(
+            AdmissionRefusalCode.IDENTITY_MISMATCH,
+            "checkpoint counters exceed the fixed target horizon",
+        )
+
+    publication_root = ref.checkpoint_dir.parent
+    try:
+        publications = read_publications(publication_catalog_path(publication_root))
+    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
+        return _admission_refusal(
+            AdmissionRefusalCode.MISSING_PUBLICATION,
+            f"checkpoint publication catalog is unavailable or invalid: {exc}",
+        )
+    if not any(
+        candidate.content_id == ref.content_id
+        and candidate.checkpoint_dir.resolve() == ref.checkpoint_dir.resolve()
+        for candidate in publications
+    ):
+        return _admission_refusal(
+            AdmissionRefusalCode.MISSING_PUBLICATION,
+            "checkpoint ref is not present in the publication catalog",
+        )
+    if not has_publication_receipt(
+        publication_receipt_path(publication_root), ref.content_id
+    ):
+        return _admission_refusal(
+            AdmissionRefusalCode.MISSING_PUBLICATION,
+            "checkpoint ref has no complete publication receipt",
+        )
+
+    evidence_binding = CheckpointEvidence.from_ref(
+        ref,
+        science_input_digest=request.science_input_digest,
+        target_iterations=request.target_iterations,
+    )
+    decision = select_recovery(
+        intent,
+        phase=RecoveryPhase.RECOVERY,
+        evidence=evidence_binding,
+    )
+    if decision.refusal is not None:
+        return _admission_refusal(
+            AdmissionRefusalCode.AMBIGUOUS_YIELD,
+            f"existing recovery selection refused the admitted checkpoint: {decision.refusal.message}",
+        )
+    try:
+        restore_request = OperationalRestoreRequest(decision)
+    except (TypeError, ValueError) as exc:
+        return _admission_refusal(
+            AdmissionRefusalCode.AMBIGUOUS_YIELD,
+            f"existing operational restore boundary refused the admitted checkpoint: {exc}",
+        )
+    return SuccessorAdmissionResult(restore_request=restore_request)
+
+
+def admit_successor(
+    first: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
+    second: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
+) -> SuccessorAdmissionResult:
+    """Alias for :func:`select_successor_admission`."""
+
+    return select_successor_admission(first, second)
+
+
+def operational_restore_request_from_admission(
+    first: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
+    second: ScienceIntent | SuccessorAdmissionRequest | Mapping[str, Any],
+) -> OperationalRestoreRequest:
+    """Return the admitted restore request or raise its typed refusal."""
+
+    result = select_successor_admission(first, second)
+    if result.restore_request is None:
+        assert result.refusal is not None
+        raise SuccessorAdmissionError(result.refusal)
+    return result.restore_request
+
+
 def _refused(
     intent: ScienceIntent,
     phase: RecoveryPhase,
@@ -689,6 +1177,7 @@ def _refused(
 
 
 __all__ = [
+    "AdmissionRefusalCode",
     "CheckpointEvidence",
     "OperationalRestoreRequest",
     "RecoveryDecision",
@@ -697,7 +1186,20 @@ __all__ = [
     "RecoveryRefusal",
     "RefusalCode",
     "ScienceIntent",
+    "SUCCESSOR_ADMISSION_SCHEMA",
+    "SuccessorAdmissionError",
+    "SuccessorAdmissionDecision",
+    "SuccessorAdmissionPredecessor",
+    "SuccessorAdmissionRefusal",
+    "SuccessorAdmissionRefusalCode",
+    "SuccessorAdmissionRequest",
+    "SuccessorAdmissionResult",
+    "SuccessorAdmissionSuccessor",
+    "admit_successor",
     "capture_science_intent",
+    "decode_successor_admission_request",
+    "operational_restore_request_from_admission",
+    "select_successor_admission",
     "select_recovery",
     "train_resume_load_overlay",
 ]
