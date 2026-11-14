@@ -16,12 +16,10 @@ def main() -> int:
     parser.add_argument("overrides", nargs="*")
     parser.add_argument("--binding", required=True)
     parser.add_argument("--kind", choices=("eval",), required=True)
-    parser.add_argument("--expected-resolved-config-identity", required=True)
     parser.add_argument("--expected-checkpoint-sha256", required=True)
     args = parser.parse_args()
     validate_gateway_binding(
         binding=args.binding, config=args.config, overrides=args.overrides, kind=args.kind,
-        expected_identity=args.expected_resolved_config_identity,
         expected_checkpoint_sha256=args.expected_checkpoint_sha256,
     )
     from tpen.run import load_config

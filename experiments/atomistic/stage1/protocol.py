@@ -168,19 +168,16 @@ def _encode_seed(*, kind: str, system: str, lineage: int = 0,
 
 
 def identity_expectations(row: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the v2 reader expectations bound by an evaluation row.
+    """Return the checkpoint expectation bound by an evaluation row.
 
-    S1-A2 passes these exact keyword values to the public trajectory reader:
-    ``expected_resolved_config_identity`` and ``expected_checkpoint_sha256``.
+    The resolved-config identity is owned by the evaluation run and is joined
+    to the record at collection time by S1-A2. This protocol slice cannot
+    compute that core identity, so it must not fabricate one.
     """
 
     if row.get("kind") != "eval":
         raise ProtocolError("identity expectations are defined for eval rows only")
-    identity = row.get("resolved_config_identity")
-    if not isinstance(identity, Mapping):
-        raise ProtocolError("eval row is missing resolved_config_identity")
     return {
-        "expected_resolved_config_identity": dict(identity),
         "expected_checkpoint_sha256": _require_sha(
             row.get("checkpoint_sha256"), length=64, field="checkpoint_sha256"
         ),
@@ -201,7 +198,6 @@ def decode_binding(token: str) -> dict[str, Any]:
 
 
 def validate_gateway_binding(*, binding: str, config: str, overrides: list[str], kind: str,
-                             expected_identity: str | None = None,
                              expected_checkpoint_sha256: str | None = None) -> dict[str, Any]:
     """Validate that gateway arguments still match the rendered row binding."""
 
@@ -217,12 +213,10 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
             f"evaluation_tasks.mcmc_energy.generator.n_draws={row['draws']}",
             f"load.path={row['checkpoint_path']}", "load.mode=model_only",
             "load.strict=true",
+            f"trajectory_identity.checkpoint_file={row['checkpoint_path']}",
         })
-        if expected_identity is None or expected_checkpoint_sha256 is None:
-            raise ProtocolError("eval requires strict restore and expected identity")
-        identity = decode_binding(expected_identity).get("resolved_config_identity")
-        if identity != row.get("resolved_config_identity"):
-            raise ProtocolError("expected resolved-config identity does not match binding")
+        if expected_checkpoint_sha256 is None:
+            raise ProtocolError("eval requires strict restore and expected checkpoint")
         _require_sha(expected_checkpoint_sha256, length=64,
                      field="expected_checkpoint_sha256")
         if expected_checkpoint_sha256 != row.get("checkpoint_sha256"):
@@ -316,13 +310,6 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
                     row_id = stable_row_id(system=spec.name, kind="eval", lineage=lineage,
                                            checkpoint=checkpoint, stream=stream)
                     eval_id = f"{spec.name}-lineage-{lineage}-checkpoint-{checkpoint}-stream-{stream}"
-                    resolved_identity = {
-                        "schema": "resolved-config-identity/v1",
-                        "config_sha256": config_sha256,
-                        "source_sha": source_sha,
-                        "system_id": spec.system_id,
-                        "row_id": row_id,
-                    }
                     rows.append({
                         "row_id": row_id, "system": spec.name, "system_id": spec.system_id,
                         "kind": "eval", "lineage": lineage, "checkpoint": checkpoint,
@@ -333,7 +320,6 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
                         "results_root": f"{root}/{spec.name}/eval", "checkpoint_path":
                         f"{root}/{spec.name}/train/lineage-{lineage}/checkpoints/step_{checkpoint:06d}/model.pt",
                         "checkpoint_sha256": checkpoint_digest,
-                        "resolved_config_identity": resolved_identity,
                         "run_id": eval_id, "depends_on": train_id,
                     })
     return rows

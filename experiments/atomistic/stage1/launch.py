@@ -44,6 +44,7 @@ def row_overrides(row: Mapping[str, Any]) -> list[str]:
             f"evaluation_sampler.n_walkers={row['walkers']}",
             f"evaluation_tasks.mcmc_energy.generator.n_draws={row['draws']}",
             f"load.path={row['checkpoint_path']}",
+            f"trajectory_identity.checkpoint_file={row['checkpoint_path']}",
             "load.mode=model_only",
             "load.strict=true",
         ])
@@ -73,8 +74,6 @@ def command_for_row(row: Mapping[str, Any], *, python: str, driver: str) -> str:
     args.extend(["--binding", _binding_token(row)])
     if row.get("kind") == "eval":
         args.extend([
-            "--expected-resolved-config-identity", _binding_token({
-                "resolved_config_identity": row["resolved_config_identity"]}),
             "--expected-checkpoint-sha256", str(row["checkpoint_sha256"]),
         ])
     return shlex.join(args)

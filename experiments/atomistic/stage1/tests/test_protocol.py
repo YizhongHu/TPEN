@@ -82,7 +82,7 @@ def test_seed_encoding_covers_field_maxima_and_old_collision_boundaries() -> Non
     assert evaluation_seed(system="hooke1", lineage=0, checkpoint=500_000, stream=0) != smoke_seed(system="he")
 
 
-def test_manifest_binds_real_identity_and_v2_expectations() -> None:
+def test_manifest_binds_real_identity_and_checkpoint_expectations() -> None:
     rows = _manifest()
     assert len(rows) == 84
     assert len({row["row_id"] for row in rows}) == 84
@@ -92,8 +92,9 @@ def test_manifest_binds_real_identity_and_v2_expectations() -> None:
     assert eval_row["source_sha"] == SHA1
     assert eval_row["config_sha256"] == SHA256
     expected = identity_expectations(eval_row)
+    assert set(expected) == {"expected_checkpoint_sha256"}
     assert expected["expected_checkpoint_sha256"] == SHA256
-    assert expected["expected_resolved_config_identity"]["row_id"] == eval_row["row_id"]
+    assert "resolved_config_identity" not in eval_row
 
 
 @pytest.mark.parametrize("field,value", [("source_sha", "tiny"), ("config_sha256", "tiny")])
