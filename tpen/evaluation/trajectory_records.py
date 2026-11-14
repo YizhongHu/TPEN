@@ -14,10 +14,15 @@ from typing import Any, NamedTuple
 
 import torch
 
+from tpen.checkpoint.hashing import RESOLVED_CONFIG_IDENTITY_SCHEMA
 from tpen.data.atomic_configuration import AtomicConfiguration
 from tpen.data.batch import ElectronBatch
 from tpen.physics.operators import OperatorId
-from tpen.physics.receipt import DiagnosticDeclaration, ExecutionReceipt
+from tpen.physics.receipt import (
+    DiagnosticDeclaration,
+    ExecutionReceipt,
+    decode_ordered_contribution_sequence,
+)
 from tpen.physics.system import HamiltonianTermDescriptor, ParticleSpec, SystemDescriptor
 from tpen.statistics.trajectory import (
     ObservableTrajectory,
@@ -86,6 +91,10 @@ TRAJECTORY_RECORD_METADATA_KEYS_V2: tuple[str, ...] = (
     "system_descriptor",
     "execution_receipt_method_id",
     "execution_receipt",
+    "resolved_config_identity",
+    "model_provenance",
+    "checkpoint_sha256",
+    "record_content_id",
 )
 """Every key `_write_metadata_v2` emits in a ``trajectory_records/v2`` sidecar.
 
@@ -443,8 +452,6 @@ class TrajectoryRecordArtifact:
         for key, expected in expected_scalars.items():
             if metadata[key] != expected:
                 raise ValueError(f"trajectory record metadata {key!r} disagrees with typed manifest")
-
-
 @dataclass(frozen=True)
 class TrajectoryRecordArtifactV2:
     """Typed manifest for one complete, streamed ``trajectory_records/v2`` artifact.
@@ -477,6 +484,10 @@ class TrajectoryRecordArtifactV2:
     byte_count: int
     system_descriptor: SystemDescriptor
     execution_receipt: ExecutionReceipt
+    resolved_config_identity: Mapping[str, str]
+    model_provenance: str
+    checkpoint_sha256: str | None
+    record_content_id: str
     final_draw: TrajectoryRecordBatch
 
     @property
@@ -485,8 +496,24 @@ class TrajectoryRecordArtifactV2:
 
         return self.row_count - self.finite_count
 
-    def validate(self, *, check_files: bool = True) -> "TrajectoryRecordArtifactV2":
-        """Validate manifest, final-draw, system/receipt binding, and optional file identity."""
+    def validate(
+        self,
+        *,
+        check_files: bool = True,
+        expected_resolved_config_identity: Mapping[str, str] | None = None,
+        expected_checkpoint_sha256: str | None = None,
+    ) -> "TrajectoryRecordArtifactV2":
+        """Validate manifest, final-draw, system/receipt binding, and optional file identity.
+
+        Parameters
+        ----------
+        check_files : bool, optional
+            Also validate the on-disk CSV and metadata sidecar.
+        expected_resolved_config_identity : mapping or None, optional
+            If supplied, require the declared resolved-config identity to match.
+        expected_checkpoint_sha256 : str or None, optional
+            If supplied, require the declared checkpoint digest to match.
+        """
 
         if not self.observable.strip():
             raise ValueError("trajectory record observable must be non-empty")
@@ -517,20 +544,18 @@ class TrajectoryRecordArtifactV2:
                 f"manifest={sorted(str(o) for o in manifest_operator_ids)}, "
                 f"system={sorted(str(o) for o in declared_operator_ids)}"
             )
-        contribution_names = tuple(
-            dict.fromkeys(
-                name
-                for names in self.execution_receipt.manifest.values()
-                for name in names
-            )
+        _validate_v2_identity_values(
+            self.resolved_config_identity,
+            self.model_provenance,
+            self.checkpoint_sha256,
         )
-        if set(contribution_names) != set(self.term_names) or len(contribution_names) != len(
-            self.term_names
-        ):
-            raise ValueError(
-                "trajectory record term_names must match the execution receipt's unique "
-                "contribution names exactly"
-            )
+        _validate_v2_expected_identity(
+            self.resolved_config_identity,
+            self.checkpoint_sha256,
+            expected_resolved_config_identity=expected_resolved_config_identity,
+            expected_checkpoint_sha256=expected_checkpoint_sha256,
+        )
+        _validate_v2_contribution_binding(self.execution_receipt, self.term_names)
         final_draw = self.final_draw.validate()
         if final_draw.retained_draw_index != self.n_draws - 1:
             raise ValueError("trajectory record final_draw must be the last retained draw")
@@ -543,6 +568,7 @@ class TrajectoryRecordArtifactV2:
         for name, value in (
             ("observable_values_content_id", self.observable_values_content_id),
             ("csv_sha256", self.csv_sha256),
+            ("record_content_id", self.record_content_id),
         ):
             if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
                 raise ValueError(f"trajectory record {name} must be a lowercase sha256 digest")
@@ -620,7 +646,11 @@ class TrajectoryRecordArtifactV2:
             "system_descriptor": _serialize_system_descriptor(self.system_descriptor),
             "execution_receipt_method_id": self.execution_receipt.method_id(),
             "execution_receipt": _serialize_execution_receipt(self.execution_receipt),
+            "resolved_config_identity": dict(self.resolved_config_identity),
+            "model_provenance": self.model_provenance,
+            "checkpoint_sha256": self.checkpoint_sha256,
         }
+        expected_scalars["record_content_id"] = _record_content_id(expected_scalars)
         declared_keys = set(TRAJECTORY_RECORD_METADATA_KEYS_V2)
         if expected_scalars.keys() != declared_keys:
             missing = sorted(declared_keys - expected_scalars.keys())
@@ -796,6 +826,9 @@ class TrajectoryRecordStreamWriter:
         atomic_configuration: AtomicConfiguration | None = None,
         system_descriptor: SystemDescriptor | None = None,
         execution_receipt: ExecutionReceipt | None = None,
+        resolved_config_identity: Mapping[str, str] | None = None,
+        model_provenance: str = "constructed",
+        checkpoint_sha256: str | None = None,
     ) -> None:
         self.path = Path(path)
         self.observable = str(observable).strip()
@@ -842,6 +875,16 @@ class TrajectoryRecordStreamWriter:
             self.atomic_configuration = None
             self.system_descriptor = system_descriptor
             self.execution_receipt = execution_receipt
+            if resolved_config_identity is None:
+                raise ValueError("trajectory_records/v2 requires resolved_config_identity")
+            _validate_v2_identity_values(
+                resolved_config_identity,
+                model_provenance,
+                checkpoint_sha256,
+            )
+            self.resolved_config_identity = dict(resolved_config_identity)
+            self.model_provenance = model_provenance
+            self.checkpoint_sha256 = checkpoint_sha256
             self._schema = TRAJECTORY_RECORD_SCHEMA_V2
         else:
             if atomic_configuration is None:
@@ -854,6 +897,9 @@ class TrajectoryRecordStreamWriter:
             self.atomic_configuration = atomic_configuration
             self.system_descriptor = None
             self.execution_receipt = None
+            self.resolved_config_identity = None
+            self.model_provenance = "constructed"
+            self.checkpoint_sha256 = None
             self._schema = TRAJECTORY_RECORD_SCHEMA
 
         self.n_electrons = first_draw.n_electrons
@@ -954,9 +1000,41 @@ class TrajectoryRecordStreamWriter:
         )
         artifact: TrajectoryRecordArtifact | TrajectoryRecordArtifactV2
         if self._schema == TRAJECTORY_RECORD_SCHEMA_V2:
+            identity_scalars = {
+                "schema": TRAJECTORY_RECORD_SCHEMA_V2,
+                "row_semantics": TRAJECTORY_RECORD_ROW_SEMANTICS,
+                "csv_filename": self.path.name,
+                "observable": self.observable,
+                "draw_count": self.n_draws,
+                "walker_count": self.n_walkers,
+                "draw_stride": trajectory.draw_stride,
+                "burn_in_draws": trajectory.burn_in_draws,
+                "n_electrons": self.n_electrons,
+                "spatial_dim": self.spatial_dim,
+                "term_names": list(self.term_names),
+                "row_count": self._row_count,
+                "finite_count": self._finite_count,
+                "nonfinite_count": self._row_count - self._finite_count,
+                "mean": _json_float(record_reconciliation.mean),
+                "variance": _json_float(record_reconciliation.variance),
+                "observable_values_content_id": record_reconciliation.values_content_id,
+                "csv_sha256": csv_sha256,
+                "byte_count": byte_count,
+                "system_descriptor_id": self.system_descriptor.system_id(),
+                "system_descriptor": _serialize_system_descriptor(self.system_descriptor),
+                "execution_receipt_method_id": self.execution_receipt.method_id(),
+                "execution_receipt": _serialize_execution_receipt(self.execution_receipt),
+                "resolved_config_identity": dict(self.resolved_config_identity),
+                "model_provenance": self.model_provenance,
+                "checkpoint_sha256": self.checkpoint_sha256,
+            }
             artifact = TrajectoryRecordArtifactV2(
                 system_descriptor=self.system_descriptor,
                 execution_receipt=self.execution_receipt,
+                resolved_config_identity=self.resolved_config_identity,
+                model_provenance=self.model_provenance,
+                checkpoint_sha256=self.checkpoint_sha256,
+                record_content_id=_record_content_id(identity_scalars),
                 **common,
             )
             _write_metadata_v2(artifact)
@@ -1039,15 +1117,15 @@ class TrajectoryRecordStreamWriter:
         return row
 
 
-TRAJECTORY_RECORD_INSPECTION_SCHEMA = "tpen.trajectory-record-inspection/v1"
+TRAJECTORY_RECORD_INSPECTION_SCHEMA = "tpen.trajectory-record-inspection/v2"
 """Schema identifier for the version-aware historical-reader result below.
 
 This is the inspection *result's* own schema, distinct from the
 ``schema`` field recorded inside a trajectory-record sidecar
 (``TRAJECTORY_RECORD_SCHEMA`` and friends, e.g. ``trajectory_records/v1``).
-A new inspection-result field would bump this identifier; a new sidecar
-schema (e.g. a future ``trajectory_records/v2``) is handled by adding a
-branch to :func:`inspect_trajectory_record` without changing this one.
+A new inspection-result field bumps this identifier; a new sidecar schema
+(e.g. a future ``trajectory_records/v3``) is handled by adding a branch to
+:func:`inspect_trajectory_record` without changing this one.
 """
 
 
@@ -1156,10 +1234,21 @@ class TrajectoryRecordInspection:
     atomic_configuration_id: str | None
     physical_context: TrajectoryPhysicalContext
     observable_values_digest: TrajectoryObservableValuesDigest
+    execution_method_id: str | None = None
+    contribution_names: tuple[str, ...] = ()
+    resolved_config_identity: Mapping[str, str] | None = None
+    model_provenance: str | None = None
+    checkpoint_sha256: str | None = None
+    record_content_id: str | None = None
     schema: str = TRAJECTORY_RECORD_INSPECTION_SCHEMA
 
 
-def inspect_trajectory_record(metadata_path: str | Path) -> TrajectoryRecordInspection:
+def inspect_trajectory_record(
+    metadata_path: str | Path,
+    *,
+    expected_resolved_config_identity: Mapping[str, str] | None = None,
+    expected_checkpoint_sha256: str | None = None,
+) -> TrajectoryRecordInspection:
     """Decode one trajectory-record sidecar under its own declared schema.
 
     Parameters
@@ -1167,6 +1256,12 @@ def inspect_trajectory_record(metadata_path: str | Path) -> TrajectoryRecordInsp
     metadata_path : str or pathlib.Path
         Path to a ``*.metadata.json`` sidecar written by a trajectory-record
         writer (any supported schema).
+    expected_resolved_config_identity : mapping or None, optional
+        If supplied, require the v2 record's resolved-config identity to match
+        this exact versioned mapping.
+    expected_checkpoint_sha256 : str or None, optional
+        If supplied, require the v2 record's checkpoint-content digest to
+        match this value.
 
     Returns
     -------
@@ -1209,7 +1304,12 @@ def inspect_trajectory_record(metadata_path: str | Path) -> TrajectoryRecordInsp
     if record_schema == TRAJECTORY_RECORD_SCHEMA:
         return _inspect_v1(metadata_path, raw)
     if record_schema == TRAJECTORY_RECORD_SCHEMA_V2:
-        return _inspect_v2(metadata_path, raw)
+        return _inspect_v2(
+            metadata_path,
+            raw,
+            expected_resolved_config_identity=expected_resolved_config_identity,
+            expected_checkpoint_sha256=expected_checkpoint_sha256,
+        )
     raise UnsupportedTrajectoryRecordSchemaError(
         f"unsupported trajectory record schema {record_schema!r} in {metadata_path}"
     )
@@ -1317,7 +1417,13 @@ def _inspect_v1(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryReco
     )
 
 
-def _inspect_v2(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryRecordInspection:
+def _inspect_v2(
+    metadata_path: Path,
+    metadata: dict[str, Any],
+    *,
+    expected_resolved_config_identity: Mapping[str, str] | None = None,
+    expected_checkpoint_sha256: str | None = None,
+) -> TrajectoryRecordInspection:
     """Decode a ``trajectory_records/v2`` sidecar, verifying its system/receipt binding.
 
     Unlike `_inspect_v1`, this reconstructs the serialized `SystemDescriptor`
@@ -1345,6 +1451,37 @@ def _inspect_v2(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryReco
         )
 
     scalars = _validate_v2_scalar_types(metadata)
+    try:
+        _validate_v2_identity_values(
+            metadata["resolved_config_identity"],
+            metadata["model_provenance"],
+            metadata["checkpoint_sha256"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record run identity is invalid: {exc}"
+        ) from exc
+    declared_record_content_id = metadata["record_content_id"]
+    if (
+        type(declared_record_content_id) is not str
+        or len(declared_record_content_id) != 64
+        or declared_record_content_id != declared_record_content_id.lower()
+        or any(character not in "0123456789abcdef" for character in declared_record_content_id)
+    ):
+        raise TamperedTrajectoryRecordError("trajectory record record_content_id is invalid")
+    if _record_content_id(metadata) != declared_record_content_id:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record record_content_id disagrees with its sidecar fields"
+        )
+    try:
+        _validate_v2_expected_identity(
+            metadata["resolved_config_identity"],
+            metadata["checkpoint_sha256"],
+            expected_resolved_config_identity=expected_resolved_config_identity,
+            expected_checkpoint_sha256=expected_checkpoint_sha256,
+        )
+    except ValueError as exc:
+        raise TamperedTrajectoryRecordError(str(exc)) from exc
     if not isinstance(metadata.get("csv_filename"), str) or not metadata["csv_filename"].strip():
         raise TamperedTrajectoryRecordError(
             "trajectory record csv_filename must be a non-empty string"
@@ -1444,17 +1581,12 @@ def _inspect_v2(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryReco
             "trajectory record execution_receipt.manifest does not cover exactly the operators "
             "declared by system_descriptor"
         )
-    receipt_contributions = tuple(
-        dict.fromkeys(
-            name for names in execution_receipt.manifest.values() for name in names
+    try:
+        contribution_order = _validate_v2_contribution_binding(
+            execution_receipt, scalars.term_names
         )
-    )
-    if set(receipt_contributions) != set(scalars.term_names) or len(receipt_contributions) != len(
-        scalars.term_names
-    ):
-        raise TamperedTrajectoryRecordError(
-            "trajectory record execution_receipt contributions do not match its CSV columns"
-        )
+    except ValueError as exc:
+        raise TamperedTrajectoryRecordError(str(exc)) from exc
 
     if scan.has_nan:
         observable_values_digest = _V1_OBSERVABLE_DIGEST_UNAVAILABLE
@@ -1484,6 +1616,12 @@ def _inspect_v2(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryReco
         atomic_configuration_id=None,
         physical_context=TrajectoryPhysicalContext(available=True, system_id=declared_system_id),
         observable_values_digest=observable_values_digest,
+        execution_method_id=declared_method_id,
+        contribution_names=contribution_order,
+        resolved_config_identity=dict(metadata["resolved_config_identity"]),
+        model_provenance=str(metadata["model_provenance"]),
+        checkpoint_sha256=metadata["checkpoint_sha256"],
+        record_content_id=declared_record_content_id,
     )
 
 
@@ -1722,7 +1860,13 @@ def _validate_v2_scalar_types(metadata: dict[str, Any]) -> _V1ScalarMetadata:
         raise TamperedTrajectoryRecordError(
             "trajectory record term_names must be a non-empty list of unique, non-blank strings"
         )
-    for key in ("observable_values_content_id", "csv_sha256", "system_descriptor_id", "execution_receipt_method_id"):
+    for key in (
+        "observable_values_content_id",
+        "csv_sha256",
+        "system_descriptor_id",
+        "execution_receipt_method_id",
+        "record_content_id",
+    ):
         value = metadata[key]
         if (
             not isinstance(value, str)
@@ -2010,10 +2154,114 @@ def _write_metadata_v2(artifact: TrajectoryRecordArtifactV2) -> None:
         "system_descriptor": _serialize_system_descriptor(artifact.system_descriptor),
         "execution_receipt_method_id": artifact.execution_receipt.method_id(),
         "execution_receipt": _serialize_execution_receipt(artifact.execution_receipt),
+        "resolved_config_identity": dict(artifact.resolved_config_identity),
+        "model_provenance": artifact.model_provenance,
+        "checkpoint_sha256": artifact.checkpoint_sha256,
     }
+    metadata["record_content_id"] = _record_content_id(metadata)
+    if metadata["record_content_id"] != artifact.record_content_id:
+        raise ValueError("trajectory record record_content_id disagrees with typed artifact")
     with artifact.metadata_path.open("x", encoding="utf-8") as handle:
         json.dump(metadata, handle, sort_keys=True, indent=2, allow_nan=False)
         handle.write("\n")
+
+
+def _validate_v2_identity_values(
+    resolved_identity: Mapping[str, str],
+    model_provenance: str,
+    checkpoint_sha256: str | None,
+) -> None:
+    """Validate the v2 run/config and model provenance contract."""
+
+    if set(resolved_identity) != {"schema", "sha256"}:
+        raise ValueError("trajectory record resolved_config_identity has an invalid key set")
+    if resolved_identity["schema"] != RESOLVED_CONFIG_IDENTITY_SCHEMA:
+        raise ValueError("trajectory record resolved_config_identity has an unknown schema")
+    digest = resolved_identity["sha256"]
+    if type(digest) is not str or len(digest) != 64 or digest != digest.lower() or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError("trajectory record resolved_config_identity.sha256 is invalid")
+    if not isinstance(model_provenance, str) or model_provenance not in {
+        "checkpoint",
+        "constructed",
+    }:
+        raise ValueError(
+            "trajectory record model_provenance must be 'checkpoint' or 'constructed'"
+        )
+    if model_provenance == "constructed" and checkpoint_sha256 is not None:
+        raise ValueError("constructed trajectory records must not carry checkpoint_sha256")
+    if model_provenance == "checkpoint":
+        if type(checkpoint_sha256) is not str or len(checkpoint_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in checkpoint_sha256
+        ):
+            raise ValueError("checkpoint-backed trajectory records require a lowercase sha256")
+
+
+def _validate_v2_expected_identity(
+    resolved_config_identity: Mapping[str, str],
+    checkpoint_sha256: str | None,
+    *,
+    expected_resolved_config_identity: Mapping[str, str] | None,
+    expected_checkpoint_sha256: str | None,
+) -> None:
+    """Reject a v2 artifact whose declared run identity differs from expectations."""
+
+    if (
+        expected_resolved_config_identity is not None
+        and dict(resolved_config_identity) != dict(expected_resolved_config_identity)
+    ):
+        raise ValueError(
+            "trajectory record resolved_config_identity disagrees with the expected run identity"
+        )
+    if expected_checkpoint_sha256 is not None and checkpoint_sha256 != expected_checkpoint_sha256:
+        raise ValueError(
+            "trajectory record checkpoint_sha256 disagrees with the expected checkpoint identity"
+        )
+
+
+def _decode_v2_contribution_order(receipt: ExecutionReceipt) -> tuple[str, ...]:
+    """Decode the receipt's exact contribution sequence for v2 column binding."""
+
+    try:
+        return decode_ordered_contribution_sequence(
+            receipt.numerical_policy["contribution_order"]
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "trajectory record execution receipt must declare a valid contribution order"
+        ) from exc
+
+
+def _validate_v2_contribution_binding(
+    receipt: ExecutionReceipt, term_names: Sequence[str]
+) -> tuple[str, ...]:
+    """Require both ordered and manifest contribution names to bind CSV columns."""
+
+    term_names = tuple(term_names)
+    contribution_order = _decode_v2_contribution_order(receipt)
+    if contribution_order != term_names:
+        raise ValueError(
+            "trajectory record term_names must match the execution receipt's contribution "
+            "order exactly"
+        )
+    contribution_names = tuple(
+        dict.fromkeys(name for names in receipt.manifest.values() for name in names)
+    )
+    if set(contribution_names) != set(term_names) or len(contribution_names) != len(term_names):
+        raise ValueError(
+            "trajectory record execution_receipt manifest contribution names must match "
+            "its CSV columns"
+        )
+    return contribution_order
+
+
+def _record_content_id(metadata: Mapping[str, Any]) -> str:
+    """Return the canonical digest of a v2 sidecar before its digest field."""
+
+    payload = {key: metadata[key] for key in sorted(metadata) if key != "record_content_id"}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _atomic_geometry_payload(atoms: AtomicConfiguration) -> dict[str, list]:
