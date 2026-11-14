@@ -13,7 +13,7 @@ from experiments.atomistic.stage1.collect import collect
 from experiments.atomistic.stage1.launch import _binding_token, row_overrides
 from experiments.atomistic.stage1.protocol import Protocol, build_manifest, manifest_hash, validate_gateway_binding
 from experiments.toolkit.trajectory_records import inspect_run, inspect_trajectory_record
-from tpen.artifacts import ArtifactManager
+from tpen.artifacts import ArtifactManager, RunResult
 from tpen.checkpoint.artifact import resolve_checkpoint_dir
 from tpen.evaluation.trajectory_records import TrajectoryRecordBatch, TrajectoryRecordStreamWriter
 from tpen.physics.hamiltonian import NaiveLocalEnergyEvaluator
@@ -32,9 +32,17 @@ def _checkpoint(path: Path, payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def test_planned_launch_paths_and_real_records_collect_without_compute(tmp_path: Path) -> None:
-    """Reverting either checkpoint or run-path binding must break this test."""
+def test_planned_launch_paths_bind_and_collect_contract_fixture(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Exercise the launch/collect contract with hand-written run artifacts.
 
+    ``run_start.json``, ``status.json``, and ``run-outcome.json`` are written
+    by this fixture with TPEN's serializers. The real-producer end-to-end test
+    lands in S1-A3b.
+    """
+
+    monkeypatch.chdir(tmp_path)
     source_sha = "a" * 40
     model_payload = b"stage1-e2e-model"
     checkpoint_sha = hashlib.sha256(model_payload).hexdigest()
@@ -99,10 +107,7 @@ def test_planned_launch_paths_and_real_records_collect_without_compute(tmp_path:
         assert checkpoint_file == load_path / "model.pt"
         assert hashlib.sha256(checkpoint_file.read_bytes()).hexdigest() == row["checkpoint_sha256"]
         assert resolve_checkpoint_dir(load_path) == load_path
-        # A real eval run points at the planned train checkpoint for inspection;
-        # it does not invent a second eval checkpoint.
         eval_dir.mkdir(parents=True, exist_ok=True)
-        (eval_dir / "checkpoints").symlink_to(train_dir / "checkpoints", target_is_directory=True)
         run_dir = eval_dir
         task_dir = run_dir / "mcmc_energy"
         task_dir.mkdir(parents=True)
@@ -123,6 +128,12 @@ def test_planned_launch_paths_and_real_records_collect_without_compute(tmp_path:
             encoding="utf-8",
         )
         (run_dir / "status.json").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+        # A checkpoint-less eval run is only completed when its typed outcome
+        # artifact is present; without it, inspection must refuse the run.
+        assert inspect_run(run_dir)["verdict"] != "completed"
+        (run_dir / "run-outcome.json").write_text(
+            json.dumps(RunResult(status="completed").to_dict()), encoding="utf-8"
+        )
         assert inspect_run(run_dir)["verdict"] == "completed"
 
     result = collect(document)
