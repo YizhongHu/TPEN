@@ -48,6 +48,20 @@ from tpen.events import Event
 
 RUN_OUTCOME_SCHEMA = "tpen.run-outcome/v1"
 RUN_OUTCOME_STATUSES = frozenset({"completed", "planned_yield", "failed", "unknown", "refused"})
+_CHECKPOINT_REF_KEYS = frozenset(
+    {
+        "schema",
+        "checkpoint_dir",
+        "schema_version",
+        "kind",
+        "next_iteration",
+        "completed_updates",
+        "manifest_sha256",
+        "model_sha256",
+        "provenance",
+        "content_id",
+    }
+)
 
 
 class RunOutcomeDecodeError(ValueError):
@@ -72,6 +86,9 @@ class RunOutcome:
         Independent producer counters.
     exception_type, publication_stage : str or None
         Optional failure and publication diagnostics.
+    schema : str or None, optional
+        Explicit ``tpen.run-outcome/v1`` marker, or ``None`` for the legacy
+        pre-marker record shape.
     """
 
     status: str
@@ -83,6 +100,7 @@ class RunOutcome:
     target_iterations: int | None
     exception_type: str | None
     publication_stage: str | None
+    schema: str | None = None
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "RunOutcome":
@@ -126,6 +144,8 @@ class RunOutcome:
         if ref_data is not None:
             if not isinstance(ref_data, Mapping):
                 raise RunOutcomeDecodeError("run outcome checkpoint_ref must be a mapping or null")
+            if set(ref_data) != _CHECKPOINT_REF_KEYS:
+                raise RunOutcomeDecodeError("run outcome checkpoint_ref has an invalid key set")
             try:
                 from tpen.checkpoint import CheckpointRef
 
@@ -142,6 +162,7 @@ class RunOutcome:
             target_iterations=counters["target_iterations"],
             exception_type=data["exception_type"],
             publication_stage=data["publication_stage"],
+            schema=data.get("schema"),
         )
 
 
@@ -171,6 +192,21 @@ def read_run_outcome(path: str | Path) -> RunOutcome:
     except (OSError, UnicodeError, ValueError) as exc:
         raise RunOutcomeDecodeError(f"cannot read {outcome_path}: {exc}") from exc
     return RunOutcome.from_mapping(data)
+
+
+def has_explicit_run_outcome_schema(path: str | Path) -> bool:
+    """Return whether a JSON outcome carries the current explicit schema marker.
+
+    Invalid or unmarked files return ``False`` so inspection can preserve the
+    historical v1/v2 path for pre-CX-01 artifacts.
+    """
+
+    try:
+        with Path(path).open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, UnicodeError, ValueError):
+        return False
+    return isinstance(data, Mapping) and data.get("schema") == RUN_OUTCOME_SCHEMA
 
 
 @dataclass(frozen=True)
@@ -286,5 +322,6 @@ __all__ = [
     "RunOutcome",
     "RunOutcomeDecodeError",
     "RunStarted",
+    "has_explicit_run_outcome_schema",
     "read_run_outcome",
 ]

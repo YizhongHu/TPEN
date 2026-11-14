@@ -27,7 +27,13 @@ from tpen.evaluation.trajectory_records import (
     UnsupportedTrajectoryRecordSchemaError,
     inspect_trajectory_record,
 )
-from tpen.run_events import RunOutcome, RunOutcomeDecodeError, read_run_outcome
+from tpen.run_events import (
+    RUN_OUTCOME_SCHEMA,
+    RunOutcome,
+    RunOutcomeDecodeError,
+    has_explicit_run_outcome_schema,
+    read_run_outcome,
+)
 
 RUN_EVIDENCE_SCHEMA = "tpen.run-evidence/v1"
 RUN_EVIDENCE_SCHEMA_V2 = "tpen.run-evidence/v2"
@@ -50,6 +56,7 @@ _CHECKPOINT_REF_KEYS = {
     "content_id",
     "profile",
 }
+_CHECKPOINT_REF_HASH_FIELDS = ("manifest_sha256", "model_sha256", "content_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,19 +117,30 @@ class RunEvidence:
             ):
                 raise ValueError("resolved config identity has an invalid sha256")
         if self.schema == RUN_EVIDENCE_SCHEMA_V3:
+            if self.resolved_config_identity is None:
+                raise ValueError("v3 run evidence requires a non-null resolved_config_identity")
             if self.outcome not in {"completed", "planned_yield", "failed", "unknown", "refused"}:
                 raise ValueError(f"unsupported typed outcome {self.outcome!r}")
+            if self.verdict != "refused" and self.run_status != self.outcome:
+                raise ValueError("v3 run_status must equal outcome unless evidence is refused")
             if self.checkpoint_ref is not None:
-                if set(self.checkpoint_ref) != _CHECKPOINT_REF_KEYS:
-                    raise ValueError("checkpoint_ref has an invalid key set")
-                if self.checkpoint_ref["profile"] not in {"train_resume", "model_only"}:
-                    raise ValueError("checkpoint_ref has an invalid payload profile")
+                _validate_checkpoint_ref_mapping(self.checkpoint_ref)
             if (
                 self.outcome == "planned_yield"
                 and self.checkpoint_ref is None
                 and self.verdict != "refused"
             ):
                 raise ValueError("planned_yield evidence requires a full checkpoint_ref")
+            if self.outcome == "planned_yield" and self.verdict != "refused":
+                if self.checkpoint is None:
+                    raise ValueError("planned_yield evidence requires a checkpoint summary")
+                if self.checkpoint_ref["profile"] != "train_resume":
+                    raise ValueError("planned_yield evidence requires a train_resume checkpoint_ref")
+                for key in ("checkpoint_dir", "next_iteration", "completed_updates"):
+                    if self.checkpoint_ref[key] != self.checkpoint[key]:
+                        raise ValueError(
+                            "planned_yield checkpoint_ref does not match checkpoint summary"
+                        )
         elif self.outcome is not None or self.checkpoint_ref is not None:
             raise ValueError("typed outcome fields are only valid in v3 evidence")
 
@@ -192,6 +210,8 @@ class RunEvidence:
             raise ValueError(f"run evidence keys differ: missing={missing}, extra={extra}")
         if schema == RUN_EVIDENCE_SCHEMA_V2 and data.get("resolved_config_identity") is None:
             raise ValueError("v2 run evidence requires a non-null resolved_config_identity")
+        if schema == RUN_EVIDENCE_SCHEMA_V3 and data.get("resolved_config_identity") is None:
+            raise ValueError("v3 run evidence requires a non-null resolved_config_identity")
         checkpoint = data["checkpoint"]
         if checkpoint is not None:
             if not isinstance(checkpoint, Mapping) or set(checkpoint) != _CHECKPOINT_KEYS:
@@ -216,15 +236,7 @@ class RunEvidence:
             if checkpoint_ref is not None:
                 if not isinstance(checkpoint_ref, Mapping):
                     raise TypeError("v3 checkpoint_ref must be a mapping or null")
-                if set(checkpoint_ref) != _CHECKPOINT_REF_KEYS:
-                    raise ValueError("v3 checkpoint_ref has an invalid key set")
-                from tpen.checkpoint import CheckpointRef
-
-                ref_data = dict(checkpoint_ref)
-                ref_data.pop("profile")
-                # Verify content_id without requiring the normalized fixture
-                # path to exist on this machine.
-                CheckpointRef.from_mapping(ref_data)
+                _validate_checkpoint_ref_mapping(checkpoint_ref)
         return cls(
             schema=data["schema"],
             run_dir=data["run_dir"],
@@ -236,6 +248,33 @@ class RunEvidence:
             outcome=outcome,
             checkpoint_ref=None if checkpoint_ref is None else dict(checkpoint_ref),
         )
+
+
+def _validate_checkpoint_ref_mapping(data: Mapping[str, Any]) -> None:
+    """Validate the wire shape of one public checkpoint reference."""
+
+    if set(data) != _CHECKPOINT_REF_KEYS:
+        raise ValueError("checkpoint_ref has an invalid key set")
+    if data["schema"] != "tpen.checkpoint-ref/v1":
+        raise ValueError("checkpoint_ref has an unsupported schema")
+    if not isinstance(data["checkpoint_dir"], str) or not isinstance(data["kind"], str):
+        raise TypeError("checkpoint_ref paths and kind must be strings")
+    for key in ("schema_version", "next_iteration", "completed_updates"):
+        if type(data[key]) is not int or data[key] < 0:
+            raise TypeError(f"checkpoint_ref {key} must be a non-negative integer")
+    for key in _CHECKPOINT_REF_HASH_FIELDS:
+        value = data[key]
+        if (
+            type(value) is not str
+            or len(value) != 64
+            or value != value.lower()
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"checkpoint_ref {key} must be a 64-hex SHA-256 value")
+    if not isinstance(data["provenance"], Mapping):
+        raise TypeError("checkpoint_ref provenance must be a mapping")
+    if data["profile"] not in {"train_resume", "model_only"}:
+        raise ValueError("checkpoint_ref has an invalid payload profile")
 
 
 class _InspectionRefusal(ValueError):
@@ -287,21 +326,31 @@ def inspect_run(path: str | Path) -> RunEvidence:
             raise _InspectionRefusal("missing-run-dir", f"run directory not found: {run_dir}")
         status_path, status = _read_status(run_dir)
         run_dir = status_path.parent.resolve()
-        has_outcome_artifact = (run_dir / "run-outcome.json").is_file()
+        has_outcome_artifact = False
         identity = _read_run_identity(run_dir)
         raw_status: object = status.get("status")
         if raw_status is not None and not isinstance(raw_status, str):
             raise _InspectionRefusal("malformed-status", f"status value is not a string: {status_path}")
         run_status = raw_status
+        outcome_path = run_dir / "run-outcome.json"
+        has_outcome_artifact = has_explicit_run_outcome_schema(outcome_path)
         if has_outcome_artifact:
             try:
-                outcome = read_run_outcome(run_dir / "run-outcome.json")
+                decoded_outcome = read_run_outcome(outcome_path)
             except RunOutcomeDecodeError as exc:
                 raise _InspectionRefusal("malformed-run-outcome", str(exc)) from exc
+            if decoded_outcome.schema != RUN_OUTCOME_SCHEMA:
+                raise _InspectionRefusal("malformed-run-outcome", "explicit schema marker was not retained")
+            outcome = decoded_outcome
             if run_status != outcome.status:
                 raise _InspectionRefusal(
                     "status-outcome-mismatch",
                     f"status.json says {run_status!r}, run-outcome.json says {outcome.status!r}",
+                )
+            if identity is None:
+                raise _InspectionRefusal(
+                    "missing-run-identity",
+                    "typed run outcome requires a valid resolved_config_identity",
                 )
             _validate_typed_outcome_ref(run_dir, outcome)
         checkpoint: dict[str, Any] | None = None
@@ -354,6 +403,16 @@ def inspect_run(path: str | Path) -> RunEvidence:
         return RunEvidence(_evidence_schema(identity), str(run_dir), "completed", run_status, checkpoint, None, identity)
     except _InspectionRefusal as exc:
         if has_outcome_artifact:
+            identity = locals().get("identity")
+            if identity is None:
+                return RunEvidence(
+                    _evidence_schema(None),
+                    str(run_dir),
+                    "refused",
+                    run_status,
+                    None,
+                    {"code": exc.code, "reason": exc.reason},
+                )
             return RunEvidence(
                 RUN_EVIDENCE_SCHEMA_V3,
                 str(run_dir),
@@ -361,7 +420,7 @@ def inspect_run(path: str | Path) -> RunEvidence:
                 run_status,
                 None,
                 {"code": exc.code, "reason": exc.reason},
-                locals().get("identity"),
+                identity,
                 "unknown" if outcome is None else outcome.status,
                 None if outcome is None else _safe_public_checkpoint_ref(outcome.checkpoint_ref),
             )
