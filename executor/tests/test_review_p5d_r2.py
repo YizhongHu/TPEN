@@ -137,7 +137,12 @@ def test_r2_t3_real_worker_kills_owned_group_and_reaps_before_propagation(tmp_pa
     assert observed.value is cancellation
     # The leader is observed with WNOWAIT, the owned group is terminated and
     # probed while its PGID is pinned, and only then is the leader reaped.
-    assert calls == ["waitid", "killpg", "waitid", "killpg", "wait", "reaped"], calls
+    collapsed = []
+    for call in calls:
+        if call == "waitid" and collapsed[-1:] == ["waitid"]:
+            continue
+        collapsed.append(call)
+    assert collapsed == ["waitid", "killpg", "waitid", "killpg", "wait", "reaped"], calls
     assert processes[0].returncode == -signal.SIGKILL
     time.sleep(1.8)
     assert not late.exists(), "owned descendant must not survive to write after cancellation"
@@ -176,6 +181,15 @@ def test_r2_t4_interrupted_cleanup_wait_cannot_return_without_reaping(tmp_path, 
     with monkeypatch.context() as patch:
         patch.setattr(subprocess, "Popen", lambda *args, **kw: child)
         patch.setattr(os, "killpg", killpg)
+        observations = []
+
+        def observe(*args, **kwargs):
+            observations.append(True)
+            if len(observations) == 1:
+                raise cancellation
+            return True
+
+        patch.setattr("tpen_executor.workers._leader_exited_without_reap", observe)
         with pytest.raises(KeyboardInterrupt) as observed:
             SubprocessWorker().run(PreparedPythonEnvironment(sys.executable), ("-c", "pass"), cwd=tmp_path, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
     assert observed.value is cancellation

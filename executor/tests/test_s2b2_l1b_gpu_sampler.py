@@ -140,7 +140,7 @@ L1B_MUTANT_TABLE = (
     },
     {
         "id": "L1", "target": "executor/src/tpen_executor/workers.py",
-        "old": "        group_reaped = _group_quiescent(spawned_pid)\n        interruptions = finish_gpu_sampler(sampler, sampler_output, lease, group_reaped=group_reaped)",
+        "old": "        interruptions = finish_gpu_sampler(sampler, sampler_output, lease, group_reaped=group_reaped)",
         "new": "        group_reaped = True\n        interruptions = finish_gpu_sampler(sampler, sampler_output, lease, group_reaped=group_reaped)",
         "killer": "test_group_quiescence_unconfirmed_retains_quarantine_and_refuses_fresh_admission",
         "suite": "executor", "assertion": "the quarantine marker is never released on a sampler's own clean command cleanup alone; science-group quiescence must be independently observed before settling the lease (review B2)",

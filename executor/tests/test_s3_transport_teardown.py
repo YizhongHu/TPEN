@@ -41,6 +41,7 @@ from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.placement import AllocationSlot
 from tpen_executor.storage import DirectoryStore
 from tpen_executor.allocations import ConfiguredAllocation
+from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.workers import SubprocessWorker
 from tpen_executor import workers as workers_module
 

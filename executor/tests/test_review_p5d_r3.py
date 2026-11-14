@@ -49,6 +49,15 @@ def test_r3_t1_repeated_cleanup_interruptions_are_visible_on_original_exception(
     with monkeypatch.context() as patch:
         patch.setattr(subprocess, "Popen", lambda *args, **kwargs: child)
         patch.setattr(os, "killpg", killpg)
+        observations = []
+
+        def observe(*args, **kwargs):
+            observations.append(True)
+            if len(observations) == 1:
+                raise original
+            return True
+
+        patch.setattr("tpen_executor.workers._leader_exited_without_reap", observe)
         with pytest.raises(original_type) as observed:
             SubprocessWorker().run(PreparedPythonEnvironment(sys.executable), ("-c", "pass"), cwd=tmp_path, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
     assert observed.value is original
@@ -119,6 +128,15 @@ def test_r3_t3_already_reaped_leader_does_not_require_another_wait(tmp_path, mon
     with monkeypatch.context() as patch:
         patch.setattr(subprocess, "Popen", lambda *args, **kwargs: child)
         patch.setattr(os, "killpg", killpg)
+        observations = []
+
+        def observe(*args, **kwargs):
+            observations.append(True)
+            if len(observations) == 1:
+                raise original
+            raise ChildProcessError()
+
+        patch.setattr("tpen_executor.workers._leader_exited_without_reap", observe)
         with pytest.raises(KeyboardInterrupt) as observed:
             SubprocessWorker().run(PreparedPythonEnvironment(sys.executable), ("-c", "pass"), cwd=tmp_path, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
     assert observed.value is original
