@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from collections.abc import Mapping
 import fcntl
 import json
 import os
@@ -13,13 +14,13 @@ import tempfile
 from typing import Any
 from uuid import uuid4
 
-from ._codec import canonical_bytes, decode_json, fields, text
+from ._codec import canonical_bytes, decode_json, digest, fields, sha256_text, text, thaw
 from .allocations import ConfiguredAllocation
 from .contracts import AttemptId, ReadyGroup
 from .results import (
     AcceptedSegment, CoreOutcomeRecord, ManifestAttempt, OutcomeReceipt, PLACEMENT_RECEIPT_TYPES, RunManifest,
     SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3, StartReceipt,
-    decode_placement_receipt,
+    SuccessorAdmissionRecord, decode_placement_receipt,
 )
 from .runners import CoreRunEvidence
 from ._records import frozen_record
@@ -27,6 +28,12 @@ from ._records import frozen_record
 
 class FenceRejected(RuntimeError):
     """Raised when an attempt fence is stale, crossed, or already finished."""
+
+
+class AdmissionFork(FenceRejected):
+    """Raised when one predecessor is presented with a different successor."""
+
+    code = "fork"
 
 
 @frozen_record
@@ -106,6 +113,9 @@ def _strict_real_directory(path: str | os.PathLike[str]) -> str:
 
 _SAFE_TASK_ID = re.compile(r"[A-Za-z0-9._:-]+\Z")
 _TASK_LOCK = ".task.lock"
+_SUCCESSOR_ADMISSIONS = "successor-admissions"
+_SUCCESSOR_ADMISSION_FILENAME = "successor-admission.json"
+_SUCCESSOR_ADMISSION_SCHEMA = "tpen.execution/successor-admission-request-v1"
 
 
 def _fsync_directory(path: str) -> None:
@@ -552,6 +562,227 @@ class DirectoryStore:
             _write_new(record_path, record.encode())
             return record
 
+    @staticmethod
+    def _successor_request_shape(request: Any) -> dict[str, Any]:
+        """Validate the executor-facing shape without importing core."""
+
+        if not isinstance(request, dict):
+            if not isinstance(request, Mapping):
+                raise TypeError("successor admission request must be a mapping")
+            request = dict(request)
+        expected = {
+            "schema", "predecessor", "successor", "science_input_digest",
+            "target_iterations", "core_evidence",
+        }
+        if set(request) != expected or request.get("schema") != _SUCCESSOR_ADMISSION_SCHEMA:
+            raise ValueError("successor admission request has an invalid closed shape")
+        predecessor = request["predecessor"]
+        successor = request["successor"]
+        if not isinstance(predecessor, Mapping) or set(predecessor) != {
+            "task_id", "attempt_id", "core_outcome_digest", "resolved_config_identity",
+        }:
+            raise ValueError("successor admission predecessor has an invalid closed shape")
+        if not isinstance(successor, Mapping) or set(successor) != {"task_id", "attempt_id"}:
+            raise ValueError("successor admission successor has an invalid closed shape")
+        for value, name in (
+            (predecessor["task_id"], "predecessor.task_id"),
+            (predecessor["attempt_id"], "predecessor.attempt_id"),
+            (predecessor["core_outcome_digest"], "predecessor.core_outcome_digest"),
+            (successor["task_id"], "successor.task_id"),
+            (successor["attempt_id"], "successor.attempt_id"),
+            (request["science_input_digest"], "science_input_digest"),
+        ):
+            if type(value) is not str or not value:
+                raise TypeError(f"{name} must be non-empty text")
+        sha256_text(predecessor["core_outcome_digest"], "predecessor.core_outcome_digest")
+        sha256_text(request["science_input_digest"], "science_input_digest")
+        if type(request["target_iterations"]) is not int or request["target_iterations"] < 0:
+            raise TypeError("target_iterations must be a nonnegative integer")
+        if not isinstance(predecessor["resolved_config_identity"], Mapping) or set(predecessor["resolved_config_identity"]) != {"schema", "sha256"}:
+            raise ValueError("predecessor.resolved_config_identity has an invalid shape")
+        if predecessor["resolved_config_identity"].get("schema") != "tpen-config-identity-v1":
+            raise ValueError("predecessor.resolved_config_identity has an invalid schema")
+        sha256_text(predecessor["resolved_config_identity"].get("sha256"), "predecessor.resolved_config_identity.sha256")
+        if not isinstance(request["core_evidence"], Mapping):
+            raise TypeError("core_evidence must be a mapping")
+        return request
+
+    def build_successor_admission_request(
+        self,
+        fence: AttemptFence,
+        successor_attempt_id: AttemptId,
+        science_input_digest: str,
+        target_iterations: int,
+    ) -> dict[str, Any]:
+        """Build core's closed admission mapping from a fenced outcome.
+
+        This method only produces a JSON-shaped mapping.  The caller must pass
+        it to ``tpen.execution.recovery.select_successor_admission`` outside
+        this package and report the resulting acceptance before the ledger can
+        be written.
+        """
+
+        if not isinstance(successor_attempt_id, AttemptId):
+            raise TypeError("successor_attempt_id must be AttemptId")
+        if isinstance(fence, AttemptFence) and successor_attempt_id == fence.attempt_id:
+            raise ValueError("successor_attempt_id must differ from predecessor attempt")
+        sha256_text(science_input_digest, "science_input_digest")
+        if type(target_iterations) is not int or target_iterations < 0:
+            raise TypeError("target_iterations must be a nonnegative integer")
+        task_dir = self._task_dir_for_fence(fence)
+        lock_path = os.path.join(task_dir, _TASK_LOCK)
+        _existing(lock_path, "task lock") if os.path.lexists(lock_path) else None
+        with _task_lock(lock_path):
+            start = self._validate_fence(fence, task_dir)
+            output_dir = _lexical(fence.output_dir)
+            core_path = _lexical(os.path.join(output_dir, "core"))
+            _require_directory(core_path, "core evidence directory")
+            outcome_path = os.path.join(output_dir, "outcome.json")
+            _require_regular(outcome_path, "outcome receipt")
+            try:
+                outcome = OutcomeReceipt.decode(Path(outcome_path).read_bytes())
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise FenceRejected("outcome receipt is unavailable") from error
+            if (
+                outcome.task_id != start.task_id
+                or outcome.attempt_id != start.attempt_id
+                or outcome.group_digest != start.group_digest
+                or outcome.output_dir != start.output_dir
+            ):
+                raise FenceRejected("outcome receipt crosses the attempt fence")
+            record_path = os.path.join(output_dir, "core-outcome.json")
+            _require_regular(record_path, "core outcome record")
+            try:
+                encoded = Path(record_path).read_bytes()
+                record = CoreOutcomeRecord.decode(encoded)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise FenceRejected("core outcome record is unavailable") from error
+            if encoded != record.encode():
+                raise FenceRejected("core outcome record is not canonical")
+            try:
+                record_core_dir = _strict_real_directory(record.evidence.get("run_dir"))
+                expected_core_dir = _strict_real_directory(core_path)
+            except (OSError, TypeError, ValueError) as error:
+                raise FenceRejected(_CORE_EVIDENCE_FENCE_REASON) from error
+            if (
+                record.task_id != start.task_id
+                or record.attempt_id != start.attempt_id
+                or record_core_dir != expected_core_dir
+            ):
+                raise FenceRejected("core outcome record crosses the attempt fence")
+            if not record.continuation_eligible or record.outcome != "planned_yield":
+                raise FenceRejected("core outcome is not a continuation-eligible planned yield")
+            checkpoint_ref = record.evidence.get("checkpoint_ref")
+            config_identity = record.evidence.get("resolved_config_identity")
+            if not isinstance(checkpoint_ref, Mapping) or type(checkpoint_ref.get("content_id")) is not str:
+                raise FenceRejected("planned-yield core outcome lacks a checkpoint content identity")
+            if not isinstance(config_identity, Mapping):
+                raise FenceRejected("core outcome lacks resolved config identity")
+            return {
+                "schema": _SUCCESSOR_ADMISSION_SCHEMA,
+                "predecessor": {
+                    "task_id": record.task_id,
+                    "attempt_id": record.attempt_id.value,
+                    "core_outcome_digest": digest(record.to_dict()),
+                    "resolved_config_identity": thaw(config_identity),
+                },
+                "successor": {"task_id": record.task_id, "attempt_id": successor_attempt_id.value},
+                "science_input_digest": science_input_digest,
+                "target_iterations": target_iterations,
+                "core_evidence": thaw(record.evidence),
+            }
+
+    def record_successor_admission(
+        self,
+        fence: AttemptFence,
+        request: Mapping[str, Any],
+        core_acceptance_digest: str,
+    ) -> SuccessorAdmissionRecord:
+        """Record a core-accepted successor request exactly once.
+
+        ``core_acceptance_digest`` is an opaque digest supplied by the caller
+        after core's admission decision (for example, a digest of an
+        ``OperationalRestoreRequest``).  It is deliberately not interpreted
+        or persisted as a second wire field; ``request_digest`` is the
+        canonical digest of the closed admission request itself.
+        """
+
+        if type(core_acceptance_digest) is not str:
+            raise TypeError("core_acceptance_digest must be a SHA-256 digest")
+        sha256_text(core_acceptance_digest, "core_acceptance_digest")
+        request = self._successor_request_shape(request)
+        request_digest = digest(request)
+        built = self.build_successor_admission_request(
+            fence,
+            AttemptId(request["successor"]["attempt_id"]),
+            request["science_input_digest"],
+            request["target_iterations"],
+        )
+        task_dir = self._task_dir_for_fence(fence)
+        lock_path = os.path.join(task_dir, _TASK_LOCK)
+        _existing(lock_path, "task lock") if os.path.lexists(lock_path) else None
+        with _task_lock(lock_path):
+            start = self._validate_fence(fence, task_dir)
+            if digest(built) != request_digest or built != request:
+                raise FenceRejected("successor admission request does not match fenced core outcome")
+            segment_path = os.path.join(_lexical(fence.output_dir), "segment.json")
+            if os.path.lexists(segment_path):
+                raise FenceRejected("planned-yield admission cannot coexist with an accepted segment")
+            successor = request["successor"]
+            record = SuccessorAdmissionRecord(
+                start.task_id,
+                start.attempt_id,
+                request["core_evidence"]["checkpoint_ref"]["content_id"],
+                successor["task_id"],
+                AttemptId(successor["attempt_id"]),
+                request_digest,
+            )
+            ledger_dir = _lexical(os.path.join(task_dir, _SUCCESSOR_ADMISSIONS))
+            _ensure_directory(ledger_dir)
+            existing_records = self._admission_records_for_task(task_dir, start.task_id)
+            for existing in existing_records:
+                if existing.predecessor_attempt_id == start.attempt_id:
+                    if existing.to_dict() == record.to_dict():
+                        return existing
+                    raise AdmissionFork("fork: a different successor is already admitted for this predecessor")
+            predecessor_dir = _lexical(os.path.join(ledger_dir, start.attempt_id.value))
+            _ensure_directory(predecessor_dir)
+            try:
+                _write_new(os.path.join(predecessor_dir, _SUCCESSOR_ADMISSION_FILENAME), record.encode())
+            except FileExistsError as error:
+                raise AdmissionFork("fork: successor admission ledger already exists") from error
+            return record
+
+    @staticmethod
+    def _admission_records_for_task(task_dir: str, task_id: str) -> tuple[SuccessorAdmissionRecord, ...]:
+        """Read every admission record and reject duplicate predecessors."""
+
+        root = _lexical(os.path.join(task_dir, _SUCCESSOR_ADMISSIONS))
+        if not os.path.lexists(root):
+            return ()
+        _require_directory(root, "successor admissions", ValueError)
+        records: list[SuccessorAdmissionRecord] = []
+        seen: set[AttemptId] = set()
+        for predecessor_attempt_id in sorted(os.listdir(root)):
+            predecessor_dir = _lexical(os.path.join(root, predecessor_attempt_id))
+            _require_directory(predecessor_dir, "successor admission predecessor directory", ValueError)
+            if predecessor_attempt_id in {".", ".."}:
+                raise ValueError("successor admission predecessor directory is malformed")
+            entries = os.listdir(predecessor_dir)
+            if entries != [_SUCCESSOR_ADMISSION_FILENAME]:
+                if sorted(entries) != [_SUCCESSOR_ADMISSION_FILENAME]:
+                    raise ValueError("successor admission predecessor directory has unexpected entries")
+            path = os.path.join(predecessor_dir, _SUCCESSOR_ADMISSION_FILENAME)
+            _require_regular(path, "successor admission record", ValueError)
+            record = SuccessorAdmissionRecord.decode(Path(path).read_bytes())
+            if record.predecessor_task_id != task_id or record.predecessor_attempt_id.value != predecessor_attempt_id:
+                raise ValueError("foreign successor admission record in task store")
+            if record.predecessor_attempt_id in seen:
+                raise ValueError("successor admission ledger contains a predecessor fork")
+            seen.add(record.predecessor_attempt_id)
+            records.append(record)
+        return tuple(records)
+
     def publish_placement(
         self,
         fence: AttemptFence,
@@ -741,6 +972,7 @@ class DirectoryStore:
         group_dir = self._group_dir(group)
         attempts: list[ManifestAttempt] = []
         segments: list[AcceptedSegment] = []
+        admissions: dict[tuple[str, AttemptId], SuccessorAdmissionRecord] = {}
         members = {member.task_id for member in group.members}
         if not os.path.lexists(self.root):
             return RunManifest(group.group_id, group.identity, ())
@@ -763,6 +995,8 @@ class DirectoryStore:
                     continue
                 if attempt_id == _TASK_LOCK:
                     _require_regular(os.path.join(task_dir, attempt_id), "task lock", ValueError)
+                    continue
+                if attempt_id == _SUCCESSOR_ADMISSIONS:
                     continue
                 output_dir = _lexical(os.path.join(task_dir, attempt_id))
                 _require_directory(output_dir, "attempt directory", ValueError)
@@ -821,8 +1055,37 @@ class DirectoryStore:
                         raise ValueError("foreign accepted segment in group store")
                     segments.append(segment)
                 attempts.append(ManifestAttempt(task_id, start.attempt_id, start, outcome, start.output_dir, placement, core_outcome))
+            for admission in self._admission_records_for_task(task_dir, task_id):
+                key = (task_id, admission.predecessor_attempt_id)
+                if key in admissions:
+                    raise ValueError("successor admission ledger contains a predecessor fork")
+                matching = [attempt for attempt in attempts if (attempt.task_id, attempt.attempt_id) == key]
+                if len(matching) != 1:
+                    raise ValueError("successor admission references an unknown predecessor attempt")
+                predecessor = matching[0]
+                if predecessor.core_outcome is None or predecessor.core_outcome.outcome != "planned_yield":
+                    raise ValueError("successor admission requires a planned-yield core outcome")
+                checkpoint_ref = predecessor.core_outcome.evidence.get("checkpoint_ref")
+                if not isinstance(checkpoint_ref, Mapping) or admission.predecessor_content_id != checkpoint_ref.get("content_id"):
+                    raise ValueError("successor admission content identity disagrees with core outcome")
+                if any(segment.attempt_id == admission.predecessor_attempt_id for segment in segments):
+                    raise ValueError("successor admission cannot coexist with an accepted segment")
+                admissions[key] = admission
+        projected_attempts = [
+            ManifestAttempt(
+                attempt.task_id,
+                attempt.attempt_id,
+                attempt.start_receipt,
+                attempt.outcome_receipt,
+                attempt.output_dir,
+                attempt.placement_receipt,
+                attempt.core_outcome,
+                admissions.get((attempt.task_id, attempt.attempt_id)),
+            )
+            for attempt in attempts
+        ]
         segments.sort(key=lambda item: (item.task_id, item.next_iteration, item.completed_updates))
-        return RunManifest(group.group_id, group.identity, tuple(attempts), tuple(segments))
+        return RunManifest(group.group_id, group.identity, tuple(projected_attempts), tuple(segments))
 
 
 def _write_pointer(path: str, attempt_id: str) -> None:
@@ -845,4 +1108,4 @@ def _write_pointer(path: str, attempt_id: str) -> None:
             except FileNotFoundError: pass
 
 
-__all__ = ["AttemptFence", "DirectoryStore", "FenceRejected"]
+__all__ = ["AdmissionFork", "AttemptFence", "DirectoryStore", "FenceRejected"]
