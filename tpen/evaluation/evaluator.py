@@ -6,10 +6,12 @@ import traceback as traceback_module
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
+from omegaconf import OmegaConf
 
+from tpen.checkpoint.hashing import file_sha256, resolved_config_identity
 from tpen.checkpoint.replay import (
     CheckpointReplaySemantics,
     REPLAY_SEMANTICS_FILENAME,
@@ -150,6 +152,7 @@ class Evaluator:
         device = _torch_device(getattr(getattr(context, "metadata", None), "device", None))
         dtype = _torch_dtype(getattr(getattr(context, "metadata", None), "dtype", None))
         run_dir = _context_run_dir(context) or Path(".")
+        identity = _evaluation_identity_from_run_context(context)
         return EvaluationContext(
             namespace=self.namespace,
             artifact_level=self.artifact_level,
@@ -160,6 +163,9 @@ class Evaluator:
             run_dir=run_dir,
             task_output_dir=run_dir,
             metadata={},
+            resolved_config_identity=identity.resolved_config_identity,
+            model_provenance=identity.model_provenance,
+            checkpoint_sha256=identity.checkpoint_sha256,
         )
 
     def _evaluate_task(
@@ -375,6 +381,61 @@ def _context_run_dir(context: Any) -> Path | None:
         return context.run_dir
     except AttributeError:
         return None
+
+
+class _EvaluationIdentity(NamedTuple):
+    """Run-derived identity values passed to evaluation components."""
+
+    resolved_config_identity: Mapping[str, str] | None
+    model_provenance: str
+    checkpoint_sha256: str | None
+
+
+def _evaluation_identity_from_run_context(context: Any) -> _EvaluationIdentity:
+    """Return the identity bound to the run that owns ``context``.
+
+    The core run-start artifact and evaluation records must use the same
+    resolved-config identity. Checkpoint-backed evaluation rows use the
+    explicit model file already supplied by the trajectory join configuration;
+    constructed controls deliberately carry no invented checkpoint digest.
+    """
+
+    cfg = getattr(context, "cfg", None)
+    source_cfg = getattr(context, "source_cfg", None)
+    metadata = getattr(context, "metadata", None)
+    if cfg is None or source_cfg is None or metadata is None:
+        return _EvaluationIdentity(None, "constructed", None)
+
+    try:
+        config_identity = resolved_config_identity(
+            source_cfg,
+            run_values={
+                "root": OmegaConf.select(cfg, "run.root", default=None),
+                "run_id": getattr(metadata, "run_id"),
+                "dir": getattr(metadata, "run_dir"),
+                "layout": OmegaConf.select(cfg, "run.layout", default=None),
+                "timezone": getattr(getattr(context, "clock", None), "timezone"),
+            },
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        # Non-core programmatic contexts do not own a resolved run config.
+        # They remain usable for v1 evaluation and must opt in explicitly to
+        # v2 with a complete identity on EvaluationContext itself.
+        config_identity = None
+
+    try:
+        checkpoint_file = OmegaConf.select(
+            cfg, "trajectory_identity.checkpoint_file", default=None
+        )
+    except (KeyError, TypeError, ValueError):
+        checkpoint_file = None
+    if checkpoint_file in (None, "", "???"):
+        return _EvaluationIdentity(config_identity, "constructed", None)
+
+    checkpoint_path = Path(str(checkpoint_file))
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = Path(getattr(metadata, "run_dir")) / checkpoint_path
+    return _EvaluationIdentity(config_identity, "checkpoint", file_sha256(checkpoint_path))
 
 
 __all__ = ["Evaluator"]

@@ -16,6 +16,8 @@ from pathlib import Path
 import pytest
 import torch
 
+import tpen.inspection as inspection_module
+from tpen.checkpoint.hashing import RESOLVED_CONFIG_IDENTITY_SCHEMA
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
 from tpen.data.batch.walkers import Walkers
 from tpen.data.atomic_configuration import AtomicConfiguration
@@ -37,7 +39,12 @@ from tpen.evaluation.trajectory_records import (
 from tpen.physics.hamiltonian import LocalEnergyResult, NaiveLocalEnergyEvaluator
 from tpen.physics.kinetic import KineticEnergy
 from tpen.physics.operators import OperatorId
-from tpen.physics.potential import HarmonicTrap
+from tpen.physics.potential import (
+    ElectronElectronInteraction,
+    ElectronNucleusPotential,
+    HarmonicTrap,
+    NucleusNucleusPotential,
+)
 from tpen.physics.receipt import ExecutionReceipt, encode_ordered_contribution_sequence
 from tpen.physics.system import ParticleSpec, build_system_descriptor
 from tpen.sampling.metropolis import MetropolisSampler
@@ -46,6 +53,7 @@ from tests.unit.evaluation.test_trajectory_record_inspection import _write_v1_ar
 
 _TERMS = {"kinetic": KineticEnergy(), "trap": HarmonicTrap(omega=0.5)}
 _PARTICLE = ParticleSpec(n_electrons=1, n_spin_up=1, n_spin_down=0, spatial_dim=3)
+_CONFIG_IDENTITY = {"schema": RESOLVED_CONFIG_IDENTITY_SCHEMA, "sha256": "a" * 64}
 
 
 def _system():
@@ -83,6 +91,7 @@ def _v2_artifact(tmp_path: Path, values: torch.Tensor, *, name: str = "trajector
         term_names=("kinetic", "trap"),
         system_descriptor=system,
         execution_receipt=receipt,
+        resolved_config_identity=_CONFIG_IDENTITY,
         first_draw=record(0),
     )
     for draw in range(1, n_draws):
@@ -190,10 +199,75 @@ def test_inspect_decodes_v2_and_reports_available_physical_context(tmp_path: Pat
     assert inspection.physical_context.system_id == system.system_id()
     assert inspection.observable_values_digest.available is True
     assert inspection.observable_values_digest.content_id == artifact.observable_values_content_id
+    assert inspection.execution_method_id == artifact.execution_receipt.method_id()
+    assert inspection.contribution_names == artifact.term_names
+    assert inspection.resolved_config_identity == _CONFIG_IDENTITY
+    assert inspection.model_provenance == "constructed"
+    assert inspection.checkpoint_sha256 is None
+    assert inspection.record_content_id == artifact.record_content_id
+    assert inspection.schema == "tpen.trajectory-record-inspection/v2"
     metadata = _read_metadata(artifact)
     metadata["observable_values_content_id"] = "0" * 64
+    metadata["record_content_id"] = trajectory_records._record_content_id(metadata)
     _rewrite_metadata(artifact, metadata)
     with pytest.raises(TamperedTrajectoryRecordError, match="observable_values_content_id"):
+        inspect_trajectory_record(artifact.metadata_path)
+
+
+def test_v2_identity_is_digest_bound_and_expected_identity_is_checked(tmp_path: Path) -> None:
+    artifact = _v2_artifact(tmp_path, FINITE)
+
+    metadata = _read_metadata(artifact)
+    metadata["resolved_config_identity"] = {
+        "schema": RESOLVED_CONFIG_IDENTITY_SCHEMA,
+        "sha256": "b" * 64,
+    }
+    _rewrite_metadata(artifact, metadata)
+    with pytest.raises(TamperedTrajectoryRecordError, match="record_content_id"):
+        inspect_trajectory_record(artifact.metadata_path)
+
+    metadata["record_content_id"] = trajectory_records._record_content_id(metadata)
+    _rewrite_metadata(artifact, metadata)
+    with pytest.raises(TamperedTrajectoryRecordError, match="resolved_config_identity"):
+        inspect_trajectory_record(
+            artifact.metadata_path,
+            expected_resolved_config_identity=_CONFIG_IDENTITY,
+        )
+
+    checkpoint_metadata = _read_metadata(artifact)
+    checkpoint_metadata["model_provenance"] = "checkpoint"
+    checkpoint_metadata["checkpoint_sha256"] = "c" * 64
+    checkpoint_metadata["record_content_id"] = trajectory_records._record_content_id(
+        checkpoint_metadata
+    )
+    _rewrite_metadata(artifact, checkpoint_metadata)
+    with pytest.raises(TamperedTrajectoryRecordError, match="checkpoint_sha256"):
+        inspect_trajectory_record(
+            artifact.metadata_path,
+            expected_checkpoint_sha256="d" * 64,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (
+            "resolved_config_identity",
+            {"schema": RESOLVED_CONFIG_IDENTITY_SCHEMA, "sha256": "b" * 64},
+        ),
+        ("model_provenance", "checkpoint"),
+    ],
+)
+def test_v2_identity_edits_without_redigest_are_rejected(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    artifact = _v2_artifact(tmp_path, FINITE)
+    metadata = _read_metadata(artifact)
+    metadata[field] = value
+    if field == "model_provenance":
+        metadata["checkpoint_sha256"] = "b" * 64
+    _rewrite_metadata(artifact, metadata)
+    with pytest.raises(TamperedTrajectoryRecordError, match="record_content_id"):
         inspect_trajectory_record(artifact.metadata_path)
 
 
@@ -289,6 +363,10 @@ def test_fused_column_manifest_must_cover_exactly_the_declared_operators(
         byte_count=1,
         system_descriptor=system,
         execution_receipt=short_receipt,
+        resolved_config_identity=_CONFIG_IDENTITY,
+        model_provenance="constructed",
+        checkpoint_sha256=None,
+        record_content_id="0" * 64,
         final_draw=TrajectoryRecordBatch(
             draw_index=torch.zeros(1, dtype=torch.int64),
             walker_index=torch.zeros(1, dtype=torch.int64),
@@ -403,6 +481,9 @@ def _hooke_context(tmp_path: Path) -> EvaluationContext:
         run_dir=tmp_path,
         task_output_dir=tmp_path,
         metadata={},
+        resolved_config_identity=_CONFIG_IDENTITY,
+        model_provenance="constructed",
+        checkpoint_sha256=None,
     )
 
 
@@ -442,11 +523,15 @@ def test_hooke_one_electron_records_v2_with_no_nuclear_resource(tmp_path: Path) 
     assert records.execution_receipt.system_id == system.system_id()
     records.validate(check_files=True)
 
-    inspection = inspect_trajectory_record(records.metadata_path)
+    inspection = inspection_module.inspect_trajectory_record(records.metadata_path)
     assert inspection.record_schema == TRAJECTORY_RECORD_SCHEMA_V2
     assert inspection.physical_context.system_id == system.system_id()
     assert inspection.observable_values_digest.available is True
     assert inspection.observable_values_digest.content_id == records.observable_values_content_id
+    assert inspection.execution_method_id == records.execution_receipt.method_id()
+    assert inspection.contribution_names == records.term_names
+    assert inspection.resolved_config_identity == _CONFIG_IDENTITY
+    assert inspection.record_content_id == records.record_content_id
 
     calculated = LocalEnergyCalculator(hamiltonian_terms=_TERMS, return_terms=True).calculate(
         model=_GaussianModel(),
@@ -455,6 +540,138 @@ def test_hooke_one_electron_records_v2_with_no_nuclear_resource(tmp_path: Path) 
     )
     assert isinstance(calculated.local_energy, LocalEnergyValues)
     assert calculated.local_energy.receipt == records.execution_receipt
+
+
+def _recorded_nuclear_case(
+    tmp_path: Path,
+    *,
+    label: str,
+    atoms: AtomicConfiguration,
+    particle: ParticleSpec,
+    terms: dict[str, object],
+) -> tuple[TrajectoryRecordArtifactV2, object]:
+    """Produce one real v2 record and decode it through the public boundary."""
+
+    output_dir = tmp_path / label
+    output_dir.mkdir()
+    system = build_system_descriptor(particle, terms, units="atomic_units")
+    sampler = MetropolisSampler(
+        n_walkers=3,
+        burn_in=1,
+        n_steps=1,
+        n_electrons=particle.n_electrons,
+        spatial_dim=particle.spatial_dim,
+        n_up=particle.n_spin_up,
+        n_down=particle.n_spin_down,
+        nuclear_positions=atoms.positions,
+        nuclear_charges=atoms.charges,
+        seed=17,
+        dtype=torch.float64,
+    )
+    generator = TrajectoryMCMCGenerator(
+        sampler=sampler,
+        hamiltonian_terms=terms,
+        n_draws=2,
+        discard_draws=1,
+        chunk_size=2,
+        system=system,
+    )
+    generated = generator.generate(model=_GaussianModel(), context=_hooke_context(output_dir))
+    records = generated.trajectory_records
+    assert isinstance(records, TrajectoryRecordArtifactV2)
+    records.validate()
+    decoded = inspection_module.inspect_trajectory_record(records.metadata_path)
+    return records, decoded
+
+
+def test_helium_real_generator_v2_record_decodes_publicly(tmp_path: Path) -> None:
+    """Record and consume a helium Hamiltonian with its nuclear resource."""
+
+    atoms = AtomicConfiguration(
+        positions=torch.zeros(1, 3, dtype=torch.float64),
+        charges=torch.tensor([2.0], dtype=torch.float64),
+    )
+    terms = {
+        "kinetic": KineticEnergy(),
+        "electron_nucleus": ElectronNucleusPotential(atoms),
+    }
+    records, decoded = _recorded_nuclear_case(
+        tmp_path,
+        label="he",
+        atoms=atoms,
+        particle=ParticleSpec(n_electrons=2, n_spin_up=2, n_spin_down=0, spatial_dim=3),
+        terms=terms,
+    )
+    assert records.system_descriptor.resources
+    assert decoded.physical_context.system_id == records.system_descriptor.system_id()
+    assert decoded.execution_method_id == records.execution_receipt.method_id()
+    assert decoded.contribution_names == ("kinetic", "electron_nucleus")
+    assert decoded.record_content_id == records.record_content_id
+    assert torch.equal(
+        records.final_draw.local_energy,
+        records.final_draw.term_energies["kinetic"]
+        + records.final_draw.term_energies["electron_nucleus"],
+    )
+
+
+def test_public_decode_rejects_a_wrong_system_id_on_real_helium_output(tmp_path: Path) -> None:
+    """A real He record cannot be relabeled by changing only its system id."""
+
+    atoms = AtomicConfiguration(
+        positions=torch.zeros(1, 3, dtype=torch.float64),
+        charges=torch.tensor([2.0], dtype=torch.float64),
+    )
+    terms = {
+        "kinetic": KineticEnergy(),
+        "electron_nucleus": ElectronNucleusPotential(atoms),
+    }
+    records, _ = _recorded_nuclear_case(
+        tmp_path,
+        label="he-wrong-system",
+        atoms=atoms,
+        particle=ParticleSpec(n_electrons=2, n_spin_up=2, n_spin_down=0, spatial_dim=3),
+        terms=terms,
+    )
+    metadata = _read_metadata(records)
+    metadata["system_descriptor_id"] = "0" * 64
+    metadata["record_content_id"] = trajectory_records._record_content_id(metadata)
+    _rewrite_metadata(records, metadata)
+    with pytest.raises(TamperedTrajectoryRecordError, match="system_descriptor_id"):
+        inspection_module.inspect_trajectory_record(records.metadata_path)
+
+
+def test_hydrogen_molecule_real_generator_records_nuclear_repulsion(tmp_path: Path) -> None:
+    """Record H2 at R=1.4 with electron and nuclear Coulomb contributions."""
+
+    atoms = AtomicConfiguration(
+        positions=torch.tensor([[-0.7, 0.0, 0.0], [0.7, 0.0, 0.0]], dtype=torch.float64),
+        charges=torch.ones(2, dtype=torch.float64),
+    )
+    terms = {
+        "kinetic": KineticEnergy(),
+        "electron_electron": ElectronElectronInteraction(),
+        "electron_nucleus": ElectronNucleusPotential(atoms),
+        "nucleus_nucleus": NucleusNucleusPotential(atoms),
+    }
+    records, decoded = _recorded_nuclear_case(
+        tmp_path,
+        label="h2",
+        atoms=atoms,
+        particle=ParticleSpec(n_electrons=2, n_spin_up=1, n_spin_down=1, spatial_dim=3),
+        terms=terms,
+    )
+    assert decoded.physical_context.system_id == records.system_descriptor.system_id()
+    assert decoded.execution_method_id == records.execution_receipt.method_id()
+    assert decoded.contribution_names == tuple(terms)
+    assert "nucleus_nucleus" in decoded.contribution_names
+    assert torch.allclose(
+        records.final_draw.term_energies["nucleus_nucleus"],
+        torch.full((records.n_walkers,), 1.0 / 1.4, dtype=torch.float64),
+    )
+    assert torch.equal(
+        records.final_draw.local_energy,
+        sum(records.final_draw.term_energies[name] for name in records.term_names),
+    )
 
 
 def test_calculator_rejects_reuse_under_a_different_requested_method(tmp_path: Path) -> None:
@@ -538,6 +755,66 @@ def test_calculator_reuses_a_valid_fused_v2_contribution(tmp_path: Path) -> None
         context=_hooke_context(tmp_path),
     )
     assert calculated.local_energy is not None
+
+
+def test_real_generator_writes_one_column_for_a_fused_contribution(tmp_path: Path) -> None:
+    """A fused evaluator records one contribution column and preserves its total."""
+
+    fused_name = "kinetic_plus_trap"
+    base_receipt = _receipt(_system())
+
+    class _FusedEvaluator(NaiveLocalEnergyEvaluator):
+        def evaluate(self, terms, context, *, return_terms=False):
+            result = super().evaluate(terms, context, return_terms=return_terms)
+            if not return_terms:
+                return result
+            assert isinstance(result, LocalEnergyResult)
+            return replace(
+                result,
+                terms={fused_name: result.total},
+            )
+
+        def describe_execution_receipt(self, terms, system_id):
+            del terms
+            return replace(
+                base_receipt,
+                system_id=system_id,
+                manifest={operator_id: (fused_name,) for operator_id in base_receipt.manifest},
+                numerical_policy={
+                    **base_receipt.numerical_policy,
+                    "contribution_order": encode_ordered_contribution_sequence((fused_name,)),
+                },
+            )
+
+    system = _system()
+    sampler = MetropolisSampler(
+        n_walkers=3,
+        burn_in=1,
+        n_steps=1,
+        n_electrons=1,
+        spatial_dim=3,
+        seed=19,
+        dtype=torch.float64,
+    )
+    generator = TrajectoryMCMCGenerator(
+        sampler=sampler,
+        hamiltonian_terms=_TERMS,
+        n_draws=2,
+        chunk_size=2,
+        system=system,
+        evaluator=_FusedEvaluator(),
+    )
+    output_dir = tmp_path / "fused"
+    output_dir.mkdir()
+    generated = generator.generate(model=_GaussianModel(), context=_hooke_context(output_dir))
+    records = generated.trajectory_records
+    assert isinstance(records, TrajectoryRecordArtifactV2)
+    assert records.term_names == (fused_name,)
+    assert torch.equal(records.final_draw.term_energies[fused_name], records.final_draw.local_energy)
+    header = records.path.read_text(encoding="utf-8").splitlines()[0].split(",")
+    assert [column for column in header if column.startswith("term/")] == [f"term/{fused_name}"]
+    decoded = inspection_module.inspect_trajectory_record(records.metadata_path)
+    assert decoded.contribution_names == (fused_name,)
 
 
 def test_generator_rejects_a_receipt_change_between_public_draws(tmp_path: Path) -> None:
