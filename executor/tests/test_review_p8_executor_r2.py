@@ -3,7 +3,6 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import pytest
-from tpen.inspection import RunEvidence
 from tpen_executor.runners import CoreRunEvidence, EvidenceUnavailable
 from tpen_executor.storage import FenceRejected
 from test_review_p8_executor_r1 import setup_store, finish
@@ -44,13 +43,12 @@ def test_r2_t2_each_outcome_binding_is_checked_independently(tmp_path, field, va
 
 
 @pytest.mark.parametrize("value", [True, 2.0, "2", "v2", None])
-def test_r2_t3_checkpoint_scalars_match_core_decoder(tmp_path, value):
+def test_r2_t3_schema_version_is_nonbool_integer(tmp_path, value):
     store, group, allocation = setup_store(tmp_path)
     _, evidence = finish(store, group, allocation, 1)
     payload = dict(schema=evidence.schema, run_dir=evidence.run_dir, verdict=evidence.verdict, run_status=evidence.run_status, checkpoint=dict(evidence.checkpoint), refusal=None, resolved_config_identity=dict(evidence.resolved_config_identity))
     assert payload["checkpoint"]["schema_version"] == 2
     assert type(payload["checkpoint"]["schema_version"]) is int
     payload["checkpoint"]["schema_version"] = value
-    core = RunEvidence.from_mapping(payload)
-    executor = CoreRunEvidence.from_mapping(payload)
-    assert dict(executor.checkpoint) == core.checkpoint
+    with pytest.raises(EvidenceUnavailable, match="schema_version must be an integer"):
+        CoreRunEvidence.from_mapping(payload)

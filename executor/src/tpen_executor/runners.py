@@ -261,6 +261,16 @@ class CoreRunEvidence:
         keys = {"checkpoint_dir", "schema_version", "next_iteration", "completed_updates"}
         if not isinstance(value, Mapping) or set(value) != keys:
             raise EvidenceUnavailable("checkpoint has invalid keys")
+        if type(value["checkpoint_dir"]) is not str:
+            raise EvidenceUnavailable("checkpoint text fields have invalid types")
+        if type(value["schema_version"]) is not int:
+            raise EvidenceUnavailable("checkpoint schema_version must be an integer")
+        if value["schema_version"] < 0:
+            raise EvidenceUnavailable("checkpoint schema_version must be nonnegative")
+        if type(value["next_iteration"]) is not int or type(value["completed_updates"]) is not int:
+            raise EvidenceUnavailable("checkpoint counters have invalid types")
+        if value["next_iteration"] < 0 or value["completed_updates"] < 0:
+            raise EvidenceUnavailable("checkpoint counters must be nonnegative")
         return MappingProxyType(dict(value))
 
     @classmethod

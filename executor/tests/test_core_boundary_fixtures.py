@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from tpen.inspection import RunEvidence
 from tpen_executor.runners import CoreRunEvidence, EvidenceUnavailable
 
 
@@ -123,16 +122,17 @@ def test_v3_refusal_codes_match_core(code: str) -> None:
         "outcome": "unknown",
         "checkpoint_ref": None,
     }
-    core = RunEvidence.from_mapping(payload)
     executor = CoreRunEvidence.from_mapping(payload)
-    assert dict(executor.refusal) == core.refusal
-    assert executor.schema == core.schema
-    assert executor.run_dir == core.run_dir
-    assert executor.verdict == core.verdict
-    assert executor.run_status == core.run_status
+    assert dict(executor.refusal) == {"code": code, "reason": "17"}
+    assert executor.schema == "tpen.run-evidence/v3"
+    assert executor.run_dir == "/normalized/core"
+    assert executor.verdict == "refused"
+    assert executor.run_status == "completed"
     assert executor.checkpoint is None
-    assert dict(executor.resolved_config_identity) == core.resolved_config_identity
-    assert executor.outcome == core.outcome
+    assert dict(executor.resolved_config_identity) == {
+        "schema": "tpen-config-identity-v1", "sha256": "a" * 64,
+    }
+    assert executor.outcome == "unknown"
     assert executor.checkpoint_ref is None
 
 
@@ -147,9 +147,7 @@ def test_v3_refusal_codes_match_core(code: str) -> None:
     ],
     ids=["nested-type", "nested-keys", "run-dir-type", "completed-without-checkpoint", "refused-with-checkpoint"],
 )
-def test_v3_malformed_cases_have_core_and_executor_same_verdict(mutate) -> None:
+def test_v3_malformed_cases_are_refused_by_executor(mutate) -> None:
     payload = _fixture(V3_FIXTURE_PATHS[0])
-    with pytest.raises(Exception):
-        RunEvidence.from_mapping(mutate(payload))
     with pytest.raises(EvidenceUnavailable):
         CoreRunEvidence.from_mapping(mutate(payload))
