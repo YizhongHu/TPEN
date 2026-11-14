@@ -43,14 +43,6 @@ stage_coordinate = importlib.import_module("experiments.atomistic.he-importance.
 launch = importlib.import_module("experiments.atomistic.he-importance.launch")
 optimizer_grid = importlib.import_module("experiments.atomistic.he-importance.optimizer_grid")
 train_config = importlib.import_module("experiments.atomistic.he-importance.train_config")
-_MANIFEST_SPEC = importlib.util.spec_from_file_location(
-    "he_importance_scan_manifest", Path(__file__).with_name("scan_manifest.py")
-)
-if _MANIFEST_SPEC is None or _MANIFEST_SPEC.loader is None:  # pragma: no cover
-    raise RuntimeError("could not load scan_manifest.py")
-scan_manifest = importlib.util.module_from_spec(_MANIFEST_SPEC)
-sys.modules[_MANIFEST_SPEC.name] = scan_manifest
-_MANIFEST_SPEC.loader.exec_module(scan_manifest)
 
 DEFAULT_STAGE = "Q"
 DEFAULT_CONTEXT = "O-raw"
@@ -131,12 +123,21 @@ def _descriptor(cell: Any) -> CellDescriptor:
             else None
         ),
     )
-
-
 def _roster() -> tuple[Any, ...]:
+
     from tpen.hi_schema import HI_METHOD_ROSTER
 
     return tuple(HI_METHOD_ROSTER)
+
+
+_MANIFEST_SPEC = importlib.util.spec_from_file_location(
+    "he_importance_scan_manifest", Path(__file__).with_name("scan_manifest.py")
+)
+if _MANIFEST_SPEC is None or _MANIFEST_SPEC.loader is None:  # pragma: no cover
+    raise RuntimeError("could not load scan_manifest.py")
+scan_manifest = importlib.util.module_from_spec(_MANIFEST_SPEC)
+sys.modules[_MANIFEST_SPEC.name] = scan_manifest
+_MANIFEST_SPEC.loader.exec_module(scan_manifest)
 
 
 architecture_stage_family = importlib.import_module(
