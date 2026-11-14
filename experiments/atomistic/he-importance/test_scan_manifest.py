@@ -94,7 +94,7 @@ def test_unavailable_rows_refuse_before_output_or_model(
     path = tmp_path / f"{method}.json"
     path.write_text(json.dumps(manifest), encoding="utf-8")
     monkeypatch.setattr(runner.train_config, "resolve_train_config", lambda *_args, **_kwargs: pytest.fail("model/config constructed"))
-    with pytest.raises(runner.StageQSelectionError, match=row["row_id"]) as excinfo:
+    with pytest.raises(runner.scan_manifest.ScanManifestError, match=row["row_id"]) as excinfo:
         runner.execute(_args(runner, path, row["row_id"], tmp_path / method))
     assert not (tmp_path / method).exists()
     assert row["unavailable_reason"] in str(excinfo.value)
@@ -110,10 +110,10 @@ def test_manifest_tamper_stale_and_unknown_refuse_before_materialization(
     tampered["rows"][0]["seed_label"] += 1
     tampered_path = tmp_path / "tampered.json"
     tampered_path.write_text(json.dumps(tampered), encoding="utf-8")
-    with pytest.raises(manifest_module.ScanManifestError, match="content hash mismatch"):
+    with pytest.raises(runner.scan_manifest.ScanManifestError, match="content hash mismatch"):
         runner.execute(_args(runner, tampered_path, tampered["rows"][0]["row_id"], tmp_path / "tampered-out"))
     assert not (tmp_path / "tampered-out").exists()
-    with pytest.raises(manifest_module.ScanManifestError, match="unknown manifest row"):
+    with pytest.raises(runner.scan_manifest.ScanManifestError, match="unknown manifest row"):
         runner.execute(_args(runner, HERE / "o1_scan_manifest_v1.json", "missing-row", tmp_path / "unknown-out"))
     assert not (tmp_path / "unknown-out").exists()
     original = runner.scan_manifest._materialized_rows()
@@ -122,7 +122,7 @@ def test_manifest_tamper_stale_and_unknown_refuse_before_materialization(
     drifted_row = next(candidate for candidate in drifted["rows"] if candidate["row_id"] == admitted["row_id"])
     drifted_row["seed_label"] += 1
     monkeypatch.setattr(runner.scan_manifest, "_materialized_rows", lambda: drifted)
-    with pytest.raises(manifest_module.ScanManifestError, match="stale or tampered"):
+    with pytest.raises(runner.scan_manifest.ScanManifestError, match="stale or tampered"):
         runner.execute(_args(runner, HERE / "o1_scan_manifest_v1.json", admitted["row_id"], tmp_path / "stale-out"))
     assert not (tmp_path / "stale-out").exists()
 
