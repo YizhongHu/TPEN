@@ -12,11 +12,15 @@ environment, installs this checkout editable into the overlay, then installs
 `$CLONE/executor` editable with `--no-deps`. The executor's `hydra-core` and
 `omegaconf` dependencies are already root-project dependencies, so the
 separate executor install only adds its editable source path. It runs the
-requested whole test paths with pytest -q, type checking disabled by an addopts
-override. `--parallel` defaults to `serial`: measurement on three heads showed
+requested whole test paths with pytest -q and type checking enabled by default.
+Pass `--typecheck off` only when explicitly justified (for example, for mutant
+arms whose mode is selected by their existing invocation). `--parallel` defaults to
+`serial`: measurement on three heads showed
 xdist gives no speed-up on the small targeted sets this runner is meant for
 (~20.8s serial vs ~21.3s xdist with type checking on); pass `--parallel xdist`
 only where a measured speed-up justifies it (e.g. the full suite).
+
+This default is required by manager rule `manager-rule-verify-typecheck-on-20261112`.
 
 `PYTHON`'s overlay interpreter is also exported as `TPEN_PYTHON` and
 `ROOT_PYTHON`, and `$OVERLAY/bin` is prepended to `PATH` so tests that spawn a
