@@ -95,37 +95,54 @@ def test_r2_t3_real_worker_kills_owned_group_and_reaps_before_propagation(tmp_pa
         environment = PreparedPythonEnvironment(sys.executable, SourceScript(str(setup)))
         args = ("-c", "pass")
     original_wait = subprocess.Popen.wait
+    original_waitid = os.waitid
     original_killpg = os.killpg
     calls = []
     processes = []
+    pids = []
     cancellation = error_type("review wait interruption")
 
-    def wait(process, *a, **kw):
-        calls.append("wait")
-        if not processes:
-            processes.append(process)
+    def waitid(id_type, pid, options):
+        calls.append("waitid")
+        pids.append(pid)
+        if len(pids) == 1:
             deadline = time.monotonic() + 5
             while not ready.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             assert ready.exists(), "bounded child must reach readiness before injected cancellation"
             raise cancellation
+        return original_waitid(id_type, pid, options)
+
+    def wait(process, *a, **kw):
+        calls.append("wait")
+        processes.append(process)
         result = original_wait(process, *a, **kw)
         calls.append("reaped")
         return result
 
     def killpg(pid, sig):
-        assert processes and pid == processes[0].pid
+        assert pids and pid == pids[0]
+        # The worker terminates its still-pinned group before the leader is
+        # reaped; membership is observed through /proc, not signal 0.
         assert sig == signal.SIGKILL
         calls.append("killpg")
         return original_killpg(pid, sig)
 
     with monkeypatch.context() as patch:
+        patch.setattr(os, "waitid", waitid)
         patch.setattr(subprocess.Popen, "wait", wait)
         patch.setattr(os, "killpg", killpg)
         with pytest.raises(error_type) as observed:
             SubprocessWorker().run(environment, args, cwd=tmp_path, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err", timeout=8)
     assert observed.value is cancellation
-    assert calls == ["wait", "killpg", "wait", "reaped"], calls
+    # The leader is observed with WNOWAIT, the owned group is terminated and
+    # probed while its PGID is pinned, and only then is the leader reaped.
+    collapsed = []
+    for call in calls:
+        if call == "waitid" and collapsed[-1:] == ["waitid"]:
+            continue
+        collapsed.append(call)
+    assert collapsed == ["waitid", "killpg", "waitid", "killpg", "wait", "reaped"], calls
     assert processes[0].returncode == -signal.SIGKILL
     time.sleep(1.8)
     assert not late.exists(), "owned descendant must not survive to write after cancellation"
@@ -152,13 +169,31 @@ def test_r2_t4_interrupted_cleanup_wait_cannot_return_without_reaping(tmp_path, 
             return -9
 
     child = Child()
+
+    def killpg(pid, sig):
+        # The first SIGKILL is the real, owned-group kill; the second is the
+        # owner cleanup's terminate step. Quiescence is observed through
+        # /proc membership, with no signal-0 probe.
+        kills.append((pid, sig))
+        if len(kills) > 1:
+            raise ProcessLookupError()
+
     with monkeypatch.context() as patch:
         patch.setattr(subprocess, "Popen", lambda *args, **kw: child)
-        patch.setattr(os, "killpg", lambda pid, sig: kills.append((pid, sig)))
+        patch.setattr(os, "killpg", killpg)
+        observations = []
+
+        def observe(*args, **kwargs):
+            observations.append(True)
+            if len(observations) == 1:
+                raise cancellation
+            return True
+
+        patch.setattr("tpen_executor.workers._leader_exited_without_reap", observe)
         with pytest.raises(KeyboardInterrupt) as observed:
             SubprocessWorker().run(PreparedPythonEnvironment(sys.executable), ("-c", "pass"), cwd=tmp_path, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
     assert observed.value is cancellation
-    assert kills == [(child.pid, signal.SIGKILL)]
+    assert kills == [(child.pid, signal.SIGKILL), (child.pid, signal.SIGKILL)]
     assert child.returncode is not None, ("cleanup returned without confirmed reap", waits, kills)
 
 

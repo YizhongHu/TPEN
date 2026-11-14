@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 import enum
 import math
 import os
@@ -10,8 +10,11 @@ from pathlib import Path
 import signal
 import socket
 import subprocess
+import threading
+import time
 from typing import Any
 
+from ._codec import decode_json
 from ._records import frozen_record
 from .environments import PreparedPythonEnvironment
 from .gpu_sampler import (
@@ -47,6 +50,124 @@ def _proc_start_ticks(pid: int) -> int | None:
     except ValueError:
         return None
     return ticks if ticks >= 0 else None
+
+
+def _proc_group_from_stat(stat_text: str) -> int | None:
+    """Parse the pgrp field from one Linux ``/proc/<pid>/stat`` record."""
+
+    close = stat_text.rfind(")")
+    if close < 0:
+        return None
+    fields_after_comm = stat_text[close + 1 :].strip().split()
+    if len(fields_after_comm) <= 2:
+        return None
+    try:
+        return int(fields_after_comm[2])
+    except ValueError:
+        return None
+
+
+def _proc_group_has_members(pgid: int, leader_pid: int) -> bool | None:
+    """Return whether a non-leader process remains in ``pgid``.
+
+    ``None`` means that ``/proc`` was unavailable or an entry could not be
+    read or parsed reliably. A process that vanishes between directory scan
+    and read is harmless and is ignored. The scan assumes same-UID descendants
+    are visible in the mounted ``/proc`` (including its ``hidepid`` scope).
+    """
+
+    proc_root = Path("/proc")
+    try:
+        if not proc_root.joinpath("self", "stat").is_file():
+            return None
+        entries = tuple(proc_root.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        try:
+            stat_text = entry.joinpath("stat").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        group = _proc_group_from_stat(stat_text)
+        if group is None:
+            return None
+        if int(entry.name) != leader_pid and group == pgid:
+            return True
+    return False
+
+
+def _group_quiescent(
+    pid: int,
+    *,
+    bound: float = 1.0,
+    interval: float = 0.02,
+    leader_reaped: bool = False,
+    spawned_ticks: int | None = None,
+) -> bool:
+    """Terminate, then bounded-observe, that no process remains in ``pid``'s group.
+
+    ``start_new_session=True`` makes this worker's process group id equal to
+    the session leader's pid, so this worker owns that group whether or not
+    the leader itself is still alive: it first ``killpg``\\ s it (review
+    P1-1 residual -- a same-group descendant the leader spawned and left
+    behind must be terminated, not merely observed), then scans ``/proc``
+    for non-leader members within the bound. The pinned zombie leader is
+    deliberately excluded from that scan. Without Linux ``/proc`` visibility,
+    the result is conservatively ``False`` and quarantine is retained.
+    """
+
+    if leader_reaped and (spawned_ticks is None or _proc_start_ticks(pid) != spawned_ticks):
+        # Once the leader is reaped, a bare PID is no longer an ownership
+        # proof.  Retain quarantine rather than risking a reused process
+        # group; callers must not signal without this identity check.
+        return False
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + bound
+    while True:
+        has_members = _proc_group_has_members(pid, pid)
+        if has_members is False:
+            return True
+        if has_members is None:
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def _leader_exited_without_reap(
+    pid: int,
+    *,
+    bound: float | None = None,
+    interval: float = 0.02,
+    cancel_requested: threading.Event | None = None,
+    terminate: Callable[[], None] | None = None,
+) -> bool:
+    """Observe a child exit while retaining its PID/PGID ownership proof.
+
+    ``WNOWAIT`` leaves the leader as a zombie, keeping its process-group id
+    pinned while :func:`_group_quiescent` terminates and observes descendants.
+    The caller must reap the leader with ``Popen.wait`` afterwards.
+    """
+
+    flags = os.WEXITED | os.WNOHANG | os.WNOWAIT
+    deadline = None if bound is None else time.monotonic() + bound
+    while True:
+        result = os.waitid(os.P_PID, pid, flags)
+        if result is not None and result.si_pid == pid:
+            return True
+        if cancel_requested is not None and cancel_requested.is_set() and terminate is not None:
+            terminate()
+            cancel_requested.clear()
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
 
 
 class LaunchPurpose(enum.Enum):
@@ -91,6 +212,13 @@ class ProcessOutcome:
     proc_start_ticks : int or None
         Linux ``/proc/<pid>/stat`` start token captured while the child was
         live, or ``None`` when it could not be observed.
+    group_reaped : bool
+        Whether this worker confirmed its own reap of the launch: either no
+        child was spawned, or a bounded, observed check
+        (:func:`_group_quiescent`) found no process left in the child's
+        process group after the session leader was reaped.  A caller that
+        cannot confirm this (an uncertain exit) never constructs a
+        :class:`ProcessOutcome` at all, so there is no default to trust.
     """
 
     argv: tuple[str, ...]
@@ -100,6 +228,7 @@ class ProcessOutcome:
     timed_out: bool
     pid: int | None = None
     proc_start_ticks: int | None = None
+    group_reaped: bool = True
 
 
 @frozen_record
@@ -154,6 +283,8 @@ class SubprocessWorker:
         process_handle: Any = None,
         pre_spawn_guard: Callable[[], bool] | None = None,
         purpose: LaunchPurpose = LaunchPurpose.SCIENCE,
+        cancel_path: str | os.PathLike[str] | None = None,
+        cancel_identity: Mapping[str, str] | None = None,
     ) -> ProcessOutcome:
         """Run the prepared interpreter with exact argument boundaries.
 
@@ -206,6 +337,8 @@ class SubprocessWorker:
             raise TypeError("args must be a sequence of strings")
         if pre_spawn_guard is not None and not callable(pre_spawn_guard):
             raise TypeError("pre_spawn_guard must be callable or None")
+        if cancel_path is not None and not isinstance(cancel_identity, Mapping):
+            raise TypeError("cancel_identity is required with cancel_path")
         if type(purpose) is not LaunchPurpose:
             # A bare string such as "inspection" never grants the exemption.
             raise TypeError("purpose must be a LaunchPurpose")
@@ -254,7 +387,15 @@ class SubprocessWorker:
             # unsampled launch is never assumed to be one (review delta-3 F1,
             # delta-4 D4-1).
             if not inspector and (slot or sampler_output is not None):
-                ensure_slot_clean(slot, quarantine_dir)
+                try:
+                    ensure_slot_clean(slot, quarantine_dir)
+                except BaseException as error:
+                    # Refused before any child exists: trivially quiescent,
+                    # not an uncertain exit (review P1-1 scope: only a child
+                    # this worker actually spawned can leave its group
+                    # non-empty).
+                    error.group_reaped = True
+                    raise
             # Claim before spawn: a worker that dies later leaves attempted,
             # unfinalized evidence, never an absent or not-sampled record.
             if not claim_sampler_evidence(sampler_output):
@@ -267,6 +408,14 @@ class SubprocessWorker:
                     **{key: child_env.get(key) for key in QUARANTINE_IDENTITY_KEYS},
                     "evidence_path": sampler_output, "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
                 })
+            if cancel_path is not None:
+                try:
+                    marker = decode_json(Path(os.fspath(cancel_path)).read_bytes())
+                except (FileNotFoundError, OSError, ValueError, TypeError):
+                    marker = None
+                if isinstance(marker, dict) and all(marker.get(key) == value for key, value in (cancel_identity or {}).items()):
+                    settle_slot_lease(lease, None, group_reaped=True)
+                    return ProcessOutcome(logical_argv, None, stdout_name, stderr_name, timed_out)
             try:
                 process = subprocess.Popen(
                     command,
@@ -276,70 +425,145 @@ class SubprocessWorker:
                     stderr=stderr,
                     start_new_session=True,
                 )
-            except OSError:
+            except OSError as error:
                 # Popen raised from the launch itself: no child exists.
-                settle_slot_lease(lease, None)
+                settle_slot_lease(lease, None, group_reaped=True)
+                error.group_reaped = True
                 raise
             except BaseException:
-                # An interrupted spawn may have left a child no one owns.
-                settle_slot_lease(lease, None, child_known=False)
+                # An interrupted spawn may have left a child no one owns:
+                # genuinely uncertain, not tagged.
+                settle_slot_lease(lease, None, child_known=False, group_reaped=False)
                 raise
             spawned_pid = process.pid
             spawned_ticks = _proc_start_ticks(spawned_pid)
             sampler = None
+            group_reaped = False
+            cancel_stop = threading.Event()
+            cancel_requested = threading.Event()
+            watcher: threading.Thread | None = None
+            watcher_started = False
+            if cancel_path is not None:
+                marker_path = os.fspath(cancel_path)
+                expected_marker = dict(cancel_identity or {})
+
+                def watch_cancel_marker() -> None:
+                    """Notify the owner thread that leaf cancellation was requested."""
+                    while not cancel_stop.wait(0.01):
+                        try:
+                            marker = decode_json(Path(marker_path).read_bytes())
+                        except (FileNotFoundError, OSError, ValueError, TypeError):
+                            continue
+                        if not isinstance(marker, dict) or any(marker.get(key) != value for key, value in expected_marker.items()):
+                            continue
+                        cancel_requested.set()
+                        return
+
+                watcher = threading.Thread(target=watch_cancel_marker, daemon=True)
             try:
                 if process_handle is not None:
                     process_handle.attach(process)
+                if watcher is not None:
+                    # Starting the watcher from inside this try means a
+                    # failure to start it (e.g. thread creation refused) is
+                    # an uncertain exit like any other: reaped and
+                    # propagated below, never a silently-true ack (review
+                    # P1-1).
+                    watcher.start()
+                    watcher_started = True
                 if sampler_output is not None:
                     # Hold the sampler before any asynchronous work starts, so
                     # an interruption during or right after start() still
                     # leaves this worker owning its cleanup (review E1).
                     sampler = GpuSampler.from_environment(spawned_pid, child_env)
                     sampler.start()
-                try:
-                    returncode = process.wait(timeout=timeout)
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                    # Kill the isolated session so setup/science descendants stop too.
+
+                def terminate_owned_group() -> None:
+                    """Signal the still-pinned group from the owner thread."""
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+
+                try:
+                    leader_exited = _leader_exited_without_reap(
+                        spawned_pid, bound=timeout, cancel_requested=cancel_requested,
+                        terminate=terminate_owned_group,
+                    )
+                except ChildProcessError:
+                    group_reaped = False
+                    returncode = process.returncode
+                else:
+                    if not leader_exited:
+                        timed_out = True
+                        # The WNOWAIT bound expired while the leader was
+                        # unreaped, so this owner-thread kill remains
+                        # pinned and cannot race another reaper.
+                        terminate_owned_group()
+                        _leader_exited_without_reap(
+                            spawned_pid, cancel_requested=cancel_requested,
+                            terminate=terminate_owned_group,
+                        )
+                    group_reaped = _group_quiescent(spawned_pid)
                     returncode = process.wait()
             except BaseException as original:
                 # An interrupt while waiting must not orphan the isolated
-                # session. Reap the leader before propagating cancellation.
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                # session. Keep the leader unreaped while terminating and
+                # observing its group, then reap it before propagating.
+                if process.returncode is None:
+                    if isinstance(original, ChildProcessError):
+                        # An already-reaped leader is no longer an ownership
+                        # proof; do not signal a possibly reused process group.
+                        group_reaped = False
+                    else:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            _leader_exited_without_reap(spawned_pid)
+                        except ChildProcessError:
+                            # The leader was already reaped; its PID/PGID is
+                            # no longer an ownership proof, so do not signal it.
+                            group_reaped = False
+                        else:
+                            group_reaped = _group_quiescent(spawned_pid)
                 cleanup_errors: list[BaseException] = []
                 while process.returncode is None:
                     try:
                         process.wait()
+                    except ChildProcessError:
+                        group_reaped = False
+                        break
                     except BaseException as cleanup_error:
                         cleanup_errors.append(cleanup_error)
                 # The cancelled child is reaped; drain the sampler's command
                 # groups and settle the lease before the cancellation leaves
                 # this worker.  A further interruption of that finalizer is
-                # recorded on the original, which still propagates.
+                # recorded on the original, which still propagates.  The
+                # science group itself is terminated and observed BEFORE the
+                # lease settles (review B2): a sampler whose own commands are
+                # clean must never release the quarantine marker while a
+                # science descendant could still be alive.
                 try:
-                    cleanup_errors.extend(finish_gpu_sampler(sampler, sampler_output, lease))
+                    cleanup_errors.extend(finish_gpu_sampler(sampler, sampler_output, lease, group_reaped=group_reaped))
                 except BaseException as finish_error:
                     cleanup_errors.append(finish_error)
                 for cleanup_error in cleanup_errors:
                     original.add_note(f"cleanup wait interruption: {cleanup_error!r}")
                 raise
             finally:
+                cancel_stop.set()
+                if watcher_started:
+                    watcher.join(timeout=1)
                 if process_handle is not None:
                     process_handle.clear(process)
-        # Normal exit and worker timeout: the child is reaped; finish the
-        # sampler and settle the lease, which stays quarantined if cleanup is
-        # still unconfirmed.
-        interruptions = finish_gpu_sampler(sampler, sampler_output, lease)
+        interruptions = finish_gpu_sampler(sampler, sampler_output, lease, group_reaped=group_reaped)
         if interruptions:
             raise interruptions[0]
-        return ProcessOutcome(logical_argv, returncode, stdout_name, stderr_name, timed_out, spawned_pid, spawned_ticks)
+        return ProcessOutcome(
+            logical_argv, returncode, stdout_name, stderr_name, timed_out, spawned_pid, spawned_ticks, group_reaped,
+        )
 
 
 __all__ = ["LaunchPurpose", "ProcessOutcome", "SubprocessWorker"]

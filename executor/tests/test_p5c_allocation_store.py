@@ -214,7 +214,10 @@ def test_p5c_each_crossed_fence_rejection_preserves_bytes(tmp_path: Path, crossi
     assert _all_bytes(Path(target.root)) == before
     with pytest.raises(ValueError):
         OutcomeReceipt("a", fence.attempt_id, group.identity, "done", "unknown", fence.output_dir)
-    assert OUTCOME_STATUSES == {"completed", "failed", "timed_out", "launch_failed"}
+    # S3 Layer C adds "remote-quiescence-unconfirmed" (bounded absence of a
+    # leaf teardown ack): a durable, non-accepting status distinct from any
+    # locally-reaped outcome.
+    assert OUTCOME_STATUSES == {"completed", "failed", "timed_out", "launch_failed", "remote-quiescence-unconfirmed"}
 
 
 @pytest.mark.parametrize(
