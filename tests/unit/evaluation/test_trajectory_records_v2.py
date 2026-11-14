@@ -8,6 +8,7 @@ by construction, not asserted against a stub.
 
 from __future__ import annotations
 
+import csv
 import json
 import math
 from dataclasses import replace
@@ -318,10 +319,36 @@ def test_swapped_execution_receipt_is_rejected(tmp_path: Path) -> None:
 
 def test_edited_csv_is_rejected(tmp_path: Path) -> None:
     artifact = _v2_artifact(tmp_path, FINITE)
-    with artifact.path.open("a") as handle:
-        handle.write("tampered\n")
+    rows = list(csv.reader(artifact.path.read_text(encoding="utf-8").splitlines()))
+    local_energy_column = rows[0].index("local_energy")
+    rows[1][local_energy_column] += " "
+    artifact.path.write_text(
+        "\n".join(",".join(row) for row in rows) + "\n", encoding="utf-8"
+    )
+    metadata = _read_metadata(artifact)
+    metadata["byte_count"] = artifact.path.stat().st_size
+    metadata["record_content_id"] = trajectory_records._record_content_id(metadata)
+    _rewrite_metadata(artifact, metadata)
     with pytest.raises(TamperedTrajectoryRecordError, match="csv_sha256"):
         inspect_trajectory_record(artifact.metadata_path)
+
+
+def test_v2_validate_rejects_a_tampered_byte_count_after_redigest(tmp_path: Path) -> None:
+    """A re-digested size declaration cannot make the typed artifact accept a short CSV."""
+
+    artifact = _v2_artifact(tmp_path, FINITE)
+    metadata = _read_metadata(artifact)
+    metadata["byte_count"] += 1
+    metadata["record_content_id"] = trajectory_records._record_content_id(metadata)
+    _rewrite_metadata(artifact, metadata)
+    artifact = replace(
+        artifact,
+        byte_count=metadata["byte_count"],
+        record_content_id=metadata["record_content_id"],
+    )
+
+    with pytest.raises(ValueError, match="byte_count"):
+        artifact.validate()
 
 
 @pytest.mark.parametrize("mutation", ["missing", "extra"])
