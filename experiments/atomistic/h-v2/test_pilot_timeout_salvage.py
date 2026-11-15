@@ -102,6 +102,17 @@ def test_salvage_refuses_trainer_cursor_mismatch(tmp_path: Path) -> None:
         attached.build_salvage_inventory(root, expected_source_commit="a" * 40)
 
 
+def test_salvage_refuses_completed_updates_only_cursor_mismatch(tmp_path: Path) -> None:
+    """Both trainer cursor fields must agree with the checkpoint step."""
+    root = _checkpoint_root(tmp_path)
+    entry = _write_checkpoint(root, 0)
+    (entry / "trainer.json").write_text(
+        json.dumps({"completed_updates": 1, "next_iteration": 0}), encoding="utf-8"
+    )
+    with pytest.raises(attached.HV2ReceiptRefusal, match="salvage-cursor-mismatch"):
+        attached.build_salvage_inventory(root, expected_source_commit="a" * 40)
+
+
 def test_salvage_refuses_hash_mismatch(tmp_path: Path) -> None:
     root = _checkpoint_root(tmp_path)
     entry = _write_checkpoint(root, 0)
@@ -124,6 +135,17 @@ def test_salvage_refuses_identity_commit_or_config_mismatch(tmp_path: Path) -> N
         attached.build_salvage_inventory(root, expected_source_commit="a" * 40)
 
 
+def test_salvage_refuses_checkpoint_symlink_escape(tmp_path: Path) -> None:
+    root = _checkpoint_root(tmp_path)
+    entry = _write_checkpoint(root, 0)
+    outside = tmp_path / "outside-model.pt"
+    outside.write_bytes((entry / "model.pt").read_bytes())
+    (entry / "model.pt").unlink()
+    (entry / "model.pt").symlink_to(outside)
+    with pytest.raises(attached.HV2ReceiptRefusal, match="salvage-checkpoint-path"):
+        attached.build_salvage_inventory(root, expected_source_commit="a" * 40)
+
+
 def test_salvage_writer_creates_new_atomic_subdirectory_without_touching_store(tmp_path: Path) -> None:
     payload = "capacity-pilot-100k"
     checkpoint_root = tmp_path / "attached" / "store" / f"h-v2-train-{payload}" / "groups" / "g" / "attempt" / "core" / "checkpoints"
@@ -141,6 +163,35 @@ def test_salvage_writer_creates_new_atomic_subdirectory_without_touching_store(t
     assert {path: path.read_bytes() for path in entry.iterdir()} == before
 
 
+def test_salvage_writer_never_overwrites_an_existing_salvage_directory(tmp_path: Path) -> None:
+    payload = "capacity-pilot-100k"
+    checkpoint_root = (
+        tmp_path
+        / "attached"
+        / "store"
+        / f"h-v2-train-{payload}"
+        / "groups"
+        / "g"
+        / "attempt"
+        / "core"
+        / "checkpoints"
+    )
+    _write_checkpoint(checkpoint_root, 0)
+    salvage_dir = tmp_path / "attached" / "salvage"
+    salvage_dir.mkdir(parents=True)
+    sentinel = salvage_dir / "existing.json"
+    sentinel.write_text("keep", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        attached.write_salvage_inventory(
+            tmp_path,
+            payload=payload,
+            job_id="60007665",
+            terminal_state="TIMEOUT",
+            expected_source_commit="a" * 40,
+        )
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
 def test_salvage_inventory_is_refused_for_science_payload(tmp_path: Path) -> None:
     with pytest.raises(job.JobError, match="refused for science"):
         job.run_eval_fanout(
@@ -152,6 +203,22 @@ def test_salvage_inventory_is_refused_for_science_payload(tmp_path: Path) -> Non
             expected_train_commit="a" * 40,
             pilot_stage=None,
             salvage_inventory_path=tmp_path / "salvage.json",
+        )
+
+
+def test_salvage_consumer_refuses_incomplete_inventory_entry() -> None:
+    with pytest.raises(eval_job.EvalJobRefusal, match="salvage-inventory-entry"):
+        eval_job.verify_salvage_inventory_identity(
+            {
+                "source": "salvage-partial-inventory",
+                "payload": "capacity-pilot-100k",
+                "lineage": "P",
+                "source_commit": "a" * 40,
+                "inventory": [{"update": 0}],
+            },
+            expected_commit="a" * 40,
+            expected_payload="capacity-pilot-100k",
+            expected_lineage="P",
         )
 
 
@@ -185,6 +252,14 @@ def test_salvage_sel_window_follows_inventory_length(tmp_path: Path) -> None:
     assert eval_job.verify_selection_record(
         record, b1_eval_receipt_sha256="c" * 64, payload="capacity-pilot-100k", ordinal_count=7
     ) == 4
+
+
+def test_salvage_default_100k_fanout_still_covers_101_ordinals() -> None:
+    generations = eval_job.pilot_fanout("1", payload="capacity-pilot-100k")
+    assert len(generations) == 101
+    assert generations[0]["ordinal"] == 0
+    assert generations[-1]["ordinal"] == 100
+    assert generations[-1]["update"] == 100_000
 
 
 def test_salvage_fanout_and_eval_receipt_preserve_source_binding(tmp_path: Path) -> None:
