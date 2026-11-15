@@ -8,6 +8,7 @@ from omegaconf import OmegaConf
 
 from tpen.run import load_config
 from experiments.atomistic.stage1.protocol import physical_system_id_from_config
+from experiments.atomistic.stage1.launch import row_overrides
 
 
 ROOT = Path(__file__).parents[1] / "configs"
@@ -57,3 +58,12 @@ def test_accepted_variational_settings_match_train_and_eval(system: str) -> None
         assert train.model.factors[1].law.curvature_range == 1.0
         assert train.model.factors[1].law.trainable is True
         assert train.model.readout.trainable is True
+
+
+def test_train_launch_binds_declared_checkpoint_steps() -> None:
+    row = {"kind": "train", "seed": 1, "results_root": "/tmp/results",
+           "experiment_name": "stage1", "sector": "he", "run_id": "train-0",
+           "walkers": 256, "updates": 101, "checkpoint_steps": [7, 101]}
+    overrides = row_overrides(row)
+    assert "callbacks.4.schedule._target_=tpen.checkpoint.ExplicitUpdates" in overrides
+    assert "callbacks.4.schedule.updates=[7,101]" in overrides
