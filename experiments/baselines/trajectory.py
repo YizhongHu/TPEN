@@ -33,6 +33,14 @@ class TrajectoryRow:
     source_file: str
 
 
+class TrajectoryTable(list[TrajectoryRow]):
+    """Rows plus source metadata needed to interpret their step labels."""
+
+    def __init__(self, rows: Iterable[TrajectoryRow], *, step_basis: str):
+        super().__init__(rows)
+        self.step_basis = step_basis
+
+
 def read_trajectory(code: str, run_dir: Path) -> list[TrajectoryRow]:
     """Read one run through its format-specific adapter."""
 
@@ -72,7 +80,7 @@ def read_trajectory(code: str, run_dir: Path) -> list[TrajectoryRow]:
         ))
     if not rows:
         raise AdapterError(f"{source_file} has no trajectory rows")
-    return rows
+    return TrajectoryTable(rows, step_basis=getattr(raw_rows, "step_basis", "optimizer_step"))
 
 
 def _finite_mean(rows: Iterable[TrajectoryRow], field: str) -> float | None:
@@ -90,7 +98,8 @@ def summarize(rows: Sequence[TrajectoryRow], *, window_fraction: float = 0.1) ->
     The first and last windows use ``max(1, floor(n_steps * fraction))`` rows.
     Trend means ignore non-finite values, while ``non_finite_count`` remains an
     explicit quality signal. A variance ratio is reported only when both window
-    means exist and the first mean is non-zero.
+    means exist and the first mean is non-zero. The endpoint ratio is not a
+    verdict that the trajectory avoided a late rise or recurrence.
     """
 
     if not rows:
@@ -120,6 +129,7 @@ def summarize(rows: Sequence[TrajectoryRow], *, window_fraction: float = 0.1) ->
     return {
         "source_code": rows[0].source_code,
         "source_file": rows[0].source_file,
+        "step_basis": getattr(rows, "step_basis", "optimizer_step"),
         "n_steps": len(rows),
         "first_step": rows[0].step,
         "last_step": rows[-1].step,
@@ -177,4 +187,4 @@ if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
 
 
-__all__ = ["TrajectoryRow", "main", "read_trajectory", "summarize", "write_csv"]
+__all__ = ["TrajectoryRow", "TrajectoryTable", "main", "read_trajectory", "summarize", "write_csv"]

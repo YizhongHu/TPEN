@@ -59,6 +59,12 @@ _START_STAMP = re.compile(r"start=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:
 _END_STAMP = re.compile(r"end=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2})")
 
 
+class _TrajectoryRows(list[dict[str, int | float | None]]):
+    """List-compatible rows carrying optimizer-step provenance."""
+
+    step_basis = "optimizer_step"
+
+
 def read_trajectory(run_dir: Path) -> list[dict[str, int | float | None]]:
     """Read FermiNet's loss and time-weighted variance per optimizer step.
 
@@ -94,7 +100,7 @@ def read_trajectory(run_dir: Path) -> list[dict[str, int | float | None]]:
             if "energy" in missing:
                 raise AdapterError(f"{stats_path} has no 'energy' column")
             raise AdapterError(f"{stats_path} is missing required column(s): {', '.join(missing)}")
-        rows = []
+        rows = _TrajectoryRows()
         for row_number, row in enumerate(reader, 2):
             try:
                 rows.append({
