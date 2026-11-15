@@ -1,0 +1,50 @@
+[
+  {
+    "id": "admit-incomplete-checkpoint",
+    "target": "experiments/atomistic/h-v2/attached.py",
+    "old": "if not manifest_path.is_file() or not complete_path.is_file():\n            break",
+    "new": "if not manifest_path.is_file():\n            break  # mutant: admit-incomplete-checkpoint",
+    "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_excludes_incomplete_checkpoint_and_stops_at_first_gap",
+    "needle_count": 1
+  },
+  {
+    "id": "ignore-salvage-hash",
+    "target": "experiments/atomistic/h-v2/attached.py",
+    "old": "if actual_hash != expected_hash:\n                raise HV2ReceiptRefusal(\n                    \"salvage-checkpoint-hash-mismatch\",",
+    "new": "if False and actual_hash != expected_hash:\n                raise HV2ReceiptRefusal(\n                    \"salvage-checkpoint-hash-mismatch\",  # mutant: ignore-salvage-hash",
+    "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_refuses_hash_mismatch",
+    "needle_count": 1
+  },
+  {
+    "id": "allow-science-salvage",
+    "target": "experiments/atomistic/h-v2/run_job.py",
+    "old": "if salvage_inventory_path is not None and payload not in _PILOT_STAGE_PAYLOADS:\n        raise JobError(\"salvage-science-refused: salvage inventory refused for science payloads\")",
+    "new": "if False and salvage_inventory_path is not None and payload not in _PILOT_STAGE_PAYLOADS:\n        raise JobError(\"salvage-science-refused: salvage inventory refused for science payloads\")  # mutant: allow-science-salvage",
+    "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_inventory_is_refused_for_science_payload",
+    "needle_count": 1
+  },
+  {
+    "id": "use-fixed-sel-window",
+    "target": "experiments/atomistic/h-v2/eval_job.py",
+    "old": "missing = sorted(set(protocol.pilot_stage1_ordinals(payload, count=ordinal_count)) - seen_ordinals)",
+    "new": "missing = sorted(set(protocol.pilot_stage1_ordinals(payload, count=len(seen_ordinals))) - seen_ordinals)  # mutant: use-fixed-sel-window",
+    "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_sel_refuses_inventory_length_7_with_only_six_b1_generations",
+    "needle_count": 1
+  },
+  {
+    "id": "remove-completed-updates-cursor-check",
+    "target": "experiments/atomistic/h-v2/attached.py",
+    "old": "if trainer.get(\"completed_updates\") != step or trainer.get(\"next_iteration\") != step:",
+    "new": "if (False and (trainer.get(\"completed_updates\") != step)) or trainer.get(\"next_iteration\") != step:  # mutant: remove-completed-updates-cursor-check",
+    "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_refuses_completed_updates_only_cursor_mismatch",
+    "needle_count": 1
+  },
+  {
+    "id": "ignore-salvage-relative-path-guard",
+    "target": "experiments/atomistic/h-v2/attached.py",
+    "old": "    if relative_path.is_absolute() or \"..\" in relative_path.parts:",
+    "new": "    if False and (relative_path.is_absolute() or \"..\" in relative_path.parts):  # mutant: ignore-salvage-relative-path-guard",
+    "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_refuses_absolute_or_parent_manifest_member",
+    "needle_count": 1
+  }
+]

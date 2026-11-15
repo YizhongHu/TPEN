@@ -317,6 +317,7 @@ def run_eval_fanout(
     lineage_index: int | None = None,
     pilot_stage: str | None = None,
     pack_k: int = 1,
+    salvage_inventory_path: Path | None = None,
 ) -> None:
     """Dispatch one EVAL fan-out job (item E, acceptance-contract 8a5e926f).
 
@@ -344,6 +345,13 @@ def run_eval_fanout(
         raise JobError(f"--pack-k must be between 1 and 6, got {pack_k}")
 
     selection_record: dict | None = None
+    source = "train-accepted-receipt"
+    source_sha256: str | None = None
+    ordinal_count: int | None = None
+    if salvage_inventory_path is not None and payload not in _PILOT_STAGE_PAYLOADS:
+        raise JobError("salvage-science-refused: salvage inventory refused for science payloads")
+    if salvage_inventory_path is not None and pilot_stage != "1":
+        raise JobError("salvage inventory is supported only for pilot stage 1")
     if payload == "science":
         if lineage not in launch_config.LINEAGES:
             raise JobError(
@@ -364,7 +372,22 @@ def run_eval_fanout(
             raise JobError(f"{payload} eval fan-out only supports --pilot-stage 1")
         task_label = f"h-v2-eval-{payload}-stage{pilot_stage}"
         if pilot_stage == "1":
-            generations = eval_job.pilot_fanout("1", payload=payload)
+            if salvage_inventory_path is not None:
+                salvage, source_sha256 = eval_job.load_salvage_inventory(salvage_inventory_path)
+                eval_job.verify_salvage_inventory_identity(
+                    salvage,
+                    expected_commit=expected_train_commit,
+                    expected_payload=payload,
+                    expected_lineage=expected_lineage,
+                )
+                train_receipt = {"checkpoint_inventory": salvage["inventory"]}
+                train_receipt_path = Path(salvage_inventory_path)
+                train_receipt_sha256 = source_sha256
+                source = "salvage-partial-inventory"
+                ordinal_count = len(salvage["inventory"])
+                generations = eval_job.pilot_fanout("1", payload=payload, ordinal_count=ordinal_count)
+            else:
+                generations = eval_job.pilot_fanout("1", payload=payload)
         else:
             selection_path = run_root / "attached" / "receipts" / f"h-v2-eval-{payload}-selection.json"
             if not selection_path.is_file():
@@ -388,14 +411,15 @@ def run_eval_fanout(
         task_label = f"h-v2-eval-{payload}"
         generations = eval_job.gpu_route_g_fanout()
 
-    train_receipt_path = run_root / "attached" / "receipts" / f"{train_task_id}.h-v2.json"
-    train_receipt, train_receipt_sha256 = eval_job.load_train_receipt(train_receipt_path)
-    eval_job.verify_train_receipt_identity(
-        train_receipt,
-        expected_commit=expected_train_commit,
-        expected_lineage=expected_lineage,
-        expected_payload=payload,
-    )
+    if salvage_inventory_path is None:
+        train_receipt_path = run_root / "attached" / "receipts" / f"{train_task_id}.h-v2.json"
+        train_receipt, train_receipt_sha256 = eval_job.load_train_receipt(train_receipt_path)
+        eval_job.verify_train_receipt_identity(
+            train_receipt,
+            expected_commit=expected_train_commit,
+            expected_lineage=expected_lineage,
+            expected_payload=payload,
+        )
 
     readout_available = eval_job.probe_readout_trajectory_generator(science_python)
     results_root = run_root / "attached" / "results" / "attached"
@@ -456,6 +480,9 @@ def run_eval_fanout(
                 generations=records,
                 readout_generator_enabled=readout_available,
                 selection=selection_record,
+                source=source,
+                source_sha256=source_sha256,
+                ordinal_count=ordinal_count,
             )
 
     failures: list[BaseException] = []
@@ -502,12 +529,18 @@ def run_pilot_sel(run_root: Path, *, payload: str = "capacity-pilot") -> None:
     # D5 (review r2 delta): hash the EXACT bytes parsed, not a later re-read
     # of the file (which an atomic replacement mid-computation could race).
     stage1_receipt, stage1_sha256 = eval_job.read_eval_receipt_with_hash(stage1_path)
-    selection_core = eval_job.compute_pilot_selection(stage1_receipt, payload=payload)
+    ordinal_count = None
+    if stage1_receipt.get("source") == "salvage-partial-inventory":
+        if not isinstance(stage1_receipt.get("source_sha256"), str) or not stage1_receipt["source_sha256"]:
+            raise JobError("sel-salvage-source-missing: B1 receipt has no salvage inventory sha256")
+        ordinal_count = stage1_receipt.get("ordinal_count")
+    selection_core = eval_job.compute_pilot_selection(stage1_receipt, payload=payload, ordinal_count=ordinal_count)
     record = eval_job.build_selection_record(
         c1=selection_core["c1"],
         triple_means=selection_core["triple_means"],
         b1_eval_receipt_sha256=stage1_sha256,
         payload=payload,
+        ordinal_count=ordinal_count,
     )
     selection_path = run_root / "attached" / "receipts" / f"h-v2-eval-{payload}-selection.json"
     selection_path.parent.mkdir(parents=True, exist_ok=True)
@@ -849,6 +882,7 @@ def _main_eval_fanout(argv: list[str]) -> int:
     parser.add_argument("--expected-train-commit", required=True)
     parser.add_argument("--pilot-stage", choices=("1", "2", "2-core"), default=None)
     parser.add_argument("--pack-k", type=int, default=1, help="Run up to six eval generations concurrently (default: 1).")
+    parser.add_argument("--salvage-inventory", type=Path, default=None, help="Explicit pilot salvage inventory input.")
     args = parser.parse_args(argv)
 
     if args.payload == "science":
@@ -882,6 +916,7 @@ def _main_eval_fanout(argv: list[str]) -> int:
             expected_train_commit=args.expected_train_commit,
             pilot_stage=args.pilot_stage,
             pack_k=args.pack_k,
+            salvage_inventory_path=args.salvage_inventory,
         )
     except Exception as error:  # noqa: BLE001 - this is the job's own top-level boundary
         print(f"[h-v2] job failed: {error}", file=sys.stderr)
@@ -901,6 +936,38 @@ def _main_sel(argv: list[str]) -> int:
     except Exception as error:  # noqa: BLE001 - this is the job's own top-level boundary
         print(f"[h-v2] job failed: {error}", file=sys.stderr)
         return 1
+    return 0
+
+
+def _main_salvage_inventory(argv: list[str]) -> int:
+    """Build one read-only pilot salvage inventory from completed checkpoints."""
+
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="run_job.py salvage-inventory")
+    parser.add_argument("payload", choices=_PILOT_STAGE_PAYLOADS)
+    parser.add_argument("--job-id", required=True)
+    parser.add_argument("--terminal-state", required=True)
+    parser.add_argument("--expected-train-commit", default=None)
+    parser.add_argument("--expected-config-sha256", default=None)
+    args = parser.parse_args(argv)
+    run_root = Path(_require_env("RUN")).resolve()
+    try:
+        output_path, receipt = attached.write_salvage_inventory(
+            run_root,
+            payload=args.payload,
+            job_id=args.job_id,
+            terminal_state=args.terminal_state,
+            expected_source_commit=args.expected_train_commit,
+            expected_config_sha256=args.expected_config_sha256,
+        )
+    except Exception as error:  # noqa: BLE001 - this is the job's own top-level boundary
+        print(f"[h-v2] job failed: {error}", file=sys.stderr)
+        return 1
+    print(
+        f"[h-v2] salvage: path={output_path} entries={len(receipt['inventory'])} "
+        f"last_step={receipt['inventory'][-1]['update']} source={receipt['source']}"
+    )
     return 0
 
 
@@ -939,6 +1006,8 @@ def main(argv: list[str] | None = None) -> int:
         return _main_sel(argv[1:])
     if argv and argv[0] == "final-sel":
         return _main_final_sel(argv[1:])
+    if argv and argv[0] == "salvage-inventory":
+        return _main_salvage_inventory(argv[1:])
     pipeline_check = False
     explicit_science = False
     pilot_payload: str | None = None
