@@ -11,7 +11,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from experiments.atomistic.stage1.protocol import (
-    _require_path_component, _require_sha, identity_expectations,
+    _require_path_component,
+    _require_sha,
+    _validate_run_identity,
+    identity_expectations,
 )
 
 ALLOWED_PARTITIONS = ("test", "gpu_test")
@@ -114,6 +117,7 @@ def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
     _require_safe_value(row_root, field="row.results_root")
     if row.get("source_sha") != head_sha:
         raise ValueError("manifest source_sha does not match rendered head_sha")
+    _validate_run_identity(row)
     if row.get("kind") == "eval":
         identity_expectations(row)
     for field in ("experiment_name", "sector", "run_id"):
