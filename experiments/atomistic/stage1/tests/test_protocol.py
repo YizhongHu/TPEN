@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from experiments.atomistic.stage1.protocol import (
@@ -13,6 +15,7 @@ from experiments.atomistic.stage1.protocol import (
     evaluation_seed,
     identity_expectations,
     smoke_seed,
+    physical_system_id_from_config,
     stable_row_id,
     training_seed,
 )
@@ -95,6 +98,39 @@ def test_manifest_binds_real_identity_and_checkpoint_expectations() -> None:
     assert set(expected) == {"expected_checkpoint_sha256"}
     assert expected["expected_checkpoint_sha256"] == SHA256
     assert "resolved_config_identity" not in eval_row
+
+
+def test_manifest_pins_configured_physical_identity_on_eval_rows() -> None:
+    rows = _manifest(checkpoints=[7])
+    config_root = Path(__file__).parents[1] / "configs"
+    for row in rows:
+        if row["kind"] == "eval":
+            expected = row["expected_physical_system_id"]
+            assert isinstance(expected, str) and len(expected) == 64
+            assert all(character in "0123456789abcdef" for character in expected)
+            assert expected == physical_system_id_from_config(
+                config_root / str(row["system"]) / "eval.yaml"
+            )
+        else:
+            assert "expected_physical_system_id" not in row
+
+
+@pytest.mark.parametrize(
+    "ids",
+    [
+        {"hooke1": "a" * 64},
+        {system: "not-a-digest" for system in ("hooke1", "he", "h2")},
+    ],
+)
+def test_manifest_rejects_missing_or_invalid_explicit_physical_identity(ids: dict[str, str]) -> None:
+    bindings = {(system, lineage, 7): SHA256
+                for system in ("hooke1", "he", "h2") for lineage in range(3)}
+    with pytest.raises(ProtocolError, match="expected_physical_system_id"):
+        build_manifest(
+            protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256=SHA256,
+            checkpoints=[7], lineage_seeds=[11, 12, 13], checkpoint_sha256=bindings,
+            results_root="/external/stage1", expected_physical_system_id=ids,
+        )
 
 
 @pytest.mark.parametrize("field,value", [("source_sha", "tiny"), ("config_sha256", "tiny")])
