@@ -7,8 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from experiments.atomistic.stage1.launch import command_for_row, render, row_overrides
+from experiments.atomistic.stage1.launch import _binding_token, command_for_row, render, row_overrides
 from experiments.atomistic.stage1.protocol import ProtocolError, validate_gateway_binding
+from experiments.toolkit.run_paths import resolve_run_dir
 
 
 ROW = {"kind": "train", "config": "configs/he/train.yaml", "row_id": "he-train-0",
@@ -199,6 +200,95 @@ def test_gateway_rejects_missing_or_mismatched_checkpoint_file(
             binding=_binding_token(eval_row), config=eval_row["config"],
             overrides=overrides, kind="eval", expected_checkpoint_sha256="d" * 64,
         )
+
+
+@pytest.mark.parametrize("checkpoint_file", ["other.pt", "nested/model.pt"])
+def test_gateway_checkpoint_file_must_be_the_planned_model_file(
+    tmp_path: Path, checkpoint_file: str,
+) -> None:
+    """A descendant of the step directory is not necessarily the loaded model."""
+
+    checkpoint_dir = tmp_path / "checkpoints" / "step_000010"
+    eval_row = {
+        **ROW,
+        "kind": "eval",
+        "results_root": str(tmp_path / "results"),
+        "draws": 256,
+        "checkpoint_dir": str(checkpoint_dir),
+        "checkpoint_file": str(checkpoint_dir / "model.pt"),
+        "checkpoint_sha256": "d" * 64,
+    }
+    overrides = row_overrides(eval_row)
+    bad_file = checkpoint_dir / checkpoint_file
+    overrides = [
+        (f"trajectory_identity.checkpoint_file={bad_file}"
+         if override.startswith("trajectory_identity.checkpoint_file=") else override)
+        for override in overrides
+    ]
+    with pytest.raises(ProtocolError, match="checkpoint_file"):
+        validate_gateway_binding(
+            binding=_binding_token(eval_row),
+            config=eval_row["config"], overrides=overrides, kind="eval",
+            expected_checkpoint_sha256=eval_row["checkpoint_sha256"],
+        )
+
+
+def test_gateway_accepts_the_planned_step_model_file(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "checkpoints" / "step_000010"
+    eval_row = {
+        **ROW,
+        "kind": "eval",
+        "results_root": str(tmp_path / "results"),
+        "draws": 256,
+        "checkpoint_dir": str(checkpoint_dir),
+        "checkpoint_file": str(checkpoint_dir / "model.pt"),
+        "checkpoint_sha256": "d" * 64,
+    }
+    assert validate_gateway_binding(
+        binding=_binding_token(eval_row), config=eval_row["config"],
+        overrides=row_overrides(eval_row), kind="eval",
+        expected_checkpoint_sha256=eval_row["checkpoint_sha256"],
+    ) == eval_row
+
+
+def test_gateway_rejects_layout_override_that_disagrees_with_planner(tmp_path: Path) -> None:
+    row = {
+        **ROW,
+        "results_root": str(tmp_path / "results"),
+        "run_layout": "nested",
+    }
+    planned = resolve_run_dir(row)
+    assert planned == Path(row["results_root"]) / row["experiment_name"] / row["sector"] / row["run_id"]
+    with pytest.raises(ProtocolError, match="layout"):
+        validate_gateway_binding(
+            binding=_binding_token(row), config=row["config"],
+            overrides=[*row_overrides(row), "run.layout=flat"], kind="train",
+        )
+
+
+def test_render_rejects_absolute_run_components_outside_results_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    approved_root = tmp_path / "approved-results"
+    monkeypatch.setattr(
+        "experiments.atomistic.stage1.launch.FACILITY_RESULTS_PREFIX",
+        f"{tmp_path}/",
+    )
+    row = {
+        **ROW,
+        "results_root": str(approved_root),
+        "source_sha": "c" * 40,
+    }
+    render(row=row, driver="driver.py", python="/usr/bin/python3",
+           head_sha="c" * 40, results_root=str(approved_root),
+           scratch_base=str(tmp_path / "scratch"))
+    for field in ("sector", "run_id"):
+        with pytest.raises(ValueError, match=field):
+            render(
+                row={**row, field: str(tmp_path / "escaped")},
+                driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
+                results_root=str(approved_root), scratch_base=str(tmp_path / "scratch"),
+            )
 
 
 def test_gateway_rejects_relative_checkpoint_paths() -> None:
