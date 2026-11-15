@@ -38,7 +38,7 @@ callbacks:
     terminal: false
     schedule:
       _target_: tpen.checkpoint.ExplicitUpdates
-      updates: ${checkpoint_steps}
+      updates: "${checkpoint_steps}"
     payload:
       _target_: tpen.checkpoint.TrainResume
     output_dir: ${run.dir}/checkpoints

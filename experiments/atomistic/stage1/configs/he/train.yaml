@@ -21,6 +21,6 @@ callbacks:
     output_path: ${run.dir}/status.json
   - _target_: tpen.callback.Checkpoint
     terminal: false
-    schedule: {_target_: tpen.checkpoint.ExplicitUpdates, updates: ${checkpoint_steps}}
+    schedule: {_target_: tpen.checkpoint.ExplicitUpdates, updates: "${checkpoint_steps}"}
     payload: {_target_: tpen.checkpoint.TrainResume}
     output_dir: ${run.dir}/checkpoints
