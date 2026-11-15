@@ -30,8 +30,8 @@
   {
     "id": "allow-science-salvage",
     "target": "experiments/atomistic/h-v2/run_job.py",
-    "old": "if salvage_inventory_path is not None and payload not in _PILOT_STAGE_PAYLOADS:\n        raise JobError(\"salvage inventory is allowed only for pilot payloads\")",
-    "new": "if False and salvage_inventory_path is not None and payload not in _PILOT_STAGE_PAYLOADS:\n        raise JobError(\"salvage inventory is allowed only for pilot payloads\")  # mutant: allow-science-salvage",
+    "old": "if salvage_inventory_path is not None and payload not in _PILOT_STAGE_PAYLOADS:\n        raise JobError(\"salvage-science-refused: salvage inventory refused for science payloads\")",
+    "new": "if False and salvage_inventory_path is not None and payload not in _PILOT_STAGE_PAYLOADS:\n        raise JobError(\"salvage-science-refused: salvage inventory refused for science payloads\")  # mutant: allow-science-salvage",
     "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_inventory_is_refused_for_science_payload"
   },
   {

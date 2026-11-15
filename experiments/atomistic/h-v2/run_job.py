@@ -349,7 +349,7 @@ def run_eval_fanout(
     source_sha256: str | None = None
     ordinal_count: int | None = None
     if salvage_inventory_path is not None and payload not in _PILOT_STAGE_PAYLOADS:
-        raise JobError("salvage inventory is allowed only for pilot payloads")
+        raise JobError("salvage-science-refused: salvage inventory refused for science payloads")
     if salvage_inventory_path is not None and pilot_stage != "1":
         raise JobError("salvage inventory is supported only for pilot stage 1")
     if payload == "science":

@@ -175,7 +175,7 @@ class HV2ReceiptRefusal(ValueError):
             raise TypeError("refusal reason must be a non-empty string")
         self.code = code
         self.reason = reason
-        super().__init__(reason)
+        super().__init__(f"{code}: {reason}")
 
 
 @dataclass(frozen=True, slots=True)
