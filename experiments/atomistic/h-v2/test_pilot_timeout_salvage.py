@@ -146,6 +146,54 @@ def test_salvage_refuses_checkpoint_symlink_escape(tmp_path: Path) -> None:
         attached.build_salvage_inventory(root, expected_source_commit="a" * 40)
 
 
+def test_salvage_refuses_absolute_or_parent_manifest_member(tmp_path: Path) -> None:
+    for index, relative in enumerate(("../outside-model.pt", str(tmp_path / "outside-model.pt"))):
+        root = tmp_path / f"manifest-case-{index}" / "checkpoints"
+        entry = _write_checkpoint(root, 0)
+        manifest_path = entry / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["files"]["model"] = relative
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with pytest.raises(attached.HV2ReceiptRefusal, match="salvage-checkpoint-path"):
+            attached.build_salvage_inventory(root, expected_source_commit="a" * 40)
+
+
+def test_salvage_refuses_symlinked_checkpoint_root(tmp_path: Path) -> None:
+    real_root = tmp_path / "real-checkpoints"
+    _write_checkpoint(real_root, 0)
+    symlink_root = tmp_path / "checkpoints"
+    symlink_root.symlink_to(real_root, target_is_directory=True)
+    with pytest.raises(attached.HV2ReceiptRefusal, match="salvage-checkpoint-root-symlink"):
+        attached.build_salvage_inventory(symlink_root, expected_source_commit="a" * 40)
+
+
+def test_salvage_refuses_symlinked_salvage_parent(tmp_path: Path) -> None:
+    payload = "capacity-pilot-100k"
+    checkpoint_root = (
+        tmp_path
+        / "attached"
+        / "store"
+        / f"h-v2-train-{payload}"
+        / "groups"
+        / "g"
+        / "attempt"
+        / "core"
+        / "checkpoints"
+    )
+    _write_checkpoint(checkpoint_root, 0)
+    outside = tmp_path / "outside-salvage"
+    outside.mkdir()
+    (tmp_path / "attached" / "salvage").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(attached.HV2ReceiptRefusal, match="salvage-parent-symlink"):
+        attached.write_salvage_inventory(
+            tmp_path,
+            payload=payload,
+            job_id="60007665",
+            terminal_state="TIMEOUT",
+            expected_source_commit="a" * 40,
+        )
+
+
 def test_salvage_writer_creates_new_atomic_subdirectory_without_touching_store(tmp_path: Path) -> None:
     payload = "capacity-pilot-100k"
     checkpoint_root = tmp_path / "attached" / "store" / f"h-v2-train-{payload}" / "groups" / "g" / "attempt" / "core" / "checkpoints"
@@ -237,7 +285,7 @@ def test_salvage_sel_window_follows_inventory_length(tmp_path: Path) -> None:
             }
         )
     selection = eval_job.compute_pilot_selection(
-        {"source": "salvage-partial-inventory", "generations": generations},
+        {"source": "salvage-partial-inventory", "ordinal_count": 7, "generations": generations},
         payload="capacity-pilot-100k",
     )
     assert selection["c1"] == 4
@@ -252,6 +300,35 @@ def test_salvage_sel_window_follows_inventory_length(tmp_path: Path) -> None:
     assert eval_job.verify_selection_record(
         record, b1_eval_receipt_sha256="c" * 64, payload="capacity-pilot-100k", ordinal_count=7
     ) == 4
+
+
+def test_salvage_sel_refuses_inventory_length_7_with_only_six_b1_generations(tmp_path: Path) -> None:
+    generations = []
+    for ordinal in range(6):
+        path = tmp_path / f"trajectory-{ordinal}.csv"
+        path.write_text("local_energy\n0\n", encoding="utf-8")
+        generations.append(
+            {
+                "ordinal": ordinal,
+                "stream": 0,
+                "seed": protocol.pilot_eval_seed(ordinal, 0),
+                "artifacts": {"trajectory_csv": {"path": str(path), "sha256": _sha(path)}},
+            }
+        )
+    with pytest.raises(eval_job.EvalJobRefusal, match="sel-incomplete-stage1"):
+        eval_job.compute_pilot_selection(
+            {"source": "salvage-partial-inventory", "ordinal_count": 7, "generations": generations},
+            payload="capacity-pilot-100k",
+        )
+
+
+@pytest.mark.parametrize("ordinal_count", [1, 4])
+def test_salvage_sel_refuses_inventory_too_short_for_center_window(ordinal_count: int) -> None:
+    with pytest.raises(eval_job.EvalJobRefusal, match="sel-inventory-too-short"):
+        eval_job.compute_pilot_selection(
+            {"source": "salvage-partial-inventory", "ordinal_count": ordinal_count, "generations": []},
+            payload="capacity-pilot-100k",
+        )
 
 
 def test_salvage_default_100k_fanout_still_covers_101_ordinals() -> None:
@@ -275,6 +352,8 @@ def test_salvage_fanout_and_eval_receipt_preserve_source_binding(tmp_path: Path)
         readout_generator_enabled=False,
         source="salvage-partial-inventory",
         source_sha256="b" * 64,
+        ordinal_count=7,
     )
     assert receipt["source"] == "salvage-partial-inventory"
     assert receipt["source_sha256"] == "b" * 64
+    assert receipt["ordinal_count"] == 7

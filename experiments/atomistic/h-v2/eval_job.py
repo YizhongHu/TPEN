@@ -35,6 +35,7 @@ import math
 import subprocess
 import sys
 import statistics
+from collections.abc import Mapping as MappingABC
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -219,6 +220,42 @@ def load_salvage_inventory(path: str | Path) -> tuple[dict[str, Any], str]:
     return payload, hashlib.sha256(raw).hexdigest()
 
 
+def _validate_salvage_inventory_entry(entry: Any, index: int) -> None:
+    """Validate one salvage entry before any checkpoint materialization."""
+
+    if not isinstance(entry, MappingABC):
+        raise EvalJobRefusal("salvage-inventory-entry", f"inventory entry {index} is not an object")
+    required = {"update", "path", "files", "source_commit", "resolved_config_sha256"}
+    missing = sorted(required - set(entry))
+    if missing:
+        raise EvalJobRefusal(
+            "salvage-inventory-entry", f"inventory entry {index} is missing required field(s) {missing!r}"
+        )
+    if type(entry["update"]) is not int or entry["update"] < 0:
+        raise EvalJobRefusal("salvage-inventory-entry", f"inventory entry {index} has an invalid update")
+    if not isinstance(entry["path"], str) or not entry["path"]:
+        raise EvalJobRefusal("salvage-inventory-entry", f"inventory entry {index} has an invalid path")
+    files = entry["files"]
+    if not isinstance(files, MappingABC):
+        raise EvalJobRefusal("salvage-inventory-entry", f"inventory entry {index} has no file map")
+    missing_closure = sorted(set(REQUIRED_CHECKPOINT_CLOSURE_FILES) - set(files))
+    if missing_closure:
+        raise EvalJobRefusal(
+            "salvage-inventory-entry",
+            f"inventory entry {index} is missing closure file(s) {missing_closure!r}",
+        )
+    for relative, digest in files.items():
+        relative_path = Path(relative) if isinstance(relative, str) else None
+        if relative_path is None or relative_path.is_absolute() or ".." in relative_path.parts:
+            raise EvalJobRefusal("salvage-inventory-entry", f"inventory entry {index} has an unsafe file path")
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise EvalJobRefusal("salvage-inventory-entry", f"inventory entry {index} has an invalid file hash")
+    if not isinstance(entry["source_commit"], str) or not entry["source_commit"]:
+        raise EvalJobRefusal("salvage-inventory-entry", f"inventory entry {index} has no source commit")
+    if not isinstance(entry["resolved_config_sha256"], str) or len(entry["resolved_config_sha256"]) != 64:
+        raise EvalJobRefusal("salvage-inventory-entry", f"inventory entry {index} has no config hash")
+
+
 def verify_salvage_inventory_identity(
     inventory: Mapping[str, Any], *, expected_commit: str, expected_payload: str, expected_lineage: str
 ) -> None:
@@ -237,10 +274,12 @@ def verify_salvage_inventory_identity(
             "wrong-salvage-commit",
             f"inventory source commit {inventory.get('source_commit')!r} != expected {expected_commit!r}",
         )
-    entries = inventory.get("inventory") or []
-    if not entries:
+    entries = inventory.get("inventory")
+    if not isinstance(entries, list) or not entries:
         raise EvalJobRefusal("salvage-inventory-empty", "salvage inventory has no complete checkpoint entries")
-    updates = [entry.get("update") for entry in entries]
+    for index, entry in enumerate(entries):
+        _validate_salvage_inventory_entry(entry, index)
+    updates = [entry["update"] for entry in entries]
     expected_updates = list(range(0, len(entries) * 1000, 1000))
     if updates != expected_updates:
         raise EvalJobRefusal("salvage-inventory-noncontiguous", f"inventory updates {updates!r} != {expected_updates!r}")
@@ -879,6 +918,7 @@ def build_eval_receipt(
     selection: Mapping[str, Any] | None = None,
     source: str = "train-accepted-receipt",
     source_sha256: str | None = None,
+    ordinal_count: int | None = None,
 ) -> dict[str, Any]:
     """Return the fan-out's own consolidated eval-receipt payload.
 
@@ -890,6 +930,9 @@ def build_eval_receipt(
     selection : mapping, optional
         The pilot SEL step's selection record (:func:`build_selection_record`),
         carried only for the pilot's stage-1 receipt.
+    ordinal_count : int, optional
+        Fixed salvage inventory length carried into the stage-1 receipt; it is
+        never inferred from the generations observed by SEL.
     """
 
     return {
@@ -900,6 +943,7 @@ def build_eval_receipt(
         "train_receipt_sha256": train_receipt_sha256,
         "source": source,
         "source_sha256": source_sha256 or train_receipt_sha256,
+        "ordinal_count": ordinal_count,
         "payload": payload,
         "readout_generator_enabled": bool(readout_generator_enabled),
         "selection": dict(selection) if selection is not None else None,
@@ -1055,8 +1099,28 @@ def compute_pilot_selection(
         *payload*'s stream-0 ordinals; code ``sel-duplicate-ordinal``,
         ``sel-wrong-seed``, or ``sel-nonfinite-energy``; code
         ``sel-trajectory-hash-mismatch``, if a trajectory CSV's current
-        bytes do not match the receipt's own recorded hash for it.
+        bytes do not match the receipt's own recorded hash for it; codes
+        ``sel-inventory-length-missing``, ``sel-inventory-length-mismatch``,
+        and ``sel-inventory-too-short`` for an invalid salvage receipt.
     """
+
+    if stage1_receipt.get("source") == "salvage-partial-inventory":
+        receipt_ordinal_count = stage1_receipt.get("ordinal_count")
+        if type(receipt_ordinal_count) is not int or receipt_ordinal_count < 1:
+            raise EvalJobRefusal(
+                "sel-inventory-length-missing", "salvage B1 receipt has no positive fixed inventory length"
+            )
+        if ordinal_count is not None and ordinal_count != receipt_ordinal_count:
+            raise EvalJobRefusal(
+                "sel-inventory-length-mismatch",
+                f"requested inventory length {ordinal_count!r} does not match receipt {receipt_ordinal_count!r}",
+            )
+        ordinal_count = receipt_ordinal_count
+        if ordinal_count < 5:
+            raise EvalJobRefusal(
+                "sel-inventory-too-short",
+                f"salvage inventory length {ordinal_count} cannot define the SEL center window 3..N-2",
+            )
 
     w_by_ordinal: dict[int, float] = {}
     seen_ordinals: set[int] = set()
@@ -1082,8 +1146,6 @@ def compute_pilot_selection(
                 "sel-nonfinite-energy", f"B1 generation for ordinal {ordinal} has a non-finite local_energy sample"
             )
         w_by_ordinal[ordinal] = protocol.w_statistic(energies)
-    if ordinal_count is None and stage1_receipt.get("source") == "salvage-partial-inventory":
-        ordinal_count = len(seen_ordinals)
     missing = sorted(set(protocol.pilot_stage1_ordinals(payload, count=ordinal_count)) - seen_ordinals)
     if missing:
         raise EvalJobRefusal(
@@ -1118,6 +1180,11 @@ def build_selection_record(
     """
 
     hi = protocol.pilot_sel_window_hi(payload, count=ordinal_count)
+    if ordinal_count is not None and ordinal_count < 5:
+        raise EvalJobRefusal(
+            "sel-inventory-too-short",
+            f"salvage inventory length {ordinal_count} cannot define the SEL center window 3..N-2",
+        )
     if not 3 <= c1 <= hi:
         raise EvalJobRefusal("sel-c1-out-of-range", f"c1 must be in 3..{hi}, got {c1}")
     return {
@@ -1146,6 +1213,11 @@ def verify_selection_record(
             f"does not match the B1 receipt {b1_eval_receipt_sha256!r}",
         )
     hi = protocol.pilot_sel_window_hi(payload, count=ordinal_count)
+    if ordinal_count is not None and ordinal_count < 5:
+        raise EvalJobRefusal(
+            "sel-inventory-too-short",
+            f"salvage inventory length {ordinal_count} cannot define the SEL center window 3..N-2",
+        )
     c1 = selection.get("c1")
     if not isinstance(c1, int) or not 3 <= c1 <= hi:
         raise EvalJobRefusal("sel-c1-out-of-range", f"selection record c1 {c1!r} is not an int in 3..{hi}")

@@ -1214,6 +1214,37 @@ _SALVAGE_REQUIRED_FILES = ("model", "optimizer", "trainer", "sampler", "rng", "r
 _STEP_DIR_RE = re.compile(r"step_(\d+)$")
 
 
+def _safe_checkpoint_member(entry: Path, relative: str, *, code: str = "salvage-checkpoint-path") -> Path:
+    """Return one manifest member without following path escapes or symlinks.
+
+    Parameters
+    ----------
+    entry : pathlib.Path
+        The checkpoint directory containing the manifest member.
+    relative : str
+        The manifest-controlled relative member path.
+    code : str, default="salvage-checkpoint-path"
+        Stable refusal code used for an unsafe member.
+
+    Raises
+    ------
+    HV2ReceiptRefusal
+        If *relative* escapes *entry* or any component is a symlink.
+    """
+
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise HV2ReceiptRefusal(code, f"manifest member {relative!r} is not a contained relative path")
+    current = entry
+    if current.is_symlink():
+        raise HV2ReceiptRefusal(code, f"checkpoint directory {entry} is a symlink")
+    for part in relative_path.parts:
+        current /= part
+        if current.is_symlink():
+            raise HV2ReceiptRefusal(code, f"checkpoint member {current} is a symlink")
+    return current
+
+
 def find_pilot_checkpoint_root(run_root: str | Path, payload: str) -> Path:
     """Find the sole executor checkpoint root for one pilot run.
 
@@ -1223,7 +1254,14 @@ def find_pilot_checkpoint_root(run_root: str | Path, payload: str) -> Path:
     """
 
     store_root = Path(run_root) / "attached" / "store" / f"h-v2-train-{payload}"
+    if store_root.is_symlink():
+        raise HV2ReceiptRefusal("salvage-checkpoint-root-symlink", f"pilot store root is a symlink: {store_root}")
     candidates = sorted(path for path in store_root.rglob("checkpoints") if path.is_dir() and path.parent.name == "core")
+    symlink_candidates = sorted(path for path in store_root.rglob("checkpoints") if path.is_symlink())
+    if symlink_candidates:
+        raise HV2ReceiptRefusal(
+            "salvage-checkpoint-root-symlink", f"pilot checkpoint root is a symlink: {symlink_candidates[0]}"
+        )
     if len(candidates) != 1:
         raise HV2ReceiptRefusal(
             "salvage-checkpoint-root-ambiguous",
@@ -1248,6 +1286,8 @@ def build_salvage_inventory(
     """
 
     root = Path(checkpoint_root)
+    if root.is_symlink():
+        raise HV2ReceiptRefusal("salvage-checkpoint-root-symlink", f"checkpoint root is a symlink: {root}")
     if not root.is_dir():
         raise HV2ReceiptRefusal("salvage-checkpoint-root-missing", f"checkpoint root is not a directory: {root}")
     entries: list[dict[str, Any]] = []
@@ -1262,8 +1302,9 @@ def build_salvage_inventory(
         step = int(_STEP_DIR_RE.fullmatch(entry.name).group(1))  # type: ignore[union-attr]
         if step != expected_update:
             break
-        manifest_path = entry / _CHECKPOINT_MANIFEST_NAME
-        if not manifest_path.is_file() or not (entry / _CHECKPOINT_COMPLETE_MARKER).is_file():
+        manifest_path = _safe_checkpoint_member(entry, _CHECKPOINT_MANIFEST_NAME)
+        complete_path = _safe_checkpoint_member(entry, _CHECKPOINT_COMPLETE_MARKER)
+        if not manifest_path.is_file() or not complete_path.is_file():
             break
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1273,7 +1314,8 @@ def build_salvage_inventory(
             files = dict(manifest["files"])
             hashes = dict(manifest["hashes"])
             provenance = dict(manifest["provenance"])
-            trainer = json.loads((entry / files["trainer"]).read_text(encoding="utf-8"))
+            trainer_path = _safe_checkpoint_member(entry, files["trainer"])
+            trainer = json.loads(trainer_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
             raise HV2ReceiptRefusal("salvage-checkpoint-invalid", f"cannot read {entry}: {error}") from error
         if schema_version != _CHECKPOINT_MANIFEST_SCHEMA_VERSION_V2:
@@ -1297,7 +1339,7 @@ def build_salvage_inventory(
                     "salvage-checkpoint-invalid",
                     f"{entry} is missing manifest file/hash for {logical_name!r}",
                 )
-            file_path = entry / relative
+            file_path = _safe_checkpoint_member(entry, relative)
             if not file_path.is_file():
                 raise HV2ReceiptRefusal("salvage-checkpoint-file-missing", f"{file_path} is missing")
             actual_hash = file_sha256(file_path)
@@ -1325,11 +1367,12 @@ def build_salvage_inventory(
                 "salvage-wrong-config-identity",
                 f"{entry} resolved_config_sha256 {entry_config_sha256!r} != expected {expected_config_sha256!r}",
             )
-        all_files = {
-            str(file_path.relative_to(entry)): file_sha256(file_path)
-            for file_path in sorted(entry.rglob("*"))
-            if file_path.is_file()
-        }
+        all_files: dict[str, str] = {}
+        for file_path in sorted(entry.rglob("*")):
+            if file_path.is_symlink():
+                raise HV2ReceiptRefusal("salvage-checkpoint-path", f"checkpoint member {file_path} is a symlink")
+            if file_path.is_file():
+                all_files[str(file_path.relative_to(entry))] = file_sha256(file_path)
         entries.append(
             {
                 "update": step,
@@ -1364,6 +1407,9 @@ def write_salvage_inventory(
         expected_config_sha256=expected_config_sha256,
     )
     salvage_dir = root / "attached" / "salvage"
+    attached_dir = root / "attached"
+    if attached_dir.is_symlink() or salvage_dir.is_symlink():
+        raise HV2ReceiptRefusal("salvage-parent-symlink", f"salvage parent is a symlink: {salvage_dir}")
     salvage_dir.mkdir(parents=True, exist_ok=False)
     output_path = salvage_dir / f"h-v2-salvage-{payload}.json"
     receipt = {

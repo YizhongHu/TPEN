@@ -482,6 +482,7 @@ def run_eval_fanout(
                 selection=selection_record,
                 source=source,
                 source_sha256=source_sha256,
+                ordinal_count=ordinal_count,
             )
 
     failures: list[BaseException] = []
@@ -530,7 +531,9 @@ def run_pilot_sel(run_root: Path, *, payload: str = "capacity-pilot") -> None:
     stage1_receipt, stage1_sha256 = eval_job.read_eval_receipt_with_hash(stage1_path)
     ordinal_count = None
     if stage1_receipt.get("source") == "salvage-partial-inventory":
-        ordinal_count = len([generation for generation in stage1_receipt.get("generations", []) if generation.get("stream") == 0])
+        if not isinstance(stage1_receipt.get("source_sha256"), str) or not stage1_receipt["source_sha256"]:
+            raise JobError("sel-salvage-source-missing: B1 receipt has no salvage inventory sha256")
+        ordinal_count = stage1_receipt.get("ordinal_count")
     selection_core = eval_job.compute_pilot_selection(stage1_receipt, payload=payload, ordinal_count=ordinal_count)
     record = eval_job.build_selection_record(
         c1=selection_core["c1"],
