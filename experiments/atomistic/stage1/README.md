@@ -57,3 +57,12 @@ training updates.
 `plan.py` writes a manifest only. `launch.py` renders a script only; submission
 is an explicit operator action. The generated script requires Slurm, checks the
 delivered partition, uses node-local per-job scratch, and records job identity.
+
+The real-producer integration test is marked `stage1_real_producer` and remains
+in default collection. Mutant packets select their test paths explicitly so
+this producer chain is not multiplied across mutants; the base-on Stage-1
+verification must include it explicitly, for example:
+
+```text
+pytest -q experiments/atomistic/stage1/tests/test_real_producer_e2e.py
+```
