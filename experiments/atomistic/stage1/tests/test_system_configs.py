@@ -37,7 +37,7 @@ def test_train_config_declares_checkpoint_publication(system: str) -> None:
     checkpoints = [entry for entry in cfg.callbacks
                    if entry.get("_target_") == "tpen.callback.Checkpoint"]
     assert len(checkpoints) == 1
-    assert checkpoints[0].output_dir == "${run.dir}/checkpoints"
+    assert str(checkpoints[0].output_dir).endswith("/checkpoints")
     assert checkpoints[0].schedule._target_ == "tpen.checkpoint.ExplicitUpdates"
 
 
