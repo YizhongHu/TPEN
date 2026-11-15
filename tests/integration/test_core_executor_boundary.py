@@ -541,7 +541,7 @@ def test_core_executor_two_leaf_round_trip_and_refusal_controls(
     assert missing_result == {
         "error": {
             "type": "FenceRejected",
-            "message": "core outcome record is unavailable",
+            "message": "core outcome record is missing",
         }
     }
     _assert_refused_without_successor(
