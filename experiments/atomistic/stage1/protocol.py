@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from omegaconf import OmegaConf
+
 from experiments.baselines.systems import load_registry
 from experiments.toolkit.run_paths import resolve_run_dir
 
@@ -416,7 +418,9 @@ def physical_system_id_from_config(
         try:
             train_cfg, train_descriptor = _load_configured_descriptor(train_config_path)
         except Exception as exc:
-            raise ProtocolError(f"train/eval Hamiltonian mismatch for {label}") from exc
+            raise ProtocolError(
+                f"train/eval Hamiltonian mismatch for {label} config {train_config_path}"
+            ) from exc
         eval_bindings = tuple(sorted((term.slot, str(term.operator_id))
                                      for term in descriptor.terms))
         train_bindings = tuple(sorted((term.slot, str(term.operator_id))
@@ -451,6 +455,20 @@ def _load_configured_descriptor(config_path: str | Path) -> tuple[Any, Any]:
     from tpen.run import load_config
 
     cfg = load_config(str(config_path))
+    system_name = str(cfg.system.id)
+    descriptor_terms = OmegaConf.to_container(cfg.system_descriptor.terms, resolve=True)
+    if "runner" in cfg:
+        consumed_terms = cfg.runner.hamiltonian_terms
+        consumer = "runner.hamiltonian_terms"
+    else:
+        consumed_terms = cfg.evaluation_tasks.mcmc_energy.generator.hamiltonian_terms
+        consumer = "evaluation_tasks.mcmc_energy.generator.hamiltonian_terms"
+    resolved_consumed_terms = OmegaConf.to_container(consumed_terms, resolve=True)
+    if descriptor_terms != resolved_consumed_terms:
+        raise ProtocolError(
+            f"system {system_name!r} config {config_path}: "
+            f"system_descriptor.terms do not match consumed {consumer}"
+        )
     return cfg, instantiate(cfg.system_descriptor)
 
 

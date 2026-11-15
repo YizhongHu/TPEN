@@ -126,9 +126,14 @@ def test_runtime_seed_and_sampler_budget_do_not_change_physical_identity(
 
     train_config = _copy_train_with_original_descriptor(config_root, "hooke2", change)
 
+    baseline_id = physical_system_id_from_config(
+        _config(config_root, "hooke2", "eval"),
+        train_config_path=_config(config_root, "hooke2", "train"),
+        system_name="hooke2",
+    )
     system_id = physical_system_id_from_config(
         _config(config_root, "hooke2", "eval"),
         train_config_path=train_config,
         system_name="hooke2",
     )
-    assert len(system_id) == 64
+    assert system_id == baseline_id
