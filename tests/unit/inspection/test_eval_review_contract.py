@@ -59,7 +59,7 @@ def _write_eval_sidecars(
         {"resolved_config_identity": None},
         {"outcome": None},
         {"run_status": "failed"},
-        {"outcome": "failed"},
+        {"run_status": "failed", "outcome": "failed"},
         {"run_status": "completed", "outcome": "failed"},
     ],
 )
