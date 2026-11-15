@@ -19,7 +19,7 @@ from typing import Any, Mapping
 from experiments.baselines.systems import load_registry
 from experiments.toolkit.run_paths import resolve_run_dir
 
-SYSTEMS = ("hooke1", "he", "h2")
+SYSTEMS = ("hooke1", "hooke2", "he", "h2")
 KINDS = ("smoke", "train", "eval")
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -81,6 +81,7 @@ class Protocol:
 STAGE1_PROTOCOL = Protocol(1000, 256, 50000, 4096, 3, 4, 4096, 256)
 SYSTEM_SPECS = tuple(SystemSpec(name, system_id) for name, system_id in (
     ("hooke1", "hooke_one_electron_omega0.5"),
+    ("hooke2", "hooke_pair_singlet_omega0.5"),
     ("he", "he_atom"),
     ("h2", "h2_molecule"),
 ))
@@ -198,7 +199,7 @@ def evaluation_seed(*, system: str, lineage: int, checkpoint: int, stream: int) 
         raise ProtocolError("invalid evaluation seed coordinates")
     # The checkpoint is a coordinate, not an array index, so non-default lists
     # cannot alias one another.  The leading kind/system fields separate all
-    # three row kinds and all three systems.
+    # three row kinds and all four systems.
     return _encode_seed(kind="eval", system=system, lineage=lineage,
                         checkpoint=checkpoint, stream=stream)
 

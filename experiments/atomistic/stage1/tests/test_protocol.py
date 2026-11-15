@@ -16,6 +16,7 @@ from experiments.atomistic.stage1.protocol import (
     _TORCH_SEED_MODULUS,
     Protocol,
     ProtocolError,
+    SYSTEMS,
     STAGE1_PROTOCOL,
     build_manifest,
     evaluation_seed,
@@ -34,7 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 
 def _manifest(checkpoints: list[int] = [7, 101]) -> list[dict[str, object]]:
     bindings = {(system, lineage, checkpoint): SHA256
-                for system in ("hooke1", "he", "h2")
+                for system in SYSTEMS
                 for lineage in range(3)
                 for checkpoint in checkpoints}
     return build_manifest(protocol=STAGE1_PROTOCOL, source_sha=SHA1,
@@ -48,9 +49,13 @@ def test_protocol_has_no_implicit_partial_defaults() -> None:
         Protocol()  # type: ignore[call-arg]
 
 
+def test_stage1_system_roster_includes_the_hooke_pair() -> None:
+    assert SYSTEMS == ("hooke1", "hooke2", "he", "h2")
+
+
 def test_seed_and_row_identity_are_injective_for_non_default_coordinates() -> None:
     coords = [(system, lineage, checkpoint, stream)
-              for system in ("hooke1", "he", "h2")
+              for system in SYSTEMS
               for lineage in (0, 1, 7)
               for checkpoint in (7, 101, 100003)
               for stream in (0, 3)]
@@ -59,18 +64,18 @@ def test_seed_and_row_identity_are_injective_for_non_default_coordinates() -> No
     assert len({stable_row_id(system=s, kind="eval", lineage=l, checkpoint=c, stream=t)
                 for s, l, c, t in coords}) == len(coords)
     assert len({training_seed(system=s, lineage=l, lineage_seed=17)
-                for s in ("hooke1", "he", "h2") for l in (0, 1, 7)}) == 9
+                for s in SYSTEMS for l in (0, 1, 7)}) == len(SYSTEMS) * 3
 
 
 def test_seed_encoding_covers_field_maxima_and_old_collision_boundaries() -> None:
     rows = [
         (kind, system, 0, 0, 0, 0)
         for kind in ("smoke", "train", "eval")
-        for system in ("hooke1", "he", "h2")
+        for system in SYSTEMS
     ] + [
         (kind, system, 999_999, 999_999, 999_999, 999_999_999)
         for kind in ("train", "eval")
-        for system in ("hooke1", "he", "h2")
+        for system in SYSTEMS
     ]
     seeds = {
         (smoke_seed(system=system) if kind == "smoke" else
@@ -80,7 +85,7 @@ def test_seed_encoding_covers_field_maxima_and_old_collision_boundaries() -> Non
         for kind, system, lineage, checkpoint, stream, lineage_seed in rows
     }
     assert len(seeds) == len(rows)
-    for system in ("hooke1", "he", "h2"):
+    for system in SYSTEMS:
         maxima = {
             _encode_seed(kind=kind, system=system, lineage=999_999,
                          checkpoint=999_999, stream=999_999,
@@ -133,10 +138,11 @@ def test_seeds_fit_torch_at_coordinate_maxima_and_reject_overflow() -> None:
 
 def test_manifest_binds_real_identity_and_checkpoint_expectations() -> None:
     rows = _manifest()
-    assert len(rows) == 84
-    assert len({row["row_id"] for row in rows}) == 84
+    expected_rows = len(SYSTEMS) * (1 + 3 + 3 * 2 * 4)
+    assert len(rows) == expected_rows
+    assert len({row["row_id"] for row in rows}) == expected_rows
     assert all("seed" in row for row in rows)
-    assert len({row["seed"] for row in rows}) == 84
+    assert len({row["seed"] for row in rows}) == expected_rows
     assert all(0 <= int(row["seed"]) < _TORCH_SEED_MODULUS for row in rows)
     eval_row = next(row for row in rows if row["kind"] == "eval")
     assert eval_row["source_sha"] == SHA1
@@ -166,12 +172,12 @@ def test_manifest_pins_configured_physical_identity_on_eval_rows() -> None:
     "ids",
     [
         {"hooke1": "a" * 64},
-        {system: "not-a-digest" for system in ("hooke1", "he", "h2")},
+        {system: "not-a-digest" for system in SYSTEMS},
     ],
 )
 def test_manifest_rejects_missing_or_invalid_explicit_physical_identity(ids: dict[str, str]) -> None:
     bindings = {(system, lineage, 7): SHA256
-                for system in ("hooke1", "he", "h2") for lineage in range(3)}
+                for system in SYSTEMS for lineage in range(3)}
     with pytest.raises(ProtocolError, match="expected_physical_system_id"):
         build_manifest(
             protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256=SHA256,
@@ -185,7 +191,7 @@ def test_manifest_rejects_placeholder_identity(field: str, value: str) -> None:
     kwargs = {"source_sha": SHA1, "config_sha256": SHA256, field: value}
     with pytest.raises(ProtocolError):
         build_manifest(protocol=STAGE1_PROTOCOL, checkpoints=[7], lineage_seeds=[11, 12, 13],
-                       checkpoint_sha256={(s, l, 7): SHA256 for s in ("hooke1", "he", "h2")
+                       checkpoint_sha256={(s, l, 7): SHA256 for s in SYSTEMS
                                           for l in range(3)},
                        results_root="/external/stage1", **kwargs)
 
@@ -194,7 +200,7 @@ def test_manifest_rejects_placeholder_config_sha256() -> None:
     with pytest.raises(ProtocolError, match="config_sha256"):
         build_manifest(protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256="tiny",
                        checkpoints=[7], lineage_seeds=[11, 12, 13],
-                       checkpoint_sha256={(s, l, 7): SHA256 for s in ("hooke1", "he", "h2")
+                       checkpoint_sha256={(s, l, 7): SHA256 for s in SYSTEMS
                                           for l in range(3)},
                        results_root="/external/stage1")
 
@@ -204,7 +210,7 @@ def test_manifest_rejects_relative_results_root() -> None:
         build_manifest(
             protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256=SHA256,
             checkpoints=[7], lineage_seeds=[11, 12, 13],
-            checkpoint_sha256={(s, l, 7): SHA256 for s in ("hooke1", "he", "h2")
+            checkpoint_sha256={(s, l, 7): SHA256 for s in SYSTEMS
                                for l in range(3)},
             results_root="relative/stage1",
         )

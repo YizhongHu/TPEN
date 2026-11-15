@@ -20,6 +20,7 @@ from experiments.atomistic.stage1.collect import CollectionError, collect
 from experiments.atomistic.stage1.launch import command_for_row, row_overrides
 from experiments.atomistic.stage1.protocol import (
     Protocol,
+    SYSTEMS,
     build_manifest,
     manifest_hash,
     validate_gateway_binding,
@@ -35,16 +36,16 @@ from tpen.run import load_config, run_from_config
 
 CONFIG_ROOT = Path(__file__).parents[1] / "configs"
 REPO_ROOT = Path(__file__).resolve().parents[4]
-SYSTEMS = ("hooke1", "he", "h2")
 EXPECTED_REGISTRY = {
     "hooke1": ("hooke_one_electron_omega0.5", 0.75, "transcribed"),
+    "hooke2": ("hooke_pair_singlet_omega0.5", 2.0, "transcribed"),
     "he": ("he_atom", -2.903724377034119598, "transcribed"),
     "h2": ("h2_molecule", -1.17447, "transcribed"),
 }
 
 
 def _config_sha256() -> str:
-    """Hash the three science-default config pairs used by this test."""
+    """Hash the four science-default config pairs used by this test."""
 
     digest = hashlib.sha256()
     for system in SYSTEMS:
@@ -101,7 +102,7 @@ def _binding_token(row: dict[str, object]) -> str:
 def test_real_train_eval_inspect_collect_chain_for_all_stage1_systems(
     tmp_path: Path, record_property,
 ) -> None:
-    """Produce and collect tiny real runs for Hooke-1e, He, and H2."""
+    """Produce and collect tiny real runs for Hooke-1e, Hooke-2e, He, and H2."""
 
     source_sha = _source_sha()
     config_sha256 = _config_sha256()
