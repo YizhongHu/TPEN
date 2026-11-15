@@ -67,10 +67,7 @@ def row_overrides(row: Mapping[str, Any]) -> list[str]:
         ])
         if row.get("checkpoint_steps"):
             steps = ",".join(str(step) for step in row["checkpoint_steps"])
-            overrides.extend([
-                "callbacks.4.schedule._target_=tpen.checkpoint.ExplicitUpdates",
-                f"callbacks.4.schedule.updates=[{steps}]",
-            ])
+            overrides.append(f"checkpoint_steps=[{steps}]")
     return overrides
 
 

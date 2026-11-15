@@ -42,6 +42,8 @@ def test_train_config_declares_checkpoint_publication(system: str) -> None:
                           if entry.get("_target_") == "tpen.callback.Checkpoint")
     assert raw_checkpoint["output_dir"] == "${run.dir}/checkpoints"
     assert checkpoints[0].schedule._target_ == "tpen.checkpoint.ExplicitUpdates"
+    assert list(checkpoints[0].schedule.updates) == [1000]
+    assert list(cfg.checkpoint_steps) == [1000]
 
 
 @pytest.mark.parametrize("system", ["hooke1", "he"])
@@ -68,5 +70,4 @@ def test_train_launch_binds_declared_checkpoint_steps() -> None:
            "experiment_name": "stage1", "sector": "he", "run_id": "train-0",
            "walkers": 256, "updates": 101, "checkpoint_steps": [7, 101]}
     overrides = row_overrides(row)
-    assert "callbacks.4.schedule._target_=tpen.checkpoint.ExplicitUpdates" in overrides
-    assert "callbacks.4.schedule.updates=[7,101]" in overrides
+    assert "checkpoint_steps=[7,101]" in overrides
