@@ -273,9 +273,24 @@ def test_render_rejects_absolute_run_components_outside_results_root(
         "results_root": str(approved_root),
         "source_sha": "c" * 40,
     }
+    (approved_root / ROW["experiment_name"] / ROW["sector"] / ROW["run_id"]).mkdir(
+        parents=True,
+    )
     render(row=row, driver="driver.py", python="/usr/bin/python3",
            head_sha="c" * 40, results_root=str(approved_root),
            scratch_base=str(tmp_path / "scratch"))
+
+    escaped_root = tmp_path / "escaped-results"
+    escaped_root.mkdir()
+    outside = tmp_path / "outside-results"
+    outside.mkdir()
+    (escaped_root / ROW["experiment_name"]).symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="beneath results_root"):
+        render(
+            row={**row, "results_root": str(escaped_root)},
+            driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
+            results_root=str(escaped_root), scratch_base=str(tmp_path / "scratch"),
+        )
     for field in ("experiment_name", "sector", "run_id"):
         with pytest.raises(ValueError, match=field):
             render(
