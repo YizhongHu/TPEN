@@ -304,7 +304,14 @@ class DirectoryStore:
         _require_directory(task_dir, "task directory")
         return task_dir
 
-    def begin_attempt(self, group: ReadyGroup, task_id: str, allocation: ConfiguredAllocation, started_at_utc: str = "") -> AttemptFence:
+    def begin_attempt(
+        self,
+        group: ReadyGroup,
+        task_id: str,
+        allocation: ConfiguredAllocation,
+        started_at_utc: str = "",
+        transport_kind: str | None = "local",
+    ) -> AttemptFence:
         """Create a fresh fenced output directory and durable start receipt.
 
         Parameters
@@ -317,6 +324,9 @@ class DirectoryStore:
             Explicit allocation identity and backend job.
         started_at_utc : str, optional
             UTC timestamp; an empty value is accepted for caller compatibility.
+        transport_kind : {"local", "remote"} or None, optional
+            Durable transport identity for continuation admission. ``None`` is
+            retained as unknown and therefore fails closed at the gate.
 
         Returns
         -------
@@ -342,6 +352,8 @@ class DirectoryStore:
             raise ValueError("task_id is not a member of group")
         if type(started_at_utc) is not str:
             raise TypeError("started_at_utc must be a string")
+        if transport_kind not in {None, "local", "remote"}:
+            raise ValueError("transport_kind must be local, remote, or None")
         stamp = started_at_utc or "unknown"
         task_dir = self._prepare_task_dir(group, task_id)
         lock_path = os.path.join(task_dir, _TASK_LOCK)
@@ -350,7 +362,7 @@ class DirectoryStore:
             attempt = AttemptId(uuid4().hex)
             output_dir = _lexical(os.path.join(task_dir, attempt.value))
             _mkdir_new(output_dir)
-            receipt = StartReceipt(task_id, attempt, allocation.allocation_id, allocation.backend_job_id, group.identity, stamp, output_dir)
+            receipt = StartReceipt(task_id, attempt, allocation.allocation_id, allocation.backend_job_id, group.identity, stamp, output_dir, transport_kind)
             _write_new(os.path.join(output_dir, "start.json"), receipt.encode())
             pointer = os.path.join(task_dir, "current-attempt.json")
             _write_pointer(pointer, attempt.value)
@@ -494,7 +506,7 @@ class DirectoryStore:
                 receipt.task_id != start.task_id
                 or receipt.attempt_id != start.attempt_id
                 or receipt.group_digest != start.group_digest
-                or receipt.allocation_id != AllocationId(start.allocation_id)
+                or receipt.allocation_id != start.allocation_id
                 or receipt.backend_job_id != start.backend_job_id
             ):
                 raise FenceRejected(_TEARDOWN_UNCONFIRMED_REASON)
@@ -749,26 +761,29 @@ class DirectoryStore:
             raise FenceRejected(_TEARDOWN_UNCONFIRMED_REASON)
 
         # The positive remote proof is a separate canonical, write-once fact;
-        # the operational ``failed`` status alone is never sufficient.
-        teardown_path = os.path.join(output_dir, _REMOTE_TEARDOWN_FILENAME)
-        try:
-            _require_regular(teardown_path, "remote teardown receipt")
-            encoded_teardown = Path(teardown_path).read_bytes()
-            teardown = RemoteTeardownReceipt.decode(encoded_teardown)
-        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise FenceRejected(_TEARDOWN_UNCONFIRMED_REASON) from error
-        if encoded_teardown != teardown.encode():
-            raise FenceRejected(_TEARDOWN_UNCONFIRMED_REASON)
-        if (
-            teardown.task_id != start.task_id
-            or teardown.attempt_id != start.attempt_id
-            or teardown.group_digest != start.group_digest
-            or teardown.allocation_id != start.allocation_id
-            or teardown.backend_job_id != start.backend_job_id
-            or not teardown.child_group_reaped
-            or teardown.inspection != "complete"
-        ):
-            raise FenceRejected(_TEARDOWN_UNCONFIRMED_REASON)
+        # the operational ``failed`` status alone is never sufficient for a
+        # remote (or legacy/unknown) attempt.  Local attempts retain the
+        # CX-04b predicate and do not manufacture a remote teardown receipt.
+        if start.transport_kind != "local":
+            teardown_path = os.path.join(output_dir, _REMOTE_TEARDOWN_FILENAME)
+            try:
+                _require_regular(teardown_path, "remote teardown receipt")
+                encoded_teardown = Path(teardown_path).read_bytes()
+                teardown = RemoteTeardownReceipt.decode(encoded_teardown)
+            except (OSError, TypeError, ValueError, FenceRejected, json.JSONDecodeError) as error:
+                raise FenceRejected(_TEARDOWN_UNCONFIRMED_REASON) from error
+            if encoded_teardown != teardown.encode():
+                raise FenceRejected(_TEARDOWN_UNCONFIRMED_REASON)
+            if (
+                teardown.task_id != start.task_id
+                or teardown.attempt_id != start.attempt_id
+                or teardown.group_digest != start.group_digest
+                or teardown.allocation_id != start.allocation_id
+                or teardown.backend_job_id != start.backend_job_id
+                or not teardown.child_group_reaped
+                or teardown.inspection != "complete"
+            ):
+                raise FenceRejected(_TEARDOWN_UNCONFIRMED_REASON)
 
         record_path = os.path.join(output_dir, "core-outcome.json")
         _require_regular(record_path, "core outcome record")

@@ -94,6 +94,7 @@ class StartReceipt:
     """
 
     schema: ClassVar[str] = "tpen-executor/start-receipt-v1"
+    schema_v2: ClassVar[str] = "tpen-executor/start-receipt-v2"
     task_id: str
     attempt_id: AttemptId
     allocation_id: AllocationId
@@ -101,24 +102,45 @@ class StartReceipt:
     group_digest: str
     started_at_utc: str
     output_dir: str
+    transport_kind: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
         _identity(self.attempt_id, AttemptId, "attempt_id"); _identity(self.allocation_id, AllocationId, "allocation_id"); _identity(self.backend_job_id, BackendJobId, "backend_job_id")
         object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
         object.__setattr__(self, "started_at_utc", text(self.started_at_utc, "started_at_utc")); object.__setattr__(self, "output_dir", text(self.output_dir, "output_dir"))
+        if self.transport_kind is not None:
+            object.__setattr__(self, "transport_kind", text(self.transport_kind, "transport_kind"))
+            if self.transport_kind not in {"local", "remote"}:
+                raise ValueError("transport_kind must be local or remote")
 
     def to_dict(self) -> dict[str, Any]:
-        return {"schema": self.schema, "task_id": self.task_id, "attempt_id": self.attempt_id.value, "allocation_id": self.allocation_id.value, "backend_job_id": self.backend_job_id.value, "group_digest": self.group_digest, "started_at_utc": self.started_at_utc, "output_dir": self.output_dir}
+        result = {"schema": self.schema, "task_id": self.task_id, "attempt_id": self.attempt_id.value, "allocation_id": self.allocation_id.value, "backend_job_id": self.backend_job_id.value, "group_digest": self.group_digest, "started_at_utc": self.started_at_utc, "output_dir": self.output_dir}
+        if self.transport_kind is not None:
+            result["schema"] = self.schema_v2
+            result["transport_kind"] = self.transport_kind
+        return result
 
     def encode(self) -> bytes:
         return canonical_bytes(self.to_dict())
 
     @classmethod
     def from_mapping(cls, data: Any) -> "StartReceipt":
-        fields(data, {"schema", "task_id", "attempt_id", "allocation_id", "backend_job_id", "group_digest", "started_at_utc", "output_dir"}, cls.schema, "StartReceipt")
+        if not isinstance(data, Mapping):
+            raise TypeError("StartReceipt must be a mapping")
+        schema = data.get("schema")
+        if schema == cls.schema:
+            fields(data, {"schema", "task_id", "attempt_id", "allocation_id", "backend_job_id", "group_digest", "started_at_utc", "output_dir"}, cls.schema, "StartReceipt")
+            transport_kind = None
+        elif schema == cls.schema_v2:
+            fields(data, {"schema", "task_id", "attempt_id", "allocation_id", "backend_job_id", "group_digest", "started_at_utc", "output_dir", "transport_kind"}, cls.schema_v2, "StartReceipt")
+            transport_kind = data["transport_kind"]
+        else:
+            raise ValueError(f"StartReceipt schema is not {cls.schema!r} or {cls.schema_v2!r}")
         if any(type(data[key]) is not str for key in ("task_id", "attempt_id", "allocation_id", "backend_job_id", "group_digest", "started_at_utc", "output_dir")): raise TypeError("StartReceipt has an invalid field type")
-        return cls(data["task_id"], AttemptId(data["attempt_id"]), AllocationId(data["allocation_id"]), BackendJobId(data["backend_job_id"]), data["group_digest"], data["started_at_utc"], data["output_dir"])
+        if transport_kind is not None and type(transport_kind) is not str:
+            raise TypeError("StartReceipt has an invalid transport_kind")
+        return cls(data["task_id"], AttemptId(data["attempt_id"]), AllocationId(data["allocation_id"]), BackendJobId(data["backend_job_id"]), data["group_digest"], data["started_at_utc"], data["output_dir"], transport_kind)
 
     @classmethod
     def decode(cls, data: bytes | str | dict[str, Any]) -> "StartReceipt":

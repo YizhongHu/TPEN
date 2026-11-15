@@ -18,7 +18,7 @@ from test_core_evidence_v3 import _planned_evidence, _typed_evidence
 
 def _planned_attempt(tmp_path: Path):
     store, group, allocation = setup_store(tmp_path)
-    fence = store.begin_attempt(group, "a", allocation, "2026-11-14T00:00:00Z")
+    fence = store.begin_attempt(group, "a", allocation, "2026-11-14T00:00:00Z", transport_kind="remote")
     core_dir = Path(fence.output_dir) / "core"
     core_dir.mkdir()
     store.finish_remote_attempt(
@@ -39,6 +39,63 @@ def _planned_attempt(tmp_path: Path):
     )
     store.record_core_outcome(fence, _planned_evidence(core_dir))
     return store, group, fence
+
+
+def test_local_planned_yield_is_admitted_without_remote_receipt(tmp_path: Path) -> None:
+    """Local CX-04b attempts retain admission without S3.C proof."""
+    store, group, allocation = setup_store(tmp_path)
+    fence = store.begin_attempt(group, "a", allocation, "2026-11-14T00:00:00Z")
+    core_dir = Path(fence.output_dir) / "core"
+    core_dir.mkdir()
+    store.finish_attempt(fence, "failed", "2026-11-14T00:01:00Z")
+    store.record_core_outcome(fence, _planned_evidence(core_dir))
+    request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+    assert request["successor"] == {"task_id": "a", "attempt_id": "successor-1"}
+
+
+def test_unknown_transport_marker_fails_closed(tmp_path: Path) -> None:
+    """A missing start discriminator cannot downgrade a remote attempt to local."""
+    store, group, allocation = setup_store(tmp_path)
+    fence = store.begin_attempt(group, "a", allocation, "2026-11-14T00:00:00Z", transport_kind="remote")
+    core_dir = Path(fence.output_dir) / "core"
+    core_dir.mkdir()
+    store.finish_remote_attempt(
+        fence,
+        {
+            "schema": "tpen-executor/leaf-teardown-v1",
+            "group_digest": fence.group_digest,
+            "task_id": fence.task_id,
+            "attempt_id": fence.attempt_id.value,
+            "allocation_id": fence.allocation_id,
+            "backend_job_id": allocation.backend_job_id.value,
+            "child_group_reaped": True,
+            "inspection": "complete",
+        },
+        "c" * 64,
+        "failed",
+        "2026-11-14T00:01:00Z",
+    )
+    store.record_core_outcome(fence, _planned_evidence(core_dir))
+    start_path = Path(fence.output_dir, "start.json")
+    start = json.loads(start_path.read_text(encoding="utf-8"))
+    start["schema"] = "tpen-executor/start-receipt-v1"
+    start.pop("transport_kind")
+    start_path.write_bytes(canonical_bytes(start))
+    Path(fence.output_dir, "remote-teardown.json").unlink()
+    with pytest.raises(FenceRejected, match="teardown-unconfirmed"):
+        store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+
+
+def test_forged_transport_marker_fails_closed(tmp_path: Path) -> None:
+    """An invalid durable transport kind is not interpreted as local."""
+    store, group, allocation = setup_store(tmp_path)
+    fence = store.begin_attempt(group, "a", allocation, "2026-11-14T00:00:00Z", transport_kind="remote")
+    start_path = Path(fence.output_dir, "start.json")
+    start = json.loads(start_path.read_text(encoding="utf-8"))
+    start["transport_kind"] = "forged"
+    start_path.write_bytes(canonical_bytes(start))
+    with pytest.raises(FenceRejected, match="start receipt is unavailable"):
+        store.finish_attempt(fence, "failed", "2026-11-14T00:01:00Z")
 
 
 def test_build_and_record_successor_admission_uses_canonical_core_record(tmp_path: Path) -> None:

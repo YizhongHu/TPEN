@@ -904,7 +904,12 @@ class ParslDispatcher(DispatcherContract):
             nonlocal begin_error, finish_error
             configured = runs[member.task_id]
             try:
-                fence = lifecycle.begin(group, member.task_id, self._utc_now())
+                fence = lifecycle.begin(
+                    group,
+                    member.task_id,
+                    self._utc_now(),
+                    transport_kind="remote" if self.transport is not None else "local",
+                )
             except Exception as error:
                 if begin_error is None:
                     begin_error = error

@@ -47,7 +47,13 @@ class AttachedAllocation:
         """
         return self.allocation.observe(state, at_utc)
 
-    def begin(self, group: ReadyGroup, task_id: str, started_at_utc: str = "") -> AttemptFence:
+    def begin(
+        self,
+        group: ReadyGroup,
+        task_id: str,
+        started_at_utc: str = "",
+        transport_kind: str | None = "local",
+    ) -> AttemptFence:
         """Begin one task attempt in the attached allocation.
 
         Parameters
@@ -58,13 +64,15 @@ class AttachedAllocation:
             Task member to start.
         started_at_utc : str, optional
             UTC start timestamp; ``""`` selects the documented placeholder.
+        transport_kind : {"local", "remote"} or None, optional
+            Durable transport identity retained in the start receipt.
 
         Returns
         -------
         AttemptFence
             Fence bound to this allocation and store.
         """
-        return self.store.begin_attempt(group, task_id, self.allocation, started_at_utc)
+        return self.store.begin_attempt(group, task_id, self.allocation, started_at_utc, transport_kind)
 
     def finish(self, fence: AttemptFence, status: str, finished_at_utc: str, result_digest: str | None = None) -> OutcomeReceipt:
         """Finish one task attempt owned by this attached allocation.
