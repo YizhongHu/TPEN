@@ -209,22 +209,17 @@ def test_gateway_checkpoint_file_must_be_the_planned_model_file(
     """A descendant of the step directory is not necessarily the loaded model."""
 
     checkpoint_dir = tmp_path / "checkpoints" / "step_000010"
+    bad_file = checkpoint_dir / checkpoint_file
     eval_row = {
         **ROW,
         "kind": "eval",
         "results_root": str(tmp_path / "results"),
         "draws": 256,
         "checkpoint_dir": str(checkpoint_dir),
-        "checkpoint_file": str(checkpoint_dir / "model.pt"),
+        "checkpoint_file": str(bad_file),
         "checkpoint_sha256": "d" * 64,
     }
     overrides = row_overrides(eval_row)
-    bad_file = checkpoint_dir / checkpoint_file
-    overrides = [
-        (f"trajectory_identity.checkpoint_file={bad_file}"
-         if override.startswith("trajectory_identity.checkpoint_file=") else override)
-        for override in overrides
-    ]
     with pytest.raises(ProtocolError, match="checkpoint_file"):
         validate_gateway_binding(
             binding=_binding_token(eval_row),
