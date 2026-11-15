@@ -67,8 +67,9 @@ def test_physical_id_rejects_registry_physics_mismatch(
         physical_system_id_from_config(mutated)
 
 
-def test_physical_id_rejects_descriptor_operator_set_mismatch(tmp_path: Path) -> None:
+def test_physical_id_rejects_descriptor_operator_set_mismatch(monkeypatch) -> None:
     source = _config("h2")
+    cfg = OmegaConf.load(source)
 
     def remove_nuclear_repulsion(cfg) -> None:
         terms = OmegaConf.to_container(cfg.hamiltonian_terms, resolve=True)
@@ -76,13 +77,15 @@ def test_physical_id_rejects_descriptor_operator_set_mismatch(tmp_path: Path) ->
         cfg.hamiltonian_terms = terms
         cfg.system_descriptor.terms = terms
 
-    mutated = _copy_config(source, tmp_path / "h2-missing-term.yaml", remove_nuclear_repulsion)
+    remove_nuclear_repulsion(cfg)
+    monkeypatch.setattr("tpen.run.load_config", lambda _: cfg)
     with pytest.raises(ProtocolError, match="operator set"):
-        physical_system_id_from_config(mutated)
+        physical_system_id_from_config("in-memory-h2-missing-term.yaml")
 
 
-def test_physical_id_rejects_extra_descriptor_operator(tmp_path: Path) -> None:
+def test_physical_id_rejects_extra_descriptor_operator(monkeypatch) -> None:
     source = _config("he")
+    cfg = OmegaConf.load(source)
 
     def add_extra_term(cfg) -> None:
         terms = OmegaConf.to_container(cfg.hamiltonian_terms, resolve=True)
@@ -93,9 +96,10 @@ def test_physical_id_rejects_extra_descriptor_operator(tmp_path: Path) -> None:
         cfg.hamiltonian_terms = terms
         cfg.system_descriptor.terms = terms
 
-    mutated = _copy_config(source, tmp_path / "he-extra-term.yaml", add_extra_term)
+    add_extra_term(cfg)
+    monkeypatch.setattr("tpen.run.load_config", lambda _: cfg)
     with pytest.raises(ProtocolError, match="operator set"):
-        physical_system_id_from_config(mutated)
+        physical_system_id_from_config("in-memory-he-extra-term.yaml")
 
 
 def test_physical_id_accepts_registry_operator_set() -> None:
