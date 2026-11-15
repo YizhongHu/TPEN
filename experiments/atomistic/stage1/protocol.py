@@ -336,11 +336,7 @@ def physical_system_id_from_config(
     from the descriptor's physical content hash.
     """
 
-    from hydra.utils import instantiate
-    from tpen.run import load_config
-
-    cfg = load_config(str(config_path))
-    descriptor = instantiate(cfg.system_descriptor)
+    cfg, descriptor = _load_configured_descriptor(config_path)
     registry = load_registry()
     entry = next((item for item in registry.get("systems", [])
                   if item.get("id") == cfg.system.id), None)
@@ -418,8 +414,7 @@ def physical_system_id_from_config(
     if train_config_path is not None:
         label = system_name or str(cfg.system.id)
         try:
-            train_cfg = load_config(str(train_config_path))
-            train_descriptor = _descriptor_from_train_config(train_cfg)
+            train_cfg, train_descriptor = _load_configured_descriptor(train_config_path)
         except Exception as exc:
             raise ProtocolError(f"train/eval Hamiltonian mismatch for {label}") from exc
         eval_bindings = tuple(sorted((term.slot, str(term.operator_id))
@@ -433,29 +428,14 @@ def physical_system_id_from_config(
     return system_id
 
 
-def _descriptor_from_train_config(cfg: Any) -> Any:
-    """Build a descriptor from a train config's actual Hamiltonian terms."""
+def _load_configured_descriptor(config_path: str | Path) -> tuple[Any, Any]:
+    """Load a config and instantiate its config-owned system descriptor."""
 
     from hydra.utils import instantiate
-    from omegaconf import OmegaConf
+    from tpen.run import load_config
 
-    descriptor_cfg = OmegaConf.merge(
-        cfg,
-        {
-            "system_descriptor": {
-                "_target_": "tpen.physics.system.build_system_descriptor",
-                "particle": {
-                    "_target_": "tpen.physics.system.ParticleSpec",
-                    "n_electrons": "${system.n_particles}",
-                    "n_spin_up": "${system.spin.n_up}",
-                    "n_spin_down": "${system.spin.n_down}",
-                    "spatial_dim": "${system.spatial_dim}",
-                },
-                "terms": "${hamiltonian_terms}",
-            }
-        },
-    )
-    return instantiate(descriptor_cfg.system_descriptor)
+    cfg = load_config(str(config_path))
+    return cfg, instantiate(cfg.system_descriptor)
 
 
 def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,

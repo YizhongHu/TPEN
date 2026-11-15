@@ -150,6 +150,21 @@ def test_plan_rejects_train_eval_hamiltonian_drift(
         )
 
 
+def test_plan_rejects_train_descriptor_terms_drift(tmp_path: Path) -> None:
+    def change(cfg) -> None:
+        cfg.system_descriptor.terms = {
+            "kinetic": {"_target_": "tpen.physics.kinetic.KineticEnergy"},
+        }
+
+    train_config = _copy_config(
+        _config("hooke2", "train"), tmp_path / "hooke2-descriptor-drift-train.yaml", change
+    )
+    with pytest.raises(ProtocolError, match="train/eval Hamiltonian mismatch for hooke2"):
+        physical_system_id_from_config(
+            _config("hooke2"), train_config_path=train_config, system_name="hooke2"
+        )
+
+
 @pytest.mark.parametrize("system", SYSTEMS)
 def test_physical_id_ignores_run_and_evaluation_budget_changes(
     system: str, tmp_path: Path
