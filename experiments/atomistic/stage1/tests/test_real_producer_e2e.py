@@ -24,6 +24,7 @@ from experiments.atomistic.stage1.protocol import (
     manifest_hash,
     validate_gateway_binding,
 )
+from experiments.baselines.systems import load_registry
 from experiments.toolkit.run_paths import resolve_run_dir
 from experiments.toolkit.trajectory_records import (
     inspect_eval_run,
@@ -35,6 +36,11 @@ from tpen.run import load_config, run_from_config
 CONFIG_ROOT = Path(__file__).parents[1] / "configs"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SYSTEMS = ("hooke1", "he", "h2")
+EXPECTED_REGISTRY = {
+    "hooke1": ("hooke_one_electron_omega0.5", 0.75, "transcribed"),
+    "he": ("he_atom", -2.903724377034119598, "transcribed"),
+    "h2": ("h2_molecule", -1.17447, "transcribed"),
+}
 
 
 def _config_sha256() -> str:
@@ -176,6 +182,9 @@ def test_real_train_eval_inspect_collect_chain_for_all_stage1_systems(
             evidence = inspect_eval_run(run_dir)
             assert evidence["verdict"] == "completed"
             identity = evidence["resolved_config_identity"]
+            run_start = json.loads((run_dir / "run_start.json").read_text(encoding="utf-8"))
+            assert run_start["resolved_config_identity"] == identity
+            assert run_start["resolved_config_identity"]["schema"] == "tpen-config-identity-v1"
             metadata_path = run_dir / "mcmc_energy" / "sampled_eval_table.metadata.json"
             inspected = inspect_trajectory_record(
                 metadata_path,
@@ -208,11 +217,36 @@ def test_real_train_eval_inspect_collect_chain_for_all_stage1_systems(
     collected = collect(document)
     assert len(collected["records"]) == len(SYSTEMS) * protocol.eval_streams
     assert len(collected["aggregates"]) == len(SYSTEMS)
+    registry = {
+        entry["id"]: entry for entry in load_registry()["systems"]
+    }
+    assert set(EXPECTED_REGISTRY) == set(SYSTEMS)
+    assert {expected[0] for expected in EXPECTED_REGISTRY.values()} <= set(registry)
     assert all(
         record["identity"]["physical_system_id"]
         == record["identity"]["expected_physical_system_id"]
         for record in collected["records"]
     )
+    for record in collected["records"]:
+        system = next(system for system, expected in EXPECTED_REGISTRY.items()
+                      if expected[0] == record["system_id"])
+        expected_id, expected_reference, expected_confidence = EXPECTED_REGISTRY[system]
+        assert record["system_id"] == expected_id
+        assert registry[expected_id]["reference_energy_hartree"] == expected_reference
+        assert registry[expected_id]["confidence"] == expected_confidence
+        assert record["reference"]["energy_hartree"] == expected_reference
+        assert record["reference"]["confidence"] == expected_confidence
+        mean = record["statistics"]["mean"]
+        signed_error = mean - expected_reference
+        assert record["reference"]["error"] == signed_error
+        assert record["reference"]["absolute_error"] == abs(signed_error)
+
+    assert {
+        (aggregate["system_id"], aggregate["lineage"], aggregate["checkpoint"])
+        for aggregate in collected["aggregates"]
+    } == {(expected[0], 0, 1) for expected in EXPECTED_REGISTRY.values()}
+    assert all(aggregate["stream_count"] == protocol.eval_streams
+               for aggregate in collected["aggregates"])
 
     wrong_physical_id = json.loads(json.dumps(document))
     wrong_physical_id["rows"][0]["expected_physical_system_id"] = "f" * 64
