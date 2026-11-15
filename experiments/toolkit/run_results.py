@@ -1192,6 +1192,42 @@ def _core_outcome(value: Any, attempt: Mapping[str, Any]) -> dict[str, Any]:
     return record
 
 
+def _successor_admission(value: Any, attempt: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one executor successor-admission manifest projection."""
+
+    record = dict(_fields(
+        value,
+        {"schema", "predecessor", "successor", "request_digest", "core_acceptance_digest"},
+        "successor admission record",
+    ))
+    if record["schema"] != "tpen-executor/successor-admission-v1":
+        raise ManifestRefusal("unknown-schema", "successor admission schema is unsupported")
+    predecessor = dict(_fields(
+        record["predecessor"],
+        {"task_id", "attempt_id", "content_id"},
+        "successor admission predecessor",
+    ))
+    successor = dict(_fields(
+        record["successor"],
+        {"task_id", "attempt_id"},
+        "successor admission successor",
+    ))
+    for key in ("task_id", "attempt_id"):
+        _text(predecessor[key], f"successor_admission.predecessor.{key}")
+        _text(successor[key], f"successor_admission.successor.{key}")
+    _sha256(predecessor["content_id"], "successor_admission.predecessor.content_id")
+    _sha256(record["request_digest"], "successor_admission.request_digest")
+    _sha256(record["core_acceptance_digest"], "successor_admission.core_acceptance_digest")
+    if (predecessor["task_id"], predecessor["attempt_id"]) != (attempt["task_id"], attempt["attempt_id"]):
+        raise ManifestRefusal(
+            "attempt-receipt-mismatch",
+            "manifest attempt disagrees with its successor admission predecessor",
+        )
+    record["predecessor"] = predecessor
+    record["successor"] = successor
+    return record
+
+
 def _attempt(value: Any, group_digest: str) -> dict[str, Any]:
     expected = {"schema", "task_id", "attempt_id", "start_receipt", "outcome_receipt", "output_dir"}
     if isinstance(value, dict) and "placement_receipt" in value:
@@ -1200,8 +1236,20 @@ def _attempt(value: Any, group_digest: str) -> dict[str, Any]:
     if schema == MANIFEST_ATTEMPT_V1:
         record = dict(_fields(value, expected, "manifest attempt"))
     elif schema == MANIFEST_ATTEMPT_V2:
-        record = dict(_fields(value, expected | {"core_outcome"}, "manifest attempt"))
-        if record["core_outcome"] is None:
+        actual = set(value)
+        allowed = (
+            expected | {"core_outcome"},
+            expected | {"core_outcome", "successor_admission"},
+            expected | {"successor_admission"},
+        )
+        if actual not in allowed:
+            raise ManifestRefusal("malformed-record", "manifest attempt keys differ")
+        record = dict(_fields(value, actual, "manifest attempt"))
+        if "successor_admission" in record and (
+            "core_outcome" not in record or record["core_outcome"] is None
+        ):
+            raise ManifestRefusal("malformed-record", "successor_admission requires core_outcome")
+        if "core_outcome" not in record or record["core_outcome"] is None:
             raise ManifestRefusal("malformed-record", "manifest-attempt-v2 requires core_outcome")
     else:
         raise ManifestRefusal("unknown-schema", "manifest attempt schema is unsupported")
@@ -1238,6 +1286,8 @@ def _attempt(value: Any, group_digest: str) -> dict[str, Any]:
     if core_outcome is not None and outcome is not None and core_outcome["evidence"]["outcome"] == "planned_yield" and outcome["status"] == "completed":
         raise ManifestRefusal("malformed-record", "planned_yield core outcome cannot have a completed operational receipt")
     record["core_outcome"] = core_outcome
+    if "successor_admission" in record:
+        record["successor_admission"] = _successor_admission(record["successor_admission"], record)
     placement = None if "placement_receipt" not in record or record["placement_receipt"] is None else _placement_receipt(record["placement_receipt"], record, start, group_digest)
     record["placement_receipt"] = placement
     return record
