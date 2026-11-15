@@ -71,6 +71,8 @@ RECORD_FILENAME = "baseline_record.json"
 #: Dataset holding the per-step mean local energy. The sibling ``samples``
 #: datasets are per-walker and run to gigabytes; they are never read here.
 ENERGY_DATASET = "local_energy/mean"
+STD_DATASET = "local_energy/std"
+STEP_DATASET = "step"
 
 #: Fraction of the trailing trace averaged by default. Deliberately larger than
 #: the FermiNet adapter's 0.1 -- see the module docstring.
@@ -84,6 +86,14 @@ NATIVE_ANSATZES = frozenset({"default"})
 _NVIDIA_SMI = re.compile(r"^\s*(NVIDIA [^,]+),\s*(GPU-[0-9a-f-]+)", re.MULTILINE)
 _START_STAMP = re.compile(r"start=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2})")
 _END_STAMP = re.compile(r"end=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2})")
+
+
+class _TrajectoryRows(list[dict[str, int | float | None]]):
+    """List-compatible rows carrying the provenance of their step labels."""
+
+    def __init__(self, rows, *, step_basis: str):
+        super().__init__(rows)
+        self.step_basis = step_basis
 
 
 def result_path(run_dir: Path) -> Path:
@@ -245,6 +255,100 @@ def read_energies(run_dir: Path) -> list[float]:
     if not energies:
         raise AdapterError(f"{path} has an empty '{ENERGY_DATASET}' dataset")
     return energies
+
+
+def read_trajectory(run_dir: Path) -> list[dict[str, int | float | None]]:
+    """Read DeepQMC's per-step mean energy and walker standard deviation.
+
+    DeepQMC rows use the persisted ``step`` dataset when present. Otherwise
+    they are explicitly labelled by observation index. The standard deviation
+    is squared here to expose the walker local-energy variance; it is never
+    confused with an error bar.
+
+    Raises
+    ------
+    AdapterError
+        If h5py, either required dataset, or aligned non-empty data is absent.
+    """
+
+    try:
+        import h5py
+    except ModuleNotFoundError as error:  # pragma: no cover - environment-dependent
+        raise AdapterError(
+            "reading DeepQMC output needs h5py, which is not a TPEN dependency; "
+            "run this adapter with the DeepQMC virtualenv that already provides it"
+        ) from error
+
+    path = result_path(run_dir)
+    if not path.is_file():
+        raise AdapterError(f"no {RESULT_FILENAME} under {run_dir}")
+
+    def _extract(handle: "h5py.File") -> list[dict[str, int | float | None]]:
+        missing = [name for name in (ENERGY_DATASET, STD_DATASET) if name not in handle]
+        if missing:
+            raise AdapterError(f"{path} has no '{missing[0]}' dataset")
+        mean_dataset, std_dataset = handle[ENERGY_DATASET], handle[STD_DATASET]
+        for name, dataset in ((ENERGY_DATASET, mean_dataset), (STD_DATASET, std_dataset)):
+            shape = dataset.shape
+            if not shape or len(shape) > 3 or any(size != 1 for size in shape[1:]):
+                raise AdapterError(
+                    f"{path} '{name}' must have shape (N,), (N,1), or (N,1,1); got {shape}"
+                )
+        if mean_dataset.shape != std_dataset.shape:
+            raise AdapterError(f"{path} has mismatched local-energy mean/std shapes")
+        energies = [float(value) for value in mean_dataset[:].ravel()]
+        stds = [float(value) for value in std_dataset[:].ravel()]
+        if not energies:
+            raise AdapterError(f"{path} has empty local-energy trajectory datasets")
+        if STEP_DATASET in handle:
+            step_dataset = handle[STEP_DATASET]
+            shape = step_dataset.shape
+            if not shape or len(shape) > 3 or any(size != 1 for size in shape[1:]):
+                raise AdapterError(
+                    f"{path} '{STEP_DATASET}' must have shape (N,), (N,1), or (N,1,1); got {shape}"
+                )
+            steps = []
+            for value in step_dataset[:].ravel():
+                try:
+                    step = int(value)
+                except (OverflowError, TypeError, ValueError) as error:
+                    raise AdapterError(
+                        f"{path} '{STEP_DATASET}' contains a non-integer value"
+                    ) from error
+                if step != value:
+                    raise AdapterError(f"{path} '{STEP_DATASET}' contains a non-integer value")
+                steps.append(step)
+            if len(steps) != len(energies):
+                raise AdapterError(f"{path} has unaligned step and local-energy datasets")
+            step_basis = "optimizer_step"
+        else:
+            steps = list(range(len(energies)))
+            step_basis = "observation_index"
+        return _TrajectoryRows(
+            (
+                {
+                    "step": step,
+                    "energy": energy,
+                    "walker_local_energy_variance": std * std,
+                    "energy_time_ewvar": None,
+                    "step_basis": step_basis,
+                }
+                for step, (energy, std) in zip(steps, zip(energies, stds))
+            ),
+            step_basis=step_basis,
+        )
+
+    try:
+        with h5py.File(path, "r") as handle:
+            rows = _extract(handle)
+    except OSError as error:
+        if "already open for write" not in str(error):
+            raise AdapterError(f"cannot open {path}: {error}") from error
+        with h5py.File(path, "r", swmr=True) as handle:
+            rows = _extract(handle)
+    if not rows:
+        raise AdapterError(f"{path} has empty local-energy trajectory datasets")
+    return rows
 
 
 def parse_device(log_text: str) -> tuple[str | None, str | None]:
