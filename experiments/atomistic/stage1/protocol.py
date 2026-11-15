@@ -320,8 +320,21 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
     return row
 
 
-def physical_system_id_from_config(config_path: str | Path) -> str:
-    """Instantiate a Stage-1 eval config and return its descriptor content ID."""
+def physical_system_id_from_config(
+    config_path: str | Path,
+    *,
+    train_config_path: str | Path | None = None,
+    system_name: str | None = None,
+) -> str:
+    """Validate an eval descriptor and return its physical content ID.
+
+    When ``train_config_path`` is supplied, the train Hamiltonian is built
+    from its actual configured terms and compared with the eval descriptor
+    before the eval identity is admitted to a plan.  The content ID covers
+    particles, operator IDs, physical parameters, and resources; slots and
+    their operator bindings are compared explicitly because slots are omitted
+    from the descriptor's physical content hash.
+    """
 
     from hydra.utils import instantiate
     from tpen.run import load_config
@@ -402,7 +415,37 @@ def physical_system_id_from_config(config_path: str | Path) -> str:
     system_id = descriptor.system_id()
     if not isinstance(system_id, str) or not _SHA256.fullmatch(system_id):
         raise ProtocolError("configured system descriptor did not produce a SHA-256 ID")
+    if train_config_path is not None:
+        label = system_name or str(cfg.system.id)
+        try:
+            train_cfg = load_config(str(train_config_path))
+            train_descriptor = _descriptor_from_train_config(train_cfg)
+        except Exception as exc:
+            raise ProtocolError(f"train/eval Hamiltonian mismatch for {label}") from exc
+        eval_bindings = tuple(sorted((term.slot, str(term.operator_id))
+                                     for term in descriptor.terms))
+        train_bindings = tuple(sorted((term.slot, str(term.operator_id))
+                                      for term in train_descriptor.terms))
+        if (train_cfg.system.id != cfg.system.id
+                or train_bindings != eval_bindings
+                or train_descriptor.system_id() != system_id):
+            raise ProtocolError(f"train/eval Hamiltonian mismatch for {label}")
     return system_id
+
+
+def _descriptor_from_train_config(cfg: Any) -> Any:
+    """Build a descriptor from a train config's actual Hamiltonian terms."""
+
+    from hydra.utils import instantiate
+    from tpen.physics.system import ParticleSpec, build_system_descriptor
+
+    particle = ParticleSpec(
+        n_electrons=int(cfg.system.n_particles),
+        n_spin_up=int(cfg.system.spin.n_up),
+        n_spin_down=int(cfg.system.spin.n_down),
+        spatial_dim=int(cfg.system.spatial_dim),
+    )
+    return build_system_descriptor(particle, instantiate(cfg.hamiltonian_terms))
 
 
 def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
@@ -424,7 +467,11 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
     if not physical_ids:
         config_root = Path(__file__).parent / "configs"
         physical_ids = {
-            name: physical_system_id_from_config(config_root / name / "eval.yaml")
+            name: physical_system_id_from_config(
+                config_root / name / "eval.yaml",
+                train_config_path=config_root / name / "train.yaml",
+                system_name=name,
+            )
             for name in SYSTEMS
         }
     for name in SYSTEMS:
