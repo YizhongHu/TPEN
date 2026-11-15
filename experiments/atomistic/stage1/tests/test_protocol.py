@@ -153,6 +153,16 @@ def test_manifest_binds_real_identity_and_checkpoint_expectations() -> None:
     assert "resolved_config_identity" not in eval_row
 
 
+def test_smoke_rows_use_real_train_config_and_final_checkpoint_step() -> None:
+    rows = _manifest()
+    smoke_rows = [row for row in rows if row["kind"] == "smoke"]
+    assert {row["config"] for row in smoke_rows} == {
+        f"configs/{system}/train.yaml" for system in SYSTEMS
+    }
+    assert all(row["checkpoint_steps"] == [STAGE1_PROTOCOL.smoke_updates]
+               for row in smoke_rows)
+
+
 def test_manifest_pins_configured_physical_identity_on_eval_rows() -> None:
     rows = _manifest(checkpoints=[7])
     config_root = Path(__file__).parents[1] / "configs"

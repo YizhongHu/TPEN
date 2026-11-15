@@ -102,6 +102,47 @@ def test_real_train_row_overrides_load_and_bind_checkpoint_schedule(
         )
 
 
+@pytest.mark.parametrize("system", SYSTEMS)
+def test_smoke_row_uses_train_config_and_loads_bounded_train_contract(
+    system: str, tmp_path: Path,
+) -> None:
+    row = next(row for row in build_manifest(
+        protocol=Protocol(
+            smoke_updates=3,
+            smoke_walkers=2,
+            lineage_updates=101,
+            lineage_walkers=2,
+            lineages=3,
+            eval_streams=4,
+            eval_walkers=2,
+            eval_draws=2,
+        ),
+        source_sha="a" * 40,
+        config_sha256="b" * 64,
+        checkpoints=[7, 101],
+        lineage_seeds=[11, 22, 33],
+        checkpoint_sha256={
+            (name, lineage, checkpoint): "d" * 64
+            for name in SYSTEMS
+            for lineage in range(3)
+            for checkpoint in (7, 101)
+        },
+        results_root=str(tmp_path / "results"),
+    ) if row["kind"] == "smoke" and row["system"] == system)
+    assert row["config"] == f"configs/{system}/train.yaml"
+    overrides = row_overrides(row)
+    assert validate_gateway_binding(
+        binding=_binding_token(row), config=row["config"],
+        overrides=overrides, kind="smoke",
+    ) == row
+    config = CONFIG_ROOT / system / "train.yaml"
+    resolved = load_config(str(config), overrides=overrides)
+    assert resolved.sampler.n_walkers == 2
+    assert resolved.trainer.max_steps == 3
+    assert list(resolved.checkpoint_steps) == [3]
+    assert list(resolved.callbacks[4].schedule.updates) == [3]
+
+
 def test_physical_id_rejects_wrong_operator_under_existing_kinetic_slot(
     tmp_path: Path,
 ) -> None:
