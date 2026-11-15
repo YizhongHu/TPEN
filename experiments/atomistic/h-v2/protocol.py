@@ -800,7 +800,7 @@ PILOT_PAYLOAD_STAGE1_ORDINAL_COUNT: dict[str, int] = {
 }
 
 
-def pilot_stage1_ordinals(payload: str = "capacity-pilot") -> tuple[int, ...]:
+def pilot_stage1_ordinals(payload: str = "capacity-pilot", *, count: int | None = None) -> tuple[int, ...]:
     """Return *payload*'s stage-1 ordinal sweep: ``0..count-1`` inclusive.
 
     Raises
@@ -809,10 +809,13 @@ def pilot_stage1_ordinals(payload: str = "capacity-pilot") -> tuple[int, ...]:
         If *payload* has no entry in :data:`PILOT_PAYLOAD_STAGE1_ORDINAL_COUNT`.
     """
 
-    return tuple(range(PILOT_PAYLOAD_STAGE1_ORDINAL_COUNT[payload]))
+    ordinal_count = PILOT_PAYLOAD_STAGE1_ORDINAL_COUNT[payload] if count is None else count
+    if ordinal_count < 1:
+        raise ValueError(f"stage-1 ordinal count must be positive, got {ordinal_count}")
+    return tuple(range(ordinal_count))
 
 
-def pilot_sel_window_hi(payload: str = "capacity-pilot") -> int:
+def pilot_sel_window_hi(payload: str = "capacity-pilot", *, count: int | None = None) -> int:
     """Return *payload*'s SEL window inclusive upper bound (the window is ``3..hi``).
 
     The window excludes the last two ordinals of the stage-1 sweep (a basin
@@ -821,13 +824,15 @@ def pilot_sel_window_hi(payload: str = "capacity-pilot") -> int:
     (``hi = 21 - 2 = 19``).
     """
 
-    return PILOT_PAYLOAD_STAGE1_ORDINAL_COUNT[payload] - 2
+    return len(pilot_stage1_ordinals(payload, count=count)) - 2
 
 
-def pilot_stage1_grid(payload: str = "capacity-pilot") -> tuple[tuple[int, int], ...]:
+def pilot_stage1_grid(
+    payload: str = "capacity-pilot", *, count: int | None = None
+) -> tuple[tuple[int, int], ...]:
     """Return *payload*'s stage-1 ``(ordinal, stream)`` pairs: stream 0 at every ordinal."""
 
-    return tuple((ordinal, PILOT_STAGE1_STREAM) for ordinal in pilot_stage1_ordinals(payload))
+    return tuple((ordinal, PILOT_STAGE1_STREAM) for ordinal in pilot_stage1_ordinals(payload, count=count))
 
 
 def pilot_stage2_window(c1: int) -> tuple[int, ...]:

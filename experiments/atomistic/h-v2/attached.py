@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -83,6 +84,7 @@ ROUTE_NAME = "h-v2-attached"
 TRAIN_STAGE = "train"
 EVAL_STAGE = "eval"
 H_V2_ACCEPTED_RECEIPT_SCHEMA = "tpen-experiments/h-v2-accepted-receipt-v1"
+SALVAGE_INVENTORY_SCHEMA = "tpen-experiments/h-v2-salvage-inventory-v1"
 #: F1: EVAL cannot yet produce accepted checkpoint-based evidence.  EVAL's
 #: model-only restore writes no training checkpoint, so
 #: ``tpen/inspection.py``'s ``inspect_run`` returns ``missing-checkpoint``
@@ -1208,6 +1210,178 @@ def build_checkpoint_inventory(checkpoint_root: str | Path) -> list[dict[str, An
     return inventory
 
 
+_SALVAGE_REQUIRED_FILES = ("model", "optimizer", "trainer", "sampler", "rng", "resolved_config")
+_STEP_DIR_RE = re.compile(r"step_(\d+)$")
+
+
+def find_pilot_checkpoint_root(run_root: str | Path, payload: str) -> Path:
+    """Find the sole executor checkpoint root for one pilot run.
+
+    The executor's store contains a generated group and attempt directory, so
+    the group/attempt digests are intentionally not guessed here.  A salvage
+    run refuses ambiguity rather than selecting one store by directory order.
+    """
+
+    store_root = Path(run_root) / "attached" / "store" / f"h-v2-train-{payload}"
+    candidates = sorted(path for path in store_root.rglob("checkpoints") if path.is_dir() and path.parent.name == "core")
+    if len(candidates) != 1:
+        raise HV2ReceiptRefusal(
+            "salvage-checkpoint-root-ambiguous",
+            f"expected exactly one pilot checkpoint root below {store_root}, found {len(candidates)}",
+        )
+    return candidates[0]
+
+
+def build_salvage_inventory(
+    checkpoint_root: str | Path,
+    *,
+    expected_source_commit: str | None = None,
+    expected_config_sha256: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Build a contiguous, hash-verified prefix from completed checkpoints.
+
+    A checkpoint without ``COMPLETE`` is treated as the terminal gap and is
+    never read.  Complete checkpoints are validated against their manifest and
+    ``trainer.json`` before they enter the prefix.  The first valid checkpoint
+    establishes the TRAIN source/config identity; every later admitted entry
+    must carry the same identities.
+    """
+
+    root = Path(checkpoint_root)
+    if not root.is_dir():
+        raise HV2ReceiptRefusal("salvage-checkpoint-root-missing", f"checkpoint root is not a directory: {root}")
+    entries: list[dict[str, Any]] = []
+    source_commit: str | None = None
+    config_sha256: str | None = None
+    expected_update = 0
+    step_dirs = sorted(
+        (entry for entry in root.iterdir() if entry.is_dir() and _STEP_DIR_RE.fullmatch(entry.name)),
+        key=lambda entry: int(_STEP_DIR_RE.fullmatch(entry.name).group(1)),  # type: ignore[union-attr]
+    )
+    for entry in step_dirs:
+        step = int(_STEP_DIR_RE.fullmatch(entry.name).group(1))  # type: ignore[union-attr]
+        if step != expected_update:
+            break
+        manifest_path = entry / _CHECKPOINT_MANIFEST_NAME
+        if not manifest_path.is_file() or not (entry / _CHECKPOINT_COMPLETE_MARKER).is_file():
+            break
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            schema_version = int(manifest["schema_version"])
+            completed_updates = int(manifest["completed_updates"])
+            next_iteration = int(manifest["next_iteration"])
+            files = dict(manifest["files"])
+            hashes = dict(manifest["hashes"])
+            provenance = dict(manifest["provenance"])
+            trainer = json.loads((entry / files["trainer"]).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+            raise HV2ReceiptRefusal("salvage-checkpoint-invalid", f"cannot read {entry}: {error}") from error
+        if schema_version != _CHECKPOINT_MANIFEST_SCHEMA_VERSION_V2:
+            raise HV2ReceiptRefusal("salvage-checkpoint-invalid", f"{entry} has schema_version {schema_version}, expected 2")
+        if not (completed_updates == next_iteration == step):
+            raise HV2ReceiptRefusal(
+                "salvage-cursor-mismatch",
+                f"{entry} requires completed_updates == next_iteration == step, got "
+                f"{completed_updates}, {next_iteration}, {step}",
+            )
+        if trainer.get("completed_updates") != step or trainer.get("next_iteration") != step:
+            raise HV2ReceiptRefusal(
+                "salvage-cursor-mismatch",
+                f"{entry}/trainer.json cursor does not equal step {step}",
+            )
+        for logical_name in _SALVAGE_REQUIRED_FILES:
+            relative = files.get(logical_name)
+            expected_hash = hashes.get(f"{logical_name}_sha256")
+            if not isinstance(relative, str) or not isinstance(expected_hash, str):
+                raise HV2ReceiptRefusal(
+                    "salvage-checkpoint-invalid",
+                    f"{entry} is missing manifest file/hash for {logical_name!r}",
+                )
+            file_path = entry / relative
+            if not file_path.is_file():
+                raise HV2ReceiptRefusal("salvage-checkpoint-file-missing", f"{file_path} is missing")
+            actual_hash = file_sha256(file_path)
+            if actual_hash != expected_hash:
+                raise HV2ReceiptRefusal(
+                    "salvage-checkpoint-hash-mismatch",
+                    f"{file_path} sha256 {actual_hash} does not match manifest {expected_hash}",
+                )
+        entry_source_commit = provenance.get("git_sha")
+        entry_config_sha256 = hashes.get("resolved_config_sha256")
+        if not isinstance(entry_source_commit, str) or not isinstance(entry_config_sha256, str):
+            raise HV2ReceiptRefusal("salvage-identity-missing", f"{entry} has no TRAIN source/config identity")
+        if expected_source_commit is not None and entry_source_commit != expected_source_commit:
+            raise HV2ReceiptRefusal(
+                "salvage-wrong-source-commit",
+                f"{entry} source commit {entry_source_commit!r} != expected {expected_source_commit!r}",
+            )
+        if source_commit is None:
+            source_commit = entry_source_commit
+            config_sha256 = entry_config_sha256
+        if entry_source_commit != source_commit or entry_config_sha256 != config_sha256:
+            raise HV2ReceiptRefusal("salvage-identity-mismatch", f"{entry} does not match the TRAIN identity")
+        if expected_config_sha256 is not None and entry_config_sha256 != expected_config_sha256:
+            raise HV2ReceiptRefusal(
+                "salvage-wrong-config-identity",
+                f"{entry} resolved_config_sha256 {entry_config_sha256!r} != expected {expected_config_sha256!r}",
+            )
+        all_files = {
+            str(file_path.relative_to(entry)): file_sha256(file_path)
+            for file_path in sorted(entry.rglob("*"))
+            if file_path.is_file()
+        }
+        entries.append(
+            {
+                "update": step,
+                "path": str(entry),
+                "files": all_files,
+                "source_commit": entry_source_commit,
+                "resolved_config_sha256": entry_config_sha256,
+            }
+        )
+        expected_update += 1000
+    if not entries:
+        raise HV2ReceiptRefusal("salvage-empty-prefix", f"no complete checkpoint at update 0 under {root}")
+    return entries, {"source_commit": source_commit or "", "resolved_config_sha256": config_sha256 or ""}
+
+
+def write_salvage_inventory(
+    run_root: str | Path,
+    *,
+    payload: str,
+    job_id: str,
+    terminal_state: str,
+    expected_source_commit: str | None = None,
+    expected_config_sha256: str | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    """Write one new, atomic salvage receipt without touching the pilot store."""
+
+    root = Path(run_root)
+    checkpoint_root = find_pilot_checkpoint_root(root, payload)
+    inventory, identity = build_salvage_inventory(
+        checkpoint_root,
+        expected_source_commit=expected_source_commit,
+        expected_config_sha256=expected_config_sha256,
+    )
+    salvage_dir = root / "attached" / "salvage"
+    salvage_dir.mkdir(parents=True, exist_ok=False)
+    output_path = salvage_dir / f"h-v2-salvage-{payload}.json"
+    receipt = {
+        "schema": SALVAGE_INVENTORY_SCHEMA,
+        "source": "salvage-partial-inventory",
+        "payload": payload,
+        "lineage": "P",
+        "job_id": str(job_id),
+        "terminal_state": str(terminal_state),
+        "checkpoint_root": str(checkpoint_root),
+        "source_commit": identity["source_commit"],
+        "resolved_config_sha256": identity["resolved_config_sha256"],
+        "inventory": inventory,
+    }
+    _atomic_text(output_path, json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n")
+    return output_path, receipt
+
+
 def build_h_v2_accepted_receipt(
     manifest_path: str | Path,
     *,
@@ -1497,6 +1671,7 @@ __all__ = [
     "EVAL_ROUTE_UNSUPPORTED_REASON",
     "EVAL_STAGE",
     "H_V2_ACCEPTED_RECEIPT_SCHEMA",
+    "SALVAGE_INVENTORY_SCHEMA",
     "HV2Activation",
     "HV2ReceiptRefusal",
     "PILOT_CONFIG_IDENTITY_KEYS",
@@ -1506,11 +1681,14 @@ __all__ = [
     "TRAIN_STAGE",
     "activate_h_v2_run",
     "build_checkpoint_inventory",
+    "build_salvage_inventory",
     "build_h_v2_accepted_receipt",
     "build_h_v2_eval_plan",
     "build_h_v2_train_plan",
     "prepare_h_v2_run",
     "assert_candidate_instantiates",
     "probe_admitted_a1_modules",
+    "find_pilot_checkpoint_root",
+    "write_salvage_inventory",
     "write_h_v2_accepted_receipt",
 ]

@@ -67,6 +67,7 @@ protocol = _h_v2_module("protocol")
 #: acceptance contract requires (eval commit, TRAIN commit, TRAIN receipt
 #: sha256, resolved config + sha256, every checkpoint and output sha256).
 EVAL_RECEIPT_SCHEMA = "tpen-experiments/h-v2-eval-receipt-v1"
+SALVAGE_INVENTORY_SCHEMA = "tpen-experiments/h-v2-salvage-inventory-v1"
 
 #: Part (g)'s single fresh-evaluation generation (pilot-plan-20261110 S7):
 #: the g TRAIN payload's lone retained non-zero checkpoint (1,000 updates),
@@ -197,6 +198,52 @@ def load_train_receipt(path: str | Path) -> tuple[dict[str, Any], str]:
     if not receipt_path.is_file():
         raise EvalJobRefusal("train-receipt-missing", f"no TRAIN accepted receipt at {receipt_path}")
     return json.loads(receipt_path.read_text(encoding="utf-8")), _sha256_file(receipt_path)
+
+
+def load_salvage_inventory(path: str | Path) -> tuple[dict[str, Any], str]:
+    """Read one explicitly selected pilot salvage inventory and its byte hash."""
+
+    inventory_path = Path(path)
+    if not inventory_path.is_file():
+        raise EvalJobRefusal("salvage-inventory-missing", f"no salvage inventory at {inventory_path}")
+    raw = inventory_path.read_bytes()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise EvalJobRefusal("salvage-inventory-bad-schema", f"cannot parse {inventory_path}: {error}") from error
+    if payload.get("schema") != SALVAGE_INVENTORY_SCHEMA:
+        raise EvalJobRefusal(
+            "salvage-inventory-bad-schema",
+            f"{inventory_path} schema {payload.get('schema')!r} != {SALVAGE_INVENTORY_SCHEMA!r}",
+        )
+    return payload, hashlib.sha256(raw).hexdigest()
+
+
+def verify_salvage_inventory_identity(
+    inventory: Mapping[str, Any], *, expected_commit: str, expected_payload: str, expected_lineage: str
+) -> None:
+    """Refuse a salvage inventory outside the explicitly requested pilot."""
+
+    if inventory.get("source") != "salvage-partial-inventory":
+        raise EvalJobRefusal("wrong-salvage-source", "inventory is not labelled salvage-partial-inventory")
+    if inventory.get("payload") != expected_payload:
+        raise EvalJobRefusal("wrong-salvage-payload", f"inventory payload {inventory.get('payload')!r} is not {expected_payload!r}")
+    if expected_payload not in ("capacity-pilot", "capacity-pilot-100k"):
+        raise EvalJobRefusal("salvage-payload-not-pilot", f"salvage inventory is not allowed for {expected_payload!r}")
+    if inventory.get("lineage") != expected_lineage:
+        raise EvalJobRefusal("wrong-salvage-lineage", f"inventory lineage {inventory.get('lineage')!r} is not {expected_lineage!r}")
+    if inventory.get("source_commit") != expected_commit:
+        raise EvalJobRefusal(
+            "wrong-salvage-commit",
+            f"inventory source commit {inventory.get('source_commit')!r} != expected {expected_commit!r}",
+        )
+    entries = inventory.get("inventory") or []
+    if not entries:
+        raise EvalJobRefusal("salvage-inventory-empty", "salvage inventory has no complete checkpoint entries")
+    updates = [entry.get("update") for entry in entries]
+    expected_updates = list(range(0, len(entries) * 1000, 1000))
+    if updates != expected_updates:
+        raise EvalJobRefusal("salvage-inventory-noncontiguous", f"inventory updates {updates!r} != {expected_updates!r}")
 
 
 def verify_train_receipt_identity(
@@ -495,7 +542,7 @@ def science_fanout(*, lineage_index: int) -> tuple[dict[str, Any], ...]:
 
 
 def pilot_fanout(
-    stage: str, *, c1: int | None = None, payload: str = "capacity-pilot"
+    stage: str, *, c1: int | None = None, payload: str = "capacity-pilot", ordinal_count: int | None = None
 ) -> tuple[dict[str, Any], ...]:
     """Return one pilot stage's fan-out generations (amendment r3/r4 E1).
 
@@ -520,7 +567,7 @@ def pilot_fanout(
     """
 
     if stage == "1":
-        pairs = protocol.pilot_stage1_grid(payload)
+        pairs = protocol.pilot_stage1_grid(payload, count=ordinal_count)
     elif stage in ("2", "2-core"):
         if c1 is None:
             raise EvalJobRefusal("pilot-stage2-needs-c1", f"--pilot-stage {stage} requires c1 from the SEL step")
@@ -830,6 +877,8 @@ def build_eval_receipt(
     generations: Sequence[Mapping[str, Any]],
     readout_generator_enabled: bool,
     selection: Mapping[str, Any] | None = None,
+    source: str = "train-accepted-receipt",
+    source_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Return the fan-out's own consolidated eval-receipt payload.
 
@@ -849,6 +898,8 @@ def build_eval_receipt(
         "train_commit": train_commit,
         "train_receipt_path": str(train_receipt_path),
         "train_receipt_sha256": train_receipt_sha256,
+        "source": source,
+        "source_sha256": source_sha256 or train_receipt_sha256,
         "payload": payload,
         "readout_generator_enabled": bool(readout_generator_enabled),
         "selection": dict(selection) if selection is not None else None,
@@ -963,7 +1014,7 @@ def read_verified_stream_local_energies(generation: Mapping[str, Any]) -> list[f
 
 
 def compute_pilot_selection(
-    stage1_receipt: Mapping[str, Any], *, payload: str = "capacity-pilot"
+    stage1_receipt: Mapping[str, Any], *, payload: str = "capacity-pilot", ordinal_count: int | None = None
 ) -> dict[str, Any]:
     """Compute the SEL step from a completed pilot stage-1 eval receipt.
 
@@ -1031,12 +1082,16 @@ def compute_pilot_selection(
                 "sel-nonfinite-energy", f"B1 generation for ordinal {ordinal} has a non-finite local_energy sample"
             )
         w_by_ordinal[ordinal] = protocol.w_statistic(energies)
-    missing = sorted(set(protocol.pilot_stage1_ordinals(payload)) - seen_ordinals)
+    if ordinal_count is None and stage1_receipt.get("source") == "salvage-partial-inventory":
+        ordinal_count = len(seen_ordinals)
+    missing = sorted(set(protocol.pilot_stage1_ordinals(payload, count=ordinal_count)) - seen_ordinals)
     if missing:
         raise EvalJobRefusal(
             "sel-incomplete-stage1", f"B1 receipt is missing stream-0 generations for ordinals {missing!r}"
         )
-    c1, triple_means = protocol.select_pilot_basin_ordinal(w_by_ordinal, hi=protocol.pilot_sel_window_hi(payload))
+    c1, triple_means = protocol.select_pilot_basin_ordinal(
+        w_by_ordinal, hi=protocol.pilot_sel_window_hi(payload, count=ordinal_count)
+    )
     return {"c1": c1, "triple_means": triple_means}
 
 
@@ -1046,6 +1101,7 @@ def build_selection_record(
     triple_means: Mapping[int, float],
     b1_eval_receipt_sha256: str,
     payload: str = "capacity-pilot",
+    ordinal_count: int | None = None,
 ) -> dict[str, Any]:
     """Return the SEL step's selection record (amendment r3/r4 E1).
 
@@ -1061,7 +1117,7 @@ def build_selection_record(
     by *payload*.
     """
 
-    hi = protocol.pilot_sel_window_hi(payload)
+    hi = protocol.pilot_sel_window_hi(payload, count=ordinal_count)
     if not 3 <= c1 <= hi:
         raise EvalJobRefusal("sel-c1-out-of-range", f"c1 must be in 3..{hi}, got {c1}")
     return {
@@ -1073,7 +1129,7 @@ def build_selection_record(
 
 
 def verify_selection_record(
-    selection: Mapping[str, Any], *, b1_eval_receipt_sha256: str, payload: str = "capacity-pilot"
+    selection: Mapping[str, Any], *, b1_eval_receipt_sha256: str, payload: str = "capacity-pilot", ordinal_count: int | None = None
 ) -> int:
     """Return ``c1`` from *selection*, refusing a mismatched or out-of-range record.
 
@@ -1089,7 +1145,7 @@ def verify_selection_record(
             f"selection record b1_eval_receipt_sha256 {selection.get('b1_eval_receipt_sha256')!r} "
             f"does not match the B1 receipt {b1_eval_receipt_sha256!r}",
         )
-    hi = protocol.pilot_sel_window_hi(payload)
+    hi = protocol.pilot_sel_window_hi(payload, count=ordinal_count)
     c1 = selection.get("c1")
     if not isinstance(c1, int) or not 3 <= c1 <= hi:
         raise EvalJobRefusal("sel-c1-out-of-range", f"selection record c1 {c1!r} is not an int in 3..{hi}")
@@ -1098,6 +1154,7 @@ def verify_selection_record(
 
 __all__ = [
     "EVAL_RECEIPT_SCHEMA",
+    "SALVAGE_INVENTORY_SCHEMA",
     "GPU_ROUTE_G_EVAL_STREAM",
     "GPU_ROUTE_G_EVAL_UPDATE",
     "EvalJobRefusal",
@@ -1109,6 +1166,7 @@ __all__ = [
     "REQUIRED_CHECKPOINT_CLOSURE_FILES",
     "gpu_route_g_fanout",
     "load_train_receipt",
+    "load_salvage_inventory",
     "pilot_fanout",
     "probe_readout_trajectory_generator",
     "read_eval_receipt",
@@ -1123,5 +1181,6 @@ __all__ = [
     "verify_checkpoint_files",
     "verify_selection_record",
     "verify_train_receipt_identity",
+    "verify_salvage_inventory_identity",
     "write_eval_receipt",
 ]
