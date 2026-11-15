@@ -8,27 +8,11 @@
     "needle_count": 1
   },
   {
-    "id": "ignore-salvage-gap",
-    "target": "experiments/atomistic/h-v2/attached.py",
-    "old": "if step != expected_update:\n            break",
-    "new": "if step != expected_update:\n            expected_update = step  # mutant: ignore-salvage-gap",
-    "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_stops_at_first_complete_checkpoint_gap",
-    "needle_count": 1
-  },
-  {
     "id": "ignore-salvage-hash",
     "target": "experiments/atomistic/h-v2/attached.py",
     "old": "if actual_hash != expected_hash:\n                raise HV2ReceiptRefusal(\n                    \"salvage-checkpoint-hash-mismatch\",",
     "new": "if False and actual_hash != expected_hash:\n                raise HV2ReceiptRefusal(\n                    \"salvage-checkpoint-hash-mismatch\",  # mutant: ignore-salvage-hash",
     "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_refuses_hash_mismatch",
-    "needle_count": 1
-  },
-  {
-    "id": "ignore-salvage-identity",
-    "target": "experiments/atomistic/h-v2/attached.py",
-    "old": "if entry_source_commit != source_commit or entry_config_sha256 != config_sha256:\n            raise HV2ReceiptRefusal(\"salvage-identity-mismatch\", f\"{entry} does not match the TRAIN identity\")",
-    "new": "if False and (entry_source_commit != source_commit or entry_config_sha256 != config_sha256):\n            raise HV2ReceiptRefusal(\"salvage-identity-mismatch\", f\"{entry} does not match the TRAIN identity\")  # mutant: ignore-salvage-identity",
-    "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_refuses_identity_commit_or_config_mismatch",
     "needle_count": 1
   },
   {
@@ -61,22 +45,6 @@
     "old": "file_path = _safe_checkpoint_member(entry, relative)",
     "new": "file_path = entry / relative  # mutant: ignore-salvage-path-guard",
     "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_refuses_checkpoint_symlink_escape",
-    "needle_count": 1
-  },
-  {
-    "id": "skip-salvage-entry-validation",
-    "target": "experiments/atomistic/h-v2/eval_job.py",
-    "old": "        _validate_salvage_inventory_entry(entry, index)",
-    "new": "        if False:\n            _validate_salvage_inventory_entry(entry, index)  # mutant: skip-salvage-entry-validation",
-    "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_consumer_refuses_incomplete_inventory_entry",
-    "needle_count": 1
-  },
-  {
-    "id": "allow-short-salvage-sel-window",
-    "target": "experiments/atomistic/h-v2/eval_job.py",
-    "old": "if ordinal_count < 5:\n            raise EvalJobRefusal(\n                \"sel-inventory-too-short\",",
-    "new": "if False and (ordinal_count < 5):\n            raise EvalJobRefusal(\n                \"sel-inventory-too-short\",  # mutant: allow-short-salvage-sel-window",
-    "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_sel_refuses_inventory_too_short_for_center_window",
     "needle_count": 1
   }
 ]

@@ -357,3 +357,16 @@ def test_salvage_fanout_and_eval_receipt_preserve_source_binding(tmp_path: Path)
     assert receipt["source"] == "salvage-partial-inventory"
     assert receipt["source_sha256"] == "b" * 64
     assert receipt["ordinal_count"] == 7
+
+
+def test_default_eval_receipt_shape_has_no_salvage_length(tmp_path: Path) -> None:
+    receipt = eval_job.build_eval_receipt(
+        eval_commit="c" * 40,
+        train_commit="a" * 40,
+        payload="capacity-pilot-100k",
+        train_receipt_path=tmp_path / "train.json",
+        train_receipt_sha256="a" * 64,
+        generations=[],
+        readout_generator_enabled=False,
+    )
+    assert "ordinal_count" not in receipt

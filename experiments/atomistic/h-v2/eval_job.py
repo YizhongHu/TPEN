@@ -935,7 +935,7 @@ def build_eval_receipt(
         never inferred from the generations observed by SEL.
     """
 
-    return {
+    receipt = {
         "schema": EVAL_RECEIPT_SCHEMA,
         "eval_commit": eval_commit,
         "train_commit": train_commit,
@@ -943,12 +943,14 @@ def build_eval_receipt(
         "train_receipt_sha256": train_receipt_sha256,
         "source": source,
         "source_sha256": source_sha256 or train_receipt_sha256,
-        "ordinal_count": ordinal_count,
         "payload": payload,
         "readout_generator_enabled": bool(readout_generator_enabled),
         "selection": dict(selection) if selection is not None else None,
         "generations": [dict(generation) for generation in generations],
     }
+    if source == "salvage-partial-inventory":
+        receipt["ordinal_count"] = ordinal_count
+    return receipt
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
