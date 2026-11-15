@@ -211,7 +211,7 @@ def test_stream_aggregate_rejects_duplicate_or_gapped_indices(
 def test_duplicate_record_sidecars_are_refused(monkeypatch, tmp_path: Path) -> None:
     """A fixed-path lookup must not silently choose among duplicate records."""
     document = _manifest(tmp_path, streams=1)
-    run_dir = tmp_path / "run-0"
+    run_dir = collector.resolve_run_dir(document["rows"][0])
     task_dir = run_dir / "mcmc_energy"
     task_dir.mkdir(parents=True)
     (task_dir / "sampled_eval_table.metadata.json").write_text("{}", encoding="utf-8")
@@ -250,7 +250,7 @@ def test_duplicate_record_sidecars_are_refused(monkeypatch, tmp_path: Path) -> N
     monkeypatch.setattr(collector, "read_energy_grid", lambda record: [[1.0, 2.0], [3.0, 4.0]])
     monkeypatch.setattr(collector, "_reference", lambda system_id, registry_path: (-2.9, "transcribed"))
 
-    with pytest.raises(collector.CollectionError, match="duplicate"):
+    with pytest.raises(collector.CollectionError, match="^duplicate trajectory metadata sidecars"):
         collector.collect(document)
 
 

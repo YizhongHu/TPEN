@@ -15,12 +15,13 @@ def resolve_run_dir(row: Mapping[str, Any]) -> Path:
 
     from tpen.artifacts import ArtifactManager
 
-    admitted = row.get("run_dir")
+    if "run_dir" in row or "run_layout" in row:
+        raise RunPathError("manifest row run_dir/run_layout options are not admitted")
     try:
         return ArtifactManager(
             row["results_root"], row["experiment_name"], row["sector"], row["run_id"],
-            layout=row.get("run_layout", "nested"),
-            logical_run_dir=None if admitted is None else Path(str(admitted)),
+            layout="nested",
+            logical_run_dir=None,
         ).run_dir
     except (KeyError, TypeError, ValueError) as exc:
         raise RunPathError("manifest row lacks fields required to resolve run directory") from exc

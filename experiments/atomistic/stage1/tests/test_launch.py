@@ -250,7 +250,6 @@ def test_gateway_rejects_layout_override_that_disagrees_with_planner(tmp_path: P
     row = {
         **ROW,
         "results_root": str(tmp_path / "results"),
-        "run_layout": "nested",
     }
     planned = resolve_run_dir(row)
     assert planned == Path(row["results_root"]) / row["experiment_name"] / row["sector"] / row["run_id"]
@@ -277,13 +276,35 @@ def test_render_rejects_absolute_run_components_outside_results_root(
     render(row=row, driver="driver.py", python="/usr/bin/python3",
            head_sha="c" * 40, results_root=str(approved_root),
            scratch_base=str(tmp_path / "scratch"))
-    for field in ("sector", "run_id"):
+    for field in ("experiment_name", "sector", "run_id"):
         with pytest.raises(ValueError, match=field):
             render(
                 row={**row, field: str(tmp_path / "escaped")},
                 driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
                 results_root=str(approved_root), scratch_base=str(tmp_path / "scratch"),
             )
+
+
+@pytest.mark.parametrize("field,value", [
+    ("experiment_name", ""), ("experiment_name", "."), ("experiment_name", ".."),
+    ("sector", "nested/sector"), ("run_id", "../escaped"),
+])
+def test_gateway_rejects_non_component_run_identity(field: str, value: str) -> None:
+    row = {**ROW, field: value}
+    with pytest.raises(ProtocolError, match=field):
+        validate_gateway_binding(
+            binding=_binding_token(row), config=row["config"],
+            overrides=row_overrides(row), kind="train",
+        )
+
+
+def test_row_overrides_bind_nested_layout_even_when_config_inherits_flat() -> None:
+    row = {**ROW, "config": "configs/he/inherited-flat.yaml"}
+    overrides = row_overrides(row)
+    assert "run.layout=nested" in overrides
+    assert validate_gateway_binding(
+        binding=_binding_token(row), config=row["config"], overrides=overrides, kind="train",
+    ) == row
 
 
 def test_gateway_rejects_relative_checkpoint_paths() -> None:
