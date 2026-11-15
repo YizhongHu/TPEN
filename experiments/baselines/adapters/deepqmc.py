@@ -71,6 +71,7 @@ RECORD_FILENAME = "baseline_record.json"
 #: Dataset holding the per-step mean local energy. The sibling ``samples``
 #: datasets are per-walker and run to gigabytes; they are never read here.
 ENERGY_DATASET = "local_energy/mean"
+STD_DATASET = "local_energy/std"
 
 #: Fraction of the trailing trace averaged by default. Deliberately larger than
 #: the FermiNet adapter's 0.1 -- see the module docstring.
@@ -245,6 +246,62 @@ def read_energies(run_dir: Path) -> list[float]:
     if not energies:
         raise AdapterError(f"{path} has an empty '{ENERGY_DATASET}' dataset")
     return energies
+
+
+def read_trajectory(run_dir: Path) -> list[dict[str, int | float | None]]:
+    """Read DeepQMC's per-step mean energy and walker standard deviation.
+
+    DeepQMC has no persisted step-number dataset, so rows are numbered from
+    zero in HDF5 order. The standard deviation is squared here to expose the
+    walker local-energy variance; it is never confused with an error bar.
+
+    Raises
+    ------
+    AdapterError
+        If h5py, either required dataset, or aligned non-empty data is absent.
+    """
+
+    try:
+        import h5py
+    except ModuleNotFoundError as error:  # pragma: no cover - environment-dependent
+        raise AdapterError(
+            "reading DeepQMC output needs h5py, which is not a TPEN dependency; "
+            "run this adapter with the DeepQMC virtualenv that already provides it"
+        ) from error
+
+    path = result_path(run_dir)
+    if not path.is_file():
+        raise AdapterError(f"no {RESULT_FILENAME} under {run_dir}")
+
+    def _extract(handle: "h5py.File") -> list[dict[str, int | float | None]]:
+        missing = [name for name in (ENERGY_DATASET, STD_DATASET) if name not in handle]
+        if missing:
+            raise AdapterError(f"{path} has no '{missing[0]}' dataset")
+        energies = [float(value) for value in handle[ENERGY_DATASET][:].ravel()]
+        stds = [float(value) for value in handle[STD_DATASET][:].ravel()]
+        if len(energies) != len(stds):
+            raise AdapterError(f"{path} has unaligned local-energy mean/std datasets")
+        return [
+            {
+                "step": index,
+                "energy": energy,
+                "walker_local_energy_variance": std * std,
+                "energy_time_ewvar": None,
+            }
+            for index, (energy, std) in enumerate(zip(energies, stds))
+        ]
+
+    try:
+        with h5py.File(path, "r") as handle:
+            rows = _extract(handle)
+    except OSError as error:
+        if "already open for write" not in str(error):
+            raise AdapterError(f"cannot open {path}: {error}") from error
+        with h5py.File(path, "r", swmr=True) as handle:
+            rows = _extract(handle)
+    if not rows:
+        raise AdapterError(f"{path} has empty local-energy trajectory datasets")
+    return rows
 
 
 def parse_device(log_text: str) -> tuple[str | None, str | None]:
