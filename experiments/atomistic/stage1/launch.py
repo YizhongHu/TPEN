@@ -19,7 +19,7 @@ from experiments.atomistic.stage1.protocol import (
 
 ALLOWED_PARTITIONS = ("test", "gpu_test")
 FACILITY_RESULTS_PREFIX = "/n/netscratch/kozinsky_lab/Lab/rhu/"
-_SAFE_RENDERED_VALUE = re.compile(r"[A-Za-z0-9_./:+,@=-]+\Z")
+_SAFE_RENDERED_VALUE = re.compile(r"[A-Za-z0-9_./:+,@=\[\]-]+\Z")
 
 
 def _require_safe_value(value: object, *, field: str) -> str:
@@ -65,6 +65,12 @@ def row_overrides(row: Mapping[str, Any]) -> list[str]:
             f"sampler.n_walkers={row['walkers']}",
             f"trainer.max_steps={row['updates']}",
         ])
+        if row.get("checkpoint_steps"):
+            steps = ",".join(str(step) for step in row["checkpoint_steps"])
+            overrides.extend([
+                "callbacks.4.schedule._target_=tpen.checkpoint.ExplicitUpdates",
+                f"callbacks.4.schedule.updates=[{steps}]",
+            ])
     return overrides
 
 

@@ -12,7 +12,10 @@ model:
       mixing: {_target_: tpen.nn.EquivariantMixing, max_order: 2, max_virtual_order: 2, channels: 4, implementation: vectorized, initial_weight: 0.5, activation: {_target_: torch.nn.SiLU}}
       path_aggregation: {_target_: tpen.nn.PathAggregation, max_order: 2, max_virtual_order: 2, channels: 4, activation: {_target_: torch.nn.SiLU}}
       update: {_target_: tpen.nn.ResidualUpdater}
-  factors: []
+  factors:
+    - _target_: tpen.nn.GaussianConfinement
+      coefficient: 0.25
+      trainable: false
   readout: {_target_: tpen.nn.readout.PfaffianReadout, channels: 4}
 hamiltonian_terms:
   kinetic: {_target_: tpen.physics.kinetic.KineticEnergy}
@@ -30,3 +33,11 @@ callbacks:
     output_path: ${run.dir}/metadata.json
   - _target_: tpen.callback.Status
     output_path: ${run.dir}/status.json
+  - _target_: tpen.callback.Checkpoint
+    terminal: false
+    schedule:
+      _target_: tpen.checkpoint.ExplicitUpdates
+      updates: [1000]
+    payload:
+      _target_: tpen.checkpoint.TrainResume
+    output_dir: ${run.dir}/checkpoints
