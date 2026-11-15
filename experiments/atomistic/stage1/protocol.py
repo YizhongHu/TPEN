@@ -457,12 +457,17 @@ def _load_configured_descriptor(config_path: str | Path) -> tuple[Any, Any]:
     cfg = load_config(str(config_path))
     system_name = str(cfg.system.id)
     descriptor_terms = OmegaConf.to_container(cfg.system_descriptor.terms, resolve=True)
-    if "runner" in cfg:
+    if "runner" in cfg and "hamiltonian_terms" in cfg.runner:
         consumed_terms = cfg.runner.hamiltonian_terms
         consumer = "runner.hamiltonian_terms"
-    else:
+    elif "evaluation_tasks" in cfg:
         consumed_terms = cfg.evaluation_tasks.mcmc_energy.generator.hamiltonian_terms
         consumer = "evaluation_tasks.mcmc_energy.generator.hamiltonian_terms"
+    else:
+        raise ProtocolError(
+            f"system {system_name!r} config {config_path}: "
+            "no consumed hamiltonian_terms binding"
+        )
     resolved_consumed_terms = OmegaConf.to_container(consumed_terms, resolve=True)
     if descriptor_terms != resolved_consumed_terms:
         raise ProtocolError(
