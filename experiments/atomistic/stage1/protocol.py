@@ -359,6 +359,7 @@ def physical_system_id_from_config(config_path: str | Path) -> str:
                         for a, e in zip(actual, expected))
                 for actual, expected in zip(actual_positions, expected_positions)
             )
+        )
         charge_match = (
             len(actual_charges) == len(expected_charges)
             and all(math.isclose(float(a), float(e), rel_tol=0.0, abs_tol=1.0e-6)
