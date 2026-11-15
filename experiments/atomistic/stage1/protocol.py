@@ -428,6 +428,22 @@ def physical_system_id_from_config(
     return system_id
 
 
+def planned_physical_system_ids(
+    config_root: str | Path | None = None,
+) -> dict[str, str]:
+    """Return train/eval-validated physical IDs for every planned system."""
+
+    root = Path(config_root) if config_root is not None else Path(__file__).parent / "configs"
+    return {
+        name: physical_system_id_from_config(
+            root / name / "eval.yaml",
+            train_config_path=root / name / "train.yaml",
+            system_name=name,
+        )
+        for name in SYSTEMS
+    }
+
+
 def _load_configured_descriptor(config_path: str | Path) -> tuple[Any, Any]:
     """Load a config and instantiate its config-owned system descriptor."""
 
@@ -446,7 +462,9 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
     """Expand systems into validated smoke, train, and eval rows.
 
     Parameters are explicit rather than defaulted so a missing identity or
-    checkpoint binding fails before a launch script can be rendered.
+    checkpoint binding fails before a launch script can be rendered. The
+    explicit physical-ID map is retained for unit fixtures; production
+    planning leaves it unset so train/eval parity is always checked here.
     """
 
     protocol.validate()
@@ -455,15 +473,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
     root = _safe_results_root(results_root)
     physical_ids = dict(expected_physical_system_id or {})
     if not physical_ids:
-        config_root = Path(__file__).parent / "configs"
-        physical_ids = {
-            name: physical_system_id_from_config(
-                config_root / name / "eval.yaml",
-                train_config_path=config_root / name / "train.yaml",
-                system_name=name,
-            )
-            for name in SYSTEMS
-        }
+        physical_ids = planned_physical_system_ids()
     for name in SYSTEMS:
         _require_sha(physical_ids.get(name), length=64,
                      field=f"expected_physical_system_id[{name!r}]")
