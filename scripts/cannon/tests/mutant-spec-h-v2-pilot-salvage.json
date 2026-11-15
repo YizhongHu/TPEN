@@ -40,11 +40,11 @@
     "needle_count": 1
   },
   {
-    "id": "ignore-salvage-path-guard",
+    "id": "ignore-salvage-relative-path-guard",
     "target": "experiments/atomistic/h-v2/attached.py",
-    "old": "        if current.is_symlink():\n            raise HV2ReceiptRefusal(code, f\"checkpoint member {current} is a symlink\")",
-    "new": "        if False and current.is_symlink():\n            raise HV2ReceiptRefusal(code, f\"checkpoint member {current} is a symlink\")  # mutant: ignore-salvage-path-guard",
-    "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_refuses_checkpoint_symlink_escape",
+    "old": "    if relative_path.is_absolute() or \"..\" in relative_path.parts:",
+    "new": "    if False and (relative_path.is_absolute() or \"..\" in relative_path.parts):  # mutant: ignore-salvage-relative-path-guard",
+    "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_refuses_absolute_or_parent_manifest_member",
     "needle_count": 1
   }
 ]
