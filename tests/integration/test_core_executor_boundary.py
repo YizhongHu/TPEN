@@ -705,11 +705,15 @@ def test_core_executor_two_leaf_round_trip_and_refusal_controls(
     assert successor.checkpoint["completed_updates"] >= predecessor.checkpoint["completed_updates"], "node=successor-counter-monotonicity"
     assert successor.checkpoint["next_iteration"] == 3
     assert successor.checkpoint["completed_updates"] == 3
-    successor_checkpoint_dir = Path(successor.checkpoint_ref["checkpoint_dir"])
+    assert successor.checkpoint_ref is None
+    successor_checkpoint_dir = Path(successor.checkpoint["checkpoint_dir"])
     successor_checkpoint_root = successor_checkpoint_dir.parent
     assert (successor_checkpoint_dir / COMPLETE_MARKER).is_file()
     successor_ref = CheckpointRef.from_directory(successor_checkpoint_dir)
-    assert successor_ref.content_id == successor.checkpoint_ref["content_id"]
+    assert successor_ref.next_iteration == 3
+    assert successor_ref.completed_updates == 3
+    if hasattr(successor_ref, "profile"):
+        assert successor_ref.profile == "train_resume"
     successor_publications = read_publications(
         publication_catalog_path(successor_checkpoint_root)
     )
