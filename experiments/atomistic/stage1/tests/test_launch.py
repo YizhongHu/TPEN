@@ -171,6 +171,28 @@ def test_gateway_rejects_omitted_or_altered_binding_before_run() -> None:
                                  expected_checkpoint_sha256=None)
 
 
+def test_train_gateway_rejects_missing_config_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    from experiments.atomistic.stage1 import train
+
+    row = {
+        **ROW,
+        "kind": "smoke",
+        "config": "configs/he/does-not-exist.yaml",
+    }
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train.py",
+            "--config", row["config"],
+            *row_overrides(row),
+            "--binding", _binding_token(row),
+            "--kind", "smoke",
+        ],
+    )
+    with pytest.raises(FileNotFoundError, match="config path does not exist"):
+        train.main()
+
+
 @pytest.mark.parametrize("checkpoint_override", [None, "/other/checkpoint.pt"])
 def test_gateway_rejects_missing_or_mismatched_checkpoint_file(
     checkpoint_override: str | None,
