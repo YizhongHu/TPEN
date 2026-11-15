@@ -88,6 +88,20 @@ SYSTEM_SPECS = tuple(SystemSpec(name, system_id) for name, system_id in (
     ("h2", "h2_molecule"),
 ))
 
+
+def resolve_config_path(config: str | Path) -> Path:
+    """Resolve a Stage-1 config independently of the submission directory.
+
+    Manifest rows use paths relative to the Stage-1 study directory, which is
+    the directory that owns ``configs/``. Absolute paths are accepted as-is
+    so callers can pass the same bound config after resolving it once.
+    """
+
+    path = Path(config)
+    if path.is_absolute():
+        return path
+    return Path(__file__).resolve().parent / path
+
 # Registry slots are execution labels; the operator identity is the physical
 # contract.  Keep this mapping explicit so a same-slot operator substitution
 # (for example HarmonicTrap under He's ``kinetic`` slot) cannot pass validation.
@@ -267,7 +281,10 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
     row = decode_binding(binding)
     if row.get("kind") != kind:
         raise ProtocolError("binding kind does not match gateway")
-    if config != row.get("config"):
+    row_config = row.get("config")
+    if not isinstance(config, str) or not isinstance(row_config, str):
+        raise ProtocolError("gateway config is invalid")
+    if resolve_config_path(config) != resolve_config_path(row_config):
         raise ProtocolError("gateway config does not match binding")
     _validate_run_identity(row)
     expected = {
