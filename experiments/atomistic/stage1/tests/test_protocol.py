@@ -8,6 +8,7 @@ import pytest
 
 from experiments.atomistic.stage1.protocol import (
     _encode_seed,
+    _TORCH_SEED_MODULUS,
     Protocol,
     ProtocolError,
     STAGE1_PROTOCOL,
@@ -85,12 +86,26 @@ def test_seed_encoding_covers_field_maxima_and_old_collision_boundaries() -> Non
     assert evaluation_seed(system="hooke1", lineage=0, checkpoint=500_000, stream=0) != smoke_seed(system="he")
 
 
+def test_seeds_fit_torch_at_coordinate_maxima_and_reject_overflow() -> None:
+    seeds = [
+        smoke_seed(system="h2"),
+        training_seed(system="h2", lineage=999_999, lineage_seed=999_999_999),
+        evaluation_seed(system="h2", lineage=999_999, checkpoint=999_999, stream=999_999),
+    ]
+    assert all(0 <= seed < _TORCH_SEED_MODULUS for seed in seeds)
+    with pytest.raises(ProtocolError, match="invalid training seed coordinates"):
+        training_seed(system="h2", lineage=1_000_000, lineage_seed=0)
+    with pytest.raises(ProtocolError, match="invalid evaluation seed coordinates"):
+        evaluation_seed(system="h2", lineage=0, checkpoint=1_000_000, stream=0)
+
+
 def test_manifest_binds_real_identity_and_checkpoint_expectations() -> None:
     rows = _manifest()
     assert len(rows) == 84
     assert len({row["row_id"] for row in rows}) == 84
     assert all("seed" in row for row in rows)
     assert len({row["seed"] for row in rows}) == 84
+    assert all(0 <= int(row["seed"]) < _TORCH_SEED_MODULUS for row in rows)
     eval_row = next(row for row in rows if row["kind"] == "eval")
     assert eval_row["source_sha"] == SHA1
     assert eval_row["config_sha256"] == SHA256

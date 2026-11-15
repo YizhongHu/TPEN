@@ -23,13 +23,12 @@ SYSTEMS = ("hooke1", "he", "h2")
 KINDS = ("smoke", "train", "eval")
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-# Seed coordinates are encoded as fixed-width mixed-radix fields.  The kind
-# and system fields lead every seed, so no coordinate in one namespace can
-# alias a coordinate in another namespace.
-_KIND_RADIX = len(KINDS)
-_SYSTEM_RADIX = len(SYSTEMS)
+# Coordinate bounds are retained in the manifest contract.  The resulting
+# seed must also fit Torch's signed 64-bit generator API, so the coordinates
+# are hashed into that range; build_manifest rejects any collision in a plan.
 _COORDINATE_RADIX = 10**6
 _LINEAGE_SEED_RADIX = 10**9
+_TORCH_SEED_MODULUS = 2**63 - 1
 
 
 class ProtocolError(ValueError):
@@ -174,7 +173,7 @@ def stable_row_id(*, system: str, kind: str, lineage: int = 0,
 
 
 def training_seed(*, system: str, lineage: int, lineage_seed: int) -> int:
-    """Derive a globally injective training seed from row coordinates."""
+    """Derive a bounded deterministic training seed from row coordinates."""
 
     if (system not in SYSTEMS or lineage < 0 or lineage >= 10**6
             or lineage_seed < 0 or lineage_seed >= 10**9):
@@ -192,7 +191,7 @@ def smoke_seed(*, system: str) -> int:
 
 
 def evaluation_seed(*, system: str, lineage: int, checkpoint: int, stream: int) -> int:
-    """Derive an injective evaluation seed for arbitrary checkpoint lists."""
+    """Derive a bounded deterministic evaluation seed for any checkpoint list."""
 
     if (system not in SYSTEMS or min(lineage, checkpoint, stream) < 0
             or lineage >= 10**6 or checkpoint >= 10**6 or stream >= 10**6):
@@ -207,7 +206,13 @@ def evaluation_seed(*, system: str, lineage: int, checkpoint: int, stream: int) 
 def _encode_seed(*, kind: str, system: str, lineage: int = 0,
                  checkpoint: int = 0, stream: int = 0,
                  lineage_seed: int = 0) -> int:
-    """Encode the bounded seed coordinates with documented fixed radices."""
+    """Encode bounded coordinates as a deterministic Torch-compatible seed.
+
+    The coordinate domain is larger than Torch's signed 64-bit seed space, so
+    injectivity cannot be guaranteed by a mixed-radix integer.  The manifest
+    builder therefore checks the finite plan for collisions after this stable
+    digest-based encoding.
+    """
 
     if kind not in KINDS or system not in SYSTEMS:
         raise ProtocolError("invalid seed namespace")
@@ -216,11 +221,10 @@ def _encode_seed(*, kind: str, system: str, lineage: int = 0,
               _COORDINATE_RADIX, _LINEAGE_SEED_RADIX)
     if any(value < 0 or value >= limit for value, limit in zip(fields, limits)):
         raise ProtocolError("seed coordinate exceeds its fixed field width")
-    namespace = KINDS.index(kind) * _SYSTEM_RADIX + SYSTEMS.index(system)
-    encoded = namespace
-    for value, radix in zip(fields, limits):
-        encoded = encoded * radix + value
-    return encoded
+    payload = json.dumps(
+        ["stage1/seed-v2", kind, system, *fields], separators=(",", ":")
+    ).encode()
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % _TORCH_SEED_MODULUS
 
 
 def identity_expectations(row: Mapping[str, Any]) -> dict[str, Any]:
