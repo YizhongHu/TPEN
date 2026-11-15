@@ -11,7 +11,13 @@ from omegaconf import OmegaConf
 
 from experiments.atomistic.stage1.collect import collect
 from experiments.atomistic.stage1.launch import _binding_token, row_overrides
-from experiments.atomistic.stage1.protocol import Protocol, build_manifest, manifest_hash, validate_gateway_binding
+from experiments.atomistic.stage1.protocol import (
+    SYSTEMS,
+    Protocol,
+    build_manifest,
+    manifest_hash,
+    validate_gateway_binding,
+)
 from experiments.toolkit.trajectory_records import inspect_eval_run, inspect_trajectory_record
 from tpen.artifacts import ArtifactManager, RunResult
 from tpen.checkpoint.artifact import resolve_checkpoint_dir
@@ -48,7 +54,7 @@ def test_planned_launch_paths_bind_and_collect_contract_fixture(
     checkpoint_sha = hashlib.sha256(model_payload).hexdigest()
     protocol = Protocol(1, 2, 1, 2, 3, 4, 2, 2)
     bindings = {(system_name, lineage, 7): checkpoint_sha
-                for system_name in ("hooke1", "he", "h2") for lineage in range(3)}
+                for system_name in SYSTEMS for lineage in range(3)}
     planned = build_manifest(
         protocol=protocol, source_sha=source_sha, config_sha256="b" * 64,
         checkpoints=[7], lineage_seeds=[11, 12, 13], checkpoint_sha256=bindings,
