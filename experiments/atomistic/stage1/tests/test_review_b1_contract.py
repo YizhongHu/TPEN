@@ -73,6 +73,7 @@ def test_physical_id_rejects_descriptor_operator_set_mismatch(tmp_path: Path) ->
     def remove_nuclear_repulsion(cfg) -> None:
         terms = OmegaConf.to_container(cfg.hamiltonian_terms, resolve=True)
         del terms["nucleus_nucleus"]
+        cfg.hamiltonian_terms = terms
         cfg.system_descriptor.terms = terms
 
     mutated = _copy_config(source, tmp_path / "h2-missing-term.yaml", remove_nuclear_repulsion)
@@ -89,6 +90,7 @@ def test_physical_id_rejects_extra_descriptor_operator(tmp_path: Path) -> None:
             "_target_": "tpen.physics.potential.HarmonicTrap",
             "omega": 0.5,
         }
+        cfg.hamiltonian_terms = terms
         cfg.system_descriptor.terms = terms
 
     mutated = _copy_config(source, tmp_path / "he-extra-term.yaml", add_extra_term)
