@@ -23,6 +23,8 @@ RUN_MANIFEST_V2 = "tpen-executor/run-manifest-v2"
 RUN_MANIFEST_V3 = "tpen-executor/run-manifest-v3"
 MANIFEST_ATTEMPT_V1 = "tpen-executor/manifest-attempt-v1"
 MANIFEST_ATTEMPT_V2 = "tpen-executor/manifest-attempt-v2"
+START_RECEIPT_V1 = "tpen-executor/start-receipt-v1"
+START_RECEIPT_V2 = "tpen-executor/start-receipt-v2"
 ACCEPTED_SEGMENT_SCHEMA = "tpen-executor/accepted-segment-v1"
 SCIENCE_PLACEMENT_RECEIPT_SCHEMA = "tpen-executor/science-placement-receipt-v1"
 SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2 = "tpen-executor/science-placement-receipt-v2"
@@ -1255,8 +1257,16 @@ def _attempt(value: Any, group_digest: str) -> dict[str, Any]:
         raise ManifestRefusal("unknown-schema", "manifest attempt schema is unsupported")
     for key in ("task_id", "attempt_id", "output_dir"):
         _text(record[key], f"attempt.{key}")
-    start = dict(_fields(record["start_receipt"], {"schema", "task_id", "attempt_id", "allocation_id", "backend_job_id", "group_digest", "started_at_utc", "output_dir"}, "start receipt"))
-    if start["schema"] != "tpen-executor/start-receipt-v1":
+    start_value = record["start_receipt"]
+    start_schema = start_value.get("schema") if isinstance(start_value, Mapping) else None
+    start_fields = {"schema", "task_id", "attempt_id", "allocation_id", "backend_job_id", "group_digest", "started_at_utc", "output_dir"}
+    if start_schema == START_RECEIPT_V1:
+        start = dict(_fields(start_value, start_fields, "start receipt"))
+    elif start_schema == START_RECEIPT_V2:
+        start = dict(_fields(start_value, start_fields | {"transport_kind"}, "start receipt"))
+        if start["transport_kind"] not in {"local", "remote"}:
+            raise ManifestRefusal("malformed-record", "start.transport_kind is unsupported")
+    else:
         raise ManifestRefusal("unknown-schema", "start receipt schema is unsupported")
     for key in ("task_id", "attempt_id", "allocation_id", "backend_job_id", "started_at_utc", "output_dir"):
         _text(start[key], f"start.{key}")
@@ -1610,6 +1620,8 @@ __all__ = [
     "RUN_MANIFEST_V1",
     "RUN_MANIFEST_V2",
     "RUN_MANIFEST_V3",
+    "START_RECEIPT_V1",
+    "START_RECEIPT_V2",
     "SCIENCE_PLACEMENT_RECEIPT_SCHEMA",
     "SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2",
     "SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V3",
