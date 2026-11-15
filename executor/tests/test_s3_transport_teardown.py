@@ -417,6 +417,7 @@ def test_fresh_controller_refuses_quarantined_remote_attempt(
     marker_ready = threading.Event()
     release_leaf = threading.Event()
     leaf_done = threading.Event()
+    release_timed_out = threading.Event()
 
     def uncertain_sampled_leaf(_index, function, args, kwargs):
         request = LeafRequest.decode(args[0])
@@ -428,9 +429,11 @@ def test_fresh_controller_refuses_quarantined_remote_attempt(
         Path(quarantine_dir, "uncertain-sampler.json").write_text(
             json.dumps({"schema": QUARANTINE_SCHEMA}), encoding="utf-8",
         )
-        marker_ready.set()
-        release_leaf.wait(5)
         try:
+            marker_ready.set()
+            if not release_leaf.wait(5):
+                release_timed_out.set()
+                raise TimeoutError("controller did not release the fake leaf")
             return function(*args, **kwargs)
         finally:
             leaf_done.set()
@@ -453,6 +456,7 @@ def test_fresh_controller_refuses_quarantined_remote_attempt(
     finally:
         release_leaf.set()
         assert leaf_done.wait(5)
+    assert not release_timed_out.is_set()
 
     initial = lifecycle.store.manifest(group).attempts[0]
     assert initial.outcome_receipt.status == "remote-quiescence-unconfirmed"  # type: ignore[union-attr]

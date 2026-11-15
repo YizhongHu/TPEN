@@ -308,13 +308,14 @@ def test_p8_reader_accepts_start_receipt_v2_transport_kinds(tmp_path: Path, tran
     [
         ("unknown-schema", "schema is unsupported"),
         ("extra-key", "keys differ"),
+        ("bad-transport", "transport_kind"),
         ("bad-transport-list", "transport_kind"),
         ("bad-transport-dict", "transport_kind"),
         ("bad-transport-null", "transport_kind"),
         ("bad-transport-int", "transport_kind"),
         ("missing-transport", "keys differ"),
     ],
-    ids=["unknown-schema", "extra-key", "bad-transport-list", "bad-transport-dict", "bad-transport-null", "bad-transport-int", "missing-transport"],
+    ids=["unknown-schema", "extra-key", "bad-transport", "bad-transport-list", "bad-transport-dict", "bad-transport-null", "bad-transport-int", "missing-transport"],
 )
 def test_p8_reader_rejects_closed_start_receipt_mutations(
     tmp_path: Path, mutation: str, expected_reason: str
@@ -331,6 +332,7 @@ def test_p8_reader_rejects_closed_start_receipt_mutations(
         start.pop("transport_kind", None)
     else:
         bad_values = {
+            "bad-transport": "unknown",
             "bad-transport-list": [],
             "bad-transport-dict": {},
             "bad-transport-null": None,
