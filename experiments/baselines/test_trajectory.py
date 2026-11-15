@@ -85,6 +85,26 @@ def test_deepqmc_rejects_molecule_state_axes_and_shape_mismatch(
         read_trajectory("deepqmc", tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("mean_shape", "std_shape"), [((2, 1, 1), (3, 1, 1)), ((3,), (2,))]
+)
+def test_deepqmc_rejects_valid_but_mismatched_mean_std_lengths(
+    tmp_path: Path, mean_shape: tuple[int, ...], std_shape: tuple[int, ...]
+):
+    h5py = pytest.importorskip("h5py", reason="h5py is not a TPEN dependency")
+    training = tmp_path / "training"
+    training.mkdir()
+    with h5py.File(training / "result.h5", "w") as handle:
+        handle.create_dataset(
+            "local_energy/mean", data=[-1.0] * mean_shape[0], shape=mean_shape
+        )
+        handle.create_dataset(
+            "local_energy/std", data=[1.0] * std_shape[0], shape=std_shape
+        )
+    with pytest.raises(AdapterError, match="mismatched"):
+        read_trajectory("deepqmc", tmp_path)
+
+
 def test_deepqmc_singleton_axes_and_persisted_steps_are_metadata(tmp_path: Path):
     h5py = pytest.importorskip("h5py", reason="h5py is not a TPEN dependency")
     training = tmp_path / "training"
