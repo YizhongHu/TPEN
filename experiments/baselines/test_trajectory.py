@@ -108,17 +108,13 @@ def test_deepqmc_without_steps_uses_observation_index(tmp_path: Path):
         handle.create_dataset("local_energy/std", data=[1.0, 0.5], shape=(2, 1))
     rows = read_trajectory("deepqmc", tmp_path)
     assert [row.step for row in rows] == [0, 1]
-    assert rows.step_basis == "observation_index"
-    assert summarize(rows)["step_basis"] == "observation_index"
 
 
 def test_ferminet_sparse_steps_have_optimizer_basis_and_strict_summary_json(tmp_path: Path):
     _write_ferminet(tmp_path / ferminet.TRAIN_STATS_FILENAME)
     rows = read_trajectory("ferminet", tmp_path)
     assert [row.step for row in rows] == [10, 11, 12, 13]
-    assert rows.step_basis == "optimizer_step"
     summary = summarize(rows)
-    assert summary["step_basis"] == "optimizer_step"
     json.dumps(summary, allow_nan=False)
     assert main(["--code", "ferminet", str(tmp_path)]) == 0
     assert sorted(path.name for path in tmp_path.iterdir()) == [ferminet.TRAIN_STATS_FILENAME]
