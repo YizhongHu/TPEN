@@ -111,6 +111,46 @@ def test_physical_id_accepts_registry_operator_set() -> None:
 
 
 @pytest.mark.parametrize("system", SYSTEMS)
+def test_plan_requires_train_eval_hamiltonian_parity(system: str) -> None:
+    eval_config = _config(system)
+    expected = physical_system_id_from_config(
+        eval_config,
+        train_config_path=_config(system, "train"),
+        system_name=system,
+    )
+    assert expected == physical_system_id_from_config(eval_config)
+
+
+@pytest.mark.parametrize(
+    ("system", "mutation"),
+    (("hooke1", "omega"), ("he", "charge"), ("hooke2", "electron_electron")),
+)
+def test_plan_rejects_train_eval_hamiltonian_drift(
+    system: str, mutation: str, tmp_path: Path
+) -> None:
+    def change(cfg) -> None:
+        if mutation == "omega":
+            cfg.hamiltonian_terms.harmonic_trap.omega = 0.6
+        elif mutation == "charge":
+            cfg.system.nuclei.charges = [3.0]
+        else:
+            terms = OmegaConf.to_container(cfg.hamiltonian_terms, resolve=True)
+            terms["electron_electron"] = {
+                "_target_": "tpen.physics.potential.HarmonicTrap",
+                "omega": 0.5,
+            }
+            cfg.hamiltonian_terms = terms
+
+    train_config = _copy_config(
+        _config(system, "train"), tmp_path / f"{system}-{mutation}-train.yaml", change
+    )
+    with pytest.raises(ProtocolError, match=rf"train/eval Hamiltonian mismatch for {system}"):
+        physical_system_id_from_config(
+            _config(system), train_config_path=train_config, system_name=system
+        )
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
 def test_physical_id_ignores_run_and_evaluation_budget_changes(
     system: str, tmp_path: Path
 ) -> None:
