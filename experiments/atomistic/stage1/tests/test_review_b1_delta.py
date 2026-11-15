@@ -142,3 +142,24 @@ def test_registry_geometry_control_accepts_baseline_and_rejects_mismatch(
     OmegaConf.save(cfg, mutated)
     with pytest.raises(ProtocolError, match="geometry"):
         physical_system_id_from_config(mutated)
+
+
+def test_registry_charge_control_remains_exact_within_position_tolerance(
+    tmp_path: Path,
+) -> None:
+    """Nuclear charges are exact integers even when the position tolerance is loose."""
+
+    source = CONFIG_ROOT / "he" / "eval.yaml"
+    cfg = OmegaConf.load(source)
+    cfg.hamiltonian_terms.electron_nucleus.atoms = {
+        "_target_": "tpen.data.atomic_configuration.AtomicConfiguration",
+        "positions": {
+            "_target_": "torch.tensor",
+            "data": [[0.0, 0.0, 0.0]],
+        },
+        "charges": {"_target_": "torch.tensor", "data": [2.0000005]},
+    }
+    mutated = tmp_path / "he-nearby-nuclear-charge.yaml"
+    OmegaConf.save(cfg, mutated)
+    with pytest.raises(ProtocolError, match="geometry"):
+        physical_system_id_from_config(mutated)
