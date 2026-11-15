@@ -90,8 +90,8 @@ def test_real_train_row_overrides_load_and_bind_checkpoint_schedule(
             kind="train",
         )
     bad_overrides = [
-        "callbacks.4.schedule.updates=[7,100]" if item.startswith(
-            "callbacks.4.schedule.updates="
+        "checkpoint_steps=[7,100]" if item.startswith(
+            "checkpoint_steps="
         ) else item
         for item in overrides
     ]

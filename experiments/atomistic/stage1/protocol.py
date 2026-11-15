@@ -17,6 +17,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from experiments.baselines.systems import load_registry
+from tpen.physics.operators import (
+    ELECTRON_ELECTRON_COULOMB,
+    ELECTRON_NUCLEUS_COULOMB,
+    HARMONIC_TRAP,
+    KINETIC_ENERGY,
+    NUCLEUS_NUCLEUS_COULOMB,
+)
 
 from experiments.toolkit.run_paths import resolve_run_dir
 
@@ -86,6 +93,17 @@ SYSTEM_SPECS = tuple(SystemSpec(name, system_id) for name, system_id in (
     ("he", "he_atom"),
     ("h2", "h2_molecule"),
 ))
+
+# Registry slots are execution labels; the operator identity is the physical
+# contract.  Keep this mapping explicit so a same-slot operator substitution
+# (for example HarmonicTrap under He's ``kinetic`` slot) cannot pass validation.
+_REGISTRY_OPERATOR_IDS = {
+    "kinetic": KINETIC_ENERGY,
+    "harmonic_trap": HARMONIC_TRAP,
+    "electron_nucleus": ELECTRON_NUCLEUS_COULOMB,
+    "electron_electron": ELECTRON_ELECTRON_COULOMB,
+    "nucleus_nucleus": NUCLEUS_NUCLEUS_COULOMB,
+}
 
 
 def _require_sha(value: object, *, length: int, field: str) -> str:
@@ -281,10 +299,7 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
                          f"trainer.max_steps={row['updates']}"})
         if row.get("checkpoint_steps"):
             steps = ",".join(str(step) for step in row["checkpoint_steps"])
-            expected.update({
-                "callbacks.4.schedule._target_=tpen.checkpoint.ExplicitUpdates",
-                f"callbacks.4.schedule.updates=[{steps}]",
-            })
+            expected.add(f"checkpoint_steps=[{steps}]")
     override_map: dict[str, str] = {}
     for override in overrides:
         key, separator, value = override.partition("=")
@@ -338,6 +353,14 @@ def physical_system_id_from_config(config_path: str | Path) -> str:
     for registry_term in registry_terms:
         slot = registry_term.get("term")
         descriptor_term = descriptor_by_slot[slot]
+        expected_operator = _REGISTRY_OPERATOR_IDS.get(slot)
+        if expected_operator is None:
+            raise ProtocolError(f"registry has no operator identity for slot {slot!r}")
+        if descriptor_term.operator_id != expected_operator:
+            raise ProtocolError(
+                f"descriptor operator for slot {slot!r} disagrees with registry "
+                f"for {cfg.system.id}"
+            )
         if slot == "harmonic_trap" and descriptor_term.parameters.get("omega") != float(registry_term["omega"]):
             raise ProtocolError(f"descriptor trap omega disagrees with registry for {cfg.system.id}")
     expected_nuclei = [term for term in registry_terms if term.get("term") == "electron_nucleus"]
@@ -350,7 +373,17 @@ def physical_system_id_from_config(config_path: str | Path) -> str:
         actual_positions = resource.positions.detach().cpu().tolist()
         actual_charges = resource.charges.detach().cpu().tolist()
         expected_positions = [list(n.get("position_bohr", [])) for n in nuclei]
-        expected_charges = [float(n["charge"]) for n in nuclei]
+        expected_charges = []
+        for nucleus in nuclei:
+            charge = nucleus.get("charge")
+            if isinstance(charge, bool) or not isinstance(charge, int):
+                raise ProtocolError(
+                    f"registry nuclear charges must be integers for {cfg.system.id}"
+                )
+            expected_charges.append(charge)
+        # Registry positions are in bohr.  They are compared with an absolute
+        # tolerance because the instantiated default-float32 path can round a
+        # decimal coordinate by a few ulps; charges remain exact integers.
         position_match = (
             len(actual_positions) == len(expected_positions)
             and all(
@@ -362,7 +395,7 @@ def physical_system_id_from_config(config_path: str | Path) -> str:
         )
         charge_match = (
             len(actual_charges) == len(expected_charges)
-            and all(math.isclose(float(a), float(e), rel_tol=0.0, abs_tol=1.0e-6)
+            and all(float(a) == e
                     for a, e in zip(actual_charges, expected_charges))
         )
         if not position_match or not charge_match:
