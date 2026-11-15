@@ -298,6 +298,22 @@ def test_gateway_rejects_non_component_run_identity(field: str, value: str) -> N
         )
 
 
+def test_gateway_rejects_effective_run_dir_outside_results_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    approved_root = tmp_path / "approved"
+    row = {**ROW, "results_root": str(approved_root)}
+    monkeypatch.setattr(
+        "experiments.atomistic.stage1.protocol.resolve_run_dir",
+        lambda _row: tmp_path / "outside" / "stage1" / "he" / "run-0",
+    )
+    with pytest.raises(ProtocolError, match="beneath results_root"):
+        validate_gateway_binding(
+            binding=_binding_token(row), config=row["config"],
+            overrides=row_overrides(row), kind="train",
+        )
+
+
 def test_row_overrides_bind_nested_layout_even_when_config_inherits_flat() -> None:
     row = {**ROW, "config": "configs/he/inherited-flat.yaml"}
     overrides = row_overrides(row)
