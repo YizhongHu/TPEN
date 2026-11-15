@@ -17,7 +17,7 @@ evaluation_tasks:
     namespace: eval/mcmc_energy
     output_dir: "${run.dir}/mcmc_energy"
     generator: {_target_: tpen.evaluation.generators.TrajectoryMCMCGenerator, sampler: "${evaluation_sampler}", hamiltonian_terms: "${hamiltonian_terms}", n_draws: 256, discard_draws: 0, seed: "${runtime.seed}", reset: true, verify_model_unchanged: true, system: "${system_descriptor}", evaluator: {_target_: tpen.physics.hamiltonian.NaiveLocalEnergyEvaluator}}
-    calculators: [{_target_: tpen.evaluation.calculators.LocalEnergyCalculator, hamiltonian_terms: "${hamiltonian_terms}", return_terms: true}]
+    calculators: [{_target_: tpen.evaluation.calculators.LocalEnergyCalculator, hamiltonian_terms: "${hamiltonian_terms}", return_terms: true}, {_target_: tpen.evaluation.calculators.WavefunctionCalculator}]
     summaries: [{_target_: tpen.evaluation.summaries.SampledRecordWriter, max_samples: 1048576, include_term_energies: true}]
 runner: {_target_: tpen.runner.Evaluate, model: "${model}", load: "${load}", evaluator: "${evaluator}"}
 callbacks:
