@@ -98,6 +98,26 @@ def inspect_run(run_dir: str | Path) -> dict[str, Any]:
         raise TrajectoryReaderError(str(exc)) from exc
 
 
+def inspect_eval_run(run_dir: str | Path) -> dict[str, Any]:
+    """Inspect a checkpoint-free evaluation run and serialize its evidence."""
+
+    from tpen.inspection import inspect_eval_run as inspect  # lazy boundary
+
+    try:
+        value = inspect(run_dir)
+        evidence = value.to_dict()
+        start = Path(run_dir) / "run_start.json"
+        if start.is_file():
+            data = json.loads(start.read_text(encoding="utf-8"))
+            git = data.get("git", {}) if isinstance(data, dict) else {}
+            evidence["source_git_sha"] = git.get("sha") if isinstance(git, dict) else None
+        else:
+            evidence["source_git_sha"] = None
+        return evidence
+    except Exception as exc:
+        raise TrajectoryReaderError(str(exc)) from exc
+
+
 def read_energy_grid(record: InspectedTrajectory) -> list[list[float]]:
     """Read local-energy values only after successful record inspection."""
 
@@ -127,5 +147,5 @@ def read_energy_grid(record: InspectedTrajectory) -> list[list[float]]:
     return [[grid[d][w] for w in sorted(grid[d])] for d in sorted(grid)]
 
 
-__all__ = ["InspectedTrajectory", "TrajectoryReaderError", "inspect_run",
+__all__ = ["InspectedTrajectory", "TrajectoryReaderError", "inspect_eval_run", "inspect_run",
            "inspect_trajectory_record", "read_energy_grid"]

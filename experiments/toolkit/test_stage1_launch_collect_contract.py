@@ -12,7 +12,7 @@ from omegaconf import OmegaConf
 from experiments.atomistic.stage1.collect import collect
 from experiments.atomistic.stage1.launch import _binding_token, row_overrides
 from experiments.atomistic.stage1.protocol import Protocol, build_manifest, manifest_hash, validate_gateway_binding
-from experiments.toolkit.trajectory_records import inspect_run, inspect_trajectory_record
+from experiments.toolkit.trajectory_records import inspect_eval_run, inspect_trajectory_record
 from tpen.artifacts import ArtifactManager, RunResult
 from tpen.checkpoint.artifact import resolve_checkpoint_dir
 from tpen.evaluation.trajectory_records import TrajectoryRecordBatch, TrajectoryRecordStreamWriter
@@ -130,11 +130,13 @@ def test_planned_launch_paths_bind_and_collect_contract_fixture(
         (run_dir / "status.json").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
         # A checkpoint-less eval run is only completed when its typed outcome
         # artifact is present; without it, inspection must refuse the run.
-        assert inspect_run(run_dir)["verdict"] != "completed"
+        refused = inspect_eval_run(run_dir)
+        assert refused["verdict"] == "refused"
+        assert refused["refusal"]["code"] == "missing-run-outcome"
         (run_dir / "run-outcome.json").write_text(
             json.dumps(RunResult(status="completed").to_dict()), encoding="utf-8"
         )
-        assert inspect_run(run_dir)["verdict"] == "completed"
+        assert inspect_eval_run(run_dir)["verdict"] == "completed"
 
     result = collect(document)
     assert len(result["records"]) == 4

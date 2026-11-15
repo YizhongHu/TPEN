@@ -6,17 +6,24 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
+class RunPathError(ValueError):
+    """A manifest row lacks the fields required to resolve its run path."""
+
+
 def resolve_run_dir(row: Mapping[str, Any]) -> Path:
     """Resolve a manifest row using TPEN's real artifact layout."""
 
     from tpen.artifacts import ArtifactManager
 
     admitted = row.get("run_dir")
-    return ArtifactManager(
-        row["results_root"], row["experiment_name"], row["sector"], row["run_id"],
-        layout=row.get("run_layout", "nested"),
-        logical_run_dir=None if admitted is None else Path(str(admitted)),
-    ).run_dir
+    try:
+        return ArtifactManager(
+            row["results_root"], row["experiment_name"], row["sector"], row["run_id"],
+            layout=row.get("run_layout", "nested"),
+            logical_run_dir=None if admitted is None else Path(str(admitted)),
+        ).run_dir
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RunPathError("manifest row lacks fields required to resolve run directory") from exc
 
 
 def resolve_checkpoint_dir(path: str | Path) -> Path:
@@ -27,4 +34,4 @@ def resolve_checkpoint_dir(path: str | Path) -> Path:
     return resolve(path)
 
 
-__all__ = ["resolve_checkpoint_dir", "resolve_run_dir"]
+__all__ = ["RunPathError", "resolve_checkpoint_dir", "resolve_run_dir"]
