@@ -40,6 +40,21 @@ def _copy_train_with_original_descriptor(
     return destination
 
 
+def _copy_eval_with_original_descriptor(
+    root: Path, system: str, mutate,
+) -> Path:
+    """Copy an eval config while freezing its descriptor to its original terms."""
+
+    source = _config(root, system, "eval")
+    cfg = OmegaConf.load(source)
+    original_terms = OmegaConf.to_container(cfg.system_descriptor.terms, resolve=True)
+    cfg.system_descriptor.terms = original_terms
+    mutate(cfg)
+    destination = root / system / "mutated-eval.yaml"
+    OmegaConf.save(cfg, destination)
+    return destination
+
+
 def test_all_planned_system_ids_accept_unchanged_train_eval_configs(
     tmp_path: Path,
 ) -> None:
@@ -52,6 +67,47 @@ def test_all_planned_system_ids_accept_unchanged_train_eval_configs(
 
     assert set(planned) == set(SYSTEMS)
     assert all(len(system_id) == 64 for system_id in planned.values())
+
+
+def test_unchanged_eval_terms_match_frozen_descriptor(tmp_path: Path) -> None:
+    """An eval config remains valid when its descriptor terms are materialized."""
+
+    config_root = tmp_path / "configs"
+    shutil.copytree(CONFIG_ROOT, config_root)
+    eval_config = _copy_eval_with_original_descriptor(
+        config_root, "hooke2", lambda cfg: None
+    )
+
+    assert physical_system_id_from_config(eval_config)
+
+
+@pytest.mark.parametrize("mutation", ["omega", "remove_ee"])
+def test_eval_consumed_hamiltonian_drift_is_not_hidden_by_frozen_descriptor(
+    mutation: str, tmp_path: Path,
+) -> None:
+    """Changing the eval generator Hamiltonian must invalidate the plan."""
+
+    config_root = tmp_path / "configs"
+    shutil.copytree(CONFIG_ROOT, config_root)
+
+    def change(cfg) -> None:
+        if mutation == "omega":
+            cfg.hamiltonian_terms.harmonic_trap.omega = 0.6
+            return
+        terms = OmegaConf.to_container(cfg.hamiltonian_terms, resolve=True)
+        del terms["electron_electron"]
+        cfg.hamiltonian_terms = terms
+
+    eval_config = _copy_eval_with_original_descriptor(config_root, "hooke2", change)
+    frozen = OmegaConf.load(eval_config).system_descriptor.terms
+    assert "electron_electron" in frozen
+
+    with pytest.raises(ProtocolError) as exc_info:
+        physical_system_id_from_config(eval_config)
+
+    message = str(exc_info.value)
+    assert "system 'hooke_pair_singlet_omega0.5'" in message
+    assert str(eval_config) in message
 
 
 @pytest.mark.parametrize("mutation", ["omega", "remove_ee"])
