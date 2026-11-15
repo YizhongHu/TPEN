@@ -60,6 +60,7 @@ def test_physical_id_rejects_registry_physics_mismatch(
         else:
             # Keep cfg.system.spin unchanged; override the descriptor particle.
             cfg.system_descriptor.particle.n_spin_up = 2
+            cfg.system_descriptor.particle.n_spin_down = 0
 
     mutated = _copy_config(source, tmp_path / f"{system}-{mutation}.yaml", change)
     with pytest.raises(ProtocolError):
@@ -91,10 +92,12 @@ def test_physical_id_ignores_run_and_evaluation_budget_changes(
             cfg.hamiltonian_terms.harmonic_trap.omega = 0.6
         else:
             cfg.system_descriptor.particle.n_spin_up = 2
+            cfg.system_descriptor.particle.n_spin_down = 0
 
     physics_changed = _copy_config(source, tmp_path / f"{system}-physics.yaml", change_physics)
-    # Controlled negative: this proves the stability assertion is not vacuous.
-    assert physical_system_id_from_config(physics_changed) != expected
+    # Controlled negative: instantiate the descriptor directly because the
+    # fixed planner is expected to reject this registry-mismatched config.
+    assert instantiate(load_config(str(physics_changed)).system_descriptor).system_id() != expected
 
 
 def _model_config(cfg):
@@ -102,8 +105,8 @@ def _model_config(cfg):
 
 
 @pytest.mark.parametrize("system", SYSTEMS)
-def test_train_eval_models_are_strict_restore_compatible_without_forward(system: str) -> None:
-    """Train/eval model graphs must match before a checkpoint is restored."""
+def test_train_eval_models_are_structurally_compatible_without_forward(system: str) -> None:
+    """Check structural compatibility only; this is not restore verification."""
 
     train_cfg = load_config(str(_config(system, "train")))
     eval_cfg = load_config(str(_config(system)))
