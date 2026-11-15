@@ -197,6 +197,20 @@ def test_missing_positive_remote_receipt_refuses_without_request_or_ledger(tmp_p
     assert not (Path(fence.output_dir).parent / "successor-admissions").exists()
 
 
+def test_symlinked_remote_receipt_refuses_without_request_or_ledger(tmp_path: Path) -> None:
+    store, _group, fence = _planned_attempt(tmp_path)
+    receipt_path = Path(fence.output_dir, "remote-teardown.json")
+    valid_copy = tmp_path / "valid-remote-teardown.json"
+    receipt_path.rename(valid_copy)
+    receipt_path.symlink_to(valid_copy)
+
+    # CX6M2 drops _require_regular; read_bytes would then follow this symlink
+    # and incorrectly admit the successor despite the non-regular receipt path.
+    with pytest.raises(FenceRejected, match="teardown-unconfirmed"):
+        store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+    assert not (Path(fence.output_dir).parent / "successor-admissions").exists()
+
+
 def test_unconfirmed_remote_outcome_refuses_and_writes_no_ledger(tmp_path: Path) -> None:
     store, group, allocation = setup_store(tmp_path)
     fence = store.begin_attempt(group, "a", allocation, "2026-11-14T00:00:00Z")
