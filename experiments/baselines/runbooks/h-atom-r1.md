@@ -1,7 +1,7 @@
 ---
 item_id: "dc036f76-7ddb-4e2f-baf8-b33a1161b539"
-runbook_revision: 3
-runbook_commit: "external: runbook-index-r3 and submission receipt"
+runbook_revision: 4
+runbook_commit: "external: runbook-index-r4 and submission receipt"
 science: "PENDING_OPERATOR"
 ---
 
@@ -16,7 +16,7 @@ retry, resubmission, cancellation, or scientific interpretation.
 The operator selects science true/false: non-science uses frozen dev and
 temporary data; science uses main, human submission approval, a science report,
 and Holystore backup. The containing TPEN commit/blob/config/helper/PBS blobs
-are bound externally in runbook-index-r3 and the submission receipt.
+are bound externally in runbook-index-r4 and the submission receipt.
 
 Five seed-0 rows run: DeepQMC default, ferminet, psiformer; FermiNet-codebase
 ferminet, psiformer; batch 4096; 1000 real-ramp steps; zero pretraining.
@@ -50,7 +50,7 @@ re-plan from seconds/step before any full run, inference, or trajectory export.
 3. Prepare clean exact TPEN checkout and immutable data-only ramp-inputs.env:
    RUNBOOK_COMMIT, SCIENCE, SOURCE_CHECKOUT, fresh RUN_ROOT, pre-freeze
    receipt/SHA, and RUNBOOK_BLOB, PBS_BLOB, INPUT_SPEC_BLOB, DQ_CONFIG_BLOB,
-   FN_CONFIG_BLOB, RECEIPT_HELPER_BLOB.
+   FN_CONFIG_BLOB, RECEIPT_HELPER_BLOB, VERIFY_SUBMIT_BLOB.
 
 Any failure stops before runner execution.
 
@@ -80,6 +80,7 @@ INPUT_SPEC_BLOB experiments/baselines/runbooks/configs/h-atom-r1.yaml
 DQ_CONFIG_BLOB experiments/baselines/runbooks/configs/deepqmc_h_atom.yaml
 FN_CONFIG_BLOB experiments/baselines/runbooks/configs/ferminet_h_atom.py
 RECEIPT_HELPER_BLOB experiments/baselines/runbooks/ramp_receipt.py
+VERIFY_SUBMIT_BLOB experiments/baselines/runbooks/h-atom-r1-verify-submit.sh
 BLOBS
 mkdir "$RUN_ROOT"; mkdir "$RUN_ROOT/logs" "$RUN_ROOT/ramp"
 cp "$INPUTS_FILE" "$RUN_ROOT/ramp-inputs.env"
@@ -127,27 +128,38 @@ artifacts, and ramp.complete only after mechanical success.
 
 ## Verification mode and required controls
 
-Verification uses a separate verifier-prepared fresh input/root. PBS accepts
-only BL_R1_MODE=verify, decimal BL_R1_VERIFY_STEPS from 1 to 100, and optional
-exact BL_R1_VERIFY_INJECT_FAIL. It changes only producer step count and a
-post-producer injected row failure. Normal submission asserts all three unset
-and PBS records mode real, so verification cannot remain accidentally enabled.
+Verification uses the complete committed script
+experiments/baselines/runbooks/h-atom-r1-verify-submit.sh. It takes exactly an
+inputs file and one control name; no setup/qsub fragment may be spliced by
+hand. It repeats the normal setup/blob/fresh-root/inventory/poll logic, asserts
+no inherited verification variables, then exports every value named in qsub
+-v. PBS accepts only BL_R1_MODE=verify, decimal BL_R1_VERIFY_STEPS from 1 to
+100, and optional exact BL_R1_VERIFY_INJECT_FAIL. It changes only producer
+step count and a post-producer injected row failure. Normal submission still
+asserts all three variables unset; PBS records mode real or verify.
 
-Success mini-ramp replaces only qsub invocation after normal setup:
+The verifier runs exactly one of these complete submitting commands, with a
+separate verifier-prepared fresh inputs file for each command:
 
 ~~~bash
-export BL_R1_MODE=verify BL_R1_VERIFY_STEPS=10
-unset BL_R1_VERIFY_INJECT_FAIL
-qsub -v RUN_ROOT,SOURCE_CHECKOUT,RUNBOOK_COMMIT,SCIENCE,PRE_FREEZE_RECEIPT,PRE_FREEZE_RECEIPT_SHA256,BL_R1_MODE,BL_R1_VERIFY_STEPS -o "$RUN_ROOT/logs/ramp.stdout" -e "$RUN_ROOT/logs/ramp.stderr" "$RUN_ROOT/ramp.pbs"
+bash "$SOURCE_CHECKOUT/experiments/baselines/runbooks/h-atom-r1-verify-submit.sh" "$INPUTS_FILE" success-mini
+bash "$SOURCE_CHECKOUT/experiments/baselines/runbooks/h-atom-r1-verify-submit.sh" "$INPUTS_FILE" fail-deepqmc-default
 ~~~
 
-Failing-row control adds export BL_R1_VERIFY_INJECT_FAIL=deepqmc-default-seed0
-and that variable to qsub -v. Expected: failed DeepQMC receipt, no
-ferminet-gate.json, no ramp.complete, preserved partial inventory.
+The success control runs all five real producer rows for ten steps. The failure
+control injects a post-producer DeepQMC default-row failure; expected evidence
+is a failed receipt, no ferminet-gate.json, no ramp.complete, and preserved
+partial inventory. The script's optional --dry-run performs all pre-qsub setup,
+records the exact exported variables and qsub -v set, then stops before qsub.
 
-Existing-root control: verifier input names an existing RUN_ROOT; mkdir
-"$RUN_ROOT" must fail before qsub. Wrong-producer-SHA control, read-only and
-no submit, must fail:
+The three non-submitting controls are literal commands. Existing-root control
+uses an inputs file naming an existing RUN_ROOT and must fail before qsub:
+
+~~~bash
+set -euo pipefail; source "$INPUTS_FILE"; mkdir "$RUN_ROOT"
+~~~
+
+Wrong-producer-SHA control is read-only, submits nothing, and must fail:
 
 ~~~bash
 test "$(git -C /home/rhu/src/deepqmc-edf373e7 rev-parse HEAD)" = 0000000000000000000000000000000000000000

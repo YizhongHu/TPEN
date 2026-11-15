@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from pathlib import Path
 
 import pytest
 
@@ -88,3 +89,15 @@ def test_inventory_preserves_partial_account_before_failure(tmp_path):
     with pytest.raises(RuntimeError, match="missing.txt"):
         inventory(tmp_path, output, ["present.txt", "missing.txt"])
     assert '"status": "missing"' in output.read_text(encoding="utf-8")
+
+
+def test_verify_submitter_has_complete_exported_control_surface():
+    """Verification submission is a whole script, not a qsub splice fragment."""
+
+    script = (Path(__file__).parent / "runbooks" / "h-atom-r1-verify-submit.sh").read_text(encoding="utf-8")
+    assert 'success-mini) INJECT_FAIL=' in script
+    assert 'fail-deepqmc-default) INJECT_FAIL=deepqmc-default-seed0' in script
+    assert 'export BL_R1_MODE=verify BL_R1_VERIFY_STEPS=10' in script
+    assert 'QSUB_VARIABLES=RUN_ROOT,SOURCE_CHECKOUT,RUNBOOK_COMMIT,SCIENCE,PRE_FREEZE_RECEIPT,PRE_FREEZE_RECEIPT_SHA256,BL_R1_MODE,BL_R1_VERIFY_STEPS' in script
+    assert 'BL_R1_VERIFY_INJECT_FAIL' in script
+    assert '--dry-run' in script
