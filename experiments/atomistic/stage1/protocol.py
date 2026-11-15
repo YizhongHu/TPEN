@@ -17,14 +17,6 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from experiments.baselines.systems import load_registry
-from tpen.physics.operators import (
-    ELECTRON_ELECTRON_COULOMB,
-    ELECTRON_NUCLEUS_COULOMB,
-    HARMONIC_TRAP,
-    KINETIC_ENERGY,
-    NUCLEUS_NUCLEUS_COULOMB,
-)
-
 from experiments.toolkit.run_paths import resolve_run_dir
 
 SYSTEMS = ("hooke1", "he", "h2")
@@ -98,11 +90,11 @@ SYSTEM_SPECS = tuple(SystemSpec(name, system_id) for name, system_id in (
 # contract.  Keep this mapping explicit so a same-slot operator substitution
 # (for example HarmonicTrap under He's ``kinetic`` slot) cannot pass validation.
 _REGISTRY_OPERATOR_IDS = {
-    "kinetic": KINETIC_ENERGY,
-    "harmonic_trap": HARMONIC_TRAP,
-    "electron_nucleus": ELECTRON_NUCLEUS_COULOMB,
-    "electron_electron": ELECTRON_ELECTRON_COULOMB,
-    "nucleus_nucleus": NUCLEUS_NUCLEUS_COULOMB,
+    "kinetic": "tpen.physics:kinetic_energy",
+    "harmonic_trap": "tpen.physics:harmonic_trap",
+    "electron_nucleus": "tpen.physics:electron_nucleus_coulomb",
+    "electron_electron": "tpen.physics:electron_electron_coulomb",
+    "nucleus_nucleus": "tpen.physics:nucleus_nucleus_coulomb",
 }
 
 
@@ -356,7 +348,7 @@ def physical_system_id_from_config(config_path: str | Path) -> str:
         expected_operator = _REGISTRY_OPERATOR_IDS.get(slot)
         if expected_operator is None:
             raise ProtocolError(f"registry has no operator identity for slot {slot!r}")
-        if descriptor_term.operator_id != expected_operator:
+        if str(descriptor_term.operator_id) != expected_operator:
             raise ProtocolError(
                 f"descriptor operator for slot {slot!r} disagrees with registry "
                 f"for {cfg.system.id}"
