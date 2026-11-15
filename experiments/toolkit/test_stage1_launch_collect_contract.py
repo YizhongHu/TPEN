@@ -56,7 +56,7 @@ def test_planned_launch_paths_bind_and_collect_contract_fixture(
     )
     rows = [row for row in planned if row["kind"] == "eval" and row["system"] == "hooke1"
             and row["lineage"] == 0 and row["checkpoint"] == 7]
-    document = {"schema": "stage1/v2", "manifest_hash": manifest_hash(rows), "rows": rows}
+    document = {"schema": "stage1/v3", "manifest_hash": manifest_hash(rows), "rows": rows}
 
     train_row = next(row for row in planned if row["kind"] == "train" and row["system"] == "hooke1"
                      and row["lineage"] == 0)

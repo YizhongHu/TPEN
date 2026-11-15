@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from experiments.baselines.systems import load_registry
+
 from experiments.toolkit.run_paths import resolve_run_dir
 
 SYSTEMS = ("hooke1", "he", "h2")
@@ -155,7 +157,7 @@ def stable_row_id(*, system: str, kind: str, lineage: int = 0,
         raise ProtocolError(f"unknown row coordinates: {system=} {kind=}")
     if min(lineage, checkpoint, stream) < 0:
         raise ProtocolError("row coordinates must be non-negative")
-    payload = json.dumps(["stage1/v2", system, kind, lineage, checkpoint, stream],
+    payload = json.dumps(["stage1/v3", system, kind, lineage, checkpoint, stream],
                          separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -299,10 +301,50 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
     return row
 
 
+def physical_system_id_from_config(config_path: str | Path) -> str:
+    """Instantiate a Stage-1 eval config and return its descriptor content ID."""
+
+    from hydra.utils import instantiate
+    from tpen.run import load_config
+
+    cfg = load_config(str(config_path))
+    descriptor = instantiate(cfg.system_descriptor)
+    registry = load_registry()
+    entry = next((item for item in registry.get("systems", [])
+                  if item.get("id") == cfg.system.id), None)
+    if entry is None:
+        raise ProtocolError(f"system {cfg.system.id!r} is absent from the baseline registry")
+    for key, actual in (("n_up", cfg.system.spin.n_up),
+                        ("n_down", cfg.system.spin.n_down),
+                        ("spatial_dim", cfg.system.spatial_dim)):
+        if entry.get(key) != actual:
+            raise ProtocolError(f"configured {key} disagrees with registry for {cfg.system.id}")
+    registry_terms = entry.get("hamiltonian", {}).get("terms", [])
+    configured_names = set(descriptor.terms and [term.slot for term in descriptor.terms])
+    registry_names = {term.get("term") for term in registry_terms}
+    if not registry_names.issubset(configured_names):
+        raise ProtocolError(f"configured Hamiltonian disagrees with registry for {cfg.system.id}")
+    expected_nuclei = [term for term in registry_terms if term.get("term") == "electron_nucleus"]
+    if expected_nuclei:
+        nuclei = expected_nuclei[0].get("nuclei", [])
+        actual_positions = list(cfg.system.nuclei.positions)
+        actual_charges = list(cfg.system.nuclei.charges)
+        if len(nuclei) != len(actual_positions) or [float(n["charge"]) for n in nuclei] != actual_charges:
+            raise ProtocolError(f"configured nuclear geometry disagrees with registry for {cfg.system.id}")
+        for expected, actual in zip(nuclei, actual_positions):
+            if list(expected.get("position_bohr", [])) != list(actual):
+                raise ProtocolError(f"configured nuclear geometry disagrees with registry for {cfg.system.id}")
+    system_id = descriptor.system_id()
+    if not isinstance(system_id, str) or not _SHA256.fullmatch(system_id):
+        raise ProtocolError("configured system descriptor did not produce a SHA-256 ID")
+    return system_id
+
+
 def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
                    checkpoints: list[int], lineage_seeds: list[int],
                    checkpoint_sha256: Mapping[tuple[str, int, int], str],
-                   results_root: str) -> list[dict[str, Any]]:
+                   results_root: str,
+                   expected_physical_system_id: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
     """Expand systems into validated smoke, train, and eval rows.
 
     Parameters are explicit rather than defaulted so a missing identity or
@@ -313,6 +355,16 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
     source_sha = _require_sha(source_sha, length=40, field="source_sha")
     config_sha256 = _require_sha(config_sha256, length=64, field="config_sha256")
     root = _safe_results_root(results_root)
+    physical_ids = dict(expected_physical_system_id or {})
+    if not physical_ids:
+        config_root = Path(__file__).parent / "configs"
+        physical_ids = {
+            name: physical_system_id_from_config(config_root / name / "eval.yaml")
+            for name in SYSTEMS
+        }
+    for name in SYSTEMS:
+        _require_sha(physical_ids.get(name), length=64,
+                     field=f"expected_physical_system_id[{name!r}]")
     if len(lineage_seeds) != protocol.lineages or len(set(lineage_seeds)) != len(lineage_seeds):
         raise ProtocolError("lineage_seeds must contain one distinct seed per lineage")
     if not checkpoints or any(step <= 0 for step in checkpoints):
@@ -375,6 +427,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
                         "walkers": protocol.eval_walkers, "draws": protocol.eval_draws,
                         "source_sha": source_sha, "config_sha256": config_sha256,
                         "config": f"configs/{spec.name}/eval.yaml", "results_root": root,
+                        "expected_physical_system_id": physical_ids[spec.name],
                         "experiment_name": "stage1", "sector": spec.name, "run_id": eval_id,
                         "checkpoint_dir": str(checkpoint_dir), "checkpoint_file": str(checkpoint_file),
                         "checkpoint_sha256": checkpoint_digest, "depends_on": train_id,
