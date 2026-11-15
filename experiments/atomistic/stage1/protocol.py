@@ -516,10 +516,14 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
             "row_id": stable_row_id(system=spec.name, kind="smoke"),
             "system": spec.name, "system_id": spec.system_id, "kind": "smoke",
             "seed": seed, "source_sha": source_sha, "config_sha256": config_sha256,
-            "config": f"configs/{spec.name}/smoke.yaml", "results_root": root,
+            # A smoke is the real system train config with a deliberately
+            # small budget.  Keeping one config source prevents its physics
+            # from drifting away from the train/eval pair.
+            "config": f"configs/{spec.name}/train.yaml", "results_root": root,
             "experiment_name": "stage1", "sector": spec.name, "run_id": "smoke",
             "updates": protocol.smoke_updates,
             "walkers": protocol.smoke_walkers,
+            "checkpoint_steps": [protocol.smoke_updates],
         })
         for lineage, seed in enumerate(lineage_seeds):
             train_seed = training_seed(system=spec.name, lineage=lineage, lineage_seed=seed)

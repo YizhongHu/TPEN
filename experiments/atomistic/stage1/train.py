@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 from tpen.run import run_from_config
 from experiments.atomistic.stage1.protocol import validate_gateway_binding
@@ -19,6 +20,9 @@ def main() -> int:
     args = parser.parse_args()
     validate_gateway_binding(binding=args.binding, config=args.config,
                              overrides=args.overrides, kind=args.kind)
+    config_path = Path(args.config)
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Stage-1 config path does not exist: {args.config}")
     # Config loading remains owned by the installed tpen entrypoint; this
     # wrapper is intentionally only a gateway and does not duplicate Runner.
     from tpen.run import load_config

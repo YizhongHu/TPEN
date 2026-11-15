@@ -65,6 +65,14 @@ training updates.
 is an explicit operator action. The generated script requires Slurm, checks the
 delivered partition, uses node-local per-job scratch, and records job identity.
 
+Smoke rows use the same `configs/<system>/train.yaml` files as train rows. Their
+smoke-ness is only the bounded budget supplied by `launch.row_overrides`:
+`sampler.n_walkers`, `trainer.max_steps`, and `checkpoint_steps` are set from
+the manifest row, with the final checkpoint at `smoke_updates`. A smoke checks
+that the launch path, gateway, real train config, and final checkpoint can run
+to `COMPLETE` at the planned cluster directory. It does not measure energy
+accuracy and does not run evaluation or collection.
+
 The real-producer integration test is marked `stage1_real_producer` and remains
 in default collection. Mutant packets select their test paths explicitly so
 this producer chain is not multiplied across mutants; the base-on Stage-1
