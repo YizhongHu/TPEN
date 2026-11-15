@@ -9,8 +9,14 @@ import pytest
 
 from tpen_executor.contracts import AttemptId
 from tpen_executor._codec import canonical_bytes, digest
-from tpen_executor.results import CoreOutcomeRecord, ManifestAttempt, RemoteTeardownReceipt
-from tpen_executor.storage import AdmissionFork, FenceRejected
+from tpen_executor.results import (
+    CoreOutcomeRecord,
+    ManifestAttempt,
+    RemoteTeardownReceipt,
+    StartReceipt,
+)
+from tpen_executor.storage import AdmissionFork, DirectoryStore, FenceRejected
+from tpen_executor.contracts import AllocationId, BackendJobId
 
 from test_review_p8_executor_r1 import setup_store
 from test_core_evidence_v3 import _planned_evidence, _typed_evidence
@@ -176,6 +182,45 @@ def test_manifest_attempt_v2_round_trips_core_only_and_core_plus_admission(tmp_p
     assert ManifestAttempt.decode(core_and_admission.encode()) == core_and_admission
 
 
+def test_start_receipt_v1_byte_round_trip() -> None:
+    receipt = StartReceipt(
+        "task-a", AttemptId("attempt-1"), AllocationId("allocation-1"),
+        BackendJobId("job-1"), "a" * 64, "2026-11-14T00:00:00Z", "/runs/a1",
+    )
+    assert receipt.to_dict()["schema"] == StartReceipt.schema
+    assert "transport_kind" not in receipt.to_dict()
+    assert StartReceipt.decode(receipt.encode()) == receipt
+    assert StartReceipt.decode(canonical_bytes(receipt.to_dict())).encode() == receipt.encode()
+
+
+def test_start_receipt_v2_round_trip() -> None:
+    receipt = StartReceipt(
+        "task-a", AttemptId("attempt-1"), AllocationId("allocation-1"),
+        BackendJobId("job-1"), "a" * 64, "2026-11-14T00:00:00Z", "/runs/a1", "remote",
+    )
+    assert receipt.to_dict()["schema"] == StartReceipt.schema_v2
+    assert receipt.to_dict()["transport_kind"] == "remote"
+    assert StartReceipt.decode(receipt.encode()) == receipt
+
+
+@pytest.mark.parametrize(
+    "transport_kind",
+    [pytest.param(None, id="null"), pytest.param([], id="list"), pytest.param({}, id="dict"), pytest.param(7, id="int"), pytest.param("missing", id="missing")],
+)
+def test_start_receipt_v2_rejects_invalid_transport_kind(transport_kind: object) -> None:
+    receipt = StartReceipt(
+        "task-a", AttemptId("attempt-1"), AllocationId("allocation-1"),
+        BackendJobId("job-1"), "a" * 64, "2026-11-14T00:00:00Z", "/runs/a1",
+    ).to_dict()
+    receipt["schema"] = StartReceipt.schema_v2
+    if transport_kind == "missing":
+        pass
+    else:
+        receipt["transport_kind"] = transport_kind
+    with pytest.raises(ValueError, match="transport_kind|keys differ"):
+        StartReceipt.from_mapping(receipt)
+
+
 def test_noneligible_outcome_writes_no_admission_or_segment(tmp_path: Path) -> None:
     store, group, allocation = setup_store(tmp_path)
     fence = store.begin_attempt(group, "a", allocation, "2026-11-14T00:00:00Z")
@@ -234,7 +279,10 @@ def test_unconfirmed_status_is_refused_even_with_a_positive_receipt(tmp_path: Pa
     assert not (Path(fence.output_dir).parent / "successor-admissions").exists()
 
 
-@pytest.mark.parametrize("mutation", ["task", "attempt", "allocation", "backend", "false-reaped", "not-run", "noncanonical"])
+@pytest.mark.parametrize(
+    "mutation",
+    ["task", "attempt", "allocation", "backend", "group", "false-reaped", "not-run", "noncanonical", "malformed"],
+)
 def test_invalid_remote_receipt_refuses_the_same_admission_gate(tmp_path: Path, mutation: str) -> None:
     store, _group, fence = _planned_attempt(tmp_path)
     receipt_path = Path(fence.output_dir, "remote-teardown.json")
@@ -248,10 +296,15 @@ def test_invalid_remote_receipt_refuses_the_same_admission_gate(tmp_path: Path, 
         payload["allocation_id"] = "crossed-allocation"
     elif mutation == "backend":
         payload["backend_job_id"] = "crossed-backend"
+    elif mutation == "group":
+        payload["group_digest"] = "d" * 64
     elif mutation == "false-reaped":
         payload["child_group_reaped"] = False
     elif mutation == "not-run":
         payload["inspection"] = "not-run"
+    elif mutation == "noncanonical":
+        receipt_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        payload = None
     else:
         receipt_path.write_bytes(b"{" + b"\"schema\": \"tpen-executor/remote-teardown-v1\"}")
         payload = None
@@ -278,11 +331,40 @@ def test_fresh_store_reads_positive_receipt_and_preserves_replay_fork_rules(tmp_
     assert reopened.manifest(group).segments == ()
 
 
-def test_record_successor_admission_rechecks_teardown_under_lock(tmp_path: Path) -> None:
+def test_record_successor_admission_rechecks_teardown_under_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store, _group, fence = _planned_attempt(tmp_path)
     request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
-    Path(fence.output_dir, "remote-teardown.json").unlink()
+    receipt_path = Path(fence.output_dir, "remote-teardown.json")
+    real_predicate = DirectoryStore._continuation_predecessor_locked
+    predicate_calls = 0
+
+    def remove_proof_after_preliminary_build(self, locked_fence, task_dir):
+        nonlocal predicate_calls
+        result = real_predicate(self, locked_fence, task_dir)
+        predicate_calls += 1
+        if predicate_calls == 1:
+            receipt_path.unlink()
+        return result
+
+    monkeypatch.setattr(DirectoryStore, "_continuation_predecessor_locked", remove_proof_after_preliminary_build)
     with pytest.raises(FenceRejected, match="teardown-unconfirmed"):
         store.record_successor_admission(fence, request, "b" * 64)
+    assert predicate_calls == 2
     assert not (Path(fence.output_dir).parent / "successor-admissions").exists()
+
+
+def test_identical_successor_replay_refuses_after_remote_proof_removed(tmp_path: Path) -> None:
+    store, group, fence = _planned_attempt(tmp_path)
+    request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+    first = store.record_successor_admission(fence, request, "b" * 64)
+    receipt_path = Path(fence.output_dir, "remote-teardown.json")
+    receipt_path.unlink()
+
+    with pytest.raises(FenceRejected, match="teardown-unconfirmed"):
+        store.record_successor_admission(fence, request, "b" * 64)
+    ledger_path = Path(fence.output_dir).parent / "successor-admissions" / fence.attempt_id.value / "successor-admission.json"
+    assert json.loads(ledger_path.read_text(encoding="utf-8")) == first.to_dict()
+    assert store.manifest(group).segments == ()
 

@@ -1264,7 +1264,7 @@ def _attempt(value: Any, group_digest: str) -> dict[str, Any]:
         start = dict(_fields(start_value, start_fields, "start receipt"))
     elif start_schema == START_RECEIPT_V2:
         start = dict(_fields(start_value, start_fields | {"transport_kind"}, "start receipt"))
-        if start["transport_kind"] not in {"local", "remote"}:
+        if type(start["transport_kind"]) is not str or start["transport_kind"] not in {"local", "remote"}:
             raise ManifestRefusal("malformed-record", "start.transport_kind is unsupported")
     else:
         raise ManifestRefusal("unknown-schema", "start receipt schema is unsupported")

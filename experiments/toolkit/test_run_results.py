@@ -308,9 +308,13 @@ def test_p8_reader_accepts_start_receipt_v2_transport_kinds(tmp_path: Path, tran
     [
         ("unknown-schema", "schema is unsupported"),
         ("extra-key", "keys differ"),
-        ("bad-transport", "transport_kind"),
+        ("bad-transport-list", "transport_kind"),
+        ("bad-transport-dict", "transport_kind"),
+        ("bad-transport-null", "transport_kind"),
+        ("bad-transport-int", "transport_kind"),
+        ("missing-transport", "keys differ"),
     ],
-    ids=["unknown-schema", "extra-key", "bad-transport"],
+    ids=["unknown-schema", "extra-key", "bad-transport-list", "bad-transport-dict", "bad-transport-null", "bad-transport-int", "missing-transport"],
 )
 def test_p8_reader_rejects_closed_start_receipt_mutations(
     tmp_path: Path, mutation: str, expected_reason: str
@@ -322,8 +326,17 @@ def test_p8_reader_rejects_closed_start_receipt_mutations(
         start["schema"] = "tpen-executor/start-receipt-v99"
     elif mutation == "extra-key":
         start["extra"] = "not-allowed"
+    elif mutation == "missing-transport":
+        start["schema"] = "tpen-executor/start-receipt-v2"
+        start.pop("transport_kind", None)
     else:
-        start.update({"schema": "tpen-executor/start-receipt-v2", "transport_kind": "unknown"})
+        bad_values = {
+            "bad-transport-list": [],
+            "bad-transport-dict": {},
+            "bad-transport-null": None,
+            "bad-transport-int": 7,
+        }
+        start.update({"schema": "tpen-executor/start-receipt-v2", "transport_kind": bad_values[mutation]})
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ManifestRefusal, match=expected_reason):

@@ -14,9 +14,11 @@ from __future__ import annotations
 import ast
 from concurrent.futures import Future
 import dataclasses
+import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -26,7 +28,7 @@ import pytest
 
 import time
 
-from tpen_executor.contracts import AllocationId, BackendJobId
+from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId
 from tpen_executor._codec import digest
 from tpen_executor.dispatch import parsl as parsl_dispatch
 from tpen_executor.dispatch.parsl import _RemoteLeaf
@@ -40,15 +42,17 @@ from tpen_executor.dispatch.transport import (
 )
 from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.placement import AllocationSlot
-from tpen_executor.storage import DirectoryStore
+from tpen_executor.storage import AttemptFence, DirectoryStore, FenceRejected
 from tpen_executor.results import RemoteTeardownReceipt
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.workers import SubprocessWorker
 from tpen_executor import workers as workers_module
+from tpen_executor.gpu_sampler import GPU_SAMPLER_OUTPUT_ENV, QUARANTINE_SCHEMA, slot_quarantine_dir
 
 from test_s3_transport_parsl import BINDING, _Parsl, _group, _lifecycle, _runs, _transport, _worker, fake_parsl
 from test_s3_transport_wire import _request, _synthetic_result
+from test_core_evidence_v3 import _planned_evidence
 
 
 PARSL_MODULE = "executor/src/tpen_executor/dispatch/parsl.py"
@@ -392,6 +396,89 @@ def test_crossed_remote_leaf_ack_persists_only_unconfirmed_outcome(tmp_path: Pat
     assert handle.wait_for_teardown(0.1) is False
     lifecycle.finish(fence, "remote-quiescence-unconfirmed", "2026-11-11T00:00:01+00:00", None)
     assert not Path(fence.output_dir, "remote-teardown.json").exists()
+
+
+def test_fresh_controller_refuses_quarantined_remote_attempt(
+    tmp_path: Path, fake_parsl: _Parsl, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh controller preserves both slot and continuation fail-closed gates."""
+
+    gpu = "GPU-12345678-1234-1234-1234-123456789ABC"
+    slot = AllocationSlot("slot-a", socket.gethostname(), (gpu,), (0,), (), ()).to_dict()
+    facts = {"slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": [slot]}}
+    root = tmp_path / "restarted-store"
+    root.mkdir()
+    allocation = ConfiguredAllocation(AllocationId("restart-allocation"), BackendJobId("restart-job"), facts)
+    lifecycle = AttachedAllocation(allocation, DirectoryStore(root))
+    group = _group("s3c-restart", "predecessor")
+    marker_ready = threading.Event()
+    release_leaf = threading.Event()
+    leaf_done = threading.Event()
+
+    def uncertain_sampled_leaf(_index, function, args, kwargs):
+        request = LeafRequest.decode(args[0])
+        values = request.environment.env
+        assert GPU_SAMPLER_OUTPUT_ENV in values
+        quarantine_dir = slot_quarantine_dir(request.root, values)
+        assert quarantine_dir is not None
+        os.makedirs(quarantine_dir, exist_ok=True)
+        Path(quarantine_dir, "uncertain-sampler.json").write_text(
+            json.dumps({"schema": QUARANTINE_SCHEMA}), encoding="utf-8",
+        )
+        marker_ready.set()
+        release_leaf.wait(5)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            leaf_done.set()
+
+    fake_parsl.hooks["run_leaf"] = uncertain_sampled_leaf
+    first = {"value": True}
+
+    def interrupt_after_marker(seconds: float) -> None:
+        if first["value"]:
+            assert marker_ready.wait(5)
+            first["value"] = False
+            raise KeyboardInterrupt("S3C restart")
+        time.sleep(seconds)
+
+    monkeypatch.setattr("tpen_executor.dispatch.parsl._poll_sleep", interrupt_after_marker)
+    dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path), transport=_transport(teardown_timeout=0.1))
+    try:
+        with pytest.raises(KeyboardInterrupt, match="S3C restart"):
+            dispatcher.run(group, _runs(tmp_path, "predecessor"), lifecycle, timeout=60)
+    finally:
+        release_leaf.set()
+        assert leaf_done.wait(5)
+
+    initial = lifecycle.store.manifest(group).attempts[0]
+    assert initial.outcome_receipt.status == "remote-quiescence-unconfirmed"  # type: ignore[union-attr]
+    predecessor = AttemptFence(
+        lifecycle.store.root, group.identity, "predecessor", allocation.allocation_id.value,
+        AttemptId(initial.attempt_id.value), initial.output_dir,
+    )
+    core_dir = Path(predecessor.output_dir) / "core"
+    core_dir.mkdir()
+    lifecycle.store.record_core_outcome(predecessor, _planned_evidence(core_dir))
+    quarantine_markers = list((root / "slot-quarantine").rglob("*.json"))
+    assert quarantine_markers and json.loads(quarantine_markers[0].read_text(encoding="utf-8"))["schema"] == QUARANTINE_SCHEMA
+
+    # Reopen every controller-owned object over the same durable root.  The
+    # fresh dispatcher refuses slot admission before submitting another leaf.
+    reopened = DirectoryStore(root)
+    fresh_lifecycle = AttachedAllocation(allocation, reopened)
+    fresh_root = tmp_path / "fresh"
+    fresh_root.mkdir()
+    fresh_dispatcher = parsl_dispatch.ParslDispatcher(_worker(fresh_root), transport=_transport(teardown_timeout=0.1))
+    fresh_group = _group("s3c-restart-successor", "successor")
+    fresh_manifest = fresh_dispatcher.run(fresh_group, _runs(fresh_root, "successor"), fresh_lifecycle, timeout=60)
+    assert fresh_manifest.attempts[0].outcome_receipt.status == "launch_failed"  # type: ignore[union-attr]
+    assert len(fake_parsl.leaf_submissions()) == 1
+
+    with pytest.raises(FenceRejected, match="teardown-unconfirmed"):
+        reopened.build_successor_admission_request(predecessor, AttemptId("successor-1"), "a" * 64, 10)
+    assert not (Path(predecessor.output_dir).parent / "successor-admissions").exists()
+    assert not (Path(predecessor.output_dir) / "segment.json").exists()
 
 
 

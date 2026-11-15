@@ -135,11 +135,11 @@ class StartReceipt:
         elif schema == cls.schema_v2:
             fields(data, {"schema", "task_id", "attempt_id", "allocation_id", "backend_job_id", "group_digest", "started_at_utc", "output_dir", "transport_kind"}, cls.schema_v2, "StartReceipt")
             transport_kind = data["transport_kind"]
+            if type(transport_kind) is not str or transport_kind not in {"local", "remote"}:
+                raise ValueError("StartReceipt v2 transport_kind must be local or remote")
         else:
             raise ValueError(f"StartReceipt schema is not {cls.schema!r} or {cls.schema_v2!r}")
         if any(type(data[key]) is not str for key in ("task_id", "attempt_id", "allocation_id", "backend_job_id", "group_digest", "started_at_utc", "output_dir")): raise TypeError("StartReceipt has an invalid field type")
-        if transport_kind is not None and type(transport_kind) is not str:
-            raise TypeError("StartReceipt has an invalid transport_kind")
         return cls(data["task_id"], AttemptId(data["attempt_id"]), AllocationId(data["allocation_id"]), BackendJobId(data["backend_job_id"]), data["group_digest"], data["started_at_utc"], data["output_dir"], transport_kind)
 
     @classmethod

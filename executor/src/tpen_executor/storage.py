@@ -764,6 +764,9 @@ class DirectoryStore:
         # the operational ``failed`` status alone is never sufficient for a
         # remote (or legacy/unknown) attempt.  Local attempts retain the
         # CX-04b predicate and do not manufacture a remote teardown receipt.
+        # Migration note: legacy v1 local attempts decode with an unknown
+        # transport kind and therefore require positive remote proof here;
+        # they are not admissible for continuation after upgrade (fail closed).
         if start.transport_kind != "local":
             teardown_path = os.path.join(output_dir, _REMOTE_TEARDOWN_FILENAME)
             try:
