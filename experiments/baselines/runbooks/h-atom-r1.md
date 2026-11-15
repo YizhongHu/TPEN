@@ -1,120 +1,78 @@
 ---
 item_id: "dc036f76-7ddb-4e2f-baf8-b33a1161b539"
-runbook_revision: 2
-runbook_commit: "external: runbook-index-r2 and the submission receipt"
+runbook_revision: 3
+runbook_commit: "external: runbook-index-r3 and submission receipt"
 science: "PENDING_OPERATOR"
 ---
 
 # BL-R1 — atomic-H baseline ramp
 
-This is the complete, one-shot **ramp** procedure.  It is not authority for a
-full run.  The runner executes commands exactly, records mechanics, and stops
-on every stated failure; it does not retry, modify an input, cancel work,
-interpret physics, or decide whether to continue.  The orchestrator owns the
-post-ramp plan decision.
+This is the complete one-shot ramp, not authority for full runs. The runner
+executes commands, preserves evidence, and stops on every failure: no patch,
+retry, resubmission, cancellation, or scientific interpretation.
 
-## Contract and fixed surface
+## Fixed surface and source evidence
 
-The operator must select `science: true|false` before freeze.  For `false`,
-use the reviewed frozen `dev` commit and disposable/temporary data; for
-`true`, use a reviewed `main` commit, human submission approval, a science
-report, and Holystore backup.  `runbook_commit` is deliberately external: a
-file cannot name the Git commit that will contain it.  The verifier records
-that exact TPEN commit, this file's blob, the PBS-template blob, and every
-config/helper blob in `runbook-index-r2`; the runner copies those values into
-its submission receipt.  A pending/missing value is a stop.
+The operator selects science true/false: non-science uses frozen dev and
+temporary data; science uses main, human submission approval, a science report,
+and Holystore backup. The containing TPEN commit/blob/config/helper/PBS blobs
+are bound externally in runbook-index-r3 and the submission receipt.
 
-Only these five seed-0 rows run: DeepQMC `default`, `ferminet`, `psiformer`;
-FermiNet-codebase `ferminet`, `psiformer`.  Each has 1,000 optimizer steps and
-batch 4,096.  DeepQMC's selected task is respectively `train`,
-`train_ferminet`, and `train_psiformer`; all set `task.pretrain_steps=0` so
-ramp timings exclude pretraining.  This is explicit because the pinned task
-defaults differ: `train.yaml:7-12`, `train_ferminet.yaml:7-12`, and
-`train_psiformer.yaml:7-20` in
-`/tmp/bl-r1-pinned-src/deepqmc-edf373e7/src/deepqmc/conf/task/`.
+Five seed-0 rows run: DeepQMC default, ferminet, psiformer; FermiNet-codebase
+ferminet, psiformer; batch 4096; 1000 real-ramp steps; zero pretraining.
+The H input is one electron, spins (1,0), one Z=1 origin nucleus. Pinned
+DeepQMC H is at
+/tmp/bl-r1-pinned-src/deepqmc-edf373e7/src/deepqmc/conf/hamil/mol/H.yaml:1-5;
+its resolved nesting is hamil.mol in conf/hamil/qc_forward_laplacian.yaml:1-6.
+Hydra snapshots are training/.hydra (conf/config.yaml:9-17 and
+conf/custom_resolvers.py:17-20); training HDF5 is in training
+(train.py:158-171; log.py:204-253).
 
-The immutable TPEN physical input is
-`configs/h-atom-r1.yaml`: one electron, spins `(1,0)`, and a `Z=1` nucleus at
-the origin.  DeepQMC's native H group declares the origin/charge/one-electron
-state at `src/deepqmc/conf/hamil/mol/H.yaml:1-5` in its pinned producer.  The
-FermiNet input fixes `atom="H"` and `(1,0)` in
-`configs/ferminet_h_atom.py`; its atom config constructs the molecule/spins at
-`/tmp/bl-r1-pinned-src/ferminet-f4b1846c/ferminet/configs/atom.py:36-60`.
+Pinned producers: DeepQMC edf373e7c26545616f87b3b10c3e48b25c70f627 at
+/home/rhu/src/deepqmc-edf373e7 (JAX 0.8.3); FermiNet
+f4b1846cd6f2776321b09b027d4d5506ae98e19b at
+/home/rhu/src/ferminet-psiformer-60c9fab3 (JAX 0.9.2). DeepQMC retry
+default/loop: train.py:48-65,303-368; PBS sets +task.max_restarts=1.
+FermiNet batch/step/NaN/pretraining defaults: ferminet/base_config.py:47,61,
+85,305-318; required trace schema: train.py:648; loop/NaN: train.py:965-1033.
+Each row asserts one GPU using its own interpreter; DeepQMC otherwise permits
+CPU device enumeration (deepqmc/app.py:300-310).
 
-The fixed producer identities are DeepQMC
-`edf373e7c26545616f87b3b10c3e48b25c70f627`
-(`/home/rhu/src/deepqmc-edf373e7`, Python 3.12/JAX 0.8.3) and FermiNet
-`f4b1846cd6f2776321b09b027d4d5506ae98e19b`
-(`/home/rhu/src/ferminet-psiformer-60c9fab3`, JAX 0.9.2).  Do not substitute a
-package path, producer revision, task default, or config.  `ramp.pbs` sets
-DeepQMC `task.max_restarts=1`: its native retry loop is
-`src/deepqmc/train.py:303-368` and its default is three at `:48-65`, so this
-permits one training pass only.  FermiNet explicitly enables `debug.check_nan`
-and disables `optim.reset_if_nan`; their defaults are false at
-`ferminet/base_config.py:85,305-318`.  Its step/batch flags are native config
-fields (`base_config.py:47,61`), seed is consumed in `train.py:400-444`, and
-the main optimization loop and CSV writes are at `train.py:965-1020`.
-DeepQMC's Hydra defaults/working-directory handoff are in
-`src/deepqmc/conf/config.yaml:1-17` and `src/deepqmc/app.py:314-328`; FermiNet
-accepts/resolves its config at `ferminet/main.py:28-35`.  Those references are
-all to the two pinned source snapshots named above.
+Use Polaris debug only, one node, one hour, no chain. The orchestrator must
+re-plan from seconds/step before any full run, inference, or trajectory export.
 
-Use Polaris `debug` only: one node, one hour, no chain.  The ramp measures
-seconds/step before an orchestrator-owned re-plan determines full steps,
-seeds, budget, and whether pretraining is in scope.  No inference evaluation,
-trajectory export, or full run is authorized here.
+## Pre-freeze verifier checks (read-only; runner does not do them)
 
-## Pre-freeze verifier checks (read-only; runner does **not** do these)
+1. Confirm clean pinned producer heads, named Python/JAX/package origins,
+   flags/custom FermiNet config, Eagle capacity, and terminal qstat -xf.
+2. Resolve all rows and retain real training/.hydra plus training/result.h5
+   fixtures; check H identity and settings/native finite outputs.
+3. Prepare clean exact TPEN checkout and immutable data-only ramp-inputs.env:
+   RUNBOOK_COMMIT, SCIENCE, SOURCE_CHECKOUT, fresh RUN_ROOT, pre-freeze
+   receipt/SHA, and RUNBOOK_BLOB, PBS_BLOB, INPUT_SPEC_BLOB, DQ_CONFIG_BLOB,
+   FN_CONFIG_BLOB, RECEIPT_HELPER_BLOB.
 
-1. Confirm both producer paths are clean at the stated commits; their named
-   interpreters import the stated JAX versions; the listed CLI overrides and
-   custom FermiNet config resolve on Polaris.
-2. Resolve every row and confirm the stated physical identity, ansatz, batch,
-   seed, 1,000 steps, zero pretraining, no-restart/NaN settings, and artifact
-   layout; confirm DeepQMC `result.h5` exposes finite local-energy mean/std
-   (the producer logger writes `result.h5` at `deepqmc/log.py:204-253` and
-   produces these statistics at `fit.py:146-160`) and FermiNet emits a finite
-   0--999 `train_stats.csv` trace.
-3. Prepare a clean exact TPEN checkout and a shell-quoted `ramp-inputs.env`,
-   validate its blob/commit values, Eagle capacity, and that `qstat -xf` can
-   read terminal jobs.  Record the verifier receipt path and SHA-256.
+Any failure stops before runner execution.
 
-If any check fails, no runner command is authorized; the verifier reports the
-failure to the orchestrator.  These are cluster facts, not assumptions for the
-runner.
+## Normal runner submission
 
-## Runner input and submission
+The verifier provides one ramp-inputs.env path as $1. This template takes only
+that argument. mkdir has no -p, so existing root stops before qsub.
+POLL_LIMIT=120 is a bounded 60-minute observation, not a retry; timeout,
+unknown state, or query error stops without qdel.
 
-The verifier supplies exactly one immutable `ramp-inputs.env`, with shell-safe
-single-line values: `RUNBOOK_COMMIT`, `SCIENCE`, `SOURCE_CHECKOUT`, `RUN_ROOT`,
-`PRE_FREEZE_RECEIPT`, `PRE_FREEZE_RECEIPT_SHA256`, and the six Git blob IDs
-`RUNBOOK_BLOB`, `PBS_BLOB`, `INPUT_SPEC_BLOB`, `DQ_CONFIG_BLOB`,
-`FN_CONFIG_BLOB`, and `RECEIPT_HELPER_BLOB`.  `SOURCE_CHECKOUT` is the
-prepared exact TPEN checkout, and `RUN_ROOT` is a never-before-used Eagle
-path.  It must not contain shell code.  The runner does not create or edit it.
-
-The verifier handoff gives the runner one literal path to that file.  The
-following shell template takes it as its sole positional argument; no other
-substitution is allowed.  Any failing command stops; preserve the existing
-path and report it.  `mkdir` deliberately has no `-p`, so a reused run
-tag/root cannot overwrite or blend results.
-
-```bash
+~~~bash
 set -euo pipefail
-test "$#" = 1
-INPUTS_FILE="$1"
-source "$INPUTS_FILE"
+test "$#" = 1; INPUTS_FILE="$1"; source "$INPUTS_FILE"
 test "$SCIENCE" = true || test "$SCIENCE" = false
-test -n "$RUNBOOK_COMMIT" && test -n "$SOURCE_CHECKOUT" && test -n "$RUN_ROOT"
-test -f "$PRE_FREEZE_RECEIPT"
+test -z "${BL_R1_MODE+x}" && test -z "${BL_R1_VERIFY_STEPS+x}" && test -z "${BL_R1_VERIFY_INJECT_FAIL+x}"
 test "$(sha256sum "$PRE_FREEZE_RECEIPT" | awk '{print $1}')" = "$PRE_FREEZE_RECEIPT_SHA256"
 git -C "$SOURCE_CHECKOUT" rev-parse --verify "$RUNBOOK_COMMIT^{commit}"
 test "$(git -C "$SOURCE_CHECKOUT" rev-parse HEAD)" = "$RUNBOOK_COMMIT"
 test -z "$(git -C "$SOURCE_CHECKOUT" status --porcelain=v1)"
-while read -r variable path; do
-  expected="${!variable}"
-  actual="$(git -C "$SOURCE_CHECKOUT" ls-tree "$RUNBOOK_COMMIT" -- "$path" | awk '{print $3}')"
-  test -n "$expected" && test "$actual" = "$expected"
+while read -r var path; do
+  test -n "${!var}"
+  test "$(git -C "$SOURCE_CHECKOUT" ls-tree "$RUNBOOK_COMMIT" -- "$path" | awk '{print $3}')" = "${!var}"
 done <<'BLOBS'
 RUNBOOK_BLOB experiments/baselines/runbooks/h-atom-r1.md
 PBS_BLOB experiments/baselines/runbooks/h-atom-r1-ramp.pbs
@@ -123,55 +81,84 @@ DQ_CONFIG_BLOB experiments/baselines/runbooks/configs/deepqmc_h_atom.yaml
 FN_CONFIG_BLOB experiments/baselines/runbooks/configs/ferminet_h_atom.py
 RECEIPT_HELPER_BLOB experiments/baselines/runbooks/ramp_receipt.py
 BLOBS
-mkdir "$RUN_ROOT"
-mkdir "$RUN_ROOT/logs" "$RUN_ROOT/ramp"
+mkdir "$RUN_ROOT"; mkdir "$RUN_ROOT/logs" "$RUN_ROOT/ramp"
 cp "$INPUTS_FILE" "$RUN_ROOT/ramp-inputs.env"
-sha256sum "$RUN_ROOT/ramp-inputs.env" "$PRE_FREEZE_RECEIPT" > "$RUN_ROOT/input-inventory.sha256"
 cp "$SOURCE_CHECKOUT/experiments/baselines/runbooks/h-atom-r1-ramp.pbs" "$RUN_ROOT/ramp.pbs"
+sha256sum "$RUN_ROOT/ramp-inputs.env" "$PRE_FREEZE_RECEIPT" "$RUN_ROOT/ramp.pbs" > "$RUN_ROOT/input-inventory.sha256"
 export RUN_ROOT SOURCE_CHECKOUT RUNBOOK_COMMIT SCIENCE PRE_FREEZE_RECEIPT PRE_FREEZE_RECEIPT_SHA256
-JOBID="$(qsub -v RUN_ROOT,SOURCE_CHECKOUT,RUNBOOK_COMMIT,SCIENCE,PRE_FREEZE_RECEIPT,PRE_FREEZE_RECEIPT_SHA256 -o "$RUN_ROOT/logs/ramp.stdout" -e "$RUN_ROOT/logs/ramp.stderr" "$RUN_ROOT/ramp.pbs")"
-test -n "$JOBID"
-printf '%s\n' "$JOBID" > "$RUN_ROOT/jobid.txt"
-while :; do
-  qstat -xf "$JOBID" > "$RUN_ROOT/qstat-final.txt"
-  STATE="$(awk -F= '/^[[:space:]]*job_state[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "$RUN_ROOT/qstat-final.txt")"
-  case "$STATE" in
-    F) break ;;
-    Q|R|B|E|W|T|S) sleep 30 ;;
-    *) printf 'unexpected PBS state: %s\n' "$STATE" >&2; exit 1 ;;
-  esac
+write_submit_partial() {
+  set +e
+  /home/rhu/.venvs/deepqmc-jax083-edf373e7/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/artifact-inventory.submit-partial.jsonl" --ramp-required --required ramp-inputs.env --required ramp.pbs --required input-inventory.sha256 --required qsub.stdout --required qsub.stderr --required qsub.status --required jobid.txt > "$RUN_ROOT/artifact-inventory.submit-partial.stdout" 2> "$RUN_ROOT/artifact-inventory.submit-partial.stderr"
+  return 0
+}
+on_submit_exit() { rc=$?; write_submit_partial; exit "$rc"; }
+trap on_submit_exit EXIT
+set +e
+qsub -v RUN_ROOT,SOURCE_CHECKOUT,RUNBOOK_COMMIT,SCIENCE,PRE_FREEZE_RECEIPT,PRE_FREEZE_RECEIPT_SHA256 -o "$RUN_ROOT/logs/ramp.stdout" -e "$RUN_ROOT/logs/ramp.stderr" "$RUN_ROOT/ramp.pbs" > "$RUN_ROOT/qsub.stdout" 2> "$RUN_ROOT/qsub.stderr"
+QSUB_STATUS=$?
+set -e
+printf '%s\n' "$QSUB_STATUS" > "$RUN_ROOT/qsub.status"
+test "$QSUB_STATUS" = 0
+test "$(wc -l < "$RUN_ROOT/qsub.stdout" | tr -d ' ')" = 1
+JOBID="$(cat "$RUN_ROOT/qsub.stdout")"; test -n "$JOBID"; printf '%s\n' "$JOBID" > "$RUN_ROOT/jobid.txt"
+for poll in $(seq 1 120); do
+  stamp="$(date --iso-8601=seconds)"; query="$RUN_ROOT/qstat-$poll.txt"
+  set +e; qstat -xf "$JOBID" > "$query" 2>&1; QUERY_STATUS=$?; set -e
+  printf '%s status=%s file=%s\n' "$stamp" "$QUERY_STATUS" "$(basename "$query")" >> "$RUN_ROOT/qstat-observations.txt"
+  test "$QUERY_STATUS" = 0
+  cp "$query" "$RUN_ROOT/qstat-last-success.txt"
+  STATE="$(awk -F= '/^[[:space:]]*job_state[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$query")"
+  test "$(awk -F= '/^[[:space:]]*queue[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$query")" = debug
+  test "$(awk -F= '/^[[:space:]]*run_count[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$query")" = 1
+  grep -Eq 'Resource_List.select = 1:system=polaris' "$query"
+  case "$STATE" in F) break ;; Q|R|B|E|W|T|S) sleep 30 ;; *) exit 1 ;; esac
 done
-EXIT_STATUS="$(awk -F= '/^[[:space:]]*Exit_status[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "$RUN_ROOT/qstat-final.txt")"
-test "$EXIT_STATUS" = 0
-```
+test "$STATE" = F
+test "$(awk -F= '/^[[:space:]]*Exit_status[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$query")" = 0
+/home/rhu/.venvs/deepqmc-jax083-edf373e7/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/artifact-inventory.jsonl" --ramp-required --required ramp-inputs.env --required ramp.pbs --required input-inventory.sha256 --required qsub.stdout --required qsub.stderr --required qsub.status --required jobid.txt --required qstat-observations.txt --required qstat-last-success.txt --required logs/ramp.stdout --required logs/ramp.stderr
+~~~
 
-`qsub` must produce one nonempty PBS job identifier; otherwise do not submit
-again.  The runner performs no SSH.  The PBS script asserts
-`PBS_QUEUE=debug`, makes all producer/interpreter/source checks, and uses a
-pre-existing `-o/-e` directory.  It records each child exit status, waits for
-already-launched siblings without cancellation, and prevents FermiNet launch
-when the DeepQMC wave fails.
+PBS writes artifact-inventory.partial.jsonl on every exit. The final command
+writes the complete deterministic inventory: fixed relative paths, size,
+SHA-256, missing status; it excludes itself and fails on a gap. Handoff is
+both inventories, raw qsub output/status, append-only qstat responses, inputs,
+PBS bytes/logs, all row logs/receipts/device bindings/timings/configs/native
+artifacts, and ramp.complete only after mechanical success.
 
-## PBS behavior and handoff
+## Verification mode and required controls
 
-`h-atom-r1-ramp.pbs` owns the zero-judgement execution.  It creates exactly
-one row directory once; verifies the resolved/native artifacts after each row;
-records `receipt/receipt.json` using `ramp_receipt.py`; then calls its gate.
-The gate refuses missing, mismatched, or nonzero row receipts.  This helper is
-pure standard library and its offline tests cover missing/failed rows and
-overwrite refusal; it makes no scientific claim.
+Verification uses a separate verifier-prepared fresh input/root. PBS accepts
+only BL_R1_MODE=verify, decimal BL_R1_VERIFY_STEPS from 1 to 100, and optional
+exact BL_R1_VERIFY_INJECT_FAIL. It changes only producer step count and a
+post-producer injected row failure. Normal submission asserts all three unset
+and PBS records mode real, so verification cannot remain accidentally enabled.
 
-The runner hands the analyst and orchestrator, without grading them:
+Success mini-ramp replaces only qsub invocation after normal setup:
 
-- `ramp-inputs.env`, `input-inventory.sha256`, `jobid.txt`, `qstat-final.txt`,
-  PBS stdout/stderr, PBS script, and the pre-freeze receipt;
-- the five row stdout/stderr, timing files, receipts, resolved configs,
-  DeepQMC `result.h5`, and FermiNet `train_stats.csv`; and
-- `ramp.complete` only if every mechanical gate passed.
+~~~bash
+export BL_R1_MODE=verify BL_R1_VERIFY_STEPS=10
+unset BL_R1_VERIFY_INJECT_FAIL
+qsub -v RUN_ROOT,SOURCE_CHECKOUT,RUNBOOK_COMMIT,SCIENCE,PRE_FREEZE_RECEIPT,PRE_FREEZE_RECEIPT_SHA256,BL_R1_MODE,BL_R1_VERIFY_STEPS -o "$RUN_ROOT/logs/ramp.stdout" -e "$RUN_ROOT/logs/ramp.stderr" "$RUN_ROOT/ramp.pbs"
+~~~
 
-The analyst may calculate seconds/step from each timing file.  The
-orchestrator must issue a new plan before any later run.  On every missing
-artifact, nonfinite value, nonzero child status, failed gate, scheduler
-deviation, or missing terminal `qstat` record: stop and report; do not repair,
-retry, resubmit, cancel, or delete.  After PR #725 merges, a separate approved
-collection stage may use `trajectory.py`; it is outside this ramp.
+Failing-row control adds export BL_R1_VERIFY_INJECT_FAIL=deepqmc-default-seed0
+and that variable to qsub -v. Expected: failed DeepQMC receipt, no
+ferminet-gate.json, no ramp.complete, preserved partial inventory.
+
+Existing-root control: verifier input names an existing RUN_ROOT; mkdir
+"$RUN_ROOT" must fail before qsub. Wrong-producer-SHA control, read-only and
+no submit, must fail:
+
+~~~bash
+test "$(git -C /home/rhu/src/deepqmc-edf373e7 rev-parse HEAD)" = 0000000000000000000000000000000000000000
+~~~
+
+Malformed-FermiNet-trace control must fail:
+
+~~~bash
+printf 'step,energy,ewmean,ewvar,pmove\n0,-0.5,-0.5,0.1,0.5\n1,,,,\n' > "$RUN_ROOT/malformed-train_stats.csv"
+! /home/rhu/.venvs/deepqmc-jax083-edf373e7/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" validate-ferminet-trace --path "$RUN_ROOT/malformed-train_stats.csv" --steps 2
+~~~
+
+After success and all four controls, the verifier records commands, statuses,
+head, cluster artifacts, and resolved DeepQMC fixtures before merge review.

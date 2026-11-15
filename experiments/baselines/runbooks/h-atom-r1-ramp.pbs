@@ -5,9 +5,6 @@
 #PBS -l walltime=01:00:00
 #PBS -l filesystems=home:eagle
 #PBS -k doe
-#
-# This file is copied from the verified SOURCE_CHECKOUT.  It relies only on the
-# qsub -v variables named in h-atom-r1.md.  Any failed assertion is terminal.
 set -euo pipefail
 
 test "${PBS_QUEUE:?missing PBS_QUEUE}" = debug
@@ -30,178 +27,146 @@ test "$(git -C "$DQ_SRC" rev-parse HEAD)" = edf373e7c26545616f87b3b10c3e48b25c70
 test -z "$(git -C "$DQ_SRC" status --porcelain=v1)"
 test "$(git -C "$FN_SRC" rev-parse HEAD)" = f4b1846cd6f2776321b09b027d4d5506ae98e19b
 test -z "$(git -C "$FN_SRC" status --porcelain=v1)"
-for path in "$DQ_PY" "$DQ" "$FN_PY" "$FN_SRC/ferminet/main.py" "$RECEIPT_HELPER"; do
-  test -e "$path"
-done
+for path in "$DQ_PY" "$DQ" "$FN_PY" "$FN_SRC/ferminet/main.py" "$RECEIPT_HELPER"; do test -e "$path"; done
+
+MODE="${BL_R1_MODE:-real}"
+case "$MODE" in
+  real)
+    test -z "${BL_R1_VERIFY_STEPS+x}"
+    test -z "${BL_R1_VERIFY_INJECT_FAIL+x}"
+    STEPS=1000; INJECT_FAIL= ;;
+  verify)
+    test -n "${BL_R1_VERIFY_STEPS:?verification requires BL_R1_VERIFY_STEPS}"
+    case "$BL_R1_VERIFY_STEPS" in *[!0-9]*|'') exit 2 ;; esac
+    test "$BL_R1_VERIFY_STEPS" -ge 1 && test "$BL_R1_VERIFY_STEPS" -le 100
+    STEPS="$BL_R1_VERIFY_STEPS"; INJECT_FAIL="${BL_R1_VERIFY_INJECT_FAIL:-}"
+    case "$INJECT_FAIL" in
+      ''|deepqmc-default-seed0|deepqmc-ferminet-seed0|deepqmc-psiformer-seed0|ferminet-codebase-ferminet-seed0|ferminet-codebase-psiformer-seed0) ;;
+      *) exit 2 ;;
+    esac ;;
+  *) exit 2 ;;
+esac
+printf '{"mode":"%s","steps":%s,"inject_fail":"%s"}\n' "$MODE" "$STEPS" "$INJECT_FAIL" > "$RUN_ROOT/ramp/mode.json"
 
 "$DQ_PY" - "$DQ_SRC" <<'PY'
-import pathlib
-import sys
-import deepqmc
-import jax
+import pathlib, sys, deepqmc, jax
 expected = pathlib.Path(sys.argv[1]).resolve()
 assert sys.prefix == '/home/rhu/.venvs/deepqmc-jax083-edf373e7'
 assert jax.__version__ == '0.8.3'
 assert pathlib.Path(deepqmc.__file__).resolve().is_relative_to(expected)
 PY
 PYTHONPATH="$FN_SRC${PYTHONPATH:+:$PYTHONPATH}" "$FN_PY" - "$FN_SRC" <<'PY'
-import pathlib
-import sys
-import ferminet
-import jax
+import pathlib, sys, ferminet, jax
 expected = pathlib.Path(sys.argv[1]).resolve()
 assert sys.prefix == '/home/rhu/.venvs/ferminet-jax092-60c9fab3'
 assert jax.__version__ == '0.9.2'
 assert pathlib.Path(ferminet.__file__).resolve().is_relative_to(expected)
-assert any(device.platform == 'gpu' for device in jax.devices())
 PY
 nvidia-smi --query-gpu=name,uuid --format=csv,noheader > "$RUN_ROOT/ramp/gpu-inventory.txt"
 
-PIDS=()
-ROWS=()
+write_partial_inventory() {
+  set +e
+  "$DQ_PY" "$RECEIPT_HELPER" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/ramp/artifact-inventory.partial.jsonl" --ramp-required > "$RUN_ROOT/ramp/artifact-inventory.partial.stdout" 2> "$RUN_ROOT/ramp/artifact-inventory.partial.stderr"
+  return 0
+}
+on_exit() { local rc=$?; write_partial_inventory; exit "$rc"; }
+trap on_exit EXIT
+
+assert_one_gpu() {
+  local interpreter="$1" output="$2"
+  "$interpreter" - "$output" <<'PY'
+import json, os, pathlib, jax
+devices = jax.local_devices()
+assert len(devices) == 1
+device = devices[0]
+assert device.platform == 'gpu'
+pathlib.Path(os.sys.argv[1]).write_text(json.dumps({'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'), 'device_count': len(devices), 'platform': device.platform, 'id': device.id, 'kind': device.device_kind}, sort_keys=True) + '\n')
+PY
+}
+maybe_inject_failure() {
+  local row="$1"
+  if test "$MODE" = verify && test "$INJECT_FAIL" = "$row"; then printf 'intentional BL-R1 verification failure: %s\n' "$row" >&2; return 97; fi
+}
+PIDS=(); ROWS=()
 
 launch_dq() {
-  local row="$1"
-  local task="$2"
-  local ansatz="$3"
-  local gpu="$4"
-  local root="$RUN_ROOT/ramp/$row"
+  local row="$1" task="$2" ansatz="$3" gpu="$4" root="$RUN_ROOT/ramp/$1"
   mkdir "$root"
   (
     export CUDA_VISIBLE_DEVICES="$gpu"
+    assert_one_gpu "$DQ_PY" "$root/backend.json"
     date --iso-8601=seconds > "$root/start.txt"
     cd "$root"
-    "$DQ" hydra.run.dir="$root" hamil/mol=H task="$task" ansatz="$ansatz" \
-      task.seed=0 task.steps=1000 task.electron_batch_size=4096 \
-      task.pretrain_steps=0 +task.max_restarts=1
+    "$DQ" hydra.run.dir="$root" hamil/mol=H task="$task" ansatz="$ansatz" task.seed=0 task.steps="$STEPS" task.electron_batch_size=4096 task.pretrain_steps=0 +task.max_restarts=1
     date --iso-8601=seconds > "$root/end.txt"
-    "$DQ_PY" - "$root" "$task" "$ansatz" <<'PY'
-import math
-import pathlib
-import sys
-import h5py
-import yaml
-root = pathlib.Path(sys.argv[1])
-task = sys.argv[2]
-ansatz = sys.argv[3]
-cfg = yaml.safe_load((root / '.hydra' / 'config.yaml').read_text())
-overrides = (root / '.hydra' / 'overrides.yaml').read_text().splitlines()
+    "$DQ_PY" - "$root" "$task" "$ansatz" "$STEPS" <<'PY'
+import math, pathlib, sys, h5py, yaml
+root = pathlib.Path(sys.argv[1]); task, ansatz, steps = sys.argv[2], sys.argv[3], int(sys.argv[4])
+training = root / 'training'
+cfg = yaml.safe_load((training / '.hydra' / 'config.yaml').read_text())
+overrides = (training / '.hydra' / 'overrides.yaml').read_text().splitlines()
 assert f'- task={task}' in overrides and f'- ansatz={ansatz}' in overrides
-assert cfg['task']['seed'] == 0 and cfg['task']['steps'] == 1000
-assert cfg['task']['electron_batch_size'] == 4096 and cfg['task']['pretrain_steps'] == 0
-assert cfg['task']['max_restarts'] == 1
-hamil = cfg['hamil']
-assert hamil['charges'] == [1] and hamil['charge'] == 0 and hamil['spin'] == 1
-assert hamil['coords'] == [[0.0, 0.0, 0.0]]
-with h5py.File(root / 'result.h5', 'r') as result:
+assert cfg['task']['seed'] == 0 and cfg['task']['steps'] == steps
+assert cfg['task']['electron_batch_size'] == 4096 and cfg['task']['pretrain_steps'] == 0 and cfg['task']['max_restarts'] == 1
+mol = cfg['hamil']['mol']
+assert mol['charges'] == [1] and mol['charge'] == 0 and mol['spin'] == 1 and mol['coords'] == [[0.0, 0.0, 0.0]]
+with h5py.File(training / 'result.h5', 'r') as result:
     for name in ('local_energy/mean', 'local_energy/std'):
         values = result[name][...].reshape(-1)
-        assert len(values) == 1000 and all(math.isfinite(float(x)) for x in values)
+        assert len(values) == steps and all(math.isfinite(float(x)) for x in values)
 PY
+    maybe_inject_failure "$row"
   ) >"$root/stdout.log" 2>"$root/stderr.log" &
 }
 
 launch_fn() {
-  local row="$1"
-  local ansatz="$2"
-  local gpu="$3"
-  local root="$RUN_ROOT/ramp/$row"
+  local row="$1" ansatz="$2" gpu="$3" root="$RUN_ROOT/ramp/$1"
   mkdir "$root"
   (
     export CUDA_VISIBLE_DEVICES="$gpu"
+    assert_one_gpu "$FN_PY" "$root/backend.json"
     date --iso-8601=seconds > "$root/start.txt"
-    PYTHONPATH="$FN_SRC${PYTHONPATH:+:$PYTHONPATH}" "$FN_PY" - \
-      "$SOURCE_CHECKOUT/experiments/baselines/runbooks/configs/ferminet_h_atom.py" \
-      "$ansatz" "$root/resolved-config.json" <<'PY'
-import importlib.util
-import json
-import pathlib
-import sys
+    PYTHONPATH="$FN_SRC${PYTHONPATH:+:$PYTHONPATH}" "$FN_PY" - "$SOURCE_CHECKOUT/experiments/baselines/runbooks/configs/ferminet_h_atom.py" "$ansatz" "$root/resolved-config.json" "$STEPS" <<'PY'
+import importlib.util, json, pathlib, sys
 from ferminet import base_config
-config_path = pathlib.Path(sys.argv[1])
-ansatz = sys.argv[2]
-output = pathlib.Path(sys.argv[3])
+config_path = pathlib.Path(sys.argv[1]); ansatz, output, steps = sys.argv[2], pathlib.Path(sys.argv[3]), int(sys.argv[4])
 spec = importlib.util.spec_from_file_location('bl_r1_ferminet_config', config_path)
-module = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(module)
+module = importlib.util.module_from_spec(spec); assert spec.loader is not None; spec.loader.exec_module(module)
 cfg = module.get_config()
-cfg.batch_size = 4096
-cfg.optim.iterations = 1000
-cfg.network.network_type = ansatz
-cfg.network.determinants = 16
-cfg.debug.deterministic = True
-cfg.debug.seed = 0
-cfg.debug.check_nan = True
-cfg.optim.reset_if_nan = False
-cfg.pretrain.iterations = 0
-cfg = base_config.resolve(cfg)
-atom = cfg.system.molecule[0]
-assert atom.charge == 1 and tuple(atom.coords) == (0, 0, 0)
-assert tuple(cfg.system.electrons) == (1, 0)
-assert cfg.batch_size == 4096 and cfg.optim.iterations == 1000
-assert cfg.network.network_type == ansatz and cfg.debug.seed == 0
-assert cfg.debug.check_nan is True and cfg.optim.reset_if_nan is False
-assert cfg.pretrain.iterations == 0
-pathlib.Path(output).write_text(json.dumps({
-    'atom_charge': atom.charge, 'atom_coords': list(atom.coords),
-    'electrons': list(cfg.system.electrons), 'batch_size': cfg.batch_size,
-    'iterations': cfg.optim.iterations, 'network_type': cfg.network.network_type,
-    'seed': cfg.debug.seed, 'check_nan': cfg.debug.check_nan,
-    'reset_if_nan': cfg.optim.reset_if_nan, 'pretrain_iterations': cfg.pretrain.iterations,
-}, sort_keys=True) + '\n')
+cfg.batch_size=4096; cfg.optim.iterations=steps; cfg.network.network_type=ansatz; cfg.network.determinants=16
+cfg.debug.deterministic=True; cfg.debug.seed=0; cfg.debug.check_nan=True; cfg.optim.reset_if_nan=False; cfg.pretrain.iterations=0
+cfg = base_config.resolve(cfg); atom = cfg.system.molecule[0]
+assert atom.charge == 1 and tuple(atom.coords) == (0, 0, 0) and tuple(cfg.system.electrons) == (1, 0)
+assert cfg.batch_size == 4096 and cfg.optim.iterations == steps and cfg.network.network_type == ansatz and cfg.debug.seed == 0
+assert cfg.debug.check_nan is True and cfg.optim.reset_if_nan is False and cfg.pretrain.iterations == 0
+output.write_text(json.dumps({'atom_charge': atom.charge, 'atom_coords': list(atom.coords), 'electrons': list(cfg.system.electrons), 'batch_size': cfg.batch_size, 'iterations': cfg.optim.iterations, 'network_type': cfg.network.network_type, 'seed': cfg.debug.seed, 'check_nan': cfg.debug.check_nan, 'reset_if_nan': cfg.optim.reset_if_nan, 'pretrain_iterations': cfg.pretrain.iterations}, sort_keys=True) + '\n')
 PY
-    PYTHONPATH="$FN_SRC${PYTHONPATH:+:$PYTHONPATH}" "$FN_PY" "$FN_SRC/ferminet/main.py" \
-      --config "$SOURCE_CHECKOUT/experiments/baselines/runbooks/configs/ferminet_h_atom.py" \
-      --config.batch_size 4096 --config.optim.iterations 1000 \
-      --config.network.network_type "$ansatz" --config.network.determinants 16 \
-      --config.debug.deterministic True --config.debug.seed 0 \
-      --config.debug.check_nan True --config.optim.reset_if_nan False \
-      --config.pretrain.iterations 0 --config.log.save_path "$root"
+    PYTHONPATH="$FN_SRC${PYTHONPATH:+:$PYTHONPATH}" "$FN_PY" "$FN_SRC/ferminet/main.py" --config "$SOURCE_CHECKOUT/experiments/baselines/runbooks/configs/ferminet_h_atom.py" --config.batch_size 4096 --config.optim.iterations "$STEPS" --config.network.network_type "$ansatz" --config.network.determinants 16 --config.debug.deterministic True --config.debug.seed 0 --config.debug.check_nan True --config.optim.reset_if_nan False --config.pretrain.iterations 0 --config.log.save_path "$root"
     date --iso-8601=seconds > "$root/end.txt"
-    "$FN_PY" - "$root/train_stats.csv" <<'PY'
-import csv
-import math
-import pathlib
-import sys
-rows = list(csv.DictReader(pathlib.Path(sys.argv[1]).open()))
-assert [int(row['step']) for row in rows] == list(range(1000))
-for row in rows:
-    for value in row.values():
-        if value not in ('', None):
-            assert math.isfinite(float(value))
-PY
+    "$DQ_PY" "$RECEIPT_HELPER" validate-ferminet-trace --path "$root/train_stats.csv" --steps "$STEPS"
+    maybe_inject_failure "$row"
   ) >"$root/stdout.log" 2>"$root/stderr.log" &
 }
 
 wait_and_gate() {
-  local i rc row
+  local gate_output="$1" i rc row
   local -a gate_args=()
   for i in "${!PIDS[@]}"; do
     row="${ROWS[$i]}"
-    set +e
-    wait "${PIDS[$i]}"
-    rc=$?
-    set -e
-    "$DQ_PY" "$RECEIPT_HELPER" record \
-      --path "$RUN_ROOT/ramp/$row/receipt/receipt.json" --row "$row" --returncode "$rc"
+    set +e; wait "${PIDS[$i]}"; rc=$?; set -e
+    "$DQ_PY" "$RECEIPT_HELPER" record --path "$RUN_ROOT/ramp/$row/receipt.json" --row "$row" --returncode "$rc"
     gate_args+=(--row "$row")
   done
-  "$DQ_PY" "$RECEIPT_HELPER" gate --root "$RUN_ROOT/ramp" "${gate_args[@]}" > "$RUN_ROOT/ramp/gate.json"
+  "$DQ_PY" "$RECEIPT_HELPER" gate --root "$RUN_ROOT/ramp" "${gate_args[@]}" > "$gate_output"
 }
 
 launch_dq deepqmc-default-seed0 train default 0; PIDS+=("$!"); ROWS+=(deepqmc-default-seed0)
 launch_dq deepqmc-ferminet-seed0 train_ferminet ferminet 1; PIDS+=("$!"); ROWS+=(deepqmc-ferminet-seed0)
 launch_dq deepqmc-psiformer-seed0 train_psiformer psiformer 2; PIDS+=("$!"); ROWS+=(deepqmc-psiformer-seed0)
-wait_and_gate
-
-PIDS=()
-ROWS=()
+wait_and_gate "$RUN_ROOT/ramp/deepqmc-gate.json"
+PIDS=(); ROWS=()
 launch_fn ferminet-codebase-ferminet-seed0 ferminet 0; PIDS+=("$!"); ROWS+=(ferminet-codebase-ferminet-seed0)
 launch_fn ferminet-codebase-psiformer-seed0 psiformer 1; PIDS+=("$!"); ROWS+=(ferminet-codebase-psiformer-seed0)
-wait_and_gate
-
-for row in "$RUN_ROOT"/ramp/*-seed0; do
-  printf 'start=%s\nend=%s\nsteps=1000\n' "$(cat "$row/start.txt")" "$(cat "$row/end.txt")" > "$row/timing.txt"
-done
-printf 'RAMP_COMPLETE job=%s queue=%s\n' "$PBS_JOBID" "$PBS_QUEUE" > "$RUN_ROOT/ramp/ramp.complete"
+wait_and_gate "$RUN_ROOT/ramp/ferminet-gate.json"
+for row in "$RUN_ROOT"/ramp/*-seed0; do printf 'start=%s\nend=%s\nsteps=%s\n' "$(cat "$row/start.txt")" "$(cat "$row/end.txt")" "$STEPS" > "$row/timing.txt"; done
+printf 'RAMP_COMPLETE job=%s queue=%s mode=%s steps=%s\n' "$PBS_JOBID" "$PBS_QUEUE" "$MODE" "$STEPS" > "$RUN_ROOT/ramp/ramp.complete"
