@@ -8,7 +8,7 @@ import pytest
 
 from experiments.baselines.adapters import ferminet
 from experiments.baselines.errors import AdapterError
-from experiments.baselines.trajectory import main, read_trajectory, summarize
+from experiments.baselines.trajectory import main, read_trajectory, summarize, write_csv
 
 
 def _write_ferminet(path: Path) -> None:
@@ -130,6 +130,49 @@ def test_deepqmc_without_steps_uses_observation_index(tmp_path: Path):
     assert [row.step for row in rows] == [0, 1]
     assert rows.step_basis == "observation_index"
     assert summarize(rows)["step_basis"] == "observation_index"
+
+
+@pytest.mark.parametrize("container", [lambda rows: rows[::1], lambda rows: rows.copy(), list])
+def test_summary_preserves_observation_basis_for_row_containers(tmp_path: Path, container):
+    h5py = pytest.importorskip("h5py", reason="h5py is not a TPEN dependency")
+    training = tmp_path / "training"
+    training.mkdir()
+    with h5py.File(training / "result.h5", "w") as handle:
+        handle.create_dataset("local_energy/mean", data=[-1.0, -2.0])
+        handle.create_dataset("local_energy/std", data=[1.0, 0.5])
+    rows = read_trajectory("deepqmc", tmp_path)
+    assert summarize(container(rows))["step_basis"] == "observation_index"
+
+
+def test_csv_export_carries_step_basis_per_row(tmp_path: Path):
+    h5py = pytest.importorskip("h5py", reason="h5py is not a TPEN dependency")
+    training = tmp_path / "training"
+    training.mkdir()
+    with h5py.File(training / "result.h5", "w") as handle:
+        handle.create_dataset("local_energy/mean", data=[-1.0, -2.0])
+        handle.create_dataset("local_energy/std", data=[1.0, 0.5])
+    rows = read_trajectory("deepqmc", tmp_path)
+    csv_path = tmp_path / "trajectory.csv"
+    write_csv(rows, csv_path)
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        exported = list(csv.DictReader(handle))
+    assert [row["step_basis"] for row in exported] == ["observation_index", "observation_index"]
+
+
+def test_summary_refuses_mixed_step_bases(tmp_path: Path):
+    h5py = pytest.importorskip("h5py", reason="h5py is not a TPEN dependency")
+    training = tmp_path / "training"
+    training.mkdir()
+    with h5py.File(training / "result.h5", "w") as handle:
+        handle.create_dataset("local_energy/mean", data=[-1.0])
+        handle.create_dataset("local_energy/std", data=[1.0])
+    observation_rows = read_trajectory("deepqmc", tmp_path)
+    ferminet_dir = tmp_path / "ferminet"
+    ferminet_dir.mkdir()
+    _write_ferminet(ferminet_dir / ferminet.TRAIN_STATS_FILENAME)
+    optimizer_rows = read_trajectory("ferminet", ferminet_dir)
+    with pytest.raises(AdapterError, match="mixed step_basis"):
+        summarize([observation_rows[0], optimizer_rows[0]])
 
 
 def test_ferminet_sparse_steps_have_optimizer_basis_and_strict_summary_json(tmp_path: Path):
