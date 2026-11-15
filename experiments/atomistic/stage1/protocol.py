@@ -278,6 +278,12 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
     else:
         expected.update({f"sampler.n_walkers={row['walkers']}",
                          f"trainer.max_steps={row['updates']}"})
+        if row.get("checkpoint_steps"):
+            steps = ",".join(str(step) for step in row["checkpoint_steps"])
+            expected.update({
+                "callbacks.4.schedule._target_=tpen.checkpoint.ExplicitUpdates",
+                f"callbacks.4.schedule.updates=[{steps}]",
+            })
     override_map: dict[str, str] = {}
     for override in overrides:
         key, separator, value = override.partition("=")
@@ -314,26 +320,40 @@ def physical_system_id_from_config(config_path: str | Path) -> str:
                   if item.get("id") == cfg.system.id), None)
     if entry is None:
         raise ProtocolError(f"system {cfg.system.id!r} is absent from the baseline registry")
-    for key, actual in (("n_up", cfg.system.spin.n_up),
-                        ("n_down", cfg.system.spin.n_down),
-                        ("spatial_dim", cfg.system.spatial_dim)):
+    particle = descriptor.particle
+    for key, actual in (("n_up", particle.n_spin_up),
+                        ("n_down", particle.n_spin_down),
+                        ("spatial_dim", particle.spatial_dim)):
         if entry.get(key) != actual:
-            raise ProtocolError(f"configured {key} disagrees with registry for {cfg.system.id}")
+            raise ProtocolError(f"descriptor {key} disagrees with registry for {cfg.system.id}")
+    if entry.get("n_up", 0) + entry.get("n_down", 0) != particle.n_electrons:
+        raise ProtocolError(f"descriptor particle count disagrees with registry for {cfg.system.id}")
     registry_terms = entry.get("hamiltonian", {}).get("terms", [])
-    configured_names = set(descriptor.terms and [term.slot for term in descriptor.terms])
+    configured_names = {term.slot for term in descriptor.terms}
     registry_names = {term.get("term") for term in registry_terms}
-    if not registry_names.issubset(configured_names):
-        raise ProtocolError(f"configured Hamiltonian disagrees with registry for {cfg.system.id}")
+    if configured_names != registry_names:
+        raise ProtocolError(f"descriptor operator set disagrees with registry for {cfg.system.id}")
+    descriptor_by_slot = {term.slot: term for term in descriptor.terms}
+    for registry_term in registry_terms:
+        slot = registry_term.get("term")
+        descriptor_term = descriptor_by_slot[slot]
+        if slot == "harmonic_trap" and descriptor_term.parameters.get("omega") != float(registry_term["omega"]):
+            raise ProtocolError(f"descriptor trap omega disagrees with registry for {cfg.system.id}")
     expected_nuclei = [term for term in registry_terms if term.get("term") == "electron_nucleus"]
     if expected_nuclei:
         nuclei = expected_nuclei[0].get("nuclei", [])
-        actual_positions = list(cfg.system.nuclei.positions)
-        actual_charges = list(cfg.system.nuclei.charges)
-        if len(nuclei) != len(actual_positions) or [float(n["charge"]) for n in nuclei] != actual_charges:
-            raise ProtocolError(f"configured nuclear geometry disagrees with registry for {cfg.system.id}")
-        for expected, actual in zip(nuclei, actual_positions):
-            if list(expected.get("position_bohr", [])) != list(actual):
-                raise ProtocolError(f"configured nuclear geometry disagrees with registry for {cfg.system.id}")
+        resources = list(descriptor.resources.values())
+        if len(resources) != 1:
+            raise ProtocolError(f"descriptor nuclear resources disagree with registry for {cfg.system.id}")
+        resource = resources[0]
+        actual_positions = resource.positions.detach().cpu().tolist()
+        actual_charges = resource.charges.detach().cpu().tolist()
+        expected_positions = [list(n.get("position_bohr", [])) for n in nuclei]
+        expected_charges = [float(n["charge"]) for n in nuclei]
+        if actual_positions != expected_positions or actual_charges != expected_charges:
+            raise ProtocolError(f"descriptor nuclear geometry disagrees with registry for {cfg.system.id}")
+    elif any(term.resource is not None for term in descriptor.terms):
+        raise ProtocolError(f"descriptor has an unexpected nuclear resource for {cfg.system.id}")
     system_id = descriptor.system_id()
     if not isinstance(system_id, str) or not _SHA256.fullmatch(system_id):
         raise ProtocolError("configured system descriptor did not produce a SHA-256 ID")
@@ -401,6 +421,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
                 "run_id": f"train-lineage-{lineage}",
                 "updates": protocol.lineage_updates,
                 "walkers": protocol.lineage_walkers,
+                "checkpoint_steps": list(checkpoints),
             })
             train_row = rows[-1]
             for checkpoint in checkpoints:

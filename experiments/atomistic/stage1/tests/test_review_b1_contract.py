@@ -67,6 +67,17 @@ def test_physical_id_rejects_registry_physics_mismatch(
         physical_system_id_from_config(mutated)
 
 
+def test_physical_id_rejects_descriptor_operator_set_mismatch(tmp_path: Path) -> None:
+    source = _config("h2")
+
+    def remove_nuclear_repulsion(cfg) -> None:
+        del cfg.hamiltonian_terms.nucleus_nucleus
+
+    mutated = _copy_config(source, tmp_path / "h2-missing-term.yaml", remove_nuclear_repulsion)
+    with pytest.raises(ProtocolError, match="operator set"):
+        physical_system_id_from_config(mutated)
+
+
 @pytest.mark.parametrize("system", SYSTEMS)
 def test_physical_id_ignores_run_and_evaluation_budget_changes(
     system: str, tmp_path: Path

@@ -26,8 +26,16 @@ cross-check, never the source of the physical hash.
 Known deviations from the source studies are the shared Stage-1 defaults:
 four channels/one layer, CPU device, 256 train walkers, 4096 eval walkers,
 and 256 retained draws. Run-slice overrides may select approved science
-budgets. H2 retains the two-center R=1.4-bohr geometry, and He retains the
-two-electron Coulomb Hamiltonian. No Hooke pair config is included.
+budgets. The one-electron Hooke route uses the h-v2-style one-electron model
+at four channels/one layer and adds the required fixed GaussianConfinement
+with alpha=0.25 (omega/2); it has no electron-electron cusp. He retains the
+he-v1 trainable electron-electron ranges, curvature cusp (coefficient 0.01,
+range 1.0), and trainable Pfaffian readout, while reducing width and runtime
+budgets. H2 follows h2-v1's two-electron cusp/readout route, with the same
+width and runtime reductions. H2 retains the two-center R=1.4-bohr geometry,
+and He retains the two-electron Coulomb Hamiltonian. No Hooke pair config is
+included. Train checkpoint callbacks use ExplicitUpdates; launch overrides
+bind each callback to exactly the manifest row's planned checkpoint steps.
 
 `plan.py` writes a manifest only. `launch.py` renders a script only; submission
 is an explicit operator action. The generated script requires Slurm, checks the

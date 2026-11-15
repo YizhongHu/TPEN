@@ -28,3 +28,32 @@ def test_eval_config_selects_v2_descriptor_and_naive_evaluator(system: str) -> N
 def test_planner_identity_is_descriptor_content_id(system: str) -> None:
     config = ROOT / system / "eval.yaml"
     assert physical_system_id_from_config(config) == instantiate(load_config(str(config)).system_descriptor).system_id()
+
+
+@pytest.mark.parametrize("system", ["hooke1", "he", "h2"])
+def test_train_config_declares_checkpoint_publication(system: str) -> None:
+    cfg = load_config(str(ROOT / system / "train.yaml"))
+    checkpoints = [entry for entry in cfg.callbacks
+                   if entry.get("_target_") == "tpen.callback.Checkpoint"]
+    assert len(checkpoints) == 1
+    assert checkpoints[0].output_dir == "${run.dir}/checkpoints"
+    assert checkpoints[0].schedule._target_ == "tpen.checkpoint.ExplicitUpdates"
+
+
+@pytest.mark.parametrize("system", ["hooke1", "he"])
+def test_accepted_variational_settings_match_train_and_eval(system: str) -> None:
+    train = load_config(str(ROOT / system / "train.yaml"))
+    eval_cfg = load_config(str(ROOT / system / "eval.yaml"))
+    assert OmegaConf.to_container(train.model, resolve=True) == OmegaConf.to_container(
+        eval_cfg.model, resolve=True
+    )
+    if system == "hooke1":
+        assert train.model.factors[0]._target_ == "tpen.nn.GaussianConfinement"
+        assert train.model.factors[0].coefficient == 0.25
+        assert train.model.factors[0].trainable is False
+    else:
+        assert train.model.factors[0].trainable_range is True
+        assert train.model.factors[1].law.curvature_coefficient == 0.01
+        assert train.model.factors[1].law.curvature_range == 1.0
+        assert train.model.factors[1].law.trainable is True
+        assert train.model.readout.trainable is True
