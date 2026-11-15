@@ -71,7 +71,9 @@ def test_physical_id_rejects_descriptor_operator_set_mismatch(tmp_path: Path) ->
     source = _config("h2")
 
     def remove_nuclear_repulsion(cfg) -> None:
-        del cfg.hamiltonian_terms.nucleus_nucleus
+        terms = OmegaConf.to_container(cfg.hamiltonian_terms, resolve=False)
+        del terms["nucleus_nucleus"]
+        cfg.system_descriptor.terms = terms
 
     mutated = _copy_config(source, tmp_path / "h2-missing-term.yaml", remove_nuclear_repulsion)
     with pytest.raises(ProtocolError, match="operator set"):
