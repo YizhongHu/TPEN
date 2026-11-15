@@ -72,7 +72,8 @@ class AttachedAllocation:
         AttemptFence
             Fence bound to this allocation and store.
         """
-        return self.store.begin_attempt(group, task_id, self.allocation, started_at_utc, transport_kind)
+        begin_kwargs = {} if transport_kind == "local" else {"transport_kind": transport_kind}
+        return self.store.begin_attempt(group, task_id, self.allocation, started_at_utc, **begin_kwargs)
 
     def finish(self, fence: AttemptFence, status: str, finished_at_utc: str, result_digest: str | None = None) -> OutcomeReceipt:
         """Finish one task attempt owned by this attached allocation.

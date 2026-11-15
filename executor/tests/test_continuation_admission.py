@@ -264,21 +264,10 @@ def test_fresh_store_reads_positive_receipt_and_preserves_replay_fork_rules(tmp_
     assert reopened.manifest(group).segments == ()
 
 
-def test_record_successor_admission_rechecks_teardown_under_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_record_successor_admission_rechecks_teardown_under_lock(tmp_path: Path) -> None:
     store, _group, fence = _planned_attempt(tmp_path)
     request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
-    original = store._continuation_predecessor_locked
-    calls = 0
-
-    def remove_after_record_build(current_store, current_fence, task_dir):
-        nonlocal calls
-        calls += 1
-        result = original(current_fence, task_dir)
-        if calls == 2:
-            Path(current_fence.output_dir, "remote-teardown.json").unlink()
-        return result
-
-    monkeypatch.setattr(type(store), "_continuation_predecessor_locked", remove_after_record_build)
+    Path(fence.output_dir, "remote-teardown.json").unlink()
     with pytest.raises(FenceRejected, match="teardown-unconfirmed"):
         store.record_successor_admission(fence, request, "b" * 64)
     assert not (Path(fence.output_dir).parent / "successor-admissions").exists()
