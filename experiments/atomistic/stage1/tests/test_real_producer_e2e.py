@@ -219,3 +219,9 @@ def test_real_train_eval_inspect_collect_chain_for_all_stage1_systems(
     wrong_physical_id["manifest_hash"] = manifest_hash(wrong_physical_id["rows"])
     with pytest.raises(CollectionError, match="physical system identity"):
         collect(wrong_physical_id)
+
+    wrong_checkpoint = json.loads(json.dumps(document))
+    wrong_checkpoint["rows"][0]["checkpoint_sha256"] = "0" * 64
+    wrong_checkpoint["manifest_hash"] = manifest_hash(wrong_checkpoint["rows"])
+    with pytest.raises(CollectionError, match="checkpoint"):
+        collect(wrong_checkpoint)
