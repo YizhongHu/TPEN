@@ -342,8 +342,8 @@ def test_record_successor_admission_rechecks_teardown_under_lock(
 
     def remove_proof_after_preliminary_build(self, locked_fence, task_dir):
         nonlocal predicate_calls
-        result = real_predicate(self, locked_fence, task_dir)
         predicate_calls += 1
+        result = real_predicate(self, locked_fence, task_dir)
         if predicate_calls == 1:
             receipt_path.unlink()
         return result

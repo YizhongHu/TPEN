@@ -405,7 +405,10 @@ def test_fresh_controller_refuses_quarantined_remote_attempt(
 
     gpu = "GPU-12345678-1234-1234-1234-123456789ABC"
     slot = AllocationSlot("slot-a", socket.gethostname(), (gpu,), (0,), (), ()).to_dict()
-    facts = {"slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": [slot]}}
+    facts = {
+        "slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": [slot]},
+        "scheduler": {"pbs_nodefile_text": f"{socket.gethostname()}\n"},
+    }
     root = tmp_path / "restarted-store"
     root.mkdir()
     allocation = ConfiguredAllocation(AllocationId("restart-allocation"), BackendJobId("restart-job"), facts)
