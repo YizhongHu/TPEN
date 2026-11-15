@@ -71,13 +71,33 @@ def test_physical_id_rejects_descriptor_operator_set_mismatch(tmp_path: Path) ->
     source = _config("h2")
 
     def remove_nuclear_repulsion(cfg) -> None:
-        terms = OmegaConf.to_container(cfg.hamiltonian_terms, resolve=False)
+        terms = OmegaConf.to_container(cfg.hamiltonian_terms, resolve=True)
         del terms["nucleus_nucleus"]
         cfg.system_descriptor.terms = terms
 
     mutated = _copy_config(source, tmp_path / "h2-missing-term.yaml", remove_nuclear_repulsion)
     with pytest.raises(ProtocolError, match="operator set"):
         physical_system_id_from_config(mutated)
+
+
+def test_physical_id_rejects_extra_descriptor_operator(tmp_path: Path) -> None:
+    source = _config("he")
+
+    def add_extra_term(cfg) -> None:
+        terms = OmegaConf.to_container(cfg.hamiltonian_terms, resolve=True)
+        terms["extra_trap"] = {
+            "_target_": "tpen.physics.potential.HarmonicTrap",
+            "omega": 0.5,
+        }
+        cfg.system_descriptor.terms = terms
+
+    mutated = _copy_config(source, tmp_path / "he-extra-term.yaml", add_extra_term)
+    with pytest.raises(ProtocolError, match="operator set"):
+        physical_system_id_from_config(mutated)
+
+
+def test_physical_id_accepts_registry_operator_set() -> None:
+    assert physical_system_id_from_config(_config("h2"))
 
 
 @pytest.mark.parametrize("system", SYSTEMS)
