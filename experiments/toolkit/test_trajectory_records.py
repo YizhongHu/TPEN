@@ -138,7 +138,7 @@ def test_real_v2_writer_reader_flows_into_stage1_collector(monkeypatch, tmp_path
         trajectory_records.inspect_trajectory_record(artifacts[0].metadata_path,
                                                      expected_resolved_config_identity=identity,
                                                      expected_checkpoint_sha256="f" * 64)
-    monkeypatch.setattr(stage1_collect, "inspect_run", lambda path: {
+    monkeypatch.setattr(stage1_collect, "inspect_eval_run", lambda path: {
         "verdict": "completed", "resolved_config_identity": identity, "source_git_sha": "a" * 40,
     })
     rows = [{"row_id": f"row-{stream}", "kind": "eval", "system_id": "he_atom",
