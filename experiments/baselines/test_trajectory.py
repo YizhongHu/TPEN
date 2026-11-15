@@ -67,3 +67,59 @@ def test_missing_trajectory_column_or_dataset_is_refused(tmp_path: Path):
     with pytest.raises(AdapterError, match="local_energy/std"):
         read_trajectory("deepqmc", tmp_path)
 
+
+@pytest.mark.parametrize(
+    ("mean_shape", "std_shape"),
+    [((2, 2, 1), (2, 2, 1)), ((2, 2, 1), (4, 1, 1))],
+)
+def test_deepqmc_rejects_molecule_state_axes_and_shape_mismatch(
+    tmp_path: Path, mean_shape: tuple[int, ...], std_shape: tuple[int, ...]
+):
+    h5py = pytest.importorskip("h5py", reason="h5py is not a TPEN dependency")
+    training = tmp_path / "training"
+    training.mkdir()
+    with h5py.File(training / "result.h5", "w") as handle:
+        handle.create_dataset("local_energy/mean", data=[-1.0] * 4, shape=mean_shape)
+        handle.create_dataset("local_energy/std", data=[1.0] * 4, shape=std_shape)
+    with pytest.raises(AdapterError):
+        read_trajectory("deepqmc", tmp_path)
+
+
+def test_deepqmc_singleton_axes_and_persisted_steps_are_metadata(tmp_path: Path):
+    h5py = pytest.importorskip("h5py", reason="h5py is not a TPEN dependency")
+    training = tmp_path / "training"
+    training.mkdir()
+    with h5py.File(training / "result.h5", "w") as handle:
+        handle.create_dataset("local_energy/mean", data=[-1.0, -2.0], shape=(2, 1, 1))
+        handle.create_dataset("local_energy/std", data=[1.0, 0.5], shape=(2, 1, 1))
+        handle.create_dataset("step", data=[100, 101])
+    rows = read_trajectory("deepqmc", tmp_path)
+    assert [row.step for row in rows] == [100, 101]
+    assert rows.step_basis == "optimizer_step"
+    assert summarize(rows)["step_basis"] == "optimizer_step"
+
+
+def test_deepqmc_without_steps_uses_observation_index(tmp_path: Path):
+    h5py = pytest.importorskip("h5py", reason="h5py is not a TPEN dependency")
+    training = tmp_path / "training"
+    training.mkdir()
+    with h5py.File(training / "result.h5", "w") as handle:
+        handle.create_dataset("local_energy/mean", data=[-1.0, -2.0], shape=(2, 1))
+        handle.create_dataset("local_energy/std", data=[1.0, 0.5], shape=(2, 1))
+    rows = read_trajectory("deepqmc", tmp_path)
+    assert [row.step for row in rows] == [0, 1]
+    assert rows.step_basis == "observation_index"
+    assert summarize(rows)["step_basis"] == "observation_index"
+
+
+def test_ferminet_sparse_steps_have_optimizer_basis_and_strict_summary_json(tmp_path: Path):
+    _write_ferminet(tmp_path / ferminet.TRAIN_STATS_FILENAME)
+    rows = read_trajectory("ferminet", tmp_path)
+    assert [row.step for row in rows] == [10, 11, 12, 13]
+    assert rows.step_basis == "optimizer_step"
+    summary = summarize(rows)
+    assert summary["step_basis"] == "optimizer_step"
+    json.dumps(summary, allow_nan=False)
+    assert main(["--code", "ferminet", str(tmp_path)]) == 0
+    assert sorted(path.name for path in tmp_path.iterdir()) == [ferminet.TRAIN_STATS_FILENAME]
+
