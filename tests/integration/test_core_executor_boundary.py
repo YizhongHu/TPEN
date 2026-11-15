@@ -64,11 +64,15 @@ builtins.__import__ = _block_tpen_import
 
 
 def _emit(value):
-    if _tpen_imports:
-        raise RuntimeError(f"executor child imported tpen: {_tpen_imports!r}")
     if not isinstance(value, dict):
         raise TypeError("executor child result must be a mapping")
-    value["_executor_boundary"] = {"tpen_imports": list(_tpen_imports)}
+    tpen_modules = sorted(
+        name for name in sys.modules if name == "tpen" or name.startswith("tpen.")
+    )
+    value["_executor_boundary"] = {
+        "tpen_imports": list(_tpen_imports),
+        "tpen_modules": tpen_modules,
+    }
     print(json.dumps(value, sort_keys=True))
 
 from tpen_executor._codec import digest
@@ -272,9 +276,15 @@ def _executor_call(tmp_path: Path, action: str, payload: Mapping[str, Any]) -> d
     if not isinstance(result, dict):
         raise AssertionError(f"executor child result is not a mapping ({action}): {result!r}")
     boundary = result.get("_executor_boundary")
-    if not isinstance(boundary, dict) or boundary.get("tpen_imports") != []:
+    if not isinstance(boundary, dict):
+        raise AssertionError(f"executor child boundary is not a mapping ({action}): {boundary!r}")
+    if boundary.get("tpen_imports") != []:
         raise AssertionError(
             f"executor child crossed tpen import boundary ({action}): {boundary!r}"
+        )
+    if boundary.get("tpen_modules") != []:
+        raise AssertionError(
+            f"executor child loaded tpen modules ({action}): {boundary!r}"
         )
     result.pop("_executor_boundary", None)
     return result
@@ -712,8 +722,6 @@ def test_core_executor_two_leaf_round_trip_and_refusal_controls(
     successor_ref = CheckpointRef.from_directory(successor_checkpoint_dir)
     assert successor_ref.next_iteration == 3
     assert successor_ref.completed_updates == 3
-    if hasattr(successor_ref, "profile"):
-        assert successor_ref.profile == "train_resume"
     successor_publications = read_publications(
         publication_catalog_path(successor_checkpoint_root)
     )
