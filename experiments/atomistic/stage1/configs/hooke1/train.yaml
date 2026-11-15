@@ -4,6 +4,7 @@ runtime: {seed: 0, device: cpu, dtype: float64}
 checkpoint_steps: [1000]
 system: {id: hooke_one_electron_omega0.5, n_particles: 1, spatial_dim: 3, spin: {n_up: 1, n_down: 0}, nuclei: {positions: [[0.0, 0.0, 0.0]], charges: [0.0]}}
 atoms: {_target_: tpen.data.atomic_configuration.AtomicConfiguration, positions: {_target_: torch.tensor, data: "${system.nuclei.positions}"}, charges: {_target_: torch.tensor, data: "${system.nuclei.charges}"}}
+system_descriptor: {_target_: tpen.physics.system.build_system_descriptor, particle: {_target_: tpen.physics.system.ParticleSpec, n_electrons: "${system.n_particles}", n_spin_up: "${system.spin.n_up}", n_spin_down: "${system.spin.n_down}", spatial_dim: "${system.spatial_dim}"}, terms: "${hamiltonian_terms}"}
 model:
   _target_: tpen.nn.TPENWaveFunction
   trace_name: tpen
