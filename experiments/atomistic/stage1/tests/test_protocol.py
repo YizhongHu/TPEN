@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import experiments.atomistic.stage1.protocol as protocol_module
 
 from experiments.atomistic.stage1.protocol import (
     _encode_seed,
@@ -108,6 +109,12 @@ def test_seed_known_vectors_are_cross_process_stable_across_hash_seeds() -> None
             [sys.executable, "-c", code], cwd=REPO_ROOT, env=env, text=True,
         ).strip())
     assert [json.loads(output) for output in outputs] == [expected, expected]
+
+
+def test_manifest_refuses_forced_seed_collision(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(protocol_module, "_encode_seed", lambda **_: 123)
+    with pytest.raises(ProtocolError, match="seed collision"):
+        _manifest(checkpoints=[7])
 
 
 def test_seeds_fit_torch_at_coordinate_maxima_and_reject_overflow() -> None:
