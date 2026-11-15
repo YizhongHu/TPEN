@@ -1,7 +1,7 @@
 # Stage 1 shared protocol and launch surface
 
 This directory owns the Stage 1 manifest, guarded Cannon launcher, and the
-science-default Hooke-1e, He, and H2 train/eval configs.
+science-default Hooke-1e, Hooke-2e, He, and H2 train/eval configs.
 
 Every manifest row carries the exact source SHA, the planned config SHA256, an
 external results root, and the TPEN run identity (`experiment_name`, `sector`,
@@ -32,9 +32,12 @@ with alpha=0.25 (omega/2); it has no electron-electron cusp. He retains the
 he-v1 trainable electron-electron ranges, curvature cusp (coefficient 0.01,
 range 1.0), and trainable Pfaffian readout. H2 follows h2-v1's two-electron
 cusp/readout route and retains its width, while using the shared Stage-1
-walker defaults. H2 retains the two-center R=1.4-bohr geometry, and He
-retains the two-electron Coulomb Hamiltonian. No Hooke pair config is
-included. Train checkpoint callbacks use ExplicitUpdates through the declared
+walker defaults. The Hooke-2e route uses the registry's Taut-solvable singlet
+pair at omega=0.5 with two electrons, no nuclear resource, kinetic + harmonic
+trap + electron-electron terms, fixed GaussianConfinement coefficient 0.25,
+and a fixed-default ElectronElectronCusp (opposite-spin coefficient 0.5). H2
+retains the two-center R=1.4-bohr geometry, and He retains the two-electron
+Coulomb Hamiltonian. Train checkpoint callbacks use ExplicitUpdates through the declared
 top-level `checkpoint_steps`; launch overrides bind that parameter to exactly
 the manifest row's planned checkpoint steps.
 
@@ -45,10 +48,11 @@ training updates.
 | System / surface | Source value | Stage-1 value | Reason |
 | --- | --- | --- | --- |
 | Hooke-1e readout | h-v2: Pfaffian readout `trainable: true` | `trainable: false` in train and eval | Deliberate one-electron Stage-1 default; the Gaussian confinement remains the fixed envelope and the train/eval model stays strict-restore compatible. |
+| Hooke-2e envelope and Hamiltonian | `experiments/hooke/tpen-pair-v1/configs/train.yaml`: Gaussian coefficient 0.25, electron-electron cusp, kinetic + harmonic trap + electron-electron interaction | Nucleus-free v2 descriptor with fixed GaussianConfinement coefficient 0.25, fixed-default ElectronElectronCusp, and `omega: 0.5` | Preserve the approved two-electron singlet physics through the current system-context/dispatch route; no legacy atomic placeholder or stale pair launcher is used. |
 | Hooke-1e eval sampler | h-v2: 1024 walkers, burn-in 1000, steps 20 | 4096 walkers, burn-in 100, steps 10 | Use the shared Stage-1 evaluation budget and cadence; this is a protocol default, not a claim that the source burn-in study transfers unchanged. |
 | He eval sampler | he-v1: 4096 walkers, burn-in 100, steps 20 | 4096 walkers, burn-in 100, steps 10 | Keep the shared Stage-1 cadence; the he-v1 stride-20 tie-break is not silently carried into this protocol. |
 | H2 model width | h2-v1: 4 output / 16 hidden channels | 4 output / 16 hidden channels | No width change is made; this row documents the retained source value and corrects the prior “width reduction” wording. |
-| H2 train/eval walkers | h2-v1: 128 train / 1024 eval | 256 train / 4096 eval | Use the shared Stage-1 train/eval walker defaults across all three systems. |
+| H2 train/eval walkers | h2-v1: 128 train / 1024 eval | 256 train / 4096 eval | Use the shared Stage-1 train/eval walker defaults across all four systems. |
 | Hooke-1e train observability | h-v2: `DataIntegrity`/`GradientStats` every 100 updates; JSONL logger | Both callbacks and logger omitted | Keep the science-default config small and portable; Stage-1 collection relies on its run/record provenance contract. |
 | He train observability | he-v1: `DataIntegrity` every 1, `GradientStats` every 5; CSV and JSONL loggers | Both callbacks and both loggers omitted | Same bounded Stage-1 config surface; these diagnostics are outside the Stage-1 manifest contract. |
 | H2 train observability | h2-v1: `DataIntegrity` every 1, `GradientStats` every 5; CSV and JSONL loggers | Both callbacks and both loggers omitted | Same bounded Stage-1 config surface; these diagnostics are outside the Stage-1 manifest contract. |

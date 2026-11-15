@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from experiments.atomistic.stage1.protocol import (
-    STAGE1_PROTOCOL, build_manifest, manifest_hash, physical_system_id_from_config,
+    SYSTEMS, STAGE1_PROTOCOL, build_manifest, manifest_hash, physical_system_id_from_config,
 )
 
 
@@ -32,7 +32,7 @@ def main() -> int:
     config_root = Path(__file__).parent / "configs"
     expected_ids = {
         name: physical_system_id_from_config(config_root / name / "eval.yaml")
-        for name in ("hooke1", "he", "h2")
+        for name in SYSTEMS
     }
     rows = build_manifest(protocol=STAGE1_PROTOCOL, source_sha=args.source_sha,
                           config_sha256=args.config_sha256, checkpoints=args.checkpoints,

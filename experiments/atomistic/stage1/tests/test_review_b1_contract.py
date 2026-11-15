@@ -9,14 +9,11 @@ import pytest
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
-from experiments.atomistic.stage1.protocol import ProtocolError, physical_system_id_from_config
+from experiments.atomistic.stage1.protocol import SYSTEMS, ProtocolError, physical_system_id_from_config
 from tpen.run import load_config
 
 
 CONFIG_ROOT = Path(__file__).parents[1] / "configs"
-SYSTEMS = ("hooke1", "he", "h2")
-
-
 def _config(system: str, kind: str = "eval") -> Path:
     return CONFIG_ROOT / system / f"{kind}.yaml"
 
@@ -32,6 +29,8 @@ def _copy_config(source: Path, destination: Path, mutate) -> Path:
     ("system", "mutation"),
     (
         ("hooke1", "trap"),
+        ("hooke2", "trap"),
+        ("hooke2", "electron_electron"),
         ("he", "nuclear_charge"),
         ("he", "descriptor_spin"),
         ("h2", "descriptor_spin"),
@@ -47,6 +46,11 @@ def test_physical_id_rejects_registry_physics_mismatch(
     def change(cfg) -> None:
         if mutation == "trap":
             cfg.hamiltonian_terms.harmonic_trap.omega = 0.6
+        elif mutation == "electron_electron":
+            terms = OmegaConf.to_container(cfg.hamiltonian_terms, resolve=True)
+            del terms["electron_electron"]
+            cfg.hamiltonian_terms = terms
+            cfg.system_descriptor.terms = terms
         elif mutation == "nuclear_charge":
             # Keep system.nuclei at Z=2; replace only the actual term resource.
             cfg.hamiltonian_terms.electron_nucleus.atoms = {
@@ -127,7 +131,7 @@ def test_physical_id_ignores_run_and_evaluation_budget_changes(
     assert physical_system_id_from_config(changed) == expected
 
     def change_physics(cfg) -> None:
-        if system == "hooke1":
+        if system in {"hooke1", "hooke2"}:
             cfg.hamiltonian_terms.harmonic_trap.omega = 0.6
         else:
             cfg.system_descriptor.particle.n_spin_up = 2
