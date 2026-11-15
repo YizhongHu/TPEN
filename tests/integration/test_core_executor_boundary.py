@@ -35,6 +35,7 @@ from tpen.execution.recovery import (
 )
 from tpen.inspection import inspect_run
 from tpen.run import PLANNED_YIELD_EXIT_CODE, run_from_config
+from tpen.training.events import TrainingIterationCompleted
 
 
 _FIXTURE = Path("tests/integration/artifacts/training/vmc_smoke.yaml")
@@ -43,19 +44,41 @@ _SUCCESSOR_ATTEMPT_ID = "cx05-successor"
 
 
 _EXECUTOR_CHILD = r'''
+import builtins
 import json
 import sys
 from pathlib import Path
 
-assert not any(name == "tpen" or name.startswith("tpen.") for name in sys.modules)
+_real_import = builtins.__import__
+_tpen_imports = []
+
+
+def _block_tpen_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "tpen" or name.startswith("tpen."):
+        _tpen_imports.append(name)
+        raise ModuleNotFoundError("executor child must not import tpen")
+    return _real_import(name, globals, locals, fromlist, level)
+
+
+builtins.__import__ = _block_tpen_import
+
+
+def _emit(value):
+    if _tpen_imports:
+        raise RuntimeError(f"executor child imported tpen: {_tpen_imports!r}")
+    if not isinstance(value, dict):
+        raise TypeError("executor child result must be a mapping")
+    value["_executor_boundary"] = {"tpen_imports": list(_tpen_imports)}
+    print(json.dumps(value, sort_keys=True))
 
 from tpen_executor._codec import digest
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
 from tpen_executor.runners import CoreRunEvidence
-from tpen_executor.storage import AttemptFence, DirectoryStore
+from tpen_executor.storage import AttemptFence, DirectoryStore, FenceRejected
 
-assert not any(name == "tpen" or name.startswith("tpen.") for name in sys.modules)
+if any(name == "tpen" or name.startswith("tpen.") for name in sys.modules):
+    raise RuntimeError("executor child started with tpen already imported")
 
 
 def group():
@@ -88,7 +111,7 @@ if action == "init":
     fence = store.begin_attempt(ready_group, "cx05", allocation(), "2026-11-14T00:00:00Z")
     core_dir = Path(fence.output_dir) / "core"
     core_dir.mkdir()
-    print(json.dumps({
+    _emit({
         "store_root": str(Path(store.root).resolve()),
         "group_digest": fence.group_digest,
         "task_id": fence.task_id,
@@ -96,7 +119,7 @@ if action == "init":
         "attempt_id": fence.attempt_id.value,
         "output_dir": fence.output_dir,
         "core_dir": str(core_dir),
-    }, sort_keys=True))
+    })
 elif action == "record-core":
     fence = fence_from(payload)
     evidence = CoreRunEvidence.from_mapping(
@@ -104,16 +127,22 @@ elif action == "record-core":
     )
     store.finish_attempt(fence, "failed", "2026-11-14T00:01:00Z")
     record = store.record_core_outcome(fence, evidence)
-    print(json.dumps({"record": record.to_dict()}, sort_keys=True))
+    _emit({"record": record.to_dict()})
 elif action == "build-request":
     fence = fence_from(payload)
-    request = store.build_successor_admission_request(
-        fence,
-        AttemptId(payload["successor_attempt_id"]),
-        payload["science_input_digest"],
-        payload["target_iterations"],
-    )
-    print(json.dumps(request, sort_keys=True))
+    try:
+        request = store.build_successor_admission_request(
+            fence,
+            AttemptId(payload["successor_attempt_id"]),
+            payload["science_input_digest"],
+            payload["target_iterations"],
+        )
+    except FenceRejected as error:
+        _emit({
+            "error": {"type": type(error).__name__, "message": str(error)},
+        })
+    else:
+        _emit(request)
 elif action == "record-admission":
     fence = fence_from(payload)
     admission = store.record_successor_admission(
@@ -126,11 +155,11 @@ elif action == "record-admission":
         / "successor-admission.json"
     )
     manifest = store.manifest(ready_group)
-    print(json.dumps({
+    _emit({
         "admission": admission.to_dict(),
         "ledger": json.loads(ledger_path.read_text(encoding="utf-8")),
         "manifest": manifest.to_dict(),
-    }, sort_keys=True))
+    })
 else:
     raise SystemExit(f"unknown child action: {action}")
 '''
@@ -180,6 +209,25 @@ def _child_payload(fence: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _executor_environment() -> dict[str, str]:
+    """Build an executor-only environment without Python startup overrides."""
+
+    environment = os.environ.copy()
+    for variable in (
+        "PYTHONHOME",
+        "PYTHONOPTIMIZE",
+        "PYTHONNOUSERSITE",
+        "PYTHONUSERBASE",
+        "PYTHONSTARTUP",
+        "PYTHONINSPECT",
+        "PYTHONWARNINGS",
+    ):
+        environment.pop(variable, None)
+    executor_src = Path(__file__).resolve().parents[2] / "executor" / "src"
+    environment["PYTHONPATH"] = str(executor_src)
+    return environment
+
+
 def _executor_call(tmp_path: Path, action: str, payload: Mapping[str, Any]) -> dict[str, Any]:
     """Run one executor-only child operation and decode its JSON result.
 
@@ -198,42 +246,38 @@ def _executor_call(tmp_path: Path, action: str, payload: Mapping[str, Any]) -> d
         JSON result emitted by the child.
     """
 
-    environment = os.environ.copy()
-    executor_src = Path(__file__).resolve().parents[2] / "executor" / "src"
-    environment["PYTHONPATH"] = str(executor_src)
-    completed = subprocess.run(
-        [sys.executable, "-c", _EXECUTOR_CHILD, action, json.dumps(dict(payload), sort_keys=True)],
-        cwd=tmp_path,
-        env=environment,
-        capture_output=True,
-        check=False,
-        text=True,
-    )
-    assert completed.returncode == 0, (
-        f"executor child failed ({action}):\nstdout={completed.stdout}\nstderr={completed.stderr}"
-    )
-    assert not completed.stderr, completed.stderr
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", _EXECUTOR_CHILD, action, json.dumps(dict(payload), sort_keys=True)],
+            cwd=tmp_path,
+            env=_executor_environment(),
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise AssertionError(
+            f"executor child timed out ({action}, timeout=120s):\n"
+            f"stdout={error.stdout}\nstderr={error.stderr}"
+        ) from error
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"executor child failed ({action}, rc={completed.returncode}):\n"
+            f"stdout={completed.stdout}\nstderr={completed.stderr}"
+        )
+    if completed.stderr:
+        raise AssertionError(f"executor child wrote stderr ({action}): {completed.stderr}")
     result = json.loads(completed.stdout)
-    assert isinstance(result, dict)
+    if not isinstance(result, dict):
+        raise AssertionError(f"executor child result is not a mapping ({action}): {result!r}")
+    boundary = result.get("_executor_boundary")
+    if not isinstance(boundary, dict) or boundary.get("tpen_imports") != []:
+        raise AssertionError(
+            f"executor child crossed tpen import boundary ({action}): {boundary!r}"
+        )
+    result.pop("_executor_boundary", None)
     return result
-
-
-def _executor_failure(tmp_path: Path, action: str, payload: Mapping[str, Any]) -> str:
-    """Run one expected executor refusal and return its diagnostic text."""
-
-    environment = os.environ.copy()
-    executor_src = Path(__file__).resolve().parents[2] / "executor" / "src"
-    environment["PYTHONPATH"] = str(executor_src)
-    completed = subprocess.run(
-        [sys.executable, "-c", _EXECUTOR_CHILD, action, json.dumps(dict(payload), sort_keys=True)],
-        cwd=tmp_path,
-        env=environment,
-        capture_output=True,
-        check=False,
-        text=True,
-    )
-    assert completed.returncode != 0
-    return completed.stderr
 
 
 def _canonical_json(value: Mapping[str, Any]) -> bytes:
@@ -303,20 +347,45 @@ def _guarded_successor_start(
 
 
 def _assert_refused_without_successor(
-    admission: SuccessorAdmissionResult,
-    code: str,
+    admission: SuccessorAdmissionResult | None,
+    code: str | None,
+    cfg: DictConfig,
+    destination: ArtifactDestination,
     successor_root: Path,
     sentinel: Path,
     core_calls: list[str],
+    admission_ledger: Path,
 ) -> None:
-    """Assert one typed refusal has no successor side effect."""
+    """Route one refusal through the guarded launch and prove no side effect."""
 
-    assert admission.restore_request is None, "node=refusal-no-restore-request"
-    assert admission.refusal is not None
-    assert admission.refusal.code.value == code, f"node={code}-refusal"
-    assert not sentinel.exists(), "node=refusal-no-sentinel"
-    assert not successor_root.exists(), "node=refusal-no-physical-leaf"
-    assert core_calls == [], "node=refusal-no-successor-core-call"
+    if admission_ledger.exists():
+        raise AssertionError("node=refusal-no-successor-admission-ledger-before")
+    if admission is not None:
+        if admission.restore_request is not None:
+            raise AssertionError("node=refusal-no-restore-request")
+        if admission.refusal is None:
+            raise AssertionError("node=refusal-has-typed-refusal")
+        if admission.refusal.code.value != code:
+            raise AssertionError(f"node={code}-refusal: {admission.refusal.code.value!r}")
+    elif code is not None:
+        raise AssertionError("node=refusal-missing-result")
+    started = _guarded_successor_start(
+        admission,
+        cfg,
+        destination,
+        sentinel,
+        core_calls,
+    )
+    if started is not None:
+        raise AssertionError("node=refusal-no-successor-return")
+    if sentinel.exists():
+        raise AssertionError("node=refusal-no-sentinel")
+    if successor_root.exists():
+        raise AssertionError("node=refusal-no-physical-leaf")
+    if core_calls != []:
+        raise AssertionError("node=refusal-no-successor-core-call")
+    if admission_ledger.exists():
+        raise AssertionError("node=refusal-no-successor-admission-ledger-after")
 
 
 class _RestoreReadback:
@@ -327,6 +396,17 @@ class _RestoreReadback:
 
     def handle_occurrence(self, occurrence: object, context: object) -> None:
         if isinstance(occurrence.event, CheckpointRestored):
+            self.events.append(occurrence.event)
+
+
+class _TrainingReadback:
+    """Count training updates observed by the refused-yield control."""
+
+    def __init__(self) -> None:
+        self.events: list[TrainingIterationCompleted] = []
+
+    def handle_occurrence(self, occurrence: object, context: object) -> None:
+        if isinstance(occurrence.event, TrainingIterationCompleted):
             self.events.append(occurrence.event)
 
 
@@ -341,6 +421,8 @@ def test_core_executor_two_leaf_round_trip_and_refusal_controls(
     tmp_path : pathlib.Path
         Pytest-owned temporary root for every logical, physical, and executor
         artifact written by this test.
+    monkeypatch : pytest.MonkeyPatch
+        Test-local admission of the sink-free runtime readback callbacks.
     """
 
     logical_root = tmp_path / "logical"
@@ -352,14 +434,25 @@ def test_core_executor_two_leaf_round_trip_and_refusal_controls(
     import tpen.run as run_module
 
     qualified_readback = f"{_RestoreReadback.__module__}.{_RestoreReadback.__qualname__}"
+    qualified_training_readback = (
+        f"{_TrainingReadback.__module__}.{_TrainingReadback.__qualname__}"
+    )
     monkeypatch.setattr(
-        run_module, "_SINK_FREE_TYPES", run_module._SINK_FREE_TYPES | {qualified_readback}
+        run_module,
+        "_SINK_FREE_TYPES",
+        run_module._SINK_FREE_TYPES | {qualified_readback, qualified_training_readback},
     )
 
     # Flow 1: begin the executor fence and place core evidence exactly beneath it.
     fence_facts = _executor_call(tmp_path, "init", {"store_root": str(executor_root)})
     predecessor_core = Path(fence_facts["core_dir"])
     predecessor_destination = ArtifactDestination(predecessor_core)
+    admission_ledger = (
+        Path(fence_facts["output_dir"]).parent
+        / "successor-admissions"
+        / fence_facts["attempt_id"]
+        / "successor-admission.json"
+    )
 
     # Flow 2: run the real predecessor through the public planned-yield boundary.
     predecessor_cfg = _cfg(logical_root, _TASK_ID)
@@ -407,7 +500,7 @@ def test_core_executor_two_leaf_round_trip_and_refusal_controls(
     )
     core_outcome_path = Path(fence_facts["output_dir"]) / "core-outcome.json"
     assert core_outcome_path.is_file()
-    assert json.loads(core_outcome_path.read_text(encoding="utf-8")) == record_result["record"]
+    assert core_outcome_path.read_bytes() == _canonical_json(record_result["record"])
     assert record_result["record"]["evidence"]["outcome"] == "planned_yield"
     assert record_result["record"]["continuation_eligible"] is True
     assert not (Path(fence_facts["output_dir"]) / "segment.json").exists()
@@ -430,12 +523,14 @@ def test_core_executor_two_leaf_round_trip_and_refusal_controls(
     restore_request = accepted.restore_request
     restore_digest = hashlib.sha256(_restore_request_bytes(restore_request)).hexdigest()
     request_digest = hashlib.sha256(_canonical_json(request)).hexdigest()
+    successor_cfg = _cfg(logical_root, _TASK_ID)
+    assert not admission_ledger.exists()
 
     # Control 1: missing core outcome is refused before a successor can start.
     missing_core_bytes = core_outcome_path.read_bytes()
     core_outcome_path.unlink()
     try:
-        missing_error = _executor_failure(tmp_path, "build-request", {
+        missing_result = _executor_call(tmp_path, "build-request", {
             **executor_identity,
             "successor_attempt_id": _SUCCESSOR_ATTEMPT_ID,
             "science_input_digest": intent.science_input_digest,
@@ -443,11 +538,22 @@ def test_core_executor_two_leaf_round_trip_and_refusal_controls(
         })
     finally:
         core_outcome_path.write_bytes(missing_core_bytes)
-    assert "core outcome record is missing" in missing_error
-    _guarded_successor_start(None, _cfg(logical_root, _TASK_ID), ArtifactDestination(successor_root), successor_sentinel, successor_core_calls)
-    assert not successor_sentinel.exists()
-    assert not successor_root.exists()
-    assert successor_core_calls == []
+    assert missing_result == {
+        "error": {
+            "type": "FenceRejected",
+            "message": "core outcome record is unavailable",
+        }
+    }
+    _assert_refused_without_successor(
+        None,
+        None,
+        successor_cfg,
+        ArtifactDestination(successor_root),
+        successor_root,
+        successor_sentinel,
+        successor_core_calls,
+        admission_ledger,
+    )
 
     # Control 2: stale checkpoint bytes are refused by core and then restored exactly.
     payload_file = next(
@@ -460,7 +566,16 @@ def test_core_executor_two_leaf_round_trip_and_refusal_controls(
         stale = select_successor_admission(intent, request)
     finally:
         payload_file.write_bytes(payload_bytes)
-    _assert_refused_without_successor(stale, "stale-ref", successor_root, successor_sentinel, successor_core_calls)
+    _assert_refused_without_successor(
+        stale,
+        "stale-ref",
+        successor_cfg,
+        ArtifactDestination(successor_root),
+        successor_root,
+        successor_sentinel,
+        successor_core_calls,
+        admission_ledger,
+    )
 
     # Control 3: remove only the publication receipt while latest and catalog remain.
     receipt_path = publication_receipt_path(checkpoint_root)
@@ -471,7 +586,14 @@ def test_core_executor_two_leaf_round_trip_and_refusal_controls(
     finally:
         receipt_path.write_bytes(receipt_bytes)
     _assert_refused_without_successor(
-        unpublished, "missing-publication", successor_root, successor_sentinel, successor_core_calls
+        unpublished,
+        "missing-publication",
+        successor_cfg,
+        ArtifactDestination(successor_root),
+        successor_root,
+        successor_sentinel,
+        successor_core_calls,
+        admission_ledger,
     )
 
     # Control 4: a model-only profile cannot be promoted to a successor restore.
@@ -479,25 +601,53 @@ def test_core_executor_two_leaf_round_trip_and_refusal_controls(
     model_only_request["core_evidence"]["checkpoint_ref"]["profile"] = "model_only"
     model_only = select_successor_admission(intent, model_only_request)
     _assert_refused_without_successor(
-        model_only, "model-only", successor_root, successor_sentinel, successor_core_calls
+        model_only,
+        "model-only",
+        successor_cfg,
+        ArtifactDestination(successor_root),
+        successor_root,
+        successor_sentinel,
+        successor_core_calls,
+        admission_ledger,
     )
 
     # Control 5: a real pre-fit refused yield is typed as non-eligible evidence.
     refused_root = tmp_path / "refused-physical"
     refused_cfg = _cfg(logical_root, _TASK_ID)
+    training_readback = _TrainingReadback()
     refused_code = run_from_config(
         refused_cfg,
         artifact_destination=ArtifactDestination(refused_root),
-        runtime_callbacks=(PlannedYield(3, 3),),
+        runtime_callbacks=(PlannedYield(3, 3), training_readback),
         raise_exceptions=True,
     )
+    # _status_to_exit_code maps every refusal to 1; planned yield is the
+    # distinct PLANNED_YIELD_EXIT_CODE (2).
+    assert refused_code == 1
     assert refused_code != PLANNED_YIELD_EXIT_CODE
     refused = inspect_run(refused_root)
+    assert refused.schema == "tpen.run-evidence/v3"
+    assert refused.outcome == "refused"
+    assert refused.run_status == "refused"
+    assert refused.refusal is None
+    assert refused.continuation_eligible is False
+    assert refused.checkpoint is None
+    assert training_readback.events == []
+    assert not any(
+        path.is_dir() for path in (refused_root / "checkpoints").glob("step_*")
+    )
     refused_request = json.loads(json.dumps(request))
     refused_request["core_evidence"] = refused.to_dict()
     refused_admission = select_successor_admission(intent, refused_request)
     _assert_refused_without_successor(
-        refused_admission, "non-eligible-outcome", successor_root, successor_sentinel, successor_core_calls
+        refused_admission,
+        "non-eligible-outcome",
+        successor_cfg,
+        ArtifactDestination(successor_root),
+        successor_root,
+        successor_sentinel,
+        successor_core_calls,
+        admission_ledger,
     )
 
     # Flow 6: record exactly the accepted request and read the write-once ledger back.
@@ -516,11 +666,21 @@ def test_core_executor_two_leaf_round_trip_and_refusal_controls(
     assert ledger["request_digest"] == request_digest, "node=admission-ledger-request-digest"
     assert ledger["core_acceptance_digest"] == restore_digest, "node=admission-ledger-core-digest"
     assert admission_result["manifest"]["segments"] == [], "node=admission-no-accepted-segment"
+    predecessor_attempt = next(
+        attempt
+        for attempt in admission_result["manifest"]["attempts"]
+        if attempt["attempt_id"] == executor_identity["attempt_id"]
+    )
+    assert predecessor_attempt["outcome_receipt"]["status"] == "failed"
+    assert predecessor_attempt["successor_admission"]["predecessor"]["content_id"] == ref.content_id
+    assert predecessor_attempt["successor_admission"]["successor"] == {
+        "task_id": _TASK_ID,
+        "attempt_id": _SUCCESSOR_ATTEMPT_ID,
+    }
 
     # Flow 7: bracket the successor with the predecessor physical tree hash.
     predecessor_tree = _content_tree_hash(predecessor_core)
     restore_readback = _RestoreReadback()
-    successor_cfg = _cfg(logical_root, _TASK_ID)
     successor_code = _guarded_successor_start(
         accepted,
         successor_cfg,
@@ -545,6 +705,25 @@ def test_core_executor_two_leaf_round_trip_and_refusal_controls(
     assert successor.checkpoint["completed_updates"] >= predecessor.checkpoint["completed_updates"], "node=successor-counter-monotonicity"
     assert successor.checkpoint["next_iteration"] == 3
     assert successor.checkpoint["completed_updates"] == 3
+    successor_checkpoint_dir = Path(successor.checkpoint_ref["checkpoint_dir"])
+    successor_checkpoint_root = successor_checkpoint_dir.parent
+    assert (successor_checkpoint_dir / COMPLETE_MARKER).is_file()
+    successor_ref = CheckpointRef.from_directory(successor_checkpoint_dir)
+    assert successor_ref.content_id == successor.checkpoint_ref["content_id"]
+    successor_publications = read_publications(
+        publication_catalog_path(successor_checkpoint_root)
+    )
+    assert any(
+        row.content_id == successor_ref.content_id
+        and row.checkpoint_dir.resolve() == successor_checkpoint_dir.resolve()
+        for row in successor_publications
+    )
+    successor_latest = read_latest(successor_checkpoint_root)
+    assert successor_checkpoint_root / successor_latest["checkpoint_dir"] == successor_checkpoint_dir
+    successor_receipts = tuple(
+        iter_valid_publication_receipts(publication_receipt_path(successor_checkpoint_root))
+    )
+    assert any(row["summary"]["content_id"] == successor_ref.content_id for row in successor_receipts)
     assert _content_tree_hash(predecessor_core) == predecessor_tree, "node=physical-leaf-tree-fence"
 
     # Flow 9: prove C is byte-identical while both physical leaves remain separate.
