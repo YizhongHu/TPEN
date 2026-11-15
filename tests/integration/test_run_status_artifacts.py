@@ -161,6 +161,8 @@ def test_a_real_completed_eval_run_has_eval_evidence_and_preserves_inspect_run_b
     assert evidence.run_status == "completed"
     assert evidence.outcome == "completed"
     assert evidence.resolved_config_identity is not None
+    run_start = json.loads((run_dir / "run_start.json").read_text(encoding="utf-8"))
+    assert evidence.resolved_config_identity == run_start["resolved_config_identity"]
     assert evidence.refusal is None
     assert evidence == type(evidence).from_mapping(evidence.to_dict())
 

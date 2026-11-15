@@ -297,6 +297,13 @@ class EvalRunEvidence:
             raise TypeError("run_status must be a string or null")
         if self.outcome is not None and self.outcome not in RUN_OUTCOME_STATUSES:
             raise ValueError(f"unsupported typed outcome {self.outcome!r}")
+        if self.verdict == "completed":
+            if self.run_status != "completed":
+                raise ValueError("completed evidence requires completed run_status")
+            if self.outcome != "completed":
+                raise ValueError("completed evidence requires completed outcome")
+            if self.resolved_config_identity is None:
+                raise ValueError("completed evidence requires a resolved config identity")
         if self.verdict == "refused":
             if self.refusal is None:
                 raise ValueError("refused evidence requires refusal")
@@ -562,11 +569,26 @@ def inspect_eval_run(path: str | Path) -> EvalRunEvidence:
     ``status-io-error``, ``malformed-status``, ``malformed-run-identity``,
     ``missing-run-identity``, ``malformed-run-outcome``,
     ``missing-run-outcome``, ``status-outcome-mismatch``, and
-    ``unexpected-checkpoint-ref``. Checkpoints are deliberately neither read
-    nor required: a completed evaluation must publish a null checkpoint ref.
+    ``unexpected-checkpoint-ref``. Run-path resolution and stat failures are
+    returned as ``run-dir-io-error``. Checkpoints are deliberately neither
+    read nor required: a completed evaluation must publish a null checkpoint
+    ref.
     """
 
-    run_dir = Path(path).resolve(strict=False)
+    raw_path = Path(path)
+    try:
+        run_dir = raw_path.resolve(strict=False)
+        is_run_dir = run_dir.is_dir()
+    except (OSError, RuntimeError) as exc:
+        return EvalRunEvidence(
+            EVAL_RUN_EVIDENCE_SCHEMA,
+            str(raw_path),
+            "refused",
+            None,
+            None,
+            None,
+            {"code": "run-dir-io-error", "reason": str(exc)},
+        )
     run_status: str | None = None
     outcome_status: str | None = None
     identity: dict[str, str] | None = None
@@ -582,13 +604,16 @@ def inspect_eval_run(path: str | Path) -> EvalRunEvidence:
             {"code": code, "reason": reason},
         )
 
-    if not run_dir.is_dir():
+    if not is_run_dir:
         return refused("missing-run-dir", f"run directory not found: {run_dir}")
     try:
         status_path, status = _read_status(run_dir)
     except _InspectionRefusal as exc:
         return refused(exc.code, exc.reason)
-    run_dir = status_path.parent.resolve()
+    try:
+        run_dir = status_path.parent.resolve()
+    except (OSError, RuntimeError) as exc:
+        return refused("run-dir-io-error", str(exc))
     raw_status: object = status.get("status")
     if raw_status is not None and not isinstance(raw_status, str):
         return refused("malformed-status", f"status value is not a string: {status_path}")

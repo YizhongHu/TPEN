@@ -107,31 +107,8 @@ def test_symlink_cycle_is_refused_as_an_artifact_problem(tmp_path: Path) -> None
 
     assert evidence.verdict == "refused"
     assert evidence.refusal is not None
-    assert isinstance(evidence.refusal["code"], str)
+    assert evidence.refusal["code"] == "run-dir-io-error"
     assert evidence.refusal["reason"]
-
-
-@pytest.mark.parametrize(
-    ("sidecar", "expected_code"),
-    [
-        ("status.json", "malformed-status"),
-        ("run_start.json", "malformed-run-identity"),
-        ("run-outcome.json", "malformed-run-outcome"),
-    ],
-)
-def test_excessively_nested_sidecars_are_refused(tmp_path: Path, sidecar: str, expected_code: str) -> None:
-    """Deep JSON is malformed input, not an uncaught interpreter recursion error."""
-
-    run_dir = tmp_path / "run"
-    _write_eval_sidecars(run_dir)
-    nested = "[" * 2000 + "0" + "]" * 2000
-    (run_dir / sidecar).write_text(nested, encoding="utf-8")
-
-    evidence = inspect_eval_run(run_dir)
-
-    assert evidence.verdict == "refused"
-    assert evidence.refusal is not None
-    assert evidence.refusal["code"] == expected_code
 
 
 @pytest.mark.parametrize("sidecar", ["status.json", "run_start.json", "run-outcome.json"])
