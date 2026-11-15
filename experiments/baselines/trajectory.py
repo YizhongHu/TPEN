@@ -29,6 +29,7 @@ class TrajectoryRow:
     walker_local_energy_variance: float | None
     energy_time_ewvar: float | None
     finite: bool
+    step_basis: str
     source_code: str
     source_file: str
 
@@ -36,9 +37,18 @@ class TrajectoryRow:
 class TrajectoryTable(list[TrajectoryRow]):
     """Rows plus source metadata needed to interpret their step labels."""
 
-    def __init__(self, rows: Iterable[TrajectoryRow], *, step_basis: str):
+    def __init__(self, rows: Iterable[TrajectoryRow]):
         super().__init__(rows)
-        self.step_basis = step_basis
+        self.step_basis = _step_basis_from_rows(self)
+
+
+def _step_basis_from_rows(rows: Sequence[TrajectoryRow]) -> str:
+    """Return the sole step basis represented by rows."""
+
+    bases = {row.step_basis for row in rows}
+    if len(bases) != 1:
+        raise AdapterError("trajectory rows have mixed step_basis values")
+    return bases.pop()
 
 
 def read_trajectory(code: str, run_dir: Path) -> list[TrajectoryRow]:
@@ -75,12 +85,13 @@ def read_trajectory(code: str, run_dir: Path) -> list[TrajectoryRow]:
                 None if raw["energy_time_ewvar"] is None else float(raw["energy_time_ewvar"])
             ),
             finite=all(math.isfinite(float(value)) for value in values),
+            step_basis=str(raw["step_basis"]),
             source_code=code,
             source_file=source_file,
         ))
     if not rows:
         raise AdapterError(f"{source_file} has no trajectory rows")
-    return TrajectoryTable(rows, step_basis=getattr(raw_rows, "step_basis", "optimizer_step"))
+    return TrajectoryTable(rows)
 
 
 def _finite_mean(rows: Iterable[TrajectoryRow], field: str) -> float | None:
@@ -129,7 +140,7 @@ def summarize(rows: Sequence[TrajectoryRow], *, window_fraction: float = 0.1) ->
     return {
         "source_code": rows[0].source_code,
         "source_file": rows[0].source_file,
-        "step_basis": getattr(rows, "step_basis", "optimizer_step"),
+        "step_basis": _step_basis_from_rows(rows),
         "n_steps": len(rows),
         "first_step": rows[0].step,
         "last_step": rows[-1].step,

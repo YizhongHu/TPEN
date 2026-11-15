@@ -108,6 +108,7 @@ def read_trajectory(run_dir: Path) -> list[dict[str, int | float | None]]:
                     "energy": float(row["energy"]),
                     "walker_local_energy_variance": None,
                     "energy_time_ewvar": float(row["ewvar"]),
+                    "step_basis": "optimizer_step",
                 })
             except (TypeError, ValueError) as error:
                 raise AdapterError(f"{stats_path}:{row_number} has invalid trajectory values") from error

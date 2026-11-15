@@ -331,6 +331,7 @@ def read_trajectory(run_dir: Path) -> list[dict[str, int | float | None]]:
                     "energy": energy,
                     "walker_local_energy_variance": std * std,
                     "energy_time_ewvar": None,
+                    "step_basis": step_basis,
                 }
                 for step, (energy, std) in zip(steps, zip(energies, stds))
             ),
