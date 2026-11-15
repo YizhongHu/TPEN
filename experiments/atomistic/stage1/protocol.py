@@ -106,6 +106,47 @@ def _safe_results_root(value: object) -> str:
     return value.rstrip("/")
 
 
+def _require_path_component(value: object, *, field: str) -> str:
+    """Require one non-empty, relative path component for a run identity."""
+
+    if (not isinstance(value, str) or not value or value in {".", ".."}
+            or "/" in value or Path(value).is_absolute()):
+        raise ProtocolError(f"{field} must be one relative path component")
+    return value
+
+
+def _checkpoint_binding(row: Mapping[str, Any]) -> tuple[Path, Path]:
+    """Validate and canonicalize the checkpoint directory/file pair."""
+
+    checkpoint_dir = row.get("checkpoint_dir")
+    checkpoint_file = row.get("checkpoint_file")
+    if (not isinstance(checkpoint_dir, str) or not isinstance(checkpoint_file, str)
+            or not Path(checkpoint_dir).is_absolute()
+            or not Path(checkpoint_file).is_absolute()):
+        raise ProtocolError("checkpoint_dir and checkpoint_file must be absolute")
+    canonical_dir = Path(checkpoint_dir).resolve()
+    canonical_file = Path(checkpoint_file).resolve()
+    if Path(checkpoint_dir) != canonical_dir or Path(checkpoint_file) != canonical_file:
+        raise ProtocolError("checkpoint_dir and checkpoint_file must be canonical absolute paths")
+    if canonical_file != canonical_dir / "model.pt":
+        raise ProtocolError("checkpoint_file must equal checkpoint_dir/model.pt")
+    return canonical_dir, canonical_file
+
+
+def _validate_run_identity(row: Mapping[str, Any]) -> None:
+    """Validate run identity and keep its effective directory beneath the root."""
+
+    for key in ("experiment_name", "sector", "run_id"):
+        _require_path_component(row.get(key), field=key)
+    root = row.get("results_root")
+    if not isinstance(root, str) or not Path(root).is_absolute():
+        raise ProtocolError("results_root must be an absolute path")
+    try:
+        resolve_run_dir(row).resolve().relative_to(Path(root).resolve())
+    except (ValueError, OSError) as exc:
+        raise ProtocolError("effective run directory must be beneath results_root") from exc
+
+
 def stable_row_id(*, system: str, kind: str, lineage: int = 0,
                   checkpoint: int = 0, stream: int = 0) -> str:
     """Return a deterministic, collision-resistant row identity."""
@@ -208,23 +249,17 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
         raise ProtocolError("binding kind does not match gateway")
     if config != row.get("config"):
         raise ProtocolError("gateway config does not match binding")
+    _validate_run_identity(row)
     expected = {
         f"runtime.seed={row['seed']}",
         f"run.root={row['results_root']}",
         f"experiment.name={row['experiment_name']}",
         f"experiment.sector={row['sector']}",
         f"run.run_id={row['run_id']}",
+        "run.layout=nested",
     }
     if kind == "eval":
-        checkpoint_dir = row.get("checkpoint_dir")
-        checkpoint_file = row.get("checkpoint_file")
-        if (not isinstance(checkpoint_dir, str) or not Path(checkpoint_dir).is_absolute()
-                or not isinstance(checkpoint_file, str) or not Path(checkpoint_file).is_absolute()):
-            raise ProtocolError("checkpoint_dir and checkpoint_file must be absolute")
-        try:
-            Path(checkpoint_file).relative_to(Path(checkpoint_dir))
-        except ValueError as exc:
-            raise ProtocolError("checkpoint_file must be inside checkpoint_dir") from exc
+        checkpoint_dir, checkpoint_file = _checkpoint_binding(row)
         expected.update({
             f"evaluation_sampler.n_walkers={row['walkers']}",
             f"evaluation_tasks.mcmc_energy.generator.n_draws={row['draws']}",
@@ -344,6 +379,10 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
                         "checkpoint_dir": str(checkpoint_dir), "checkpoint_file": str(checkpoint_file),
                         "checkpoint_sha256": checkpoint_digest, "depends_on": train_id,
                     })
+    for row in rows:
+        _validate_run_identity(row)
+        if row["kind"] == "eval":
+            _checkpoint_binding(row)
     return rows
 
 

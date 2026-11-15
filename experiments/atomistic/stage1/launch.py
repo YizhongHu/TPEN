@@ -10,7 +10,9 @@ import shlex
 from pathlib import Path
 from typing import Any, Mapping
 
-from experiments.atomistic.stage1.protocol import _require_sha, identity_expectations
+from experiments.atomistic.stage1.protocol import (
+    _require_path_component, _require_sha, identity_expectations,
+)
 
 ALLOWED_PARTITIONS = ("test", "gpu_test")
 FACILITY_RESULTS_PREFIX = "/n/netscratch/kozinsky_lab/Lab/rhu/"
@@ -44,6 +46,7 @@ def row_overrides(row: Mapping[str, Any]) -> list[str]:
         f"experiment.name={row['experiment_name']}",
         f"experiment.sector={row['sector']}",
         f"run.run_id={row['run_id']}",
+        "run.layout=nested",
     ]
     if kind == "eval":
         overrides.extend([
@@ -113,6 +116,8 @@ def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
         raise ValueError("manifest source_sha does not match rendered head_sha")
     if row.get("kind") == "eval":
         identity_expectations(row)
+    for field in ("experiment_name", "sector", "run_id"):
+        _require_path_component(row.get(field), field=field)
     command = command_for_row(row, python=python, driver=driver)
     template_path = Path(__file__).with_name("templates") / "cannon.sbatch"
     template = template_path.read_text(encoding="utf-8")
