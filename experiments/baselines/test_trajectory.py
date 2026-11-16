@@ -2,6 +2,7 @@
 
 import csv
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,51 @@ def test_ferminet_keeps_ewvar_out_of_walker_variance(tmp_path: Path):
     assert summary["first_non_finite_step"] == 12
     assert summary["walker_variance_ratio_last_over_first"] is None
     assert "unavailable" in summary["walker_variance_unavailable_reason"]
+
+
+def test_ferminet_reads_walker_variance_and_summarizes_it(tmp_path: Path):
+    (tmp_path / ferminet.TRAIN_STATS_FILENAME).write_text(
+        "step,energy,ewmean,ewvar,pmove,walker_variance\n"
+        "10,-1.0,-1.0,0.25,0.5,4.0\n"
+        "11,-2.0,-1.5,0.16,0.5,1.0\n"
+        "12,-3.0,-1.8,0.09,0.5,0.25\n"
+        "13,-4.0,-2.0,0.04,0.5,0.0625\n",
+        encoding="utf-8",
+    )
+
+    rows = read_trajectory("ferminet", tmp_path)
+
+    assert [row.walker_local_energy_variance for row in rows] == [4.0, 1.0, 0.25, 0.0625]
+    assert [row.energy_time_ewvar for row in rows] == [0.25, 0.16, 0.09, 0.04]
+    summary = summarize(rows, window_fraction=0.5)
+    assert summary["walker_variance_first_window_mean"] == pytest.approx(2.5)
+    assert summary["walker_variance_last_window_mean"] == pytest.approx(0.15625)
+    assert summary["walker_variance_ratio_last_over_first"] == pytest.approx(0.0625)
+
+
+def test_ferminet_rejects_blank_walker_variance(tmp_path: Path):
+    (tmp_path / ferminet.TRAIN_STATS_FILENAME).write_text(
+        "step,energy,ewmean,ewvar,pmove,walker_variance\n"
+        "10,-1.0,-1.0,0.25,0.5,\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AdapterError, match="invalid trajectory values"):
+        read_trajectory("ferminet", tmp_path)
+
+
+def test_ferminet_marks_nan_walker_variance_non_finite(tmp_path: Path):
+    (tmp_path / ferminet.TRAIN_STATS_FILENAME).write_text(
+        "step,energy,ewmean,ewvar,pmove,walker_variance\n"
+        "10,-1.0,-1.0,0.25,0.5,nan\n",
+        encoding="utf-8",
+    )
+
+    rows = read_trajectory("ferminet", tmp_path)
+
+    assert math.isnan(rows[0].walker_local_energy_variance)
+    assert rows[0].finite is False
+    assert rows[0].energy_time_ewvar == 0.25
 
 
 def test_deepqmc_squares_std_and_cli_writes_requested_outputs(tmp_path: Path):
