@@ -113,6 +113,16 @@ def test_verify_submitter_has_complete_exported_control_surface():
     assert 'QUEUE_POLL_LIMIT=120' in script and 'RUN_POLL_LIMIT=120' in script
 
 
+def test_pbs_stages_patched_source_without_ownership_copy_and_traps_early():
+    """Eagle staging must avoid ownership preservation and retain setup failures."""
+
+    script = (Path(__file__).parent / "runbooks" / "h-atom-r1-ramp.pbs").read_text(encoding="utf-8")
+    clone = 'git clone --no-hardlinks --quiet "$FN_SHARED_SRC" "$PATCHED_SRC"'
+    assert clone in script
+    assert 'cp -a "$FN_SHARED_SRC"' not in script
+    assert script.index("trap on_exit EXIT") < script.index(clone)
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [

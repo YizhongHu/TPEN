@@ -7,6 +7,21 @@
 #PBS -k doe
 set -euo pipefail
 
+FN_SHARED_SRC=/home/rhu/src/ferminet-psiformer-60c9fab3
+PATCHED_SRC="$RUN_ROOT/src/ferminet-patched"
+FN_SRC="$PATCHED_SRC"
+FN_PY=/home/rhu/.venvs/ferminet-jax092-60c9fab3/bin/python
+RECEIPT_HELPER="$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py"
+FN_PATCH="$SOURCE_CHECKOUT/experiments/baselines/runbooks/patches/ferminet-f4b1846c-walker-variance-logging.patch"
+
+write_partial_inventory() {
+  set +e
+  "$FN_PY" "$RECEIPT_HELPER" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/ramp/artifact-inventory.partial.jsonl" --ramp-required > "$RUN_ROOT/ramp/artifact-inventory.partial.stdout" 2> "$RUN_ROOT/ramp/artifact-inventory.partial.stderr"
+  return 0
+}
+on_exit() { local rc=$?; write_partial_inventory; exit "$rc"; }
+trap on_exit EXIT
+
 test "${PBS_QUEUE:?missing PBS_QUEUE}" = debug
 test -n "${PBS_JOBID:?missing PBS_JOBID}"
 test -d "${RUN_ROOT:?missing RUN_ROOT}/logs"
@@ -17,18 +32,15 @@ test -n "${PATCH_BLOB:?missing PATCH_BLOB}"
 test "$(git -C "$SOURCE_CHECKOUT" rev-parse HEAD)" = "$RUNBOOK_COMMIT"
 test -z "$(git -C "$SOURCE_CHECKOUT" status --porcelain=v1)"
 
-FN_SHARED_SRC=/home/rhu/src/ferminet-psiformer-60c9fab3
-FN_SRC="$RUN_ROOT/src/ferminet-patched"
-FN_PY=/home/rhu/.venvs/ferminet-jax092-60c9fab3/bin/python
-RECEIPT_HELPER="$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py"
-FN_PATCH="$SOURCE_CHECKOUT/experiments/baselines/runbooks/patches/ferminet-f4b1846c-walker-variance-logging.patch"
-
 test "$(git -C "$FN_SHARED_SRC" rev-parse HEAD)" = f4b1846cd6f2776321b09b027d4d5506ae98e19b
 test -z "$(git -C "$FN_SHARED_SRC" status --porcelain=v1)"
 test "$(git -C "$SOURCE_CHECKOUT" ls-tree "$RUNBOOK_COMMIT" -- experiments/baselines/runbooks/patches/ferminet-f4b1846c-walker-variance-logging.patch | awk '{print $3}')" = "$PATCH_BLOB"
 test -e "$FN_PATCH"
 mkdir "$RUN_ROOT/src"
-cp -a "$FN_SHARED_SRC" "$FN_SRC"
+git clone --no-hardlinks --quiet "$FN_SHARED_SRC" "$PATCHED_SRC"
+git -C "$PATCHED_SRC" checkout --quiet --detach f4b1846cd6f2776321b09b027d4d5506ae98e19b
+test "$(git -C "$PATCHED_SRC" rev-parse HEAD)" = f4b1846cd6f2776321b09b027d4d5506ae98e19b
+test -z "$(git -C "$PATCHED_SRC" status --porcelain=v1)"
 git -C "$FN_SRC" apply "$FN_PATCH"
 test "$(git -C "$FN_SRC" diff --name-only)" = ferminet/train.py
 sha256sum "$FN_PATCH" > "$RUN_ROOT/src/logging-patch.sha256"
@@ -64,14 +76,6 @@ assert jax.__version__ == '0.9.2'
 assert pathlib.Path(ferminet.__file__).resolve().is_relative_to(expected)
 PY
 nvidia-smi --query-gpu=name,uuid --format=csv,noheader > "$RUN_ROOT/ramp/gpu-inventory.txt"
-
-write_partial_inventory() {
-  set +e
-  "$FN_PY" "$RECEIPT_HELPER" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/ramp/artifact-inventory.partial.jsonl" --ramp-required > "$RUN_ROOT/ramp/artifact-inventory.partial.stdout" 2> "$RUN_ROOT/ramp/artifact-inventory.partial.stderr"
-  return 0
-}
-on_exit() { local rc=$?; write_partial_inventory; exit "$rc"; }
-trap on_exit EXIT
 
 assert_one_gpu() {
   local interpreter="$1" output="$2"
