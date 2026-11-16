@@ -156,6 +156,32 @@ def inventory(root: Path, output: Path, required: Sequence[str]) -> dict[str, ob
     return report
 
 
+def check_qstat_poll(path: Path) -> dict[str, str]:
+    """Validate the run-count contract for one preserved PBS observation."""
+
+    fields: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        fields[key.strip()] = value.strip()
+    state = fields.get("job_state")
+    run_count = fields.get("run_count")
+    if state in {"Q", "H", "W", "T"}:
+        if run_count not in (None, "0"):
+            raise ValueError(f"state {state} requires absent or zero run_count, found {run_count!r}")
+        return {"state": state, "phase": "queue"}
+    if state in {"R", "B", "E", "F"}:
+        if run_count != "1":
+            raise ValueError(f"state {state} requires run_count=1, found {run_count!r}")
+        if state == "F":
+            if fields.get("Exit_status") != "0":
+                raise ValueError(f"finished job requires Exit_status=0, found {fields.get('Exit_status')!r}")
+            return {"state": state, "phase": "terminal"}
+        return {"state": state, "phase": "run"}
+    raise ValueError(f"unknown or missing PBS job_state: {state!r}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the receipt writer or gate."""
 
@@ -176,6 +202,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     inventory_parser.add_argument("--output", type=Path, required=True)
     inventory_parser.add_argument("--required", action="append", default=[])
     inventory_parser.add_argument("--ramp-required", action="store_true")
+    poll_parser = subparsers.add_parser("poll-check")
+    poll_parser.add_argument("--path", type=Path, required=True)
+    poll_parser.add_argument("--field", choices=("state", "phase"))
     args = parser.parse_args(argv)
     try:
         if args.command == "record":
@@ -184,9 +213,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(gate(args.root, args.row), sort_keys=True))
         elif args.command == "validate-ferminet-trace":
             print(json.dumps(validate_ferminet_trace(args.path, steps=args.steps), sort_keys=True))
-        else:
+        elif args.command == "inventory":
             required = args.required + (ramp_required_paths() if args.ramp_required else [])
             print(json.dumps(inventory(args.root, args.output, required), sort_keys=True))
+        else:
+            result = check_qstat_poll(args.path)
+            print(result[args.field] if args.field else json.dumps(result, sort_keys=True))
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}")
         return 1

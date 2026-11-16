@@ -78,7 +78,13 @@ JOBID="$(cat "$RUN_ROOT/qsub.stdout")"
 test -n "$JOBID"
 printf '%s\n' "$JOBID" > "$RUN_ROOT/jobid.txt"
 
-for poll in $(seq 1 120); do
+QUEUE_POLL_LIMIT=120
+RUN_POLL_LIMIT=120
+QUEUE_POLLS=0
+RUN_POLLS=0
+poll=0
+while :; do
+  poll=$((poll + 1))
   stamp="$(date --iso-8601=seconds)"
   query="$RUN_ROOT/qstat-$poll.txt"
   set +e
@@ -88,12 +94,20 @@ for poll in $(seq 1 120); do
   printf '%s status=%s file=%s\n' "$stamp" "$QUERY_STATUS" "$(basename "$query")" >> "$RUN_ROOT/qstat-observations.txt"
   test "$QUERY_STATUS" = 0
   cp "$query" "$RUN_ROOT/qstat-last-success.txt"
-  STATE="$(awk -F= '/^[[:space:]]*job_state[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$query")"
+  STATE="$("$DQ_PY" "$RECEIPT_HELPER" poll-check --path "$query" --field state)"
+  PHASE="$("$DQ_PY" "$RECEIPT_HELPER" poll-check --path "$query" --field phase)"
   test "$(awk -F= '/^[[:space:]]*queue[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$query")" = debug
-  test "$(awk -F= '/^[[:space:]]*run_count[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$query")" = 1
   grep -Eq 'Resource_List.select = 1:system=polaris' "$query"
-  case "$STATE" in F) break ;; Q|R|B|E|W|T|S) sleep 30 ;; *) exit 1 ;; esac
+  case "$PHASE" in
+    queue)
+      QUEUE_POLLS=$((QUEUE_POLLS + 1))
+      if test "$QUEUE_POLLS" -gt "$QUEUE_POLL_LIMIT"; then printf 'queue wait bound exceeded after %s observations; preserve last observation and report, do not qdel\n' "$QUEUE_POLLS" >&2; exit 1; fi ;;
+    run)
+      RUN_POLLS=$((RUN_POLLS + 1))
+      if test "$RUN_POLLS" -gt "$RUN_POLL_LIMIT"; then printf 'run wait bound exceeded after %s observations; preserve last observation and report, do not qdel\n' "$RUN_POLLS" >&2; exit 1; fi ;;
+    terminal) break ;;
+    *) exit 1 ;;
+  esac
+  sleep 30
 done
-test "$STATE" = F
-test "$(awk -F= '/^[[:space:]]*Exit_status[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$query")" = 0
 /home/rhu/.venvs/deepqmc-jax083-edf373e7/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/artifact-inventory.jsonl" --ramp-required --required ramp-inputs.env --required ramp.pbs --required input-inventory.sha256 --required verify-submit-mode.json --required qsub.stdout --required qsub.stderr --required qsub.status --required jobid.txt --required qstat-observations.txt --required qstat-last-success.txt --required logs/ramp.stdout --required logs/ramp.stderr

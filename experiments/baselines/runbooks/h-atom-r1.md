@@ -1,7 +1,7 @@
 ---
 item_id: "dc036f76-7ddb-4e2f-baf8-b33a1161b539"
-runbook_revision: 4
-runbook_commit: "external: runbook-index-r4 and submission receipt"
+runbook_revision: 5
+runbook_commit: "external: runbook-index-r5 and submission receipt"
 science: "PENDING_OPERATOR"
 ---
 
@@ -16,7 +16,7 @@ retry, resubmission, cancellation, or scientific interpretation.
 The operator selects science true/false: non-science uses frozen dev and
 temporary data; science uses main, human submission approval, a science report,
 and Holystore backup. The containing TPEN commit/blob/config/helper/PBS blobs
-are bound externally in runbook-index-r4 and the submission receipt.
+are bound externally in runbook-index-r5 and the submission receipt.
 
 Five seed-0 rows run: DeepQMC default, ferminet, psiformer; FermiNet-codebase
 ferminet, psiformer; batch 4096; 1000 real-ramp steps; zero pretraining.
@@ -58,8 +58,9 @@ Any failure stops before runner execution.
 
 The verifier provides one ramp-inputs.env path as $1. This template takes only
 that argument. mkdir has no -p, so existing root stops before qsub.
-POLL_LIMIT=120 is a bounded 60-minute observation, not a retry; timeout,
-unknown state, or query error stops without qdel.
+QUEUE_POLL_LIMIT=120 and RUN_POLL_LIMIT=120 are separate 60-minute bounds at
+30 seconds per observation, not retries. Each exhausted bound records the
+last observation and stops/reports without qdel.
 
 ~~~bash
 set -euo pipefail
@@ -102,20 +103,26 @@ printf '%s\n' "$QSUB_STATUS" > "$RUN_ROOT/qsub.status"
 test "$QSUB_STATUS" = 0
 test "$(wc -l < "$RUN_ROOT/qsub.stdout" | tr -d ' ')" = 1
 JOBID="$(cat "$RUN_ROOT/qsub.stdout")"; test -n "$JOBID"; printf '%s\n' "$JOBID" > "$RUN_ROOT/jobid.txt"
-for poll in $(seq 1 120); do
+QUEUE_POLL_LIMIT=120; RUN_POLL_LIMIT=120; QUEUE_POLLS=0; RUN_POLLS=0; poll=0
+while :; do
+  poll=$((poll + 1))
   stamp="$(date --iso-8601=seconds)"; query="$RUN_ROOT/qstat-$poll.txt"
   set +e; qstat -xf "$JOBID" > "$query" 2>&1; QUERY_STATUS=$?; set -e
   printf '%s status=%s file=%s\n' "$stamp" "$QUERY_STATUS" "$(basename "$query")" >> "$RUN_ROOT/qstat-observations.txt"
   test "$QUERY_STATUS" = 0
   cp "$query" "$RUN_ROOT/qstat-last-success.txt"
-  STATE="$(awk -F= '/^[[:space:]]*job_state[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$query")"
+  STATE="$(/home/rhu/.venvs/deepqmc-jax083-edf373e7/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" poll-check --path "$query" --field state)"
+  PHASE="$(/home/rhu/.venvs/deepqmc-jax083-edf373e7/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" poll-check --path "$query" --field phase)"
   test "$(awk -F= '/^[[:space:]]*queue[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$query")" = debug
-  test "$(awk -F= '/^[[:space:]]*run_count[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$query")" = 1
   grep -Eq 'Resource_List.select = 1:system=polaris' "$query"
-  case "$STATE" in F) break ;; Q|R|B|E|W|T|S) sleep 30 ;; *) exit 1 ;; esac
+  case "$PHASE" in
+    queue) QUEUE_POLLS=$((QUEUE_POLLS + 1)); if test "$QUEUE_POLLS" -gt "$QUEUE_POLL_LIMIT"; then printf 'queue wait bound exceeded; preserve last observation and report, do not qdel\n' >&2; exit 1; fi ;;
+    run) RUN_POLLS=$((RUN_POLLS + 1)); if test "$RUN_POLLS" -gt "$RUN_POLL_LIMIT"; then printf 'run wait bound exceeded; preserve last observation and report, do not qdel\n' >&2; exit 1; fi ;;
+    terminal) break ;;
+    *) exit 1 ;;
+  esac
+  sleep 30
 done
-test "$STATE" = F
-test "$(awk -F= '/^[[:space:]]*Exit_status[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$query")" = 0
 /home/rhu/.venvs/deepqmc-jax083-edf373e7/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/artifact-inventory.jsonl" --ramp-required --required ramp-inputs.env --required ramp.pbs --required input-inventory.sha256 --required qsub.stdout --required qsub.stderr --required qsub.status --required jobid.txt --required qstat-observations.txt --required qstat-last-success.txt --required logs/ramp.stdout --required logs/ramp.stderr
 ~~~
 
