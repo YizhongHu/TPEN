@@ -96,6 +96,16 @@ class _TrajectoryRows(list[dict[str, int | float | None]]):
         self.step_basis = step_basis
 
 
+def _validate_single_system_shape(dataset, *, path: Path, name: str) -> None:
+    """Reject molecule/state multiplicity axes before a trace is flattened."""
+
+    shape = dataset.shape
+    if not shape or len(shape) > 3 or any(size != 1 for size in shape[1:]):
+        raise AdapterError(
+            f"{path} '{name}' must have shape (N,), (N,1), or (N,1,1); got {shape}"
+        )
+
+
 def result_path(run_dir: Path) -> Path:
     """Return the HDF5 path for a run directory.
 
@@ -240,7 +250,9 @@ def read_energies(run_dir: Path) -> list[float]:
     def _extract(handle: "h5py.File") -> list[float]:
         if ENERGY_DATASET not in handle:
             raise AdapterError(f"{path} has no '{ENERGY_DATASET}' dataset")
-        return [float(value) for value in handle[ENERGY_DATASET][:].ravel()]
+        dataset = handle[ENERGY_DATASET]
+        _validate_single_system_shape(dataset, path=path, name=ENERGY_DATASET)
+        return [float(value) for value in dataset[:].ravel()]
 
     try:
         with h5py.File(path, "r") as handle:
@@ -289,11 +301,7 @@ def read_trajectory(run_dir: Path) -> list[dict[str, int | float | None]]:
             raise AdapterError(f"{path} has no '{missing[0]}' dataset")
         mean_dataset, std_dataset = handle[ENERGY_DATASET], handle[STD_DATASET]
         for name, dataset in ((ENERGY_DATASET, mean_dataset), (STD_DATASET, std_dataset)):
-            shape = dataset.shape
-            if not shape or len(shape) > 3 or any(size != 1 for size in shape[1:]):
-                raise AdapterError(
-                    f"{path} '{name}' must have shape (N,), (N,1), or (N,1,1); got {shape}"
-                )
+            _validate_single_system_shape(dataset, path=path, name=name)
         if mean_dataset.shape != std_dataset.shape:
             raise AdapterError(f"{path} has mismatched local-energy mean/std shapes")
         energies = [float(value) for value in mean_dataset[:].ravel()]
@@ -302,11 +310,7 @@ def read_trajectory(run_dir: Path) -> list[dict[str, int | float | None]]:
             raise AdapterError(f"{path} has empty local-energy trajectory datasets")
         if STEP_DATASET in handle:
             step_dataset = handle[STEP_DATASET]
-            shape = step_dataset.shape
-            if not shape or len(shape) > 3 or any(size != 1 for size in shape[1:]):
-                raise AdapterError(
-                    f"{path} '{STEP_DATASET}' must have shape (N,), (N,1), or (N,1,1); got {shape}"
-                )
+            _validate_single_system_shape(step_dataset, path=path, name=STEP_DATASET)
             steps = []
             for value in step_dataset[:].ravel():
                 try:
