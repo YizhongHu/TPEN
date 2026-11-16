@@ -404,6 +404,47 @@ def test_salvage_stride_five_selects_the_fixed_20_member_roster() -> None:
     assert [generation["update"] for generation in generations] == [member["update"] for member in roster]
 
 
+@pytest.mark.parametrize("stride", [0, -1, 1.5, True])
+def test_salvage_selection_rejects_non_positive_or_non_integral_stride(stride: object) -> None:
+    inventory = {"inventory": [{"update": 0}]}
+    with pytest.raises(eval_job.EvalJobRefusal, match="salvage-stride-invalid"):
+        eval_job.salvage_selection_roster(inventory, ordinal_stride=stride)
+
+
+def test_salvage_sel_uses_strided_index_and_binds_each_generation_update(tmp_path: Path) -> None:
+    """SEL's center is the selected-roster index, while updates remain bound."""
+    roster = [{"ordinal": ordinal, "update": ordinal * 1000} for ordinal in range(0, 98, 5)]
+    generations = []
+    for index, member in enumerate(roster):
+        path = tmp_path / f"trajectory-{member['ordinal']}.csv"
+        amplitude = 1 if index in (7, 8, 9) else 100
+        path.write_text(f"local_energy\n0\n0\n{amplitude}\n", encoding="utf-8")
+        generations.append(
+            {
+                **member,
+                "stream": 0,
+                "seed": protocol.pilot_eval_seed(member["ordinal"], 0),
+                "artifacts": {"trajectory_csv": {"path": str(path), "sha256": _sha(path)}},
+            }
+        )
+    receipt = {
+        "source": "salvage-partial-inventory",
+        "n_sel": 20,
+        "ordinal_count": 20,
+        "inventory_count": 98,
+        "ordinal_stride": 5,
+        "selected_roster": roster,
+        "generations": generations,
+    }
+
+    assert eval_job.compute_pilot_selection(receipt, payload="capacity-pilot-100k")["c1"] == 8
+
+    wrong_update = [*generations]
+    wrong_update[8] = {**wrong_update[8], "update": 45_000}
+    with pytest.raises(eval_job.EvalJobRefusal, match="sel-unexpected-member"):
+        eval_job.compute_pilot_selection({**receipt, "generations": wrong_update}, payload="capacity-pilot-100k")
+
+
 def test_salvage_sel_refuses_missing_and_unexpected_fixed_roster_members(tmp_path: Path) -> None:
     roster = [{"ordinal": ordinal, "update": ordinal * 1000} for ordinal in range(0, 98, 5)]
     generations = []
@@ -506,3 +547,63 @@ def test_default_eval_receipt_shape_has_no_salvage_length(tmp_path: Path) -> Non
         readout_generator_enabled=False,
     )
     assert "ordinal_count" not in receipt
+
+
+def test_salvage_stride_one_preserves_all_98_members_and_default_receipt_shape(tmp_path: Path) -> None:
+    inventory = {"inventory": [{"update": ordinal * 1000} for ordinal in range(98)]}
+    roster = eval_job.salvage_selection_roster(inventory, ordinal_stride=1)
+    assert len(roster) == 98
+    assert roster[-1] == {"ordinal": 97, "update": 97_000}
+
+    default = eval_job.build_eval_receipt(
+        eval_commit="c" * 40,
+        train_commit="a" * 40,
+        payload="capacity-pilot-100k",
+        train_receipt_path=tmp_path / "train.json",
+        train_receipt_sha256="a" * 64,
+        generations=[],
+        readout_generator_enabled=False,
+    )
+    assert not {"ordinal_count", "n_sel", "ordinal_stride", "selected_roster", "inventory_count", "inventory_sha256"} & default.keys()
+
+
+def test_run_job_cli_forwards_salvage_stride_to_real_fanout_boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setenv("RUN", str(tmp_path))
+    monkeypatch.setenv("SHA", "b" * 40)
+    monkeypatch.setenv("SCIENCE_PYTHON", sys.executable)
+    monkeypatch.setattr(job, "check_identity", lambda *args, **kwargs: None)
+
+    def fake_fanout(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(job, "run_eval_fanout", fake_fanout)
+    inventory = tmp_path / "salvage.json"
+    assert job._main_eval_fanout(
+        [
+            "capacity-pilot-100k",
+            "--expected-train-commit", "a" * 40,
+            "--pilot-stage", "1",
+            "--salvage-inventory", str(inventory),
+            "--ordinal-stride", "5",
+        ]
+    ) == 0
+    assert captured["salvage_inventory_path"] == inventory
+    assert captured["ordinal_stride"] == 5
+
+
+def test_launch_cli_forwards_salvage_inventory_and_stride_in_eval_wrapper(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    run_root = tmp_path / "runs" / "h-v2" / "capacity-pilot-100k" / "P"
+    inventory = tmp_path / "salvage.json"
+    assert helpers.launch.main(
+        [
+            "--run-root", str(run_root), "--run-root-prefix", str(tmp_path / "runs"),
+            "--commit", "b" * 40, "--payload", "capacity-pilot-100k", "--stage", "eval",
+            "--pilot-stage", "1", "--expected-train-commit", "a" * 40, "--time", "04:00:00",
+            "--salvage-inventory", str(inventory), "--ordinal-stride", "5",
+            "--science-python", sys.executable, "--executor-python", sys.executable, "--dry-run",
+        ]
+    ) == 0
+    printed = capsys.readouterr().out
+    assert f"--salvage-inventory {inventory}" in printed
+    assert "--ordinal-stride 5" in printed
