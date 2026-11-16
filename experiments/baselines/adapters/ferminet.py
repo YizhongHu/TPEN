@@ -1,9 +1,10 @@
 """Translate a FermiNet run directory into a :class:`BaselineRecord`.
 
 A FermiNet run leaves ``train_stats.csv`` (columns ``step,energy,ewmean,ewvar,
-pmove``) in its save path, and the job script leaves a stdout log carrying the
-device identity and the run's start/end stamps. This module reads both and
-emits the one ``baseline_record.json`` the collector expects.
+pmove``; newer runs may append ``walker_variance``) in its save path, and the
+job script leaves a stdout log carrying the device identity and the run's
+start/end stamps. This module reads both and emits the one
+``baseline_record.json`` the collector expects.
 
 Two properties of the energy estimate are deliberate and must survive any
 refactor.
@@ -66,7 +67,7 @@ class _TrajectoryRows(list[dict[str, int | float | None]]):
 
 
 def read_trajectory(run_dir: Path) -> list[dict[str, int | float | None]]:
-    """Read FermiNet's loss and time-weighted variance per optimizer step.
+    """Read FermiNet's loss and variances per optimizer step.
 
     Parameters
     ----------
@@ -77,9 +78,9 @@ def read_trajectory(run_dir: Path) -> list[dict[str, int | float | None]]:
     -------
     list of dict
         Rows with ``step``, ``energy``, ``walker_local_energy_variance`` and
-        ``energy_time_ewvar`` fields. FermiNet does not write walker variance;
-        its ``ewvar`` is deliberately kept under the separate time-variance
-        field.
+        ``energy_time_ewvar`` fields. Historical FermiNet files without
+        ``walker_variance`` retain ``None`` for the walker variance; ``ewvar``
+        remains under the separate time-variance field.
 
     Raises
     ------
@@ -103,10 +104,15 @@ def read_trajectory(run_dir: Path) -> list[dict[str, int | float | None]]:
         rows = _TrajectoryRows()
         for row_number, row in enumerate(reader, 2):
             try:
+                walker_variance = (
+                    None
+                    if "walker_variance" not in row
+                    else float(row["walker_variance"])
+                )
                 rows.append({
                     "step": int(row["step"]),
                     "energy": float(row["energy"]),
-                    "walker_local_energy_variance": None,
+                    "walker_local_energy_variance": walker_variance,
                     "energy_time_ewvar": float(row["ewvar"]),
                     "step_basis": "optimizer_step",
                 })
