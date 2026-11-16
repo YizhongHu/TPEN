@@ -254,6 +254,33 @@ def test_salvage_inventory_is_refused_for_science_payload(tmp_path: Path) -> Non
         )
 
 
+def test_salvage_stride_is_refused_without_an_inventory(tmp_path: Path) -> None:
+    with pytest.raises(job.JobError, match="salvage-stride-requires-inventory"):
+        job.run_eval_fanout(
+            run_root=tmp_path,
+            expected_commit="b" * 40,
+            science_python=sys.executable,
+            payload="capacity-pilot-100k",
+            lineage="P",
+            expected_train_commit="a" * 40,
+            pilot_stage="1",
+            ordinal_stride=5,
+        )
+
+
+def test_salvage_stride_is_refused_for_science_payload(tmp_path: Path) -> None:
+    with pytest.raises(job.JobError, match="salvage-science-refused"):
+        job.run_eval_fanout(
+            run_root=tmp_path,
+            expected_commit="b" * 40,
+            science_python=sys.executable,
+            payload="science",
+            lineage="P",
+            expected_train_commit="a" * 40,
+            ordinal_stride=5,
+        )
+
+
 def test_salvage_consumer_refuses_incomplete_inventory_entry() -> None:
     with pytest.raises(eval_job.EvalJobRefusal, match="salvage-inventory-entry"):
         eval_job.verify_salvage_inventory_identity(
