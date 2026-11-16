@@ -306,6 +306,7 @@ def test_salvage_sel_window_follows_inventory_length(tmp_path: Path) -> None:
         generations.append(
             {
                 "ordinal": ordinal,
+                "update": ordinal * 1000,
                 "stream": 0,
                 "seed": protocol.pilot_eval_seed(ordinal, 0),
                 "artifacts": {"trajectory_csv": {"path": str(path), "sha256": _sha(path)}},
@@ -348,6 +349,7 @@ def test_salvage_sel_refuses_inventory_length_7_with_only_six_b1_generations(tmp
         generations.append(
             {
                 "ordinal": ordinal,
+                "update": ordinal * 1000,
                 "stream": 0,
                 "seed": protocol.pilot_eval_seed(ordinal, 0),
                 "artifacts": {"trajectory_csv": {"path": str(path), "sha256": _sha(path)}},
