@@ -81,6 +81,56 @@ def test_ferminet_marks_nan_walker_variance_non_finite(tmp_path: Path):
     assert rows[0].energy_time_ewvar == 0.25
 
 
+@pytest.mark.parametrize("suffix", [",", ""])
+def test_energy_reader_ignores_missing_optional_variance(tmp_path: Path, suffix: str):
+    (tmp_path / ferminet.TRAIN_STATS_FILENAME).write_text(
+        "step,energy,ewmean,ewvar,pmove,walker_variance\n"
+        f"10,-1.0,-1.0,0.25,0.5{suffix}\n",
+        encoding="utf-8",
+    )
+
+    assert ferminet.read_energies(tmp_path) == [-1.0]
+
+
+def test_ferminet_rejects_only_truncated_variance_cell(tmp_path: Path):
+    (tmp_path / ferminet.TRAIN_STATS_FILENAME).write_text(
+        "step,energy,ewmean,ewvar,pmove,walker_variance\n"
+        "10,-1.0,-1.0,0.25,0.5\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AdapterError, match="invalid trajectory values"):
+        read_trajectory("ferminet", tmp_path)
+
+
+def test_ferminet_export_preserves_variance_and_source(tmp_path: Path):
+    source = tmp_path / ferminet.TRAIN_STATS_FILENAME
+    source.write_text(
+        "step,energy,ewmean,ewvar,pmove,walker_variance\n"
+        "10,-1.0,-1.0,0.25,0.5,4.0\n",
+        encoding="utf-8",
+    )
+    csv_path, json_path = tmp_path / "out.csv", tmp_path / "out.json"
+
+    assert main([
+        "--code", "ferminet", str(tmp_path),
+        "--out", str(csv_path), "--json", str(json_path),
+    ]) == 0
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        row, = list(csv.DictReader(handle))
+    assert float(row["walker_local_energy_variance"]) == 4.0
+    assert float(row["energy_time_ewvar"]) == 0.25
+    summary = json.loads(json_path.read_text(encoding="utf-8"))
+    for exported in (row, summary):
+        assert exported["source_code"] == "ferminet"
+        assert exported["source_file"] == str(source)
+        assert exported["step_basis"] == "optimizer_step"
+    assert summary["walker_variance_first_window_mean"] == 4.0
+    assert summary["energy_time_ewvar_first_window_mean"] == 0.25
+    assert summary["walker_variance_unavailable_reason"] is None
+
+
 def test_deepqmc_squares_std_and_cli_writes_requested_outputs(tmp_path: Path):
     h5py = pytest.importorskip("h5py", reason="h5py is not a TPEN dependency")
     training = tmp_path / "training"
