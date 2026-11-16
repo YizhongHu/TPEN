@@ -21,7 +21,7 @@ def test_pbs_layout_records_and_gates_existing_row_directories(tmp_path):
 
     root = tmp_path / "ramp"
     root.mkdir()
-    rows = ["deepqmc-default-seed0", "deepqmc-ferminet-seed0"]
+    rows = ["ferminet-codebase-ferminet-seed0", "ferminet-codebase-psiformer-seed0"]
     for row in rows:
         (root / row).mkdir()
         record(root / row / "receipt.json", row=row, returncode=0)
@@ -97,7 +97,7 @@ def test_verify_submitter_has_complete_exported_control_surface():
 
     script = (Path(__file__).parent / "runbooks" / "h-atom-r1-verify-submit.sh").read_text(encoding="utf-8")
     assert 'success-mini) INJECT_FAIL=' in script
-    assert 'fail-deepqmc-default) INJECT_FAIL=deepqmc-default-seed0' in script
+    assert 'fail-ferminet-ferminet) INJECT_FAIL=ferminet-codebase-ferminet-seed0' in script
     assert 'export BL_R1_MODE=verify BL_R1_VERIFY_STEPS=10' in script
     assert 'QSUB_VARIABLES=RUN_ROOT,SOURCE_CHECKOUT,RUNBOOK_COMMIT,SCIENCE,PRE_FREEZE_RECEIPT,PRE_FREEZE_RECEIPT_SHA256,BL_R1_MODE,BL_R1_VERIFY_STEPS' in script
     assert 'BL_R1_VERIFY_INJECT_FAIL' in script

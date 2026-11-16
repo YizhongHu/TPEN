@@ -100,25 +100,14 @@ def _sha256(path: Path) -> str:
 
 
 def ramp_required_paths() -> list[str]:
-    """Return the fixed relative evidence set for the five-row BL-R1 ramp."""
+    """Return the fixed relative evidence set for the two-row BL-R1 ramp."""
 
     required = [
         "ramp/mode.json",
         "ramp/gpu-inventory.txt",
-        "ramp/deepqmc-gate.json",
         "ramp/ferminet-gate.json",
         "ramp/ramp.complete",
     ]
-    for row in ("deepqmc-default-seed0", "deepqmc-ferminet-seed0", "deepqmc-psiformer-seed0"):
-        required.extend(
-            [
-                f"ramp/{row}/{name}"
-                for name in (
-                    "stdout.log", "stderr.log", "start.txt", "end.txt", "timing.txt", "receipt.json", "backend.json",
-                    "training/.hydra/config.yaml", "training/.hydra/overrides.yaml", "training/result.h5",
-                )
-            ]
-        )
     for row in ("ferminet-codebase-ferminet-seed0", "ferminet-codebase-psiformer-seed0"):
         required.extend(
             [

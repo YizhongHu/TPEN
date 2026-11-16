@@ -1,6 +1,6 @@
 #!/bin/bash
 # Complete verifier-only submitter. Usage:
-#   h-atom-r1-verify-submit.sh INPUTS_FILE success-mini|fail-deepqmc-default
+#   h-atom-r1-verify-submit.sh INPUTS_FILE success-mini|fail-ferminet-ferminet
 set -euo pipefail
 
 test "$#" = 2 || test "$#" = 3
@@ -10,7 +10,7 @@ DRY_RUN="${3:-}"
 test -z "$DRY_RUN" || test "$DRY_RUN" = --dry-run
 case "$CONTROL" in
   success-mini) INJECT_FAIL= ;;
-  fail-deepqmc-default) INJECT_FAIL=deepqmc-default-seed0 ;;
+  fail-ferminet-ferminet) INJECT_FAIL=ferminet-codebase-ferminet-seed0 ;;
   *) printf 'unknown verification control: %s\n' "$CONTROL" >&2; exit 2 ;;
 esac
 
@@ -20,6 +20,7 @@ test -z "${BL_R1_MODE+x}"
 test -z "${BL_R1_VERIFY_STEPS+x}"
 test -z "${BL_R1_VERIFY_INJECT_FAIL+x}"
 source "$INPUTS_FILE"
+RECEIPT_HELPER="$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py"
 test "$SCIENCE" = true || test "$SCIENCE" = false
 test "$(sha256sum "$PRE_FREEZE_RECEIPT" | awk '{print $1}')" = "$PRE_FREEZE_RECEIPT_SHA256"
 git -C "$SOURCE_CHECKOUT" rev-parse --verify "$RUNBOOK_COMMIT^{commit}"
@@ -32,7 +33,6 @@ done <<'BLOBS'
 RUNBOOK_BLOB experiments/baselines/runbooks/h-atom-r1.md
 PBS_BLOB experiments/baselines/runbooks/h-atom-r1-ramp.pbs
 INPUT_SPEC_BLOB experiments/baselines/runbooks/configs/h-atom-r1.yaml
-DQ_CONFIG_BLOB experiments/baselines/runbooks/configs/deepqmc_h_atom.yaml
 FN_CONFIG_BLOB experiments/baselines/runbooks/configs/ferminet_h_atom.py
 RECEIPT_HELPER_BLOB experiments/baselines/runbooks/ramp_receipt.py
 VERIFY_SUBMIT_BLOB experiments/baselines/runbooks/h-atom-r1-verify-submit.sh
@@ -51,7 +51,7 @@ printf '{"control":"%s","mode":"%s","steps":%s,"inject_fail":"%s"}\n' "$CONTROL"
 
 write_submit_partial() {
   set +e
-  /home/rhu/.venvs/deepqmc-jax083-edf373e7/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/artifact-inventory.submit-partial.jsonl" --ramp-required --required ramp-inputs.env --required ramp.pbs --required input-inventory.sha256 --required verify-submit-mode.json --required qsub.stdout --required qsub.stderr --required qsub.status --required jobid.txt > "$RUN_ROOT/artifact-inventory.submit-partial.stdout" 2> "$RUN_ROOT/artifact-inventory.submit-partial.stderr"
+  /home/rhu/.venvs/ferminet-jax092-60c9fab3/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/artifact-inventory.submit-partial.jsonl" --ramp-required --required ramp-inputs.env --required ramp.pbs --required input-inventory.sha256 --required verify-submit-mode.json --required qsub.stdout --required qsub.stderr --required qsub.status --required jobid.txt > "$RUN_ROOT/artifact-inventory.submit-partial.stdout" 2> "$RUN_ROOT/artifact-inventory.submit-partial.stderr"
   return 0
 }
 on_submit_exit() { rc=$?; write_submit_partial; exit "$rc"; }
@@ -94,8 +94,8 @@ while :; do
   printf '%s status=%s file=%s\n' "$stamp" "$QUERY_STATUS" "$(basename "$query")" >> "$RUN_ROOT/qstat-observations.txt"
   test "$QUERY_STATUS" = 0
   cp "$query" "$RUN_ROOT/qstat-last-success.txt"
-  STATE="$("$DQ_PY" "$RECEIPT_HELPER" poll-check --path "$query" --field state)"
-  PHASE="$("$DQ_PY" "$RECEIPT_HELPER" poll-check --path "$query" --field phase)"
+  STATE="$(/home/rhu/.venvs/ferminet-jax092-60c9fab3/bin/python "$RECEIPT_HELPER" poll-check --path "$query" --field state)"
+  PHASE="$(/home/rhu/.venvs/ferminet-jax092-60c9fab3/bin/python "$RECEIPT_HELPER" poll-check --path "$query" --field phase)"
   test "$(awk -F= '/^[[:space:]]*queue[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$query")" = debug
   grep -Eq 'Resource_List.select = 1:system=polaris' "$query"
   case "$PHASE" in
@@ -110,4 +110,4 @@ while :; do
   esac
   sleep 30
 done
-/home/rhu/.venvs/deepqmc-jax083-edf373e7/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/artifact-inventory.jsonl" --ramp-required --required ramp-inputs.env --required ramp.pbs --required input-inventory.sha256 --required verify-submit-mode.json --required qsub.stdout --required qsub.stderr --required qsub.status --required jobid.txt --required qstat-observations.txt --required qstat-last-success.txt --required logs/ramp.stdout --required logs/ramp.stderr
+/home/rhu/.venvs/ferminet-jax092-60c9fab3/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/artifact-inventory.jsonl" --ramp-required --required ramp-inputs.env --required ramp.pbs --required input-inventory.sha256 --required verify-submit-mode.json --required qsub.stdout --required qsub.stderr --required qsub.status --required jobid.txt --required qstat-observations.txt --required qstat-last-success.txt --required logs/ramp.stdout --required logs/ramp.stderr

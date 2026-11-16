@@ -15,10 +15,6 @@ electrons:
   total: 1
   spins: [1, 0]
 reference_energy_hartree: -0.5
-deepqmc:
-  hydra_overrides:
-    hamil/mol: H
-    task.electron_batch_size: 4096
 ferminet:
   config: experiments/baselines/runbooks/configs/ferminet_h_atom.py
   flags:

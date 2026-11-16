@@ -16,18 +16,13 @@ test "${SCIENCE:?missing SCIENCE}" = true || test "$SCIENCE" = false
 test "$(git -C "$SOURCE_CHECKOUT" rev-parse HEAD)" = "$RUNBOOK_COMMIT"
 test -z "$(git -C "$SOURCE_CHECKOUT" status --porcelain=v1)"
 
-DQ_SRC=/home/rhu/src/deepqmc-edf373e7
 FN_SRC=/home/rhu/src/ferminet-psiformer-60c9fab3
-DQ_PY=/home/rhu/.venvs/deepqmc-jax083-edf373e7/bin/python
-DQ=/home/rhu/.venvs/deepqmc-jax083-edf373e7/bin/deepqmc
 FN_PY=/home/rhu/.venvs/ferminet-jax092-60c9fab3/bin/python
 RECEIPT_HELPER="$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py"
 
-test "$(git -C "$DQ_SRC" rev-parse HEAD)" = edf373e7c26545616f87b3b10c3e48b25c70f627
-test -z "$(git -C "$DQ_SRC" status --porcelain=v1)"
 test "$(git -C "$FN_SRC" rev-parse HEAD)" = f4b1846cd6f2776321b09b027d4d5506ae98e19b
 test -z "$(git -C "$FN_SRC" status --porcelain=v1)"
-for path in "$DQ_PY" "$DQ" "$FN_PY" "$FN_SRC/ferminet/main.py" "$RECEIPT_HELPER"; do test -e "$path"; done
+for path in "$FN_PY" "$FN_SRC/ferminet/main.py" "$RECEIPT_HELPER"; do test -e "$path"; done
 
 MODE="${BL_R1_MODE:-real}"
 case "$MODE" in
@@ -41,20 +36,13 @@ case "$MODE" in
     test "$BL_R1_VERIFY_STEPS" -ge 1 && test "$BL_R1_VERIFY_STEPS" -le 100
     STEPS="$BL_R1_VERIFY_STEPS"; INJECT_FAIL="${BL_R1_VERIFY_INJECT_FAIL:-}"
     case "$INJECT_FAIL" in
-      ''|deepqmc-default-seed0|deepqmc-ferminet-seed0|deepqmc-psiformer-seed0|ferminet-codebase-ferminet-seed0|ferminet-codebase-psiformer-seed0) ;;
+      ''|ferminet-codebase-ferminet-seed0|ferminet-codebase-psiformer-seed0) ;;
       *) exit 2 ;;
     esac ;;
   *) exit 2 ;;
 esac
 printf '{"mode":"%s","steps":%s,"inject_fail":"%s"}\n' "$MODE" "$STEPS" "$INJECT_FAIL" > "$RUN_ROOT/ramp/mode.json"
 
-"$DQ_PY" - "$DQ_SRC" <<'PY'
-import pathlib, sys, deepqmc, jax
-expected = pathlib.Path(sys.argv[1]).resolve()
-assert sys.prefix == '/home/rhu/.venvs/deepqmc-jax083-edf373e7'
-assert jax.__version__ == '0.8.3'
-assert pathlib.Path(deepqmc.__file__).resolve().is_relative_to(expected)
-PY
 PYTHONPATH="$FN_SRC${PYTHONPATH:+:$PYTHONPATH}" "$FN_PY" - "$FN_SRC" <<'PY'
 import pathlib, sys, ferminet, jax
 expected = pathlib.Path(sys.argv[1]).resolve()
@@ -66,7 +54,7 @@ nvidia-smi --query-gpu=name,uuid --format=csv,noheader > "$RUN_ROOT/ramp/gpu-inv
 
 write_partial_inventory() {
   set +e
-  "$DQ_PY" "$RECEIPT_HELPER" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/ramp/artifact-inventory.partial.jsonl" --ramp-required > "$RUN_ROOT/ramp/artifact-inventory.partial.stdout" 2> "$RUN_ROOT/ramp/artifact-inventory.partial.stderr"
+  "$FN_PY" "$RECEIPT_HELPER" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/ramp/artifact-inventory.partial.jsonl" --ramp-required > "$RUN_ROOT/ramp/artifact-inventory.partial.stdout" 2> "$RUN_ROOT/ramp/artifact-inventory.partial.stderr"
   return 0
 }
 on_exit() { local rc=$?; write_partial_inventory; exit "$rc"; }
@@ -88,36 +76,6 @@ maybe_inject_failure() {
   if test "$MODE" = verify && test "$INJECT_FAIL" = "$row"; then printf 'intentional BL-R1 verification failure: %s\n' "$row" >&2; return 97; fi
 }
 PIDS=(); ROWS=()
-
-launch_dq() {
-  local row="$1" task="$2" ansatz="$3" gpu="$4" root="$RUN_ROOT/ramp/$1"
-  mkdir "$root"
-  (
-    export CUDA_VISIBLE_DEVICES="$gpu"
-    assert_one_gpu "$DQ_PY" "$root/backend.json"
-    date --iso-8601=seconds > "$root/start.txt"
-    cd "$root"
-    "$DQ" hydra.run.dir="$root" hamil/mol=H task="$task" ansatz="$ansatz" task.seed=0 task.steps="$STEPS" task.electron_batch_size=4096 task.pretrain_steps=0 +task.max_restarts=1
-    date --iso-8601=seconds > "$root/end.txt"
-    "$DQ_PY" - "$root" "$task" "$ansatz" "$STEPS" <<'PY'
-import math, pathlib, sys, h5py, yaml
-root = pathlib.Path(sys.argv[1]); task, ansatz, steps = sys.argv[2], sys.argv[3], int(sys.argv[4])
-training = root / 'training'
-cfg = yaml.safe_load((training / '.hydra' / 'config.yaml').read_text())
-overrides = (training / '.hydra' / 'overrides.yaml').read_text().splitlines()
-assert f'- task={task}' in overrides and f'- ansatz={ansatz}' in overrides
-assert cfg['task']['seed'] == 0 and cfg['task']['steps'] == steps
-assert cfg['task']['electron_batch_size'] == 4096 and cfg['task']['pretrain_steps'] == 0 and cfg['task']['max_restarts'] == 1
-mol = cfg['hamil']['mol']
-assert mol['charges'] == [1] and mol['charge'] == 0 and mol['spin'] == 1 and mol['coords'] == [[0.0, 0.0, 0.0]]
-with h5py.File(training / 'result.h5', 'r') as result:
-    for name in ('local_energy/mean', 'local_energy/std'):
-        values = result[name][...].reshape(-1)
-        assert len(values) == steps and all(math.isfinite(float(x)) for x in values)
-PY
-    maybe_inject_failure "$row"
-  ) >"$root/stdout.log" 2>"$root/stderr.log" &
-}
 
 launch_fn() {
   local row="$1" ansatz="$2" gpu="$3" root="$RUN_ROOT/ramp/$1"
@@ -143,7 +101,7 @@ output.write_text(json.dumps({'atom_charge': atom.charge, 'atom_coords': list(at
 PY
     PYTHONPATH="$FN_SRC${PYTHONPATH:+:$PYTHONPATH}" "$FN_PY" "$FN_SRC/ferminet/main.py" --config "$SOURCE_CHECKOUT/experiments/baselines/runbooks/configs/ferminet_h_atom.py" --config.batch_size 4096 --config.optim.iterations "$STEPS" --config.network.network_type "$ansatz" --config.network.determinants 16 --config.debug.deterministic True --config.debug.seed 0 --config.debug.check_nan True --config.optim.reset_if_nan False --config.pretrain.iterations 0 --config.log.save_path "$root"
     date --iso-8601=seconds > "$root/end.txt"
-    "$DQ_PY" "$RECEIPT_HELPER" validate-ferminet-trace --path "$root/train_stats.csv" --steps "$STEPS"
+    "$FN_PY" "$RECEIPT_HELPER" validate-ferminet-trace --path "$root/train_stats.csv" --steps "$STEPS"
     maybe_inject_failure "$row"
   ) >"$root/stdout.log" 2>"$root/stderr.log" &
 }
@@ -154,17 +112,12 @@ wait_and_gate() {
   for i in "${!PIDS[@]}"; do
     row="${ROWS[$i]}"
     set +e; wait "${PIDS[$i]}"; rc=$?; set -e
-    "$DQ_PY" "$RECEIPT_HELPER" record --path "$RUN_ROOT/ramp/$row/receipt.json" --row "$row" --returncode "$rc"
+    "$FN_PY" "$RECEIPT_HELPER" record --path "$RUN_ROOT/ramp/$row/receipt.json" --row "$row" --returncode "$rc"
     gate_args+=(--row "$row")
   done
-  "$DQ_PY" "$RECEIPT_HELPER" gate --root "$RUN_ROOT/ramp" "${gate_args[@]}" > "$gate_output"
+  "$FN_PY" "$RECEIPT_HELPER" gate --root "$RUN_ROOT/ramp" "${gate_args[@]}" > "$gate_output"
 }
 
-launch_dq deepqmc-default-seed0 train default 0; PIDS+=("$!"); ROWS+=(deepqmc-default-seed0)
-launch_dq deepqmc-ferminet-seed0 train_ferminet ferminet 1; PIDS+=("$!"); ROWS+=(deepqmc-ferminet-seed0)
-launch_dq deepqmc-psiformer-seed0 train_psiformer psiformer 2; PIDS+=("$!"); ROWS+=(deepqmc-psiformer-seed0)
-wait_and_gate "$RUN_ROOT/ramp/deepqmc-gate.json"
-PIDS=(); ROWS=()
 launch_fn ferminet-codebase-ferminet-seed0 ferminet 0; PIDS+=("$!"); ROWS+=(ferminet-codebase-ferminet-seed0)
 launch_fn ferminet-codebase-psiformer-seed0 psiformer 1; PIDS+=("$!"); ROWS+=(ferminet-codebase-psiformer-seed0)
 wait_and_gate "$RUN_ROOT/ramp/ferminet-gate.json"
