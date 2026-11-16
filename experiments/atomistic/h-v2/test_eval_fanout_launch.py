@@ -367,6 +367,38 @@ def test_capacity_pilot_stage1_dry_run_is_one_line(tmp_path: Path, capsys: pytes
     assert "--pilot-stage 1" in printed
 
 
+@pytest.mark.parametrize("ordinal_stride", [0, -1])
+def test_salvage_invalid_ordinal_stride_refuses_before_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ordinal_stride: int
+) -> None:
+    """The launcher rejects non-positive salvage strides before ``sbatch``."""
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        launch.subprocess,
+        "run",
+        lambda command, **kwargs: calls.append(list(command)),
+    )
+    with pytest.raises(launch.LaunchError, match="^salvage-stride-invalid:"):
+        launch.main(
+            [
+                "--run-root", str(tmp_path / "runs" / "h-v2" / "capacity-pilot-100k" / "P"),
+                "--run-root-prefix", str(tmp_path / "runs"),
+                "--commit", SHA,
+                "--payload", "capacity-pilot-100k",
+                "--stage", "eval",
+                "--pilot-stage", "1",
+                "--expected-train-commit", TRAIN_SHA,
+                "--time", "06:25:00",
+                "--salvage-inventory", str(tmp_path / "salvage.json"),
+                "--ordinal-stride", str(ordinal_stride),
+                "--science-python", sys.executable,
+                "--executor-python", sys.executable,
+            ]
+        )
+    assert calls == []
+
+
 def test_capacity_pilot_stage1_never_auto_submits_stage2(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
