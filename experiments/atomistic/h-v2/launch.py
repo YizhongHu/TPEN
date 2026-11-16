@@ -1355,6 +1355,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parse_args(argv)
     run_root = Path(args.run_root).resolve()
+    if args.ordinal_stride is not None and (
+        type(args.ordinal_stride) is not int or args.ordinal_stride < 1
+    ):
+        raise LaunchError(
+            f"salvage-stride-invalid: ordinal stride must be a positive integer, got {args.ordinal_stride!r}"
+        )
     if args.ordinal_stride is not None and args.payload == "science":
         raise LaunchError("salvage-science-refused: ordinal stride is allowed only for pilot salvage eval")
     if args.ordinal_stride is not None and args.salvage_inventory is None:
