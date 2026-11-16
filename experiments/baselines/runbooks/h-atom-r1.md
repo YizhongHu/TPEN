@@ -1,6 +1,6 @@
 ---
 item_id: "dc036f76-7ddb-4e2f-baf8-b33a1161b539"
-runbook_revision: 6
+runbook_revision: 7
 runbook_commit: "external: runbook-index-r5 and submission receipt"
 science: "PENDING_OPERATOR"
 ---
@@ -23,12 +23,21 @@ Two seed-0 rows run: FermiNet-codebase ferminet and psiformer; batch 4096;
 spins (1,0), one Z=1 origin nucleus. The DeepQMC rows are removed because
 the pinned producer rejects one-electron H at `hamil.py:144` (`assert n_elec >
 1`), as recorded in TO note `plan-revision-1-deepqmc-cannot-run-h-20261116`.
-Walker local-energy variance is UNAVAILABLE for this slice: FermiNet's
-`ewvar` is time variance, not walker local-energy variance.
+Each H-atom record and receipt is labelled `ferminet f4b1846c + logging patch
+<patch sha256>`. The patch adds `walker_variance`, sourced from FermiNet
+`aux_data.variance` (unclipped batch local-energy variance, `loss.py:227`);
+`ewvar` remains time variance. The trajectory reader
+(`adapters/ferminet.py`) does not support this new column in this slice; that
+is a follow-up item.
 
 Pinned producer: FermiNet
 f4b1846cd6f2776321b09b027d4d5506ae98e19b at
 /home/rhu/src/ferminet-psiformer-60c9fab3 (JAX 0.9.2).
+The PBS job asserts that shared tree is at this commit and clean, copies it
+to a new `$RUN_ROOT/src/ferminet-patched`, applies the committed logging patch
+there, asserts the diff touches only `ferminet/train.py`, and records the patch
+SHA-256, patched `train.py` SHA-256, and full diff under the run root. It never
+modifies the shared tree; `FN_SRC`/`PYTHONPATH` point to the patched copy.
 FermiNet batch/step/NaN/pretraining defaults: ferminet/base_config.py:47,61,
 85,305-318; required trace schema: train.py:648; loop/NaN: train.py:965-1033.
 Each row asserts one GPU using its own interpreter.
@@ -45,7 +54,7 @@ re-plan from seconds/step before any full run, inference, or trajectory export.
 3. Prepare clean exact TPEN checkout and immutable data-only ramp-inputs.env:
    RUNBOOK_COMMIT, SCIENCE, SOURCE_CHECKOUT, fresh RUN_ROOT, pre-freeze
    receipt/SHA, and RUNBOOK_BLOB, PBS_BLOB, INPUT_SPEC_BLOB,
-   FN_CONFIG_BLOB, RECEIPT_HELPER_BLOB, VERIFY_SUBMIT_BLOB.
+   FN_CONFIG_BLOB, RECEIPT_HELPER_BLOB, VERIFY_SUBMIT_BLOB, PATCH_BLOB.
 
 Any failure stops before runner execution.
 
@@ -76,12 +85,13 @@ INPUT_SPEC_BLOB experiments/baselines/runbooks/configs/h-atom-r1.yaml
 FN_CONFIG_BLOB experiments/baselines/runbooks/configs/ferminet_h_atom.py
 RECEIPT_HELPER_BLOB experiments/baselines/runbooks/ramp_receipt.py
 VERIFY_SUBMIT_BLOB experiments/baselines/runbooks/h-atom-r1-verify-submit.sh
+PATCH_BLOB experiments/baselines/runbooks/patches/ferminet-f4b1846c-walker-variance-logging.patch
 BLOBS
 mkdir "$RUN_ROOT"; mkdir "$RUN_ROOT/logs" "$RUN_ROOT/ramp"
 cp "$INPUTS_FILE" "$RUN_ROOT/ramp-inputs.env"
 cp "$SOURCE_CHECKOUT/experiments/baselines/runbooks/h-atom-r1-ramp.pbs" "$RUN_ROOT/ramp.pbs"
 sha256sum "$RUN_ROOT/ramp-inputs.env" "$PRE_FREEZE_RECEIPT" "$RUN_ROOT/ramp.pbs" > "$RUN_ROOT/input-inventory.sha256"
-export RUN_ROOT SOURCE_CHECKOUT RUNBOOK_COMMIT SCIENCE PRE_FREEZE_RECEIPT PRE_FREEZE_RECEIPT_SHA256
+export RUN_ROOT SOURCE_CHECKOUT RUNBOOK_COMMIT SCIENCE PRE_FREEZE_RECEIPT PRE_FREEZE_RECEIPT_SHA256 PATCH_BLOB
 write_submit_partial() {
   set +e
   /home/rhu/.venvs/ferminet-jax092-60c9fab3/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/artifact-inventory.submit-partial.jsonl" --ramp-required --required ramp-inputs.env --required ramp.pbs --required input-inventory.sha256 --required qsub.stdout --required qsub.stderr --required qsub.status --required jobid.txt > "$RUN_ROOT/artifact-inventory.submit-partial.stdout" 2> "$RUN_ROOT/artifact-inventory.submit-partial.stderr"
@@ -90,7 +100,7 @@ write_submit_partial() {
 on_submit_exit() { rc=$?; write_submit_partial; exit "$rc"; }
 trap on_submit_exit EXIT
 set +e
-qsub -v RUN_ROOT,SOURCE_CHECKOUT,RUNBOOK_COMMIT,SCIENCE,PRE_FREEZE_RECEIPT,PRE_FREEZE_RECEIPT_SHA256 -o "$RUN_ROOT/logs/ramp.stdout" -e "$RUN_ROOT/logs/ramp.stderr" "$RUN_ROOT/ramp.pbs" > "$RUN_ROOT/qsub.stdout" 2> "$RUN_ROOT/qsub.stderr"
+qsub -v RUN_ROOT,SOURCE_CHECKOUT,RUNBOOK_COMMIT,SCIENCE,PRE_FREEZE_RECEIPT,PRE_FREEZE_RECEIPT_SHA256,PATCH_BLOB -o "$RUN_ROOT/logs/ramp.stdout" -e "$RUN_ROOT/logs/ramp.stderr" "$RUN_ROOT/ramp.pbs" > "$RUN_ROOT/qsub.stdout" 2> "$RUN_ROOT/qsub.stderr"
 QSUB_STATUS=$?
 set -e
 printf '%s\n' "$QSUB_STATUS" > "$RUN_ROOT/qsub.status"
@@ -169,7 +179,7 @@ test "$(git -C /home/rhu/src/ferminet-psiformer-60c9fab3 rev-parse HEAD)" = 0000
 Malformed-FermiNet-trace control must fail:
 
 ~~~bash
-printf 'step,energy,ewmean,ewvar,pmove\n0,-0.5,-0.5,0.1,0.5\n1,,,,\n' > "$RUN_ROOT/malformed-train_stats.csv"
+printf 'step,energy,ewmean,ewvar,pmove,walker_variance\n0,-0.5,-0.5,0.1,0.5,0.2\n1,,,,,\n' > "$RUN_ROOT/malformed-train_stats.csv"
 ! /home/rhu/.venvs/ferminet-jax092-60c9fab3/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" validate-ferminet-trace --path "$RUN_ROOT/malformed-train_stats.csv" --steps 2
 ~~~
 

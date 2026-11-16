@@ -17,17 +17,27 @@ from pathlib import Path
 from typing import Sequence
 
 
-def record(path: Path, *, row: str, returncode: int) -> None:
+def record(path: Path, *, row: str, returncode: int, producer_label: str) -> None:
     """Persist one outcome inside a pre-created row directory, once only."""
 
     if not row or "/" in row or "\\" in row:
         raise ValueError("row must be a non-empty leaf name")
+    if not producer_label:
+        raise ValueError("producer_label must be non-empty")
     if path.exists():
         raise FileExistsError(f"receipt already exists: {path}")
     if not path.parent.is_dir():
         raise FileNotFoundError(f"receipt parent is not an existing directory: {path.parent}")
     path.write_text(
-        json.dumps({"schema": "bl-r1-ramp-row/v1", "row": row, "returncode": returncode}) + "\n",
+        json.dumps(
+            {
+                "schema": "bl-r1-ramp-row/v1",
+                "row": row,
+                "returncode": returncode,
+                "producer_label": producer_label,
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -50,6 +60,8 @@ def gate(root: Path, expected_rows: Sequence[str]) -> dict[str, object]:
         observed.append(payload)
         if payload.get("schema") != "bl-r1-ramp-row/v1" or payload.get("row") != row:
             failures.append(f"{row}: receipt identity mismatch")
+        if not payload.get("producer_label"):
+            failures.append(f"{row}: missing producer label")
         if payload.get("returncode") != 0:
             failures.append(f"{row}: producer returncode={payload.get('returncode')!r}")
     report: dict[str, object] = {"schema": "bl-r1-ramp-gate/v1", "rows": observed, "failures": failures}
@@ -58,7 +70,7 @@ def gate(root: Path, expected_rows: Sequence[str]) -> dict[str, object]:
     return report
 
 
-_FERMINET_TRACE_COLUMNS = ("step", "energy", "ewmean", "ewvar", "pmove")
+_FERMINET_TRACE_COLUMNS = ("step", "energy", "ewmean", "ewvar", "pmove", "walker_variance")
 
 
 def validate_ferminet_trace(path: Path, *, steps: int) -> dict[str, object]:
@@ -180,6 +192,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     record_parser.add_argument("--path", type=Path, required=True)
     record_parser.add_argument("--row", required=True)
     record_parser.add_argument("--returncode", type=int, required=True)
+    record_parser.add_argument("--producer-label", required=True)
     gate_parser = subparsers.add_parser("gate")
     gate_parser.add_argument("--root", type=Path, required=True)
     gate_parser.add_argument("--row", action="append", required=True)
@@ -197,7 +210,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "record":
-            record(args.path, row=args.row, returncode=args.returncode)
+            record(args.path, row=args.row, returncode=args.returncode, producer_label=args.producer_label)
         elif args.command == "gate":
             print(json.dumps(gate(args.root, args.row), sort_keys=True))
         elif args.command == "validate-ferminet-trace":

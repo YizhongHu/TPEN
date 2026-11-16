@@ -24,7 +24,7 @@ def test_pbs_layout_records_and_gates_existing_row_directories(tmp_path):
     rows = ["ferminet-codebase-ferminet-seed0", "ferminet-codebase-psiformer-seed0"]
     for row in rows:
         (root / row).mkdir()
-        record(root / row / "receipt.json", row=row, returncode=0)
+        record(root / row / "receipt.json", row=row, returncode=0, producer_label="ferminet f4b1846c + logging patch test")
     assert [entry["row"] for entry in gate(root, rows)["rows"]] == rows
 
 
@@ -35,7 +35,7 @@ def test_pbs_layout_rejects_missing_and_failed_receipts(tmp_path):
     root.mkdir()
     (root / "missing").mkdir()
     (root / "failed").mkdir()
-    record(root / "failed" / "receipt.json", row="failed", returncode=7)
+    record(root / "failed" / "receipt.json", row="failed", returncode=7, producer_label="ferminet f4b1846c + logging patch test")
     with pytest.raises(RuntimeError, match="missing"):
         gate(root, ["missing", "failed"])
     with pytest.raises(RuntimeError, match="returncode"):
@@ -47,14 +47,14 @@ def test_record_refuses_an_existing_receipt_and_missing_row(tmp_path):
 
     path = tmp_path / "a" / "receipt.json"
     with pytest.raises(FileNotFoundError):
-        record(path, row="a", returncode=0)
+        record(path, row="a", returncode=0, producer_label="ferminet f4b1846c + logging patch test")
     path.parent.mkdir()
-    record(path, row="a", returncode=0)
+    record(path, row="a", returncode=0, producer_label="ferminet f4b1846c + logging patch test")
     with pytest.raises(FileExistsError):
-        record(path, row="a", returncode=0)
+        record(path, row="a", returncode=0, producer_label="ferminet f4b1846c + logging patch test")
 
 
-def _write_trace(path, rows, fieldnames=("step", "energy", "ewmean", "ewvar", "pmove")):
+def _write_trace(path, rows, fieldnames=("step", "energy", "ewmean", "ewvar", "pmove", "walker_variance")):
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -66,12 +66,12 @@ def test_ferminet_trace_requires_pinned_schema_and_complete_values(tmp_path):
 
     path = tmp_path / "train_stats.csv"
     rows = [
-        {"step": index, "energy": -0.5, "ewmean": -0.5, "ewvar": 0.1, "pmove": 0.5}
+        {"step": index, "energy": -0.5, "ewmean": -0.5, "ewvar": 0.1, "pmove": 0.5, "walker_variance": 0.2}
         for index in range(3)
     ]
     _write_trace(path, rows)
     assert validate_ferminet_trace(path, steps=3)["steps"] == 3
-    _write_trace(path, rows, fieldnames=("step", "energy"))
+    _write_trace(path, rows, fieldnames=("step", "energy", "ewmean", "ewvar", "pmove"))
     with pytest.raises(ValueError, match="schema"):
         validate_ferminet_trace(path, steps=3)
     _write_trace(path, [{**row, "energy": ""} if row["step"] == 1 else row for row in rows])
@@ -79,6 +79,12 @@ def test_ferminet_trace_requires_pinned_schema_and_complete_values(tmp_path):
         validate_ferminet_trace(path, steps=3)
     _write_trace(path, rows[:-1] + [{"step": 2, "energy": -0.5}])
     with pytest.raises(ValueError, match="missing ewmean"):
+        validate_ferminet_trace(path, steps=3)
+    _write_trace(path, [{**row, "walker_variance": ""} if row["step"] == 1 else row for row in rows])
+    with pytest.raises(ValueError, match="missing walker_variance"):
+        validate_ferminet_trace(path, steps=3)
+    _write_trace(path, [{**row, "walker_variance": "nan"} if row["step"] == 1 else row for row in rows])
+    with pytest.raises(ValueError, match="non-finite walker_variance"):
         validate_ferminet_trace(path, steps=3)
 
 
@@ -99,7 +105,8 @@ def test_verify_submitter_has_complete_exported_control_surface():
     assert 'success-mini) INJECT_FAIL=' in script
     assert 'fail-ferminet-ferminet) INJECT_FAIL=ferminet-codebase-ferminet-seed0' in script
     assert 'export BL_R1_MODE=verify BL_R1_VERIFY_STEPS=10' in script
-    assert 'QSUB_VARIABLES=RUN_ROOT,SOURCE_CHECKOUT,RUNBOOK_COMMIT,SCIENCE,PRE_FREEZE_RECEIPT,PRE_FREEZE_RECEIPT_SHA256,BL_R1_MODE,BL_R1_VERIFY_STEPS' in script
+    assert 'QSUB_VARIABLES=RUN_ROOT,SOURCE_CHECKOUT,RUNBOOK_COMMIT,SCIENCE,PRE_FREEZE_RECEIPT,PRE_FREEZE_RECEIPT_SHA256,PATCH_BLOB,BL_R1_MODE,BL_R1_VERIFY_STEPS' in script
+    assert 'PATCH_BLOB experiments/baselines/runbooks/patches/ferminet-f4b1846c-walker-variance-logging.patch' in script
     assert 'BL_R1_VERIFY_INJECT_FAIL' in script
     assert '--dry-run' in script
     assert 'poll-check --path "$query" --field state' in script

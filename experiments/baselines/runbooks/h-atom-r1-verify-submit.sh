@@ -22,6 +22,7 @@ test -z "${BL_R1_VERIFY_INJECT_FAIL+x}"
 source "$INPUTS_FILE"
 RECEIPT_HELPER="$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py"
 test "$SCIENCE" = true || test "$SCIENCE" = false
+test -n "${PATCH_BLOB:?missing PATCH_BLOB}"
 test "$(sha256sum "$PRE_FREEZE_RECEIPT" | awk '{print $1}')" = "$PRE_FREEZE_RECEIPT_SHA256"
 git -C "$SOURCE_CHECKOUT" rev-parse --verify "$RUNBOOK_COMMIT^{commit}"
 test "$(git -C "$SOURCE_CHECKOUT" rev-parse HEAD)" = "$RUNBOOK_COMMIT"
@@ -36,6 +37,7 @@ INPUT_SPEC_BLOB experiments/baselines/runbooks/configs/h-atom-r1.yaml
 FN_CONFIG_BLOB experiments/baselines/runbooks/configs/ferminet_h_atom.py
 RECEIPT_HELPER_BLOB experiments/baselines/runbooks/ramp_receipt.py
 VERIFY_SUBMIT_BLOB experiments/baselines/runbooks/h-atom-r1-verify-submit.sh
+PATCH_BLOB experiments/baselines/runbooks/patches/ferminet-f4b1846c-walker-variance-logging.patch
 BLOBS
 
 mkdir "$RUN_ROOT"
@@ -44,7 +46,7 @@ cp "$INPUTS_FILE" "$RUN_ROOT/ramp-inputs.env"
 cp "$SOURCE_CHECKOUT/experiments/baselines/runbooks/h-atom-r1-ramp.pbs" "$RUN_ROOT/ramp.pbs"
 sha256sum "$RUN_ROOT/ramp-inputs.env" "$PRE_FREEZE_RECEIPT" "$RUN_ROOT/ramp.pbs" > "$RUN_ROOT/input-inventory.sha256"
 
-export RUN_ROOT SOURCE_CHECKOUT RUNBOOK_COMMIT SCIENCE PRE_FREEZE_RECEIPT PRE_FREEZE_RECEIPT_SHA256
+export RUN_ROOT SOURCE_CHECKOUT RUNBOOK_COMMIT SCIENCE PRE_FREEZE_RECEIPT PRE_FREEZE_RECEIPT_SHA256 PATCH_BLOB
 export BL_R1_MODE=verify BL_R1_VERIFY_STEPS=10
 if test -n "$INJECT_FAIL"; then export BL_R1_VERIFY_INJECT_FAIL="$INJECT_FAIL"; fi
 printf '{"control":"%s","mode":"%s","steps":%s,"inject_fail":"%s"}\n' "$CONTROL" "$BL_R1_MODE" "$BL_R1_VERIFY_STEPS" "$INJECT_FAIL" > "$RUN_ROOT/verify-submit-mode.json"
@@ -57,10 +59,10 @@ write_submit_partial() {
 on_submit_exit() { rc=$?; write_submit_partial; exit "$rc"; }
 trap on_submit_exit EXIT
 
-QSUB_VARIABLES=RUN_ROOT,SOURCE_CHECKOUT,RUNBOOK_COMMIT,SCIENCE,PRE_FREEZE_RECEIPT,PRE_FREEZE_RECEIPT_SHA256,BL_R1_MODE,BL_R1_VERIFY_STEPS
+QSUB_VARIABLES=RUN_ROOT,SOURCE_CHECKOUT,RUNBOOK_COMMIT,SCIENCE,PRE_FREEZE_RECEIPT,PRE_FREEZE_RECEIPT_SHA256,PATCH_BLOB,BL_R1_MODE,BL_R1_VERIFY_STEPS
 if test -n "$INJECT_FAIL"; then QSUB_VARIABLES="$QSUB_VARIABLES,BL_R1_VERIFY_INJECT_FAIL"; fi
 if test "$DRY_RUN" = --dry-run; then
-  env | grep -E '^(RUN_ROOT|SOURCE_CHECKOUT|RUNBOOK_COMMIT|SCIENCE|PRE_FREEZE_RECEIPT|PRE_FREEZE_RECEIPT_SHA256|BL_R1_MODE|BL_R1_VERIFY_STEPS|BL_R1_VERIFY_INJECT_FAIL)=' | sort > "$RUN_ROOT/verify-submit-dry-run.env"
+  env | grep -E '^(RUN_ROOT|SOURCE_CHECKOUT|RUNBOOK_COMMIT|SCIENCE|PRE_FREEZE_RECEIPT|PRE_FREEZE_RECEIPT_SHA256|PATCH_BLOB|BL_R1_MODE|BL_R1_VERIFY_STEPS|BL_R1_VERIFY_INJECT_FAIL)=' | sort > "$RUN_ROOT/verify-submit-dry-run.env"
   grep -Fx 'BL_R1_MODE=verify' "$RUN_ROOT/verify-submit-dry-run.env"
   grep -Fx 'BL_R1_VERIFY_STEPS=10' "$RUN_ROOT/verify-submit-dry-run.env"
   printf '%s\n' "$QSUB_VARIABLES" > "$RUN_ROOT/verify-submit-qsub-variables.txt"

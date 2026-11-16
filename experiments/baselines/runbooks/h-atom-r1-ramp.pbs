@@ -13,16 +13,29 @@ test -d "${RUN_ROOT:?missing RUN_ROOT}/logs"
 test -n "${SOURCE_CHECKOUT:?missing SOURCE_CHECKOUT}"
 test -n "${RUNBOOK_COMMIT:?missing RUNBOOK_COMMIT}"
 test "${SCIENCE:?missing SCIENCE}" = true || test "$SCIENCE" = false
+test -n "${PATCH_BLOB:?missing PATCH_BLOB}"
 test "$(git -C "$SOURCE_CHECKOUT" rev-parse HEAD)" = "$RUNBOOK_COMMIT"
 test -z "$(git -C "$SOURCE_CHECKOUT" status --porcelain=v1)"
 
-FN_SRC=/home/rhu/src/ferminet-psiformer-60c9fab3
+FN_SHARED_SRC=/home/rhu/src/ferminet-psiformer-60c9fab3
+FN_SRC="$RUN_ROOT/src/ferminet-patched"
 FN_PY=/home/rhu/.venvs/ferminet-jax092-60c9fab3/bin/python
 RECEIPT_HELPER="$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py"
+FN_PATCH="$SOURCE_CHECKOUT/experiments/baselines/runbooks/patches/ferminet-f4b1846c-walker-variance-logging.patch"
 
-test "$(git -C "$FN_SRC" rev-parse HEAD)" = f4b1846cd6f2776321b09b027d4d5506ae98e19b
-test -z "$(git -C "$FN_SRC" status --porcelain=v1)"
-for path in "$FN_PY" "$FN_SRC/ferminet/main.py" "$RECEIPT_HELPER"; do test -e "$path"; done
+test "$(git -C "$FN_SHARED_SRC" rev-parse HEAD)" = f4b1846cd6f2776321b09b027d4d5506ae98e19b
+test -z "$(git -C "$FN_SHARED_SRC" status --porcelain=v1)"
+test "$(git -C "$SOURCE_CHECKOUT" ls-tree "$RUNBOOK_COMMIT" -- experiments/baselines/runbooks/patches/ferminet-f4b1846c-walker-variance-logging.patch | awk '{print $3}')" = "$PATCH_BLOB"
+test -e "$FN_PATCH"
+mkdir "$RUN_ROOT/src"
+cp -a "$FN_SHARED_SRC" "$FN_SRC"
+git -C "$FN_SRC" apply "$FN_PATCH"
+test "$(git -C "$FN_SRC" diff --name-only)" = ferminet/train.py
+sha256sum "$FN_PATCH" > "$RUN_ROOT/src/logging-patch.sha256"
+sha256sum "$FN_SRC/ferminet/train.py" > "$RUN_ROOT/src/patched-train.py.sha256"
+git -C "$FN_SRC" diff > "$RUN_ROOT/src/patched-ferminet.diff"
+for path in "$FN_PY" "$FN_SRC/ferminet/main.py" "$RECEIPT_HELPER" "$FN_PATCH"; do test -e "$path"; done
+PRODUCER_LABEL="ferminet f4b1846c + logging patch $(awk '{print $1}' "$RUN_ROOT/src/logging-patch.sha256")"
 
 MODE="${BL_R1_MODE:-real}"
 case "$MODE" in
@@ -112,7 +125,7 @@ wait_and_gate() {
   for i in "${!PIDS[@]}"; do
     row="${ROWS[$i]}"
     set +e; wait "${PIDS[$i]}"; rc=$?; set -e
-    "$FN_PY" "$RECEIPT_HELPER" record --path "$RUN_ROOT/ramp/$row/receipt.json" --row "$row" --returncode "$rc"
+    "$FN_PY" "$RECEIPT_HELPER" record --path "$RUN_ROOT/ramp/$row/receipt.json" --row "$row" --returncode "$rc" --producer-label "$PRODUCER_LABEL"
     gate_args+=(--row "$row")
   done
   "$FN_PY" "$RECEIPT_HELPER" gate --root "$RUN_ROOT/ramp" "${gate_args[@]}" > "$gate_output"
