@@ -318,6 +318,7 @@ def run_eval_fanout(
     pilot_stage: str | None = None,
     pack_k: int = 1,
     salvage_inventory_path: Path | None = None,
+    ordinal_stride: int | None = None,
 ) -> None:
     """Dispatch one EVAL fan-out job (item E, acceptance-contract 8a5e926f).
 
@@ -348,6 +349,12 @@ def run_eval_fanout(
     source = "train-accepted-receipt"
     source_sha256: str | None = None
     ordinal_count: int | None = None
+    inventory_count: int | None = None
+    selected_roster: tuple[dict[str, int], ...] | None = None
+    if ordinal_stride is not None and payload == "science":
+        raise JobError("salvage-science-refused: ordinal stride is allowed only for pilot salvage eval")
+    if ordinal_stride is not None and salvage_inventory_path is None:
+        raise JobError("salvage-stride-requires-inventory: ordinal stride requires a salvage inventory")
     if salvage_inventory_path is not None and payload not in _PILOT_STAGE_PAYLOADS:
         raise JobError("salvage-science-refused: salvage inventory refused for science payloads")
     if salvage_inventory_path is not None and pilot_stage != "1":
@@ -384,8 +391,19 @@ def run_eval_fanout(
                 train_receipt_path = Path(salvage_inventory_path)
                 train_receipt_sha256 = source_sha256
                 source = "salvage-partial-inventory"
-                ordinal_count = len(salvage["inventory"])
-                generations = eval_job.pilot_fanout("1", payload=payload, ordinal_count=ordinal_count)
+                inventory_count = len(salvage["inventory"])
+                effective_stride = 1 if ordinal_stride is None else ordinal_stride
+                selected_roster = eval_job.salvage_selection_roster(
+                    salvage, ordinal_stride=effective_stride
+                )
+                ordinal_count = len(selected_roster)
+                generations = eval_job.pilot_fanout(
+                    "1",
+                    payload=payload,
+                    ordinal_count=ordinal_count,
+                    ordinal_stride=effective_stride,
+                    selected_roster=selected_roster,
+                )
             else:
                 generations = eval_job.pilot_fanout("1", payload=payload)
         else:
@@ -483,6 +501,9 @@ def run_eval_fanout(
                 source=source,
                 source_sha256=source_sha256,
                 ordinal_count=ordinal_count,
+                ordinal_stride=(1 if ordinal_stride is None and source == "salvage-partial-inventory" else ordinal_stride),
+                selected_roster=selected_roster,
+                inventory_count=inventory_count,
             )
 
     failures: list[BaseException] = []
@@ -530,10 +551,14 @@ def run_pilot_sel(run_root: Path, *, payload: str = "capacity-pilot") -> None:
     # of the file (which an atomic replacement mid-computation could race).
     stage1_receipt, stage1_sha256 = eval_job.read_eval_receipt_with_hash(stage1_path)
     ordinal_count = None
+    ordinal_stride = None
+    selected_roster = None
     if stage1_receipt.get("source") == "salvage-partial-inventory":
         if not isinstance(stage1_receipt.get("source_sha256"), str) or not stage1_receipt["source_sha256"]:
             raise JobError("sel-salvage-source-missing: B1 receipt has no salvage inventory sha256")
-        ordinal_count = stage1_receipt.get("ordinal_count")
+        ordinal_count = stage1_receipt.get("n_sel", stage1_receipt.get("ordinal_count"))
+        ordinal_stride = stage1_receipt.get("ordinal_stride")
+        selected_roster = stage1_receipt.get("selected_roster")
     selection_core = eval_job.compute_pilot_selection(stage1_receipt, payload=payload, ordinal_count=ordinal_count)
     record = eval_job.build_selection_record(
         c1=selection_core["c1"],
@@ -541,6 +566,8 @@ def run_pilot_sel(run_root: Path, *, payload: str = "capacity-pilot") -> None:
         b1_eval_receipt_sha256=stage1_sha256,
         payload=payload,
         ordinal_count=ordinal_count,
+        ordinal_stride=ordinal_stride,
+        selected_roster=selected_roster,
     )
     selection_path = run_root / "attached" / "receipts" / f"h-v2-eval-{payload}-selection.json"
     selection_path.parent.mkdir(parents=True, exist_ok=True)
@@ -883,6 +910,12 @@ def _main_eval_fanout(argv: list[str]) -> int:
     parser.add_argument("--pilot-stage", choices=("1", "2", "2-core"), default=None)
     parser.add_argument("--pack-k", type=int, default=1, help="Run up to six eval generations concurrently (default: 1).")
     parser.add_argument("--salvage-inventory", type=Path, default=None, help="Explicit pilot salvage inventory input.")
+    parser.add_argument(
+        "--ordinal-stride",
+        type=int,
+        default=None,
+        help="Explicit salvage-only inventory ordinal stride; requires --salvage-inventory.",
+    )
     args = parser.parse_args(argv)
 
     if args.payload == "science":
@@ -917,6 +950,7 @@ def _main_eval_fanout(argv: list[str]) -> int:
             pilot_stage=args.pilot_stage,
             pack_k=args.pack_k,
             salvage_inventory_path=args.salvage_inventory,
+            ordinal_stride=args.ordinal_stride,
         )
     except Exception as error:  # noqa: BLE001 - this is the job's own top-level boundary
         print(f"[h-v2] job failed: {error}", file=sys.stderr)

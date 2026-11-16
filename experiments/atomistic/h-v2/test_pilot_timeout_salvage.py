@@ -284,8 +284,17 @@ def test_salvage_sel_window_follows_inventory_length(tmp_path: Path) -> None:
                 "artifacts": {"trajectory_csv": {"path": str(path), "sha256": _sha(path)}},
             }
         )
+    roster = [{"ordinal": ordinal, "update": ordinal * 1000} for ordinal in range(7)]
     selection = eval_job.compute_pilot_selection(
-        {"source": "salvage-partial-inventory", "ordinal_count": 7, "generations": generations},
+        {
+            "source": "salvage-partial-inventory",
+            "ordinal_count": 7,
+            "n_sel": 7,
+            "inventory_count": 7,
+            "ordinal_stride": 1,
+            "selected_roster": roster,
+            "generations": generations,
+        },
         payload="capacity-pilot-100k",
     )
     assert selection["c1"] == 4
@@ -295,6 +304,8 @@ def test_salvage_sel_window_follows_inventory_length(tmp_path: Path) -> None:
         b1_eval_receipt_sha256="c" * 64,
         payload="capacity-pilot-100k",
         ordinal_count=7,
+        ordinal_stride=1,
+        selected_roster=roster,
     )
     assert record["interior_minimum"] is True
     assert eval_job.verify_selection_record(
@@ -317,7 +328,15 @@ def test_salvage_sel_refuses_inventory_length_7_with_only_six_b1_generations(tmp
         )
     with pytest.raises(eval_job.EvalJobRefusal, match="sel-incomplete-stage1"):
         eval_job.compute_pilot_selection(
-            {"source": "salvage-partial-inventory", "ordinal_count": 7, "generations": generations},
+            {
+                "source": "salvage-partial-inventory",
+                "ordinal_count": 7,
+                "n_sel": 7,
+                "inventory_count": 7,
+                "ordinal_stride": 1,
+                "selected_roster": [{"ordinal": i, "update": i * 1000} for i in range(7)],
+                "generations": generations,
+            },
             payload="capacity-pilot-100k",
         )
 
@@ -326,9 +345,71 @@ def test_salvage_sel_refuses_inventory_length_7_with_only_six_b1_generations(tmp
 def test_salvage_sel_refuses_inventory_too_short_for_center_window(ordinal_count: int) -> None:
     with pytest.raises(eval_job.EvalJobRefusal, match="sel-inventory-too-short"):
         eval_job.compute_pilot_selection(
-            {"source": "salvage-partial-inventory", "ordinal_count": ordinal_count, "generations": []},
+            {
+                "source": "salvage-partial-inventory",
+                "ordinal_count": ordinal_count,
+                "n_sel": ordinal_count,
+                "inventory_count": ordinal_count,
+                "ordinal_stride": 1,
+                "selected_roster": [
+                    {"ordinal": i, "update": i * 1000} for i in range(ordinal_count)
+                ],
+                "generations": [],
+            },
             payload="capacity-pilot-100k",
         )
+
+
+def test_salvage_stride_five_selects_the_fixed_20_member_roster() -> None:
+    inventory = {"inventory": [{"update": ordinal * 1000} for ordinal in range(98)]}
+    roster = eval_job.salvage_selection_roster(inventory, ordinal_stride=5)
+    assert len(roster) == 20
+    assert [member["ordinal"] for member in roster] == list(range(0, 98, 5))
+    assert [member["update"] for member in roster] == [0, 5000, 10000, 15000, 20000,
+                                                       25000, 30000, 35000, 40000, 45000,
+                                                       50000, 55000, 60000, 65000, 70000,
+                                                       75000, 80000, 85000, 90000, 95000]
+    generations = eval_job.pilot_fanout(
+        "1", payload="capacity-pilot-100k", ordinal_count=20, ordinal_stride=5, selected_roster=roster
+    )
+    assert [generation["update"] for generation in generations] == [member["update"] for member in roster]
+
+
+def test_salvage_sel_refuses_missing_and_unexpected_fixed_roster_members(tmp_path: Path) -> None:
+    roster = [{"ordinal": ordinal, "update": ordinal * 1000} for ordinal in range(0, 98, 5)]
+    generations = []
+    for member in roster:
+        path = tmp_path / f"trajectory-{member['ordinal']}.csv"
+        path.write_text("local_energy\n0\n", encoding="utf-8")
+        generations.append(
+            {
+                **member,
+                "stream": 0,
+                "seed": protocol.pilot_eval_seed(member["ordinal"], 0),
+                "artifacts": {"trajectory_csv": {"path": str(path), "sha256": _sha(path)}},
+            }
+        )
+    receipt = {
+        "source": "salvage-partial-inventory",
+        "n_sel": 20,
+        "ordinal_count": 20,
+        "inventory_count": 98,
+        "ordinal_stride": 5,
+        "selected_roster": roster,
+        "generations": generations,
+    }
+    assert eval_job.compute_pilot_selection(receipt, payload="capacity-pilot-100k")["c1"] == 3
+    with pytest.raises(eval_job.EvalJobRefusal, match="sel-incomplete-stage1"):
+        eval_job.compute_pilot_selection({**receipt, "generations": generations[:-1]}, payload="capacity-pilot-100k")
+    extra = {
+        "ordinal": 1,
+        "update": 1000,
+        "stream": 0,
+        "seed": protocol.pilot_eval_seed(1, 0),
+        "artifacts": {"trajectory_csv": {"path": str(tmp_path / "trajectory-0.csv"), "sha256": _sha(tmp_path / "trajectory-0.csv")}},
+    }
+    with pytest.raises(eval_job.EvalJobRefusal, match="sel-unexpected-member"):
+        eval_job.compute_pilot_selection({**receipt, "generations": [*generations, extra]}, payload="capacity-pilot-100k")
 
 
 def test_salvage_default_100k_fanout_still_covers_101_ordinals() -> None:
@@ -341,6 +422,7 @@ def test_salvage_default_100k_fanout_still_covers_101_ordinals() -> None:
 
 def test_salvage_fanout_and_eval_receipt_preserve_source_binding(tmp_path: Path) -> None:
     generations = eval_job.pilot_fanout("1", payload="capacity-pilot-100k", ordinal_count=7)
+    roster = [{"ordinal": ordinal, "update": ordinal * 1000} for ordinal in range(7)]
     assert len(generations) == 7
     receipt = eval_job.build_eval_receipt(
         eval_commit="c" * 40,
@@ -353,10 +435,35 @@ def test_salvage_fanout_and_eval_receipt_preserve_source_binding(tmp_path: Path)
         source="salvage-partial-inventory",
         source_sha256="b" * 64,
         ordinal_count=7,
+        ordinal_stride=1,
+        selected_roster=roster,
+        inventory_count=7,
     )
     assert receipt["source"] == "salvage-partial-inventory"
     assert receipt["source_sha256"] == "b" * 64
     assert receipt["ordinal_count"] == 7
+    assert receipt["n_sel"] == 7
+    assert receipt["ordinal_stride"] == 1
+    assert receipt["selected_roster"] == roster
+    assert receipt["inventory_sha256"] == "b" * 64
+
+
+def test_salvage_receipt_requires_fixed_stride_roster_binding(tmp_path: Path) -> None:
+    with pytest.raises(eval_job.EvalJobRefusal, match="salvage-receipt-binding"):
+        eval_job.build_eval_receipt(
+            eval_commit="c" * 40,
+            train_commit="a" * 40,
+            payload="capacity-pilot-100k",
+            train_receipt_path=tmp_path / "salvage.json",
+            train_receipt_sha256="a" * 64,
+            generations=[],
+            readout_generator_enabled=False,
+            source="salvage-partial-inventory",
+            source_sha256="b" * 64,
+            ordinal_count=20,
+            ordinal_stride=5,
+            inventory_count=98,
+        )
 
 
 def test_default_eval_receipt_shape_has_no_salvage_length(tmp_path: Path) -> None:

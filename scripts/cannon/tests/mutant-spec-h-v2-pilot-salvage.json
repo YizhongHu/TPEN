@@ -24,11 +24,11 @@
     "needle_count": 1
   },
   {
-    "id": "use-fixed-sel-window",
+    "id": "accept-unexpected-stride-member",
     "target": "experiments/atomistic/h-v2/eval_job.py",
-    "old": "missing = sorted(set(protocol.pilot_stage1_ordinals(payload, count=ordinal_count)) - seen_ordinals)",
-    "new": "missing = sorted(set(protocol.pilot_stage1_ordinals(payload, count=len(seen_ordinals))) - seen_ordinals)  # mutant: use-fixed-sel-window",
-    "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_sel_refuses_inventory_length_7_with_only_six_b1_generations",
+    "old": "if expected_members is not None and ordinal not in expected_members:",
+    "new": "if False and (expected_members is not None and ordinal not in expected_members):  # mutant: accept-unexpected-stride-member",
+    "killer": "experiments/atomistic/h-v2/test_pilot_timeout_salvage.py::test_salvage_sel_refuses_missing_and_unexpected_fixed_roster_members",
     "needle_count": 1
   },
   {

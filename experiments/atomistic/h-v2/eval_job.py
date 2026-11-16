@@ -285,6 +285,47 @@ def verify_salvage_inventory_identity(
         raise EvalJobRefusal("salvage-inventory-noncontiguous", f"inventory updates {updates!r} != {expected_updates!r}")
 
 
+def salvage_selection_roster(
+    inventory: Mapping[str, Any], *, ordinal_stride: int
+) -> tuple[dict[str, int], ...]:
+    """Return the fixed salvage roster selected by *ordinal_stride*.
+
+    The inventory has already been authenticated by
+    :func:`verify_salvage_inventory_identity`.  Selection therefore happens
+    against its declared ordinal sequence, before any generation runs; SEL
+    later validates against this same roster rather than reconstructing it
+    from whichever generations happened to finish.
+
+    Parameters
+    ----------
+    inventory : mapping
+        A validated ``salvage-partial-inventory`` payload.
+    ordinal_stride : int
+        Positive stride in inventory ordinals.  ``5`` selects updates
+        ``0, 5000, ..., 95000`` from the 98-entry pilot inventory.
+
+    Raises
+    ------
+    EvalJobRefusal
+        Code ``salvage-stride-invalid`` for a non-positive/non-integral
+        stride, or ``salvage-roster-empty`` when no member is selected.
+    """
+
+    if type(ordinal_stride) is not int or ordinal_stride < 1:
+        raise EvalJobRefusal("salvage-stride-invalid", f"ordinal stride must be a positive integer, got {ordinal_stride!r}")
+    entries = inventory.get("inventory")
+    if not isinstance(entries, list):
+        raise EvalJobRefusal("salvage-inventory-empty", "salvage inventory has no declared entry list")
+    roster = tuple(
+        {"ordinal": int(entry["update"]) // 1000, "update": int(entry["update"])}
+        for index, entry in enumerate(entries)
+        if index % ordinal_stride == 0
+    )
+    if not roster:
+        raise EvalJobRefusal("salvage-roster-empty", "ordinal stride selected no salvage inventory members")
+    return roster
+
+
 def verify_train_receipt_identity(
     receipt: Mapping[str, Any],
     *,
@@ -581,7 +622,13 @@ def science_fanout(*, lineage_index: int) -> tuple[dict[str, Any], ...]:
 
 
 def pilot_fanout(
-    stage: str, *, c1: int | None = None, payload: str = "capacity-pilot", ordinal_count: int | None = None
+    stage: str,
+    *,
+    c1: int | None = None,
+    payload: str = "capacity-pilot",
+    ordinal_count: int | None = None,
+    ordinal_stride: int = 1,
+    selected_roster: Sequence[Mapping[str, int]] | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Return one pilot stage's fan-out generations (amendment r3/r4 E1).
 
@@ -605,8 +652,32 @@ def pilot_fanout(
         Code ``pilot-stage2-needs-c1`` or ``unknown-pilot-stage``.
     """
 
+    update_by_ordinal: dict[int, int] = {}
     if stage == "1":
-        pairs = protocol.pilot_stage1_grid(payload, count=ordinal_count)
+        if selected_roster is not None:
+            if type(ordinal_stride) is not int or ordinal_stride < 1:
+                raise EvalJobRefusal("salvage-stride-invalid", f"ordinal stride must be a positive integer, got {ordinal_stride!r}")
+            if ordinal_count is not None and ordinal_count != len(selected_roster):
+                raise EvalJobRefusal(
+                    "salvage-roster-count-mismatch",
+                    f"fixed selected count {ordinal_count!r} does not match roster length {len(selected_roster)!r}",
+                )
+            pairs = []
+            for member in selected_roster:
+                try:
+                    ordinal = int(member["ordinal"])
+                    update = int(member["update"])
+                except (KeyError, TypeError, ValueError) as error:
+                    raise EvalJobRefusal("salvage-roster-invalid", f"invalid selected roster member {member!r}") from error
+                if ordinal < 0 or update != ordinal * 1000 or ordinal in update_by_ordinal:
+                    raise EvalJobRefusal("salvage-roster-invalid", f"invalid selected roster member {member!r}")
+                update_by_ordinal[ordinal] = update
+                pairs.append((ordinal, 0))
+        else:
+            base_ordinals = protocol.pilot_stage1_ordinals(payload, count=ordinal_count)
+            if type(ordinal_stride) is not int or ordinal_stride < 1:
+                raise EvalJobRefusal("salvage-stride-invalid", f"ordinal stride must be a positive integer, got {ordinal_stride!r}")
+            pairs = [(ordinal, 0) for ordinal in base_ordinals if ordinal % ordinal_stride == 0]
     elif stage in ("2", "2-core"):
         if c1 is None:
             raise EvalJobRefusal("pilot-stage2-needs-c1", f"--pilot-stage {stage} requires c1 from the SEL step")
@@ -616,7 +687,7 @@ def pilot_fanout(
     return tuple(
         {
             "ordinal": ordinal,
-            "update": ordinal * 1000,
+            "update": update_by_ordinal.get(ordinal, ordinal * 1000),
             "stream": stream,
             "seed": protocol.pilot_eval_seed(ordinal, stream),
         }
@@ -919,6 +990,9 @@ def build_eval_receipt(
     source: str = "train-accepted-receipt",
     source_sha256: str | None = None,
     ordinal_count: int | None = None,
+    ordinal_stride: int | None = None,
+    selected_roster: Sequence[Mapping[str, int]] | None = None,
+    inventory_count: int | None = None,
 ) -> dict[str, Any]:
     """Return the fan-out's own consolidated eval-receipt payload.
 
@@ -931,8 +1005,17 @@ def build_eval_receipt(
         The pilot SEL step's selection record (:func:`build_selection_record`),
         carried only for the pilot's stage-1 receipt.
     ordinal_count : int, optional
-        Fixed salvage inventory length carried into the stage-1 receipt; it is
-        never inferred from the generations observed by SEL.
+        Fixed selected salvage roster length (``N_sel``) carried into the
+        stage-1 receipt; it is never inferred from generations observed by
+        SEL.
+    ordinal_stride : int, optional
+        Salvage-only inventory ordinal stride.
+    selected_roster : sequence of mappings, optional
+        Salvage-only exact ``ordinal``/``update`` roster selected before the
+        fan-out runs.
+    inventory_count : int, optional
+        Salvage-only full inventory length, retained to distinguish ``N``
+        from the fixed selected count ``N_sel``.
     """
 
     receipt = {
@@ -949,7 +1032,26 @@ def build_eval_receipt(
         "generations": [dict(generation) for generation in generations],
     }
     if source == "salvage-partial-inventory":
+        if type(ordinal_count) is not int or ordinal_count < 1:
+            raise EvalJobRefusal("salvage-receipt-binding", "salvage receipt requires a positive fixed N_sel")
+        if type(ordinal_stride) is not int or ordinal_stride < 1:
+            raise EvalJobRefusal("salvage-receipt-binding", "salvage receipt requires a positive ordinal stride")
+        if selected_roster is None or len(selected_roster) != ordinal_count:
+            raise EvalJobRefusal("salvage-receipt-binding", "salvage receipt requires the exact selected roster")
+        if type(inventory_count) is not int or inventory_count < 1:
+            raise EvalJobRefusal("salvage-receipt-binding", "salvage receipt requires the fixed full inventory length")
+        expected_roster = [
+            {"ordinal": ordinal, "update": ordinal * 1000}
+            for ordinal in range(0, inventory_count, ordinal_stride)
+        ]
+        if [dict(member) for member in selected_roster] != expected_roster:
+            raise EvalJobRefusal("salvage-receipt-binding", "salvage receipt selected roster does not match N/stride")
         receipt["ordinal_count"] = ordinal_count
+        receipt["n_sel"] = ordinal_count
+        receipt["ordinal_stride"] = ordinal_stride
+        receipt["selected_roster"] = [dict(member) for member in selected_roster]
+        receipt["inventory_count"] = inventory_count if inventory_count is not None else ordinal_count
+        receipt["inventory_sha256"] = source_sha256 or train_receipt_sha256
     return receipt
 
 
@@ -1106,22 +1208,46 @@ def compute_pilot_selection(
         and ``sel-inventory-too-short`` for an invalid salvage receipt.
     """
 
+    expected_members: dict[int, dict[str, int]] | None = None
     if stage1_receipt.get("source") == "salvage-partial-inventory":
-        receipt_ordinal_count = stage1_receipt.get("ordinal_count")
-        if type(receipt_ordinal_count) is not int or receipt_ordinal_count < 1:
-            raise EvalJobRefusal(
-                "sel-inventory-length-missing", "salvage B1 receipt has no positive fixed inventory length"
-            )
-        if ordinal_count is not None and ordinal_count != receipt_ordinal_count:
+        receipt_n_sel = stage1_receipt.get("n_sel", stage1_receipt.get("ordinal_count"))
+        if type(receipt_n_sel) is not int or receipt_n_sel < 1:
+            raise EvalJobRefusal("sel-inventory-length-missing", "salvage B1 receipt has no positive fixed N_sel")
+        if ordinal_count is not None and ordinal_count != receipt_n_sel:
             raise EvalJobRefusal(
                 "sel-inventory-length-mismatch",
-                f"requested inventory length {ordinal_count!r} does not match receipt {receipt_ordinal_count!r}",
+                f"requested selected length {ordinal_count!r} does not match receipt {receipt_n_sel!r}",
             )
-        ordinal_count = receipt_ordinal_count
+        ordinal_count = receipt_n_sel
+        stride = stage1_receipt.get("ordinal_stride")
+        roster = stage1_receipt.get("selected_roster")
+        inventory_count = stage1_receipt.get("inventory_count")
+        if type(stride) is not int or stride < 1 or type(inventory_count) is not int or inventory_count < 1 or not isinstance(roster, list):
+            raise EvalJobRefusal("sel-roster-missing", "salvage B1 receipt lacks its fixed stride/selected roster")
+        if len(roster) != ordinal_count:
+            raise EvalJobRefusal("sel-roster-count-mismatch", "salvage B1 selected roster length does not equal N_sel")
+        expected_roster = [
+            {"ordinal": ordinal, "update": ordinal * 1000}
+            for ordinal in range(0, inventory_count, stride)
+        ]
+        if roster != expected_roster:
+            raise EvalJobRefusal("sel-roster-mismatch", "salvage B1 selected roster does not match its fixed N/stride")
+        expected_members = {}
+        for index, member in enumerate(roster):
+            if not isinstance(member, MappingABC):
+                raise EvalJobRefusal("sel-roster-invalid", f"selected roster member {index} is not an object")
+            ordinal = member.get("ordinal")
+            update = member.get("update")
+            if type(ordinal) is not int or type(update) is not int or ordinal < 0 or update != ordinal * 1000:
+                raise EvalJobRefusal("sel-roster-invalid", f"selected roster member {index} is invalid")
+            if ordinal in expected_members:
+                raise EvalJobRefusal("sel-roster-invalid", f"selected roster repeats ordinal {ordinal}")
+            expected_members[ordinal] = {"ordinal": ordinal, "update": update, "index": index}
+        if len(expected_members) != ordinal_count:
+            raise EvalJobRefusal("sel-roster-count-mismatch", "salvage B1 selected roster has duplicate members")
         if ordinal_count < 5:
             raise EvalJobRefusal(
-                "sel-inventory-too-short",
-                f"salvage inventory length {ordinal_count} cannot define the SEL center window 3..N-2",
+                "sel-inventory-too-short", f"salvage selected roster N_sel={ordinal_count} cannot define the SEL center window 3..N-2",
             )
 
     w_by_ordinal: dict[int, float] = {}
@@ -1130,6 +1256,10 @@ def compute_pilot_selection(
         if generation.get("stream") != 0:
             continue
         ordinal = generation["ordinal"]
+        if expected_members is not None and ordinal not in expected_members:
+            raise EvalJobRefusal(
+                "sel-unexpected-member", f"B1 receipt carries stream-0 ordinal {ordinal} outside the fixed selected roster"
+            )
         if ordinal in seen_ordinals:
             raise EvalJobRefusal(
                 "sel-duplicate-ordinal", f"B1 receipt carries more than one stream-0 generation for ordinal {ordinal}"
@@ -1142,19 +1272,33 @@ def compute_pilot_selection(
                 f"B1 generation for ordinal {ordinal} has seed {generation.get('seed')!r}, "
                 f"expected {expected_seed!r}",
             )
+        if expected_members is not None and generation.get("update") != expected_members[ordinal]["update"]:
+            raise EvalJobRefusal(
+                "sel-unexpected-member",
+                f"B1 generation ordinal {ordinal} has update {generation.get('update')!r}, "
+                f"expected {expected_members[ordinal]['update']!r}",
+            )
         energies = read_verified_stream_local_energies(generation)
         if not all(math.isfinite(energy) for energy in energies):
             raise EvalJobRefusal(
                 "sel-nonfinite-energy", f"B1 generation for ordinal {ordinal} has a non-finite local_energy sample"
             )
-        w_by_ordinal[ordinal] = protocol.w_statistic(energies)
-    missing = sorted(set(protocol.pilot_stage1_ordinals(payload, count=ordinal_count)) - seen_ordinals)
+        key = expected_members[ordinal]["index"] if expected_members is not None else ordinal
+        w_by_ordinal[key] = protocol.w_statistic(energies)
+    expected_ordinals = (
+        set(expected_members) if expected_members is not None else set(protocol.pilot_stage1_ordinals(payload, count=ordinal_count))
+    )
+    missing = sorted(expected_ordinals - seen_ordinals)
     if missing:
         raise EvalJobRefusal(
             "sel-incomplete-stage1", f"B1 receipt is missing stream-0 generations for ordinals {missing!r}"
         )
+    if expected_members is not None:
+        hi = ordinal_count - 2
+    else:
+        hi = protocol.pilot_sel_window_hi(payload, count=ordinal_count)
     c1, triple_means = protocol.select_pilot_basin_ordinal(
-        w_by_ordinal, hi=protocol.pilot_sel_window_hi(payload, count=ordinal_count)
+        w_by_ordinal, hi=hi
     )
     return {"c1": c1, "triple_means": triple_means}
 
@@ -1166,6 +1310,8 @@ def build_selection_record(
     b1_eval_receipt_sha256: str,
     payload: str = "capacity-pilot",
     ordinal_count: int | None = None,
+    ordinal_stride: int | None = None,
+    selected_roster: Sequence[Mapping[str, int]] | None = None,
 ) -> dict[str, Any]:
     """Return the SEL step's selection record (amendment r3/r4 E1).
 
@@ -1187,6 +1333,12 @@ def build_selection_record(
             "sel-inventory-too-short",
             f"salvage inventory length {ordinal_count} cannot define the SEL center window 3..N-2",
         )
+    if selected_roster is not None:
+        if type(ordinal_stride) is not int or ordinal_stride < 1:
+            raise EvalJobRefusal("sel-roster-missing", "salvage selection requires a positive fixed ordinal stride")
+        if type(ordinal_count) is not int or len(selected_roster) != ordinal_count:
+            raise EvalJobRefusal("sel-roster-count-mismatch", "salvage selection roster length does not equal N_sel")
+        hi = ordinal_count - 2
     if not 3 <= c1 <= hi:
         raise EvalJobRefusal("sel-c1-out-of-range", f"c1 must be in 3..{hi}, got {c1}")
     return {
@@ -1194,6 +1346,15 @@ def build_selection_record(
         "triple_means": {str(center): mean for center, mean in triple_means.items()},
         "b1_eval_receipt_sha256": b1_eval_receipt_sha256,
         "interior_minimum": protocol.is_interior_minimum(c1, hi=hi),
+        **(
+            {
+                "n_sel": ordinal_count,
+                "ordinal_stride": ordinal_stride,
+                "selected_roster": [dict(member) for member in selected_roster],
+            }
+            if selected_roster is not None
+            else {}
+        ),
     }
 
 
@@ -1249,6 +1410,7 @@ __all__ = [
     "read_verified_stream_local_energies",
     "resolve_checkpoint",
     "run_generation_direct",
+    "salvage_selection_roster",
     "science_fanout",
     "select_checkpoint",
     "trajectory_csv_path",

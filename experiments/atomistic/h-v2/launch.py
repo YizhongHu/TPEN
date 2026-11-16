@@ -561,6 +561,8 @@ def _wrap_eval_fanout_command(
     science_python: str,
     executor_python: str,
     pack_k: int = 1,
+    salvage_inventory: Path | None = None,
+    ordinal_stride: int | None = None,
 ) -> str:
     """Return the wrapper body for ``run_job.py eval-fanout ...`` (item E).
 
@@ -578,6 +580,10 @@ def _wrap_eval_fanout_command(
     argv += ["--expected-train-commit", expected_train_commit]
     if pack_k != 1:
         argv += ["--pack-k", str(pack_k)]
+    if salvage_inventory is not None:
+        argv += ["--salvage-inventory", str(salvage_inventory)]
+    if ordinal_stride is not None:
+        argv += ["--ordinal-stride", str(ordinal_stride)]
     if pilot_stage is not None:
         argv += ["--pilot-stage", pilot_stage]
     checkout_quoted = shlex.quote(str(checkout_root))
@@ -620,6 +626,8 @@ def build_eval_fanout_sbatch_command(
     pack_k: int = 1,
     eval_count: int | None = None,
     measured_batch_time: str | None = None,
+    salvage_inventory: Path | None = None,
+    ordinal_stride: int | None = None,
 ) -> list[str]:
     """Return the exact ``sbatch`` argv for one EVAL fan-out job (item E).
 
@@ -718,6 +726,8 @@ def build_eval_fanout_sbatch_command(
             science_python=science_python,
             executor_python=executor_python,
             pack_k=pack_k,
+            salvage_inventory=salvage_inventory,
+            ordinal_stride=ordinal_stride,
         )
     )
     return command
@@ -1291,6 +1301,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Measured wall time for one packed batch, as a Slurm duration (for example 00:15:00).",
     )
     parser.add_argument(
+        "--salvage-inventory",
+        type=Path,
+        default=None,
+        help="Explicit pilot salvage inventory input for a salvage-only EVAL fan-out.",
+    )
+    parser.add_argument(
+        "--ordinal-stride",
+        type=int,
+        default=None,
+        help="Explicit salvage-only inventory ordinal stride; requires --salvage-inventory.",
+    )
+    parser.add_argument(
         "--run-root-prefix",
         default=None,
         help=(
@@ -1333,6 +1355,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parse_args(argv)
     run_root = Path(args.run_root).resolve()
+    if args.ordinal_stride is not None and args.payload == "science":
+        raise LaunchError("salvage-science-refused: ordinal stride is allowed only for pilot salvage eval")
+    if args.ordinal_stride is not None and args.salvage_inventory is None:
+        raise LaunchError("salvage-stride-requires-inventory: ordinal stride requires --salvage-inventory")
+    if args.salvage_inventory is not None and args.payload not in PILOT_PAYLOADS:
+        raise LaunchError("salvage-science-refused: salvage inventory is allowed only for pilot eval")
+    if args.salvage_inventory is not None and args.stage != "eval":
+        raise LaunchError("salvage-inventory-stage: salvage inventory is valid only with --stage eval")
     # F5: no custom-checkout option. run_job.py's in-job identity check always
     # asserts the checkout at RUN/checkout (section B3), so a launch-time
     # override here would submit a job whose wrapper and whose own identity
@@ -1422,6 +1452,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             pack_k=args.pack_k,
             eval_count=args.eval_count,
             measured_batch_time=args.measured_batch_time,
+            salvage_inventory=args.salvage_inventory,
+            ordinal_stride=args.ordinal_stride,
         )
         if args.dry_run:
             print(shlex.join(eval_command))
@@ -1499,6 +1531,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 pack_k=args.pack_k,
                 eval_count=args.eval_count,
                 measured_batch_time=args.measured_batch_time,
+                salvage_inventory=args.salvage_inventory,
+                ordinal_stride=args.ordinal_stride,
             )
             if args.dry_run:
                 print(shlex.join(command))
