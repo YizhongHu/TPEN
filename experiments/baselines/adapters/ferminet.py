@@ -66,6 +66,46 @@ class _TrajectoryRows(list[dict[str, int | float | None]]):
     step_basis = "optimizer_step"
 
 
+def _read_rows(
+    run_dir: Path, *, include_walker_variance: bool
+) -> _TrajectoryRows:
+    """Read FermiNet rows with an explicitly selected diagnostic projection."""
+
+    stats_path = run_dir / TRAIN_STATS_FILENAME
+    if not stats_path.is_file():
+        raise AdapterError(f"no {TRAIN_STATS_FILENAME} in {run_dir}")
+
+    with stats_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        required = {"step", "energy", "ewvar"}
+        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+            missing = sorted(required.difference(reader.fieldnames or ()))
+            if "energy" in missing:
+                raise AdapterError(f"{stats_path} has no 'energy' column")
+            raise AdapterError(f"{stats_path} is missing required column(s): {', '.join(missing)}")
+        rows = _TrajectoryRows()
+        for row_number, row in enumerate(reader, 2):
+            try:
+                walker_variance = (
+                    None
+                    if not include_walker_variance or "walker_variance" not in row
+                    else float(row["walker_variance"])
+                )
+                rows.append({
+                    "step": int(row["step"]),
+                    "energy": float(row["energy"]),
+                    "walker_local_energy_variance": walker_variance,
+                    "energy_time_ewvar": float(row["ewvar"]),
+                    "step_basis": "optimizer_step",
+                })
+            except (TypeError, ValueError) as error:
+                raise AdapterError(f"{stats_path}:{row_number} has invalid trajectory values") from error
+
+    if not rows:
+        raise AdapterError(f"{stats_path} has no data rows")
+    return rows
+
+
 def read_trajectory(run_dir: Path) -> list[dict[str, int | float | None]]:
     """Read FermiNet's loss and variances per optimizer step.
 
@@ -89,45 +129,13 @@ def read_trajectory(run_dir: Path) -> list[dict[str, int | float | None]]:
         An empty run is an error, not an empty result.
     """
 
-    stats_path = run_dir / TRAIN_STATS_FILENAME
-    if not stats_path.is_file():
-        raise AdapterError(f"no {TRAIN_STATS_FILENAME} in {run_dir}")
-
-    with stats_path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        required = {"step", "energy", "ewvar"}
-        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
-            missing = sorted(required.difference(reader.fieldnames or ()))
-            if "energy" in missing:
-                raise AdapterError(f"{stats_path} has no 'energy' column")
-            raise AdapterError(f"{stats_path} is missing required column(s): {', '.join(missing)}")
-        rows = _TrajectoryRows()
-        for row_number, row in enumerate(reader, 2):
-            try:
-                walker_variance = (
-                    None
-                    if "walker_variance" not in row
-                    else float(row["walker_variance"])
-                )
-                rows.append({
-                    "step": int(row["step"]),
-                    "energy": float(row["energy"]),
-                    "walker_local_energy_variance": walker_variance,
-                    "energy_time_ewvar": float(row["ewvar"]),
-                    "step_basis": "optimizer_step",
-                })
-            except (TypeError, ValueError) as error:
-                raise AdapterError(f"{stats_path}:{row_number} has invalid trajectory values") from error
-
-    if not rows:
-        raise AdapterError(f"{stats_path} has no data rows")
-    return rows
+    return _read_rows(run_dir, include_walker_variance=True)
 
 
 def read_energies(run_dir: Path) -> list[float]:
     """Return the per-step energy column of a FermiNet run."""
 
-    return [float(row["energy"]) for row in read_trajectory(run_dir)]
+    return [float(row["energy"]) for row in _read_rows(run_dir, include_walker_variance=False)]
 
 
 def parse_device(log_text: str) -> tuple[str | None, str | None]:
