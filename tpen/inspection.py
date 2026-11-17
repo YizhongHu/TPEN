@@ -29,6 +29,7 @@ from tpen.evaluation.trajectory_records import (
 )
 from tpen.run_events import (
     RUN_OUTCOME_SCHEMA,
+    RUN_OUTCOME_STATUSES,
     RunOutcome,
     RunOutcomeDecodeError,
     has_explicit_run_outcome_schema,
@@ -38,6 +39,7 @@ from tpen.run_events import (
 RUN_EVIDENCE_SCHEMA = "tpen.run-evidence/v1"
 RUN_EVIDENCE_SCHEMA_V2 = "tpen.run-evidence/v2"
 RUN_EVIDENCE_SCHEMA_V3 = "tpen.run-evidence/v3"
+EVAL_RUN_EVIDENCE_SCHEMA = "tpen.eval-run-evidence/v1"
 _EVIDENCE_KEYS = {"schema", "run_dir", "verdict", "run_status", "checkpoint", "refusal"}
 _EVIDENCE_V2_KEYS = _EVIDENCE_KEYS | {"resolved_config_identity"}
 _EVIDENCE_V3_KEYS = _EVIDENCE_V2_KEYS | {"outcome", "checkpoint_ref"}
@@ -250,6 +252,130 @@ class RunEvidence:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class EvalRunEvidence:
+    """Versioned facts observed in one evaluation run directory.
+
+    Unlike :class:`RunEvidence`, this evidence does not inspect checkpoints.
+    A completed evaluation is admitted only when its status, typed outcome,
+    run-start identity, and no-checkpoint contract all agree.
+
+    Parameters
+    ----------
+    schema : str
+        Evidence schema identifier.
+    run_dir : str
+        Run directory inspected.
+    verdict : str
+        One of ``completed``, ``incomplete``, ``failed``, or ``refused``.
+    run_status : str or None
+        Status written by the core run harness.
+    outcome : str or None
+        Typed status from the explicit run-outcome artifact.
+    resolved_config_identity : dict or None
+        Validated identity emitted at the run-start boundary.
+    refusal : dict or None
+        Stable refusal code and reason when inspection refuses the run.
+    """
+
+    schema: str
+    run_dir: str
+    verdict: str
+    run_status: str | None
+    outcome: str | None
+    resolved_config_identity: dict[str, str] | None
+    refusal: dict[str, str] | None
+
+    def __post_init__(self) -> None:
+        if self.schema != EVAL_RUN_EVIDENCE_SCHEMA:
+            raise ValueError(f"unsupported eval-run evidence schema {self.schema!r}")
+        if self.verdict not in {"completed", "incomplete", "failed", "refused"}:
+            raise ValueError(f"unsupported eval-run evidence verdict {self.verdict!r}")
+        if not isinstance(self.run_dir, str):
+            raise TypeError("run_dir must be a string")
+        if self.run_status is not None and not isinstance(self.run_status, str):
+            raise TypeError("run_status must be a string or null")
+        if self.outcome is not None and self.outcome not in RUN_OUTCOME_STATUSES:
+            raise ValueError(f"unsupported typed outcome {self.outcome!r}")
+        if self.verdict == "completed":
+            if self.run_status != "completed":
+                raise ValueError("completed evidence requires completed run_status")
+            if self.outcome != "completed":
+                raise ValueError("completed evidence requires completed outcome")
+            if self.resolved_config_identity is None:
+                raise ValueError("completed evidence requires a resolved config identity")
+        if self.verdict == "refused":
+            if self.refusal is None:
+                raise ValueError("refused evidence requires refusal")
+        elif self.refusal is not None:
+            raise ValueError(f"{self.verdict} evidence cannot contain a refusal")
+        if self.resolved_config_identity is not None:
+            if set(self.resolved_config_identity) != {"schema", "sha256"}:
+                raise ValueError("resolved config identity has an invalid key set")
+            if self.resolved_config_identity["schema"] != RESOLVED_CONFIG_IDENTITY_SCHEMA:
+                raise ValueError("resolved config identity has an unknown schema")
+            digest = self.resolved_config_identity["sha256"]
+            if type(digest) is not str or len(digest) != 64 or digest != digest.lower() or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError("resolved config identity has an invalid sha256")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe copy of this evidence."""
+
+        return {
+            "schema": self.schema,
+            "run_dir": self.run_dir,
+            "verdict": self.verdict,
+            "run_status": self.run_status,
+            "outcome": self.outcome,
+            "resolved_config_identity": (
+                None
+                if self.resolved_config_identity is None
+                else dict(self.resolved_config_identity)
+            ),
+            "refusal": None if self.refusal is None else dict(self.refusal),
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "EvalRunEvidence":
+        """Construct evidence while enforcing the v1 object shape."""
+
+        expected = {
+            "schema",
+            "run_dir",
+            "verdict",
+            "run_status",
+            "outcome",
+            "resolved_config_identity",
+            "refusal",
+        }
+        if not isinstance(data, Mapping):
+            raise TypeError("eval-run evidence must be a mapping")
+        if set(data) != expected:
+            raise ValueError(
+                f"eval-run evidence keys differ: missing={sorted(expected - set(data))}, "
+                f"extra={sorted(set(data) - expected)}"
+            )
+        identity = data["resolved_config_identity"]
+        if identity is not None and not isinstance(identity, Mapping):
+            raise TypeError("resolved_config_identity must be a mapping or null")
+        refusal = data["refusal"]
+        if refusal is not None:
+            if not isinstance(refusal, Mapping) or set(refusal) != _REFUSAL_KEYS:
+                raise ValueError("refusal evidence has an invalid key set")
+            refusal = {str(key): str(value) for key, value in refusal.items()}
+        return cls(
+            schema=data["schema"],
+            run_dir=data["run_dir"],
+            verdict=data["verdict"],
+            run_status=data["run_status"],
+            outcome=data["outcome"],
+            resolved_config_identity=None if identity is None else dict(identity),
+            refusal=refusal,
+        )
+
+
 def _validate_checkpoint_ref_mapping(data: Mapping[str, Any]) -> None:
     """Validate the wire shape of one public checkpoint reference."""
 
@@ -432,6 +558,121 @@ def inspect_run(path: str | Path) -> RunEvidence:
             None,
             {"code": exc.code, "reason": exc.reason},
         )
+
+
+def inspect_eval_run(path: str | Path) -> EvalRunEvidence:
+    """Inspect a completed evaluation run without reading checkpoints.
+
+    Expected artifact problems are returned as ``verdict="refused"`` with a
+    stable code rather than escaping as an exception. Refusal codes are
+    ``missing-run-dir``, ``missing-status``, ``multiple-status``,
+    ``status-io-error``, ``malformed-status``, ``malformed-run-identity``,
+    ``missing-run-identity``, ``malformed-run-outcome``,
+    ``missing-run-outcome``, ``status-outcome-mismatch``, and
+    ``unexpected-checkpoint-ref``. Run-path resolution and stat failures are
+    returned as ``run-dir-io-error``. Checkpoints are deliberately neither
+    read nor required: a completed evaluation must publish a null checkpoint
+    ref.
+    """
+
+    raw_path = Path(path)
+    try:
+        run_dir = raw_path.resolve(strict=False)
+        is_run_dir = run_dir.is_dir()
+    except (OSError, RuntimeError) as exc:
+        return EvalRunEvidence(
+            EVAL_RUN_EVIDENCE_SCHEMA,
+            str(raw_path),
+            "refused",
+            None,
+            None,
+            None,
+            {"code": "run-dir-io-error", "reason": str(exc)},
+        )
+    run_status: str | None = None
+    outcome_status: str | None = None
+    identity: dict[str, str] | None = None
+
+    def refused(code: str, reason: str) -> EvalRunEvidence:
+        return EvalRunEvidence(
+            EVAL_RUN_EVIDENCE_SCHEMA,
+            str(run_dir),
+            "refused",
+            run_status,
+            outcome_status,
+            identity,
+            {"code": code, "reason": reason},
+        )
+
+    if not is_run_dir:
+        return refused("missing-run-dir", f"run directory not found: {run_dir}")
+    try:
+        status_path, status = _read_status(run_dir)
+    except _InspectionRefusal as exc:
+        return refused(exc.code, exc.reason)
+    try:
+        run_dir = status_path.parent.resolve()
+    except (OSError, RuntimeError) as exc:
+        return refused("run-dir-io-error", str(exc))
+    raw_status: object = status.get("status")
+    if raw_status is not None and not isinstance(raw_status, str):
+        return refused("malformed-status", f"status value is not a string: {status_path}")
+    run_status = raw_status
+
+    try:
+        identity = _read_run_identity(run_dir)
+    except _InspectionRefusal as exc:
+        return refused(exc.code, exc.reason)
+
+    outcome_path = run_dir / "run-outcome.json"
+    outcome: RunOutcome | None = None
+    if outcome_path.is_file():
+        if not has_explicit_run_outcome_schema(outcome_path):
+            return refused(
+                "malformed-run-outcome",
+                f"run outcome at {outcome_path} lacks the explicit {RUN_OUTCOME_SCHEMA} schema",
+            )
+        try:
+            outcome = read_run_outcome(outcome_path)
+        except RunOutcomeDecodeError as exc:
+            return refused("malformed-run-outcome", str(exc))
+        outcome_status = outcome.status
+        if outcome.status != run_status:
+            return refused(
+                "status-outcome-mismatch",
+                f"status.json says {run_status!r}, run-outcome.json says {outcome.status!r}",
+            )
+    elif run_status == "completed":
+        return refused("missing-run-outcome", f"no run-outcome.json under {run_dir}")
+
+    if run_status == "completed":
+        if identity is None:
+            return refused("missing-run-identity", "completed evaluation has no valid run-start identity")
+        assert outcome is not None
+        if outcome.checkpoint_ref is not None:
+            return refused(
+                "unexpected-checkpoint-ref",
+                "completed evaluation outcome must have a null checkpoint_ref",
+            )
+        return EvalRunEvidence(
+            EVAL_RUN_EVIDENCE_SCHEMA,
+            str(run_dir),
+            "completed",
+            run_status,
+            outcome.status,
+            identity,
+            None,
+        )
+
+    return EvalRunEvidence(
+        EVAL_RUN_EVIDENCE_SCHEMA,
+        str(run_dir),
+        _verdict_for_status(run_status),
+        run_status,
+        outcome_status,
+        identity,
+        None,
+    )
 
 
 def _evidence_schema(identity: dict[str, str] | None) -> str:
@@ -673,16 +914,19 @@ if __name__ == "__main__":  # pragma: no cover - exercised by CLI tests
 
 
 __all__ = [
+    "EVAL_RUN_EVIDENCE_SCHEMA",
     "RUN_EVIDENCE_SCHEMA",
     "RUN_EVIDENCE_SCHEMA_V2",
     "RUN_EVIDENCE_SCHEMA_V3",
     "TRAJECTORY_RECORD_INSPECTION_SCHEMA",
+    "EvalRunEvidence",
     "RunEvidence",
     "TamperedTrajectoryRecordError",
     "TrajectoryPhysicalContext",
     "TrajectoryRecordInspection",
     "UnsupportedTrajectoryRecordSchemaError",
     "inspect_run",
+    "inspect_eval_run",
     "inspect_trajectory_record",
     "resolved_config_identity",
 ]

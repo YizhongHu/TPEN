@@ -34,8 +34,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from omegaconf import DictConfig, OmegaConf
 
+from tpen.checkpoint import CheckpointRef
+from tpen.inspection import inspect_eval_run, inspect_run
 from tpen.run import run_from_config
 
 _STATUS_CALLBACK = {
@@ -143,6 +146,102 @@ def test_a_successful_run_records_completed_and_an_empty_index(tmp_path: Path) -
     assert run_end[0]["payload"] == {"status": "completed"}
 
     assert json.loads((run_dir / "diagnostics" / "index.json").read_text()) == {"tasks": []}
+
+
+def test_a_real_completed_eval_run_has_eval_evidence_and_preserves_inspect_run_behavior(
+    tmp_path: Path,
+) -> None:
+    """The new API reads the real eval artifacts without requiring checkpoints."""
+
+    assert run_from_config(_cfg(tmp_path), config_path="s.yaml", command="pytest") == 0
+
+    run_dir = _run_dir(tmp_path)
+    evidence = inspect_eval_run(run_dir)
+    assert evidence.verdict == "completed"
+    assert evidence.run_status == "completed"
+    assert evidence.outcome == "completed"
+    assert evidence.resolved_config_identity is not None
+    run_start = json.loads((run_dir / "run_start.json").read_text(encoding="utf-8"))
+    assert evidence.resolved_config_identity == run_start["resolved_config_identity"]
+    assert evidence.refusal is None
+    assert evidence == type(evidence).from_mapping(evidence.to_dict())
+
+    # This is intentionally pinned: the legacy checkpoint-oriented API still
+    # cannot represent a completed evaluation with no checkpoint.
+    with pytest.raises(ValueError):
+        inspect_run(run_dir)
+
+
+def test_a_real_failed_eval_run_has_failed_eval_evidence(tmp_path: Path) -> None:
+    """A real failed evaluation suite maps to the failed eval verdict."""
+
+    cfg = _cfg(
+        tmp_path,
+        callbacks=[_STATUS_CALLBACK, _METADATA_CALLBACK, _EVALUATION_TIMING_CALLBACK],
+        evaluator={
+            "_target_": "tpen.evaluation.Evaluator",
+            "namespace": "eval",
+            "tasks": [_failing_task_cfg()],
+        },
+    )
+    assert run_from_config(cfg, config_path="s.yaml", command="pytest") == 1
+
+    evidence = inspect_eval_run(_run_dir(tmp_path))
+    assert evidence.verdict == "failed"
+    assert evidence.run_status == "failed"
+    assert evidence.outcome == "failed"
+    assert evidence.refusal is None
+
+
+def test_eval_evidence_refuses_missing_outcome_identity_and_matching_status(tmp_path: Path) -> None:
+    """Each negative case changes one artifact from a real completed eval."""
+
+    assert run_from_config(_cfg(tmp_path), config_path="s.yaml", command="pytest") == 0
+    run_dir = _run_dir(tmp_path)
+
+    (run_dir / "run-outcome.json").unlink()
+    assert inspect_eval_run(run_dir).refusal["code"] == "missing-run-outcome"
+
+    # Recreate a fresh real run for each independent one-file mutation.
+    identity_root = tmp_path / "identity"
+    assert run_from_config(_cfg(identity_root), config_path="s.yaml", command="pytest") == 0
+    identity_dir = _run_dir(identity_root)
+    (identity_dir / "run_start.json").unlink()
+    assert inspect_eval_run(identity_dir).refusal["code"] == "missing-run-identity"
+
+    status_root = tmp_path / "status"
+    assert run_from_config(_cfg(status_root), config_path="s.yaml", command="pytest") == 0
+    status_dir = _run_dir(status_root)
+    status_path = status_dir / "status.json"
+    status = json.loads(status_path.read_text())
+    status["status"] = "failed"
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+    assert inspect_eval_run(status_dir).refusal["code"] == "status-outcome-mismatch"
+
+
+def test_eval_evidence_refuses_a_completed_checkpoint_ref(tmp_path: Path) -> None:
+    """A completed evaluation must not claim a checkpoint, even if the ref is shaped correctly."""
+
+    assert run_from_config(_cfg(tmp_path), config_path="s.yaml", command="pytest") == 0
+    run_dir = _run_dir(tmp_path)
+    outcome_path = run_dir / "run-outcome.json"
+    outcome = json.loads(outcome_path.read_text())
+    outcome["checkpoint_ref"] = CheckpointRef(
+        checkpoint_dir=run_dir / "checkpoints" / "step_000001",
+        schema_version=2,
+        kind="training",
+        next_iteration=1,
+        completed_updates=1,
+        manifest_sha256="a" * 64,
+        model_sha256="b" * 64,
+        provenance={},
+    ).to_dict()
+    outcome_path.write_text(json.dumps(outcome), encoding="utf-8")
+
+    evidence = inspect_eval_run(run_dir)
+    assert evidence.verdict == "refused"
+    assert evidence.refusal is not None
+    assert evidence.refusal["code"] == "unexpected-checkpoint-ref"
 
 
 def test_a_failed_evaluation_suite_returns_nonzero_and_records_failed(tmp_path: Path) -> None:
