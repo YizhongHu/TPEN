@@ -13,7 +13,7 @@ from experiments.baselines.systems import load_registry
 from experiments.toolkit.trajectory_records import (
     TrajectoryReaderError, inspect_eval_run, inspect_trajectory_record, read_energy_grid,
 )
-from experiments.atomistic.stage1.protocol import manifest_hash, resolve_run_dir
+from experiments.atomistic.stage1.protocol import CONFIG_IDENTITY_RULE, manifest_hash, resolve_run_dir
 
 
 class CollectionError(ValueError):
@@ -101,6 +101,12 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
     registry_to_physical: dict[str, str] = {}
     physical_to_registry: dict[str, str] = {}
     for row in eval_rows:
+        if row.get("config_identity_rule") not in {None, CONFIG_IDENTITY_RULE}:
+            raise CollectionError(f"row {row.get('row_id')}: unsupported config identity rule")
+        if row.get("config_identity_rule") == CONFIG_IDENTITY_RULE:
+            digest = row.get("config_sha256")
+            if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise CollectionError(f"row {row.get('row_id')}: malformed config identity")
         row_id = str(row.get("row_id"))
         if row_id in seen:
             raise CollectionError(f"duplicate planned row {row_id}")

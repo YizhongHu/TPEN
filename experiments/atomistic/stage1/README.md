@@ -15,6 +15,13 @@ records checkpoint provenance. S1-A3 system
 eval configs must define a `trajectory_identity` block with `checkpoint_file`
 for this override to be accepted by Hydra.
 
+Planning is two-phase: phase 1 may select systems and emits smoke/train rows;
+phase 2 consumes that manifest and binds checkpoint digests to eval rows without
+replanning seeds or source/config identity. `config_sha256` is computed by the
+planner under `stage1-config-v1`: sorted `configs/<system>/{train,eval}.yaml`
+paths and their canonical bytes are hashed. The rule id is recorded in each row;
+GPU intent is recorded as a row `device` only when explicitly requested.
+
 Each evaluation config builds one `SystemDescriptor` from its instantiated
 `ParticleSpec` and `hamiltonian_terms`, and passes that descriptor plus an
 explicit `NaiveLocalEnergyEvaluator` to `TrajectoryMCMCGenerator`. The
