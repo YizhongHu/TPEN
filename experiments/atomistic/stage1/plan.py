@@ -18,12 +18,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-sha", required=True)
-    parser.add_argument("--config-sha256", help="legacy precomputed digest; prefer --config-root")
-    parser.add_argument("--config-root", type=Path,
-                        default=Path(__file__).resolve().parent / "configs")
+    parser.add_argument("--config-sha256", help="legacy digest input; two-phase modes recompute it")
     parser.add_argument("--results-root", required=True)
     parser.add_argument("--checkpoint-bindings", type=Path,
-                        help="JSON object keyed by system/lineage/checkpoint")
+                        help="phase-2 evidence envelope, or one-shot digest map")
     parser.add_argument("--phase", type=int, choices=(1, 2), default=2)
     parser.add_argument("--device", choices=("cpu", "cuda"))
     parser.add_argument("--systems", nargs="+", choices=SYSTEMS)
@@ -33,11 +31,11 @@ def main() -> int:
     parser.add_argument("--lineage-seeds", type=int, nargs="+", required=True)
     args = parser.parse_args()
     systems = tuple(args.systems) if args.systems else None
-    if args.config_sha256 is not None:
-        config_sha256: str | dict[str, str] = args.config_sha256
-    else:
-        config_sha256 = config_identities(config_root=args.config_root, systems=systems)
+    config_root = Path(__file__).resolve().parent / "configs"
+    config_sha256: str | dict[str, str]
     if args.phase == 1:
+        config_sha256 = config_identities(config_root=config_root, systems=systems)
+        _compare_legacy_config_sha256(args.config_sha256, config_sha256)
         rows = build_manifest(protocol=STAGE1_PROTOCOL, source_sha=args.source_sha,
                               config_sha256=config_sha256, checkpoints=args.checkpoints,
                               lineage_seeds=args.lineage_seeds, checkpoint_sha256={},
@@ -54,17 +52,26 @@ def main() -> int:
                     or not isinstance(phase1_hash, str)
                     or phase1_hash != manifest_hash(phase1_rows)):
                 raise ValueError("--phase1-manifest has an invalid manifest_hash")
+            phase1_systems = tuple(dict.fromkeys(
+                str(row["system"]) for row in phase1_rows if row.get("kind") == "train"
+            ))
+            config_sha256 = config_identities(config_root=config_root, systems=phase1_systems)
+            _compare_legacy_config_sha256(args.config_sha256, config_sha256)
             eval_rows = bind_evaluation_manifest(
                 phase1_rows=phase1_rows, checkpoints=args.checkpoints,
-                checkpoint_sha256=_read_bindings(args.checkpoint_bindings),
+                checkpoint_evidence=_read_bindings(args.checkpoint_bindings, structured=True),
                 source_sha=args.source_sha,
-                config_sha256=config_sha256 if isinstance(config_sha256, dict) else None,
+                config_sha256=config_sha256,
                 protocol=STAGE1_PROTOCOL,
                 phase1_manifest_hash=phase1_hash,
                 device=args.device,
             )
             rows = list(phase1_rows) + eval_rows
         else:
+            if args.config_sha256 is not None:
+                config_sha256 = args.config_sha256
+            else:
+                config_sha256 = config_identities(config_root=config_root, systems=systems)
             rows = build_manifest(protocol=STAGE1_PROTOCOL, source_sha=args.source_sha,
                                   config_sha256=config_sha256, checkpoints=args.checkpoints,
                                   lineage_seeds=args.lineage_seeds,
@@ -82,12 +89,25 @@ def main() -> int:
     return 0
 
 
-def _read_bindings(path: Path | None) -> dict[tuple[str, int, int], str]:
-    """Decode the explicit system:lineage:checkpoint digest map."""
+def _compare_legacy_config_sha256(
+    supplied: str | None, computed: dict[str, str],
+) -> None:
+    """Check a legacy scalar against every computed two-phase identity."""
+
+    if supplied is not None and any(digest != supplied for digest in computed.values()):
+        raise ValueError("--config-sha256 does not match the computed two-phase identity")
+
+
+def _read_bindings(path: Path | None, *, structured: bool = False) -> dict:
+    """Decode one-shot digest maps or the structured phase-2 evidence envelope."""
 
     if path is None:
         raise ValueError("phase 2 requires --checkpoint-bindings")
     raw = json.loads(path.read_text(encoding="utf-8"))
+    if structured:
+        if not isinstance(raw, dict):
+            raise ValueError("phase-2 checkpoint evidence must be a JSON object")
+        return raw
     if not isinstance(raw, dict):
         raise ValueError("checkpoint bindings must be a JSON object")
     bindings = {}

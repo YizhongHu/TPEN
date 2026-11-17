@@ -62,3 +62,26 @@ def test_plan_main_uses_protocol_planned_physical_system_ids(
     with pytest.raises(ProtocolError, match="planned IDs were not requested"):
         plan_module.main()
 
+
+def test_two_phase_plan_compares_legacy_config_digest_to_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "plan.py",
+            "--output", str(tmp_path / "manifest.json"),
+            "--source-sha", "a" * 40,
+            "--config-sha256", "b" * 64,
+            "--results-root", "/external/stage1",
+            "--phase", "1",
+            "--systems", "he",
+            "--checkpoints", "7",
+            "--lineage-seeds", "11", "12", "13",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="computed two-phase identity"):
+        plan_module.main()
+

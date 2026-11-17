@@ -25,6 +25,7 @@ SYSTEMS = ("hooke1", "hooke2", "he", "h2")
 KINDS = ("smoke", "train", "eval")
 CONFIG_IDENTITY_RULE = "stage1-config-v1"
 LEGACY_CONFIG_IDENTITY_RULE = "legacy-config-sha256"
+CHECKPOINT_EVIDENCE_SCHEMA = "stage1-checkpoint-evidence/v1"
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 # Coordinate bounds are retained in the manifest contract.  The resulting
@@ -742,7 +743,8 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
 
 def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
                              checkpoints: list[int],
-                             checkpoint_sha256: Mapping[tuple[str, int, int], str],
+                             checkpoint_evidence: Mapping[str, Any] | None = None,
+                             checkpoint_sha256: Mapping[str, Any] | None = None,
                              expected_physical_system_id: Mapping[str, str] | None = None,
                              eval_streams: int = 4, eval_walkers: int = 4096,
                              eval_draws: int = 256,
@@ -758,6 +760,9 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
     inconsistent checkpoint binding is rejected before an eval row exists.
     """
 
+    if checkpoint_evidence is not None and checkpoint_sha256 is not None:
+        raise ProtocolError("phase-2 checkpoint evidence was supplied twice")
+    evidence = checkpoint_evidence if checkpoint_evidence is not None else checkpoint_sha256
     if (not phase1_rows or any(not isinstance(row, Mapping) for row in phase1_rows)
             or any(row.get("kind") not in {"smoke", "train"} for row in phase1_rows)):
         raise ProtocolError("phase-2 binding requires a phase-1 smoke/train manifest")
@@ -775,6 +780,9 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         raise ProtocolError("phase-1 manifest contains duplicate seed")
     train_rows = [row for row in phase1_rows if row.get("kind") == "train"]
     systems = tuple(dict.fromkeys(str(row["system"]) for row in train_rows))
+    train_identity_keys = [f"{row.get('system')}:{row.get('lineage')}" for row in train_rows]
+    if len(set(train_identity_keys)) != len(train_identity_keys):
+        raise ProtocolError("phase-1 manifest contains duplicate train identity")
     if not systems or any(row.get("config_identity_rule") != CONFIG_IDENTITY_RULE for row in train_rows):
         raise ProtocolError("phase-1 manifest has no recognized config identity rule")
     source_shas = {_require_sha(row.get("source_sha"), length=40, field="source_sha")
@@ -789,6 +797,51 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         previous = config_by_system.setdefault(system, digest)
         if previous != digest:
             raise ProtocolError(f"phase-1 manifest has inconsistent config_sha256 for {system}")
+    if not isinstance(evidence, Mapping):
+        raise ProtocolError(
+            "phase-2 requires structured checkpoint evidence; bare maps are not accepted"
+        )
+    if evidence.get("schema") != CHECKPOINT_EVIDENCE_SCHEMA:
+        raise ProtocolError("phase-2 checkpoint evidence has an unsupported schema")
+    evidence_manifest_hash = _require_sha(
+        evidence.get("phase1_manifest_hash"), length=64,
+        field="checkpoint evidence phase1_manifest_hash",
+    )
+    if evidence_manifest_hash != phase1_manifest_hash:
+        raise ProtocolError("checkpoint evidence does not match phase-1 manifest")
+    raw_train_hashes = evidence.get("phase1_train_row_hashes")
+    if not isinstance(raw_train_hashes, Mapping):
+        raise ProtocolError("checkpoint evidence must include phase-1 train identities")
+    expected_train_hashes = {
+        f"{row['system']}:{row['lineage']}": manifest_hash([row])
+        for row in train_rows
+    }
+    if set(raw_train_hashes) != set(expected_train_hashes):
+        raise ProtocolError("checkpoint evidence train identities do not match phase-1 rows")
+    for key, expected_hash in expected_train_hashes.items():
+        if _require_sha(raw_train_hashes.get(key), length=64,
+                        field=f"checkpoint evidence phase1_train_row_hashes[{key!r}]") != expected_hash:
+            raise ProtocolError("checkpoint evidence train identity does not match phase-1 row")
+    raw_bindings = evidence.get("checkpoints")
+    if not isinstance(raw_bindings, Mapping):
+        raise ProtocolError("checkpoint evidence must include checkpoint digests")
+    bindings: dict[tuple[str, int, int], str] = {}
+    for raw_key, raw_digest in raw_bindings.items():
+        if not isinstance(raw_key, str):
+            raise ProtocolError("checkpoint evidence keys must be system:lineage:checkpoint")
+        parts = raw_key.split(":")
+        if len(parts) != 3:
+            raise ProtocolError(f"invalid checkpoint evidence key {raw_key!r}")
+        system, raw_lineage, raw_checkpoint = parts
+        try:
+            key = (system, int(raw_lineage), int(raw_checkpoint))
+        except ValueError as exc:
+            raise ProtocolError(f"invalid checkpoint evidence key {raw_key!r}") from exc
+        if key in bindings:
+            raise ProtocolError(f"duplicate checkpoint evidence key {raw_key!r}")
+        bindings[key] = _require_sha(
+            raw_digest, length=64, field=f"checkpoint evidence checkpoints[{raw_key!r}]"
+        )
     if protocol is not None:
         eval_streams, eval_walkers, eval_draws = protocol.eval_streams, protocol.eval_walkers, protocol.eval_draws
     if eval_streams <= 0 or eval_walkers <= 0 or eval_draws <= 0:
@@ -797,6 +850,14 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         raise ProtocolError("checkpoints must be a non-empty list of positive updates")
     if len(set(checkpoints)) != len(checkpoints):
         raise ProtocolError("checkpoints must not contain duplicates")
+    phase1_checkpoint_steps = {
+        tuple(row.get("checkpoint_steps", ())) for row in train_rows
+    }
+    if len(phase1_checkpoint_steps) != 1 or not next(iter(phase1_checkpoint_steps)):
+        raise ProtocolError("phase-1 manifest has inconsistent checkpoint_steps")
+    allowed_checkpoints = set(next(iter(phase1_checkpoint_steps)))
+    if any(checkpoint not in allowed_checkpoints for checkpoint in checkpoints):
+        raise ProtocolError("phase-2 checkpoints must be in phase-1 checkpoint_steps")
     phase1_source_sha = next(iter(source_shas))
     if source_sha is not None and source_sha != phase1_source_sha:
         raise ProtocolError("phase-2 source_sha differs from phase-1 manifest")
@@ -819,13 +880,16 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
     for system in systems:
         _require_sha(physical_ids.get(system), length=64,
                      field=f"expected_physical_system_id[{system!r}]")
+    combined_row_ids = {row.get("row_id") for row in phase1_rows}
+    combined_seeds = {row.get("seed") for row in phase1_rows}
     for train_row in train_rows:
         system = str(train_row["system"])
         lineage = int(train_row["lineage"])
         for checkpoint in checkpoints:
             key = (system, lineage, checkpoint)
-            digest = _require_sha(checkpoint_sha256.get(key), length=64,
-                                  field=f"checkpoint_sha256[{key!r}]")
+            digest = bindings.get(key)
+            if digest is None:
+                raise ProtocolError(f"checkpoint evidence missing digest for {key!r}")
             checkpoint_dir = resolve_run_dir(train_row) / "checkpoints" / f"step_{checkpoint:06d}"
             for stream in range(eval_streams):
                 row_id = stable_row_id(system=system, kind="eval", lineage=lineage,
@@ -848,6 +912,10 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
                     "checkpoint_dir": str(checkpoint_dir), "checkpoint_file": str(checkpoint_dir / "model.pt"),
                     "checkpoint_sha256": digest, "depends_on": train_row["row_id"],
                 }
+                if row["row_id"] in combined_row_ids or row["seed"] in combined_seeds:
+                    raise ProtocolError("phase-1 and phase-2 rows are not jointly unique")
+                combined_row_ids.add(row["row_id"])
+                combined_seeds.add(row["seed"])
                 rows.append(row)
                 if effective_device is not None:
                     row["device"] = effective_device
