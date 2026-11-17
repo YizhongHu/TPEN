@@ -14,8 +14,11 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
+
+import yaml
 
 
 def record(path: Path, *, row: str, returncode: int, producer_label: str) -> None:
@@ -72,142 +75,138 @@ def gate(root: Path, expected_rows: Sequence[str]) -> dict[str, object]:
 
 
 _FERMINET_TRACE_COLUMNS = ("step", "energy", "ewmean", "ewvar", "pmove", "walker_variance")
+_FERMINET_CONFIG_HEADER = re.compile(r"(?m)^[IWEF]\d{4} .*main\.py:34\] System config:\s*$")
+_LOG_RECORD = re.compile(r"(?m)^[IWEF]\d{4} ")
+_FERMINET_ATOM_TAG = "!!python/object:ferminet.utils.system.Atom"
+
+
+class _FerminetSafeLoader(yaml.SafeLoader):
+    """Safe YAML loader for the exact, producer-logged FermiNet config."""
+
+
+def _construct_tuple(loader: _FerminetSafeLoader, node: yaml.Node) -> tuple[Any, ...]:
+    return tuple(loader.construct_sequence(node, deep=True))
+
+
+def _construct_mapping(
+    loader: _FerminetSafeLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+def _reject_python_tag(loader: _FerminetSafeLoader, tag_suffix: str, node: yaml.Node) -> Any:
+    del loader
+    raise yaml.constructor.ConstructorError(
+        None,
+        None,
+        f"unsupported Python YAML tag: {tag_suffix}",
+        node.start_mark,
+    )
+
+
+_FerminetSafeLoader.add_constructor("tag:yaml.org,2002:python/tuple", _construct_tuple)
+_FerminetSafeLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping)
+_FerminetSafeLoader.add_multi_constructor("tag:yaml.org,2002:python/", _reject_python_tag)
+
+
+def _producer_yaml_block(stderr: str) -> str:
+    markers = list(_FERMINET_CONFIG_HEADER.finditer(stderr))
+    if len(markers) != 1:
+        raise ValueError(f"expected one pinned FermiNet System config record, found {len(markers)}")
+    start = markers[0].end()
+    terminator = _LOG_RECORD.search(stderr, start)
+    if terminator is None:
+        raise ValueError("producer system config record is truncated at EOF")
+    block = stderr[start : terminator.start()]
+    if not block.strip():
+        raise ValueError("producer System config record is truncated")
+    # The producer serializes Atom values with this known tag.  Normalize only
+    # that exact producer type to a plain mapping before SafeLoader sees it;
+    # every other Python tag remains rejected by the loader.
+    return block.replace(_FERMINET_ATOM_TAG, "")
+
+
+def _mapping_value(mapping: Mapping[str, Any], path: str) -> Any:
+    value: Any = mapping
+    for component in path.split("."):
+        if not isinstance(value, Mapping) or component not in value:
+            raise ValueError(f"incomplete producer config record: missing={path!r}")
+        value = value[component]
+    return value
 
 
 def parse_ferminet_logged_config(stderr: str, *, steps: int, expected_network_type: str) -> dict[str, object]:
-    """Parse and validate the config FermiNet printed before training.
-
-    FermiNet's ``main.py`` logs ``FLAGS.config`` immediately before calling
-    ``train.train``.  This deliberately parses that producer-owned dump rather
-    than re-resolving the input config in a separate process.
-    """
+    """Parse and validate FermiNet's complete, producer-logged config dump."""
 
     if steps < 1:
         raise ValueError("steps must be positive")
     if not expected_network_type:
         raise ValueError("expected_network_type must be non-empty")
-    markers = list(re.finditer(r"(?m)^.*System config:\s*$", stderr))
-    if len(markers) != 1:
-        raise ValueError(f"expected one complete FermiNet System config record, found {len(markers)}")
-    start = markers[0].end()
-    next_record = re.search(r"(?m)^I\d{4} .*?\n", stderr[start:])
-    block = stderr[start : start + next_record.start() if next_record else len(stderr)]
-    if not block.strip():
-        raise ValueError("producer System config record is truncated")
+    try:
+        config = yaml.load(_producer_yaml_block(stderr), Loader=_FerminetSafeLoader)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid producer config YAML: {exc}") from exc
+    if not isinstance(config, Mapping):
+        raise ValueError("producer System config must be a YAML mapping")
 
-    # Parse only primitive values and list entries required by the receipt.  In
-    # particular, never hand the producer's python-tagged YAML to an object
-    # constructor or a general-purpose YAML loader.
-    scalar = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z_]+):(?: (?P<value>.*))?$")
-    values: dict[str, object] = {}
-    seen: set[str] = set()
-    section: str | None = None
-    subsection: str | None = None
-    in_molecule = False
-    molecule_count = 0
-    coords: list[float] = []
-    electrons: list[int] = []
-
-    def parse_scalar(raw: str) -> object:
-        if raw == "true":
-            return True
-        if raw == "false":
-            return False
-        if re.fullmatch(r"[+-]?\d+", raw):
-            return int(raw)
-        if re.fullmatch(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?", raw):
-            return float(raw)
-        return raw.strip("'")
-
-    def add(path: str, value: object) -> None:
-        if path in seen:
-            raise ValueError(f"duplicate producer config path: {path}")
-        seen.add(path)
-        values[path] = value
-
-    for line in block.splitlines():
-        match = scalar.match(line)
-        if match:
-            indent = len(match.group("indent"))
-            key, raw = match.group("key"), match.group("value") or ""
-            if indent == 0:
-                section, subsection, in_molecule = key, None, False
-                if key == "batch_size" and raw:
-                    add("batch_size", parse_scalar(raw))
-            elif indent == 2:
-                subsection = key
-                in_molecule = section == "system" and key == "molecule"
-                if section in {"debug", "optim", "pretrain", "network"}:
-                    add(f"{section}.{key}", parse_scalar(raw))
-                elif section == "system" and key in {"charge", "electrons", "molecule"}:
-                    if raw and key != "electrons":
-                        add(f"system.{key}", parse_scalar(raw))
-            elif indent == 4 and section == "system" and in_molecule and key in {"atomic_number", "charge", "coords"}:
-                if key == "coords":
-                    subsection = "coords"
-                add(f"system.molecule.{key}", parse_scalar(raw) if key != "coords" else raw)
-            elif indent == 4 and section == "system" and in_molecule and key == "symbol":
-                add("system.molecule.symbol", parse_scalar(raw))
-            continue
-        if section == "system" and subsection == "electrons" and line.startswith("  - "):
-            electrons.append(int(line[4:]))
-        elif section == "system" and in_molecule and subsection == "coords" and line.startswith("    - "):
-            coords.append(float(line[6:]))
-        elif section == "system" and subsection == "molecule" and line.startswith("  - "):
-            molecule_count += 1
-
-    add("system.electrons", tuple(electrons))
-    add("system.molecule.coords_values", tuple(coords))
-    if molecule_count != 1:
-        raise ValueError(f"incomplete system record: expected one nucleus, found {molecule_count}")
-    required_paths = {
-        "batch_size": "batch_size",
-        "debug.check_nan": "debug_check_nan",
-        "debug.deterministic": "debug_deterministic",
-        "debug.seed": "debug_seed",
-        "optim.iterations": "iterations",
-        "optim.reset_if_nan": "optim_reset_if_nan",
-        "pretrain.iterations": "pretrain_iterations",
-        "network.network_type": "network_type",
-        "system.charge": "system_charge",
-        "system.molecule.atomic_number": "atomic_number",
-        "system.molecule.charge": "nucleus_charge",
-        "system.molecule.coords": "system.molecule.coords",
-    }
-    missing = sorted(path for path in required_paths if path not in seen)
-    if missing:
-        raise ValueError(f"incomplete producer config record: missing={missing!r}")
-    if len(electrons) != 2:
-        raise ValueError(f"producer system electrons record is incomplete: {tuple(electrons)!r}")
-    if tuple(coords) != (0.0, 0.0, 0.0):
-        raise ValueError(f"producer nucleus origin={tuple(coords)!r}, expected (0.0, 0.0, 0.0)")
-    if tuple(electrons) != (1, 0):
-        raise ValueError(f"producer system electrons={tuple(electrons)!r}, expected (1, 0)")
-    if values["system.charge"] != 0 or values["system.molecule.atomic_number"] != 1 or values["system.molecule.charge"] != 1.0:
-        raise ValueError("producer nucleus identity is not one H nucleus with charge 1")
-    if values["network.network_type"] != expected_network_type:
-        raise ValueError(f"producer network_type={values['network.network_type']!r}, expected {expected_network_type!r}")
-    expected = {
-        "reset_if_nan": False,
-        "check_nan": True,
-        "deterministic": True,
-        "seed": 0,
+    required = {
         "batch_size": 4096,
-        "iterations": steps,
-        "pretrain_iterations": 0,
+        "debug.check_nan": True,
+        "debug.deterministic": True,
+        "debug.seed": 0,
+        "optim.iterations": steps,
+        "optim.reset_if_nan": False,
+        "pretrain.iterations": 0,
     }
-    aliases = {"reset_if_nan": "optim.reset_if_nan", "check_nan": "debug.check_nan", "deterministic": "debug.deterministic", "seed": "debug.seed", "iterations": "optim.iterations", "pretrain_iterations": "pretrain.iterations", "network_type": "network.network_type"}
-    observed = {key: values.get(aliases.get(key, key)) for key in expected}
-    for key, wanted in expected.items():
-        if observed[key] != wanted:
-            raise ValueError(f"producer config {key}={observed[key]!r}, expected {wanted!r}")
+    observed: dict[str, object] = {}
+    output_names = {
+        "optim.iterations": "iterations",
+        "pretrain.iterations": "pretrain_iterations",
+    }
+    for path, wanted in required.items():
+        value = _mapping_value(config, path)
+        observed[output_names.get(path, path.rsplit(".", 1)[-1])] = value
+        if value != wanted:
+            raise ValueError(f"producer config {path}={value!r}, expected {wanted!r}")
+
+    network_type = _mapping_value(config, "network.network_type")
+    if network_type != expected_network_type:
+        raise ValueError(f"producer network_type={network_type!r}, expected {expected_network_type!r}")
+    system = _mapping_value(config, "system")
+    electrons = _mapping_value(system, "electrons")
+    if tuple(electrons) != (1, 0):
+        raise ValueError(f"producer system electrons={electrons!r}, expected (1, 0)")
+    molecule = _mapping_value(system, "molecule")
+    if not isinstance(molecule, list) or len(molecule) != 1 or not isinstance(molecule[0], Mapping):
+        raise ValueError("producer nucleus identity is incomplete: expected one atom")
+    atom = molecule[0]
+    atomic_number = _mapping_value(atom, "atomic_number")
+    nucleus_charge = _mapping_value(atom, "charge")
+    nucleus_coords = _mapping_value(atom, "coords")
+    _mapping_value(atom, "symbol")
+    if _mapping_value(system, "charge") != 0 or atomic_number != 1 or nucleus_charge != 1.0:
+        raise ValueError("producer nucleus identity is not one H nucleus with charge 1")
+    if tuple(nucleus_coords) != (0.0, 0.0, 0.0):
+        raise ValueError(f"producer nucleus origin={nucleus_coords!r}, expected (0.0, 0.0, 0.0)")
+
     observed.update(
         {
-            "network_type": values["network.network_type"],
-            "nucleus_count": molecule_count,
-            "nucleus_atomic_number": values["system.molecule.atomic_number"],
-            "nucleus_charge": values["system.molecule.charge"],
-            "nucleus_coords": list(coords),
+            "network_type": network_type,
+            "nucleus_count": len(molecule),
+            "nucleus_atomic_number": atomic_number,
+            "nucleus_charge": nucleus_charge,
+            "nucleus_coords": list(nucleus_coords),
             "electrons": list(electrons),
         }
     )
