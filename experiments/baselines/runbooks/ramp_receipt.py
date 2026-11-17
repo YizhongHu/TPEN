@@ -15,6 +15,7 @@ import json
 import math
 import re
 from collections.abc import Mapping
+from numbers import Real
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -75,9 +76,11 @@ def gate(root: Path, expected_rows: Sequence[str]) -> dict[str, object]:
 
 
 _FERMINET_TRACE_COLUMNS = ("step", "energy", "ewmean", "ewvar", "pmove", "walker_variance")
-_FERMINET_CONFIG_HEADER = re.compile(r"(?m)^[IWEF]\d{4} .*main\.py:34\] System config:\s*$")
+_FERMINET_CONFIG_HEADER = re.compile(
+    r"(?m)^[IWEF]\d{4} \d{2}:\d{2}:\d{2}\.\d{6} \d+ main\.py:34\] System config:\s*$"
+)
 _LOG_RECORD = re.compile(r"(?m)^[IWEF]\d{4} ")
-_FERMINET_ATOM_TAG = "!!python/object:ferminet.utils.system.Atom"
+_FERMINET_ATOM_TAG = "tag:yaml.org,2002:python/object:ferminet.utils.system.Atom"
 
 
 class _FerminetSafeLoader(yaml.SafeLoader):
@@ -117,6 +120,7 @@ def _reject_python_tag(loader: _FerminetSafeLoader, tag_suffix: str, node: yaml.
 
 _FerminetSafeLoader.add_constructor("tag:yaml.org,2002:python/tuple", _construct_tuple)
 _FerminetSafeLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping)
+_FerminetSafeLoader.add_constructor(_FERMINET_ATOM_TAG, _construct_mapping)
 _FerminetSafeLoader.add_multi_constructor("tag:yaml.org,2002:python/", _reject_python_tag)
 
 
@@ -131,10 +135,7 @@ def _producer_yaml_block(stderr: str) -> str:
     block = stderr[start : terminator.start()]
     if not block.strip():
         raise ValueError("producer System config record is truncated")
-    # The producer serializes Atom values with this known tag.  Normalize only
-    # that exact producer type to a plain mapping before SafeLoader sees it;
-    # every other Python tag remains rejected by the loader.
-    return block.replace(_FERMINET_ATOM_TAG, "")
+    return block
 
 
 def _mapping_value(mapping: Mapping[str, Any], path: str) -> Any:
@@ -144,6 +145,20 @@ def _mapping_value(mapping: Mapping[str, Any], path: str) -> Any:
             raise ValueError(f"incomplete producer config record: missing={path!r}")
         value = value[component]
     return value
+
+
+def _sequence_value(value: Any, *, path: str, length: int, item_type: type | tuple[type, ...]) -> list[Any]:
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        raise ValueError(f"producer config {path} must be a sequence")
+    if len(value) != length:
+        raise ValueError(f"producer config {path} must contain {length} values")
+    if item_type is int:
+        valid = all(type(item) is int for item in value)
+    else:
+        valid = all(isinstance(item, item_type) and not isinstance(item, bool) for item in value)
+    if not valid:
+        raise ValueError(f"producer config {path} has invalid value types")
+    return list(value)
 
 
 def parse_ferminet_logged_config(stderr: str, *, steps: int, expected_network_type: str) -> dict[str, object]:
@@ -184,8 +199,8 @@ def parse_ferminet_logged_config(stderr: str, *, steps: int, expected_network_ty
     if network_type != expected_network_type:
         raise ValueError(f"producer network_type={network_type!r}, expected {expected_network_type!r}")
     system = _mapping_value(config, "system")
-    electrons = _mapping_value(system, "electrons")
-    if tuple(electrons) != (1, 0):
+    electrons = _sequence_value(_mapping_value(system, "electrons"), path="system.electrons", length=2, item_type=int)
+    if electrons != [1, 0]:
         raise ValueError(f"producer system electrons={electrons!r}, expected (1, 0)")
     molecule = _mapping_value(system, "molecule")
     if not isinstance(molecule, list) or len(molecule) != 1 or not isinstance(molecule[0], Mapping):
@@ -193,11 +208,11 @@ def parse_ferminet_logged_config(stderr: str, *, steps: int, expected_network_ty
     atom = molecule[0]
     atomic_number = _mapping_value(atom, "atomic_number")
     nucleus_charge = _mapping_value(atom, "charge")
-    nucleus_coords = _mapping_value(atom, "coords")
+    nucleus_coords = _sequence_value(_mapping_value(atom, "coords"), path="system.molecule[0].coords", length=3, item_type=Real)
     _mapping_value(atom, "symbol")
     if _mapping_value(system, "charge") != 0 or atomic_number != 1 or nucleus_charge != 1.0:
         raise ValueError("producer nucleus identity is not one H nucleus with charge 1")
-    if tuple(nucleus_coords) != (0.0, 0.0, 0.0):
+    if nucleus_coords != [0.0, 0.0, 0.0]:
         raise ValueError(f"producer nucleus origin={nucleus_coords!r}, expected (0.0, 0.0, 0.0)")
 
     observed.update(
