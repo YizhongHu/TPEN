@@ -13,8 +13,13 @@ import csv
 import hashlib
 import json
 import math
+import re
+from collections.abc import Mapping
+from numbers import Real
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
+
+import yaml
 
 
 def record(path: Path, *, row: str, returncode: int, producer_label: str) -> None:
@@ -71,6 +76,156 @@ def gate(root: Path, expected_rows: Sequence[str]) -> dict[str, object]:
 
 
 _FERMINET_TRACE_COLUMNS = ("step", "energy", "ewmean", "ewvar", "pmove", "walker_variance")
+_FERMINET_CONFIG_HEADER = re.compile(
+    r"(?m)^[IWEF]\d{4} \d{2}:\d{2}:\d{2}\.\d{6} \d+ main\.py:34\] System config:\s*$"
+)
+_LOG_RECORD = re.compile(r"(?m)^[IWEF]\d{4} ")
+_FERMINET_ATOM_TAG = "tag:yaml.org,2002:python/object:ferminet.utils.system.Atom"
+
+
+class _FerminetSafeLoader(yaml.SafeLoader):
+    """Safe YAML loader for the exact, producer-logged FermiNet config."""
+
+
+def _construct_tuple(loader: _FerminetSafeLoader, node: yaml.Node) -> tuple[Any, ...]:
+    return tuple(loader.construct_sequence(node, deep=True))
+
+
+def _construct_mapping(
+    loader: _FerminetSafeLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+def _reject_python_tag(loader: _FerminetSafeLoader, tag_suffix: str, node: yaml.Node) -> Any:
+    del loader
+    raise yaml.constructor.ConstructorError(
+        None,
+        None,
+        f"unsupported Python YAML tag: {tag_suffix}",
+        node.start_mark,
+    )
+
+
+_FerminetSafeLoader.add_constructor("tag:yaml.org,2002:python/tuple", _construct_tuple)
+_FerminetSafeLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping)
+_FerminetSafeLoader.add_constructor(_FERMINET_ATOM_TAG, _construct_mapping)
+_FerminetSafeLoader.add_multi_constructor("tag:yaml.org,2002:python/", _reject_python_tag)
+
+
+def _producer_yaml_block(stderr: str) -> str:
+    markers = list(_FERMINET_CONFIG_HEADER.finditer(stderr))
+    if len(markers) != 1:
+        raise ValueError(f"expected one pinned FermiNet System config record, found {len(markers)}")
+    start = markers[0].end()
+    terminator = _LOG_RECORD.search(stderr, start)
+    if terminator is None:
+        raise ValueError("producer system config record is truncated at EOF")
+    block = stderr[start : terminator.start()]
+    if not block.strip():
+        raise ValueError("producer System config record is truncated")
+    return block
+
+
+def _mapping_value(mapping: Mapping[str, Any], path: str) -> Any:
+    value: Any = mapping
+    for component in path.split("."):
+        if not isinstance(value, Mapping) or component not in value:
+            raise ValueError(f"incomplete producer config record: missing={path!r}")
+        value = value[component]
+    return value
+
+
+def _sequence_value(value: Any, *, path: str, length: int, item_type: type | tuple[type, ...]) -> list[Any]:
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        raise ValueError(f"producer config {path} must be a sequence")
+    if len(value) != length:
+        raise ValueError(f"producer config {path} must contain {length} values")
+    if item_type is int:
+        valid = all(type(item) is int for item in value)
+    else:
+        valid = all(isinstance(item, item_type) and not isinstance(item, bool) for item in value)
+    if not valid:
+        raise ValueError(f"producer config {path} has invalid value types")
+    return list(value)
+
+
+def parse_ferminet_logged_config(stderr: str, *, steps: int, expected_network_type: str) -> dict[str, object]:
+    """Parse and validate FermiNet's complete, producer-logged config dump."""
+
+    if steps < 1:
+        raise ValueError("steps must be positive")
+    if not expected_network_type:
+        raise ValueError("expected_network_type must be non-empty")
+    try:
+        config = yaml.load(_producer_yaml_block(stderr), Loader=_FerminetSafeLoader)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid producer config YAML: {exc}") from exc
+    if not isinstance(config, Mapping):
+        raise ValueError("producer System config must be a YAML mapping")
+
+    required = {
+        "batch_size": 4096,
+        "debug.check_nan": True,
+        "debug.deterministic": True,
+        "debug.seed": 0,
+        "optim.iterations": steps,
+        "optim.reset_if_nan": False,
+        "pretrain.iterations": 0,
+    }
+    observed: dict[str, object] = {}
+    output_names = {
+        "optim.iterations": "iterations",
+        "pretrain.iterations": "pretrain_iterations",
+    }
+    for path, wanted in required.items():
+        value = _mapping_value(config, path)
+        observed[output_names.get(path, path.rsplit(".", 1)[-1])] = value
+        if value != wanted:
+            raise ValueError(f"producer config {path}={value!r}, expected {wanted!r}")
+
+    network_type = _mapping_value(config, "network.network_type")
+    if network_type != expected_network_type:
+        raise ValueError(f"producer network_type={network_type!r}, expected {expected_network_type!r}")
+    system = _mapping_value(config, "system")
+    electrons = _sequence_value(_mapping_value(system, "electrons"), path="system.electrons", length=2, item_type=int)
+    if electrons != [1, 0]:
+        raise ValueError(f"producer system electrons={electrons!r}, expected (1, 0)")
+    molecule = _mapping_value(system, "molecule")
+    if not isinstance(molecule, list) or len(molecule) != 1 or not isinstance(molecule[0], Mapping):
+        raise ValueError("producer nucleus identity is incomplete: expected one atom")
+    atom = molecule[0]
+    atomic_number = _mapping_value(atom, "atomic_number")
+    nucleus_charge = _mapping_value(atom, "charge")
+    nucleus_coords = _sequence_value(_mapping_value(atom, "coords"), path="system.molecule[0].coords", length=3, item_type=Real)
+    _mapping_value(atom, "symbol")
+    if _mapping_value(system, "charge") != 0 or atomic_number != 1 or nucleus_charge != 1.0:
+        raise ValueError("producer nucleus identity is not one H nucleus with charge 1")
+    if nucleus_coords != [0.0, 0.0, 0.0]:
+        raise ValueError(f"producer nucleus origin={nucleus_coords!r}, expected (0.0, 0.0, 0.0)")
+
+    observed.update(
+        {
+            "network_type": network_type,
+            "nucleus_count": len(molecule),
+            "nucleus_atomic_number": atomic_number,
+            "nucleus_charge": nucleus_charge,
+            "nucleus_coords": list(nucleus_coords),
+            "electrons": list(electrons),
+        }
+    )
+    return observed
 
 
 def validate_ferminet_trace(path: Path, *, steps: int) -> dict[str, object]:
@@ -126,7 +281,7 @@ def ramp_required_paths() -> list[str]:
                 f"ramp/{row}/{name}"
                 for name in (
                     "stdout.log", "stderr.log", "start.txt", "end.txt", "timing.txt", "receipt.json", "backend.json",
-                    "resolved-config.json", "train_stats.csv",
+                    "producer-config.json", "train_stats.csv",
                 )
             ]
         )
@@ -199,6 +354,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     trace_parser = subparsers.add_parser("validate-ferminet-trace")
     trace_parser.add_argument("--path", type=Path, required=True)
     trace_parser.add_argument("--steps", type=int, required=True)
+    config_parser = subparsers.add_parser("validate-ferminet-config")
+    config_parser.add_argument("--path", type=Path, required=True)
+    config_parser.add_argument("--steps", type=int, required=True)
+    config_parser.add_argument("--expected-network-type", required=True)
+    config_parser.add_argument("--output", type=Path, required=True)
     inventory_parser = subparsers.add_parser("inventory")
     inventory_parser.add_argument("--root", type=Path, required=True)
     inventory_parser.add_argument("--output", type=Path, required=True)
@@ -215,6 +375,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(gate(args.root, args.row), sort_keys=True))
         elif args.command == "validate-ferminet-trace":
             print(json.dumps(validate_ferminet_trace(args.path, steps=args.steps), sort_keys=True))
+        elif args.command == "validate-ferminet-config":
+            result = parse_ferminet_logged_config(args.path.read_text(encoding="utf-8"), steps=args.steps, expected_network_type=args.expected_network_type)
+            args.output.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+            print(json.dumps(result, sort_keys=True))
         elif args.command == "inventory":
             required = args.required + (ramp_required_paths() if args.ramp_required else [])
             print(json.dumps(inventory(args.root, args.output, required), sort_keys=True))

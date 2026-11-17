@@ -101,22 +101,8 @@ launch_fn() {
     export CUDA_VISIBLE_DEVICES="$gpu"
     assert_one_gpu "$FN_PY" "$root/backend.json"
     date --iso-8601=seconds > "$root/start.txt"
-    PYTHONPATH="$FN_SRC${PYTHONPATH:+:$PYTHONPATH}" "$FN_PY" - "$SOURCE_CHECKOUT/experiments/baselines/runbooks/configs/ferminet_h_atom.py" "$ansatz" "$root/resolved-config.json" "$STEPS" <<'PY'
-import importlib.util, json, pathlib, sys
-from ferminet import base_config
-config_path = pathlib.Path(sys.argv[1]); ansatz, output, steps = sys.argv[2], pathlib.Path(sys.argv[3]), int(sys.argv[4])
-spec = importlib.util.spec_from_file_location('bl_r1_ferminet_config', config_path)
-module = importlib.util.module_from_spec(spec); assert spec.loader is not None; spec.loader.exec_module(module)
-cfg = module.get_config()
-cfg.batch_size=4096; cfg.optim.iterations=steps; cfg.network.network_type=ansatz; cfg.network.determinants=16
-cfg.debug.deterministic=True; cfg.debug.seed=0; cfg.debug.check_nan=True; cfg.optim.reset_if_nan=False; cfg.pretrain.iterations=0
-cfg = base_config.resolve(cfg); atom = cfg.system.molecule[0]
-assert atom.charge == 1 and tuple(atom.coords) == (0, 0, 0) and tuple(cfg.system.electrons) == (1, 0)
-assert cfg.batch_size == 4096 and cfg.optim.iterations == steps and cfg.network.network_type == ansatz and cfg.debug.seed == 0
-assert cfg.debug.check_nan is True and cfg.optim.reset_if_nan is False and cfg.pretrain.iterations == 0
-output.write_text(json.dumps({'atom_charge': atom.charge, 'atom_coords': list(atom.coords), 'electrons': list(cfg.system.electrons), 'batch_size': cfg.batch_size, 'iterations': cfg.optim.iterations, 'network_type': cfg.network.network_type, 'seed': cfg.debug.seed, 'check_nan': cfg.debug.check_nan, 'reset_if_nan': cfg.optim.reset_if_nan, 'pretrain_iterations': cfg.pretrain.iterations}, sort_keys=True) + '\n')
-PY
-    PYTHONPATH="$FN_SRC${PYTHONPATH:+:$PYTHONPATH}" "$FN_PY" "$FN_SRC/ferminet/main.py" --config "$SOURCE_CHECKOUT/experiments/baselines/runbooks/configs/ferminet_h_atom.py" --config.batch_size 4096 --config.optim.iterations "$STEPS" --config.network.network_type "$ansatz" --config.network.determinants 16 --config.debug.deterministic True --config.debug.seed 0 --config.debug.check_nan True --config.optim.reset_if_nan False --config.pretrain.iterations 0 --config.log.save_path "$root"
+    PYTHONPATH="$FN_SRC${PYTHONPATH:+:$PYTHONPATH}" "$FN_PY" "$FN_SRC/ferminet/main.py" --config "$SOURCE_CHECKOUT/experiments/baselines/runbooks/configs/ferminet_h_atom.py" --config.batch_size=4096 --config.optim.iterations="$STEPS" --config.network.network_type="$ansatz" --config.network.determinants=16 --config.debug.deterministic=True --config.debug.seed=0 --config.debug.check_nan=True --config.optim.reset_if_nan=False --config.pretrain.iterations=0 --config.log.save_path="$root"
+    "$FN_PY" "$RECEIPT_HELPER" validate-ferminet-config --path "$root/stderr.log" --steps "$STEPS" --expected-network-type "$ansatz" --output "$root/producer-config.json"
     date --iso-8601=seconds > "$root/end.txt"
     "$FN_PY" "$RECEIPT_HELPER" validate-ferminet-trace --path "$root/train_stats.csv" --steps "$STEPS"
     maybe_inject_failure "$row"
