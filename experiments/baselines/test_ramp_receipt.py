@@ -105,6 +105,81 @@ def test_producer_logged_config_rejects_multiple_records_and_duplicate_paths():
         parse_ferminet_logged_config(duplicate, steps=1000, expected_network_type="ferminet")
 
 
+def _good_logged_config():
+    return (Path(__file__).parent / "testdata" / "ferminet-stderr-pbs7857872-config.log").read_text().replace(
+        "  reset_if_nan: true", "  reset_if_nan: false"
+    )
+
+
+@pytest.mark.parametrize("case", ["wrong_source", "warning", "truncated_atom"])
+def test_producer_logged_config_rejects_untrusted_record_boundaries(case):
+    """Only the pinned producer record may supply a complete config dump."""
+
+    stderr = _good_logged_config()
+    if case == "wrong_source":
+        stderr = stderr.replace("main.py:34] System config:", "other.py:34] System config:")
+    elif case == "warning":
+        stderr = stderr.replace(
+            "  reset_if_nan: false\n",
+            "W1117 16:56:21.000000 1 worker.py:1] unrelated record\n"
+            "  reset_if_nan: false\n",
+        )
+    else:
+        stderr = stderr.split("    symbol: H\n", 1)[0]
+    with pytest.raises(ValueError):
+        parse_ferminet_logged_config(stderr, steps=1000, expected_network_type="ferminet")
+
+
+def test_producer_logged_config_rejects_eof_truncation():
+    """A config prefix without the next log record is not producer evidence."""
+
+    stderr = _good_logged_config()
+    stderr = stderr.rsplit("\nI", 1)[0] + "\n"
+    with pytest.raises(ValueError, match="terminator|truncated"):
+        parse_ferminet_logged_config(stderr, steps=1000, expected_network_type="ferminet")
+
+
+def test_producer_logged_config_rejects_duplicate_electron_fields():
+    """Repeated sequence fields cannot be concatenated into a fabricated value."""
+
+    stderr = _good_logged_config().replace(
+        "  electrons: !!python/tuple\n  - 1\n  - 0\n",
+        "  electrons: !!python/tuple\n  - 1\n"
+        "  electrons: !!python/tuple\n  - 0\n",
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        parse_ferminet_logged_config(stderr, steps=1000, expected_network_type="ferminet")
+
+
+def test_producer_logged_config_rejects_duplicate_nested_yaml_key():
+    """Duplicate mapping keys are rejected at levels outside the receipt paths."""
+
+    stderr = _good_logged_config().replace(
+        "  check_nan: true\n", "  check_nan: true\n  check_nan: false\n"
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        parse_ferminet_logged_config(stderr, steps=1000, expected_network_type="ferminet")
+
+
+def test_producer_logged_config_rejects_unknown_python_tag():
+    """Only the explicitly supported tuple tag may appear in producer YAML."""
+
+    stderr = _good_logged_config().replace(
+        "batch_size: 4096\n", "batch_size: !!python/object:unknown.Type {}\n"
+    )
+    with pytest.raises(ValueError, match="tag|python"):
+        parse_ferminet_logged_config(stderr, steps=1000, expected_network_type="ferminet")
+
+
+def test_complete_producer_config_followed_by_warning_is_valid():
+    """A complete producer record ends before a following warning record."""
+
+    stderr = _good_logged_config() + "W1117 16:56:21.000000 1 worker.py:1] unrelated record\n"
+    config = parse_ferminet_logged_config(stderr, steps=1000, expected_network_type="ferminet")
+    assert config["electrons"] == [1, 0]
+    assert config["reset_if_nan"] is False
+
+
 @pytest.mark.parametrize(
     ("replacement", "message"),
     [
