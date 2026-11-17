@@ -19,6 +19,8 @@ from experiments.atomistic.stage1.protocol import (
     SYSTEMS,
     STAGE1_PROTOCOL,
     build_manifest,
+    bind_evaluation_manifest,
+    config_identity,
     evaluation_seed,
     identity_expectations,
     smoke_seed,
@@ -224,3 +226,67 @@ def test_manifest_rejects_relative_results_root() -> None:
                                for l in range(3)},
             results_root="relative/stage1",
         )
+
+
+def _phase1_rows() -> list[dict[str, object]]:
+    return build_manifest(
+        protocol=STAGE1_PROTOCOL, source_sha=SHA1,
+        config_sha256={system: SHA256 for system in SYSTEMS},
+        checkpoints=[7], lineage_seeds=[11, 12, 13], checkpoint_sha256={},
+        results_root="/external/stage1", systems=("he",), phase=1,
+    )
+
+
+def _phase2_bindings() -> dict[tuple[str, int, int], str]:
+    return {("he", lineage, 7): SHA256 for lineage in range(3)}
+
+
+def test_phase1_selected_system_preserves_full_manifest_identity() -> None:
+    selected = _phase1_rows()
+    full = build_manifest(
+        protocol=STAGE1_PROTOCOL, source_sha=SHA1,
+        config_sha256={system: SHA256 for system in SYSTEMS},
+        checkpoints=[7], lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={(system, lineage, 7): SHA256 for system in SYSTEMS for lineage in range(3)},
+        results_root="/external/stage1",
+        expected_physical_system_id={system: "c" * 64 for system in SYSTEMS},
+    )
+    full_selected = [row for row in full if row["system"] == "he" and row["kind"] in {"smoke", "train"}]
+    assert selected == full_selected
+
+
+def test_phase2_rejects_changed_source_sha() -> None:
+    with pytest.raises(ProtocolError, match="source_sha"):
+        bind_evaluation_manifest(
+            phase1_rows=_phase1_rows(), checkpoints=[7], checkpoint_sha256=_phase2_bindings(),
+            expected_physical_system_id={"he": "c" * 64}, source_sha="d" * 40,
+        )
+
+
+def test_phase2_requires_checkpoint_binding() -> None:
+    with pytest.raises(ProtocolError, match="checkpoint_sha256"):
+        bind_evaluation_manifest(
+            phase1_rows=_phase1_rows(), checkpoints=[7], checkpoint_sha256={},
+            expected_physical_system_id={"he": "c" * 64},
+        )
+
+
+def test_phase2_rejects_missing_identity_rule() -> None:
+    rows = _phase1_rows()
+    rows[0].pop("config_identity_rule")
+    with pytest.raises(ProtocolError, match="identity rule"):
+        bind_evaluation_manifest(
+            phase1_rows=rows, checkpoints=[7], checkpoint_sha256=_phase2_bindings(),
+            expected_physical_system_id={"he": "c" * 64},
+        )
+
+
+def test_config_identity_changes_for_eval_only_and_ignores_unrelated_file(tmp_path: Path) -> None:
+    config_root = tmp_path / "configs"
+    shutil.copytree(REPO_ROOT / "experiments/atomistic/stage1/configs", config_root)
+    before = config_identity(config_root=config_root, systems=("he",))
+    (config_root / "unrelated.txt").write_text("unrelated", encoding="utf-8")
+    assert config_identity(config_root=config_root, systems=("he",)) == before
+    eval_path = config_root / "he" / "eval.yaml"
+    eval_path.write_bytes(eval_path.read_bytes() + b"\n")
+    assert config_identity(config_root=config_root, systems=("he",))["sha256"] != before["sha256"]
