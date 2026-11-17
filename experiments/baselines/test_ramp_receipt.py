@@ -11,6 +11,7 @@ from experiments.baselines.runbooks.ramp_receipt import (
     gate,
     inventory,
     check_qstat_poll,
+    parse_ferminet_logged_config,
     record,
     validate_ferminet_trace,
 )
@@ -52,6 +53,29 @@ def test_record_refuses_an_existing_receipt_and_missing_row(tmp_path):
     record(path, row="a", returncode=0, producer_label="ferminet f4b1846c + logging patch test")
     with pytest.raises(FileExistsError):
         record(path, row="a", returncode=0, producer_label="ferminet f4b1846c + logging patch test")
+
+
+def test_producer_logged_config_rejects_real_pbs_7857872_fixture():
+    """The receipt measures FermiNet's logged config, not intended overrides."""
+
+    stderr = (Path(__file__).parent / "testdata" / "ferminet-stderr-pbs7857872-config.log").read_text()
+    with pytest.raises(ValueError, match="reset_if_nan"):
+        parse_ferminet_logged_config(stderr, steps=1000)
+
+
+def test_producer_logged_config_accepts_same_dump_when_boolean_is_false():
+    """A producer dump with the required values is accepted."""
+
+    stderr = (Path(__file__).parent / "testdata" / "ferminet-stderr-pbs7857872-config.log").read_text()
+    stderr = stderr.replace("  reset_if_nan: true", "  reset_if_nan: false")
+    config = parse_ferminet_logged_config(stderr, steps=1000)
+    assert config["reset_if_nan"] is False
+    assert config["check_nan"] is True
+    assert config["deterministic"] is True
+    assert config["seed"] == 0
+    assert config["batch_size"] == 4096
+    assert config["iterations"] == 1000
+    assert config["pretrain_iterations"] == 0
 
 
 def _write_trace(path, rows, fieldnames=("step", "energy", "ewmean", "ewvar", "pmove", "walker_variance")):

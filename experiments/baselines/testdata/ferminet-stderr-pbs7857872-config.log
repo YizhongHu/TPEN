@@ -1,0 +1,141 @@
+I1117 16:56:20.258440 22827212132416 main.py:34] System config:
+
+batch_size: 4096
+config_module: .atom
+debug:
+  check_nan: true
+  deterministic: true
+  seed: 0
+log:
+  features: false
+  local_energies: false
+  restore_path: ''
+  save_frequency: 10.0
+  save_path: /eagle/HetRxnEnergy/rhu/bl-r1-ramp-r2-20261117T165247Z/run/ramp/ferminet-codebase-ferminet-seed0
+  stats_frequency: 1
+  walkers: false
+mcmc:
+  adapt_frequency: 100
+  blocks: 1
+  burn_in: 100
+  init_means: !!python/tuple []
+  init_width: 1.0
+  move_width: 0.02
+  num_leapfrog_steps: 10
+  scale_by_nuclear_distance: false
+  steps: 10
+  use_hmc: false
+network:
+  bias_orbitals: false
+  complex: false
+  determinants: 16
+  ferminet:
+    electron_nuclear_aux_dims: !!python/tuple []
+    hidden_dims: !!python/tuple
+    - &id001 !!python/tuple
+      - 256
+      - 32
+    - *id001
+    - *id001
+    - *id001
+    nuclear_embedding_dim: 0
+    schnet_electron_electron_convolutions: !!python/tuple []
+    schnet_electron_nuclear_convolutions: !!python/tuple []
+    separate_spin_channels: false
+    use_last_layer: false
+  full_det: true
+  jastrow: default
+  make_envelope_fn: ''
+  make_envelope_kwargs: {}
+  make_feature_layer_fn: ''
+  make_feature_layer_kwargs: {}
+  network_type: ferminet
+  psiformer:
+    heads_dim: 64
+    mlp_hidden_dims: !!python/tuple
+    - 256
+    num_heads: 4
+    num_layers: 4
+    tf32: false
+    use_layer_norm: true
+  rescale_inputs: false
+observables:
+  density: false
+  density_basis: def2-tzvpd
+  dipole: false
+  s2: false
+optim:
+  adam:
+    b1: 0.9
+    b2: 0.999
+    eps: 1.0e-08
+    eps_root: 0.0
+  center_at_clip: true
+  clip_local_energy: 5.0
+  clip_median: false
+  iterations: 1000
+  kfac:
+    cov_ema_decay: 0.95
+    cov_update_every: 1
+    damping: 0.001
+    invert_every: 1
+    l2_reg: 0.0
+    mean_center: true
+    min_damping: 0.0001
+    momentum: 0.0
+    momentum_type: regular
+    norm_constraint: 0.001
+    register_only_generic: false
+  laplacian: default
+  lr:
+    decay: 1.0
+    delay: 10000.0
+    rate: 0.05
+  max_vmap_batch_size: 0
+  objective: vmc
+  optimizer: kfac
+  overlap:
+    penalty: 1.0
+    weights: null
+  reset_if_nan: true
+  spin_energy: 0.0
+  vmc_weight: 0.0
+pretrain:
+  basis: ccpvdz
+  excitation_type: ordered
+  iterations: 0
+  method: hf
+  scf_fraction: 1.0
+system:
+  atom: H
+  charge: 0
+  delta_charge: 0.0
+  electrons: !!python/tuple
+  - 1
+  - 0
+  make_local_energy_fn: ''
+  make_local_energy_kwargs: {}
+  molecule:
+  - !!python/object:ferminet.utils.system.Atom
+    atomic_number: 1
+    charge: 1.0
+    coords: !!python/tuple
+    - 0.0
+    - 0.0
+    - 0.0
+    symbol: H
+    units: bohr
+  ndim: 3
+  pp:
+    basis: ccecp-cc-pVDZ
+    symbols: null
+    type: ccecp
+  pyscf_mol: null
+  set_molecule: adjust_nuclear_charge
+  spin_polarisation: null
+  states: 0
+  type: 1
+  units: bohr
+  use_pp: false
+
+
