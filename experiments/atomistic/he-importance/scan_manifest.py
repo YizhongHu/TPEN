@@ -94,7 +94,7 @@ def _materialized_rows() -> dict[str, Any]:
         if spec is None or spec.loader is None:
             raise ScanManifestError(f"cannot load study module {filename}")
         module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
+        sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         return module
 
