@@ -16,7 +16,7 @@ FN_PATCH="$SOURCE_CHECKOUT/experiments/baselines/runbooks/patches/ferminet-f4b18
 
 write_partial_inventory() {
   set +e
-  "$FN_PY" "$RECEIPT_HELPER" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/ramp/artifact-inventory.partial.jsonl" --ramp-required > "$RUN_ROOT/ramp/artifact-inventory.partial.stdout" 2> "$RUN_ROOT/ramp/artifact-inventory.partial.stderr"
+  "$FN_PY" "$RECEIPT_HELPER" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/ramp/artifact-inventory.partial.jsonl" --ramp-required --run-mode "${BL_R1_RUN_MODE:-ramp}" > "$RUN_ROOT/ramp/artifact-inventory.partial.stdout" 2> "$RUN_ROOT/ramp/artifact-inventory.partial.stderr"
   return 0
 }
 on_exit() { local rc=$?; write_partial_inventory; exit "$rc"; }
@@ -49,24 +49,32 @@ git -C "$FN_SRC" diff > "$RUN_ROOT/src/patched-ferminet.diff"
 for path in "$FN_PY" "$FN_SRC/ferminet/main.py" "$RECEIPT_HELPER" "$FN_PATCH"; do test -e "$path"; done
 PRODUCER_LABEL="ferminet f4b1846c + logging patch $(awk '{print $1}' "$RUN_ROOT/src/logging-patch.sha256")"
 
+RUN_MODE="${BL_R1_RUN_MODE:-ramp}"
+FIXED_STEPS=$("$FN_PY" "$RECEIPT_HELPER" mode-steps --mode "$RUN_MODE")
+mapfile -t ROW_SPECS < <("$FN_PY" "$RECEIPT_HELPER" mode-rows --mode "$RUN_MODE")
+test "${#ROW_SPECS[@]}" -gt 0
 MODE="${BL_R1_MODE:-real}"
 case "$MODE" in
   real)
     test -z "${BL_R1_VERIFY_STEPS+x}"
     test -z "${BL_R1_VERIFY_INJECT_FAIL+x}"
-    STEPS=1000; INJECT_FAIL= ;;
+    STEPS="$FIXED_STEPS"; INJECT_FAIL= ;;
   verify)
     test -n "${BL_R1_VERIFY_STEPS:?verification requires BL_R1_VERIFY_STEPS}"
     case "$BL_R1_VERIFY_STEPS" in *[!0-9]*|'') exit 2 ;; esac
     test "$BL_R1_VERIFY_STEPS" -ge 1 && test "$BL_R1_VERIFY_STEPS" -le 100
     STEPS="$BL_R1_VERIFY_STEPS"; INJECT_FAIL="${BL_R1_VERIFY_INJECT_FAIL:-}"
-    case "$INJECT_FAIL" in
-      ''|ferminet-codebase-ferminet-seed0|ferminet-codebase-psiformer-seed0) ;;
-      *) exit 2 ;;
-    esac ;;
+    if test -n "$INJECT_FAIL"; then
+      valid_injection=false
+      for row_spec in "${ROW_SPECS[@]}"; do
+        IFS=$'\t' read -r row ansatz seed gpu <<< "$row_spec"
+        if test "$INJECT_FAIL" = "$row"; then valid_injection=true; fi
+      done
+      test "$valid_injection" = true
+    fi ;;
   *) exit 2 ;;
 esac
-printf '{"mode":"%s","steps":%s,"inject_fail":"%s"}\n' "$MODE" "$STEPS" "$INJECT_FAIL" > "$RUN_ROOT/ramp/mode.json"
+printf '{"mode":"%s","run_mode":"%s","steps":%s,"inject_fail":"%s"}\n' "$MODE" "$RUN_MODE" "$STEPS" "$INJECT_FAIL" > "$RUN_ROOT/ramp/mode.json"
 
 PYTHONPATH="$FN_SRC${PYTHONPATH:+:$PYTHONPATH}" "$FN_PY" - "$FN_SRC" <<'PY'
 import pathlib, sys, ferminet, jax
@@ -95,14 +103,14 @@ maybe_inject_failure() {
 PIDS=(); ROWS=()
 
 launch_fn() {
-  local row="$1" ansatz="$2" gpu="$3" root="$RUN_ROOT/ramp/$1"
+  local row="$1" ansatz="$2" seed="$3" gpu="$4" root="$RUN_ROOT/ramp/$1"
   mkdir "$root"
   (
     export CUDA_VISIBLE_DEVICES="$gpu"
     assert_one_gpu "$FN_PY" "$root/backend.json"
     date --iso-8601=seconds > "$root/start.txt"
-    PYTHONPATH="$FN_SRC${PYTHONPATH:+:$PYTHONPATH}" "$FN_PY" "$FN_SRC/ferminet/main.py" --config "$SOURCE_CHECKOUT/experiments/baselines/runbooks/configs/ferminet_h_atom.py" --config.batch_size=4096 --config.optim.iterations="$STEPS" --config.network.network_type="$ansatz" --config.network.determinants=16 --config.debug.deterministic=True --config.debug.seed=0 --config.debug.check_nan=True --config.optim.reset_if_nan=False --config.pretrain.iterations=0 --config.log.save_path="$root"
-    "$FN_PY" "$RECEIPT_HELPER" validate-ferminet-config --path "$root/stderr.log" --steps "$STEPS" --expected-network-type "$ansatz" --output "$root/producer-config.json"
+    PYTHONPATH="$FN_SRC${PYTHONPATH:+:$PYTHONPATH}" "$FN_PY" "$FN_SRC/ferminet/main.py" --config "$SOURCE_CHECKOUT/experiments/baselines/runbooks/configs/ferminet_h_atom.py" --config.batch_size=4096 --config.optim.iterations="$STEPS" --config.network.network_type="$ansatz" --config.network.determinants=16 --config.debug.deterministic=True --config.debug.seed="$seed" --config.debug.check_nan=True --config.optim.reset_if_nan=False --config.pretrain.iterations=0 --config.log.save_path="$root"
+    "$FN_PY" "$RECEIPT_HELPER" validate-ferminet-config --path "$root/stderr.log" --steps "$STEPS" --expected-network-type "$ansatz" --expected-seed "$seed" --output "$root/producer-config.json"
     date --iso-8601=seconds > "$root/end.txt"
     "$FN_PY" "$RECEIPT_HELPER" validate-ferminet-trace --path "$root/train_stats.csv" --steps "$STEPS"
     maybe_inject_failure "$row"
@@ -121,8 +129,15 @@ wait_and_gate() {
   "$FN_PY" "$RECEIPT_HELPER" gate --root "$RUN_ROOT/ramp" "${gate_args[@]}" > "$gate_output"
 }
 
-launch_fn ferminet-codebase-ferminet-seed0 ferminet 0; PIDS+=("$!"); ROWS+=(ferminet-codebase-ferminet-seed0)
-launch_fn ferminet-codebase-psiformer-seed0 psiformer 1; PIDS+=("$!"); ROWS+=(ferminet-codebase-psiformer-seed0)
+for row_spec in "${ROW_SPECS[@]}"; do
+  IFS=$'\t' read -r row ansatz seed gpu <<< "$row_spec"
+  launch_fn "$row" "$ansatz" "$seed" "$gpu"
+  PIDS+=("$!")
+  ROWS+=("$row")
+done
 wait_and_gate "$RUN_ROOT/ramp/ferminet-gate.json"
-for row in "$RUN_ROOT"/ramp/*-seed0; do printf 'start=%s\nend=%s\nsteps=%s\n' "$(cat "$row/start.txt")" "$(cat "$row/end.txt")" "$STEPS" > "$row/timing.txt"; done
-printf 'RAMP_COMPLETE job=%s queue=%s mode=%s steps=%s\n' "$PBS_JOBID" "$PBS_QUEUE" "$MODE" "$STEPS" > "$RUN_ROOT/ramp/ramp.complete"
+for row in "${ROWS[@]}"; do
+  row_root="$RUN_ROOT/ramp/$row"
+  printf 'start=%s\nend=%s\nsteps=%s\n' "$(cat "$row_root/start.txt")" "$(cat "$row_root/end.txt")" "$STEPS" > "$row_root/timing.txt"
+done
+printf 'RAMP_COMPLETE job=%s queue=%s mode=%s run_mode=%s steps=%s\n' "$PBS_JOBID" "$PBS_QUEUE" "$MODE" "$RUN_MODE" "$STEPS" > "$RUN_ROOT/ramp/ramp.complete"

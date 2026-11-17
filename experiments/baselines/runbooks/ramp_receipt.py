@@ -22,6 +22,45 @@ from typing import Any, Sequence
 import yaml
 
 
+_RUN_MODE_SPECS: dict[str, dict[str, object]] = {
+    "ramp": {
+        "steps": 1000,
+        "rows": (
+            ("ferminet-codebase-ferminet-seed0", "ferminet", 0, 0),
+            ("ferminet-codebase-psiformer-seed0", "psiformer", 0, 1),
+        ),
+    },
+    "full-ferminet": {
+        "steps": 50000,
+        "rows": tuple(
+            (f"ferminet-codebase-ferminet-seed{seed}", "ferminet", seed, seed)
+            for seed in range(3)
+        ),
+    },
+    "full-psiformer": {
+        "steps": 30000,
+        "rows": tuple(
+            (f"ferminet-codebase-psiformer-seed{seed}", "psiformer", seed, seed)
+            for seed in range(3)
+        ),
+    },
+}
+
+
+def run_mode_spec(mode: str) -> dict[str, object]:
+    """Return one immutable operator-allowlisted run shape."""
+
+    try:
+        spec = _RUN_MODE_SPECS[mode]
+    except KeyError as exc:
+        raise ValueError(f"run mode {mode!r} is not in the allowlist") from exc
+    rows = [
+        {"row": row, "ansatz": ansatz, "seed": seed, "gpu": gpu}
+        for row, ansatz, seed, gpu in spec["rows"]  # type: ignore[union-attr]
+    ]
+    return {"mode": mode, "steps": spec["steps"], "rows": rows}
+
+
 def record(path: Path, *, row: str, returncode: int, producer_label: str) -> None:
     """Persist one outcome inside a pre-created row directory, once only."""
 
@@ -161,13 +200,17 @@ def _sequence_value(value: Any, *, path: str, length: int, item_type: type | tup
     return list(value)
 
 
-def parse_ferminet_logged_config(stderr: str, *, steps: int, expected_network_type: str) -> dict[str, object]:
+def parse_ferminet_logged_config(
+    stderr: str, *, steps: int, expected_network_type: str, expected_seed: int = 0
+) -> dict[str, object]:
     """Parse and validate FermiNet's complete, producer-logged config dump."""
 
     if steps < 1:
         raise ValueError("steps must be positive")
     if not expected_network_type:
         raise ValueError("expected_network_type must be non-empty")
+    if expected_seed < 0:
+        raise ValueError("expected_seed must be non-negative")
     try:
         config = yaml.load(_producer_yaml_block(stderr), Loader=_FerminetSafeLoader)
     except yaml.YAMLError as exc:
@@ -179,7 +222,7 @@ def parse_ferminet_logged_config(stderr: str, *, steps: int, expected_network_ty
         "batch_size": 4096,
         "debug.check_nan": True,
         "debug.deterministic": True,
-        "debug.seed": 0,
+        "debug.seed": expected_seed,
         "optim.iterations": steps,
         "optim.reset_if_nan": False,
         "pretrain.iterations": 0,
@@ -266,8 +309,8 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def ramp_required_paths() -> list[str]:
-    """Return the fixed relative evidence set for the two-row BL-R1 ramp."""
+def ramp_required_paths(run_mode: str = "ramp") -> list[str]:
+    """Return the fixed relative evidence set for one allowlisted run mode."""
 
     required = [
         "ramp/mode.json",
@@ -275,7 +318,8 @@ def ramp_required_paths() -> list[str]:
         "ramp/ferminet-gate.json",
         "ramp/ramp.complete",
     ]
-    for row in ("ferminet-codebase-ferminet-seed0", "ferminet-codebase-psiformer-seed0"):
+    for row_spec in run_mode_spec(run_mode)["rows"]:  # type: ignore[union-attr]
+        row = row_spec["row"]
         required.extend(
             [
                 f"ramp/{row}/{name}"
@@ -358,12 +402,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     config_parser.add_argument("--path", type=Path, required=True)
     config_parser.add_argument("--steps", type=int, required=True)
     config_parser.add_argument("--expected-network-type", required=True)
+    config_parser.add_argument("--expected-seed", type=int, default=0)
     config_parser.add_argument("--output", type=Path, required=True)
     inventory_parser = subparsers.add_parser("inventory")
     inventory_parser.add_argument("--root", type=Path, required=True)
     inventory_parser.add_argument("--output", type=Path, required=True)
     inventory_parser.add_argument("--required", action="append", default=[])
     inventory_parser.add_argument("--ramp-required", action="store_true")
+    inventory_parser.add_argument("--run-mode", default="ramp")
+    mode_parser = subparsers.add_parser("mode-rows")
+    mode_parser.add_argument("--mode", required=True)
+    steps_parser = subparsers.add_parser("mode-steps")
+    steps_parser.add_argument("--mode", required=True)
     poll_parser = subparsers.add_parser("poll-check")
     poll_parser.add_argument("--path", type=Path, required=True)
     poll_parser.add_argument("--field", choices=("state", "phase"))
@@ -376,12 +426,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "validate-ferminet-trace":
             print(json.dumps(validate_ferminet_trace(args.path, steps=args.steps), sort_keys=True))
         elif args.command == "validate-ferminet-config":
-            result = parse_ferminet_logged_config(args.path.read_text(encoding="utf-8"), steps=args.steps, expected_network_type=args.expected_network_type)
+            result = parse_ferminet_logged_config(
+                args.path.read_text(encoding="utf-8"),
+                steps=args.steps,
+                expected_network_type=args.expected_network_type,
+                expected_seed=args.expected_seed,
+            )
             args.output.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
             print(json.dumps(result, sort_keys=True))
         elif args.command == "inventory":
-            required = args.required + (ramp_required_paths() if args.ramp_required else [])
+            required = args.required + (ramp_required_paths(args.run_mode) if args.ramp_required else [])
             print(json.dumps(inventory(args.root, args.output, required), sort_keys=True))
+        elif args.command == "mode-rows":
+            for row in run_mode_spec(args.mode)["rows"]:  # type: ignore[union-attr]
+                print("\t".join(str(row[field]) for field in ("row", "ansatz", "seed", "gpu")))
+        elif args.command == "mode-steps":
+            print(run_mode_spec(args.mode)["steps"])
         else:
             result = check_qstat_poll(args.path)
             print(result[args.field] if args.field else json.dumps(result, sort_keys=True))

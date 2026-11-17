@@ -8,9 +8,14 @@ INPUTS_FILE="$1"
 CONTROL="$2"
 DRY_RUN="${3:-}"
 test -z "$DRY_RUN" || test "$DRY_RUN" = --dry-run
+SELECTED_RUN_MODE=ramp
 case "$CONTROL" in
   success-mini) INJECT_FAIL= ;;
+  success-full-ferminet) SELECTED_RUN_MODE=full-ferminet; INJECT_FAIL= ;;
+  success-full-psiformer) SELECTED_RUN_MODE=full-psiformer; INJECT_FAIL= ;;
   fail-ferminet-ferminet) INJECT_FAIL=ferminet-codebase-ferminet-seed0 ;;
+  fail-full-ferminet-seed1) SELECTED_RUN_MODE=full-ferminet; INJECT_FAIL=ferminet-codebase-ferminet-seed1 ;;
+  fail-full-psiformer-seed1) SELECTED_RUN_MODE=full-psiformer; INJECT_FAIL=ferminet-codebase-psiformer-seed1 ;;
   *) printf 'unknown verification control: %s\n' "$CONTROL" >&2; exit 2 ;;
 esac
 
@@ -48,23 +53,26 @@ sha256sum "$RUN_ROOT/ramp-inputs.env" "$PRE_FREEZE_RECEIPT" "$RUN_ROOT/ramp.pbs"
 
 export RUN_ROOT SOURCE_CHECKOUT RUNBOOK_COMMIT SCIENCE PRE_FREEZE_RECEIPT PRE_FREEZE_RECEIPT_SHA256 PATCH_BLOB
 export BL_R1_MODE=verify BL_R1_VERIFY_STEPS=10
+export BL_R1_RUN_MODE="$SELECTED_RUN_MODE"
 if test -n "$INJECT_FAIL"; then export BL_R1_VERIFY_INJECT_FAIL="$INJECT_FAIL"; fi
-printf '{"control":"%s","mode":"%s","steps":%s,"inject_fail":"%s"}\n' "$CONTROL" "$BL_R1_MODE" "$BL_R1_VERIFY_STEPS" "$INJECT_FAIL" > "$RUN_ROOT/verify-submit-mode.json"
+printf '{"control":"%s","mode":"%s","run_mode":"%s","steps":%s,"inject_fail":"%s"}\n' "$CONTROL" "$BL_R1_MODE" "$SELECTED_RUN_MODE" "$BL_R1_VERIFY_STEPS" "$INJECT_FAIL" > "$RUN_ROOT/verify-submit-mode.json"
 
 write_submit_partial() {
   set +e
-  /home/rhu/.venvs/ferminet-jax092-60c9fab3/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/artifact-inventory.submit-partial.jsonl" --ramp-required --required ramp-inputs.env --required ramp.pbs --required input-inventory.sha256 --required verify-submit-mode.json --required qsub.stdout --required qsub.stderr --required qsub.status --required jobid.txt > "$RUN_ROOT/artifact-inventory.submit-partial.stdout" 2> "$RUN_ROOT/artifact-inventory.submit-partial.stderr"
+  /home/rhu/.venvs/ferminet-jax092-60c9fab3/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/artifact-inventory.submit-partial.jsonl" --ramp-required --run-mode "$SELECTED_RUN_MODE" --required ramp-inputs.env --required ramp.pbs --required input-inventory.sha256 --required verify-submit-mode.json --required qsub.stdout --required qsub.stderr --required qsub.status --required jobid.txt > "$RUN_ROOT/artifact-inventory.submit-partial.stdout" 2> "$RUN_ROOT/artifact-inventory.submit-partial.stderr"
   return 0
 }
 on_submit_exit() { rc=$?; write_submit_partial; exit "$rc"; }
 trap on_submit_exit EXIT
 
 QSUB_VARIABLES=RUN_ROOT,SOURCE_CHECKOUT,RUNBOOK_COMMIT,SCIENCE,PRE_FREEZE_RECEIPT,PRE_FREEZE_RECEIPT_SHA256,PATCH_BLOB,BL_R1_MODE,BL_R1_VERIFY_STEPS
+QSUB_VARIABLES="$QSUB_VARIABLES,BL_R1_RUN_MODE"
 if test -n "$INJECT_FAIL"; then QSUB_VARIABLES="$QSUB_VARIABLES,BL_R1_VERIFY_INJECT_FAIL"; fi
 if test "$DRY_RUN" = --dry-run; then
-  env | grep -E '^(RUN_ROOT|SOURCE_CHECKOUT|RUNBOOK_COMMIT|SCIENCE|PRE_FREEZE_RECEIPT|PRE_FREEZE_RECEIPT_SHA256|PATCH_BLOB|BL_R1_MODE|BL_R1_VERIFY_STEPS|BL_R1_VERIFY_INJECT_FAIL)=' | sort > "$RUN_ROOT/verify-submit-dry-run.env"
+  env | grep -E '^(RUN_ROOT|SOURCE_CHECKOUT|RUNBOOK_COMMIT|SCIENCE|PRE_FREEZE_RECEIPT|PRE_FREEZE_RECEIPT_SHA256|PATCH_BLOB|BL_R1_MODE|BL_R1_VERIFY_STEPS|BL_R1_RUN_MODE|BL_R1_VERIFY_INJECT_FAIL)=' | sort > "$RUN_ROOT/verify-submit-dry-run.env"
   grep -Fx 'BL_R1_MODE=verify' "$RUN_ROOT/verify-submit-dry-run.env"
   grep -Fx 'BL_R1_VERIFY_STEPS=10' "$RUN_ROOT/verify-submit-dry-run.env"
+  grep -Fx "BL_R1_RUN_MODE=$SELECTED_RUN_MODE" "$RUN_ROOT/verify-submit-dry-run.env"
   printf '%s\n' "$QSUB_VARIABLES" > "$RUN_ROOT/verify-submit-qsub-variables.txt"
   exit 0
 fi
@@ -112,4 +120,4 @@ while :; do
   esac
   sleep 30
 done
-/home/rhu/.venvs/ferminet-jax092-60c9fab3/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/artifact-inventory.jsonl" --ramp-required --required ramp-inputs.env --required ramp.pbs --required input-inventory.sha256 --required verify-submit-mode.json --required qsub.stdout --required qsub.stderr --required qsub.status --required jobid.txt --required qstat-observations.txt --required qstat-last-success.txt --required logs/ramp.stdout --required logs/ramp.stderr
+/home/rhu/.venvs/ferminet-jax092-60c9fab3/bin/python "$SOURCE_CHECKOUT/experiments/baselines/runbooks/ramp_receipt.py" inventory --root "$RUN_ROOT" --output "$RUN_ROOT/artifact-inventory.jsonl" --ramp-required --run-mode "$SELECTED_RUN_MODE" --required ramp-inputs.env --required ramp.pbs --required input-inventory.sha256 --required verify-submit-mode.json --required qsub.stdout --required qsub.stderr --required qsub.status --required jobid.txt --required qstat-observations.txt --required qstat-last-success.txt --required logs/ramp.stdout --required logs/ramp.stderr
