@@ -147,6 +147,18 @@ def test_pbs_stages_patched_source_without_ownership_copy_and_traps_early():
     assert script.index("trap on_exit EXIT") < script.index(clone)
 
 
+def test_pbs_uses_equals_boolean_overrides_and_producer_config_receipt():
+    """Boolean flags and the receipt must use the producer's actual argv/log."""
+
+    script = (Path(__file__).parent / "runbooks" / "h-atom-r1-ramp.pbs").read_text()
+    assert "--config.optim.reset_if_nan=False" in script
+    assert "--config.debug.check_nan=True" in script
+    assert "--config.debug.deterministic=True" in script
+    assert "--config.optim.reset_if_nan False" not in script
+    assert "validate-ferminet-config --path \"$root/stderr.log\"" in script
+    assert "resolved-config.json" not in script
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [

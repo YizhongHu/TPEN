@@ -42,6 +42,18 @@ FermiNet batch/step/NaN/pretraining defaults: ferminet/base_config.py:47,61,
 85,305-318; required trace schema: train.py:648; loop/NaN: train.py:965-1033.
 Each row asserts one GPU using its own interpreter.
 
+The PBS template passes every FermiNet boolean override with an equals form,
+for example `--config.optim.reset_if_nan=False`. This is the syntax consumed
+by the pinned `absl.flags`/`ml_collections.config_flags` path in
+`ferminet/main.py`; a space-separated boolean value can set the flag by
+presence and leave the value token ineffective. FermiNet logs the resolved
+`FLAGS.config` immediately before training. The row receipt parses that exact
+`stderr.log` dump into `producer-config.json` and stops before the row receipt
+if any required value differs: `reset_if_nan=false`, `check_nan=true`,
+`deterministic=true`, `seed=0`, `batch_size=4096`, `iterations=STEPS`, and
+`pretrain.iterations=0`. A separately re-resolved config is intent evidence,
+not a producer receipt, and is not used by this runbook.
+
 Use Polaris debug only, one node, one hour, no chain. The orchestrator must
 re-plan from seconds/step before any full run, inference, or trajectory export.
 
@@ -134,7 +146,7 @@ PBS writes artifact-inventory.partial.jsonl on every exit. The final command
 writes the complete deterministic inventory: fixed relative paths, size,
 SHA-256, missing status; it excludes itself and fails on a gap. Handoff is
 both inventories, raw qsub output/status, append-only qstat responses, inputs,
-PBS bytes/logs, all row logs/receipts/device bindings/timings/configs/native
+PBS bytes/logs, all row logs/receipts/device bindings/timings/producer configs/native
 artifacts, and ramp.complete only after mechanical success.
 
 ## Verification mode and required controls

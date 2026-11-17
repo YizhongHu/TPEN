@@ -13,6 +13,7 @@ import csv
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 from typing import Sequence
 
@@ -73,6 +74,65 @@ def gate(root: Path, expected_rows: Sequence[str]) -> dict[str, object]:
 _FERMINET_TRACE_COLUMNS = ("step", "energy", "ewmean", "ewvar", "pmove", "walker_variance")
 
 
+def parse_ferminet_logged_config(stderr: str, *, steps: int) -> dict[str, object]:
+    """Parse and validate the config FermiNet printed before training.
+
+    FermiNet's ``main.py`` logs ``FLAGS.config`` immediately before calling
+    ``train.train``.  This deliberately parses that producer-owned dump rather
+    than re-resolving the input config in a separate process.
+    """
+
+    if steps < 1:
+        raise ValueError("steps must be positive")
+    marker = "System config:"
+    try:
+        block = stderr.split(marker, 1)[1].split("\n\nI", 1)[0]
+    except IndexError as exc:
+        raise ValueError("producer log has no FermiNet System config dump") from exc
+
+    values: dict[str, object] = {}
+    section: str | None = None
+    scalar = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z_]+):(?: (?P<value>.*))?$")
+    for line in block.splitlines():
+        match = scalar.match(line)
+        if not match:
+            continue
+        indent = len(match.group("indent"))
+        key, raw = match.group("key"), match.group("value") or ""
+        if indent == 0:
+            section = key
+        elif indent == 2 and section in {"debug", "optim", "pretrain"}:
+            if raw == "true":
+                value: object = True
+            elif raw == "false":
+                value = False
+            elif re.fullmatch(r"[+-]?\d+", raw):
+                value = int(raw)
+            else:
+                value = raw
+            values[f"{section}_{key}" if section != "optim" or key != "iterations" else "iterations"] = value
+
+    if "batch_size" not in values:
+        match = re.search(r"(?m)^batch_size: (\d+)$", block)
+        if match:
+            values["batch_size"] = int(match.group(1))
+    expected = {
+        "reset_if_nan": False,
+        "check_nan": True,
+        "deterministic": True,
+        "seed": 0,
+        "batch_size": 4096,
+        "iterations": steps,
+        "pretrain_iterations": 0,
+    }
+    aliases = {"reset_if_nan": "optim_reset_if_nan", "check_nan": "debug_check_nan", "deterministic": "debug_deterministic", "seed": "debug_seed"}
+    observed = {key: values.get(aliases.get(key, key)) for key in expected}
+    for key, wanted in expected.items():
+        if observed[key] != wanted:
+            raise ValueError(f"producer config {key}={observed[key]!r}, expected {wanted!r}")
+    return observed
+
+
 def validate_ferminet_trace(path: Path, *, steps: int) -> dict[str, object]:
     """Require the pinned FermiNet training schema and a complete finite trace."""
 
@@ -126,7 +186,7 @@ def ramp_required_paths() -> list[str]:
                 f"ramp/{row}/{name}"
                 for name in (
                     "stdout.log", "stderr.log", "start.txt", "end.txt", "timing.txt", "receipt.json", "backend.json",
-                    "resolved-config.json", "train_stats.csv",
+                    "producer-config.json", "train_stats.csv",
                 )
             ]
         )
@@ -199,6 +259,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     trace_parser = subparsers.add_parser("validate-ferminet-trace")
     trace_parser.add_argument("--path", type=Path, required=True)
     trace_parser.add_argument("--steps", type=int, required=True)
+    config_parser = subparsers.add_parser("validate-ferminet-config")
+    config_parser.add_argument("--path", type=Path, required=True)
+    config_parser.add_argument("--steps", type=int, required=True)
+    config_parser.add_argument("--output", type=Path, required=True)
     inventory_parser = subparsers.add_parser("inventory")
     inventory_parser.add_argument("--root", type=Path, required=True)
     inventory_parser.add_argument("--output", type=Path, required=True)
@@ -215,6 +279,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(gate(args.root, args.row), sort_keys=True))
         elif args.command == "validate-ferminet-trace":
             print(json.dumps(validate_ferminet_trace(args.path, steps=args.steps), sort_keys=True))
+        elif args.command == "validate-ferminet-config":
+            result = parse_ferminet_logged_config(args.path.read_text(encoding="utf-8"), steps=args.steps)
+            args.output.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+            print(json.dumps(result, sort_keys=True))
         elif args.command == "inventory":
             required = args.required + (ramp_required_paths() if args.ramp_required else [])
             print(json.dumps(inventory(args.root, args.output, required), sort_keys=True))
