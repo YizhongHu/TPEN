@@ -99,7 +99,11 @@ def test_producer_logged_config_rejects_multiple_records_and_duplicate_paths():
     fixture = (Path(__file__).parent / "testdata" / "ferminet-stderr-pbs7857872-config.log").read_text()
     good = fixture.replace("  reset_if_nan: true", "  reset_if_nan: false")
     with pytest.raises(ValueError, match="single|record"):
-        parse_ferminet_logged_config(good + "\nI1117 16:57:00 main.py:34] System config:\n\n", steps=1000, expected_network_type="ferminet")
+        parse_ferminet_logged_config(
+            good + "\nI1117 16:57:00.000000 1 main.py:34] System config:\n\n",
+            steps=1000,
+            expected_network_type="ferminet",
+        )
     duplicate = good.replace("  network_type: ferminet\n", "  network_type: ferminet\n  network_type: psiformer\n")
     with pytest.raises(ValueError, match="duplicate"):
         parse_ferminet_logged_config(duplicate, steps=1000, expected_network_type="ferminet")
@@ -178,6 +182,62 @@ def test_complete_producer_config_followed_by_warning_is_valid():
     config = parse_ferminet_logged_config(stderr, steps=1000, expected_network_type="ferminet")
     assert config["electrons"] == [1, 0]
     assert config["reset_if_nan"] is False
+
+
+def test_parser_does_not_reinterpret_atom_tag_in_scalar():
+    """An Atom tag is data only when it is the producer's Atom mapping node."""
+
+    stderr = _good_logged_config().replace(
+        "  network_type: ferminet\n",
+        "  network_type: '!!python/object:ferminet.utils.system.Atomferminet'\n",
+    )
+    with pytest.raises(ValueError, match="network_type"):
+        parse_ferminet_logged_config(stderr, steps=1000, expected_network_type="ferminet")
+
+
+def test_parser_requires_exact_pinned_main_py_header():
+    """A similarly named source file is not the pinned FermiNet producer record."""
+
+    stderr = _good_logged_config().replace("main.py:34] System config:", "othermain.py:34] System config:")
+    with pytest.raises(ValueError, match="record"):
+        parse_ferminet_logged_config(stderr, steps=1000, expected_network_type="ferminet")
+
+
+@pytest.mark.parametrize(
+    ("replacement", "message"),
+    [
+        ("  electrons: {1: 99, 0: 99}\n", "electrons"),
+        (
+            "    coords: null\n",
+            "coords",
+        ),
+    ],
+)
+def test_parser_rejects_non_sequence_electron_and_coordinate_shapes(replacement, message):
+    """Mappings must not be coerced by iterating their keys as physical values."""
+
+    stderr = _good_logged_config()
+    if message == "electrons":
+        stderr = stderr.replace(
+            "  electrons: !!python/tuple\n  - 1\n  - 0\n", replacement
+        )
+    else:
+        stderr = stderr.replace(
+            "    coords: !!python/tuple\n    - 0.0\n    - 0.0\n    - 0.0\n", replacement
+        )
+    with pytest.raises(ValueError, match=message):
+        parse_ferminet_logged_config(stderr, steps=1000, expected_network_type="ferminet")
+
+
+@pytest.mark.parametrize("severity", ["I", "W", "E", "F"])
+def test_each_log_severity_terminates_complete_config(severity):
+    """Any subsequent absl severity record closes a complete producer dump."""
+
+    body = _good_logged_config().rsplit("\nI", 1)[0] + "\n"
+    stderr = body + f"{severity}1117 16:56:21.000000 1 worker.py:1] next record\n"
+    config = parse_ferminet_logged_config(stderr, steps=1000, expected_network_type="ferminet")
+    assert config["network_type"] == "ferminet"
+    assert config["electrons"] == [1, 0]
 
 
 @pytest.mark.parametrize(
