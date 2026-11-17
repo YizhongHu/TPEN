@@ -293,7 +293,7 @@ def test_writer_statistics_are_forwarded_without_reducing_again(
     collector_variance = total_square / 256 - collector_mean * collector_mean
     writer_mean = math.nextafter(collector_mean, math.inf)
     writer_variance = math.nextafter(collector_variance, math.inf)
-    _install_single_fake(
+    document = _install_single_fake(
         monkeypatch,
         tmp_path,
         streams=4,
