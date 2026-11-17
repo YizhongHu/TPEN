@@ -204,7 +204,7 @@ def test_b1_admitted_transport_is_retained_on_dispatch_plan(tmp_path: Path, monk
     )
     expected = AttachedTransportSpec.from_mapping(payload)
     assert plan.transport == expected
-    assert plan.dispatcher.transport is expected
+    assert plan.dispatcher.transport is plan.transport
     assert observed["worker"] is plan.worker
 
 
