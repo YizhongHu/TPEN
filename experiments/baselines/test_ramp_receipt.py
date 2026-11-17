@@ -11,6 +11,7 @@ from experiments.baselines.runbooks.ramp_receipt import (
     gate,
     inventory,
     check_qstat_poll,
+    run_mode_spec,
     parse_ferminet_logged_config,
     record,
     validate_ferminet_trace,
@@ -82,6 +83,59 @@ def test_producer_logged_config_accepts_same_dump_when_boolean_is_false():
     assert config["nucleus_charge"] == 1.0
     assert config["nucleus_coords"] == [0.0, 0.0, 0.0]
     assert config["electrons"] == [1, 0]
+
+
+def test_full_run_modes_are_fixed_and_allowlisted():
+    """Full runs expose only the two operator-approved fixed shapes."""
+
+    ferminet = run_mode_spec("full-ferminet")
+    psiformer = run_mode_spec("full-psiformer")
+    assert ferminet["steps"] == 50000
+    assert psiformer["steps"] == 30000
+    assert [row["row"] for row in ferminet["rows"]] == [
+        "ferminet-codebase-ferminet-seed0",
+        "ferminet-codebase-ferminet-seed1",
+        "ferminet-codebase-ferminet-seed2",
+    ]
+    assert [row["seed"] for row in psiformer["rows"]] == [0, 1, 2]
+    assert [row["gpu"] for row in ferminet["rows"]] == [0, 1, 2]
+    with pytest.raises(ValueError, match="allowlist"):
+        run_mode_spec("full-ferminet-50000")
+
+
+def test_producer_logged_config_checks_the_expected_row_seed():
+    """A row receipt must reject a producer dump carrying another row's seed."""
+
+    stderr = _good_logged_config()
+    with pytest.raises(ValueError, match="seed"):
+        parse_ferminet_logged_config(
+            stderr,
+            steps=1000,
+            expected_network_type="ferminet",
+            expected_seed=1,
+        )
+    config = parse_ferminet_logged_config(
+        stderr,
+        steps=1000,
+        expected_network_type="ferminet",
+        expected_seed=0,
+    )
+    assert config["seed"] == 0
+
+
+def test_three_row_gate_requires_every_named_full_run_row(tmp_path):
+    """One gate accounts for all three fixed full-run rows."""
+
+    root = tmp_path / "full"
+    root.mkdir()
+    rows = [f"ferminet-codebase-ferminet-seed{seed}" for seed in range(3)]
+    for row in rows:
+        (root / row).mkdir()
+        record(root / row / "receipt.json", row=row, returncode=0, producer_label="producer")
+    assert [entry["row"] for entry in gate(root, rows)["rows"]] == rows
+    (root / rows[-1] / "receipt.json").unlink()
+    with pytest.raises(RuntimeError, match=rows[-1]):
+        gate(root, rows)
 
 
 def test_producer_logged_config_rejects_truncated_dump_before_system_record():
@@ -325,7 +379,11 @@ def test_verify_submitter_has_complete_exported_control_surface():
     script = (Path(__file__).parent / "runbooks" / "h-atom-r1-verify-submit.sh").read_text(encoding="utf-8")
     assert 'success-mini) INJECT_FAIL=' in script
     assert 'fail-ferminet-ferminet) INJECT_FAIL=ferminet-codebase-ferminet-seed0' in script
+    assert 'success-full-ferminet) SELECTED_RUN_MODE=full-ferminet' in script
+    assert 'success-full-psiformer) SELECTED_RUN_MODE=full-psiformer' in script
+    assert 'fail-full-ferminet-seed1) SELECTED_RUN_MODE=full-ferminet' in script
     assert 'export BL_R1_MODE=verify BL_R1_VERIFY_STEPS=10' in script
+    assert 'export BL_R1_RUN_MODE="$SELECTED_RUN_MODE"' in script
     assert 'QSUB_VARIABLES=RUN_ROOT,SOURCE_CHECKOUT,RUNBOOK_COMMIT,SCIENCE,PRE_FREEZE_RECEIPT,PRE_FREEZE_RECEIPT_SHA256,PATCH_BLOB,BL_R1_MODE,BL_R1_VERIFY_STEPS' in script
     assert 'PATCH_BLOB experiments/baselines/runbooks/patches/ferminet-f4b1846c-walker-variance-logging.patch' in script
     assert 'BL_R1_VERIFY_INJECT_FAIL' in script
@@ -354,6 +412,17 @@ def test_pbs_uses_equals_boolean_overrides_and_producer_config_receipt():
     assert "--config.optim.reset_if_nan False" not in script
     assert "validate-ferminet-config --path \"$root/stderr.log\"" in script
     assert "resolved-config.json" not in script
+
+
+def test_pbs_uses_allowlisted_full_modes_and_row_expected_seed():
+    """The PBS launcher derives rows from fixed modes and checks each seed."""
+
+    script = (Path(__file__).parent / "runbooks" / "h-atom-r1-ramp.pbs").read_text()
+    assert 'mode-rows --mode "$RUN_MODE"' in script
+    assert 'mode-steps --mode "$RUN_MODE"' in script
+    assert '--config.debug.seed="$seed"' in script
+    assert '--expected-seed "$seed"' in script
+    assert 'mode-rows --mode "$RUN_MODE"' in script
 
 
 @pytest.mark.parametrize(
