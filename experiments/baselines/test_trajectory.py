@@ -2,6 +2,7 @@
 
 import csv
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,101 @@ def test_ferminet_keeps_ewvar_out_of_walker_variance(tmp_path: Path):
     assert summary["first_non_finite_step"] == 12
     assert summary["walker_variance_ratio_last_over_first"] is None
     assert "unavailable" in summary["walker_variance_unavailable_reason"]
+
+
+def test_ferminet_reads_walker_variance_and_summarizes_it(tmp_path: Path):
+    (tmp_path / ferminet.TRAIN_STATS_FILENAME).write_text(
+        "step,energy,ewmean,ewvar,pmove,walker_variance\n"
+        "10,-1.0,-1.0,0.25,0.5,4.0\n"
+        "11,-2.0,-1.5,0.16,0.5,1.0\n"
+        "12,-3.0,-1.8,0.09,0.5,0.25\n"
+        "13,-4.0,-2.0,0.04,0.5,0.0625\n",
+        encoding="utf-8",
+    )
+
+    rows = read_trajectory("ferminet", tmp_path)
+
+    assert [row.walker_local_energy_variance for row in rows] == [4.0, 1.0, 0.25, 0.0625]
+    assert [row.energy_time_ewvar for row in rows] == [0.25, 0.16, 0.09, 0.04]
+    summary = summarize(rows, window_fraction=0.5)
+    assert summary["walker_variance_first_window_mean"] == pytest.approx(2.5)
+    assert summary["walker_variance_last_window_mean"] == pytest.approx(0.15625)
+    assert summary["walker_variance_ratio_last_over_first"] == pytest.approx(0.0625)
+
+
+def test_ferminet_rejects_blank_walker_variance(tmp_path: Path):
+    (tmp_path / ferminet.TRAIN_STATS_FILENAME).write_text(
+        "step,energy,ewmean,ewvar,pmove,walker_variance\n"
+        "10,-1.0,-1.0,0.25,0.5,\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AdapterError, match="invalid trajectory values"):
+        read_trajectory("ferminet", tmp_path)
+
+
+def test_ferminet_marks_nan_walker_variance_non_finite(tmp_path: Path):
+    (tmp_path / ferminet.TRAIN_STATS_FILENAME).write_text(
+        "step,energy,ewmean,ewvar,pmove,walker_variance\n"
+        "10,-1.0,-1.0,0.25,0.5,nan\n",
+        encoding="utf-8",
+    )
+
+    rows = read_trajectory("ferminet", tmp_path)
+
+    assert math.isnan(rows[0].walker_local_energy_variance)
+    assert rows[0].finite is False
+    assert rows[0].energy_time_ewvar == 0.25
+
+
+@pytest.mark.parametrize("suffix", [",", ""])
+def test_energy_reader_ignores_missing_optional_variance(tmp_path: Path, suffix: str):
+    (tmp_path / ferminet.TRAIN_STATS_FILENAME).write_text(
+        "step,energy,ewmean,ewvar,pmove,walker_variance\n"
+        f"10,-1.0,-1.0,0.25,0.5{suffix}\n",
+        encoding="utf-8",
+    )
+
+    assert ferminet.read_energies(tmp_path) == [-1.0]
+
+
+def test_ferminet_rejects_only_truncated_variance_cell(tmp_path: Path):
+    (tmp_path / ferminet.TRAIN_STATS_FILENAME).write_text(
+        "step,energy,ewmean,ewvar,pmove,walker_variance\n"
+        "10,-1.0,-1.0,0.25,0.5\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AdapterError, match="invalid trajectory values"):
+        read_trajectory("ferminet", tmp_path)
+
+
+def test_ferminet_export_preserves_variance_and_source(tmp_path: Path):
+    source = tmp_path / ferminet.TRAIN_STATS_FILENAME
+    source.write_text(
+        "step,energy,ewmean,ewvar,pmove,walker_variance\n"
+        "10,-1.0,-1.0,0.25,0.5,4.0\n",
+        encoding="utf-8",
+    )
+    csv_path, json_path = tmp_path / "out.csv", tmp_path / "out.json"
+
+    assert main([
+        "--code", "ferminet", str(tmp_path),
+        "--out", str(csv_path), "--json", str(json_path),
+    ]) == 0
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        row, = list(csv.DictReader(handle))
+    assert float(row["walker_local_energy_variance"]) == 4.0
+    assert float(row["energy_time_ewvar"]) == 0.25
+    summary = json.loads(json_path.read_text(encoding="utf-8"))
+    for exported in (row, summary):
+        assert exported["source_code"] == "ferminet"
+        assert exported["source_file"] == str(source)
+        assert exported["step_basis"] == "optimizer_step"
+    assert summary["walker_variance_first_window_mean"] == 4.0
+    assert summary["energy_time_ewvar_first_window_mean"] == 0.25
+    assert summary["walker_variance_unavailable_reason"] is None
 
 
 def test_deepqmc_squares_std_and_cli_writes_requested_outputs(tmp_path: Path):
