@@ -11,10 +11,12 @@ import json
 import re
 import base64
 import binascii
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from experiments.baselines.systems import load_registry
 from experiments.toolkit.run_paths import resolve_run_dir
 
 SYSTEMS = ("hooke1", "he", "h2")
@@ -83,6 +85,17 @@ SYSTEM_SPECS = tuple(SystemSpec(name, system_id) for name, system_id in (
     ("he", "he_atom"),
     ("h2", "h2_molecule"),
 ))
+
+# Registry slots are execution labels; the operator identity is the physical
+# contract.  Keep this mapping explicit so a same-slot operator substitution
+# (for example HarmonicTrap under He's ``kinetic`` slot) cannot pass validation.
+_REGISTRY_OPERATOR_IDS = {
+    "kinetic": "tpen.physics:kinetic_energy",
+    "harmonic_trap": "tpen.physics:harmonic_trap",
+    "electron_nucleus": "tpen.physics:electron_nucleus_coulomb",
+    "electron_electron": "tpen.physics:electron_electron_coulomb",
+    "nucleus_nucleus": "tpen.physics:nucleus_nucleus_coulomb",
+}
 
 
 def _require_sha(value: object, *, length: int, field: str) -> str:
@@ -155,7 +168,7 @@ def stable_row_id(*, system: str, kind: str, lineage: int = 0,
         raise ProtocolError(f"unknown row coordinates: {system=} {kind=}")
     if min(lineage, checkpoint, stream) < 0:
         raise ProtocolError("row coordinates must be non-negative")
-    payload = json.dumps(["stage1/v2", system, kind, lineage, checkpoint, stream],
+    payload = json.dumps(["stage1/v3", system, kind, lineage, checkpoint, stream],
                          separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -276,6 +289,9 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
     else:
         expected.update({f"sampler.n_walkers={row['walkers']}",
                          f"trainer.max_steps={row['updates']}"})
+        if row.get("checkpoint_steps"):
+            steps = ",".join(str(step) for step in row["checkpoint_steps"])
+            expected.add(f"checkpoint_steps=[{steps}]")
     override_map: dict[str, str] = {}
     for override in overrides:
         key, separator, value = override.partition("=")
@@ -299,10 +315,96 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
     return row
 
 
+def physical_system_id_from_config(config_path: str | Path) -> str:
+    """Instantiate a Stage-1 eval config and return its descriptor content ID."""
+
+    from hydra.utils import instantiate
+    from tpen.run import load_config
+
+    cfg = load_config(str(config_path))
+    descriptor = instantiate(cfg.system_descriptor)
+    registry = load_registry()
+    entry = next((item for item in registry.get("systems", [])
+                  if item.get("id") == cfg.system.id), None)
+    if entry is None:
+        raise ProtocolError(f"system {cfg.system.id!r} is absent from the baseline registry")
+    particle = descriptor.particle
+    for key, actual in (("n_up", particle.n_spin_up),
+                        ("n_down", particle.n_spin_down),
+                        ("spatial_dim", particle.spatial_dim)):
+        if entry.get(key) != actual:
+            raise ProtocolError(f"descriptor {key} disagrees with registry for {cfg.system.id}")
+    if entry.get("n_up", 0) + entry.get("n_down", 0) != particle.n_electrons:
+        raise ProtocolError(f"descriptor particle count disagrees with registry for {cfg.system.id}")
+    registry_terms = entry.get("hamiltonian", {}).get("terms", [])
+    configured_names = {term.slot for term in descriptor.terms}
+    registry_names = {term.get("term") for term in registry_terms}
+    if configured_names != registry_names:
+        raise ProtocolError(f"descriptor operator set disagrees with registry for {cfg.system.id}")
+    descriptor_by_slot = {term.slot: term for term in descriptor.terms}
+    for registry_term in registry_terms:
+        slot = registry_term.get("term")
+        descriptor_term = descriptor_by_slot[slot]
+        expected_operator = _REGISTRY_OPERATOR_IDS.get(slot)
+        if expected_operator is None:
+            raise ProtocolError(f"registry has no operator identity for slot {slot!r}")
+        if str(descriptor_term.operator_id) != expected_operator:
+            raise ProtocolError(
+                f"descriptor operator for slot {slot!r} disagrees with registry "
+                f"for {cfg.system.id}"
+            )
+        if slot == "harmonic_trap" and descriptor_term.parameters.get("omega") != float(registry_term["omega"]):
+            raise ProtocolError(f"descriptor trap omega disagrees with registry for {cfg.system.id}")
+    expected_nuclei = [term for term in registry_terms if term.get("term") == "electron_nucleus"]
+    if expected_nuclei:
+        nuclei = expected_nuclei[0].get("nuclei", [])
+        resources = list(descriptor.resources.values())
+        if len(resources) != 1:
+            raise ProtocolError(f"descriptor nuclear resources disagree with registry for {cfg.system.id}")
+        resource = resources[0]
+        actual_positions = resource.positions.detach().cpu().tolist()
+        actual_charges = resource.charges.detach().cpu().tolist()
+        expected_positions = [list(n.get("position_bohr", [])) for n in nuclei]
+        expected_charges = []
+        for nucleus in nuclei:
+            charge = nucleus.get("charge")
+            if isinstance(charge, bool) or not isinstance(charge, int):
+                raise ProtocolError(
+                    f"registry nuclear charges must be integers for {cfg.system.id}"
+                )
+            expected_charges.append(charge)
+        # Registry positions are in bohr.  They are compared with an absolute
+        # tolerance because the instantiated default-float32 path can round a
+        # decimal coordinate by a few ulps; charges remain exact integers.
+        position_match = (
+            len(actual_positions) == len(expected_positions)
+            and all(
+                len(actual) == len(expected)
+                and all(math.isclose(float(a), float(e), rel_tol=0.0, abs_tol=1.0e-6)
+                        for a, e in zip(actual, expected))
+                for actual, expected in zip(actual_positions, expected_positions)
+            )
+        )
+        charge_match = (
+            len(actual_charges) == len(expected_charges)
+            and all(float(a) == e
+                    for a, e in zip(actual_charges, expected_charges))
+        )
+        if not position_match or not charge_match:
+            raise ProtocolError(f"descriptor nuclear geometry disagrees with registry for {cfg.system.id}")
+    elif any(term.resource is not None for term in descriptor.terms):
+        raise ProtocolError(f"descriptor has an unexpected nuclear resource for {cfg.system.id}")
+    system_id = descriptor.system_id()
+    if not isinstance(system_id, str) or not _SHA256.fullmatch(system_id):
+        raise ProtocolError("configured system descriptor did not produce a SHA-256 ID")
+    return system_id
+
+
 def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
                    checkpoints: list[int], lineage_seeds: list[int],
                    checkpoint_sha256: Mapping[tuple[str, int, int], str],
-                   results_root: str) -> list[dict[str, Any]]:
+                   results_root: str,
+                   expected_physical_system_id: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
     """Expand systems into validated smoke, train, and eval rows.
 
     Parameters are explicit rather than defaulted so a missing identity or
@@ -313,6 +415,16 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
     source_sha = _require_sha(source_sha, length=40, field="source_sha")
     config_sha256 = _require_sha(config_sha256, length=64, field="config_sha256")
     root = _safe_results_root(results_root)
+    physical_ids = dict(expected_physical_system_id or {})
+    if not physical_ids:
+        config_root = Path(__file__).parent / "configs"
+        physical_ids = {
+            name: physical_system_id_from_config(config_root / name / "eval.yaml")
+            for name in SYSTEMS
+        }
+    for name in SYSTEMS:
+        _require_sha(physical_ids.get(name), length=64,
+                     field=f"expected_physical_system_id[{name!r}]")
     if len(lineage_seeds) != protocol.lineages or len(set(lineage_seeds)) != len(lineage_seeds):
         raise ProtocolError("lineage_seeds must contain one distinct seed per lineage")
     if not checkpoints or any(step <= 0 for step in checkpoints):
@@ -349,6 +461,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
                 "run_id": f"train-lineage-{lineage}",
                 "updates": protocol.lineage_updates,
                 "walkers": protocol.lineage_walkers,
+                "checkpoint_steps": list(checkpoints),
             })
             train_row = rows[-1]
             for checkpoint in checkpoints:
@@ -375,6 +488,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
                         "walkers": protocol.eval_walkers, "draws": protocol.eval_draws,
                         "source_sha": source_sha, "config_sha256": config_sha256,
                         "config": f"configs/{spec.name}/eval.yaml", "results_root": root,
+                        "expected_physical_system_id": physical_ids[spec.name],
                         "experiment_name": "stage1", "sector": spec.name, "run_id": eval_id,
                         "checkpoint_dir": str(checkpoint_dir), "checkpoint_file": str(checkpoint_file),
                         "checkpoint_sha256": checkpoint_digest, "depends_on": train_id,

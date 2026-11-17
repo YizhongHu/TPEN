@@ -85,6 +85,8 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
     does not carry it.
     """
     document = _load(manifest)
+    if document.get("schema") != "stage1/v3":
+        raise CollectionError("unsupported manifest schema; expected stage1/v3")
     rows = document.get("rows")
     if not isinstance(rows, list):
         raise CollectionError("manifest rows must be a list")
@@ -131,6 +133,12 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
             physical_system_id = record.system_id
             if not isinstance(physical_system_id, str) or not physical_system_id.strip():
                 raise CollectionError(f"row {row_id}: physical system identity is absent")
+            expected_physical = row.get("expected_physical_system_id")
+            if physical_system_id != expected_physical:
+                raise CollectionError(
+                    f"row {row_id}: observed physical system identity does not match "
+                    "manifest expected_physical_system_id"
+                )
             registry_system_id = row.get("system_id")
             previous_physical = registry_to_physical.get(registry_system_id)
             if previous_physical is not None and previous_physical != physical_system_id:
@@ -182,6 +190,7 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
             "run_dir": str(run_dir),
             "identity": {"record_content_id": record.record_content_id,
                          "physical_system_id": physical_system_id,
+                         "expected_physical_system_id": expected_physical,
                          "csv_sha256": record.csv_sha256,
                          "checkpoint_sha256": record.checkpoint_sha256,
                          "resolved_config_identity": record.resolved_config_identity},

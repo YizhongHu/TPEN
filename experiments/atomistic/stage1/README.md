@@ -1,8 +1,7 @@
 # Stage 1 shared protocol and launch surface
 
-This directory owns the system-neutral Stage 1 manifest and guarded Cannon
-launcher. It does not collect trajectory records and does not contain the
-Hooke, He, or H2 system configs; those are separate S1 slices.
+This directory owns the Stage 1 manifest, guarded Cannon launcher, and the
+science-default Hooke-1e, He, and H2 train/eval configs.
 
 Every manifest row carries the exact source SHA, the planned config SHA256, an
 external results root, and the TPEN run identity (`experiment_name`, `sector`,
@@ -15,6 +14,45 @@ protocol layer does not fabricate one. Evaluation launches bind
 records checkpoint provenance. S1-A3 system
 eval configs must define a `trajectory_identity` block with `checkpoint_file`
 for this override to be accepted by Hydra.
+
+Each evaluation config builds one `SystemDescriptor` from its instantiated
+`ParticleSpec` and `hamiltonian_terms`, and passes that descriptor plus an
+explicit `NaiveLocalEnergyEvaluator` to `TrajectoryMCMCGenerator`. The
+descriptor content ID is computed during planning and stored as
+`expected_physical_system_id` in every v3 eval row. Collection refuses a
+record whose observed ID differs from that value; registry IDs are only a
+cross-check, never the source of the physical hash.
+
+Known deviations from the source studies are the shared Stage-1 defaults:
+four channels/one layer, CPU device, 256 train walkers, 4096 eval walkers,
+and 256 retained draws. Run-slice overrides may select approved science
+budgets. The one-electron Hooke route uses the h-v2-style one-electron model
+at four channels/one layer and adds the required fixed GaussianConfinement
+with alpha=0.25 (omega/2); it has no electron-electron cusp. He retains the
+he-v1 trainable electron-electron ranges, curvature cusp (coefficient 0.01,
+range 1.0), and trainable Pfaffian readout. H2 follows h2-v1's two-electron
+cusp/readout route and retains its width, while using the shared Stage-1
+walker defaults. H2 retains the two-center R=1.4-bohr geometry, and He
+retains the two-electron Coulomb Hamiltonian. No Hooke pair config is
+included. Train checkpoint callbacks use ExplicitUpdates through the declared
+top-level `checkpoint_steps`; launch overrides bind that parameter to exactly
+the manifest row's planned checkpoint steps.
+
+The following table records every retained source-to-Stage-1 deviation and
+its reason. Lengths are in bohr where stated; callback frequencies are
+training updates.
+
+| System / surface | Source value | Stage-1 value | Reason |
+| --- | --- | --- | --- |
+| Hooke-1e readout | h-v2: Pfaffian readout `trainable: true` | `trainable: false` in train and eval | Deliberate one-electron Stage-1 default; the Gaussian confinement remains the fixed envelope and the train/eval model stays strict-restore compatible. |
+| Hooke-1e eval sampler | h-v2: 1024 walkers, burn-in 1000, steps 20 | 4096 walkers, burn-in 100, steps 10 | Use the shared Stage-1 evaluation budget and cadence; this is a protocol default, not a claim that the source burn-in study transfers unchanged. |
+| He eval sampler | he-v1: 4096 walkers, burn-in 100, steps 20 | 4096 walkers, burn-in 100, steps 10 | Keep the shared Stage-1 cadence; the he-v1 stride-20 tie-break is not silently carried into this protocol. |
+| H2 model width | h2-v1: 4 output / 16 hidden channels | 4 output / 16 hidden channels | No width change is made; this row documents the retained source value and corrects the prior “width reduction” wording. |
+| H2 train/eval walkers | h2-v1: 128 train / 1024 eval | 256 train / 4096 eval | Use the shared Stage-1 train/eval walker defaults across all three systems. |
+| Hooke-1e train observability | h-v2: `DataIntegrity`/`GradientStats` every 100 updates; JSONL logger | Both callbacks and logger omitted | Keep the science-default config small and portable; Stage-1 collection relies on its run/record provenance contract. |
+| He train observability | he-v1: `DataIntegrity` every 1, `GradientStats` every 5; CSV and JSONL loggers | Both callbacks and both loggers omitted | Same bounded Stage-1 config surface; these diagnostics are outside the Stage-1 manifest contract. |
+| H2 train observability | h2-v1: `DataIntegrity` every 1, `GradientStats` every 5; CSV and JSONL loggers | Both callbacks and both loggers omitted | Same bounded Stage-1 config surface; these diagnostics are outside the Stage-1 manifest contract. |
+| Evaluation loggers | h-v2, he-v1, and h2-v1 each write CSV/JSONL or JSONL metrics | No metric logger in the Stage-1 eval configs | Stage-1 evaluation retains trajectory records and summaries as its required evidence; study-specific metric logging is not part of this layer. |
 
 `plan.py` writes a manifest only. `launch.py` renders a script only; submission
 is an explicit operator action. The generated script requires Slurm, checks the

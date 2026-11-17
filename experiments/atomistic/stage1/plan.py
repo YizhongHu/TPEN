@@ -6,7 +6,9 @@ import argparse
 import json
 from pathlib import Path
 
-from experiments.atomistic.stage1.protocol import STAGE1_PROTOCOL, build_manifest, manifest_hash
+from experiments.atomistic.stage1.protocol import (
+    STAGE1_PROTOCOL, build_manifest, manifest_hash, physical_system_id_from_config,
+)
 
 
 def main() -> int:
@@ -27,12 +29,18 @@ def main() -> int:
     for key, digest in raw.items():
         system, lineage, checkpoint = key.split(":")
         bindings[(system, int(lineage), int(checkpoint))] = digest
+    config_root = Path(__file__).parent / "configs"
+    expected_ids = {
+        name: physical_system_id_from_config(config_root / name / "eval.yaml")
+        for name in ("hooke1", "he", "h2")
+    }
     rows = build_manifest(protocol=STAGE1_PROTOCOL, source_sha=args.source_sha,
                           config_sha256=args.config_sha256, checkpoints=args.checkpoints,
                           lineage_seeds=args.lineage_seeds,
-                          checkpoint_sha256=bindings, results_root=args.results_root)
+                          checkpoint_sha256=bindings, results_root=args.results_root,
+                          expected_physical_system_id=expected_ids)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps({"schema": "stage1/v2", "manifest_hash": manifest_hash(rows),
+    args.output.write_text(json.dumps({"schema": "stage1/v3", "manifest_hash": manifest_hash(rows),
                                        "rows": rows}, indent=2) + "\n", encoding="utf-8")
     return 0
 
