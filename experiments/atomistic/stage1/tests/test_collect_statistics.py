@@ -1,5 +1,7 @@
 """Hand-computable collector statistics and join guards."""
 
+import hashlib
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -274,13 +276,67 @@ def test_join_guards_refuse_invalid_record(monkeypatch, tmp_path: Path, changes,
         collector.collect(_install_single_fake(monkeypatch, tmp_path, **changes))
 
 
-@pytest.mark.parametrize("changes", [
-    pytest.param({"mean": 2.6}, id="mean"),
-    pytest.param({"variance": 1.5}, id="variance"),
-])
-def test_inspection_statistics_must_reconcile_with_grid(monkeypatch, tmp_path: Path, changes) -> None:
-    with pytest.raises(collector.CollectionError, match="do not reconcile"):
-        collector.collect(_install_single_fake(monkeypatch, tmp_path, **changes))
+def test_writer_statistics_are_forwarded_without_reducing_again(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A realistic grid may round differently from the writer's reduction tree."""
+    document = _manifest(tmp_path, streams=1)
+    values = [
+        [0.75 + ((draw * 64 + walker) % 17 - 8) * 1.0e-5 for walker in range(64)]
+        for draw in range(4)
+    ]
+    draw_sums = [sum(draw) for draw in values]
+    draw_square_sums = [sum(value * value for value in draw) for draw in values]
+    total = sum(draw_sums)
+    total_square = sum(draw_square_sums)
+    collector_mean = total / 256
+    collector_variance = total_square / 256 - collector_mean * collector_mean
+    writer_mean = math.nextafter(collector_mean, math.inf)
+    writer_variance = math.nextafter(collector_variance, math.inf)
+    _install_single_fake(
+        monkeypatch,
+        tmp_path,
+        mean=writer_mean,
+        variance=writer_variance,
+    )
+    monkeypatch.setattr(collector, "read_energy_grid", lambda record: values)
+    result = collector.collect(document)
+    stats = result["records"][0]["statistics"]
+    assert stats["mean"] == writer_mean
+    assert stats["variance"] == writer_variance
+
+
+def test_tampered_csv_is_refused_after_inspection(monkeypatch, tmp_path: Path) -> None:
+    """A post-inspection energy edit remains fail-closed at the reader boundary."""
+    document = _manifest(tmp_path, streams=1)
+    csv_path = tmp_path / "values.csv"
+    csv_path.write_text(
+        "draw_index,walker_index,local_energy\n"
+        "0,0,1.0\n0,1,2.0\n1,0,3.0\n1,1,4.0\n",
+        encoding="utf-8",
+    )
+    identity = {"schema": "tpen-config-identity-v1", "sha256": "b" * 64}
+    record = SimpleNamespace(
+        record_schema="trajectory_records/v2", draw_count=2, walker_count=2,
+        row_count=4, finite_count=4, mean=2.5, variance=1.25,
+        csv_sha256=hashlib.sha256(csv_path.read_bytes()).hexdigest(),
+        path=csv_path, system_id="he_atom", execution_method_id="method",
+        resolved_config_identity=identity, model_provenance="checkpoint",
+        checkpoint_sha256="c" * 64, record_content_id="e" * 64,
+    )
+    monkeypatch.setattr(collector, "inspect_eval_run", lambda path: {
+        "verdict": "completed", "resolved_config_identity": identity,
+        "source_git_sha": "a" * 40,
+    })
+    monkeypatch.setattr(collector, "_record_path", lambda path: path / "m.json")
+
+    def inspect_and_tamper(path, **kwargs):
+        csv_path.write_text(csv_path.read_text(encoding="utf-8").replace("1.0", "9.0"), encoding="utf-8")
+        return record
+
+    monkeypatch.setattr(collector, "inspect_trajectory_record", inspect_and_tamper)
+    with pytest.raises(collector.CollectionError, match="changed after inspection"):
+        collector.collect(document)
 
 
 def test_missing_record_is_refused(monkeypatch, tmp_path: Path) -> None:
