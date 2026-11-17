@@ -103,7 +103,7 @@ def _validate_gpu_resources(*, cpus_per_task: int | None, mem: str | None,
         raise ValueError("mem must be a positive GiB value such as 64G")
     if int(mem[:-1]) > _MAX_MEMORY_GIB:
         raise ValueError(f"mem must be at most {_MAX_MEMORY_GIB}G")
-    match = re.fullmatch(r"([0-9]{2}):([0-5][0-9]):([0-5][0-9])", str(time))
+    match = re.fullmatch(r"([0-9]{2,3}):([0-5][0-9]):([0-5][0-9])", str(time))
     if match is None:
         raise ValueError("time must use HH:MM:SS")
     hours, minutes, seconds = (int(value) for value in match.groups())
@@ -113,15 +113,18 @@ def _validate_gpu_resources(*, cpus_per_task: int | None, mem: str | None,
     return cpus_per_task, mem, str(time)
 
 
-def _gpu_guard() -> str:
+def _gpu_guard(python: str) -> str:
     """Return the in-job A100/non-MIG admission guard."""
 
     return '''
-GPU_INFO="$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits)"
+if ! GPU_INFO="$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits)"; then
+  echo "STAGE1_GUARD nvidia-smi management query failed" >&2
+  exit 2
+fi
 printf 'STAGE1_GUARD nvidia-smi=%s\\n' "$GPU_INFO"
 GPU_COUNT="$(printf '%s\\n' "$GPU_INFO" | awk 'NF { count++ } END { print count + 0 }')"
 if [[ "$GPU_COUNT" != "1" ]]; then
-  echo "STAGE1_GUARD expected exactly one visible GPU, got $GPU_COUNT" >&2
+  echo "STAGE1_GUARD expected exactly one management GPU, got $GPU_COUNT" >&2
   exit 2
 fi
 GPU_NAME="${GPU_INFO%%,*}"
@@ -135,7 +138,24 @@ if [[ "$GPU_MEMORY" != "81920" ]]; then
   echo "STAGE1_GUARD expected 81920 MiB, got $GPU_MEMORY" >&2
   exit 2
 fi
-'''
+if ! MIG_MODE="$(nvidia-smi --query-gpu=mig.mode.current --format=csv,noheader)"; then
+  echo "STAGE1_GUARD nvidia-smi MIG-mode query failed" >&2
+  exit 2
+fi
+MIG_MODE="$(printf '%s' "$MIG_MODE" | tr -d '[:space:]')"
+if [[ "$MIG_MODE" != "Disabled" ]]; then
+  echo "STAGE1_GUARD expected MIG mode Disabled, got $MIG_MODE" >&2
+  exit 2
+fi
+if ! CUDA_DEVICE_COUNT="$(__GPU_PYTHON__ -c 'import torch; print(torch.cuda.device_count())')"; then
+  echo "STAGE1_GUARD CUDA device-count probe failed" >&2
+  exit 2
+fi
+if [[ ! "$CUDA_DEVICE_COUNT" =~ ^[0-9]+$ || "$CUDA_DEVICE_COUNT" != "1" ]]; then
+  echo "STAGE1_GUARD expected exactly one CUDA device, got $CUDA_DEVICE_COUNT" >&2
+  exit 2
+fi
+'''.replace("__GPU_PYTHON__", shlex.quote(python))
 
 
 def command_for_row(row: Mapping[str, Any], *, python: str, driver: str) -> str:
@@ -244,7 +264,7 @@ def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
             '  echo "STAGE1_GUARD partition delivered=$SLURM_JOB_PARTITION requested=$REQUESTED_PARTITION" >&2\n'
             '  exit 2\nfi\n',
         )
-        template = template.replace('SCRATCH_BASE=', _gpu_guard() + 'SCRATCH_BASE=', 1)
+        template = template.replace('SCRATCH_BASE=', _gpu_guard(python) + 'SCRATCH_BASE=', 1)
     for marker, value in {
         "__PARTITION__": partition,
         "__RESULTS_ROOT__": results_root,
