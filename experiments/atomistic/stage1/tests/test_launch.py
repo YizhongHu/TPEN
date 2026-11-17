@@ -60,7 +60,7 @@ def test_render_fails_for_unapproved_partition_or_results_root() -> None:
     with pytest.raises(ValueError, match="partition"):
         render(row=ROW, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
                results_root="/n/netscratch/kozinsky_lab/Lab/rhu/stage1",
-               partition="gpu", scratch_base="/tmp/stage1")
+               partition="not-a-partition", scratch_base="/tmp/stage1")
     with pytest.raises(ValueError, match="Netscratch"):
         render(row=ROW, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
                results_root="/tmp/stage1", scratch_base="/tmp/stage1")
