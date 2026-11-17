@@ -60,7 +60,7 @@ def test_producer_logged_config_rejects_real_pbs_7857872_fixture():
 
     stderr = (Path(__file__).parent / "testdata" / "ferminet-stderr-pbs7857872-config.log").read_text()
     with pytest.raises(ValueError, match="reset_if_nan"):
-        parse_ferminet_logged_config(stderr, steps=1000)
+        parse_ferminet_logged_config(stderr, steps=1000, expected_network_type="ferminet")
 
 
 def test_producer_logged_config_accepts_same_dump_when_boolean_is_false():
@@ -76,6 +76,12 @@ def test_producer_logged_config_accepts_same_dump_when_boolean_is_false():
     assert config["batch_size"] == 4096
     assert config["iterations"] == 1000
     assert config["pretrain_iterations"] == 0
+    assert config["network_type"] == "ferminet"
+    assert config["nucleus_count"] == 1
+    assert config["nucleus_atomic_number"] == 1
+    assert config["nucleus_charge"] == 1.0
+    assert config["nucleus_coords"] == [0.0, 0.0, 0.0]
+    assert config["electrons"] == [1, 0]
 
 
 def test_producer_logged_config_rejects_truncated_dump_before_system_record():

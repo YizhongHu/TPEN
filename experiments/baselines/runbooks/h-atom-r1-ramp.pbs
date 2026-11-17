@@ -102,7 +102,7 @@ launch_fn() {
     assert_one_gpu "$FN_PY" "$root/backend.json"
     date --iso-8601=seconds > "$root/start.txt"
     PYTHONPATH="$FN_SRC${PYTHONPATH:+:$PYTHONPATH}" "$FN_PY" "$FN_SRC/ferminet/main.py" --config "$SOURCE_CHECKOUT/experiments/baselines/runbooks/configs/ferminet_h_atom.py" --config.batch_size=4096 --config.optim.iterations="$STEPS" --config.network.network_type="$ansatz" --config.network.determinants=16 --config.debug.deterministic=True --config.debug.seed=0 --config.debug.check_nan=True --config.optim.reset_if_nan=False --config.pretrain.iterations=0 --config.log.save_path="$root"
-    "$FN_PY" "$RECEIPT_HELPER" validate-ferminet-config --path "$root/stderr.log" --steps "$STEPS" --output "$root/producer-config.json"
+    "$FN_PY" "$RECEIPT_HELPER" validate-ferminet-config --path "$root/stderr.log" --steps "$STEPS" --expected-network-type "$ansatz" --output "$root/producer-config.json"
     date --iso-8601=seconds > "$root/end.txt"
     "$FN_PY" "$RECEIPT_HELPER" validate-ferminet-trace --path "$root/train_stats.csv" --steps "$STEPS"
     maybe_inject_failure "$row"

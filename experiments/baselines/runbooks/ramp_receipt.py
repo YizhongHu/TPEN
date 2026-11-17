@@ -74,7 +74,7 @@ def gate(root: Path, expected_rows: Sequence[str]) -> dict[str, object]:
 _FERMINET_TRACE_COLUMNS = ("step", "energy", "ewmean", "ewvar", "pmove", "walker_variance")
 
 
-def parse_ferminet_logged_config(stderr: str, *, steps: int) -> dict[str, object]:
+def parse_ferminet_logged_config(stderr: str, *, steps: int, expected_network_type: str) -> dict[str, object]:
     """Parse and validate the config FermiNet printed before training.
 
     FermiNet's ``main.py`` logs ``FLAGS.config`` immediately before calling
@@ -84,38 +84,109 @@ def parse_ferminet_logged_config(stderr: str, *, steps: int) -> dict[str, object
 
     if steps < 1:
         raise ValueError("steps must be positive")
-    marker = "System config:"
-    try:
-        block = stderr.split(marker, 1)[1].split("\n\nI", 1)[0]
-    except IndexError as exc:
-        raise ValueError("producer log has no FermiNet System config dump") from exc
+    if not expected_network_type:
+        raise ValueError("expected_network_type must be non-empty")
+    markers = list(re.finditer(r"(?m)^.*System config:\s*$", stderr))
+    if len(markers) != 1:
+        raise ValueError(f"expected one complete FermiNet System config record, found {len(markers)}")
+    start = markers[0].end()
+    next_record = re.search(r"(?m)^I\d{4} .*?\n", stderr[start:])
+    block = stderr[start : start + next_record.start() if next_record else len(stderr)]
+    if not block.strip():
+        raise ValueError("producer System config record is truncated")
 
-    values: dict[str, object] = {}
-    section: str | None = None
+    # Parse only primitive values and list entries required by the receipt.  In
+    # particular, never hand the producer's python-tagged YAML to an object
+    # constructor or a general-purpose YAML loader.
     scalar = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z_]+):(?: (?P<value>.*))?$")
+    values: dict[str, object] = {}
+    seen: set[str] = set()
+    section: str | None = None
+    subsection: str | None = None
+    in_molecule = False
+    molecule_count = 0
+    coords: list[float] = []
+    electrons: list[int] = []
+
+    def parse_scalar(raw: str) -> object:
+        if raw == "true":
+            return True
+        if raw == "false":
+            return False
+        if re.fullmatch(r"[+-]?\d+", raw):
+            return int(raw)
+        if re.fullmatch(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?", raw):
+            return float(raw)
+        return raw.strip("'")
+
+    def add(path: str, value: object) -> None:
+        if path in seen:
+            raise ValueError(f"duplicate producer config path: {path}")
+        seen.add(path)
+        values[path] = value
+
     for line in block.splitlines():
         match = scalar.match(line)
-        if not match:
-            continue
-        indent = len(match.group("indent"))
-        key, raw = match.group("key"), match.group("value") or ""
-        if indent == 0:
-            section = key
-        elif indent == 2 and section in {"debug", "optim", "pretrain"}:
-            if raw == "true":
-                value: object = True
-            elif raw == "false":
-                value = False
-            elif re.fullmatch(r"[+-]?\d+", raw):
-                value = int(raw)
-            else:
-                value = raw
-            values[f"{section}_{key}" if section != "optim" or key != "iterations" else "iterations"] = value
-
-    if "batch_size" not in values:
-        match = re.search(r"(?m)^batch_size: (\d+)$", block)
         if match:
-            values["batch_size"] = int(match.group(1))
+            indent = len(match.group("indent"))
+            key, raw = match.group("key"), match.group("value") or ""
+            if indent == 0:
+                section, subsection, in_molecule = key, None, False
+                if key == "batch_size" and raw:
+                    add("batch_size", parse_scalar(raw))
+            elif indent == 2:
+                subsection = key
+                in_molecule = section == "system" and key == "molecule"
+                if section in {"debug", "optim", "pretrain", "network"}:
+                    add(f"{section}.{key}", parse_scalar(raw))
+                elif section == "system" and key in {"charge", "electrons", "molecule"}:
+                    if raw and key != "electrons":
+                        add(f"system.{key}", parse_scalar(raw))
+            elif indent == 4 and section == "system" and in_molecule and key in {"atomic_number", "charge", "coords"}:
+                if key == "coords":
+                    subsection = "coords"
+                add(f"system.molecule.{key}", parse_scalar(raw) if key != "coords" else raw)
+            elif indent == 4 and section == "system" and in_molecule and key == "symbol":
+                add("system.molecule.symbol", parse_scalar(raw))
+            continue
+        if section == "system" and subsection == "electrons" and line.startswith("  - "):
+            electrons.append(int(line[4:]))
+        elif section == "system" and in_molecule and subsection == "coords" and line.startswith("    - "):
+            coords.append(float(line[6:]))
+        elif section == "system" and subsection == "molecule" and line.startswith("  - "):
+            molecule_count += 1
+
+    add("system.electrons", tuple(electrons))
+    add("system.molecule.coords_values", tuple(coords))
+    if molecule_count != 1:
+        raise ValueError(f"incomplete system record: expected one nucleus, found {molecule_count}")
+    required_paths = {
+        "batch_size": "batch_size",
+        "debug.check_nan": "debug_check_nan",
+        "debug.deterministic": "debug_deterministic",
+        "debug.seed": "debug_seed",
+        "optim.iterations": "iterations",
+        "optim.reset_if_nan": "optim_reset_if_nan",
+        "pretrain.iterations": "pretrain_iterations",
+        "network.network_type": "network_type",
+        "system.charge": "system_charge",
+        "system.molecule.atomic_number": "atomic_number",
+        "system.molecule.charge": "nucleus_charge",
+        "system.molecule.coords": "system.molecule.coords",
+    }
+    missing = sorted(path for path in required_paths if path not in seen)
+    if missing:
+        raise ValueError(f"incomplete producer config record: missing={missing!r}")
+    if len(electrons) != 2:
+        raise ValueError(f"producer system electrons record is incomplete: {tuple(electrons)!r}")
+    if tuple(coords) != (0.0, 0.0, 0.0):
+        raise ValueError(f"producer nucleus origin={tuple(coords)!r}, expected (0.0, 0.0, 0.0)")
+    if tuple(electrons) != (1, 0):
+        raise ValueError(f"producer system electrons={tuple(electrons)!r}, expected (1, 0)")
+    if values["system.charge"] != 0 or values["system.molecule.atomic_number"] != 1 or values["system.molecule.charge"] != 1.0:
+        raise ValueError("producer nucleus identity is not one H nucleus with charge 1")
+    if values["network.network_type"] != expected_network_type:
+        raise ValueError(f"producer network_type={values['network.network_type']!r}, expected {expected_network_type!r}")
     expected = {
         "reset_if_nan": False,
         "check_nan": True,
@@ -125,11 +196,21 @@ def parse_ferminet_logged_config(stderr: str, *, steps: int) -> dict[str, object
         "iterations": steps,
         "pretrain_iterations": 0,
     }
-    aliases = {"reset_if_nan": "optim_reset_if_nan", "check_nan": "debug_check_nan", "deterministic": "debug_deterministic", "seed": "debug_seed"}
+    aliases = {"reset_if_nan": "optim.reset_if_nan", "check_nan": "debug.check_nan", "deterministic": "debug.deterministic", "seed": "debug.seed", "iterations": "optim.iterations", "pretrain_iterations": "pretrain.iterations", "network_type": "network.network_type"}
     observed = {key: values.get(aliases.get(key, key)) for key in expected}
     for key, wanted in expected.items():
         if observed[key] != wanted:
             raise ValueError(f"producer config {key}={observed[key]!r}, expected {wanted!r}")
+    observed.update(
+        {
+            "network_type": values["network.network_type"],
+            "nucleus_count": molecule_count,
+            "nucleus_atomic_number": values["system.molecule.atomic_number"],
+            "nucleus_charge": values["system.molecule.charge"],
+            "nucleus_coords": list(coords),
+            "electrons": list(electrons),
+        }
+    )
     return observed
 
 
@@ -262,6 +343,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     config_parser = subparsers.add_parser("validate-ferminet-config")
     config_parser.add_argument("--path", type=Path, required=True)
     config_parser.add_argument("--steps", type=int, required=True)
+    config_parser.add_argument("--expected-network-type", required=True)
     config_parser.add_argument("--output", type=Path, required=True)
     inventory_parser = subparsers.add_parser("inventory")
     inventory_parser.add_argument("--root", type=Path, required=True)
@@ -280,7 +362,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "validate-ferminet-trace":
             print(json.dumps(validate_ferminet_trace(args.path, steps=args.steps), sort_keys=True))
         elif args.command == "validate-ferminet-config":
-            result = parse_ferminet_logged_config(args.path.read_text(encoding="utf-8"), steps=args.steps)
+            result = parse_ferminet_logged_config(args.path.read_text(encoding="utf-8"), steps=args.steps, expected_network_type=args.expected_network_type)
             args.output.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
             print(json.dumps(result, sort_keys=True))
         elif args.command == "inventory":
