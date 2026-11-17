@@ -64,6 +64,27 @@ training updates.
 `plan.py` writes a manifest only. `launch.py` renders a script only; submission
 is an explicit operator action. The generated script requires Slurm, checks the
 delivered partition, uses node-local per-job scratch, and records job identity.
+The supported submission directory is the repository root. When `render` is
+called with the repository-relative driver path, it emits commands of this
+form, with the row's relative config preserved:
+
+```text
+/absolute/path/to/python experiments/atomistic/stage1/train.py --config configs/he/train.yaml --kind smoke <row overrides> --binding <row token>
+```
+
+The Stage-1 drivers resolve relative configs against this directory, not the
+process cwd. An absolute `--config` path is accepted when it names the same
+bound config. The eval driver emits the corresponding
+`experiments/atomistic/stage1/eval.py --config configs/<system>/eval.yaml`
+command and its strict-checkpoint arguments.
+
+Smoke rows use the same `configs/<system>/train.yaml` files as train rows. Their
+smoke-ness is only the bounded budget supplied by `launch.row_overrides`:
+`sampler.n_walkers`, `trainer.max_steps`, and `checkpoint_steps` are set from
+the manifest row, with the final checkpoint at `smoke_updates`. A smoke checks
+that the launch path, gateway, real train config, and final checkpoint can run
+to `COMPLETE` at the planned cluster directory. It does not measure energy
+accuracy and does not run evaluation or collection.
 
 The real-producer integration test is marked `stage1_real_producer` and remains
 in default collection. Mutant packets select their test paths explicitly so
