@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import shlex
 import subprocess
 import sys
@@ -57,18 +58,44 @@ def _row(kind: str) -> dict[str, object]:
     return row
 
 
-def _rendered_argv(row: dict[str, object], driver: str, tmp_path: Path) -> list[str]:
+def _rendered_argv(
+    row: dict[str, object], driver: str, tmp_path: Path, checkout_root: Path,
+) -> list[str]:
     """Extract the command that launch.render places in the sbatch script."""
 
     script = render(
         row=row,
         driver=driver,
         python=sys.executable,
+        checkout_root=str(checkout_root),
         head_sha=str(row["source_sha"]),
         results_root=RESULTS_ROOT,
         scratch_base=str(tmp_path / "scratch"),
     )
     return shlex.split(script.splitlines()[-1])
+
+
+def _make_probe_checkout(source: Path, destination: Path, marker: str) -> Path:
+    """Make a light checkout containing the real drivers and protocol imports."""
+
+    for relative in (
+        Path("experiments/atomistic/stage1"),
+        Path("experiments/baselines"),
+        Path("experiments/toolkit"),
+    ):
+        shutil.copytree(source / relative, destination / relative)
+    (destination / "tpen").mkdir(parents=True)
+    (destination / "tpen/__init__.py").write_text("")
+    (destination / "tpen/run.py").write_text(
+        "def load_config(*args, **kwargs):\n    return None\n"
+        "def run_from_config(*args, **kwargs):\n    return 0\n"
+    )
+    protocol = destination / "experiments/atomistic/stage1/protocol.py"
+    protocol.write_text(
+        protocol.read_text()
+        + f"\nprint('STAGE1_PROTOCOL_ORIGIN={marker}:' + __file__)\n"
+    )
+    return destination
 
 
 @pytest.mark.parametrize(
@@ -80,21 +107,40 @@ def _rendered_argv(row: dict[str, object], driver: str, tmp_path: Path) -> list[
     ],
 )
 def test_rendered_driver_imports_experiments_outside_checkout(
-    kind: str, driver: str, tmp_path: Path,
+    kind: str, driver: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The real rendered command imports its source package from any cwd."""
+    """The selected execution checkout owns the driver and protocol import."""
 
-    argv = _rendered_argv(_row(kind), driver, tmp_path)
+    checkout_a = _make_probe_checkout(REPO_ROOT, tmp_path / "checkout-a", "A")
+    checkout_b = _make_probe_checkout(REPO_ROOT, tmp_path / "checkout-b", "B")
+    monkeypatch.chdir(checkout_a)
+    monkeypatch.setattr(sys, "path", [str(checkout_a), *sys.path])
+    argv = _rendered_argv(_row(kind), driver, tmp_path, checkout_b)
     result = subprocess.run(
         [*argv, "--help"],
-        cwd=tmp_path,
+        cwd=checkout_a,
         env={"PATH": os.environ["PATH"]},
         capture_output=True,
         text=True,
     )
     assert result.returncode == 0, result.stderr
     assert "usage:" in result.stdout
-    assert argv[1] == str(REPO_ROOT / driver)
+    assert argv[1] == str(checkout_b / driver)
+    assert f"STAGE1_PROTOCOL_ORIGIN=B:{checkout_b}" in result.stdout
+
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    control_argv = _rendered_argv(_row(kind), driver, tmp_path, checkout_a)
+    control = subprocess.run(
+        [*control_argv, "--help"],
+        cwd=unrelated,
+        env={"PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+    )
+    assert control.returncode == 0, control.stderr
+    assert control_argv[1] == str(checkout_a / driver)
+    assert f"STAGE1_PROTOCOL_ORIGIN=A:{checkout_a}" in control.stdout
 
 
 @pytest.mark.parametrize(
@@ -116,7 +162,7 @@ def test_rendered_driver_resolves_config_from_any_submission_cwd(
     """The rendered command reaches load_config with its bounded row budget."""
 
     row = _row(kind)
-    argv = _rendered_argv(row, driver, tmp_path)
+    argv = _rendered_argv(row, driver, tmp_path, REPO_ROOT)
     assert str(row["config"]) in argv
 
     module = stage1_eval if kind == "eval" else stage1_train
@@ -172,7 +218,7 @@ def test_rendered_driver_refuses_missing_config_from_any_submission_cwd(
     """A missing row config is rejected after the same path resolution step."""
 
     row = {**_row("smoke"), "config": "configs/he/does-not-exist.yaml"}
-    argv = _rendered_argv(row, "experiments/atomistic/stage1/train.py", tmp_path)
+    argv = _rendered_argv(row, "experiments/atomistic/stage1/train.py", tmp_path, REPO_ROOT)
     monkeypatch.chdir(REPO_ROOT if submission_cwd == "repo" else tmp_path)
     monkeypatch.setattr(sys, "argv", [argv[1], *argv[2:]])
 
