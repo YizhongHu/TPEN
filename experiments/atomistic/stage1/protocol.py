@@ -295,6 +295,11 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
         f"run.run_id={row['run_id']}",
         "run.layout=nested",
     }
+    if "device" in row:
+        device = row["device"]
+        if device not in {"cpu", "cuda"}:
+            raise ProtocolError("binding device must be 'cpu' or 'cuda'")
+        expected.add(f"runtime.device={device}")
     if kind == "eval":
         checkpoint_dir, checkpoint_file = _checkpoint_binding(row)
         expected.update({

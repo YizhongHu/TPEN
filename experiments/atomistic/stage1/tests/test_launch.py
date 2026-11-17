@@ -66,6 +66,84 @@ def test_render_fails_for_unapproved_partition_or_results_root() -> None:
                results_root="/tmp/stage1", scratch_base="/tmp/stage1")
 
 
+def test_gpu_render_requires_explicit_shape_and_cuda_binding() -> None:
+    gpu_row = {**ROW, "device": "cuda"}
+    with pytest.raises(ValueError, match="cpus_per_task"):
+        render(row=gpu_row, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
+               results_root=ROW["results_root"], partition="seas_gpu")
+    script = render(
+        row=gpu_row, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
+        results_root=ROW["results_root"], partition="seas_gpu,kozinsky_gpu",
+        cpus_per_task=8, mem="64G", time="08:00:00", scratch_base="/tmp/stage1",
+    )
+    assert "#SBATCH --gres=gpu:1" in script
+    assert "#SBATCH --constraint=a100" in script
+    assert "#SBATCH --cpus-per-task=8" in script
+    assert "#SBATCH --mem=64G" in script
+    assert "#SBATCH --time=08:00:00" in script
+    assert "runtime.device=cuda" in script
+    assert "expected exactly one visible GPU" in script
+
+
+def test_gpu_render_rejects_cpu_binding_and_invalid_resources() -> None:
+    with pytest.raises(ValueError, match="cuda"):
+        render(row=ROW, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
+               results_root=ROW["results_root"], partition="gpu",
+               cpus_per_task=8, mem="64G", time="08:00:00")
+    gpu_row = {**ROW, "device": "cuda"}
+    for kwargs, message in [
+        ({"cpus_per_task": 0, "mem": "64G", "time": "08:00:00"}, "cpus_per_task"),
+        ({"cpus_per_task": 8, "mem": "64G", "time": "8:00:00"}, "time"),
+        ({"cpus_per_task": 8, "mem": "2049G", "time": "08:00:00"}, "mem"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            render(row=gpu_row, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
+                   results_root=ROW["results_root"], partition="gpu", **kwargs)
+
+
+def test_gpu_partition_guard_accepts_one_requested_partition(tmp_path: Path) -> None:
+    gpu_row = {**ROW, "device": "cuda"}
+    script = render(
+        row=gpu_row, driver="/bin/true", python="/usr/bin/true", head_sha="c" * 40,
+        results_root=ROW["results_root"], partition="seas_gpu,gpu",
+        cpus_per_task=8, mem="64G", time="08:00:00", scratch_base=str(tmp_path),
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    nvidia = fake_bin / "nvidia-smi"
+    nvidia.write_text("#!/bin/sh\nprintf 'NVIDIA A100-SXM4-80GB, 81920\\n'\n", encoding="utf-8")
+    nvidia.chmod(0o750)
+    result = _run(script, tmp_path, PATH=f"{fake_bin}:/usr/bin:/bin",
+                   SLURM_JOB_ID="123", SLURM_JOB_PARTITION="gpu")
+    assert result.returncode == 0, result.stderr
+    assert "STAGE1_GUARD nvidia-smi=NVIDIA A100-SXM4-80GB, 81920" in result.stdout
+
+
+@pytest.mark.parametrize("gpu_output", [
+    "NVIDIA A100-SXM4-40GB MIG 1g.5gb, 40960\\n",
+    "NVIDIA A100-SXM4-40GB, 40960\\n",
+    "NVIDIA A100-SXM4-80GB, 81920\\nNVIDIA A100-SXM4-80GB, 81920\\n",
+])
+def test_gpu_guard_rejects_mig_small_memory_and_multiple_gpus(
+    tmp_path: Path, gpu_output: str,
+) -> None:
+    gpu_row = {**ROW, "device": "cuda"}
+    script = render(
+        row=gpu_row, driver="/bin/true", python="/usr/bin/true", head_sha="c" * 40,
+        results_root=ROW["results_root"], partition="gpu",
+        cpus_per_task=8, mem="64G", time="08:00:00", scratch_base=str(tmp_path),
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    nvidia = fake_bin / "nvidia-smi"
+    nvidia.write_text(f"#!/bin/sh\nprintf '%b' '{gpu_output}'\n", encoding="utf-8")
+    nvidia.chmod(0o750)
+    result = _run(script, tmp_path, PATH=f"{fake_bin}:/usr/bin:/bin",
+                   SLURM_JOB_ID="123", SLURM_JOB_PARTITION="gpu")
+    assert result.returncode == 2
+    assert "STAGE1_GUARD" in result.stderr
+
+
 def test_partition_guard_is_exercised_by_fake_environment(tmp_path: Path) -> None:
     script = render(row=ROW, driver="/bin/true", python="/usr/bin/true",
                     head_sha="c" * 40,
@@ -171,6 +249,19 @@ def test_gateway_rejects_omitted_or_altered_binding_before_run() -> None:
     with pytest.raises(ProtocolError):
         validate_gateway_binding(binding=token, config="configs/he/other.yaml",
                                  overrides=overrides, kind="train")
+    gpu_row = {**ROW, "device": "cuda"}
+    gpu_overrides = row_overrides(gpu_row)
+    assert validate_gateway_binding(
+        binding=_binding_token(gpu_row), config=gpu_row["config"],
+        overrides=gpu_overrides, kind="train",
+    ) == gpu_row
+    with pytest.raises(ProtocolError):
+        validate_gateway_binding(
+            binding=_binding_token(gpu_row), config=gpu_row["config"],
+            overrides=[override for override in gpu_overrides
+                       if not override.startswith("runtime.device=")],
+            kind="train",
+        )
     eval_row = {
         **ROW, "kind": "eval", "draws": 256,
         "checkpoint_dir": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010",

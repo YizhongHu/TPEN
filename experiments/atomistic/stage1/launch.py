@@ -17,7 +17,11 @@ from experiments.atomistic.stage1.protocol import (
     identity_expectations,
 )
 
-ALLOWED_PARTITIONS = ("test", "gpu_test")
+ALLOWED_PARTITIONS = ("test", "gpu_test", "seas_gpu", "kozinsky_gpu", "gpu")
+GPU_PARTITIONS = frozenset(ALLOWED_PARTITIONS[1:])
+_MAX_CPUS = 256
+_MAX_MEMORY_GIB = 2048
+_MAX_TIME_SECONDS = 7 * 24 * 60 * 60
 FACILITY_RESULTS_PREFIX = "/n/netscratch/kozinsky_lab/Lab/rhu/"
 _SAFE_RENDERED_VALUE = re.compile(r"[A-Za-z0-9_./:+,@=\[\]-]+\Z")
 
@@ -51,6 +55,11 @@ def row_overrides(row: Mapping[str, Any]) -> list[str]:
         f"run.run_id={row['run_id']}",
         "run.layout=nested",
     ]
+    if "device" in row:
+        device = row["device"]
+        if device not in {"cpu", "cuda"}:
+            raise ValueError("manifest row device must be 'cpu' or 'cuda'")
+        overrides.append(f"runtime.device={device}")
     if kind == "eval":
         overrides.extend([
             f"evaluation_sampler.n_walkers={row['walkers']}",
@@ -69,6 +78,63 @@ def row_overrides(row: Mapping[str, Any]) -> list[str]:
             steps = ",".join(str(step) for step in row["checkpoint_steps"])
             overrides.append(f"checkpoint_steps=[{steps}]")
     return overrides
+
+
+def _partition_names(partition: str) -> list[str]:
+    """Validate and split the explicit Slurm partition request."""
+
+    if not isinstance(partition, str) or not partition:
+        raise ValueError("partition must be a non-empty comma-separated allow-list")
+    names = partition.split(",")
+    if any(not name or name not in ALLOWED_PARTITIONS for name in names):
+        raise ValueError(f"partition must be a comma-separated subset of {ALLOWED_PARTITIONS}")
+    if len(set(names)) != len(names):
+        raise ValueError("partition must not contain duplicates")
+    return names
+
+
+def _validate_gpu_resources(*, cpus_per_task: int | None, mem: str | None,
+                            time: str | None) -> tuple[int, str, str]:
+    """Validate the explicit resource shape required for GPU rows."""
+
+    if not isinstance(cpus_per_task, int) or not 1 <= cpus_per_task <= _MAX_CPUS:
+        raise ValueError(f"cpus_per_task must be between 1 and {_MAX_CPUS}")
+    if not isinstance(mem, str) or not re.fullmatch(r"[1-9][0-9]{0,3}G", mem):
+        raise ValueError("mem must be a positive GiB value such as 64G")
+    if int(mem[:-1]) > _MAX_MEMORY_GIB:
+        raise ValueError(f"mem must be at most {_MAX_MEMORY_GIB}G")
+    match = re.fullmatch(r"([0-9]{2}):([0-5][0-9]):([0-5][0-9])", str(time))
+    if match is None:
+        raise ValueError("time must use HH:MM:SS")
+    hours, minutes, seconds = (int(value) for value in match.groups())
+    total = hours * 3600 + minutes * 60 + seconds
+    if total < 1 or total > _MAX_TIME_SECONDS:
+        raise ValueError("time must be between 00:00:01 and 168:00:00")
+    return cpus_per_task, mem, str(time)
+
+
+def _gpu_guard() -> str:
+    """Return the in-job A100/non-MIG admission guard."""
+
+    return '''
+GPU_INFO="$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits)"
+printf 'STAGE1_GUARD nvidia-smi=%s\\n' "$GPU_INFO"
+GPU_COUNT="$(printf '%s\\n' "$GPU_INFO" | awk 'NF { count++ } END { print count + 0 }')"
+if [[ "$GPU_COUNT" != "1" ]]; then
+  echo "STAGE1_GUARD expected exactly one visible GPU, got $GPU_COUNT" >&2
+  exit 2
+fi
+GPU_NAME="${GPU_INFO%%,*}"
+GPU_MEMORY="${GPU_INFO##*,}"
+if [[ "$GPU_NAME" != *A100* || "$GPU_NAME" == *MIG* || "$GPU_NAME" =~ [0-9]+g\\.[0-9]+gb ]]; then
+  echo "STAGE1_GUARD expected a non-MIG A100, got $GPU_NAME" >&2
+  exit 2
+fi
+if [[ "${GPU_MEMORY//[[:space:]]/}" != "81920" ]]; then
+  echo "STAGE1_GUARD expected 81920 MiB, got $GPU_MEMORY" >&2
+  exit 2
+fi
+'''
 
 
 def command_for_row(row: Mapping[str, Any], *, python: str, driver: str) -> str:
@@ -105,7 +171,8 @@ def _resolve_driver_path(driver: str, checkout_root: str) -> str:
 
 def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
            checkout_root: str, results_root: str, partition: str = "test",
-           scratch_base: str = "/scratch") -> str:
+           scratch_base: str = "/scratch", cpus_per_task: int | None = None,
+           mem: str | None = None, time: str | None = None) -> str:
     """Render a fail-closed script for one identity-bound row.
 
     ``checkout_root`` is the exact checkout staged for execution. It is
@@ -123,8 +190,16 @@ def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
     if not Path(scratch_base).is_absolute() or scratch_base == "/":
         raise ValueError("scratch_base must be absolute and not '/'")
     _require_sha(head_sha, length=40, field="head_sha")
-    if partition not in ALLOWED_PARTITIONS:
-        raise ValueError(f"partition must be one of {ALLOWED_PARTITIONS}")
+    partitions = _partition_names(partition)
+    is_gpu = bool(GPU_PARTITIONS.intersection(partitions))
+    if is_gpu:
+        cpus_per_task, mem, time = _validate_gpu_resources(
+            cpus_per_task=cpus_per_task, mem=mem, time=time,
+        )
+        if row.get("device") != "cuda":
+            raise ValueError("GPU partitions require a row device binding of cuda")
+    elif row.get("device") not in (None, "cpu"):
+        raise ValueError("CPU partitions require a row device binding of cpu")
     if not results_root.startswith(FACILITY_RESULTS_PREFIX):
         raise ValueError("results_root must be below the approved Netscratch prefix")
     _require_safe_value(results_root, field="results_root")
@@ -146,6 +221,29 @@ def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
     )
     template_path = Path(__file__).with_name("templates") / "cannon.sbatch"
     template = template_path.read_text(encoding="utf-8")
+    if is_gpu:
+        template = template.replace(
+            "#SBATCH --cpus-per-task=1\n#SBATCH --no-requeue",
+            f"#SBATCH --cpus-per-task={cpus_per_task}\n"
+            f"#SBATCH --mem={mem}\n#SBATCH --time={time}\n"
+            "#SBATCH --gres=gpu:1\n#SBATCH --constraint=a100\n#SBATCH --no-requeue",
+        )
+        template = template.replace(
+            'REQUESTED_PARTITION="__PARTITION__"\n'
+            'if [[ "$SLURM_JOB_PARTITION" != "$REQUESTED_PARTITION" ]]; then\n'
+            '  echo "STAGE1_GUARD partition delivered=$SLURM_JOB_PARTITION requested=$REQUESTED_PARTITION" >&2\n'
+            '  exit 2\nfi\n',
+            'REQUESTED_PARTITION="__PARTITION__"\n'
+            'IFS="," read -r -a REQUESTED_PARTITIONS <<< "$REQUESTED_PARTITION"\n'
+            'PARTITION_MATCH=0\n'
+            'for requested in "${REQUESTED_PARTITIONS[@]}"; do\n'
+            '  [[ "$SLURM_JOB_PARTITION" == "$requested" ]] && PARTITION_MATCH=1\n'
+            'done\n'
+            'if [[ "$PARTITION_MATCH" != "1" ]]; then\n'
+            '  echo "STAGE1_GUARD partition delivered=$SLURM_JOB_PARTITION requested=$REQUESTED_PARTITION" >&2\n'
+            '  exit 2\nfi\n',
+        )
+        template = template.replace('SCRATCH_BASE=', _gpu_guard() + 'SCRATCH_BASE=', 1)
     for marker, value in {
         "__PARTITION__": partition,
         "__RESULTS_ROOT__": results_root,
@@ -170,12 +268,17 @@ def main() -> int:
     parser.add_argument("--results-root", required=True)
     parser.add_argument("--partition", default="test")
     parser.add_argument("--scratch-base", default="/scratch")
+    parser.add_argument("--cpus-per-task", type=int)
+    parser.add_argument("--mem")
+    parser.add_argument("--time")
     args = parser.parse_args()
     row = json.loads(args.row.read_text(encoding="utf-8"))
     args.output.write_text(render(row=row, driver=args.driver, python=args.python,
                                   checkout_root=args.checkout_root,
                                   head_sha=args.head_sha, results_root=args.results_root,
-                                  partition=args.partition, scratch_base=args.scratch_base), encoding="utf-8")
+                                  partition=args.partition, scratch_base=args.scratch_base,
+                                  cpus_per_task=args.cpus_per_task, mem=args.mem,
+                                  time=args.time), encoding="utf-8")
     args.output.chmod(0o750)
     return 0
 
