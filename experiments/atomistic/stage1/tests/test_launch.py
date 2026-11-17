@@ -120,6 +120,7 @@ def test_gpu_partition_guard_accepts_one_requested_partition(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize("gpu_output", [
+    "NVIDIA A100-SXM4-80GB MIG, 81920\\n",
     "NVIDIA A100-SXM4-40GB MIG 1g.5gb, 40960\\n",
     "NVIDIA A100-SXM4-40GB, 40960\\n",
     "NVIDIA A100-SXM4-80GB, 81920\\nNVIDIA A100-SXM4-80GB, 81920\\n",

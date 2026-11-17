@@ -130,7 +130,8 @@ if [[ "$GPU_NAME" != *A100* || "$GPU_NAME" == *MIG* || "$GPU_NAME" =~ [0-9]+g\\.
   echo "STAGE1_GUARD expected a non-MIG A100, got $GPU_NAME" >&2
   exit 2
 fi
-if [[ "${GPU_MEMORY//[[:space:]]/}" != "81920" ]]; then
+GPU_MEMORY="$(printf '%s' "$GPU_MEMORY" | tr -d '[:space:]')"
+if [[ "$GPU_MEMORY" != "81920" ]]; then
   echo "STAGE1_GUARD expected 81920 MiB, got $GPU_MEMORY" >&2
   exit 2
 fi
