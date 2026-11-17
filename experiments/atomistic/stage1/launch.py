@@ -94,6 +94,16 @@ def command_for_row(row: Mapping[str, Any], *, python: str, driver: str) -> str:
     return shlex.join(args)
 
 
+def _resolve_driver_path(driver: str) -> str:
+    """Resolve a repository-relative driver before leaving the checkout cwd."""
+
+    path = Path(driver)
+    if path.is_absolute():
+        return driver
+    repo_root = Path(__file__).resolve().parents[3]
+    return str((repo_root / path).resolve())
+
+
 def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
            results_root: str, partition: str = "test",
            scratch_base: str = "/scratch") -> str:
@@ -125,7 +135,7 @@ def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
         identity_expectations(row)
     for field in ("experiment_name", "sector", "run_id"):
         _require_path_component(row.get(field), field=field)
-    command = command_for_row(row, python=python, driver=driver)
+    command = command_for_row(row, python=python, driver=_resolve_driver_path(driver))
     template_path = Path(__file__).with_name("templates") / "cannon.sbatch"
     template = template_path.read_text(encoding="utf-8")
     for marker, value in {

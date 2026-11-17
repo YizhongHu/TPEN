@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -67,6 +69,32 @@ def _rendered_argv(row: dict[str, object], driver: str, tmp_path: Path) -> list[
         scratch_base=str(tmp_path / "scratch"),
     )
     return shlex.split(script.splitlines()[-1])
+
+
+@pytest.mark.parametrize(
+    ("kind", "driver"),
+    [
+        ("smoke", "experiments/atomistic/stage1/train.py"),
+        ("train", "experiments/atomistic/stage1/train.py"),
+        ("eval", "experiments/atomistic/stage1/eval.py"),
+    ],
+)
+def test_rendered_driver_imports_experiments_outside_checkout(
+    kind: str, driver: str, tmp_path: Path,
+) -> None:
+    """The real rendered command imports its source package from any cwd."""
+
+    argv = _rendered_argv(_row(kind), driver, tmp_path)
+    result = subprocess.run(
+        [*argv, "--help"],
+        cwd=tmp_path,
+        env={"PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "usage:" in result.stdout
+    assert argv[1] == str(REPO_ROOT / driver)
 
 
 @pytest.mark.parametrize(
