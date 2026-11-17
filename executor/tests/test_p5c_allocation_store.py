@@ -347,8 +347,8 @@ def test_p5c_runtime_write_trap_is_lexical_and_reentrant(tmp_path: Path, monkeyp
 def test_p5c_attached_allocation_delegates_with_bound_allocation() -> None:
     """Attached lifecycle delegates begin/finish and observes its configured allocation."""
     class FakeStore:
-        def begin_attempt(self, group, task_id, allocation, started_at_utc):
-            self.begin_args = (group, task_id, allocation, started_at_utc)
+        def begin_attempt(self, group, task_id, allocation, started_at_utc, *, transport_kind="local"):
+            self.begin_args = (group, task_id, allocation, started_at_utc, transport_kind)
             return "fence"
 
         def finish_attempt(self, fence, status, finished_at_utc, result_digest=None):
@@ -360,7 +360,9 @@ def test_p5c_attached_allocation_delegates_with_bound_allocation() -> None:
     attached = AttachedAllocation(allocation, fake)  # type: ignore[arg-type]
     group = _group("a")
     assert attached.begin(group, "a", "start") == "fence"
-    assert fake.begin_args == (group, "a", allocation, "start")
+    assert fake.begin_args == (group, "a", allocation, "start", "local")
+    assert attached.begin(group, "a", "remote-start", transport_kind="remote") == "fence"
+    assert fake.begin_args == (group, "a", allocation, "remote-start", "remote")
     assert attached.finish("fence", "completed", "finish", "digest") == "outcome"
     assert fake.finish_args == ("fence", "completed", "finish", "digest")
     assert attached.observe("running", "observe").allocation_id == allocation.allocation_id

@@ -109,6 +109,13 @@ until a separate disposition authorizes removing it. A supervised release
 command, which must prove that all possibly-launched work is gone, is a future
 follow-up.
 
+### Start-receipt-v1 migration
+
+Historical `start-receipt-v1` attempts carry no transport kind, so after an
+upgrade they read as unknown and are not eligible for continuation or replay
+without a positive remote teardown receipt. Their transport is never inferred
+or rewritten as local.
+
 Assumption: one controller per allocation. The local and ThreadPool
 dispatchers run their workers in the controller process, so the in-process
 lease sees every launch, and the durable marker covers a controller restart on

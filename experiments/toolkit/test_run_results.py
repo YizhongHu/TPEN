@@ -73,6 +73,9 @@ destination.joinpath("manifest.json").write_bytes(store.manifest(group).encode()
     assert written.returncode == 0, written.stderr
 
     result = read(manifest)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert payload["attempts"][0]["start_receipt"]["schema"] == "tpen-executor/start-receipt-v2"
+    assert payload["attempts"][0]["start_receipt"]["transport_kind"] == "local"
     assert not result.chains
     assert len(result.preserved_attempts) == 1
     assert result.preserved_attempts[0].outcome == "remote-quiescence-unconfirmed"
@@ -255,6 +258,91 @@ def _materialized_manifest(tmp_path: Path, *, extra_attempt: bool = False) -> tu
     path = tmp_path / "run-manifest.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path, str(core_dir)
+
+
+def _read_materialized_manifest(path: Path, core_dir: str, tmp_path: Path):
+    """Read a materialized fixture with a deterministic completed inspection."""
+
+    checkpoint_dir = str(tmp_path / "attempt-1" / "core" / "checkpoint" / "step_000001")
+
+    def inspect(run_dir: str | Path) -> dict[str, object]:
+        assert str(run_dir) == core_dir
+        return {
+            "verdict": "completed",
+            "checkpoint": {
+                "checkpoint_dir": checkpoint_dir,
+                "schema_version": 1,
+                "next_iteration": 1,
+                "completed_updates": 1,
+            },
+        }
+
+    return read(path, inspect)
+
+
+def test_p8_reader_accepts_start_receipt_v1(tmp_path: Path) -> None:
+    path, core_dir = _materialized_manifest(tmp_path)
+
+    result = _read_materialized_manifest(path, core_dir, tmp_path)
+
+    assert len(result.chains) == 1
+
+
+@pytest.mark.parametrize("transport_kind", ["local", "remote"], ids=["local", "remote"])
+def test_p8_reader_accepts_start_receipt_v2_transport_kinds(tmp_path: Path, transport_kind: str) -> None:
+    path, core_dir = _materialized_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["attempts"][0]["start_receipt"].update({
+        "schema": "tpen-executor/start-receipt-v2",
+        "transport_kind": transport_kind,
+    })
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = _read_materialized_manifest(path, core_dir, tmp_path)
+
+    assert len(result.chains) == 1
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("unknown-schema", "schema is unsupported"),
+        ("extra-key", "keys differ"),
+        ("bad-transport", "transport_kind"),
+        ("bad-transport-list", "transport_kind"),
+        ("bad-transport-dict", "transport_kind"),
+        ("bad-transport-null", "transport_kind"),
+        ("bad-transport-int", "transport_kind"),
+        ("missing-transport", "keys differ"),
+    ],
+    ids=["unknown-schema", "extra-key", "bad-transport", "bad-transport-list", "bad-transport-dict", "bad-transport-null", "bad-transport-int", "missing-transport"],
+)
+def test_p8_reader_rejects_closed_start_receipt_mutations(
+    tmp_path: Path, mutation: str, expected_reason: str
+) -> None:
+    path, _ = _materialized_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    start = payload["attempts"][0]["start_receipt"]
+    if mutation == "unknown-schema":
+        start["schema"] = "tpen-executor/start-receipt-v99"
+    elif mutation == "extra-key":
+        start["extra"] = "not-allowed"
+    elif mutation == "missing-transport":
+        start["schema"] = "tpen-executor/start-receipt-v2"
+        start.pop("transport_kind", None)
+    else:
+        bad_values = {
+            "bad-transport": "unknown",
+            "bad-transport-list": [],
+            "bad-transport-dict": {},
+            "bad-transport-null": None,
+            "bad-transport-int": 7,
+        }
+        start.update({"schema": "tpen-executor/start-receipt-v2", "transport_kind": bad_values[mutation]})
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ManifestRefusal, match=expected_reason):
+        _read_materialized_manifest(path, "unused", tmp_path)
 
 
 def test_p8_reader_selects_exactly_once_and_preserves_unselected_attempts(tmp_path: Path) -> None:
