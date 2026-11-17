@@ -193,6 +193,10 @@ codes are:
 * `4`: unexpected dispatch or publication failure after admission;
 * `130`: cancellation after an attempt began.
 
+Attached transport capacity and standard-worker shape refusals are reported as
+typed `dispatcher-admission` errors with exit code `2`, before the store is
+reserved. Shared-store reachability checks remain runtime dispatch failures.
+
 ## Remote-leaf wire (S3 Layer A)
 
 `tpen_executor.dispatch.transport` defines the versioned wire between a

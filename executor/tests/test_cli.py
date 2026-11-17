@@ -185,6 +185,20 @@ def test_b1_invalid_transport_refuses_before_store_reservation(tmp_path: Path, p
     assert not Path(paths["store"]).exists()
 
 
+@pytest.mark.parametrize("timeout_field", ["preflight_timeout", "teardown_timeout"])
+def test_b1_oversized_transport_timeout_is_typed_refusal(tmp_path: Path, timeout_field: str) -> None:
+    paths = _inputs(tmp_path)
+    payload = _valid_transport()
+    payload[timeout_field] = 10**400
+    transport = _transport_file(tmp_path, payload)
+    result = _run_cli(paths, "--dispatcher", "parsl", "--transport", str(transport))
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "Traceback" not in result.stderr
+    assert json.loads(result.stderr)["code"] == "invalid-transport"
+    assert not Path(paths["store"]).exists()
+
+
 def test_b1_admitted_transport_is_retained_on_dispatch_plan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     paths = _inputs(tmp_path)
     payload = _valid_transport()

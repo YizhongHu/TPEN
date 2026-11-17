@@ -49,6 +49,7 @@ import pytest
 
 from tpen_executor._codec import digest
 from tpen_executor.allocations import ConfiguredAllocation
+from tpen_executor import cli, composition
 from tpen_executor.contracts import AllocationId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
 from tpen_executor.dispatch import LocalDispatcher
 from tpen_executor.dispatch import parsl as parsl_dispatch
@@ -58,7 +59,7 @@ from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.placement import AllocationSlot
 from tpen_executor.programs import WorkerProgram
 from tpen_executor.storage import DirectoryStore
-from tpen_executor.tasks import ConfiguredRun
+from tpen_executor.tasks import ConfiguredRun, ConfiguredRunTable
 
 
 EXECUTOR_ROOT = Path(__file__).parents[1]
@@ -372,6 +373,59 @@ def _transport(**changes) -> dict:
     return spec
 
 
+def _cli_inputs(tmp_path: Path, allocation: ConfiguredAllocation, *, runner: str = "tpen_executor.runners.TPENCommand") -> dict[str, Path | ReadyGroup]:
+    """Write one CLI-shaped group, allocation, worker, and run table."""
+
+    group = _group("s3b-cli", "member")
+    core = _make_fake_core(tmp_path)
+    config = tmp_path / "member.cfg"
+    config.write_text("ok", encoding="utf-8")
+    worker = tmp_path / "worker.yaml"
+    runner_lines = [
+        "  runner:",
+        f"    _target_: {runner}",
+        "    _recursive_: false",
+    ]
+    if runner.endswith("TPENCommand"):
+        runner_lines.append(f"    config: {json.dumps(str(config))}")
+    worker.write_text(
+        "\n".join(
+            [
+                "worker:",
+                "  _target_: tpen_executor.programs.WorkerProgram",
+                "  _recursive_: false",
+                "  environment:",
+                "    _target_: tpen_executor.environments.PreparedPythonEnvironment",
+                "    _recursive_: false",
+                f"    python: {json.dumps(sys.executable)}",
+                "    env:",
+                f"      PYTHONPATH: {json.dumps(str(core))}",
+                "  process:",
+                "    _target_: tpen_executor.workers.SubprocessWorker",
+                "    _recursive_: false",
+                *runner_lines,
+                "  evidence:",
+                "    _target_: tpen_executor.runners.TPENEvidence",
+                "    _recursive_: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    paths: dict[str, Path | ReadyGroup] = {
+        "input": tmp_path / "executor_input.json",
+        "allocation": tmp_path / "allocation.json",
+        "runs": tmp_path / "runs.json",
+        "worker": worker,
+        "store": tmp_path / "store",
+        "group": group,
+    }
+    paths["input"].write_bytes(group.encode())  # type: ignore[union-attr]
+    paths["allocation"].write_bytes(allocation.encode())  # type: ignore[union-attr]
+    paths["runs"].write_bytes(ConfiguredRunTable(group.identity, (ConfiguredRun("member", str(config)),)).encode())  # type: ignore[union-attr]
+    return paths
+
+
 def _lifecycle(tmp_path: Path, name: str = "store") -> AttachedAllocation:
     root = tmp_path / name
     root.mkdir(exist_ok=True)
@@ -508,6 +562,101 @@ def test_transport_refusal_leaves_no_attempt(tmp_path: Path, fake_parsl: _Parsl,
             dispatcher.run(group, runs, target, timeout=60)
     assert fake_parsl.dfks == [] and fake_parsl.submissions == []
     assert not (Path(lifecycle.store.root) / "groups").exists()
+
+
+@pytest.mark.parametrize("case", ["capacity", "non-standard-runner"])
+def test_cli_transport_shape_refusal_precedes_store_reservation(
+    tmp_path: Path, fake_parsl: _Parsl, capsys: pytest.CaptureFixture[str], case: str,
+) -> None:
+    """F1: capacity and exact worker-shape refusals are public admission errors."""
+
+    if case == "capacity":
+        slots = [
+            AllocationSlot("slot-a", "node-a", ("device-a",), (0,), (), ()).to_dict(),
+            AllocationSlot("slot-b", "node-a", ("device-b",), (1,), (), ()).to_dict(),
+        ]
+        allocation = ConfiguredAllocation(
+            AllocationId("s3b-cli-allocation"), BackendJobId("s3b-cli-job"),
+            {"slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": slots}},
+        )
+        runner = "tpen_executor.runners.TPENCommand"
+    else:
+        allocation = ConfiguredAllocation(
+            AllocationId("s3b-cli-allocation"), BackendJobId("s3b-cli-job"), {"binding": BINDING},
+        )
+        runner = "tpen_executor.programs.DummyRunner"
+    paths = _cli_inputs(tmp_path, allocation, runner=runner)
+    transport = tmp_path / "transport.json"
+    payload = _transport(max_workers_per_node=1)
+    transport.write_text(json.dumps(payload), encoding="utf-8")
+
+    code = cli.main(
+        [
+            "dispatch", "--input", str(paths["input"]), "--store", str(paths["store"]),
+            "--allocation", str(paths["allocation"]), "--worker-config", str(paths["worker"]),
+            "--runs", str(paths["runs"]), "--dispatcher", "parsl", "--transport", str(transport),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 2 and captured.out == ""
+    error = json.loads(captured.err)
+    assert error["schema"] == "tpen-executor/cli-error-v1"
+    assert error["code"] == "dispatcher-admission"
+    assert not Path(paths["store"]).exists()
+    assert fake_parsl.dfks == [] and fake_parsl.submissions == []
+
+
+@pytest.mark.parametrize(
+    "allocation_kind",
+    [
+        "legacy-binding",
+        pytest.param("cpu-slot", marks=pytest.mark.skipif(not sys.platform.startswith("linux"), reason="CPU slot affinity is Linux-only")),
+    ],
+)
+def test_cli_admitted_plan_dispatches_allocation_binding_with_real_dispatcher(
+    tmp_path: Path, fake_parsl: _Parsl, monkeypatch: pytest.MonkeyPatch, allocation_kind: str,
+) -> None:
+    """F1 test 3: composition and dispatch share one real admitted plan."""
+
+    if allocation_kind == "legacy-binding":
+        allocation = ConfiguredAllocation(
+            AllocationId("s3b-cli-allocation"), BackendJobId("s3b-cli-job"), {"binding": BINDING},
+        )
+    else:
+        cpu = min(os.sched_getaffinity(0))
+        slot = AllocationSlot("slot-cpu", socket.gethostname(), (), (cpu,), (), ())
+        allocation = ConfiguredAllocation(
+            AllocationId("s3b-cli-allocation"), BackendJobId("s3b-cli-job"),
+            {"slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": [slot.to_dict()]}},
+        )
+    paths = _cli_inputs(tmp_path, allocation)
+    transport = tmp_path / "transport.json"
+    transport.write_text(json.dumps(_transport(max_workers_per_node=1)), encoding="utf-8")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "controller-ambient-0")
+    monkeypatch.setenv("OMP_NUM_THREADS", "99")
+    plan = composition.admit(
+        paths["input"], paths["store"], paths["allocation"], paths["worker"], paths["runs"],
+        dispatcher_name="parsl", transport_path=transport,
+    )
+    manifest = composition.dispatch(plan)
+
+    assert _summary(manifest) == {"member": ("completed", False)}
+    assert plan.dispatcher.transport is plan.transport
+    [record] = fake_parsl.leaf_submissions()
+    request = LeafRequest.decode(record["args"][0])
+    if allocation_kind == "legacy-binding":
+        assert request.environment.env["CUDA_VISIBLE_DEVICES"] == BINDING["environment"]["CUDA_VISIBLE_DEVICES"]
+        assert request.environment.env["OMP_NUM_THREADS"] == BINDING["environment"]["OMP_NUM_THREADS"]
+    else:
+        assert request.environment.env["TPEN_SLOT_ID"] == "slot-cpu"
+        assert request.environment.env["TPEN_SLOT_NODE"] == socket.gethostname()
+    observed = _observed(plan.lifecycle, paths["group"], "member")  # type: ignore[arg-type]
+    if allocation_kind == "legacy-binding":
+        assert (observed["cuda"], observed["omp"]) == ("slot-gpu-3", "3")
+    [dfk] = fake_parsl.dfks
+    assert [type(executor) for executor in dfk.config.executors] == [_HTEX]
+    assert dfk.config.executors[0].label == LABEL
+    assert [item["function"] for item in fake_parsl.submissions] == ["_shared_store_probe", "run_leaf"]
 
 
 # ------------------------------------------------------------- submission
@@ -1039,3 +1188,63 @@ def test_real_attached_htex_runs_the_leaf_on_its_workers(tmp_path: Path, monkeyp
     preflights = sorted(parsl_root.glob("store-preflight-*"))
     assert len(preflights) == 2
     assert all(len(list(path.glob("arrival-*"))) == 2 for path in preflights)
+
+
+@pytest.mark.skipif(not HAS_PARSL, reason="requires the approved executor parsl extra")
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="real attached HTEX is exercised on the Linux test partition")
+def test_real_attached_htex_cli_entry_runs_allocation_bound_leaf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """F1 test 4: the public CLI reaches the real attached HTEX route."""
+
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "mpiexec").write_text(_MPIEXEC_STANDIN, encoding="utf-8")
+    (shim / "mpiexec").chmod(stat.S_IRWXU)
+    mpiexec_log = tmp_path / "mpiexec.log"
+    venv_bin = os.path.dirname(sys.executable)
+    path = [entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry and os.path.realpath(entry) != os.path.realpath(venv_bin)]
+    monkeypatch.setenv("PATH", os.pathsep.join([str(shim), *path]))
+    monkeypatch.setenv("S3B_MPIEXEC_LOG", str(mpiexec_log))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "controller-ambient-0")
+    monkeypatch.setenv("OMP_NUM_THREADS", "99")
+    monkeypatch.delenv(WORKER_MARK, raising=False)
+    worker_init = "\n".join([
+        f"export PATH={shim}:$PATH",
+        f"export PYTHONPATH={EXECUTOR_ROOT / 'src'}${{PYTHONPATH:+:$PYTHONPATH}}",
+        f"export {WORKER_MARK}=htex-worker",
+    ])
+    allocation = ConfiguredAllocation(
+        AllocationId("s3b-cli-allocation"), BackendJobId("s3b-cli-job"), {"binding": BINDING},
+    )
+    paths = _cli_inputs(tmp_path, allocation)
+    transport = tmp_path / "transport.json"
+    transport.write_text(
+        json.dumps(_transport(worker_init=worker_init, address="127.0.0.1", max_workers_per_node=2, preflight_timeout=120)),
+        encoding="utf-8",
+    )
+    code = cli.main(
+        [
+            "dispatch", "--input", str(paths["input"]), "--store", str(paths["store"]),
+            "--allocation", str(paths["allocation"]), "--worker-config", str(paths["worker"]),
+            "--runs", str(paths["runs"]), "--dispatcher", "parsl", "--transport", str(transport),
+            "--timeout", "120",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0 and captured.err == ""
+    stdout_manifest = json.loads(captured.out)
+    durable_manifest = json.loads((Path(paths["store"]) / "run-manifest.json").read_text(encoding="utf-8"))
+    assert stdout_manifest == durable_manifest
+    assert stdout_manifest["attempts"][0]["outcome_receipt"]["status"] == "completed"
+
+    lifecycle = AttachedAllocation(allocation, DirectoryStore(Path(paths["store"])))
+    observed = _observed(lifecycle, paths["group"], "member")  # type: ignore[arg-type]
+    assert observed["mark"] == "htex-worker" and observed["ppid"] != os.getpid()
+    assert (observed["cuda"], observed["omp"]) == ("slot-gpu-3", "3")
+    parsl_root = Path(paths["store"]) / "parsl"
+    run_dirs = [path for path in parsl_root.iterdir() if path.is_dir() and path.name.isdigit()]
+    assert len(run_dirs) == 1 and (run_dirs[0] / LABEL).is_dir()
+    assert len(mpiexec_log.read_text(encoding="utf-8").splitlines()) == 1
+    preflights = list(parsl_root.glob("store-preflight-*"))
+    assert len(preflights) == 1 and len(list(preflights[0].glob("arrival-*"))) == 2
