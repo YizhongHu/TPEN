@@ -126,6 +126,17 @@ def test_manifest_refuses_forced_seed_collision(monkeypatch: pytest.MonkeyPatch)
         _manifest(checkpoints=[7])
 
 
+def test_manifest_rejects_duplicate_checkpoint() -> None:
+    with pytest.raises(ProtocolError, match="duplicates"):
+        build_manifest(
+            protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256=SHA256,
+            checkpoints=[7, 7], lineage_seeds=[11, 12, 13],
+            checkpoint_sha256={(system, lineage, 7): SHA256 for system in SYSTEMS
+                               for lineage in range(3)},
+            results_root="/external/stage1",
+        )
+
+
 def test_seeds_fit_torch_at_coordinate_maxima_and_reject_overflow() -> None:
     seeds = [
         smoke_seed(system="h2"),
