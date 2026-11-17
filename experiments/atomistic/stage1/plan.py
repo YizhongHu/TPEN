@@ -7,8 +7,8 @@ import json
 from pathlib import Path
 
 from experiments.atomistic.stage1.protocol import (
-    CONFIG_IDENTITY_RULE, SYSTEMS, STAGE1_PROTOCOL, bind_evaluation_manifest,
-    build_manifest, config_identities, manifest_hash,
+    SYSTEMS, STAGE1_PROTOCOL, bind_evaluation_manifest, build_manifest,
+    config_identities, manifest_hash,
 )
 
 
@@ -48,15 +48,22 @@ def main() -> int:
             phase1_doc = json.loads(args.phase1_manifest.read_text(encoding="utf-8"))
             if phase1_doc.get("phase") != 1:
                 raise ValueError("--phase1-manifest must contain a phase-1 manifest")
+            phase1_rows = phase1_doc.get("rows")
+            phase1_hash = phase1_doc.get("manifest_hash")
+            if (not isinstance(phase1_rows, list)
+                    or not isinstance(phase1_hash, str)
+                    or phase1_hash != manifest_hash(phase1_rows)):
+                raise ValueError("--phase1-manifest has an invalid manifest_hash")
             eval_rows = bind_evaluation_manifest(
-                phase1_rows=phase1_doc.get("rows", []), checkpoints=args.checkpoints,
+                phase1_rows=phase1_rows, checkpoints=args.checkpoints,
                 checkpoint_sha256=_read_bindings(args.checkpoint_bindings),
                 source_sha=args.source_sha,
                 config_sha256=config_sha256 if isinstance(config_sha256, dict) else None,
                 protocol=STAGE1_PROTOCOL,
+                phase1_manifest_hash=phase1_hash,
                 device=args.device,
             )
-            rows = list(phase1_doc.get("rows", [])) + eval_rows
+            rows = list(phase1_rows) + eval_rows
         else:
             rows = build_manifest(protocol=STAGE1_PROTOCOL, source_sha=args.source_sha,
                                   config_sha256=config_sha256, checkpoints=args.checkpoints,
@@ -65,8 +72,11 @@ def main() -> int:
                                   results_root=args.results_root, systems=systems, phase=2,
                                   device=args.device)
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    identity_rules = {row.get("config_identity_rule") for row in rows}
+    if len(identity_rules) != 1:
+        raise ValueError("manifest rows must use one config identity rule")
     args.output.write_text(json.dumps({"schema": "stage1/v3", "phase": args.phase,
-                                       "config_identity_rule": CONFIG_IDENTITY_RULE,
+                                       "config_identity_rule": next(iter(identity_rules)),
                                        "manifest_hash": manifest_hash(rows),
                                        "rows": rows}, indent=2) + "\n", encoding="utf-8")
     return 0

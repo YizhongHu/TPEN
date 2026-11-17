@@ -14,7 +14,12 @@ from experiments.atomistic.stage1.launch import (
     render as _render,
     row_overrides,
 )
-from experiments.atomistic.stage1.protocol import ProtocolError, validate_gateway_binding
+from experiments.atomistic.stage1.protocol import (
+    CONFIG_IDENTITY_RULE,
+    ProtocolError,
+    config_identity,
+    validate_gateway_binding,
+)
 from experiments.toolkit.run_paths import resolve_run_dir
 
 
@@ -427,6 +432,26 @@ def test_train_gateway_rejects_missing_config_path(monkeypatch: pytest.MonkeyPat
     )
     with pytest.raises(FileNotFoundError, match="config path does not exist"):
         train.main()
+
+
+def test_gateway_recomputes_the_bound_config_identity() -> None:
+    config_root = REPO_ROOT / "experiments" / "atomistic" / "stage1" / "configs"
+    row = {
+        **ROW,
+        "system": "he",
+        "config_identity_rule": CONFIG_IDENTITY_RULE,
+        "config_sha256": config_identity(config_root=config_root, systems=("he",))["sha256"],
+    }
+    validate_gateway_binding(
+        binding=_binding_token(row), config=row["config"],
+        overrides=row_overrides(row), kind="train",
+    )
+    wrong = {**row, "config_sha256": "d" * 64}
+    with pytest.raises(ProtocolError, match="config identity"):
+        validate_gateway_binding(
+            binding=_binding_token(wrong), config=wrong["config"],
+            overrides=row_overrides(wrong), kind="train",
+        )
 
 
 @pytest.mark.parametrize("checkpoint_override", [None, "/other/checkpoint.pt"])

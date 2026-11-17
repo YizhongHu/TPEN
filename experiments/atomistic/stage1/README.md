@@ -21,6 +21,8 @@ replanning seeds or source/config identity. `config_sha256` is computed by the
 planner under `stage1-config-v1`: sorted `configs/<system>/{train,eval}.yaml`
 paths and their canonical bytes are hashed. The rule id is recorded in each row;
 GPU intent is recorded as a row `device` only when explicitly requested.
+The compatibility `--config-sha256` input is recorded as
+`legacy-config-sha256`; it is not admitted as a phase-2 computed identity.
 
 Each evaluation config builds one `SystemDescriptor` from its instantiated
 `ParticleSpec` and `hamiltonian_terms`, and passes that descriptor plus an

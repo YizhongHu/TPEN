@@ -24,6 +24,7 @@ from experiments.toolkit.run_paths import resolve_run_dir
 SYSTEMS = ("hooke1", "hooke2", "he", "h2")
 KINDS = ("smoke", "train", "eval")
 CONFIG_IDENTITY_RULE = "stage1-config-v1"
+LEGACY_CONFIG_IDENTITY_RULE = "legacy-config-sha256"
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 # Coordinate bounds are retained in the manifest contract.  The resulting
@@ -159,6 +160,24 @@ def config_identities(*, config_root: str | Path, systems: tuple[str, ...] | lis
         raise ProtocolError("systems must contain distinct known Stage-1 systems")
     return {system: str(config_identity(config_root=config_root, systems=(system,))["sha256"])
             for system in selected}
+
+
+def _validate_config_identity_for_row(row: Mapping[str, Any], config_path: str | Path) -> None:
+    """Verify a computed Stage-1 identity against the execution config tree."""
+
+    if row.get("config_identity_rule") != CONFIG_IDENTITY_RULE:
+        return
+    system = row.get("system")
+    if not isinstance(system, str) or system not in SYSTEMS:
+        raise ProtocolError("computed config identity requires a known system")
+    path = Path(config_path).resolve()
+    expected_name = "eval.yaml" if row.get("kind") == "eval" else "train.yaml"
+    expected_path = path.parent / expected_name
+    if path != expected_path or path.parent.name != system:
+        raise ProtocolError("config path does not match the bound Stage-1 system")
+    actual = config_identity(config_root=path.parent.parent, systems=(system,))["sha256"]
+    if actual != row.get("config_sha256"):
+        raise ProtocolError("executed config identity does not match binding")
 
 
 def compute_config_sha256(*, config_root: str | Path,
@@ -349,10 +368,13 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
     row_config = row.get("config")
     if not isinstance(config, str) or not isinstance(row_config, str):
         raise ProtocolError("gateway config is invalid")
-    if row.get("config_identity_rule") not in {None, CONFIG_IDENTITY_RULE}:
+    if row.get("config_identity_rule") not in {
+        None, CONFIG_IDENTITY_RULE, LEGACY_CONFIG_IDENTITY_RULE,
+    }:
         raise ProtocolError("binding config identity rule is unsupported")
     if resolve_config_path(config) != resolve_config_path(row_config):
         raise ProtocolError("gateway config does not match binding")
+    _validate_config_identity_for_row(row, resolve_config_path(config))
     _validate_run_identity(row)
     expected = {
         f"runtime.seed={row['seed']}",
@@ -591,12 +613,18 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         raise ProtocolError("systems must contain distinct known Stage-1 systems")
     if device is not None and device not in {"cpu", "cuda"}:
         raise ProtocolError("device must be 'cpu' or 'cuda'")
+    if not checkpoints or any(step <= 0 for step in checkpoints):
+        raise ProtocolError("checkpoints must be a non-empty list of positive updates")
+    if len(set(checkpoints)) != len(checkpoints):
+        raise ProtocolError("checkpoints must not contain duplicates")
     if isinstance(config_sha256, Mapping):
         config_ids = {system: _require_sha(config_sha256.get(system), length=64,
                                            field=f"config_sha256[{system!r}]") for system in selected}
+        config_identity_rule = CONFIG_IDENTITY_RULE
     else:
         legacy_config_sha = _require_sha(config_sha256, length=64, field="config_sha256")
         config_ids = {system: legacy_config_sha for system in selected}
+        config_identity_rule = LEGACY_CONFIG_IDENTITY_RULE
     root = _safe_results_root(results_root)
     physical_ids = dict(expected_physical_system_id or {})
     if phase == 2 and not physical_ids:
@@ -607,8 +635,26 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                          field=f"expected_physical_system_id[{name!r}]")
     if len(lineage_seeds) != protocol.lineages or len(set(lineage_seeds)) != len(lineage_seeds):
         raise ProtocolError("lineage_seeds must contain one distinct seed per lineage")
-    if not checkpoints or any(step <= 0 for step in checkpoints):
-        raise ProtocolError("checkpoints must be a non-empty list of positive updates")
+    # Check the complete protocol before applying a selected-system filter.
+    # Otherwise an excluded system can hide a seed collision from the plan.
+    protocol_seeds: set[int] = set()
+    for spec in SYSTEM_SPECS:
+        candidate_seeds = [smoke_seed(system=spec.name)]
+        candidate_seeds.extend(
+            training_seed(system=spec.name, lineage=lineage, lineage_seed=seed)
+            for lineage, seed in enumerate(lineage_seeds)
+        )
+        candidate_seeds.extend(
+            evaluation_seed(system=spec.name, lineage=lineage,
+                            checkpoint=checkpoint, stream=stream)
+            for lineage in range(protocol.lineages)
+            for checkpoint in checkpoints
+            for stream in range(protocol.eval_streams)
+        )
+        for candidate in candidate_seeds:
+            if candidate in protocol_seeds:
+                raise ProtocolError("seed collision across Stage-1 rows")
+            protocol_seeds.add(candidate)
     rows: list[dict[str, Any]] = []
     seen_seeds: set[int] = set()
     for spec in SYSTEM_SPECS:
@@ -623,7 +669,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
             "row_id": stable_row_id(system=spec.name, kind="smoke"),
             "system": spec.name, "system_id": spec.system_id, "kind": "smoke",
             "seed": seed, "source_sha": source_sha, "config_sha256": config_ids[spec.name],
-            "config_identity_rule": CONFIG_IDENTITY_RULE,
+            "config_identity_rule": config_identity_rule,
             # A smoke is the real system train config with a deliberately
             # small budget.  Keeping one config source prevents its physics
             # from drifting away from the train/eval pair.
@@ -643,7 +689,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                 "row_id": train_id, "system": spec.name, "system_id": spec.system_id,
                 "kind": "train", "lineage": lineage, "seed": train_seed,
                 "source_sha": source_sha, "config_sha256": config_ids[spec.name],
-                "config_identity_rule": CONFIG_IDENTITY_RULE,
+                "config_identity_rule": config_identity_rule,
                 "config": f"configs/{spec.name}/train.yaml", "results_root": root,
                 "experiment_name": "stage1", "sector": spec.name,
                 "run_id": f"train-lineage-{lineage}",
@@ -677,7 +723,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                         "stream": stream, "seed": eval_seed, "updates": checkpoint,
                         "walkers": protocol.eval_walkers, "draws": protocol.eval_draws,
                         "source_sha": source_sha, "config_sha256": config_ids[spec.name],
-                        "config_identity_rule": CONFIG_IDENTITY_RULE,
+                        "config_identity_rule": config_identity_rule,
                         "config": f"configs/{spec.name}/eval.yaml", "results_root": root,
                         "expected_physical_system_id": physical_ids[spec.name],
                         "experiment_name": "stage1", "sector": spec.name, "run_id": eval_id,
@@ -703,6 +749,7 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
                              source_sha: str | None = None,
                              config_sha256: Mapping[str, str] | None = None,
                              protocol: Protocol | None = None,
+                             phase1_manifest_hash: str | None = None,
                              device: str | None = None) -> list[dict[str, Any]]:
     """Bind eval rows to an existing phase-1 manifest without re-planning it.
 
@@ -711,13 +758,27 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
     inconsistent checkpoint binding is rejected before an eval row exists.
     """
 
-    if not phase1_rows or any(row.get("kind") not in {"smoke", "train"} for row in phase1_rows):
+    if (not phase1_rows or any(not isinstance(row, Mapping) for row in phase1_rows)
+            or any(row.get("kind") not in {"smoke", "train"} for row in phase1_rows)):
         raise ProtocolError("phase-2 binding requires a phase-1 smoke/train manifest")
+    actual_phase1_hash = manifest_hash(phase1_rows)
+    if phase1_manifest_hash is not None:
+        expected_phase1_hash = _require_sha(
+            phase1_manifest_hash, length=64, field="phase1_manifest_hash"
+        )
+        if expected_phase1_hash != actual_phase1_hash:
+            raise ProtocolError("phase-1 manifest_hash does not match phase-1 rows")
+    phase1_manifest_hash = actual_phase1_hash
+    if len({row.get("row_id") for row in phase1_rows}) != len(phase1_rows):
+        raise ProtocolError("phase-1 manifest contains duplicate row_id")
+    if len({row.get("seed") for row in phase1_rows}) != len(phase1_rows):
+        raise ProtocolError("phase-1 manifest contains duplicate seed")
     train_rows = [row for row in phase1_rows if row.get("kind") == "train"]
     systems = tuple(dict.fromkeys(str(row["system"]) for row in train_rows))
     if not systems or any(row.get("config_identity_rule") != CONFIG_IDENTITY_RULE for row in train_rows):
         raise ProtocolError("phase-1 manifest has no recognized config identity rule")
-    source_shas = {row.get("source_sha") for row in train_rows}
+    source_shas = {_require_sha(row.get("source_sha"), length=40, field="source_sha")
+                   for row in train_rows}
     if len(source_shas) != 1:
         raise ProtocolError("phase-1 manifest has inconsistent source_sha")
     config_by_system: dict[str, str] = {}
@@ -732,6 +793,10 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         eval_streams, eval_walkers, eval_draws = protocol.eval_streams, protocol.eval_walkers, protocol.eval_draws
     if eval_streams <= 0 or eval_walkers <= 0 or eval_draws <= 0:
         raise ProtocolError("evaluation dimensions must be positive")
+    if not checkpoints or any(not isinstance(step, int) or step <= 0 for step in checkpoints):
+        raise ProtocolError("checkpoints must be a non-empty list of positive updates")
+    if len(set(checkpoints)) != len(checkpoints):
+        raise ProtocolError("checkpoints must not contain duplicates")
     phase1_source_sha = next(iter(source_shas))
     if source_sha is not None and source_sha != phase1_source_sha:
         raise ProtocolError("phase-2 source_sha differs from phase-1 manifest")
@@ -743,10 +808,12 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
     phase1_devices = {row.get("device") for row in train_rows}
     if len(phase1_devices) > 1 or (phase1_devices and next(iter(phase1_devices)) not in {None, "cpu", "cuda"}):
         raise ProtocolError("phase-1 manifest has an invalid device binding")
+    phase1_device = next(iter(phase1_devices), None)
     if device is not None and device not in {"cpu", "cuda"}:
         raise ProtocolError("device must be 'cpu' or 'cuda'")
-    if device is not None and phase1_devices and next(iter(phase1_devices)) not in {None, device}:
+    if device is not None and phase1_device not in {None, device}:
         raise ProtocolError("phase-2 device differs from phase-1 manifest")
+    effective_device = phase1_device if device is None else device
     rows: list[dict[str, Any]] = []
     physical_ids = dict(expected_physical_system_id or planned_physical_system_ids())
     for system in systems:
@@ -756,8 +823,6 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         system = str(train_row["system"])
         lineage = int(train_row["lineage"])
         for checkpoint in checkpoints:
-            if not isinstance(checkpoint, int) or checkpoint <= 0:
-                raise ProtocolError("checkpoints must be a non-empty list of positive updates")
             key = (system, lineage, checkpoint)
             digest = _require_sha(checkpoint_sha256.get(key), length=64,
                                   field=f"checkpoint_sha256[{key!r}]")
@@ -774,6 +839,8 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
                     "source_sha": phase1_source_sha,
                     "config_sha256": config_by_system[system],
                     "config_identity_rule": CONFIG_IDENTITY_RULE,
+                    "phase1_manifest_hash": phase1_manifest_hash,
+                    "phase1_train_row_hash": manifest_hash([train_row]),
                     "config": f"configs/{system}/eval.yaml", "results_root": train_row["results_root"],
                     "expected_physical_system_id": physical_ids[system],
                     "experiment_name": train_row["experiment_name"], "sector": train_row["sector"],
@@ -782,8 +849,8 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
                     "checkpoint_sha256": digest, "depends_on": train_row["row_id"],
                 }
                 rows.append(row)
-                if device is not None:
-                    row["device"] = device
+                if effective_device is not None:
+                    row["device"] = effective_device
     for row in rows:
         _validate_run_identity(row)
         _checkpoint_binding(row)

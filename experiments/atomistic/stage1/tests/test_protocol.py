@@ -272,6 +272,57 @@ def test_phase2_requires_checkpoint_binding() -> None:
         )
 
 
+def test_phase2_rejects_a_duplicate_checkpoint() -> None:
+    with pytest.raises(ProtocolError, match="duplicates"):
+        bind_evaluation_manifest(
+            phase1_rows=_phase1_rows(), checkpoints=[7, 7], checkpoint_sha256=_phase2_bindings(),
+            expected_physical_system_id={"he": "c" * 64},
+        )
+
+
+def test_phase2_requires_the_stored_phase1_manifest_hash() -> None:
+    rows = _phase1_rows()
+    with pytest.raises(ProtocolError, match="manifest_hash"):
+        bind_evaluation_manifest(
+            phase1_rows=rows, checkpoints=[7], checkpoint_sha256=_phase2_bindings(),
+            expected_physical_system_id={"he": "c" * 64}, phase1_manifest_hash="a" * 64,
+        )
+
+
+def test_phase2_rows_carry_phase1_manifest_and_train_identity() -> None:
+    phase1 = _phase1_rows()
+    phase1_hash = protocol_module.manifest_hash(phase1)
+    bound = bind_evaluation_manifest(
+        phase1_rows=phase1, checkpoints=[7], checkpoint_sha256=_phase2_bindings(),
+        expected_physical_system_id={"he": "c" * 64}, phase1_manifest_hash=phase1_hash,
+    )
+    train = next(row for row in phase1 if row["kind"] == "train")
+    assert {row["phase1_manifest_hash"] for row in bound} == {phase1_hash}
+    assert {row["phase1_train_row_hash"] for row in bound} == {
+        protocol_module.manifest_hash([train])
+    }
+
+
+def test_phase2_rejects_a_conflicting_config_identity() -> None:
+    with pytest.raises(ProtocolError, match="config_sha256"):
+        bind_evaluation_manifest(
+            phase1_rows=_phase1_rows(), checkpoints=[7], checkpoint_sha256=_phase2_bindings(),
+            expected_physical_system_id={"he": "c" * 64},
+            config_sha256={"he": "d" * 64},
+        )
+
+
+def test_phase2_inherits_phase1_device_when_not_overridden() -> None:
+    rows = _phase1_rows()
+    for row in rows:
+        row["device"] = "cuda"
+    bound = bind_evaluation_manifest(
+        phase1_rows=rows, checkpoints=[7], checkpoint_sha256=_phase2_bindings(),
+        expected_physical_system_id={"he": "c" * 64},
+    )
+    assert all(row["device"] == "cuda" for row in bound)
+
+
 def test_phase2_rejects_missing_identity_rule() -> None:
     rows = _phase1_rows()
     next(row for row in rows if row["kind"] == "train").pop("config_identity_rule")
