@@ -13,6 +13,7 @@ from experiments.atomistic.stage1.launch import _binding_token, row_overrides
 from experiments.atomistic.stage1.protocol import (
     Protocol,
     ProtocolError,
+    SYSTEMS,
     build_manifest,
     physical_system_id_from_config,
     validate_gateway_binding,
@@ -22,9 +23,6 @@ from tpen.run import load_config
 
 REPO_ROOT = Path.cwd()
 CONFIG_ROOT = REPO_ROOT / "experiments" / "atomistic" / "stage1" / "configs"
-SYSTEMS = ("hooke1", "he", "h2")
-
-
 @pytest.fixture(autouse=True)
 def _assert_external_packet_imports_reviewed_checkout() -> None:
     """Ensure an externally staged test exercises the exact cloned source."""

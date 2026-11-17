@@ -16,10 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from omegaconf import OmegaConf
+
 from experiments.baselines.systems import load_registry
 from experiments.toolkit.run_paths import resolve_run_dir
 
-SYSTEMS = ("hooke1", "he", "h2")
+SYSTEMS = ("hooke1", "hooke2", "he", "h2")
 KINDS = ("smoke", "train", "eval")
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -81,6 +83,7 @@ class Protocol:
 STAGE1_PROTOCOL = Protocol(1000, 256, 50000, 4096, 3, 4, 4096, 256)
 SYSTEM_SPECS = tuple(SystemSpec(name, system_id) for name, system_id in (
     ("hooke1", "hooke_one_electron_omega0.5"),
+    ("hooke2", "hooke_pair_singlet_omega0.5"),
     ("he", "he_atom"),
     ("h2", "h2_molecule"),
 ))
@@ -198,7 +201,7 @@ def evaluation_seed(*, system: str, lineage: int, checkpoint: int, stream: int) 
         raise ProtocolError("invalid evaluation seed coordinates")
     # The checkpoint is a coordinate, not an array index, so non-default lists
     # cannot alias one another.  The leading kind/system fields separate all
-    # three row kinds and all three systems.
+    # three row kinds and all four systems.
     return _encode_seed(kind="eval", system=system, lineage=lineage,
                         checkpoint=checkpoint, stream=stream)
 
@@ -319,14 +322,23 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
     return row
 
 
-def physical_system_id_from_config(config_path: str | Path) -> str:
-    """Instantiate a Stage-1 eval config and return its descriptor content ID."""
+def physical_system_id_from_config(
+    config_path: str | Path,
+    *,
+    train_config_path: str | Path | None = None,
+    system_name: str | None = None,
+) -> str:
+    """Validate an eval descriptor and return its physical content ID.
 
-    from hydra.utils import instantiate
-    from tpen.run import load_config
+    When ``train_config_path`` is supplied, the train Hamiltonian is built
+    from its actual configured terms and compared with the eval descriptor
+    before the eval identity is admitted to a plan.  The content ID covers
+    particles, operator IDs, physical parameters, and resources; slots and
+    their operator bindings are compared explicitly because slots are omitted
+    from the descriptor's physical content hash.
+    """
 
-    cfg = load_config(str(config_path))
-    descriptor = instantiate(cfg.system_descriptor)
+    cfg, descriptor = _load_configured_descriptor(config_path)
     registry = load_registry()
     entry = next((item for item in registry.get("systems", [])
                   if item.get("id") == cfg.system.id), None)
@@ -401,7 +413,68 @@ def physical_system_id_from_config(config_path: str | Path) -> str:
     system_id = descriptor.system_id()
     if not isinstance(system_id, str) or not _SHA256.fullmatch(system_id):
         raise ProtocolError("configured system descriptor did not produce a SHA-256 ID")
+    if train_config_path is not None:
+        label = system_name or str(cfg.system.id)
+        try:
+            train_cfg, train_descriptor = _load_configured_descriptor(train_config_path)
+        except Exception as exc:
+            raise ProtocolError(
+                f"train/eval Hamiltonian mismatch for {label} config {train_config_path}"
+            ) from exc
+        eval_bindings = tuple(sorted((term.slot, str(term.operator_id))
+                                     for term in descriptor.terms))
+        train_bindings = tuple(sorted((term.slot, str(term.operator_id))
+                                      for term in train_descriptor.terms))
+        if (train_cfg.system.id != cfg.system.id
+                or train_bindings != eval_bindings
+                or train_descriptor.system_id() != system_id):
+            raise ProtocolError(f"train/eval Hamiltonian mismatch for {label}")
     return system_id
+
+
+def planned_physical_system_ids(
+    config_root: str | Path | None = None,
+) -> dict[str, str]:
+    """Return train/eval-validated physical IDs for every planned system."""
+
+    root = Path(config_root) if config_root is not None else Path(__file__).parent / "configs"
+    return {
+        name: physical_system_id_from_config(
+            root / name / "eval.yaml",
+            train_config_path=root / name / "train.yaml",
+            system_name=name,
+        )
+        for name in SYSTEMS
+    }
+
+
+def _load_configured_descriptor(config_path: str | Path) -> tuple[Any, Any]:
+    """Load a config and instantiate its config-owned system descriptor."""
+
+    from hydra.utils import instantiate
+    from tpen.run import load_config
+
+    cfg = load_config(str(config_path))
+    system_name = str(cfg.system.id)
+    descriptor_terms = OmegaConf.to_container(cfg.system_descriptor.terms, resolve=True)
+    if "runner" in cfg and "hamiltonian_terms" in cfg.runner:
+        consumed_terms = cfg.runner.hamiltonian_terms
+        consumer = "runner.hamiltonian_terms"
+    elif "evaluation_tasks" in cfg:
+        consumed_terms = cfg.evaluation_tasks.mcmc_energy.generator.hamiltonian_terms
+        consumer = "evaluation_tasks.mcmc_energy.generator.hamiltonian_terms"
+    else:
+        raise ProtocolError(
+            f"system {system_name!r} config {config_path}: "
+            "no consumed hamiltonian_terms binding"
+        )
+    resolved_consumed_terms = OmegaConf.to_container(consumed_terms, resolve=True)
+    if descriptor_terms != resolved_consumed_terms:
+        raise ProtocolError(
+            f"system {system_name!r} config {config_path}: "
+            f"system_descriptor.terms do not match consumed {consumer}"
+        )
+    return cfg, instantiate(cfg.system_descriptor)
 
 
 def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
@@ -412,7 +485,9 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
     """Expand systems into validated smoke, train, and eval rows.
 
     Parameters are explicit rather than defaulted so a missing identity or
-    checkpoint binding fails before a launch script can be rendered.
+    checkpoint binding fails before a launch script can be rendered. The
+    explicit physical-ID map is retained for unit fixtures; production
+    planning leaves it unset so train/eval parity is always checked here.
     """
 
     protocol.validate()
@@ -421,11 +496,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
     root = _safe_results_root(results_root)
     physical_ids = dict(expected_physical_system_id or {})
     if not physical_ids:
-        config_root = Path(__file__).parent / "configs"
-        physical_ids = {
-            name: physical_system_id_from_config(config_root / name / "eval.yaml")
-            for name in SYSTEMS
-        }
+        physical_ids = planned_physical_system_ids()
     for name in SYSTEMS:
         _require_sha(physical_ids.get(name), length=64,
                      field=f"expected_physical_system_id[{name!r}]")
