@@ -88,17 +88,35 @@ def test_producer_logged_config_accepts_same_dump_when_boolean_is_false():
 def test_full_run_modes_are_fixed_and_allowlisted():
     """Full runs expose only the two operator-approved fixed shapes."""
 
+    ramp = run_mode_spec("ramp")
     ferminet = run_mode_spec("full-ferminet")
     psiformer = run_mode_spec("full-psiformer")
+    assert ramp["steps"] == 1000
     assert ferminet["steps"] == 50000
     assert psiformer["steps"] == 30000
-    assert [row["row"] for row in ferminet["rows"]] == [
-        "ferminet-codebase-ferminet-seed0",
-        "ferminet-codebase-ferminet-seed1",
-        "ferminet-codebase-ferminet-seed2",
+    assert [
+        (row["row"], row["ansatz"], row["seed"], row["gpu"])
+        for row in ramp["rows"]
+    ] == [
+        ("ferminet-codebase-ferminet-seed0", "ferminet", 0, 0),
+        ("ferminet-codebase-psiformer-seed0", "psiformer", 0, 1),
     ]
-    assert [row["seed"] for row in psiformer["rows"]] == [0, 1, 2]
-    assert [row["gpu"] for row in ferminet["rows"]] == [0, 1, 2]
+    assert [
+        (row["row"], row["ansatz"], row["seed"], row["gpu"])
+        for row in ferminet["rows"]
+    ] == [
+        ("ferminet-codebase-ferminet-seed0", "ferminet", 0, 0),
+        ("ferminet-codebase-ferminet-seed1", "ferminet", 1, 1),
+        ("ferminet-codebase-ferminet-seed2", "ferminet", 2, 2),
+    ]
+    assert [
+        (row["row"], row["ansatz"], row["seed"], row["gpu"])
+        for row in psiformer["rows"]
+    ] == [
+        ("ferminet-codebase-psiformer-seed0", "psiformer", 0, 0),
+        ("ferminet-codebase-psiformer-seed1", "psiformer", 1, 1),
+        ("ferminet-codebase-psiformer-seed2", "psiformer", 2, 2),
+    ]
     with pytest.raises(ValueError, match="allowlist"):
         run_mode_spec("full-ferminet-50000")
 
