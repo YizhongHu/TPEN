@@ -24,8 +24,8 @@ def _manifest(tmp_path: Path, streams: int = 4) -> dict:
     return {"schema": "stage1/v3", "manifest_hash": manifest_hash(rows), "rows": rows}
 
 
-def _install_single_fake(monkeypatch, tmp_path: Path, **changes):
-    document = _manifest(tmp_path, streams=1)
+def _install_single_fake(monkeypatch, tmp_path: Path, *, streams: int = 1, **changes):
+    document = _manifest(tmp_path, streams=streams)
     identity = {"schema": "tpen-config-identity-v1", "sha256": "b" * 64}
     base = dict(record_schema="trajectory_records/v2", draw_count=2, walker_count=2, row_count=4,
                 finite_count=4, mean=2.5, variance=1.25, csv_sha256="d" * 64,
@@ -296,6 +296,7 @@ def test_writer_statistics_are_forwarded_without_reducing_again(
     _install_single_fake(
         monkeypatch,
         tmp_path,
+        streams=4,
         mean=writer_mean,
         variance=writer_variance,
     )
