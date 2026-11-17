@@ -53,7 +53,19 @@ training updates.
 | He train observability | he-v1: `DataIntegrity` every 1, `GradientStats` every 5; CSV and JSONL loggers | Both callbacks and both loggers omitted | Same bounded Stage-1 config surface; these diagnostics are outside the Stage-1 manifest contract. |
 | H2 train observability | h2-v1: `DataIntegrity` every 1, `GradientStats` every 5; CSV and JSONL loggers | Both callbacks and both loggers omitted | Same bounded Stage-1 config surface; these diagnostics are outside the Stage-1 manifest contract. |
 | Evaluation loggers | h-v2, he-v1, and h2-v1 each write CSV/JSONL or JSONL metrics | No metric logger in the Stage-1 eval configs | Stage-1 evaluation retains trajectory records and summaries as its required evidence; study-specific metric logging is not part of this layer. |
+| Manifest seed encoding | Prior mixed-radix coordinates could exceed Torch's signed int64 seed range | Deterministic SHA-256 digest mapped to `[0, 2**63-2]`; manifest-wide collision refusal and boundary tests | The real producer exposed Torch overflow. Retaining unbounded mixed-radix values was rejected because every run seeds Torch generators. |
+| Stage-1 evaluation statistics summary | `TrajectoryStatisticsSummary` without its required identity fields | Removed from Stage-1 eval configs; provenance remains from `Evaluator._evaluation_identity`, and collection computes statistics from the inspected grid | Supplying `stage`, `run_id`, `attempt_id`, `evaluator_id`, and `config_sha256` from `launch.py` was rejected because it would broaden the launcher contract without an owned evaluator identity. |
+| Stage-1 record calculators | Eval configs supplied only `LocalEnergyCalculator` | Add `WavefunctionCalculator` beside it | `SampledRecordWriter` requires the wavefunction bundle field for durable records; the canonical producer wiring supplies both calculators. |
 
 `plan.py` writes a manifest only. `launch.py` renders a script only; submission
 is an explicit operator action. The generated script requires Slurm, checks the
 delivered partition, uses node-local per-job scratch, and records job identity.
+
+The real-producer integration test is marked `stage1_real_producer` and remains
+in default collection. Mutant packets select their test paths explicitly so
+this producer chain is not multiplied across mutants; the base-on Stage-1
+verification must include it explicitly, for example:
+
+```text
+pytest -q experiments/atomistic/stage1/tests/test_real_producer_e2e.py
+```

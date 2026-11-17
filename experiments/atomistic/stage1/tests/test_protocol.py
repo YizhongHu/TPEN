@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+import experiments.atomistic.stage1.protocol as protocol_module
 
 from experiments.atomistic.stage1.protocol import (
     _encode_seed,
+    _TORCH_SEED_MODULUS,
     Protocol,
     ProtocolError,
     STAGE1_PROTOCOL,
@@ -23,6 +29,7 @@ from experiments.atomistic.stage1.protocol import (
 
 SHA1 = "a" * 40
 SHA256 = "b" * 64
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 def _manifest(checkpoints: list[int] = [7, 101]) -> list[dict[str, object]]:
@@ -85,12 +92,52 @@ def test_seed_encoding_covers_field_maxima_and_old_collision_boundaries() -> Non
     assert evaluation_seed(system="hooke1", lineage=0, checkpoint=500_000, stream=0) != smoke_seed(system="he")
 
 
+def test_seed_known_vectors_are_cross_process_stable_across_hash_seeds() -> None:
+    """The protocol vectors do not depend on Python's randomized hash salt."""
+
+    code = (
+        "import json; "
+        "from experiments.atomistic.stage1.protocol import evaluation_seed, smoke_seed, training_seed; "
+        "print(json.dumps([smoke_seed(system='hooke1'), "
+        "training_seed(system='he', lineage=7, lineage_seed=17), "
+        "evaluation_seed(system='h2', lineage=12, checkpoint=101, stream=3)]))"
+    )
+    expected = [3275376356878631123, 1864976247629386342, 6989498304342109654]
+    outputs = []
+    for hash_seed in ("1", "987654321"):
+        env = dict(os.environ, PYTHONHASHSEED=hash_seed)
+        outputs.append(subprocess.check_output(
+            [sys.executable, "-c", code], cwd=REPO_ROOT, env=env, text=True,
+        ).strip())
+    assert [json.loads(output) for output in outputs] == [expected, expected]
+
+
+def test_manifest_refuses_forced_seed_collision(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(protocol_module, "_encode_seed", lambda **_: 123)
+    with pytest.raises(ProtocolError, match="seed collision"):
+        _manifest(checkpoints=[7])
+
+
+def test_seeds_fit_torch_at_coordinate_maxima_and_reject_overflow() -> None:
+    seeds = [
+        smoke_seed(system="h2"),
+        training_seed(system="h2", lineage=999_999, lineage_seed=999_999_999),
+        evaluation_seed(system="h2", lineage=999_999, checkpoint=999_999, stream=999_999),
+    ]
+    assert all(0 <= seed < _TORCH_SEED_MODULUS for seed in seeds)
+    with pytest.raises(ProtocolError, match="invalid training seed coordinates"):
+        training_seed(system="h2", lineage=1_000_000, lineage_seed=0)
+    with pytest.raises(ProtocolError, match="invalid evaluation seed coordinates"):
+        evaluation_seed(system="h2", lineage=0, checkpoint=1_000_000, stream=0)
+
+
 def test_manifest_binds_real_identity_and_checkpoint_expectations() -> None:
     rows = _manifest()
     assert len(rows) == 84
     assert len({row["row_id"] for row in rows}) == 84
     assert all("seed" in row for row in rows)
     assert len({row["seed"] for row in rows}) == 84
+    assert all(0 <= int(row["seed"]) < _TORCH_SEED_MODULUS for row in rows)
     eval_row = next(row for row in rows if row["kind"] == "eval")
     assert eval_row["source_sha"] == SHA1
     assert eval_row["config_sha256"] == SHA256
