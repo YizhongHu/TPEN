@@ -93,7 +93,7 @@ def test_gpu_render_requires_explicit_shape_and_cuda_binding() -> None:
     assert "#SBATCH --mem=64G" in script
     assert "#SBATCH --time=08:00:00" in script
     assert "runtime.device=cuda" in script
-    assert "expected exactly one visible GPU" in script
+    assert "expected exactly one management GPU" in script
 
 
 def test_gpu_render_rejects_cpu_binding_and_invalid_resources() -> None:
@@ -136,7 +136,7 @@ def test_gpu_partition_guard_accepts_one_requested_partition(
     result = _run(script, tmp_path, PATH=f"{fake_bin}:/usr/bin:/bin",
                    SLURM_JOB_ID="123", SLURM_JOB_PARTITION="gpu")
     assert result.returncode == 0, result.stderr
-    assert "STAGE1_GUARD nvidia-smi=NVIDIA A100-SXM4-80GB, 81920" in result.stdout
+    assert f"STAGE1_GUARD nvidia-smi={gpu_name}, 81920" in result.stdout
 
 
 @pytest.mark.parametrize("gpu_output", [
