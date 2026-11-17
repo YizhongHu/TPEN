@@ -68,7 +68,7 @@ def test_producer_logged_config_accepts_same_dump_when_boolean_is_false():
 
     stderr = (Path(__file__).parent / "testdata" / "ferminet-stderr-pbs7857872-config.log").read_text()
     stderr = stderr.replace("  reset_if_nan: true", "  reset_if_nan: false")
-    config = parse_ferminet_logged_config(stderr, steps=1000)
+    config = parse_ferminet_logged_config(stderr, steps=1000, expected_network_type="ferminet")
     assert config["reset_if_nan"] is False
     assert config["check_nan"] is True
     assert config["deterministic"] is True
@@ -76,6 +76,62 @@ def test_producer_logged_config_accepts_same_dump_when_boolean_is_false():
     assert config["batch_size"] == 4096
     assert config["iterations"] == 1000
     assert config["pretrain_iterations"] == 0
+
+
+def test_producer_logged_config_rejects_truncated_dump_before_system_record():
+    """A prefix ending before the required system record is not evidence."""
+
+    stderr = (Path(__file__).parent / "testdata" / "ferminet-stderr-pbs7857872-config.log").read_text()
+    truncated = stderr.split("system:\n", 1)[0]
+    with pytest.raises(ValueError, match="complete|system"):
+        parse_ferminet_logged_config(truncated, steps=1000, expected_network_type="ferminet")
+
+
+def test_producer_logged_config_rejects_multiple_records_and_duplicate_paths():
+    """A receipt cannot merge records or silently accept duplicate required paths."""
+
+    fixture = (Path(__file__).parent / "testdata" / "ferminet-stderr-pbs7857872-config.log").read_text()
+    good = fixture.replace("  reset_if_nan: true", "  reset_if_nan: false")
+    with pytest.raises(ValueError, match="single|record"):
+        parse_ferminet_logged_config(good + "\nI1117 16:57:00 main.py:34] System config:\n\n", steps=1000, expected_network_type="ferminet")
+    duplicate = good.replace("  network_type: ferminet\n", "  network_type: ferminet\n  network_type: psiformer\n")
+    with pytest.raises(ValueError, match="duplicate"):
+        parse_ferminet_logged_config(duplicate, steps=1000, expected_network_type="ferminet")
+
+
+@pytest.mark.parametrize(
+    ("replacement", "message"),
+    [
+        ("  atomic_number: 1\n", "nucleus"),
+        ("  charge: 1.0\n", "charge"),
+        ("    - 0.0\n    - 0.0\n    - 1.0\n", "origin"),
+        ("  - 2\n  - 0\n", "electrons"),
+    ],
+)
+def test_producer_logged_config_rejects_wrong_system_identity(replacement, message):
+    """The receipt checks the producer's logged H-atom identity, not intent."""
+
+    fixture = (Path(__file__).parent / "testdata" / "ferminet-stderr-pbs7857872-config.log").read_text()
+    stderr = fixture.replace("  reset_if_nan: true", "  reset_if_nan: false")
+    if message == "origin":
+        stderr = stderr.replace("    - 0.0\n    - 0.0\n    - 0.0\n", replacement)
+    elif message == "electrons":
+        stderr = stderr.replace("  - 1\n  - 0\n", replacement)
+    elif message == "nucleus":
+        stderr = stderr.replace("    atomic_number: 1\n", "    atomic_number: 2\n")
+    else:
+        stderr = stderr.replace("    charge: 1.0\n", "    charge: 2.0\n")
+    with pytest.raises(ValueError, match=message):
+        parse_ferminet_logged_config(stderr, steps=1000, expected_network_type="ferminet")
+
+
+def test_producer_logged_config_rejects_wrong_network_type():
+    """The row's expected ansatz must match the producer's logged config."""
+
+    stderr = (Path(__file__).parent / "testdata" / "ferminet-stderr-pbs7857872-config.log").read_text()
+    stderr = stderr.replace("  reset_if_nan: true", "  reset_if_nan: false")
+    with pytest.raises(ValueError, match="network_type"):
+        parse_ferminet_logged_config(stderr, steps=1000, expected_network_type="psiformer")
 
 
 def _write_trace(path, rows, fieldnames=("step", "energy", "ewmean", "ewvar", "pmove", "walker_variance")):
