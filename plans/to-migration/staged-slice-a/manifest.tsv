@@ -1,0 +1,16 @@
+legacy_skill	v4_skill	pinned_source_path
+adopt-project-scope	adopt-project-scope	claude-plugins/task-orchestrator/skills/adopt-project-scope/SKILL.md
+batch-complete	batch-complete	claude-plugins/task-orchestrator/skills/batch-complete/SKILL.md
+configure-server	configure-server	claude-plugins/task-orchestrator/skills/configure-server/SKILL.md
+create-item	create-item	claude-plugins/task-orchestrator/skills/create-item/SKILL.md
+dependency-manager	dependency-manager	claude-plugins/task-orchestrator/skills/dependency-manager/SKILL.md
+manage-schemas	manage-schemas	claude-plugins/task-orchestrator/skills/manage-schemas/SKILL.md
+post-plan-workflow	post-plan-workflow	claude-plugins/task-orchestrator/skills/post-plan-workflow/SKILL.md
+pre-plan-workflow	pre-plan-workflow	claude-plugins/task-orchestrator/skills/pre-plan-workflow/SKILL.md
+quick-start	quick-start	claude-plugins/task-orchestrator/skills/quick-start/SKILL.md
+ralph	ralph	claude-plugins/task-orchestrator/skills/ralph/SKILL.md
+review-proposals	review-proposals	claude-plugins/task-orchestrator/skills/review-proposals/SKILL.md
+schema-workflow	schema-workflow	claude-plugins/task-orchestrator/skills/schema-workflow/SKILL.md
+session-retrospective	session-retrospective	claude-plugins/task-orchestrator/skills/session-retrospective/SKILL.md
+status-progression	status-progression	claude-plugins/task-orchestrator/skills/status-progression/SKILL.md
+work-summary	work-summary	claude-plugins/task-orchestrator/skills/work-summary/SKILL.md
