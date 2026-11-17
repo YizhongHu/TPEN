@@ -157,7 +157,11 @@ def test_gpu_guard_rejects_mig_small_memory_and_multiple_gpus(
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     nvidia = fake_bin / "nvidia-smi"
-    nvidia.write_text(f"#!/bin/sh\nprintf '%b' '{gpu_output}'\n", encoding="utf-8")
+    nvidia.write_text(
+        f"#!/bin/sh\ncase \"$*\" in *mig.mode.current*) printf 'Disabled\\n';; "
+        f"*) printf '%b' '{gpu_output}';; esac\n",
+        encoding="utf-8",
+    )
     nvidia.chmod(0o750)
     python = _fake_gpu_python(fake_bin)
     script = render(
