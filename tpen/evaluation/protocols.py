@@ -27,6 +27,9 @@ class EvaluationContext:
     run_dir: Path
     task_output_dir: Path
     metadata: Mapping[str, Any]
+    resolved_config_identity: Mapping[str, str] | None = None
+    model_provenance: str = "constructed"
+    checkpoint_sha256: str | None = None
 
 
 class Generator(Protocol):

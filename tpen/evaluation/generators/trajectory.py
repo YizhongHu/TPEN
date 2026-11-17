@@ -111,6 +111,12 @@ class TrajectoryMCMCGenerator:
         `system` is supplied -- selection never silently falls back to naive
         for an explicitly requested evaluator.
 
+    Notes
+    -----
+    The v2 writer receives the run-derived identity from ``EvaluationContext``.
+    A checkpoint-backed run must provide the model-file digest; constructed
+    controls carry ``model_provenance="constructed"`` and no checkpoint hash.
+
     Raises
     ------
     ValueError
@@ -250,6 +256,9 @@ class TrajectoryMCMCGenerator:
                                 term_names=tuple(record.term_energies),
                                 system_descriptor=self.system,
                                 execution_receipt=result.receipt,
+                                resolved_config_identity=context.resolved_config_identity,
+                                model_provenance=context.model_provenance,
+                                checkpoint_sha256=context.checkpoint_sha256,
                                 first_draw=record,
                             )
                     else:

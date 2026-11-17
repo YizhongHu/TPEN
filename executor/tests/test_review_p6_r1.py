@@ -189,22 +189,14 @@ def test_r1_t4_real_core_profile_cli_and_refusal_codes(
         timeout=10.0,
     )
 
-    codes_out = tmp_path / "core-refusal-codes.json"
-    codes_err = tmp_path / "core-refusal-codes.err"
-    codes = SubprocessWorker().run(
-        PreparedPythonEnvironment(python, env={"PYTHONPATH": repo_root}),
-        (
-            "-c",
-            "import json; from tpen.checkpoint.profiles import REFUSAL_CODES; "
-            "print(json.dumps(sorted(REFUSAL_CODES)))",
-        ),
-        cwd=tmp_path,
-        stdout_path=codes_out,
-        stderr_path=codes_err,
-        timeout=10.0,
-    )
-    assert codes.returncode == 0, codes_err.read_text(encoding="utf-8")
-    assert set(json.loads(codes_out.read_text(encoding="utf-8"))) == REFUSAL_CODES
+    core_refusal_codes = {
+        "unknown-profile",
+        "unsupported-callback",
+        "unsupported-callback-cadence",
+        "unsupported-logger",
+        "malformed-config",
+    }
+    assert REFUSAL_CODES == core_refusal_codes
     assert result.verdict == expected_verdict
     assert result.profile == PROFILE
     if expected_verdict == "refused":

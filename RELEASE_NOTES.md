@@ -1,5 +1,124 @@
 # Release Notes
 
+## v0.5.3 - Stage 1 benchmark code, H-v2 salvage path, core-executor continuation
+
+43 commits since `v0.5.2` (`14235a0a`), merged into `dev` through PRs
+#706-#742, plus this version bump, released to `main` by #748. The version
+sources move to `0.5.3` in this release (operator request).
+
+```
+git log --format='%H' 14235a0a..1c15b144175719b331e2bbd564e691eddbc802e2 | wc -l
+```
+
+Release gate: full default suite at `1c15b144` on FASRC Cannon (`test`,
+typecheck on, executor arms included), root suite job 61620847: 8994 passed, 0 failed, 0 errors, 20 skipped; executor arms job 61620861: all steps exit 0 (root 9006 passed / 23 skipped; parsl py3.12 and py3.14 909 passed / 1 skipped each; no-parsl py3.12 and py3.14 858 passed / 39 skipped each), 0 failures, 0 errors. Receipt `release-gate-1c15b144` on TO 6f4c431e.
+
+Why now: Stage 1 science benchmarks (He due Nov 22, H2 Nov 29) must run from a
+`main` commit carrying the Stage 1 code; the H-v2 salvage path lets a timed-out
+science lineage be evaluated. Running H-v2 science TRAIN jobs stay pinned to
+`14235a0a` and are unaffected.
+
+### Added
+
+- **Stage 1 benchmarks** (H, Hooke-1e, Hooke-2e pair, He, H2): shared protocol,
+  plan and guarded launch (#713); collector and reference matching (#718);
+  launch/plan fixes and no-compute end-to-end (#722); additive
+  `tpen.inspection` eval-run inspection API (#723); system configs with
+  plan-pinned physical identity (#732); tiny real-producer train -> eval ->
+  inspect -> collect end-to-end (#733); two-electron Hooke pair, omega=0.5,
+  exact 2.0 Ha (#734); launchable smoke rows (#735); He/H2 recorded evaluation
+  with v2 record identity (#707).
+- **H-v2 salvage**: attested partial TRAIN inventory and eval/SEL over N
+  checkpoints (#727); 5k stride fallback for eval/SEL (#737).
+- **Core-executor continuation**: typed evidence v3 with producer-generated
+  fixtures; owner-defined operational-slot registry (CX-03); executor decodes
+  evidence v3, planned yield continuation-eligible; successor admission
+  request decoder/gates (CX-04a, #717) and builder with write-once ledger
+  (CX-04b, #720); successor admission gated on confirmed remote teardown
+  (CX-06, #730).
+- **Baselines**: trajectory summaries (#725); hydrogen registry entry (#724);
+  H-atom runbook (#729).
+- **He-importance**: frozen O1 scan manifest (#706); tracked scan design
+  document (#711, #716).
+
+### Fixed
+
+- Stage 1 launch drivers import `experiments` outside the checkout (#742).
+- FermiNet boolean overrides actually applied; run receipt reads the
+  producer's own logged config (#741).
+- FermiNet walker variance read correctly (#738); DeepQMC molecule/state
+  energy axes rejected (#736).
+- HI scan-manifest study modules registered under `spec.name` (#726).
+- Toolkit accepts remote-quiescence-unconfirmed outcome (#708).
+
+### Tests and documentation
+
+- CX-05 two-leaf core-executor continuation round trip (#728); catalog
+  membership binds checkpoint directory (#731).
+- Release notes for v0.5.2 (#710); version sources bumped to 0.5.2 (#712).
+- Version sources bumped to 0.5.3 (this PR).
+
+## v0.5.2 - H-v2 science code, core-executor contract start, Stage 1 records, executor teardown
+
+44 commits since `v0.5.1` (`76c35bc6`), merged into `dev` through 26 pull
+requests and released to `main` by #709 as `14235a0a` (tree identical to dev
+`fce3de22`). The tagged code still reports package version `0.5.1`; the
+version sources move to `0.5.2` on `dev` in #712.
+
+```
+git log --format='%H' 76c35bc63bcf2fee0cc2b3dee7587c5f1358b86c..fce3de22ccb88538f704ad329c94ea868b7b2e11 | wc -l
+```
+
+Release gate: full default suite at `fce3de22` on FASRC Cannon (`test`
+partition, typecheck on, executor arms included), job 60478238: 8586 passed,
+0 failed, 0 errors, 20 skipped.
+
+### Changed
+
+- **`scripts/cannon/verify.sh` type-checks by default** (#683). Runs now use
+  typeguard unless `--typecheck off` is passed. The overlay installs the
+  executor as an editable package and binds only the whole-word
+  `*_(EXECUTOR|ROOT|SCIENCE)_PYTHON` interpreter selectors (#696).
+- **Implementation lifecycle** (#705): an item advances to `review` only once
+  its PR is ready for human merge, so `unblockAt: review` fires at ready. The
+  review checklist asks any new test slower than 30 s to state and justify its
+  runtime.
+
+### Added
+
+- **H-v2 science code**: science horizon extended to 100k updates (#687);
+  `AmplitudeRiskFraction` enabled in the science A1 modules every 100 updates
+  (#690); evaluation generations packed per GPU job (#675); 100k pilot
+  consumer probes (#684).
+- **Core-executor contract**: boundary contract document and versioned
+  fixtures (CX-00, #693); published-boundary planned yield for resumable runs
+  (S4, #691).
+- **Executor**: bounded remote teardown acknowledgement (EX-S3.C, #668).
+- **Physics and evaluation (Stage 1)**: physical system descriptor and semantic
+  term declarations (#674); shared local-energy execution receipt and result
+  transport (#677); version-aware historical trajectory reader with immutable
+  v1 fixtures (#678); opt-in `trajectory_records/v2` writer and active-producer
+  binding (#682); one-electron Hooke oracle and reference registry (#695).
+- **Operational artifact routing** with constant science config (S3, #663).
+- **Baselines**: seed-spread summary for collected baseline records (#701).
+- **Cannon submit-lint** shared-environment prefix split (#676).
+
+### Fixed
+
+- `tpen.run` no longer imports `torch.nn` at module import; the planned-yield
+  and checkpoint names load lazily (#703, regression from #691).
+- Baseline rung builder uses checkout imports instead of a hard-coded home
+  path (#700).
+
+### Tests and documentation
+
+- Test-only fixes: S2 restore-test fakes are real `Runner` instances (#688);
+  chain-resume tests treat the R2.3 `trainer_cursor` refusal as an observed
+  outcome (#698); H-v2 store reservation probe stabilised (#685); named skip
+  when review-test interpreters are unset (#697); sampler-draw receipt with a
+  corrupted `transition_count` is refused (#699).
+- README release version set to 0.5.1 (#694).
+
 ## v0.5.1 - H-v2 100k pilot payload, shared Holystore environments, resume and executor layers
 
 33 commits since `v0.5.0` (`db001085`), merged into `dev` through 11 pull

@@ -1,0 +1,226 @@
+"""Contract tests for Stage-1 protocol identity and seed injectivity."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+import experiments.atomistic.stage1.protocol as protocol_module
+
+from experiments.atomistic.stage1.protocol import (
+    _encode_seed,
+    _TORCH_SEED_MODULUS,
+    Protocol,
+    ProtocolError,
+    SYSTEMS,
+    STAGE1_PROTOCOL,
+    build_manifest,
+    evaluation_seed,
+    identity_expectations,
+    smoke_seed,
+    physical_system_id_from_config,
+    stable_row_id,
+    training_seed,
+)
+
+
+SHA1 = "a" * 40
+SHA256 = "b" * 64
+REPO_ROOT = Path(__file__).resolve().parents[4]
+
+
+def _manifest(checkpoints: list[int] = [7, 101]) -> list[dict[str, object]]:
+    bindings = {(system, lineage, checkpoint): SHA256
+                for system in SYSTEMS
+                for lineage in range(3)
+                for checkpoint in checkpoints}
+    return build_manifest(protocol=STAGE1_PROTOCOL, source_sha=SHA1,
+                          config_sha256=SHA256, checkpoints=checkpoints,
+                          lineage_seeds=[11, 12, 13], checkpoint_sha256=bindings,
+                          results_root="/external/stage1")
+
+
+def test_protocol_has_no_implicit_partial_defaults() -> None:
+    with pytest.raises(TypeError):
+        Protocol()  # type: ignore[call-arg]
+
+
+def test_stage1_system_roster_includes_the_hooke_pair() -> None:
+    assert SYSTEMS == ("hooke1", "hooke2", "he", "h2")
+
+
+def test_seed_and_row_identity_are_injective_for_non_default_coordinates() -> None:
+    coords = [(system, lineage, checkpoint, stream)
+              for system in SYSTEMS
+              for lineage in (0, 1, 7)
+              for checkpoint in (7, 101, 100003)
+              for stream in (0, 3)]
+    assert len({evaluation_seed(system=s, lineage=l, checkpoint=c, stream=t)
+                for s, l, c, t in coords}) == len(coords)
+    assert len({stable_row_id(system=s, kind="eval", lineage=l, checkpoint=c, stream=t)
+                for s, l, c, t in coords}) == len(coords)
+    assert len({training_seed(system=s, lineage=l, lineage_seed=17)
+                for s in SYSTEMS for l in (0, 1, 7)}) == len(SYSTEMS) * 3
+
+
+def test_seed_encoding_covers_field_maxima_and_old_collision_boundaries() -> None:
+    rows = [
+        (kind, system, 0, 0, 0, 0)
+        for kind in ("smoke", "train", "eval")
+        for system in SYSTEMS
+    ] + [
+        (kind, system, 999_999, 999_999, 999_999, 999_999_999)
+        for kind in ("train", "eval")
+        for system in SYSTEMS
+    ]
+    seeds = {
+        (smoke_seed(system=system) if kind == "smoke" else
+         training_seed(system=system, lineage=lineage, lineage_seed=lineage_seed)
+         if kind == "train" else
+         evaluation_seed(system=system, lineage=lineage, checkpoint=checkpoint, stream=stream))
+        for kind, system, lineage, checkpoint, stream, lineage_seed in rows
+    }
+    assert len(seeds) == len(rows)
+    for system in SYSTEMS:
+        maxima = {
+            _encode_seed(kind=kind, system=system, lineage=999_999,
+                         checkpoint=999_999, stream=999_999,
+                         lineage_seed=999_999_999)
+            for kind in ("smoke", "train", "eval")
+        }
+        assert len(maxima) == 3
+    assert evaluation_seed(system="hooke1", lineage=0, checkpoint=400_000, stream=0) != smoke_seed(system="hooke1")
+    assert evaluation_seed(system="hooke1", lineage=0, checkpoint=500_000, stream=0) != smoke_seed(system="he")
+
+
+def test_seed_known_vectors_are_cross_process_stable_across_hash_seeds() -> None:
+    """The protocol vectors do not depend on Python's randomized hash salt."""
+
+    code = (
+        "import json; "
+        "from experiments.atomistic.stage1.protocol import evaluation_seed, smoke_seed, training_seed; "
+        "print(json.dumps([smoke_seed(system='hooke1'), "
+        "training_seed(system='he', lineage=7, lineage_seed=17), "
+        "evaluation_seed(system='h2', lineage=12, checkpoint=101, stream=3)]))"
+    )
+    expected = [3275376356878631123, 1864976247629386342, 6989498304342109654]
+    outputs = []
+    for hash_seed in ("1", "987654321"):
+        env = dict(os.environ, PYTHONHASHSEED=hash_seed)
+        outputs.append(subprocess.check_output(
+            [sys.executable, "-c", code], cwd=REPO_ROOT, env=env, text=True,
+        ).strip())
+    assert [json.loads(output) for output in outputs] == [expected, expected]
+
+
+def test_manifest_refuses_forced_seed_collision(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(protocol_module, "_encode_seed", lambda **_: 123)
+    with pytest.raises(ProtocolError, match="seed collision"):
+        _manifest(checkpoints=[7])
+
+
+def test_seeds_fit_torch_at_coordinate_maxima_and_reject_overflow() -> None:
+    seeds = [
+        smoke_seed(system="h2"),
+        training_seed(system="h2", lineage=999_999, lineage_seed=999_999_999),
+        evaluation_seed(system="h2", lineage=999_999, checkpoint=999_999, stream=999_999),
+    ]
+    assert all(0 <= seed < _TORCH_SEED_MODULUS for seed in seeds)
+    with pytest.raises(ProtocolError, match="invalid training seed coordinates"):
+        training_seed(system="h2", lineage=1_000_000, lineage_seed=0)
+    with pytest.raises(ProtocolError, match="invalid evaluation seed coordinates"):
+        evaluation_seed(system="h2", lineage=0, checkpoint=1_000_000, stream=0)
+
+
+def test_manifest_binds_real_identity_and_checkpoint_expectations() -> None:
+    rows = _manifest()
+    expected_rows = len(SYSTEMS) * (1 + 3 + 3 * 2 * 4)
+    assert len(rows) == expected_rows
+    assert len({row["row_id"] for row in rows}) == expected_rows
+    assert all("seed" in row for row in rows)
+    assert len({row["seed"] for row in rows}) == expected_rows
+    assert all(0 <= int(row["seed"]) < _TORCH_SEED_MODULUS for row in rows)
+    eval_row = next(row for row in rows if row["kind"] == "eval")
+    assert eval_row["source_sha"] == SHA1
+    assert eval_row["config_sha256"] == SHA256
+    expected = identity_expectations(eval_row)
+    assert set(expected) == {"expected_checkpoint_sha256"}
+    assert expected["expected_checkpoint_sha256"] == SHA256
+    assert "resolved_config_identity" not in eval_row
+
+
+def test_smoke_rows_use_real_train_config_and_final_checkpoint_step() -> None:
+    rows = _manifest()
+    smoke_rows = [row for row in rows if row["kind"] == "smoke"]
+    assert {row["config"] for row in smoke_rows} == {
+        f"configs/{system}/train.yaml" for system in SYSTEMS
+    }
+    assert all(row["checkpoint_steps"] == [STAGE1_PROTOCOL.smoke_updates]
+               for row in smoke_rows)
+
+
+def test_manifest_pins_configured_physical_identity_on_eval_rows() -> None:
+    rows = _manifest(checkpoints=[7])
+    config_root = Path(__file__).parents[1] / "configs"
+    for row in rows:
+        if row["kind"] == "eval":
+            expected = row["expected_physical_system_id"]
+            assert isinstance(expected, str) and len(expected) == 64
+            assert all(character in "0123456789abcdef" for character in expected)
+            assert expected == physical_system_id_from_config(
+                config_root / str(row["system"]) / "eval.yaml"
+            )
+        else:
+            assert "expected_physical_system_id" not in row
+
+
+@pytest.mark.parametrize(
+    "ids",
+    [
+        {"hooke1": "a" * 64},
+        {system: "not-a-digest" for system in SYSTEMS},
+    ],
+)
+def test_manifest_rejects_missing_or_invalid_explicit_physical_identity(ids: dict[str, str]) -> None:
+    bindings = {(system, lineage, 7): SHA256
+                for system in SYSTEMS for lineage in range(3)}
+    with pytest.raises(ProtocolError, match="expected_physical_system_id"):
+        build_manifest(
+            protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256=SHA256,
+            checkpoints=[7], lineage_seeds=[11, 12, 13], checkpoint_sha256=bindings,
+            results_root="/external/stage1", expected_physical_system_id=ids,
+        )
+
+
+@pytest.mark.parametrize("field,value", [("source_sha", "tiny"), ("config_sha256", "tiny")])
+def test_manifest_rejects_placeholder_identity(field: str, value: str) -> None:
+    kwargs = {"source_sha": SHA1, "config_sha256": SHA256, field: value}
+    with pytest.raises(ProtocolError):
+        build_manifest(protocol=STAGE1_PROTOCOL, checkpoints=[7], lineage_seeds=[11, 12, 13],
+                       checkpoint_sha256={(s, l, 7): SHA256 for s in SYSTEMS
+                                          for l in range(3)},
+                       results_root="/external/stage1", **kwargs)
+
+
+def test_manifest_rejects_placeholder_config_sha256() -> None:
+    with pytest.raises(ProtocolError, match="config_sha256"):
+        build_manifest(protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256="tiny",
+                       checkpoints=[7], lineage_seeds=[11, 12, 13],
+                       checkpoint_sha256={(s, l, 7): SHA256 for s in SYSTEMS
+                                          for l in range(3)},
+                       results_root="/external/stage1")
+
+
+def test_manifest_rejects_relative_results_root() -> None:
+    with pytest.raises(ProtocolError, match="results_root must be an absolute"):
+        build_manifest(
+            protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256=SHA256,
+            checkpoints=[7], lineage_seeds=[11, 12, 13],
+            checkpoint_sha256={(s, l, 7): SHA256 for s in SYSTEMS
+                               for l in range(3)},
+            results_root="relative/stage1",
+        )

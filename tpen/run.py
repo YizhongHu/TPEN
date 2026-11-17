@@ -715,21 +715,9 @@ def _validate_loggers(loggers: list[object]) -> None:
 #: registry's field list would never see. core-owned writes that instead go
 #: through `RunContext.path`/`ArtifactManager.path` are already physical
 #: because `ArtifactManager.run_dir` itself is bound to the destination.
-_ARTIFACT_SINK_FIELDS: dict[str, tuple[str, ...]] = {
-    "tpen.callback.snapshot.ConfigSnapshot": ("output_path",),
-    "tpen.callback.snapshot.ResolvedConfigSnapshot": ("output_path",),
-    "tpen.callback.metadata.Metadata": ("output_path",),
-    "tpen.callback.status.Status": ("output_path",),
-    "tpen.callback.checkpoint.Checkpoint": ("output_dir",),
-    "tpen.callback.initial_checkpoint.InitialCheckpoint": ("output_dir",),
-    "tpen.callback.evaluation.ArtifactIndex": ("path",),
-    "tpen.callback.evaluation.FailureLog": ("path",),
-    "tpen.callback.parameter_activity.ParameterActivity": ("output_path",),
-    "tpen.callback.equivariance.RuntimeEquivariance": ("artifact_dir",),
-    "tpen.callback.raw_training_batch_recorder.RawTrainingBatchRecorder": ("path",),
-    "tpen.logging.csv.CSV": ("path",),
-    "tpen.logging.jsonl.JSONL": ("path",),
-}
+from tpen.checkpoint.operational_slots import routed_sink_fields, sink_free_types
+
+_ARTIFACT_SINK_FIELDS: dict[str, tuple[str, ...]] = routed_sink_fields()
 
 #: Closed registry of callback/logger types known to own NO constructor-side
 #: output path at all (review-r2 B/R2.2). Membership is checked by EXACT
@@ -739,26 +727,7 @@ _ARTIFACT_SINK_FIELDS: dict[str, tuple[str, ...]] = {
 #: core callback/logger reachable from `experiments/atomistic/he-importance`
 #: or `tests/integration/artifacts/training/vmc_smoke.yaml` that is not a
 #: registered writer above is listed here; anything else is refused.
-_SINK_FREE_TYPES: frozenset[str] = frozenset(
-    {
-        "tpen.callback.amplitude_risk.AmplitudeRiskFraction",
-        "tpen.callback.electron_nucleus_distance.ElectronNucleusDistanceQuantiles",
-        "tpen.callback.factor_scalars.FactorScalars",
-        "tpen.callback.module_norms.ModuleNorms",
-        "tpen.callback.optimizer_state.OptimizerState",
-        "tpen.callback.resource_usage.ResourceUsage",
-        "tpen.callback.health.data_integrity.DataIntegrity",
-        "tpen.callback.health.gradient_stats.GradientStats",
-        "tpen.callback.health.sampler_health.SamplerHealth",
-        "tpen.callback.timing.diagnostic_timing.DiagnosticTiming",
-        "tpen.callback.timing.evaluation_component_timing.EvaluationComponentTiming",
-        "tpen.callback.timing.evaluation_timing.EvaluationTiming",
-        "tpen.callback.timing.run_timing.RunTiming",
-        "tpen.callback.timing.train_phase_timing.TrainPhaseTiming",
-        "tpen.callback.timing.train_step_timing.TrainStepTiming",
-        "tpen.callback.planned_yield.PlannedYield",
-    }
-)
+_SINK_FREE_TYPES: frozenset[str] = sink_free_types()
 
 
 def _registered_sink_fields(sink: object) -> tuple[str, ...] | None:

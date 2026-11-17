@@ -595,6 +595,41 @@ def test_reads_the_three_dimensional_dataset_shape(tmp_path: Path) -> None:
     assert read_energies(tmp_path) == pytest.approx([-2.9, -2.91, -2.92], abs=1e-6)
 
 
+@pytest.mark.parametrize("shape", [(3,), (3, 1), (3, 1, 1)])
+def test_read_energies_preserves_single_system_layouts(
+    tmp_path: Path, shape: tuple[int, ...]
+) -> None:
+    """Singleton molecule/state axes retain the historical flattened values."""
+
+    h5py = pytest.importorskip("h5py")
+    numpy = pytest.importorskip("numpy")
+    run = tmp_path / "training"
+    run.mkdir()
+    values = numpy.asarray([-2.9, -2.91, -2.92], dtype="float32").reshape(shape)
+    with h5py.File(run / "result.h5", "w") as handle:
+        handle.create_dataset(ENERGY_DATASET, data=values)
+
+    assert read_energies(tmp_path) == pytest.approx([-2.9, -2.91, -2.92], abs=1e-6)
+
+
+@pytest.mark.parametrize("shape", [(3, 2), (3, 1, 2)])
+def test_read_energies_rejects_molecule_and_state_axes(
+    tmp_path: Path, shape: tuple[int, ...]
+) -> None:
+    """Multiplicity axes must not be silently interpreted as extra steps."""
+
+    h5py = pytest.importorskip("h5py")
+    numpy = pytest.importorskip("numpy")
+    run = tmp_path / "training"
+    run.mkdir()
+    values = numpy.arange(1, numpy.prod(shape) + 1, dtype="float32").reshape(shape)
+    with h5py.File(run / "result.h5", "w") as handle:
+        handle.create_dataset(ENERGY_DATASET, data=values)
+
+    with pytest.raises(AdapterError, match="shape"):
+        read_energies(tmp_path)
+
+
 def test_missing_dataset_raises(tmp_path: Path) -> None:
     h5py = pytest.importorskip("h5py")
     run = tmp_path / "training"

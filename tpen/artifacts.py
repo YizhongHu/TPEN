@@ -347,6 +347,9 @@ class RunResult:
         """Return the JSON-safe public run outcome."""
         ref = self.checkpoint_ref
         return {
+            # Keep the S4 artifact self-describing.  The decoder lives with
+            # the run lifecycle events rather than in public inspection.
+            "schema": "tpen.run-outcome/v1",
             "status": self.status,
             "run_dir": None if self.run_dir is None else str(self.run_dir),
             "error": self.error,

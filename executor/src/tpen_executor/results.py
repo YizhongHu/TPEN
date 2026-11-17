@@ -94,6 +94,7 @@ class StartReceipt:
     """
 
     schema: ClassVar[str] = "tpen-executor/start-receipt-v1"
+    schema_v2: ClassVar[str] = "tpen-executor/start-receipt-v2"
     task_id: str
     attempt_id: AttemptId
     allocation_id: AllocationId
@@ -101,24 +102,45 @@ class StartReceipt:
     group_digest: str
     started_at_utc: str
     output_dir: str
+    transport_kind: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
         _identity(self.attempt_id, AttemptId, "attempt_id"); _identity(self.allocation_id, AllocationId, "allocation_id"); _identity(self.backend_job_id, BackendJobId, "backend_job_id")
         object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
         object.__setattr__(self, "started_at_utc", text(self.started_at_utc, "started_at_utc")); object.__setattr__(self, "output_dir", text(self.output_dir, "output_dir"))
+        if self.transport_kind is not None:
+            object.__setattr__(self, "transport_kind", text(self.transport_kind, "transport_kind"))
+            if self.transport_kind not in {"local", "remote"}:
+                raise ValueError("transport_kind must be local or remote")
 
     def to_dict(self) -> dict[str, Any]:
-        return {"schema": self.schema, "task_id": self.task_id, "attempt_id": self.attempt_id.value, "allocation_id": self.allocation_id.value, "backend_job_id": self.backend_job_id.value, "group_digest": self.group_digest, "started_at_utc": self.started_at_utc, "output_dir": self.output_dir}
+        result = {"schema": self.schema, "task_id": self.task_id, "attempt_id": self.attempt_id.value, "allocation_id": self.allocation_id.value, "backend_job_id": self.backend_job_id.value, "group_digest": self.group_digest, "started_at_utc": self.started_at_utc, "output_dir": self.output_dir}
+        if self.transport_kind is not None:
+            result["schema"] = self.schema_v2
+            result["transport_kind"] = self.transport_kind
+        return result
 
     def encode(self) -> bytes:
         return canonical_bytes(self.to_dict())
 
     @classmethod
     def from_mapping(cls, data: Any) -> "StartReceipt":
-        fields(data, {"schema", "task_id", "attempt_id", "allocation_id", "backend_job_id", "group_digest", "started_at_utc", "output_dir"}, cls.schema, "StartReceipt")
+        if not isinstance(data, Mapping):
+            raise TypeError("StartReceipt must be a mapping")
+        schema = data.get("schema")
+        if schema == cls.schema:
+            fields(data, {"schema", "task_id", "attempt_id", "allocation_id", "backend_job_id", "group_digest", "started_at_utc", "output_dir"}, cls.schema, "StartReceipt")
+            transport_kind = None
+        elif schema == cls.schema_v2:
+            fields(data, {"schema", "task_id", "attempt_id", "allocation_id", "backend_job_id", "group_digest", "started_at_utc", "output_dir", "transport_kind"}, cls.schema_v2, "StartReceipt")
+            transport_kind = data["transport_kind"]
+            if type(transport_kind) is not str or transport_kind not in {"local", "remote"}:
+                raise ValueError("StartReceipt v2 transport_kind must be local or remote")
+        else:
+            raise ValueError(f"StartReceipt schema is not {cls.schema!r} or {cls.schema_v2!r}")
         if any(type(data[key]) is not str for key in ("task_id", "attempt_id", "allocation_id", "backend_job_id", "group_digest", "started_at_utc", "output_dir")): raise TypeError("StartReceipt has an invalid field type")
-        return cls(data["task_id"], AttemptId(data["attempt_id"]), AllocationId(data["allocation_id"]), BackendJobId(data["backend_job_id"]), data["group_digest"], data["started_at_utc"], data["output_dir"])
+        return cls(data["task_id"], AttemptId(data["attempt_id"]), AllocationId(data["allocation_id"]), BackendJobId(data["backend_job_id"]), data["group_digest"], data["started_at_utc"], data["output_dir"], transport_kind)
 
     @classmethod
     def decode(cls, data: bytes | str | dict[str, Any]) -> "StartReceipt":
@@ -178,6 +200,302 @@ class OutcomeReceipt:
     @classmethod
     def decode(cls, data: bytes | str | dict[str, Any]) -> "OutcomeReceipt":
         return cls.from_mapping(decode_json(data))
+
+
+@frozen_record
+class RemoteTeardownReceipt:
+    """Durable controller record of one validated remote leaf teardown.
+
+    The leaf-authored wire acknowledgement remains in the transport result;
+    this executor-owned record is the controller's attempt-bound proof that
+    the acknowledgement was validated before terminal publication.
+
+    Parameters
+    ----------
+    task_id : str
+        Logical task identity.
+    attempt_id : AttemptId
+        Attempt identity bound to the receipt.
+    allocation_id : AllocationId
+        Allocation identity echoed by the leaf.
+    backend_job_id : BackendJobId
+        Backend job identity echoed by the leaf.
+    group_digest : str
+        Digest of the issuing ready group.
+    child_group_reaped : bool
+        Leaf-confirmed child-group reap fact.
+    inspection : str
+        Leaf teardown inspection state, either ``complete`` or ``not-run``.
+    leaf_result_digest : str
+        Digest of the canonical, already validated leaf result bytes/data.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/remote-teardown-v1"
+    task_id: str
+    attempt_id: AttemptId
+    allocation_id: AllocationId
+    backend_job_id: BackendJobId
+    group_digest: str
+    child_group_reaped: bool
+    inspection: str
+    leaf_result_digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
+        _identity(self.attempt_id, AttemptId, "attempt_id")
+        _identity(self.allocation_id, AllocationId, "allocation_id")
+        _identity(self.backend_job_id, BackendJobId, "backend_job_id")
+        object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
+        if type(self.child_group_reaped) is not bool:
+            raise TypeError("child_group_reaped must be a boolean")
+        if type(self.inspection) is not str or self.inspection not in {"complete", "not-run"}:
+            raise ValueError("inspection must be complete or not-run")
+        object.__setattr__(self, "leaf_result_digest", sha256_text(self.leaf_result_digest, "leaf_result_digest"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "task_id": self.task_id,
+            "attempt_id": self.attempt_id.value,
+            "allocation_id": self.allocation_id.value,
+            "backend_job_id": self.backend_job_id.value,
+            "group_digest": self.group_digest,
+            "child_group_reaped": self.child_group_reaped,
+            "inspection": self.inspection,
+            "leaf_result_digest": self.leaf_result_digest,
+        }
+
+    @property
+    def result_digest(self) -> str:
+        """Return the canonical validated leaf-result digest."""
+
+        return self.leaf_result_digest
+
+    def encode(self) -> bytes:
+        """Encode the receipt as canonical JSON bytes."""
+
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "RemoteTeardownReceipt":
+        """Decode one receipt from its exact closed mapping shape."""
+
+        fields(
+            data,
+            {
+                "schema", "task_id", "attempt_id", "allocation_id", "backend_job_id",
+                "group_digest", "child_group_reaped", "inspection", "leaf_result_digest",
+            },
+            cls.schema,
+            cls.__name__,
+        )
+        if any(
+            type(data[key]) is not str
+            for key in (
+                "task_id", "attempt_id", "allocation_id", "backend_job_id",
+                "group_digest", "inspection", "leaf_result_digest",
+            )
+        ) or type(data["child_group_reaped"]) is not bool:
+            raise TypeError("RemoteTeardownReceipt has an invalid field type")
+        return cls(
+            data["task_id"],
+            AttemptId(data["attempt_id"]),
+            AllocationId(data["allocation_id"]),
+            BackendJobId(data["backend_job_id"]),
+            data["group_digest"],
+            data["child_group_reaped"],
+            data["inspection"],
+            data["leaf_result_digest"],
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "RemoteTeardownReceipt":
+        """Decode one receipt from JSON-shaped data."""
+
+        return cls.from_mapping(decode_json(data))
+
+
+@frozen_record
+class CoreOutcomeRecord:
+    """Typed v3 core outcome retained beside the operational receipt.
+
+    This record deliberately does not change executor ``OutcomeReceipt``
+    status.  In particular, a planned yield is retained as typed evidence and
+    remains operationally non-completed; it is never an ``AcceptedSegment``.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/core-outcome-v1"
+    task_id: str
+    attempt_id: AttemptId
+    evidence: Mapping[str, Any]
+    continuation_eligible: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
+        _identity(self.attempt_id, AttemptId, "attempt_id")
+        if not isinstance(self.evidence, Mapping):
+            raise TypeError("core outcome evidence must be a mapping")
+        if type(self.continuation_eligible) is not bool:
+            raise TypeError("continuation_eligible must be a boolean")
+        from .runners import CoreRunEvidence
+
+        decoded = CoreRunEvidence.from_mapping(dict(self.evidence))
+        if decoded.schema != "tpen.run-evidence/v3":
+            raise ValueError("core outcome record requires v3 evidence")
+        if self.continuation_eligible != decoded.continuation_eligible:
+            raise ValueError("core outcome eligibility disagrees with v3 evidence")
+        object.__setattr__(self, "evidence", _freeze(decoded_mapping(decoded), "evidence"))
+
+    @property
+    def outcome(self) -> str:
+        """Return the core typed outcome without changing operational status."""
+
+        return self.evidence["outcome"]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "task_id": self.task_id,
+            "attempt_id": self.attempt_id.value,
+            "evidence": thaw(self.evidence),
+            "continuation_eligible": self.continuation_eligible,
+        }
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "CoreOutcomeRecord":
+        expected = {"schema", "task_id", "attempt_id", "evidence", "continuation_eligible"}
+        fields(data, expected, cls.schema, "CoreOutcomeRecord")
+        if any(type(data[key]) is not str for key in ("task_id", "attempt_id")):
+            raise TypeError("CoreOutcomeRecord identity fields have invalid types")
+        if type(data["continuation_eligible"]) is not bool:
+            raise TypeError("continuation_eligible must be a boolean")
+        return cls(data["task_id"], AttemptId(data["attempt_id"]), data["evidence"], data["continuation_eligible"])
+
+    @classmethod
+    def from_evidence(cls, task_id: str, attempt_id: AttemptId, evidence: Any) -> "CoreOutcomeRecord":
+        from .runners import CoreRunEvidence
+
+        if not isinstance(evidence, CoreRunEvidence):
+            raise TypeError("evidence must be CoreRunEvidence")
+        if evidence.schema != "tpen.run-evidence/v3":
+            raise ValueError("core outcome record requires v3 evidence")
+        return cls(task_id, attempt_id, decoded_mapping(evidence), evidence.continuation_eligible)
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "CoreOutcomeRecord":
+        return cls.from_mapping(decode_json(data))
+
+
+@frozen_record
+class SuccessorAdmissionRecord:
+    """One closed, write-once executor successor-admission ledger record.
+
+    The executor records the canonical digest of the request that the caller
+    presented to core and the caller-supplied digest of core's accepted
+    ``OperationalRestoreRequest``.  The acceptance is intentionally opaque at
+    this boundary: importing or reimplementing the core decision here would
+    violate the executor/core ownership split.  The caller (the dispatcher or
+    integration owner) is responsible for supplying a digest that actually
+    identifies an accepted request; the executor cannot verify that claim
+    without importing ``tpen``.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/successor-admission-v1"
+    predecessor_task_id: str
+    predecessor_attempt_id: AttemptId
+    predecessor_content_id: str
+    successor_task_id: str
+    successor_attempt_id: AttemptId
+    request_digest: str
+    core_acceptance_digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "predecessor_task_id", text(self.predecessor_task_id, "predecessor_task_id"))
+        _identity(self.predecessor_attempt_id, AttemptId, "predecessor_attempt_id")
+        object.__setattr__(self, "predecessor_content_id", sha256_text(self.predecessor_content_id, "predecessor_content_id"))
+        object.__setattr__(self, "successor_task_id", text(self.successor_task_id, "successor_task_id"))
+        _identity(self.successor_attempt_id, AttemptId, "successor_attempt_id")
+        object.__setattr__(self, "request_digest", sha256_text(self.request_digest, "request_digest"))
+        object.__setattr__(self, "core_acceptance_digest", sha256_text(self.core_acceptance_digest, "core_acceptance_digest"))
+
+    @property
+    def predecessor(self) -> dict[str, Any]:
+        """Return the predecessor identity in the ledger's nested shape."""
+
+        return {
+            "task_id": self.predecessor_task_id,
+            "attempt_id": self.predecessor_attempt_id.value,
+            "content_id": self.predecessor_content_id,
+        }
+
+    @property
+    def successor(self) -> dict[str, str]:
+        """Return the reserved successor identity in the ledger's nested shape."""
+
+        return {"task_id": self.successor_task_id, "attempt_id": self.successor_attempt_id.value}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "predecessor": self.predecessor,
+            "successor": self.successor,
+            "request_digest": self.request_digest,
+            "core_acceptance_digest": self.core_acceptance_digest,
+        }
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "SuccessorAdmissionRecord":
+        fields(data, {"schema", "predecessor", "successor", "request_digest", "core_acceptance_digest"}, cls.schema, cls.__name__)
+        if not isinstance(data["predecessor"], Mapping) or set(data["predecessor"]) != {"task_id", "attempt_id", "content_id"}:
+            raise ValueError("SuccessorAdmissionRecord.predecessor keys differ")
+        if not isinstance(data["successor"], Mapping) or set(data["successor"]) != {"task_id", "attempt_id"}:
+            raise ValueError("SuccessorAdmissionRecord.successor keys differ")
+        if any(type(data[key]) is not str for key in ("request_digest", "core_acceptance_digest")):
+            raise TypeError("successor admission digests must be text")
+        if any(type(data["predecessor"][key]) is not str for key in ("task_id", "attempt_id", "content_id")):
+            raise TypeError("successor admission predecessor fields must be text")
+        if any(type(data["successor"][key]) is not str for key in ("task_id", "attempt_id")):
+            raise TypeError("successor admission successor fields must be text")
+        return cls(
+            data["predecessor"]["task_id"],
+            AttemptId(data["predecessor"]["attempt_id"]),
+            data["predecessor"]["content_id"],
+            data["successor"]["task_id"],
+            AttemptId(data["successor"]["attempt_id"]),
+            data["request_digest"],
+            data["core_acceptance_digest"],
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "SuccessorAdmissionRecord":
+        return cls.from_mapping(decode_json(data))
+
+
+# Keep the shorter name available to callers without creating a second wire
+# type or a second ledger schema.
+SuccessorAdmission = SuccessorAdmissionRecord
+
+
+def decoded_mapping(evidence: Any) -> dict[str, Any]:
+    """Return the closed JSON mapping for a decoded v3 evidence record."""
+
+    return {
+        "schema": evidence.schema,
+        "run_dir": evidence.run_dir,
+        "verdict": evidence.verdict,
+        "run_status": evidence.run_status,
+        "checkpoint": None if evidence.checkpoint is None else dict(evidence.checkpoint),
+        "refusal": None if evidence.refusal is None else dict(evidence.refusal),
+        "resolved_config_identity": None if evidence.resolved_config_identity is None else dict(evidence.resolved_config_identity),
+        "outcome": evidence.outcome,
+        "checkpoint_ref": None if evidence.checkpoint_ref is None else dict(evidence.checkpoint_ref),
+    }
 
 
 @frozen_record
@@ -878,12 +1196,16 @@ class ManifestAttempt:
     """
 
     schema: ClassVar[str] = "tpen-executor/manifest-attempt-v1"
+    V1_SCHEMA: ClassVar[str] = schema
+    V2_SCHEMA: ClassVar[str] = "tpen-executor/manifest-attempt-v2"
     task_id: str
     attempt_id: AttemptId
     start_receipt: StartReceipt
     outcome_receipt: OutcomeReceipt | None
     output_dir: str
     placement_receipt: SciencePlacementReceipt | SciencePlacementReceiptV2 | SciencePlacementReceiptV3 | None = None
+    core_outcome: CoreOutcomeRecord | None = None
+    successor_admission: SuccessorAdmissionRecord | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_id", text(self.task_id, "task_id")); _identity(self.attempt_id, AttemptId, "attempt_id"); _identity(self.start_receipt, StartReceipt, "start_receipt"); _identity(self.start_receipt.attempt_id, AttemptId, "start_receipt.attempt_id")
@@ -904,12 +1226,29 @@ class ManifestAttempt:
                 or self.start_receipt.backend_job_id.value != self.placement_receipt.backend_job_id
             ):
                 raise ValueError("manifest attempt disagrees with placement receipt")
+        if self.core_outcome is not None:
+            if not isinstance(self.core_outcome, CoreOutcomeRecord):
+                raise TypeError("core_outcome must be CoreOutcomeRecord or None")
+            if self.task_id != self.core_outcome.task_id or self.attempt_id != self.core_outcome.attempt_id:
+                raise ValueError("manifest attempt disagrees with core outcome record")
+        if self.successor_admission is not None:
+            if not isinstance(self.successor_admission, SuccessorAdmissionRecord):
+                raise TypeError("successor_admission must be SuccessorAdmissionRecord or None")
+            if (
+                self.task_id != self.successor_admission.predecessor_task_id
+                or self.attempt_id != self.successor_admission.predecessor_attempt_id
+            ):
+                raise ValueError("manifest attempt disagrees with successor admission record")
         object.__setattr__(self, "output_dir", text(self.output_dir, "output_dir"))
 
     def to_dict(self) -> dict[str, Any]:
-        result = {"schema": self.schema, "task_id": self.task_id, "attempt_id": self.attempt_id.value, "start_receipt": self.start_receipt.to_dict(), "outcome_receipt": None if self.outcome_receipt is None else self.outcome_receipt.to_dict(), "output_dir": self.output_dir}
+        result = {"schema": self.V2_SCHEMA if (self.core_outcome is not None or self.successor_admission is not None) else self.V1_SCHEMA, "task_id": self.task_id, "attempt_id": self.attempt_id.value, "start_receipt": self.start_receipt.to_dict(), "outcome_receipt": None if self.outcome_receipt is None else self.outcome_receipt.to_dict(), "output_dir": self.output_dir}
         if self.placement_receipt is not None:
             result["placement_receipt"] = self.placement_receipt.to_dict()
+        if self.core_outcome is not None:
+            result["core_outcome"] = self.core_outcome.to_dict()
+        if self.successor_admission is not None:
+            result["successor_admission"] = self.successor_admission.to_dict()
         return result
 
     def encode(self) -> bytes:
@@ -919,14 +1258,38 @@ class ManifestAttempt:
     def from_mapping(cls, data: Any) -> "ManifestAttempt":
         legacy = {"schema", "task_id", "attempt_id", "start_receipt", "outcome_receipt", "output_dir"}
         current = legacy | {"placement_receipt"}
-        if not isinstance(data, Mapping) or set(data) not in (legacy, current):
+        v2_optional = {"core_outcome", "successor_admission"}
+        if not isinstance(data, Mapping):
             raise ValueError("ManifestAttempt keys differ")
-        fields(data, set(data), cls.schema, "ManifestAttempt")
+        schema = data.get("schema")
+        if schema == cls.V1_SCHEMA:
+            if set(data) not in (legacy, current):
+                raise ValueError("ManifestAttempt keys differ")
+            fields(data, set(data), cls.V1_SCHEMA, "ManifestAttempt")
+            if "core_outcome" in data:
+                raise ValueError("manifest-attempt-v1 cannot carry core_outcome")
+        elif schema == cls.V2_SCHEMA:
+            allowed = {
+                frozenset(base | optional)
+                for base in (legacy, current)
+                for optional in ({"core_outcome"}, {"successor_admission"}, v2_optional)
+            }
+            if frozenset(data) not in allowed:
+                raise ValueError("ManifestAttempt keys differ")
+            fields(data, set(data), cls.V2_SCHEMA, "ManifestAttempt")
+            if data.get("core_outcome") is None and data.get("successor_admission") is None:
+                raise ValueError("manifest-attempt-v2 requires a core outcome or successor admission")
+        else:
+            raise ValueError("ManifestAttempt schema is unknown")
         if any(type(data[key]) is not str for key in ("task_id", "attempt_id", "output_dir")): raise TypeError("ManifestAttempt has an invalid scalar field")
         outcome = None if data["outcome_receipt"] is None else OutcomeReceipt.from_mapping(data["outcome_receipt"])
         placement_data = data.get("placement_receipt")
         placement = None if placement_data is None else decode_placement_receipt(placement_data)
-        return cls(data["task_id"], AttemptId(data["attempt_id"]), StartReceipt.from_mapping(data["start_receipt"]), outcome, data["output_dir"], placement)
+        core_outcome_data = data.get("core_outcome")
+        core_outcome = None if core_outcome_data is None else CoreOutcomeRecord.from_mapping(core_outcome_data)
+        admission_data = data.get("successor_admission")
+        admission = None if admission_data is None else SuccessorAdmissionRecord.from_mapping(admission_data)
+        return cls(data["task_id"], AttemptId(data["attempt_id"]), StartReceipt.from_mapping(data["start_receipt"]), outcome, data["output_dir"], placement, core_outcome, admission)
 
     @classmethod
     def decode(cls, data: bytes | str | dict[str, Any]) -> "ManifestAttempt":
@@ -1054,6 +1417,14 @@ class RunManifest:
         if len({attempt.attempt_id for attempt in attempts}) != len(attempts): raise ValueError("duplicate attempt_id in manifest")
         if any(attempt.start_receipt.group_digest != self.group_digest or (attempt.outcome_receipt is not None and attempt.outcome_receipt.group_digest != self.group_digest) for attempt in attempts):
             raise ValueError("receipt group_digest does not match manifest group_digest")
+        if any(
+            attempt.core_outcome is not None
+            and attempt.outcome_receipt is not None
+            and attempt.core_outcome.outcome == "planned_yield"
+            and attempt.outcome_receipt.status == "completed"
+            for attempt in attempts
+        ):
+            raise ValueError("planned_yield core outcome cannot have a completed operational receipt")
         object.__setattr__(self, "attempts", attempts)
         segments = sequence(self.segments, "segments")
         if any(not isinstance(segment, AcceptedSegment) for segment in segments):
@@ -1070,6 +1441,8 @@ class RunManifest:
                 raise ValueError("accepted segment task_id disagrees with attempt")
             if attempt.outcome_receipt is None or attempt.outcome_receipt.status != "completed":
                 raise ValueError("accepted segment requires a completed attempt")
+            if attempt.core_outcome is not None and attempt.core_outcome.outcome != "completed":
+                raise ValueError("accepted segment requires a completed core outcome")
             previous = previous_by_task.get(segment.task_id)
             if previous is None:
                 if segment.predecessor_checkpoint is not None:
@@ -1171,10 +1544,10 @@ class RunManifest:
 
 
 __all__ = [
-    "AcceptedSegment", "AllocationObservation", "ManifestAttempt", "OutcomeReceipt", "OUTCOME_STATUSES",
+    "AcceptedSegment", "AllocationObservation", "CoreOutcomeRecord", "ManifestAttempt", "OutcomeReceipt", "RemoteTeardownReceipt", "OUTCOME_STATUSES",
     "PLACEMENT_NOT_SAMPLED_MESSAGE", "PLACEMENT_RECEIPT_TYPES", "PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE",
     "PLACEMENT_UNQUALIFIED_MESSAGE", "PLACEMENT_V3_WARNINGS", "RunManifest", "SciencePlacementReceipt",
-    "SciencePlacementReceiptV2", "SciencePlacementReceiptV3", "StartReceipt", "decode_placement_receipt",
+    "SciencePlacementReceiptV2", "SciencePlacementReceiptV3", "StartReceipt", "SuccessorAdmission", "SuccessorAdmissionRecord", "decode_placement_receipt",
     "placement_unqualified_message",
 ]
 

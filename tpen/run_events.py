@@ -38,9 +38,175 @@ each time was a point event.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping
 
 from tpen.events import Event
+
+
+RUN_OUTCOME_SCHEMA = "tpen.run-outcome/v1"
+RUN_OUTCOME_STATUSES = frozenset({"completed", "planned_yield", "failed", "unknown", "refused"})
+_CHECKPOINT_REF_KEYS = frozenset(
+    {
+        "schema",
+        "checkpoint_dir",
+        "schema_version",
+        "kind",
+        "next_iteration",
+        "completed_updates",
+        "manifest_sha256",
+        "model_sha256",
+        "provenance",
+        "content_id",
+    }
+)
+
+
+class RunOutcomeDecodeError(ValueError):
+    """Raised when a durable S4 run outcome is not a closed valid record."""
+
+
+@dataclass(frozen=True, slots=True)
+class RunOutcome:
+    """Decoded, typed contents of the S4 ``run-outcome.json`` artifact.
+
+    Parameters
+    ----------
+    status : str
+        Typed result status returned by the core runner.
+    run_dir : str or None
+        Producer-reported run directory, when available.
+    error : str or None
+        Producer-reported error text, when available.
+    checkpoint_ref : CheckpointRef or None
+        Full checkpoint identity named by the typed result.
+    next_iteration, completed_updates, target_iterations : int or None
+        Independent producer counters.
+    exception_type, publication_stage : str or None
+        Optional failure and publication diagnostics.
+    schema : str or None, optional
+        Explicit ``tpen.run-outcome/v1`` marker, or ``None`` for the legacy
+        pre-marker record shape.
+    """
+
+    status: str
+    run_dir: str | None
+    error: str | None
+    checkpoint_ref: Any | None
+    next_iteration: int | None
+    completed_updates: int | None
+    target_iterations: int | None
+    exception_type: str | None
+    publication_stage: str | None
+    schema: str | None = None
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "RunOutcome":
+        """Decode one closed S4 outcome mapping and its checkpoint identity."""
+
+        if not isinstance(data, Mapping):
+            raise RunOutcomeDecodeError("run outcome must be a mapping")
+        expected = {
+            "schema",
+            "status",
+            "run_dir",
+            "error",
+            "checkpoint_ref",
+            "next_iteration",
+            "completed_updates",
+            "target_iterations",
+            "exception_type",
+            "publication_stage",
+        }
+        legacy_expected = expected - {"schema"}
+        data_keys = set(data)
+        if (data_keys != expected and data_keys != legacy_expected) or (
+            "schema" in data and data.get("schema") != RUN_OUTCOME_SCHEMA
+        ):
+            raise RunOutcomeDecodeError("run outcome has an invalid schema or key set")
+        status = data["status"]
+        if type(status) is not str or status not in RUN_OUTCOME_STATUSES:
+            raise RunOutcomeDecodeError(f"unsupported run outcome status {status!r}")
+        for key in ("run_dir", "error", "exception_type", "publication_stage"):
+            value = data[key]
+            if value is not None and type(value) is not str:
+                raise RunOutcomeDecodeError(f"run outcome {key} must be a string or null")
+        counters: dict[str, int | None] = {}
+        for key in ("next_iteration", "completed_updates", "target_iterations"):
+            value = data[key]
+            if value is not None and (type(value) is not int or value < 0):
+                raise RunOutcomeDecodeError(f"run outcome {key} must be a non-negative integer or null")
+            counters[key] = value
+        ref_data = data["checkpoint_ref"]
+        ref = None
+        if ref_data is not None:
+            if not isinstance(ref_data, Mapping):
+                raise RunOutcomeDecodeError("run outcome checkpoint_ref must be a mapping or null")
+            if set(ref_data) != _CHECKPOINT_REF_KEYS:
+                raise RunOutcomeDecodeError("run outcome checkpoint_ref has an invalid key set")
+            try:
+                from tpen.checkpoint import CheckpointRef
+
+                ref = CheckpointRef.from_mapping(ref_data)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RunOutcomeDecodeError(f"invalid run outcome checkpoint_ref: {exc}") from exc
+        return cls(
+            status=status,
+            run_dir=data["run_dir"],
+            error=data["error"],
+            checkpoint_ref=ref,
+            next_iteration=counters["next_iteration"],
+            completed_updates=counters["completed_updates"],
+            target_iterations=counters["target_iterations"],
+            exception_type=data["exception_type"],
+            publication_stage=data["publication_stage"],
+            schema=data.get("schema"),
+        )
+
+
+def read_run_outcome(path: str | Path) -> RunOutcome:
+    """Read and decode one S4 ``run-outcome.json`` artifact.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Path to the producer-written outcome artifact.
+
+    Returns
+    -------
+    RunOutcome
+        Strictly decoded typed result.
+
+    Raises
+    ------
+    RunOutcomeDecodeError
+        If the file cannot be read, parsed, or decoded as the closed schema.
+    """
+
+    outcome_path = Path(path)
+    try:
+        with outcome_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise RunOutcomeDecodeError(f"cannot read {outcome_path}: {exc}") from exc
+    return RunOutcome.from_mapping(data)
+
+
+def has_explicit_run_outcome_schema(path: str | Path) -> bool:
+    """Return whether a JSON outcome carries the current explicit schema marker.
+
+    Invalid or unmarked files return ``False`` so inspection can preserve the
+    historical v1/v2 path for pre-CX-01 artifacts.
+    """
+
+    try:
+        with Path(path).open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, UnicodeError, ValueError):
+        return False
+    return isinstance(data, Mapping) and data.get("schema") == RUN_OUTCOME_SCHEMA
 
 
 @dataclass(frozen=True)
@@ -148,4 +314,14 @@ class RunFailed(Event):
     exception_message: str
 
 
-__all__ = ["RunCompleted", "RunFailed", "RunStarted"]
+__all__ = [
+    "RUN_OUTCOME_SCHEMA",
+    "RUN_OUTCOME_STATUSES",
+    "RunCompleted",
+    "RunFailed",
+    "RunOutcome",
+    "RunOutcomeDecodeError",
+    "RunStarted",
+    "has_explicit_run_outcome_schema",
+    "read_run_outcome",
+]

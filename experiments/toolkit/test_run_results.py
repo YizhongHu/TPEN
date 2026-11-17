@@ -11,16 +11,145 @@ backward-compatibility case.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
-from experiments.toolkit.run_results import ManifestRefusal, read
+from experiments.toolkit.run_results import ManifestRefusal, OUTCOME_STATUSES, _core_outcome, read
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "run-manifest-v2.json"
 FIXTURE_V1 = Path(__file__).parent / "fixtures" / "run-manifest-v1.json"
 GPU_A = "GPU-12345678-1234-1234-1234-123456789ABC"
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _executor(code: str, *args: Path | str) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ, PYTHONPATH=str(ROOT / "executor" / "src"))
+    python = os.environ.get("P8_EXECUTOR_PYTHON", sys.executable)
+    return subprocess.run(
+        [python, "-c", code, *map(str, args)],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+
+def test_outcome_statuses_match_executor_vocabulary() -> None:
+    result = _executor("import json; from tpen_executor.results import OUTCOME_STATUSES; print(json.dumps(sorted(OUTCOME_STATUSES)))")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == sorted(OUTCOME_STATUSES)
+
+
+def test_real_executor_manifest_preserves_remote_quiescence_outcome(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.json"
+    code = '''import sys
+from pathlib import Path
+from tpen_executor._codec import digest
+from tpen_executor.allocations import ConfiguredAllocation
+from tpen_executor.contracts import AllocationId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
+from tpen_executor.storage import DirectoryStore
+
+destination = Path(sys.argv[1])
+program = ProgramSpecRef({}, digest({}))
+group = ReadyGroup("g", (TaskSpec("task", "task", program, digest("task"), 1, "steps"),), digest("group"))
+store = DirectoryStore(destination / "store")
+fence = store.begin_attempt(
+    group,
+    "task",
+    ConfiguredAllocation(AllocationId("allocation"), BackendJobId("job"), {}),
+    "2026-11-14T00:00:00Z",
+)
+store.finish_attempt(fence, "remote-quiescence-unconfirmed", "2026-11-14T00:01:00Z")
+destination.joinpath("manifest.json").write_bytes(store.manifest(group).encode())
+'''
+    written = _executor(code, tmp_path)
+    assert written.returncode == 0, written.stderr
+
+    result = read(manifest)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert payload["attempts"][0]["start_receipt"]["schema"] == "tpen-executor/start-receipt-v2"
+    assert payload["attempts"][0]["start_receipt"]["transport_kind"] == "local"
+    assert not result.chains
+    assert len(result.preserved_attempts) == 1
+    assert result.preserved_attempts[0].outcome == "remote-quiescence-unconfirmed"
+    assert result.preserved_attempts[0].reason == "failed-or-incomplete"
+
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["attempts"][0]["outcome_receipt"]["status"] = "unknown-status"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ManifestRefusal, match="supported operational status"):
+        read(manifest)
+
+
+def test_real_executor_successor_admission_manifest_round_trips(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.json"
+    code = '''import json
+import sys
+from pathlib import Path
+from tpen_executor._codec import digest
+from tpen_executor.allocations import ConfiguredAllocation
+from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
+from tpen_executor.runners import CoreRunEvidence
+from tpen_executor.storage import DirectoryStore
+
+destination = Path(sys.argv[1])
+fixture = Path(sys.argv[2])
+program = ProgramSpecRef({}, digest({}))
+group = ReadyGroup("g", (TaskSpec("task", "task", program, digest("task"), 1, "steps"),), digest("group"))
+store = DirectoryStore(destination / "store")
+fence = store.begin_attempt(
+    group,
+    "task",
+    ConfiguredAllocation(AllocationId("allocation"), BackendJobId("job"), {}),
+    "2026-11-14T00:00:00Z",
+)
+core_dir = Path(fence.output_dir) / "core"
+core_dir.mkdir()
+payload = json.loads(fixture.read_text(encoding="utf-8"))
+payload["run_dir"] = str(core_dir)
+checkpoint_dir = str(core_dir / "checkpoints" / "step_000002")
+payload["checkpoint"]["checkpoint_dir"] = checkpoint_dir
+payload["checkpoint_ref"]["checkpoint_dir"] = checkpoint_dir
+store.finish_attempt(fence, "failed", "2026-11-14T00:01:00Z")
+store.record_core_outcome(fence, CoreRunEvidence.from_mapping(payload))
+request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+store.record_successor_admission(fence, request, "b" * 64)
+(destination / "manifest.json").write_bytes(store.manifest(group).encode())
+'''
+    written = _executor(
+        code,
+        tmp_path,
+        ROOT / "tests" / "contracts" / "fixtures" / "core-run-evidence-v3-planned-yield.json",
+    )
+    assert written.returncode == 0, written.stderr
+
+    result = read(manifest)
+    assert not result.chains
+    assert len(result.preserved_attempts) == 1
+    assert result.preserved_attempts[0].core_outcome is not None
+
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    original_core_outcome = payload["attempts"][0]["core_outcome"]
+    admission = payload["attempts"][0]["successor_admission"]
+    assert admission["core_acceptance_digest"] == "b" * 64
+
+    payload["attempts"][0].pop("core_outcome")
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ManifestRefusal, match="^successor_admission requires core_outcome$"):
+        read(manifest)
+
+    payload["attempts"][0]["core_outcome"] = original_core_outcome
+    payload["attempts"][0]["successor_admission"]["predecessor"]["task_id"] = "foreign"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ManifestRefusal, match="successor admission predecessor"):
+        read(manifest)
 
 
 def _placement_receipt(output_dir: str = "/runs/group-1/task-a/attempt-1") -> dict[str, object]:
@@ -131,6 +260,91 @@ def _materialized_manifest(tmp_path: Path, *, extra_attempt: bool = False) -> tu
     return path, str(core_dir)
 
 
+def _read_materialized_manifest(path: Path, core_dir: str, tmp_path: Path):
+    """Read a materialized fixture with a deterministic completed inspection."""
+
+    checkpoint_dir = str(tmp_path / "attempt-1" / "core" / "checkpoint" / "step_000001")
+
+    def inspect(run_dir: str | Path) -> dict[str, object]:
+        assert str(run_dir) == core_dir
+        return {
+            "verdict": "completed",
+            "checkpoint": {
+                "checkpoint_dir": checkpoint_dir,
+                "schema_version": 1,
+                "next_iteration": 1,
+                "completed_updates": 1,
+            },
+        }
+
+    return read(path, inspect)
+
+
+def test_p8_reader_accepts_start_receipt_v1(tmp_path: Path) -> None:
+    path, core_dir = _materialized_manifest(tmp_path)
+
+    result = _read_materialized_manifest(path, core_dir, tmp_path)
+
+    assert len(result.chains) == 1
+
+
+@pytest.mark.parametrize("transport_kind", ["local", "remote"], ids=["local", "remote"])
+def test_p8_reader_accepts_start_receipt_v2_transport_kinds(tmp_path: Path, transport_kind: str) -> None:
+    path, core_dir = _materialized_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["attempts"][0]["start_receipt"].update({
+        "schema": "tpen-executor/start-receipt-v2",
+        "transport_kind": transport_kind,
+    })
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = _read_materialized_manifest(path, core_dir, tmp_path)
+
+    assert len(result.chains) == 1
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("unknown-schema", "schema is unsupported"),
+        ("extra-key", "keys differ"),
+        ("bad-transport", "transport_kind"),
+        ("bad-transport-list", "transport_kind"),
+        ("bad-transport-dict", "transport_kind"),
+        ("bad-transport-null", "transport_kind"),
+        ("bad-transport-int", "transport_kind"),
+        ("missing-transport", "keys differ"),
+    ],
+    ids=["unknown-schema", "extra-key", "bad-transport", "bad-transport-list", "bad-transport-dict", "bad-transport-null", "bad-transport-int", "missing-transport"],
+)
+def test_p8_reader_rejects_closed_start_receipt_mutations(
+    tmp_path: Path, mutation: str, expected_reason: str
+) -> None:
+    path, _ = _materialized_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    start = payload["attempts"][0]["start_receipt"]
+    if mutation == "unknown-schema":
+        start["schema"] = "tpen-executor/start-receipt-v99"
+    elif mutation == "extra-key":
+        start["extra"] = "not-allowed"
+    elif mutation == "missing-transport":
+        start["schema"] = "tpen-executor/start-receipt-v2"
+        start.pop("transport_kind", None)
+    else:
+        bad_values = {
+            "bad-transport": "unknown",
+            "bad-transport-list": [],
+            "bad-transport-dict": {},
+            "bad-transport-null": None,
+            "bad-transport-int": 7,
+        }
+        start.update({"schema": "tpen-executor/start-receipt-v2", "transport_kind": bad_values[mutation]})
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ManifestRefusal, match=expected_reason):
+        _read_materialized_manifest(path, "unused", tmp_path)
+
+
 def test_p8_reader_selects_exactly_once_and_preserves_unselected_attempts(tmp_path: Path) -> None:
     path, core_dir = _materialized_manifest(tmp_path, extra_attempt=True)
 
@@ -158,6 +372,86 @@ def test_p8_reader_refuses_core_evidence_mismatch(tmp_path: Path) -> None:
     path, _ = _materialized_manifest(tmp_path)
     with pytest.raises(ManifestRefusal, match="disagrees"):
         read(path, lambda _: {"verdict": "completed", "checkpoint": {"checkpoint_dir": "wrong", "schema_version": 1, "next_iteration": 1, "completed_updates": 1}})
+
+
+def _v3_completed_evidence(core_dir: str, checkpoint_dir: str) -> dict[str, object]:
+    return {
+        "schema": "tpen.run-evidence/v3",
+        "run_dir": core_dir,
+        "verdict": "completed",
+        "run_status": "completed",
+        "checkpoint": {"checkpoint_dir": checkpoint_dir, "schema_version": 1, "next_iteration": 1, "completed_updates": 1},
+        "refusal": None,
+        "resolved_config_identity": {"schema": "tpen-config-identity-v1", "sha256": "a" * 64},
+        "outcome": "completed",
+        "checkpoint_ref": None,
+    }
+
+
+def test_p8_reader_accepts_completed_v3_inspection(tmp_path: Path) -> None:
+    path, core_dir = _materialized_manifest(tmp_path)
+    checkpoint_dir = str(tmp_path / "attempt-1" / "core" / "checkpoint" / "step_000001")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    completed = _v3_completed_evidence(core_dir, checkpoint_dir)
+    payload["attempts"][0]["schema"] = "tpen-executor/manifest-attempt-v2"
+    payload["attempts"][0]["core_outcome"] = {
+        "schema": "tpen-executor/core-outcome-v1", "task_id": "task-a", "attempt_id": "attempt-1",
+        "evidence": completed, "continuation_eligible": False,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    result = read(path, lambda _: completed)
+    assert len(result.chains) == 1
+
+
+def test_p8_reader_refuses_planned_yield_inspection_without_core_outcome(tmp_path: Path) -> None:
+    path, core_dir = _materialized_manifest(tmp_path)
+    checkpoint_dir = str(tmp_path / "attempt-1" / "core" / "checkpoint" / "step_000001")
+    planned = _v3_completed_evidence(core_dir, checkpoint_dir)
+    planned["run_status"] = "planned_yield"
+    planned["outcome"] = "planned_yield"
+    planned["verdict"] = "incomplete"
+    planned["checkpoint_ref"] = {
+        "schema": "tpen.checkpoint-ref/v1", "checkpoint_dir": checkpoint_dir, "schema_version": 1,
+        "kind": "tpen.checkpoint", "next_iteration": 1, "completed_updates": 1,
+        "manifest_sha256": "b" * 64, "model_sha256": "c" * 64, "provenance": {},
+        "content_id": "d" * 64, "profile": "train_resume",
+    }
+    with pytest.raises(ManifestRefusal, match="outcome is not completed"):
+        read(path, lambda _: planned)
+
+
+def test_p8_reader_refuses_planned_yield_committed_with_core_outcome(tmp_path: Path) -> None:
+    path, core_dir = _materialized_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    checkpoint_dir = str(tmp_path / "attempt-1" / "core" / "checkpoint" / "step_000001")
+    planned = _v3_completed_evidence(core_dir, checkpoint_dir)
+    planned["run_status"] = "planned_yield"
+    planned["outcome"] = "planned_yield"
+    planned["verdict"] = "incomplete"
+    planned["checkpoint_ref"] = {
+        "schema": "tpen.checkpoint-ref/v1", "checkpoint_dir": checkpoint_dir, "schema_version": 1,
+        "kind": "tpen.checkpoint", "next_iteration": 1, "completed_updates": 1,
+        "manifest_sha256": "b" * 64, "model_sha256": "c" * 64, "provenance": {},
+        "content_id": "d" * 64, "profile": "train_resume",
+    }
+    payload["attempts"][0]["schema"] = "tpen-executor/manifest-attempt-v2"
+    payload["attempts"][0]["core_outcome"] = {
+        "schema": "tpen-executor/core-outcome-v1", "task_id": "task-a", "attempt_id": "attempt-1",
+        "evidence": planned, "continuation_eligible": True,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ManifestRefusal, match="planned_yield core outcome cannot have a completed operational receipt"):
+        read(path, lambda _: planned)
+
+
+def test_p8_core_outcome_mirrors_completed_and_refused_checkpoint_invariants() -> None:
+    evidence = _v3_completed_evidence("/core", "/core/checkpoint")
+    base = {"schema": "tpen-executor/core-outcome-v1", "task_id": "task-a", "attempt_id": "attempt-1", "continuation_eligible": False}
+    with pytest.raises(ManifestRefusal, match="completed core outcome requires checkpoint"):
+        _core_outcome(dict(base, evidence=dict(evidence, checkpoint=None)), {"task_id": "task-a", "attempt_id": "attempt-1"})
+    refused = dict(evidence, verdict="refused", outcome="unknown", refusal={"code": "refused", "reason": "no"})
+    with pytest.raises(ManifestRefusal, match="refused core outcome requires refusal and no checkpoint"):
+        _core_outcome(dict(base, evidence=refused), {"task_id": "task-a", "attempt_id": "attempt-1"})
 
 
 def test_p8_reader_accepts_optional_placement_receipt_and_surfaces_it(tmp_path: Path) -> None:

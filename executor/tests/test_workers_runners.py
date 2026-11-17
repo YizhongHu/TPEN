@@ -341,14 +341,25 @@ def test_tpen_evidence_decodes_all_verdicts_and_never_reads_run_dir(tmp_path: Pa
         lambda x: {**x, "extra": 1},
         lambda x: {key: value for key, value in x.items() if key != "verdict"},
         lambda x: {**x, "run_status": 1},
-        lambda x: {**x, "refusal": {"code": "unknown", "reason": "x"}, "verdict": "refused", "checkpoint": None},
     ],
-    ids=["bad-schema", "extra-key", "missing-key", "bad-type", "unknown-refusal-code"],
+    ids=["bad-schema", "extra-key", "missing-key", "bad-type"],
 )
 def test_core_evidence_rejects_schema_key_type_and_refusal_mutants(mutate) -> None:
     base = {"schema": "tpen.run-evidence/v1", "run_dir": "/r", "verdict": "incomplete", "run_status": None, "checkpoint": None, "refusal": None}
     with pytest.raises(EvidenceUnavailable):
         CoreRunEvidence.from_mapping(mutate(base))
+
+
+def test_core_evidence_coerces_refusal_values_like_core() -> None:
+    evidence = CoreRunEvidence.from_mapping({
+        "schema": "tpen.run-evidence/v1",
+        "run_dir": "/r",
+        "verdict": "refused",
+        "run_status": None,
+        "checkpoint": None,
+        "refusal": {"code": "new-core-code", "reason": 17},
+    })
+    assert dict(evidence.refusal) == {"code": "new-core-code", "reason": "17"}
 
 
 class _StubWorker:

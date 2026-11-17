@@ -21,6 +21,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 import hashlib
 import importlib
+import importlib.util
 import inspect
 import json
 import os
@@ -122,12 +123,21 @@ def _descriptor(cell: Any) -> CellDescriptor:
             else None
         ),
     )
-
-
 def _roster() -> tuple[Any, ...]:
+
     from tpen.hi_schema import HI_METHOD_ROSTER
 
     return tuple(HI_METHOD_ROSTER)
+
+
+_MANIFEST_SPEC = importlib.util.spec_from_file_location(
+    "he_importance_scan_manifest", Path(__file__).with_name("scan_manifest.py")
+)
+if _MANIFEST_SPEC is None or _MANIFEST_SPEC.loader is None:  # pragma: no cover
+    raise RuntimeError("could not load scan_manifest.py")
+scan_manifest = importlib.util.module_from_spec(_MANIFEST_SPEC)
+sys.modules[_MANIFEST_SPEC.name] = scan_manifest
+_MANIFEST_SPEC.loader.exec_module(scan_manifest)
 
 
 architecture_stage_family = importlib.import_module(
@@ -1476,6 +1486,43 @@ def execute(
         truthful admitted cell, or the walker count is not declared.
     """
 
+    manifest_path = getattr(args, "manifest", None)
+    row_id = getattr(args, "row", None)
+    if (manifest_path is None) != (row_id is None):
+        raise StageQSelectionError("--manifest and --row must be supplied together")
+    if manifest_path is not None:
+        explicit = tuple(
+            name
+            for name in (
+                "stage", "context", "optimizer", "lr", "beta2", "seed_label",
+                "walkers", "literal_configuration",
+            )
+            if getattr(args, name, None) is not None
+        )
+        if explicit:
+            raise StageQSelectionError(
+                "--manifest/--row are mutually exclusive with flag selection: "
+                + ", ".join(f"--{name.replace('_', '-')}" for name in explicit)
+            )
+        manifest = scan_manifest.load_manifest(Path(manifest_path).expanduser().resolve())
+        row = scan_manifest.validate_live_row(manifest, str(row_id))
+        args.stage = "O1"
+        args.context = row["context"]
+        args.seed_label = row["seed_label"]
+        args.walkers = manifest["walkers"]
+    else:
+        args.stage = getattr(args, "stage", None) or DEFAULT_STAGE
+        args.context = getattr(args, "context", None) or DEFAULT_CONTEXT
+        args.optimizer = getattr(args, "optimizer", None) or DEFAULT_OPTIMIZER
+        args.lr = getattr(args, "lr", None)
+        if args.lr is None:
+            args.lr = 0.005
+        args.beta2 = getattr(args, "beta2", None)
+        if args.beta2 is None:
+            args.beta2 = 0.999
+        args.walkers = getattr(args, "walkers", None)
+        if args.walkers is None:
+            args.walkers = stage_coordinate.COMMITTED_WALKERS
     _require_executable_stage(args.stage)
     output_root = Path(args.output_root).expanduser().resolve()
     # Materialize only the requested stage so the selection receipt's discard
@@ -1488,16 +1535,31 @@ def execute(
             availability=optimizer_grid.roster_availability(),
             stages=(args.stage,),
         )
+    live_manifest_cell = None
+    if manifest_path is not None:
+        live_manifest_cell = next(
+            (candidate for candidate in cells if candidate.content_hash == str(row_id)),
+            None,
+        )
+        if live_manifest_cell is None:
+            raise scan_manifest.ScanManifestError(
+                f"live materialized cell for manifest row {row_id!r} is unavailable"
+            )
+        live_levels = live_manifest_cell.manifest["scientific_identity"]["optimizer"]["levels"]
     selection = select_cell(
         cells,
         stage=args.stage,
         context=getattr(args, "context", DEFAULT_CONTEXT),
-        optimizer=args.optimizer,
-        lr=getattr(args, "lr", 0.005),
-        beta2=getattr(args, "beta2", 0.999),
+        optimizer=("adam" if manifest_path is not None else args.optimizer),
+        lr=live_levels["lr"] if manifest_path is not None else getattr(args, "lr", 0.005),
+        beta2=live_levels["beta2"] if manifest_path is not None else getattr(args, "beta2", 0.999),
         seed_label=args.seed_label,
         literal_configuration=getattr(args, "literal_configuration", None),
     )
+    if manifest_path is not None and selection.cell.content_hash != str(row_id):
+        raise scan_manifest.ScanManifestError(
+            f"live materialized cell hash {selection.cell.content_hash!r} does not match row {row_id!r}"
+        )
     declared_walkers = stage_coordinate.sampler_override_values(args.stage, "n_walkers")
     if args.walkers == stage_coordinate.COMMITTED_WALKERS:
         cell = selection.cell
@@ -1576,16 +1638,18 @@ def execute(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", default=DEFAULT_STAGE)
-    parser.add_argument("--context", default=DEFAULT_CONTEXT)
-    parser.add_argument("--optimizer", default=DEFAULT_OPTIMIZER)
-    parser.add_argument("--lr", type=float, default=0.005)
-    parser.add_argument("--beta2", type=float, default=0.999)
+    parser.add_argument("--stage")
+    parser.add_argument("--context")
+    parser.add_argument("--optimizer")
+    parser.add_argument("--lr", type=float)
+    parser.add_argument("--beta2", type=float)
     parser.add_argument("--seed-label", type=int)
-    parser.add_argument("--walkers", type=int, default=stage_coordinate.COMMITTED_WALKERS)
+    parser.add_argument("--walkers", type=int)
     parser.add_argument("--output-root", type=Path, default=Path(__file__).with_name("outputs"))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--literal-configuration", type=json.loads)
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--row")
     return parser
 
 

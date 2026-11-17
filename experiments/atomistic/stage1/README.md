@@ -1,0 +1,101 @@
+# Stage 1 shared protocol and launch surface
+
+This directory owns the Stage 1 manifest, guarded Cannon launcher, and the
+science-default Hooke-1e, Hooke-2e, He, and H2 train/eval configs.
+
+Every manifest row carries the exact source SHA, the planned config SHA256, an
+external results root, and the TPEN run identity (`experiment_name`, `sector`,
+and `run_id`). Evaluation rows additionally carry separate absolute
+`checkpoint_dir` and `checkpoint_file` fields plus the checkpoint SHA256. The
+run's own core resolved-config identity is joined by the collection slice; this
+protocol layer does not fabricate one. Evaluation launches bind
+`load.path` to the checkpoint step directory and
+`trajectory_identity.checkpoint_file` to its `model.pt`, so the evaluator
+records checkpoint provenance. S1-A3 system
+eval configs must define a `trajectory_identity` block with `checkpoint_file`
+for this override to be accepted by Hydra.
+
+Each evaluation config builds one `SystemDescriptor` from its instantiated
+`ParticleSpec` and `hamiltonian_terms`, and passes that descriptor plus an
+explicit `NaiveLocalEnergyEvaluator` to `TrajectoryMCMCGenerator`. The
+descriptor content ID is computed during planning and stored as
+`expected_physical_system_id` in every v3 eval row. Collection refuses a
+record whose observed ID differs from that value; registry IDs are only a
+cross-check, never the source of the physical hash.
+
+Known deviations from the source studies are the shared Stage-1 defaults:
+four channels/one layer, CPU device, 256 train walkers, 4096 eval walkers,
+and 256 retained draws. Run-slice overrides may select approved science
+budgets. The one-electron Hooke route uses the h-v2-style one-electron model
+at four channels/one layer and adds the required fixed GaussianConfinement
+with alpha=0.25 (omega/2); it has no electron-electron cusp. He retains the
+he-v1 trainable electron-electron ranges, curvature cusp (coefficient 0.01,
+range 1.0), and trainable Pfaffian readout. H2 follows h2-v1's two-electron
+cusp/readout route and retains its width, while using the shared Stage-1
+walker defaults. The Hooke-2e route uses the registry's Taut-solvable singlet
+pair at omega=0.5 with two electrons, no nuclear resource, kinetic + harmonic
+trap + electron-electron terms, fixed GaussianConfinement coefficient 0.25,
+and a fixed-default ElectronElectronCusp (opposite-spin coefficient 0.5). H2
+retains the two-center R=1.4-bohr geometry, and He retains the two-electron
+Coulomb Hamiltonian. Train checkpoint callbacks use ExplicitUpdates through the declared
+top-level `checkpoint_steps`; launch overrides bind that parameter to exactly
+the manifest row's planned checkpoint steps.
+
+The following table records every retained source-to-Stage-1 deviation and
+its reason. Lengths are in bohr where stated; callback frequencies are
+training updates.
+
+| System / surface | Source value | Stage-1 value | Reason |
+| --- | --- | --- | --- |
+| Hooke-1e readout | h-v2: Pfaffian readout `trainable: true` | `trainable: false` in train and eval | Deliberate one-electron Stage-1 default; the Gaussian confinement remains the fixed envelope and the train/eval model stays strict-restore compatible. |
+| Hooke-2e envelope and Hamiltonian | `experiments/hooke/tpen-pair-v1/configs/train.yaml`: Gaussian coefficient 0.25, electron-electron cusp, kinetic + harmonic trap + electron-electron interaction | Nucleus-free v2 descriptor with fixed GaussianConfinement coefficient 0.25, fixed-default ElectronElectronCusp, and `omega: 0.5` | Preserve the approved two-electron singlet physics through the current system-context/dispatch route; no legacy atomic placeholder or stale pair launcher is used. |
+| Hooke-1e eval sampler | h-v2: 1024 walkers, burn-in 1000, steps 20 | 4096 walkers, burn-in 100, steps 10 | Use the shared Stage-1 evaluation budget and cadence; this is a protocol default, not a claim that the source burn-in study transfers unchanged. |
+| He eval sampler | he-v1: 4096 walkers, burn-in 100, steps 20 | 4096 walkers, burn-in 100, steps 10 | Keep the shared Stage-1 cadence; the he-v1 stride-20 tie-break is not silently carried into this protocol. |
+| H2 model width | h2-v1: 4 output / 16 hidden channels | 4 output / 16 hidden channels | No width change is made; this row documents the retained source value and corrects the prior “width reduction” wording. |
+| H2 train/eval walkers | h2-v1: 128 train / 1024 eval | 256 train / 4096 eval | Use the shared Stage-1 train/eval walker defaults across all four systems. |
+| Hooke-1e train observability | h-v2: `DataIntegrity`/`GradientStats` every 100 updates; JSONL logger | Both callbacks and logger omitted | Keep the science-default config small and portable; Stage-1 collection relies on its run/record provenance contract. |
+| He train observability | he-v1: `DataIntegrity` every 1, `GradientStats` every 5; CSV and JSONL loggers | Both callbacks and both loggers omitted | Same bounded Stage-1 config surface; these diagnostics are outside the Stage-1 manifest contract. |
+| H2 train observability | h2-v1: `DataIntegrity` every 1, `GradientStats` every 5; CSV and JSONL loggers | Both callbacks and both loggers omitted | Same bounded Stage-1 config surface; these diagnostics are outside the Stage-1 manifest contract. |
+| Evaluation loggers | h-v2, he-v1, and h2-v1 each write CSV/JSONL or JSONL metrics | No metric logger in the Stage-1 eval configs | Stage-1 evaluation retains trajectory records and summaries as its required evidence; study-specific metric logging is not part of this layer. |
+| Manifest seed encoding | Prior mixed-radix coordinates could exceed Torch's signed int64 seed range | Deterministic SHA-256 digest mapped to `[0, 2**63-2]`; manifest-wide collision refusal and boundary tests | The real producer exposed Torch overflow. Retaining unbounded mixed-radix values was rejected because every run seeds Torch generators. |
+| Stage-1 evaluation statistics summary | `TrajectoryStatisticsSummary` without its required identity fields | Removed from Stage-1 eval configs; provenance remains from `Evaluator._evaluation_identity`, and collection computes statistics from the inspected grid | Supplying `stage`, `run_id`, `attempt_id`, `evaluator_id`, and `config_sha256` from `launch.py` was rejected because it would broaden the launcher contract without an owned evaluator identity. |
+| Stage-1 record calculators | Eval configs supplied only `LocalEnergyCalculator` | Add `WavefunctionCalculator` beside it | `SampledRecordWriter` requires the wavefunction bundle field for durable records; the canonical producer wiring supplies both calculators. |
+
+`plan.py` writes a manifest only. `launch.py` renders a script only; submission
+is an explicit operator action. The generated script requires Slurm, checks the
+delivered partition, uses node-local per-job scratch, and records job identity.
+The supported submission directory is the repository root. `render` and the
+CLI require an explicit absolute `checkout_root`/`--checkout-root`: this is the
+exact execution checkout staged for the job, and it owns the driver,
+`experiments` protocol, configs, and source identity. The checkout used to
+render the command may be different. When `render` is called with the
+repository-relative driver path, it emits commands of this form, with the
+row's relative config preserved:
+
+```text
+/absolute/path/to/python /absolute/execution/checkout/experiments/atomistic/stage1/train.py --config configs/he/train.yaml --kind smoke <row overrides> --binding <row token>
+```
+
+The Stage-1 drivers resolve relative configs against this directory, not the
+process cwd. An absolute `--config` path is accepted when it names the same
+bound config. The eval driver emits the corresponding absolute driver path and
+its strict-checkpoint arguments. A CLI caller rendering from the repository
+root for a staged checkout passes `--checkout-root /path/to/staged/checkout`;
+it must not rely on the launch module's own location or the submission cwd.
+
+Smoke rows use the same `configs/<system>/train.yaml` files as train rows. Their
+smoke-ness is only the bounded budget supplied by `launch.row_overrides`:
+`sampler.n_walkers`, `trainer.max_steps`, and `checkpoint_steps` are set from
+the manifest row, with the final checkpoint at `smoke_updates`. A smoke checks
+that the launch path, gateway, real train config, and final checkpoint can run
+to `COMPLETE` at the planned cluster directory. It does not measure energy
+accuracy and does not run evaluation or collection.
+
+The real-producer integration test is marked `stage1_real_producer` and remains
+in default collection. Mutant packets select their test paths explicitly so
+this producer chain is not multiplied across mutants; the base-on Stage-1
+verification must include it explicitly, for example:
+
+```text
+pytest -q experiments/atomistic/stage1/tests/test_real_producer_e2e.py
+```

@@ -1,9 +1,10 @@
 """Translate a FermiNet run directory into a :class:`BaselineRecord`.
 
 A FermiNet run leaves ``train_stats.csv`` (columns ``step,energy,ewmean,ewvar,
-pmove``) in its save path, and the job script leaves a stdout log carrying the
-device identity and the run's start/end stamps. This module reads both and
-emits the one ``baseline_record.json`` the collector expects.
+pmove``; newer runs may append ``walker_variance``) in its save path, and the
+job script leaves a stdout log carrying the device identity and the run's
+start/end stamps. This module reads both and emits the one
+``baseline_record.json`` the collector expects.
 
 Two properties of the energy estimate are deliberate and must survive any
 refactor.
@@ -59,8 +60,54 @@ _START_STAMP = re.compile(r"start=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:
 _END_STAMP = re.compile(r"end=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2})")
 
 
-def read_energies(run_dir: Path) -> list[float]:
-    """Return the per-step energy column of a FermiNet run.
+class _TrajectoryRows(list[dict[str, int | float | None]]):
+    """List-compatible rows carrying optimizer-step provenance."""
+
+    step_basis = "optimizer_step"
+
+
+def _read_rows(
+    run_dir: Path, *, include_walker_variance: bool
+) -> _TrajectoryRows:
+    """Read FermiNet rows with an explicitly selected diagnostic projection."""
+
+    stats_path = run_dir / TRAIN_STATS_FILENAME
+    if not stats_path.is_file():
+        raise AdapterError(f"no {TRAIN_STATS_FILENAME} in {run_dir}")
+
+    with stats_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        required = {"step", "energy", "ewvar"}
+        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+            missing = sorted(required.difference(reader.fieldnames or ()))
+            if "energy" in missing:
+                raise AdapterError(f"{stats_path} has no 'energy' column")
+            raise AdapterError(f"{stats_path} is missing required column(s): {', '.join(missing)}")
+        rows = _TrajectoryRows()
+        for row_number, row in enumerate(reader, 2):
+            try:
+                walker_variance = (
+                    None
+                    if not include_walker_variance or "walker_variance" not in row
+                    else float(row["walker_variance"])
+                )
+                rows.append({
+                    "step": int(row["step"]),
+                    "energy": float(row["energy"]),
+                    "walker_local_energy_variance": walker_variance,
+                    "energy_time_ewvar": float(row["ewvar"]),
+                    "step_basis": "optimizer_step",
+                })
+            except (TypeError, ValueError) as error:
+                raise AdapterError(f"{stats_path}:{row_number} has invalid trajectory values") from error
+
+    if not rows:
+        raise AdapterError(f"{stats_path} has no data rows")
+    return rows
+
+
+def read_trajectory(run_dir: Path) -> list[dict[str, int | float | None]]:
+    """Read FermiNet's loss and variances per optimizer step.
 
     Parameters
     ----------
@@ -69,29 +116,26 @@ def read_energies(run_dir: Path) -> list[float]:
 
     Returns
     -------
-    list of float
-        One energy per optimizer step, in file order.
+    list of dict
+        Rows with ``step``, ``energy``, ``walker_local_energy_variance`` and
+        ``energy_time_ewvar`` fields. Historical FermiNet files without
+        ``walker_variance`` retain ``None`` for the walker variance; ``ewvar``
+        remains under the separate time-variance field.
 
     Raises
     ------
     AdapterError
-        If the file is missing, has no ``energy`` column, or has no data rows.
+        If the file is missing, required columns are absent, or it has no rows.
         An empty run is an error, not an empty result.
     """
 
-    stats_path = run_dir / TRAIN_STATS_FILENAME
-    if not stats_path.is_file():
-        raise AdapterError(f"no {TRAIN_STATS_FILENAME} in {run_dir}")
+    return _read_rows(run_dir, include_walker_variance=True)
 
-    with stats_path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        if reader.fieldnames is None or "energy" not in reader.fieldnames:
-            raise AdapterError(f"{stats_path} has no 'energy' column")
-        energies = [float(row["energy"]) for row in reader if row.get("energy")]
 
-    if not energies:
-        raise AdapterError(f"{stats_path} has no data rows")
-    return energies
+def read_energies(run_dir: Path) -> list[float]:
+    """Return the per-step energy column of a FermiNet run."""
+
+    return [float(row["energy"]) for row in _read_rows(run_dir, include_walker_variance=False)]
 
 
 def parse_device(log_text: str) -> tuple[str | None, str | None]:

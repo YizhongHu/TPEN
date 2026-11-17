@@ -24,6 +24,7 @@ from tpen.checkpoint.hashing import (
     canonical_resolved_config_bytes,
     resolved_config_identity,
 )
+from tpen.checkpoint.operational_slots import OPERATIONAL_SLOT_MANIFEST
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -361,6 +362,38 @@ def test_callback_logger_path_table_is_closed_and_non_operational_reasons_exist(
     )
 
 
+def test_operational_slot_manifest_derives_identity_and_routing_registries() -> None:
+    """Hashing and routing must consume the same owner-defined manifest."""
+
+    from tpen.run import _ARTIFACT_SINK_FIELDS, _SINK_FREE_TYPES
+
+    assert _CALLBACK_OUTPUT_FIELDS == {
+        target: set(slot.fields)
+        for target, slot in OPERATIONAL_SLOT_MANIFEST.items()
+        if slot.kind == "callback" and slot.fields
+    }
+    assert _LOGGER_PATH_FIELDS == {
+        target: set(slot.fields)
+        for target, slot in OPERATIONAL_SLOT_MANIFEST.items()
+        if slot.kind == "logger" and slot.fields
+    }
+    assert _NON_OPERATIONAL_PATH_FIELDS == {
+        target: dict(slot.non_operational_reasons)
+        for target, slot in OPERATIONAL_SLOT_MANIFEST.items()
+        if slot.non_operational_reasons
+    }
+    assert _ARTIFACT_SINK_FIELDS == {
+        target: slot.fields
+        for target, slot in OPERATIONAL_SLOT_MANIFEST.items()
+        if slot.routed and slot.fields
+    }
+    assert _SINK_FREE_TYPES == frozenset(
+        target
+        for target, slot in OPERATIONAL_SLOT_MANIFEST.items()
+        if slot.routed and slot.sink_free
+    )
+
+
 @pytest.mark.parametrize(
     "config_path",
     _identity_config_paths(),
@@ -431,6 +464,29 @@ def test_golden_identity_vector() -> None:
     assert resolved_config_identity(_config()) == {
         "schema": RESOLVED_CONFIG_IDENTITY_SCHEMA,
         "sha256": "b58ece8d8f791a7954277ae4879695fb1fa196b8badd56539b891e996d46fc6a",
+    }
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "expected_sha256"),
+    [
+        # Golden computed by an independent verification job at base fce3de22
+        # and re-checked identical at the CX-03 head; receipt: Task Orchestrator note orch-golden-probe-60514113 on item cd093a8e.
+        (
+            "experiments/atomistic/he-importance/configs/train.yaml",
+            "eca06e9ab1796dca1a192c2cfd3de7fb62cfa07c47eb1020784470060304d713",
+        ),
+    ],
+)
+def test_he_importance_identity_golden_from_base_commit(
+    relative_path: str, expected_sha256: str
+) -> None:
+    """The real He-importance config keeps its v1 identity byte-identical."""
+
+    config = _guard_config(_REPO_ROOT / relative_path)
+    assert resolved_config_identity(config) == {
+        "schema": RESOLVED_CONFIG_IDENTITY_SCHEMA,
+        "sha256": expected_sha256,
     }
 
 

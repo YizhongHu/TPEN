@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 from ..allocations import ConfiguredAllocation
 from ..contracts import ReadyGroup
 from ..results import AllocationObservation, OutcomeReceipt
@@ -44,7 +47,13 @@ class AttachedAllocation:
         """
         return self.allocation.observe(state, at_utc)
 
-    def begin(self, group: ReadyGroup, task_id: str, started_at_utc: str = "") -> AttemptFence:
+    def begin(
+        self,
+        group: ReadyGroup,
+        task_id: str,
+        started_at_utc: str = "",
+        transport_kind: str | None = "local",
+    ) -> AttemptFence:
         """Begin one task attempt in the attached allocation.
 
         Parameters
@@ -55,13 +64,16 @@ class AttachedAllocation:
             Task member to start.
         started_at_utc : str, optional
             UTC start timestamp; ``""`` selects the documented placeholder.
+        transport_kind : {"local", "remote"} or None, optional
+            Durable transport identity retained in the start receipt.
 
         Returns
         -------
         AttemptFence
             Fence bound to this allocation and store.
         """
-        return self.store.begin_attempt(group, task_id, self.allocation, started_at_utc)
+        begin_kwargs = {} if transport_kind == "local" else {"transport_kind": transport_kind}
+        return self.store.begin_attempt(group, task_id, self.allocation, started_at_utc, **begin_kwargs)
 
     def finish(self, fence: AttemptFence, status: str, finished_at_utc: str, result_digest: str | None = None) -> OutcomeReceipt:
         """Finish one task attempt owned by this attached allocation.
@@ -91,6 +103,34 @@ class AttachedAllocation:
         if isinstance(fence, AttemptFence) and fence.allocation_id != self.allocation.allocation_id.value:
             raise FenceRejected("fence belongs to another attached allocation")
         return self.store.finish_attempt(fence, status, finished_at_utc, result_digest)
+
+    def finish_remote(
+        self,
+        fence: AttemptFence,
+        teardown: Mapping[str, Any],
+        leaf_result_digest: str,
+        status: str,
+        finished_at_utc: str,
+        result_digest: str | None = None,
+    ) -> OutcomeReceipt:
+        """Forward one validated remote teardown to the fenced store.
+
+        The allocation check remains at this adapter boundary so a receipt
+        from another attached allocation cannot reach the terminal helper.
+        ``teardown`` contains only primitive facts retained from a validated
+        remote leaf result; this adapter never imports or stores transport
+        wire types.
+        """
+        if isinstance(fence, AttemptFence) and fence.allocation_id != self.allocation.allocation_id.value:
+            raise FenceRejected("fence belongs to another attached allocation")
+        return self.store.finish_remote_attempt(
+            fence,
+            teardown,
+            leaf_result_digest,
+            status,
+            finished_at_utc,
+            result_digest,
+        )
 
 
 __all__ = ["AttachedAllocation"]
