@@ -1,0 +1,20 @@
+--- a/ferminet/train.py
++++ b/ferminet/train.py
+@@ -645,7 +645,7 @@
+     density_state_ckpt = None
+ 
+   # Set up logging and observables
+-  train_schema = ['step', 'energy', 'ewmean', 'ewvar', 'pmove']
++  train_schema = ['step', 'energy', 'ewmean', 'ewvar', 'pmove', 'walker_variance']
+ 
+   if cfg.system.states:
+     energy_matrix_file = open(
+@@ -1030,6 +1030,8 @@
+             'ewmean': np.asarray(weighted_stats.mean),
+             'ewvar': np.asarray(weighted_stats.variance),
+             'pmove': np.asarray(pmove),
++            # aux_data.variance is the unclipped batch local-energy variance (loss.py:227).
++            'walker_variance': np.asarray(aux_data.variance[0]),
+         }
+         for key in observable_data:
+           obs_data = observable_data[key]

@@ -1,0 +1,22 @@
+# Immutable physical-input specification for BL-R1.
+#
+# This file is intentionally independent of either producer's configuration
+# syntax.  The runbook translates it into the producer-native flags and then
+# checks the resolved producer configuration; do not substitute a directory
+# name or an inferred elemental default for this explicit identity.
+schema: baselines-h-atom-r1/v1
+system_id: h_atom
+units: bohr
+nuclei:
+  - element: H
+    charge: 1
+    position_bohr: [0.0, 0.0, 0.0]
+electrons:
+  total: 1
+  spins: [1, 0]
+reference_energy_hartree: -0.5
+ferminet:
+  config: experiments/baselines/runbooks/configs/ferminet_h_atom.py
+  flags:
+    --config.system.atom: H
+    --config.system.electrons: [1, 0]
