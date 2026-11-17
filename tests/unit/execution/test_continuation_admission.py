@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 from omegaconf import OmegaConf
 
+from tpen.checkpoint.catalog import publication_catalog_path, read_publications
 from tpen.checkpoint import CheckpointRef, TrainResume, save_checkpoint
 from tpen.checkpoint.hashing import resolved_config_identity
 from tpen.execution.recovery import (
@@ -206,6 +207,42 @@ def test_missing_catalog_or_receipt_is_missing_publication(tmp_path: Path) -> No
     result = select_successor_admission(_intent(), _request(ref))
     assert result.refusal is not None
     assert result.refusal.code is AdmissionRefusalCode.MISSING_PUBLICATION
+
+
+def test_matching_catalog_content_id_at_different_dir_is_missing_publication(
+    tmp_path: Path,
+) -> None:
+    """Refuse a publication row whose content ID is at another directory.
+
+    Parameters
+    ----------
+    tmp_path : pathlib.Path
+        Temporary root used by the real checkpoint and publication fixtures.
+
+    Notes
+    -----
+    The catalog row is rewritten in its on-disk JSONL format, preserving the
+    valid publication receipt while changing only the path-independent row's
+    location.
+    """
+
+    ref = _checkpoint(tmp_path)
+    catalog_path = publication_catalog_path(ref.checkpoint_dir.parent)
+    record = json.loads(catalog_path.read_text(encoding="utf-8"))
+    forged_dir = ref.checkpoint_dir.parent / "step_999999"
+    record["ref"]["checkpoint_dir"] = str(forged_dir)
+    catalog_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    publications = read_publications(catalog_path)
+    assert len(publications) == 1
+    assert publications[0].content_id == ref.content_id
+    assert publications[0].checkpoint_dir.resolve() == forged_dir.resolve()
+
+    result = select_successor_admission(_intent(), _request(ref))
+
+    assert result.refusal is not None
+    assert result.refusal.code is AdmissionRefusalCode.MISSING_PUBLICATION
+    assert result.restore_request is None
 
 
 def test_missing_receipt_is_missing_publication(tmp_path: Path) -> None:
