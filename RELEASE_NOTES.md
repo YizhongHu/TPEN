@@ -1,5 +1,63 @@
 # Release Notes
 
+## v0.5.3 - Stage 1 benchmark code, H-v2 salvage path, core-executor continuation
+
+43 commits since `v0.5.2` (`14235a0a`), merged into `dev` through PRs
+#706-#742, plus this version bump, released to `main` by #748. The version
+sources move to `0.5.3` in this release (operator request).
+
+```
+git log --format='%H' 14235a0a..1c15b144175719b331e2bbd564e691eddbc802e2 | wc -l
+```
+
+Release gate: full default suite at `1c15b144` on FASRC Cannon (`test`,
+typecheck on, executor arms included), root suite job 61620847: 8994 passed, 0 failed, 0 errors, 20 skipped; executor arms job 61620861: all steps exit 0 (root 9006 passed / 23 skipped; parsl py3.12 and py3.14 909 passed / 1 skipped each; no-parsl py3.12 and py3.14 858 passed / 39 skipped each), 0 failures, 0 errors. Receipt `release-gate-1c15b144` on TO 6f4c431e.
+
+Why now: Stage 1 science benchmarks (He due Nov 22, H2 Nov 29) must run from a
+`main` commit carrying the Stage 1 code; the H-v2 salvage path lets a timed-out
+science lineage be evaluated. Running H-v2 science TRAIN jobs stay pinned to
+`14235a0a` and are unaffected.
+
+### Added
+
+- **Stage 1 benchmarks** (H, Hooke-1e, Hooke-2e pair, He, H2): shared protocol,
+  plan and guarded launch (#713); collector and reference matching (#718);
+  launch/plan fixes and no-compute end-to-end (#722); additive
+  `tpen.inspection` eval-run inspection API (#723); system configs with
+  plan-pinned physical identity (#732); tiny real-producer train -> eval ->
+  inspect -> collect end-to-end (#733); two-electron Hooke pair, omega=0.5,
+  exact 2.0 Ha (#734); launchable smoke rows (#735); He/H2 recorded evaluation
+  with v2 record identity (#707).
+- **H-v2 salvage**: attested partial TRAIN inventory and eval/SEL over N
+  checkpoints (#727); 5k stride fallback for eval/SEL (#737).
+- **Core-executor continuation**: typed evidence v3 with producer-generated
+  fixtures; owner-defined operational-slot registry (CX-03); executor decodes
+  evidence v3, planned yield continuation-eligible; successor admission
+  request decoder/gates (CX-04a, #717) and builder with write-once ledger
+  (CX-04b, #720); successor admission gated on confirmed remote teardown
+  (CX-06, #730).
+- **Baselines**: trajectory summaries (#725); hydrogen registry entry (#724);
+  H-atom runbook (#729).
+- **He-importance**: frozen O1 scan manifest (#706); tracked scan design
+  document (#711, #716).
+
+### Fixed
+
+- Stage 1 launch drivers import `experiments` outside the checkout (#742).
+- FermiNet boolean overrides actually applied; run receipt reads the
+  producer's own logged config (#741).
+- FermiNet walker variance read correctly (#738); DeepQMC molecule/state
+  energy axes rejected (#736).
+- HI scan-manifest study modules registered under `spec.name` (#726).
+- Toolkit accepts remote-quiescence-unconfirmed outcome (#708).
+
+### Tests and documentation
+
+- CX-05 two-leaf core-executor continuation round trip (#728); catalog
+  membership binds checkpoint directory (#731).
+- Release notes for v0.5.2 (#710); version sources bumped to 0.5.2 (#712).
+- Version sources bumped to 0.5.3 (this PR).
+
 ## v0.5.2 - H-v2 science code, core-executor contract start, Stage 1 records, executor teardown
 
 44 commits since `v0.5.1` (`76c35bc6`), merged into `dev` through 26 pull
