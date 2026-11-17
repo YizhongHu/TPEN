@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -273,7 +274,7 @@ def test_phase2_requires_checkpoint_binding() -> None:
 
 def test_phase2_rejects_missing_identity_rule() -> None:
     rows = _phase1_rows()
-    rows[0].pop("config_identity_rule")
+    next(row for row in rows if row["kind"] == "train").pop("config_identity_rule")
     with pytest.raises(ProtocolError, match="identity rule"):
         bind_evaluation_manifest(
             phase1_rows=rows, checkpoints=[7], checkpoint_sha256=_phase2_bindings(),
