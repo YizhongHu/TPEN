@@ -307,11 +307,13 @@ def test_phase2_rows_carry_phase1_manifest_and_train_identity() -> None:
         phase1_rows=phase1, checkpoints=[7], checkpoint_sha256=_phase2_bindings(),
         expected_physical_system_id={"he": "c" * 64}, phase1_manifest_hash=phase1_hash,
     )
-    train = next(row for row in phase1 if row["kind"] == "train")
-    assert {row["phase1_manifest_hash"] for row in bound} == {phase1_hash}
-    assert {row["phase1_train_row_hash"] for row in bound} == {
-        protocol_module.manifest_hash([train])
+    train_hashes = {
+        protocol_module.manifest_hash([row])
+        for row in phase1
+        if row["kind"] == "train"
     }
+    assert {row["phase1_manifest_hash"] for row in bound} == {phase1_hash}
+    assert {row["phase1_train_row_hash"] for row in bound} == train_hashes
 
 
 def test_phase2_rejects_a_conflicting_config_identity() -> None:
