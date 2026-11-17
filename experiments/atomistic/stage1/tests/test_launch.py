@@ -7,14 +7,16 @@ from pathlib import Path
 
 import pytest
 
-from experiments.atomistic.stage1.launch import command_for_row, render, row_overrides
+from experiments.atomistic.stage1.launch import _binding_token, command_for_row, render, row_overrides
 from experiments.atomistic.stage1.protocol import ProtocolError, validate_gateway_binding
+from experiments.toolkit.run_paths import resolve_run_dir
 
 
 ROW = {"kind": "train", "config": "configs/he/train.yaml", "row_id": "he-train-0",
        "seed": 123, "updates": 50000, "walkers": 4096,
        "source_sha": "c" * 40, "config_sha256": "b" * 64,
-       "results_root": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/he/train"}
+       "results_root": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1",
+       "experiment_name": "stage1", "sector": "he", "run_id": "train-lineage-0"}
 
 
 def _run(script: str, tmp_path: Path, **slurm: str) -> subprocess.CompletedProcess[str]:
@@ -156,7 +158,8 @@ def test_gateway_rejects_omitted_or_altered_binding_before_run() -> None:
                                  overrides=overrides, kind="train")
     eval_row = {
         **ROW, "kind": "eval", "draws": 256,
-        "checkpoint_path": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/he/train/model.pt",
+        "checkpoint_dir": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010",
+        "checkpoint_file": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010/model.pt",
         "checkpoint_sha256": "d" * 64,
     }
     eval_token = _binding_token(eval_row)
@@ -176,7 +179,8 @@ def test_gateway_rejects_missing_or_mismatched_checkpoint_file(
 
     eval_row = {
         **ROW, "kind": "eval", "draws": 256,
-        "checkpoint_path": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/he/train/model.pt",
+        "checkpoint_dir": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010",
+        "checkpoint_file": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010/model.pt",
         "checkpoint_sha256": "d" * 64,
     }
     overrides = row_overrides(eval_row)
@@ -198,15 +202,152 @@ def test_gateway_rejects_missing_or_mismatched_checkpoint_file(
         )
 
 
-def test_gateway_rejects_relative_checkpoint_path() -> None:
+@pytest.mark.parametrize("checkpoint_file", ["other.pt", "nested/model.pt"])
+def test_gateway_checkpoint_file_must_be_the_planned_model_file(
+    tmp_path: Path, checkpoint_file: str,
+) -> None:
+    """A descendant of the step directory is not necessarily the loaded model."""
+
+    checkpoint_dir = tmp_path / "checkpoints" / "step_000010"
+    bad_file = checkpoint_dir / checkpoint_file
+    eval_row = {
+        **ROW,
+        "kind": "eval",
+        "results_root": str(tmp_path / "results"),
+        "draws": 256,
+        "checkpoint_dir": str(checkpoint_dir),
+        "checkpoint_file": str(bad_file),
+        "checkpoint_sha256": "d" * 64,
+    }
+    overrides = row_overrides(eval_row)
+    with pytest.raises(ProtocolError, match="checkpoint_file"):
+        validate_gateway_binding(
+            binding=_binding_token(eval_row),
+            config=eval_row["config"], overrides=overrides, kind="eval",
+            expected_checkpoint_sha256=eval_row["checkpoint_sha256"],
+        )
+
+
+def test_gateway_accepts_the_planned_step_model_file(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "checkpoints" / "step_000010"
+    eval_row = {
+        **ROW,
+        "kind": "eval",
+        "results_root": str(tmp_path / "results"),
+        "draws": 256,
+        "checkpoint_dir": str(checkpoint_dir),
+        "checkpoint_file": str(checkpoint_dir / "model.pt"),
+        "checkpoint_sha256": "d" * 64,
+    }
+    assert validate_gateway_binding(
+        binding=_binding_token(eval_row), config=eval_row["config"],
+        overrides=row_overrides(eval_row), kind="eval",
+        expected_checkpoint_sha256=eval_row["checkpoint_sha256"],
+    ) == eval_row
+
+
+def test_gateway_rejects_layout_override_that_disagrees_with_planner(tmp_path: Path) -> None:
+    row = {
+        **ROW,
+        "results_root": str(tmp_path / "results"),
+    }
+    planned = resolve_run_dir(row)
+    assert planned == Path(row["results_root"]) / row["experiment_name"] / row["sector"] / row["run_id"]
+    with pytest.raises(ProtocolError, match="layout"):
+        validate_gateway_binding(
+            binding=_binding_token(row), config=row["config"],
+            overrides=[*row_overrides(row), "run.layout=flat"], kind="train",
+        )
+
+
+def test_render_rejects_absolute_run_components_outside_results_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    approved_root = tmp_path / "approved-results"
+    monkeypatch.setattr(
+        "experiments.atomistic.stage1.launch.FACILITY_RESULTS_PREFIX",
+        f"{tmp_path}/",
+    )
+    row = {
+        **ROW,
+        "results_root": str(approved_root),
+        "source_sha": "c" * 40,
+    }
+    (approved_root / ROW["experiment_name"] / ROW["sector"] / ROW["run_id"]).mkdir(
+        parents=True,
+    )
+    render(row=row, driver="driver.py", python="/usr/bin/python3",
+           head_sha="c" * 40, results_root=str(approved_root),
+           scratch_base=str(tmp_path / "scratch"))
+
+    escaped_root = tmp_path / "escaped-results"
+    escaped_root.mkdir()
+    outside = tmp_path / "outside-results"
+    outside.mkdir()
+    (escaped_root / ROW["experiment_name"]).symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="beneath results_root"):
+        render(
+            row={**row, "results_root": str(escaped_root)},
+            driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
+            results_root=str(escaped_root), scratch_base=str(tmp_path / "scratch"),
+        )
+    for field in ("experiment_name", "sector", "run_id"):
+        with pytest.raises(ValueError, match=field):
+            render(
+                row={**row, field: str(tmp_path / "escaped")},
+                driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
+                results_root=str(approved_root), scratch_base=str(tmp_path / "scratch"),
+            )
+
+
+@pytest.mark.parametrize("field,value", [
+    ("experiment_name", ""), ("experiment_name", "."), ("experiment_name", ".."),
+    ("sector", "nested/sector"), ("run_id", "../escaped"),
+])
+def test_gateway_rejects_non_component_run_identity(field: str, value: str) -> None:
+    row = {**ROW, field: value}
+    with pytest.raises(ProtocolError, match=field):
+        validate_gateway_binding(
+            binding=_binding_token(row), config=row["config"],
+            overrides=row_overrides(row), kind="train",
+        )
+
+
+def test_gateway_rejects_effective_run_dir_outside_results_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    approved_root = tmp_path / "approved"
+    row = {**ROW, "results_root": str(approved_root)}
+    monkeypatch.setattr(
+        "experiments.atomistic.stage1.protocol.resolve_run_dir",
+        lambda _row: tmp_path / "outside" / "stage1" / "he" / "run-0",
+    )
+    with pytest.raises(ProtocolError, match="beneath results_root"):
+        validate_gateway_binding(
+            binding=_binding_token(row), config=row["config"],
+            overrides=row_overrides(row), kind="train",
+        )
+
+
+def test_row_overrides_bind_nested_layout_even_when_config_inherits_flat() -> None:
+    row = {**ROW, "config": "configs/he/inherited-flat.yaml"}
+    overrides = row_overrides(row)
+    assert "run.layout=nested" in overrides
+    assert validate_gateway_binding(
+        binding=_binding_token(row), config=row["config"], overrides=overrides, kind="train",
+    ) == row
+
+
+def test_gateway_rejects_relative_checkpoint_paths() -> None:
     from experiments.atomistic.stage1.launch import _binding_token, row_overrides
 
     eval_row = {
         **ROW, "kind": "eval", "draws": 256,
-        "checkpoint_path": "relative/model.pt",
+        "checkpoint_dir": "relative/checkpoint",
+        "checkpoint_file": "relative/checkpoint/model.pt",
         "checkpoint_sha256": "d" * 64,
     }
-    with pytest.raises(ProtocolError, match="checkpoint_path must be absolute"):
+    with pytest.raises(ProtocolError, match="checkpoint_dir and checkpoint_file must be absolute"):
         validate_gateway_binding(
             binding=_binding_token(eval_row), config=eval_row["config"],
             overrides=row_overrides(eval_row), kind="eval",
@@ -219,7 +360,8 @@ def test_gateway_rejects_mismatched_checkpoint_expectation() -> None:
 
     eval_row = {
         **ROW, "kind": "eval", "draws": 256,
-        "checkpoint_path": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/he/train/model.pt",
+        "checkpoint_dir": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010",
+        "checkpoint_file": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010/model.pt",
         "checkpoint_sha256": "d" * 64,
     }
     with pytest.raises(ProtocolError):
@@ -236,7 +378,8 @@ def test_gateway_rejects_conflicting_duplicate_override(key: str) -> None:
 
     eval_row = {
         **ROW, "kind": "eval", "draws": 256,
-        "checkpoint_path": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/he/train/model.pt",
+        "checkpoint_dir": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010",
+        "checkpoint_file": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010/model.pt",
         "checkpoint_sha256": "d" * 64,
     }
     overrides = row_overrides(eval_row)
@@ -254,7 +397,8 @@ def test_gateway_rejects_prefixed_override(override: str) -> None:
 
     eval_row = {
         **ROW, "kind": "eval", "draws": 256,
-        "checkpoint_path": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/he/train/model.pt",
+        "checkpoint_dir": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010",
+        "checkpoint_file": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010/model.pt",
         "checkpoint_sha256": "d" * 64,
     }
     with pytest.raises(ProtocolError, match="prefixed gateway overrides"):
@@ -268,7 +412,8 @@ def test_gateway_rejects_prefixed_override(override: str) -> None:
 def test_command_binds_every_kind() -> None:
     eval_row = {
         **ROW, "kind": "eval", "draws": 256,
-        "checkpoint_path": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/he/train/model.pt",
+        "checkpoint_dir": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010",
+        "checkpoint_file": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010/model.pt",
         "checkpoint_sha256": "d" * 64,
     }
     for row in ({**ROW, "kind": "smoke"}, ROW, eval_row):

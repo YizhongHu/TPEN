@@ -113,7 +113,7 @@ def test_real_v2_writer_reader_flows_into_stage1_collector(monkeypatch, tmp_path
 
     artifacts = []
     for stream in range(4):
-        run_dir = tmp_path / f"run-{stream}"
+        run_dir = tmp_path / "stage1" / "he" / f"run-{stream}"
         task_dir = run_dir / "mcmc_energy"
         task_dir.mkdir(parents=True)
         writer = TrajectoryRecordStreamWriter(
@@ -138,12 +138,13 @@ def test_real_v2_writer_reader_flows_into_stage1_collector(monkeypatch, tmp_path
         trajectory_records.inspect_trajectory_record(artifacts[0].metadata_path,
                                                      expected_resolved_config_identity=identity,
                                                      expected_checkpoint_sha256="f" * 64)
-    monkeypatch.setattr(stage1_collect, "inspect_run", lambda path: {
+    monkeypatch.setattr(stage1_collect, "inspect_eval_run", lambda path: {
         "verdict": "completed", "resolved_config_identity": identity, "source_git_sha": "a" * 40,
     })
     rows = [{"row_id": f"row-{stream}", "kind": "eval", "system_id": "he_atom",
              "lineage": 0, "checkpoint": 10, "stream": stream, "results_root": str(tmp_path),
-             "run_id": f"run-{stream}", "draws": 2, "walkers": 2, "source_sha": "a" * 40,
+             "experiment_name": "stage1", "sector": "he", "run_id": f"run-{stream}",
+             "draws": 2, "walkers": 2, "source_sha": "a" * 40,
              "checkpoint_sha256": "c" * 64} for stream in range(4)]
     document = {"schema": "stage1/v2", "rows": rows, "manifest_hash": manifest_hash(rows)}
     result = stage1_collect.collect(document)

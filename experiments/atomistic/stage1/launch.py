@@ -10,7 +10,12 @@ import shlex
 from pathlib import Path
 from typing import Any, Mapping
 
-from experiments.atomistic.stage1.protocol import _require_sha, identity_expectations
+from experiments.atomistic.stage1.protocol import (
+    _require_path_component,
+    _require_sha,
+    _validate_run_identity,
+    identity_expectations,
+)
 
 ALLOWED_PARTITIONS = ("test", "gpu_test")
 FACILITY_RESULTS_PREFIX = "/n/netscratch/kozinsky_lab/Lab/rhu/"
@@ -38,13 +43,20 @@ def row_overrides(row: Mapping[str, Any]) -> list[str]:
     kind = row.get("kind")
     if kind not in {"smoke", "train", "eval"}:
         raise ValueError("manifest row has an invalid kind")
-    overrides = [f"runtime.seed={row['seed']}"]
+    overrides = [
+        f"runtime.seed={row['seed']}",
+        f"run.root={row['results_root']}",
+        f"experiment.name={row['experiment_name']}",
+        f"experiment.sector={row['sector']}",
+        f"run.run_id={row['run_id']}",
+        "run.layout=nested",
+    ]
     if kind == "eval":
         overrides.extend([
             f"evaluation_sampler.n_walkers={row['walkers']}",
             f"evaluation_tasks.mcmc_energy.generator.n_draws={row['draws']}",
-            f"load.path={row['checkpoint_path']}",
-            f"trajectory_identity.checkpoint_file={row['checkpoint_path']}",
+            f"load.path={row['checkpoint_dir']}",
+            f"trajectory_identity.checkpoint_file={row['checkpoint_file']}",
             "load.mode=model_only",
             "load.strict=true",
         ])
@@ -98,13 +110,18 @@ def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
         raise ValueError("results_root must be below the approved Netscratch prefix")
     _require_safe_value(results_root, field="results_root")
     row_root = row.get("results_root")
-    if not isinstance(row_root, str) or not row_root.startswith(results_root.rstrip("/") + "/"):
+    approved_root = results_root.rstrip("/")
+    if (not isinstance(row_root, str)
+            or (row_root != approved_root and not row_root.startswith(approved_root + "/"))):
         raise ValueError("row results_root is not bound to the rendered root")
     _require_safe_value(row_root, field="row.results_root")
     if row.get("source_sha") != head_sha:
         raise ValueError("manifest source_sha does not match rendered head_sha")
+    _validate_run_identity(row)
     if row.get("kind") == "eval":
         identity_expectations(row)
+    for field in ("experiment_name", "sector", "run_id"):
+        _require_path_component(row.get(field), field=field)
     command = command_for_row(row, python=python, driver=driver)
     template_path = Path(__file__).with_name("templates") / "cannon.sbatch"
     template = template_path.read_text(encoding="utf-8")

@@ -14,7 +14,8 @@ def _manifest(tmp_path: Path, streams: int = 4) -> dict:
     for stream in range(streams):
         rows.append({"row_id": f"row-{stream}", "kind": "eval", "system_id": "he_atom",
                      "lineage": 0, "checkpoint": 10, "stream": stream,
-                     "results_root": str(tmp_path), "run_id": f"run-{stream}",
+                     "results_root": str(tmp_path), "experiment_name": "stage1",
+                     "sector": "he", "run_id": f"run-{stream}",
                      "draws": 2, "walkers": 2, "source_sha": "a" * 40,
                      "checkpoint_sha256": "c" * 64})
     return {"schema": "stage1/v2", "manifest_hash": manifest_hash(rows), "rows": rows}
@@ -28,7 +29,7 @@ def _install_single_fake(monkeypatch, tmp_path: Path, **changes):
                 system_id="he_atom", execution_method_id="method", resolved_config_identity=identity,
                 model_provenance="checkpoint", checkpoint_sha256="c" * 64, record_content_id="e" * 64)
     base.update(changes)
-    monkeypatch.setattr(collector, "inspect_run", lambda path: {
+    monkeypatch.setattr(collector, "inspect_eval_run", lambda path: {
         "verdict": "completed", "resolved_config_identity": identity, "source_git_sha": "a" * 40})
     monkeypatch.setattr(collector, "_record_path", lambda path: path / "m.json")
     monkeypatch.setattr(collector, "inspect_trajectory_record", lambda path, **kwargs: SimpleNamespace(**base))
@@ -40,7 +41,7 @@ def test_happy_path_statistics_and_four_stream_aggregate(monkeypatch, tmp_path: 
     document = _manifest(tmp_path)
     values = [[[1.0, 2.0], [3.0, 4.0]], [[2.0, 3.0], [4.0, 5.0]],
               [[3.0, 4.0], [5.0, 6.0]], [[4.0, 5.0], [6.0, 7.0]]]
-    monkeypatch.setattr(collector, "inspect_run", lambda path: {
+    monkeypatch.setattr(collector, "inspect_eval_run", lambda path: {
         "verdict": "completed", "resolved_config_identity": {"schema": "tpen-config-identity-v1", "sha256": "b" * 64},
         "source_git_sha": "a" * 40})
     def inspect(path, **kwargs):
@@ -75,7 +76,7 @@ def _install_multi_fake(monkeypatch, tmp_path: Path, *, physical_ids, registry_i
             row["system_id"] = system_id
         document["manifest_hash"] = manifest_hash(document["rows"])
     identity = {"schema": "tpen-config-identity-v1", "sha256": "b" * 64}
-    monkeypatch.setattr(collector, "inspect_run", lambda path: {
+    monkeypatch.setattr(collector, "inspect_eval_run", lambda path: {
         "verdict": "completed", "resolved_config_identity": identity, "source_git_sha": "a" * 40})
     monkeypatch.setattr(collector, "_record_path", lambda path: path / ("m-" + path.name))
 
@@ -122,7 +123,7 @@ def test_stream_aggregate_requires_the_complete_four_stream_set(
     identity = {"schema": "tpen-config-identity-v1", "sha256": "b" * 64}
     monkeypatch.setattr(
         collector,
-        "inspect_run",
+        "inspect_eval_run",
         lambda path: {
             "verdict": "completed",
             "resolved_config_identity": identity,
@@ -172,7 +173,7 @@ def test_stream_aggregate_rejects_duplicate_or_gapped_indices(
     identity = {"schema": "tpen-config-identity-v1", "sha256": "b" * 64}
     monkeypatch.setattr(
         collector,
-        "inspect_run",
+        "inspect_eval_run",
         lambda path: {
             "verdict": "completed",
             "resolved_config_identity": identity,
@@ -210,7 +211,7 @@ def test_stream_aggregate_rejects_duplicate_or_gapped_indices(
 def test_duplicate_record_sidecars_are_refused(monkeypatch, tmp_path: Path) -> None:
     """A fixed-path lookup must not silently choose among duplicate records."""
     document = _manifest(tmp_path, streams=1)
-    run_dir = tmp_path / "run-0"
+    run_dir = collector.resolve_run_dir(document["rows"][0])
     task_dir = run_dir / "mcmc_energy"
     task_dir.mkdir(parents=True)
     (task_dir / "sampled_eval_table.metadata.json").write_text("{}", encoding="utf-8")
@@ -218,7 +219,7 @@ def test_duplicate_record_sidecars_are_refused(monkeypatch, tmp_path: Path) -> N
     identity = {"schema": "tpen-config-identity-v1", "sha256": "b" * 64}
     monkeypatch.setattr(
         collector,
-        "inspect_run",
+        "inspect_eval_run",
         lambda path: {
             "verdict": "completed",
             "resolved_config_identity": identity,
@@ -249,14 +250,14 @@ def test_duplicate_record_sidecars_are_refused(monkeypatch, tmp_path: Path) -> N
     monkeypatch.setattr(collector, "read_energy_grid", lambda record: [[1.0, 2.0], [3.0, 4.0]])
     monkeypatch.setattr(collector, "_reference", lambda system_id, registry_path: (-2.9, "transcribed"))
 
-    with pytest.raises(collector.CollectionError, match="duplicate"):
+    with pytest.raises(collector.CollectionError, match="^duplicate trajectory metadata sidecars"):
         collector.collect(document)
 
 
 @pytest.mark.parametrize("identity", [None, {"schema": "wrong", "sha256": "b" * 64}])
 def test_missing_or_malformed_run_identity_is_refused(monkeypatch, tmp_path: Path, identity) -> None:
     document = _manifest(tmp_path, streams=1)
-    monkeypatch.setattr(collector, "inspect_run", lambda path: {"verdict": "completed", "resolved_config_identity": identity})
+    monkeypatch.setattr(collector, "inspect_eval_run", lambda path: {"verdict": "completed", "resolved_config_identity": identity})
     with pytest.raises(collector.CollectionError, match="identity"):
         collector.collect(document)
 
@@ -283,7 +284,7 @@ def test_inspection_statistics_must_reconcile_with_grid(monkeypatch, tmp_path: P
 
 def test_missing_record_is_refused(monkeypatch, tmp_path: Path) -> None:
     document = _manifest(tmp_path, streams=1)
-    monkeypatch.setattr(collector, "inspect_run", lambda path: {
+    monkeypatch.setattr(collector, "inspect_eval_run", lambda path: {
         "verdict": "completed", "resolved_config_identity": {"schema": "tpen-config-identity-v1", "sha256": "b" * 64},
         "source_git_sha": "a" * 40})
     with pytest.raises(collector.CollectionError, match="missing trajectory"):

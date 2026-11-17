@@ -11,9 +11,9 @@ from typing import Any, Mapping
 
 from experiments.baselines.systems import load_registry
 from experiments.toolkit.trajectory_records import (
-    TrajectoryReaderError, inspect_run, inspect_trajectory_record, read_energy_grid,
+    TrajectoryReaderError, inspect_eval_run, inspect_trajectory_record, read_energy_grid,
 )
-from experiments.atomistic.stage1.protocol import manifest_hash
+from experiments.atomistic.stage1.protocol import manifest_hash, resolve_run_dir
 
 
 class CollectionError(ValueError):
@@ -103,9 +103,9 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
         if row_id in seen:
             raise CollectionError(f"duplicate planned row {row_id}")
         seen.add(row_id)
-        run_dir = Path(str(row["results_root"])) / str(row["run_id"])
+        run_dir = resolve_run_dir(row)
         try:
-            run = inspect_run(run_dir)
+            run = inspect_eval_run(run_dir)
             if run.get("verdict") != "completed":
                 raise CollectionError(f"run {run_dir} is not completed")
             identity = run.get("resolved_config_identity")
