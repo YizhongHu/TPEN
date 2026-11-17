@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from experiments.atomistic.stage1.launch import _binding_token, command_for_row, render, row_overrides
+from experiments.atomistic.stage1.launch import (
+    _binding_token,
+    command_for_row,
+    render as _render,
+    row_overrides,
+)
 from experiments.atomistic.stage1.protocol import ProtocolError, validate_gateway_binding
 from experiments.toolkit.run_paths import resolve_run_dir
 
@@ -17,6 +23,15 @@ ROW = {"kind": "train", "config": "configs/he/train.yaml", "row_id": "he-train-0
        "source_sha": "c" * 40, "config_sha256": "b" * 64,
        "results_root": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1",
        "experiment_name": "stage1", "sector": "he", "run_id": "train-lineage-0"}
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+
+
+def render(*args: Any, **kwargs: Any) -> str:
+    """Keep legacy test calls bound to this checkout explicitly."""
+
+    kwargs.setdefault("checkout_root", str(REPO_ROOT))
+    return _render(*args, **kwargs)
 
 
 def _run(script: str, tmp_path: Path, **slurm: str) -> subprocess.CompletedProcess[str]:

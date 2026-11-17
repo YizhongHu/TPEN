@@ -3,6 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
+
+# Direct script execution puts only this directory on sys.path.  Add the
+# checkout root before importing the source-owned experiments package.
+_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from tpen.run import run_from_config
 from experiments.atomistic.stage1.protocol import resolve_config_path, validate_gateway_binding

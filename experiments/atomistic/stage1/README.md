@@ -64,19 +64,24 @@ training updates.
 `plan.py` writes a manifest only. `launch.py` renders a script only; submission
 is an explicit operator action. The generated script requires Slurm, checks the
 delivered partition, uses node-local per-job scratch, and records job identity.
-The supported submission directory is the repository root. When `render` is
-called with the repository-relative driver path, it emits commands of this
-form, with the row's relative config preserved:
+The supported submission directory is the repository root. `render` and the
+CLI require an explicit absolute `checkout_root`/`--checkout-root`: this is the
+exact execution checkout staged for the job, and it owns the driver,
+`experiments` protocol, configs, and source identity. The checkout used to
+render the command may be different. When `render` is called with the
+repository-relative driver path, it emits commands of this form, with the
+row's relative config preserved:
 
 ```text
-/absolute/path/to/python experiments/atomistic/stage1/train.py --config configs/he/train.yaml --kind smoke <row overrides> --binding <row token>
+/absolute/path/to/python /absolute/execution/checkout/experiments/atomistic/stage1/train.py --config configs/he/train.yaml --kind smoke <row overrides> --binding <row token>
 ```
 
 The Stage-1 drivers resolve relative configs against this directory, not the
 process cwd. An absolute `--config` path is accepted when it names the same
-bound config. The eval driver emits the corresponding
-`experiments/atomistic/stage1/eval.py --config configs/<system>/eval.yaml`
-command and its strict-checkpoint arguments.
+bound config. The eval driver emits the corresponding absolute driver path and
+its strict-checkpoint arguments. A CLI caller rendering from the repository
+root for a staged checkout passes `--checkout-root /path/to/staged/checkout`;
+it must not rely on the launch module's own location or the submission cwd.
 
 Smoke rows use the same `configs/<system>/train.yaml` files as train rows. Their
 smoke-ness is only the bounded budget supplied by `launch.row_overrides`:

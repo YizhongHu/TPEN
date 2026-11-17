@@ -94,14 +94,30 @@ def command_for_row(row: Mapping[str, Any], *, python: str, driver: str) -> str:
     return shlex.join(args)
 
 
+def _resolve_driver_path(driver: str, checkout_root: str) -> str:
+    """Resolve a repository-relative driver from the selected execution checkout."""
+
+    path = Path(driver)
+    if path.is_absolute():
+        return driver
+    return str((Path(checkout_root) / path).resolve())
+
+
 def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
-           results_root: str, partition: str = "test",
+           checkout_root: str, results_root: str, partition: str = "test",
            scratch_base: str = "/scratch") -> str:
-    """Render a fail-closed script for one identity-bound row."""
+    """Render a fail-closed script for one identity-bound row.
+
+    ``checkout_root`` is the exact checkout staged for execution. It is
+    explicit so rendering from one checkout cannot launch a different tree.
+    """
 
     if not Path(python).is_absolute():
         raise ValueError("python must be an absolute path")
     _require_safe_value(python, field="python")
+    if not Path(checkout_root).is_absolute() or checkout_root == "/":
+        raise ValueError("checkout_root must be absolute and not '/'")
+    _require_safe_value(checkout_root, field="checkout_root")
     _require_safe_value(driver, field="driver")
     _require_safe_value(scratch_base, field="scratch_base")
     if not Path(scratch_base).is_absolute() or scratch_base == "/":
@@ -125,7 +141,9 @@ def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
         identity_expectations(row)
     for field in ("experiment_name", "sector", "run_id"):
         _require_path_component(row.get(field), field=field)
-    command = command_for_row(row, python=python, driver=driver)
+    command = command_for_row(
+        row, python=python, driver=_resolve_driver_path(driver, checkout_root)
+    )
     template_path = Path(__file__).with_name("templates") / "cannon.sbatch"
     template = template_path.read_text(encoding="utf-8")
     for marker, value in {
@@ -146,6 +164,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--row", type=Path, required=True)
     parser.add_argument("--driver", required=True)
+    parser.add_argument("--checkout-root", required=True)
     parser.add_argument("--python", required=True)
     parser.add_argument("--head-sha", required=True)
     parser.add_argument("--results-root", required=True)
@@ -154,6 +173,7 @@ def main() -> int:
     args = parser.parse_args()
     row = json.loads(args.row.read_text(encoding="utf-8"))
     args.output.write_text(render(row=row, driver=args.driver, python=args.python,
+                                  checkout_root=args.checkout_root,
                                   head_sha=args.head_sha, results_root=args.results_root,
                                   partition=args.partition, scratch_base=args.scratch_base), encoding="utf-8")
     args.output.chmod(0o750)
