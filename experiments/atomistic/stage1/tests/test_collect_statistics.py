@@ -11,7 +11,7 @@ from experiments.atomistic.stage1 import collect as collector
 from experiments.atomistic.stage1.protocol import manifest_hash
 
 
-def _manifest(tmp_path: Path, streams: int = 4) -> dict:
+def _manifest(tmp_path: Path, streams: int = 4, draws: int = 2, walkers: int = 2) -> dict:
     rows = []
     for stream in range(streams):
         rows.append({"row_id": f"row-{stream}", "kind": "eval", "system_id": "he_atom",
@@ -19,16 +19,18 @@ def _manifest(tmp_path: Path, streams: int = 4) -> dict:
                      "lineage": 0, "checkpoint": 10, "stream": stream,
                      "results_root": str(tmp_path), "experiment_name": "stage1",
                      "sector": "he", "run_id": f"run-{stream}",
-                     "draws": 2, "walkers": 2, "source_sha": "a" * 40,
+                     "draws": draws, "walkers": walkers, "source_sha": "a" * 40,
                      "checkpoint_sha256": "c" * 64})
     return {"schema": "stage1/v3", "manifest_hash": manifest_hash(rows), "rows": rows}
 
 
-def _install_single_fake(monkeypatch, tmp_path: Path, *, streams: int = 1, **changes):
-    document = _manifest(tmp_path, streams=streams)
+def _install_single_fake(monkeypatch, tmp_path: Path, *, streams: int = 1, draws: int = 2,
+                          walkers: int = 2, **changes):
+    document = _manifest(tmp_path, streams=streams, draws=draws, walkers=walkers)
     identity = {"schema": "tpen-config-identity-v1", "sha256": "b" * 64}
-    base = dict(record_schema="trajectory_records/v2", draw_count=2, walker_count=2, row_count=4,
-                finite_count=4, mean=2.5, variance=1.25, csv_sha256="d" * 64,
+    row_count = draws * walkers
+    base = dict(record_schema="trajectory_records/v2", draw_count=draws, walker_count=walkers,
+                row_count=row_count, finite_count=row_count, mean=2.5, variance=1.25, csv_sha256="d" * 64,
                 system_id="he_atom", execution_method_id="method", resolved_config_identity=identity,
                 model_provenance="checkpoint", checkpoint_sha256="c" * 64, record_content_id="e" * 64)
     base.update(changes)
@@ -297,6 +299,8 @@ def test_writer_statistics_are_forwarded_without_reducing_again(
         monkeypatch,
         tmp_path,
         streams=4,
+        draws=4,
+        walkers=64,
         mean=writer_mean,
         variance=writer_variance,
     )
@@ -305,6 +309,34 @@ def test_writer_statistics_are_forwarded_without_reducing_again(
     stats = result["records"][0]["statistics"]
     assert stats["mean"] == writer_mean
     assert stats["variance"] == writer_variance
+
+
+def test_writer_statistics_exact_recompute_matches(monkeypatch, tmp_path: Path) -> None:
+    """Control: an exactly recomputed sidecar scalar passes identically on the base collector."""
+    values = [
+        [0.75 + ((draw * 64 + walker) % 17 - 8) * 1.0e-5 for walker in range(64)]
+        for draw in range(4)
+    ]
+    draw_sums = [sum(draw) for draw in values]
+    draw_square_sums = [sum(value * value for value in draw) for draw in values]
+    total = sum(draw_sums)
+    total_square = sum(draw_square_sums)
+    collector_mean = total / 256
+    collector_variance = total_square / 256 - collector_mean * collector_mean
+    document = _install_single_fake(
+        monkeypatch,
+        tmp_path,
+        streams=4,
+        draws=4,
+        walkers=64,
+        mean=collector_mean,
+        variance=collector_variance,
+    )
+    monkeypatch.setattr(collector, "read_energy_grid", lambda record: values)
+    result = collector.collect(document)
+    stats = result["records"][0]["statistics"]
+    assert stats["mean"] == collector_mean
+    assert stats["variance"] == collector_variance
 
 
 def test_tampered_csv_is_refused_after_inspection(monkeypatch, tmp_path: Path) -> None:
