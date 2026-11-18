@@ -14,7 +14,7 @@ from experiments.atomistic.stage1.protocol import CHECKPOINT_EVIDENCE_SCHEMA, ma
 
 
 HERE = Path(__file__).resolve().parent
-REPO_ROOT = HERE.parents[4]
+REPO_ROOT = HERE.parents[3]
 WRAPPER = HERE.parent / "polaris" / "pbs_stage1.sh"
 FIXTURES = HERE / "fixtures" / "polaris_p1_r2"
 EAGLE_ROOT = "/eagle/HetRxnEnergy/rhu/stage1-p2-test"
