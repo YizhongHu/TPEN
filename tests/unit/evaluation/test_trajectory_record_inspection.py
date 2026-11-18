@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import shutil
 from pathlib import Path
 
 import pytest
@@ -87,6 +88,14 @@ def _write_v1_artifact(
 
 
 VALUES = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+_REAL_STAGE1_HE_FIXTURE = (
+    Path(__file__).resolve().parents[2]
+    / "integration"
+    / "artifacts"
+    / "trajectory_records"
+    / "stage1_he_real_eval"
+)
 
 
 def _read_metadata(artifact: TrajectoryRecordArtifact) -> dict:
@@ -292,6 +301,57 @@ def test_mean_variance_tamper_detected_even_with_consistent_grid(tmp_path: Path)
     _write_metadata(artifact, metadata)
     with pytest.raises(TamperedTrajectoryRecordError, match="mean/variance"):
         inspect_trajectory_record(artifact.metadata_path)
+
+
+def test_real_stage1_eval_fixture_reconciles_float64_roundoff() -> None:
+    """A real four-draw Stage 1 pair survives its independent reduction roundoff."""
+
+    metadata_path = _REAL_STAGE1_HE_FIXTURE / "sampled_eval_table.metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    scan = trajectory_records._scan_v1_csv(
+        _REAL_STAGE1_HE_FIXTURE / "sampled_eval_table.csv",
+        draw_count=metadata["draw_count"],
+        walker_count=metadata["walker_count"],
+        n_electrons=metadata["n_electrons"],
+        spatial_dim=metadata["spatial_dim"],
+        term_names=metadata["term_names"],
+    )
+
+    # The real writer and this reader reduce the same CSV in different orders;
+    # the variance differs by a few binary64 ulps, not by a science-scale amount.
+    assert scan.variance != metadata["variance"]
+    inspected = inspect_trajectory_record(metadata_path)
+    assert inspected.row_count == 256
+    assert inspected.mean == metadata["mean"]
+    assert inspected.variance == metadata["variance"]
+
+
+def test_stage1_scale_rejects_one_e_6_relative_variance_tamper(tmp_path: Path) -> None:
+    """A 1e-6 variance change is outside the float64 reconciliation bound."""
+
+    offsets = torch.arange(256, dtype=torch.float64).reshape(4, 64)
+    centered = offsets - offsets.mean()
+    values = 1.0 + centered * math.sqrt(7.0e-6 / float((centered.square()).mean()))
+    artifact = _write_v1_artifact(tmp_path, values)
+    metadata = _read_metadata(artifact)
+    metadata["variance"] *= 1.0 + 1.0e-6
+
+    # The old abs_tol=1e-9 accepted this 7e-12 absolute change.  Keep the
+    # perturbation below that obsolete allowance so the test kills that mutant.
+    assert abs(metadata["variance"] - artifact.variance) < 1.0e-9
+    _write_metadata(artifact, metadata)
+    with pytest.raises(TamperedTrajectoryRecordError, match="mean/variance"):
+        inspect_trajectory_record(artifact.metadata_path)
+
+
+def test_real_stage1_fixture_can_be_replayed_from_a_copied_pair(tmp_path: Path) -> None:
+    """The committed pair remains usable when copied as a run artifact would be."""
+
+    copied = tmp_path / "stage1_he_real_eval"
+    shutil.copytree(_REAL_STAGE1_HE_FIXTURE, copied)
+    inspected = inspect_trajectory_record(copied / "sampled_eval_table.metadata.json")
+    assert inspected.record_schema == "trajectory_records/v2"
+    assert inspected.row_count == 256
 
 
 # ---------------------------------------------------------------------------

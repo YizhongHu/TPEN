@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import math
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -1391,8 +1392,10 @@ def _inspect_v1(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryReco
         )
     declared_mean = _as_float(metadata["mean"])
     declared_variance = _as_float(metadata["variance"])
-    if not _close_or_same_nonfinite(scan.mean, declared_mean) or not _close_or_same_nonfinite(
-        scan.variance, declared_variance
+    if not _close_or_same_nonfinite(
+        scan.mean, declared_mean, sample_count=scan.row_count
+    ) or not _close_or_same_nonfinite(
+        scan.variance, declared_variance, sample_count=scan.row_count
     ):
         raise TamperedTrajectoryRecordError(
             "trajectory record mean/variance disagrees with its CSV: "
@@ -1530,8 +1533,10 @@ def _inspect_v2(
         raise TamperedTrajectoryRecordError(
             "trajectory record mean/variance must be finite or valid non-finite sentinels"
         ) from exc
-    if not _close_or_same_nonfinite(scan.mean, declared_mean) or not _close_or_same_nonfinite(
-        scan.variance, declared_variance
+    if not _close_or_same_nonfinite(
+        scan.mean, declared_mean, sample_count=scan.row_count
+    ) or not _close_or_same_nonfinite(
+        scan.variance, declared_variance, sample_count=scan.row_count
     ):
         raise TamperedTrajectoryRecordError(
             "trajectory record mean/variance disagrees with its CSV: "
@@ -2315,17 +2320,55 @@ def _same_float(left: float, right: float) -> bool:
     return left == right or (math.isnan(left) and math.isnan(right))
 
 
-def _close_or_same_nonfinite(left: float, right: float, *, rel_tol: float = 1e-9, abs_tol: float = 1e-9) -> bool:
-    """Compare two floats tolerantly, treating matching non-finite values as equal.
+def _reconciliation_tolerance(*, left: float, right: float, sample_count: int) -> float:
+    """Return a conservative float64 summation-error bound.
 
-    Used only to cross-check a reader's independent recomputation against a
-    sidecar's declared value; two different summation orders (this module's
-    plain accumulation versus the writer's torch reduction) can legitimately
-    differ in the last few bits without either being tampered.
+    Parameters
+    ----------
+    left, right : float
+        The independently reduced values being compared.
+    sample_count : int
+        Number of CSV rows contributing to the reduction.
+
+    Returns
+    -------
+    float
+        An absolute comparison bound scaled to the values being compared.
+
+    Notes
+    -----
+    A binary64 operation has unit roundoff ``u = 2**-53``.  The standard
+    first-order bound for a sequence of ``n`` rounded operations is
+    ``gamma_n = n*u/(1 - n*u)``.  The writer and reader each perform a
+    reduction, then perform the mean/variance arithmetic, so eight ``gamma_n``
+    units cover those two reductions and the surrounding operations with a
+    conservative constant.  The ``max(..., 1.0)`` floor gives values near zero
+    a finite absolute allowance while retaining scale-aware relative behavior
+    for Stage 1 values.  This is many orders tighter than the former fixed
+    ``1e-9`` absolute allowance at variances around ``7e-6``.
+    """
+
+    if sample_count < 1:
+        raise ValueError("sample_count must be positive")
+    unit_roundoff = sys.float_info.epsilon / 2.0
+    n_times_u = sample_count * unit_roundoff
+    gamma_n = n_times_u / (1.0 - n_times_u)
+    scale = max(abs(left), abs(right), 1.0)
+    return 8.0 * gamma_n * scale
+
+
+def _close_or_same_nonfinite(left: float, right: float, *, sample_count: int) -> bool:
+    """Compare independently reduced floats using a dtype/size-aware bound.
+
+    Matching non-finite values remain exact sentinels.  Finite values are
+    compared with :func:`_reconciliation_tolerance`, so a genuine sidecar
+    mismatch is not hidden by a fixed absolute tolerance.
     """
 
     if math.isfinite(left) and math.isfinite(right):
-        return math.isclose(left, right, rel_tol=rel_tol, abs_tol=abs_tol)
+        return abs(left - right) <= _reconciliation_tolerance(
+            left=left, right=right, sample_count=sample_count
+        )
     return _same_float(left, right)
 
 
