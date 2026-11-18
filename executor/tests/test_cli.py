@@ -210,6 +210,10 @@ def test_b1_admitted_transport_is_retained_on_dispatch_plan(tmp_path: Path, monk
             observed["worker"] = worker
             self.transport = transport
 
+        def admit_transport_shape(self, allocation, env=None):
+            observed["shape_calls"] = observed.get("shape_calls", 0) + 1
+            observed["shape_allocation"] = allocation
+
     monkeypatch.setattr(composition, "ParslDispatcher", StubParslDispatcher)
     monkeypatch.setattr(composition, "bindings_from_allocation", lambda allocation: ())
     plan = composition.admit(
@@ -219,6 +223,8 @@ def test_b1_admitted_transport_is_retained_on_dispatch_plan(tmp_path: Path, monk
     expected = AttachedTransportSpec.from_mapping(payload)
     assert plan.transport == expected
     assert plan.dispatcher.transport is plan.transport
+    assert observed["shape_calls"] == 1
+    assert observed["shape_allocation"] is plan.allocation
     assert observed["worker"] is plan.worker
 
 
