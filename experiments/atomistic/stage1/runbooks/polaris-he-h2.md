@@ -169,11 +169,15 @@ qsub -A HetRxnEnergy -q capacity \
   "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 ```
 
-The wrapper maps lineages `0,1,2` to GPU/CPU ranges `(0,0-15)`, `(1,16-31)`,
-and `(2,32-47)`, exports `OMP_NUM_THREADS=16` and `MKL_NUM_THREADS=16`, and
-starts all three rows concurrently.  GPU 3 is left unused.  Each row writes
-a separate log and `.status` receipt under `RESULTS_ROOT/logs/`; the wrapper
-also captures the exact argv returned by `launch.command_for_row`.
+The wrapper derives the affinity-constrained layout from `taskset -pc $$` and
+`lscpu -p=CPU,CORE,NODE`: it keeps one logical CPU per physical core, orders by
+NUMA node and core, and splits the usable cores into three equal lineage slices.
+Train/eval export `OMP_NUM_THREADS` and `MKL_NUM_THREADS` from each slice's
+derived physical-core count and reuse the exact derived CPU list with `taskset`.
+The allocation-dependent `POLARIS_LAYOUT` lines record the CPU lists and counts;
+the three rows start concurrently and GPU 3 is left unused.  Each row writes a
+separate log and `.status` receipt under `RESULTS_ROOT/logs/`; the wrapper also
+captures the exact argv returned by `launch.command_for_row`.
 
 ### 3. Phase-2 checkpoint binding on free `debug`
 
