@@ -350,6 +350,17 @@ def test_phase2_rejects_checkpoint_evidence_from_a_foreign_phase1_manifest() -> 
         )
 
 
+def test_phase2_rejects_evidence_with_a_forged_manifest_hash() -> None:
+    phase1 = _phase1_rows()
+    evidence = _phase2_evidence(phase1)
+    evidence["phase1_manifest_hash"] = "e" * 64
+    with pytest.raises(ProtocolError, match="does not match phase-1 manifest"):
+        bind_evaluation_manifest(
+            phase1_rows=phase1, checkpoints=[7], checkpoint_evidence=evidence,
+            expected_physical_system_id={"he": "c" * 64},
+        )
+
+
 def test_phase2_rejects_checkpoint_outside_phase1_steps() -> None:
     evidence = _phase2_evidence()
     evidence["checkpoints"] = {
