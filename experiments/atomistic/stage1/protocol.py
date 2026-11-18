@@ -614,8 +614,8 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         raise ProtocolError("systems must contain distinct known Stage-1 systems")
     if device is not None and device not in {"cpu", "cuda"}:
         raise ProtocolError("device must be 'cpu' or 'cuda'")
-    if not checkpoints or any(step <= 0 for step in checkpoints):
-        raise ProtocolError("checkpoints must be a non-empty list of positive updates")
+    if not checkpoints or any(type(step) is not int or step < 0 for step in checkpoints):
+        raise ProtocolError("checkpoints must be a non-empty list of non-negative updates")
     if len(set(checkpoints)) != len(checkpoints):
         raise ProtocolError("checkpoints must not contain duplicates")
     if isinstance(config_sha256, Mapping):
@@ -844,8 +844,8 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         eval_streams, eval_walkers, eval_draws = protocol.eval_streams, protocol.eval_walkers, protocol.eval_draws
     if eval_streams <= 0 or eval_walkers <= 0 or eval_draws <= 0:
         raise ProtocolError("evaluation dimensions must be positive")
-    if not checkpoints or any(not isinstance(step, int) or step <= 0 for step in checkpoints):
-        raise ProtocolError("checkpoints must be a non-empty list of positive updates")
+    if not checkpoints or any(type(step) is not int or step < 0 for step in checkpoints):
+        raise ProtocolError("checkpoints must be a non-empty list of non-negative updates")
     if len(set(checkpoints)) != len(checkpoints):
         raise ProtocolError("checkpoints must not contain duplicates")
     phase1_checkpoint_steps = {
