@@ -13,7 +13,15 @@ from experiments.baselines.systems import load_registry
 from experiments.toolkit.trajectory_records import (
     TrajectoryReaderError, inspect_eval_run, inspect_trajectory_record, read_energy_grid,
 )
-from experiments.atomistic.stage1.protocol import manifest_hash, resolve_run_dir
+from experiments.atomistic.stage1.protocol import (
+    CONFIG_IDENTITY_RULE,
+    LEGACY_CONFIG_IDENTITY_RULE,
+    _validate_config_identity_for_row,
+    manifest_hash,
+    ProtocolError,
+    resolve_config_path,
+    resolve_run_dir,
+)
 
 
 class CollectionError(ValueError):
@@ -96,11 +104,37 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
     if any(not isinstance(row, Mapping) for row in rows):
         raise CollectionError("manifest contains a malformed eval row")
     eval_rows = [row for row in rows if row.get("kind") == "eval"]
+    phase1_rows = [row for row in rows if row.get("kind") != "eval"]
+    phase1_hashes = {row.get("phase1_manifest_hash") for row in eval_rows
+                     if row.get("phase1_manifest_hash") is not None}
+    if phase1_hashes:
+        if len(phase1_hashes) != 1 or next(iter(phase1_hashes)) != manifest_hash(phase1_rows):
+            raise CollectionError("phase-2 rows are not bound to this phase-1 manifest")
+        train_by_id = {
+            row.get("row_id"): row for row in phase1_rows if row.get("kind") == "train"
+        }
+        for row in eval_rows:
+            depends_on = row.get("depends_on")
+            train_row = train_by_id.get(depends_on)
+            if train_row is None or row.get("phase1_train_row_hash") != manifest_hash([train_row]):
+                raise CollectionError("phase-2 row is not bound to its phase-1 train row")
     records: list[dict[str, Any]] = []
     seen: set[str] = set()
     registry_to_physical: dict[str, str] = {}
     physical_to_registry: dict[str, str] = {}
     for row in eval_rows:
+        if row.get("config_identity_rule") not in {
+            None, CONFIG_IDENTITY_RULE, LEGACY_CONFIG_IDENTITY_RULE,
+        }:
+            raise CollectionError(f"row {row.get('row_id')}: unsupported config identity rule")
+        if row.get("config_identity_rule") == CONFIG_IDENTITY_RULE:
+            digest = row.get("config_sha256")
+            if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise CollectionError(f"row {row.get('row_id')}: malformed config identity")
+            try:
+                _validate_config_identity_for_row(row, resolve_config_path(row.get("config")))
+            except (KeyError, TypeError, OSError, ProtocolError) as exc:
+                raise CollectionError(f"row {row.get('row_id')}: config identity mismatch") from exc
         row_id = str(row.get("row_id"))
         if row_id in seen:
             raise CollectionError(f"duplicate planned row {row_id}")

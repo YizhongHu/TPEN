@@ -15,6 +15,25 @@ records checkpoint provenance. S1-A3 system
 eval configs must define a `trajectory_identity` block with `checkpoint_file`
 for this override to be accepted by Hydra.
 
+Planning is two-phase: phase 1 may select systems and emits smoke/train rows;
+phase 2 consumes that manifest and binds checkpoint digests to eval rows without
+replanning seeds or source/config identity. `config_sha256` is computed by the
+planner under `stage1-config-v1`: sorted `configs/<system>/{train,eval}.yaml`
+paths and their canonical bytes are hashed. The rule id is recorded in each row;
+GPU intent is recorded as a row `device` only when explicitly requested.
+The one-shot compatibility `--config-sha256` input is recorded as
+`legacy-config-sha256`; two-phase planning always records the computed rule.
+
+Phase-2 checkpoint input is a `stage1-checkpoint-evidence/v1` envelope, not a
+bare digest map. It contains `phase1_manifest_hash`, a
+`phase1_train_row_hashes` map keyed by `system:lineage`, and a `checkpoints` map
+keyed by `system:lineage:checkpoint`. The planner compares both identities
+before reading checkpoint digests, and phase-2 checkpoints must be among the
+phase-1 train rows' declared `checkpoint_steps`. Two-phase CLI modes always
+compute config identity from this checkout; a supplied legacy scalar is only a
+comparison value. The one-shot compatibility mode may still consume the old
+scalar/map inputs.
+
 Each evaluation config builds one `SystemDescriptor` from its instantiated
 `ParticleSpec` and `hamiltonian_terms`, and passes that descriptor plus an
 explicit `NaiveLocalEnergyEvaluator` to `TrajectoryMCMCGenerator`. The
