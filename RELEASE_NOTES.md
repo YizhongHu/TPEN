@@ -1,5 +1,24 @@
 # Release Notes
 
+## v0.5.4 - Stage 1 production GPU launch, reconciled collector statistics, two-phase manifest identity
+
+5 commits since `v0.5.3` (`0cc1de6d`), merged into `dev` through PRs #744,
+#746, #747, #750, plus this version bump.
+
+### Added
+
+- **Stage 1 production GPU launch** (#746): production GPU launch shape,
+  in-job A100 guard, device binding [S1-A7].
+- **Stage 1 two-phase manifest** (#747): two-phase per-system manifest and
+  computed `stage1-config-v1` config identity [S1-A8].
+- **Baselines full-run modes** (#744): fixed full-run modes for the h-atom
+  r1 ramp runbook.
+
+### Fixed
+
+- **Stage 1 collector** (#750): collector now uses inspection's reconciled
+  pooled statistics [S1-A9].
+
 ## v0.5.3 - Stage 1 benchmark code, H-v2 salvage path, core-executor continuation
 
 43 commits since `v0.5.2` (`14235a0a`), merged into `dev` through PRs
