@@ -18,11 +18,11 @@ _CONFIG_PATH = Path(__file__).with_name("configs") / "train.yaml"
 _RESTORED = "restored", "native train_resume owns the corresponding state"
 _RECONSTRUCTIBLE = (
     "reconstructible",
-    "the object is rebuilt from the committed HI configuration",
+    "immutable construction policy is rebuilt from the committed HI configuration; mutable trained state is owned by TrainResume",
 )
 _TYPED_REFUSED = (
     "typed-refused",
-    "native recovery profile does not admit this mutable owner; HI continuation refuses before construction",
+    "native recovery profile does not admit this mutable owner; with p=1 and max_calls=None cadence state is inert, otherwise HI continuation refuses before construction",
 )
 _ALLOCATION_LOCAL = (
     "allocation-local",
@@ -47,7 +47,7 @@ _REGISTRY: dict[tuple[str, str], tuple[str, str]] = {
             ("sampler", "tpen.sampling.metropolis.MetropolisSampler"),
             ("trainer", "tpen.training.trainer.VMCTrainer"),
         ],
-        _RESTORED,
+        _RECONSTRUCTIBLE,
     ),
     **_registry_entries(
         [
@@ -141,6 +141,61 @@ _REGISTRY.update(
     )
 )
 
+# Resolved family rows retain the same objects under ``runner.*`` aliases.
+_REGISTRY.update(
+    {
+        (f"runner.{path}", target): disposition
+        for (path, target), disposition in tuple(_REGISTRY.items())
+        if path in {"model", "sampler", "trainer", "optimizer"}
+    }
+)
+_REGISTRY.update(
+    _registry_entries(
+        [
+            ("model.layers.0.mixing.layout", "tpen.data.paths.compose_path_layout"),
+            ("model.layers.0.mixing.layout.tensor_product", "tpen.data.paths.PathMetadata.generate"),
+            ("model.layers.0.mixing.layout.input_orders", "tpen.data.paths.NormalizedOrders"),
+            ("model.layers.0.mixing.layout.output_orders", "tpen.data.paths.NormalizedOrders"),
+            ("model.layers.0.mixing.layout.input_channels", "tpen.data.paths.NormalizedChannels"),
+            ("model.layers.0.mixing.layout.output_channels", "tpen.data.paths.NormalizedChannels"),
+            ("model.layers.0.mixing.producers.0", "tpen.nn.EquivariantMixing"),
+            ("model.layers.0.mixing.producers.0.paths", "tpen.data.paths.PathMetadata.generate"),
+            ("model.layers.0.path_aggregation.layout", "tpen.data.paths.compose_path_layout"),
+            ("model.layers.0.path_aggregation.layout.tensor_product", "tpen.data.paths.PathMetadata.generate"),
+            ("model.layers.0.path_aggregation.layout.input_orders", "tpen.data.paths.NormalizedOrders"),
+            ("model.layers.0.path_aggregation.layout.output_orders", "tpen.data.paths.NormalizedOrders"),
+            ("model.layers.0.path_aggregation.layout.input_channels", "tpen.data.paths.NormalizedChannels"),
+            ("model.layers.0.path_aggregation.layout.output_channels", "tpen.data.paths.NormalizedChannels"),
+            ("model.factors.1.atoms", "tpen.data.atomic_configuration.AtomicConfiguration"),
+            ("model.factors.1.atoms.positions", "torch.tensor"),
+            ("model.factors.1.atoms.charges", "torch.tensor"),
+            ("hamiltonian_terms.electron_nucleus.atoms", "tpen.data.atomic_configuration.AtomicConfiguration"),
+            ("hamiltonian_terms.electron_nucleus.atoms.positions", "torch.tensor"),
+            ("hamiltonian_terms.electron_nucleus.atoms.charges", "torch.tensor"),
+            ("hamiltonian_terms.nucleus_nucleus.atoms", "tpen.data.atomic_configuration.AtomicConfiguration"),
+            ("hamiltonian_terms.nucleus_nucleus.atoms.positions", "torch.tensor"),
+            ("hamiltonian_terms.nucleus_nucleus.atoms.charges", "torch.tensor"),
+            ("model.layers.0.update", "tpen.nn.ReplaceUpdater"),
+            ("model.layers.0.update_envelope", "tpen.nn.coordinate_envelopes.GaussianCoordinateEnvelope"),
+        ],
+        _RECONSTRUCTIBLE,
+    )
+)
+
+# These are the mutable recovery owners named by the native checkpoint
+# contract.  They are inventory records, not Hydra constructors.
+_TRAIN_RESUME_STATE = (
+    ("state.model", "TrainResume.model", "model"),
+    ("state.optimizer", "TrainResume.optimizer", "optimizer"),
+    ("state.trainer", "TrainResume.trainer", "trainer"),
+    ("state.sampler", "TrainResume.sampler", "sampler"),
+    ("state.process_rng", "TrainResume.rng", "rng"),
+)
+_ATTEMPT_LOCAL_STATE = (
+    ("state.loggers", "attempt-local.loggers", "loggers"),
+    ("state.checkpoint_publication", "attempt-local.checkpoint_publication", "checkpoint publication fields"),
+)
+
 
 @dataclass(frozen=True, slots=True)
 class MutableStateEntry:
@@ -193,6 +248,23 @@ def _walk_targets(value: Any, path: str = "") -> list[tuple[str, str]]:
 
 
 def _config_tree(config: Any | None) -> Mapping[str, Any]:
+    """Convert an OmegaConf or mapping input to a constructor tree.
+
+    Parameters
+    ----------
+    config : object, optional
+        HI configuration; ``None`` composes the committed base tree.
+
+    Returns
+    -------
+    Mapping
+        Plain mapping containing the constructor tree.
+
+    Raises
+    ------
+    TypeError
+        If ``config`` is not mapping-like.
+    """
     if config is None:
         from . import train_config
 
@@ -205,12 +277,36 @@ def _config_tree(config: Any | None) -> Mapping[str, Any]:
 
 
 def build_mutable_state_inventory(config: Any | None = None) -> tuple[MutableStateEntry, ...]:
-    """Enumerate and classify every constructor in the HI train config."""
+    """Enumerate and classify every constructor in the HI train config.
+
+    Parameters
+    ----------
+    config : object, optional
+        HI configuration to inspect.
+
+    Returns
+    -------
+    tuple of MutableStateEntry
+        Explicit constructor and native-state ownership records.
+
+    Raises
+    ------
+    ValueError
+        If a constructor is not in the sealed registry or the tree is empty.
+    """
 
     tree = _config_tree(config)
     entries: list[MutableStateEntry] = []
     for path, target in _walk_targets(tree):
-        classification, reason = _classification(path, target)
+        try:
+            classification, reason = _classification(path, target)
+        except ValueError:
+            # ``runner.*`` is a producer alias emitted by resolve_train_config;
+            # accept only an exact registered target at its canonical path.
+            if path.startswith("runner."):
+                classification, reason = _classification(path[7:], target)
+            else:
+                raise
         entries.append(
             MutableStateEntry(
                 path=path,
@@ -220,13 +316,49 @@ def build_mutable_state_inventory(config: Any | None = None) -> tuple[MutableSta
                 source=_source_ref(path, target),
             )
         )
+    entries.extend(
+        MutableStateEntry(
+            path=path,
+            target=target,
+            classification="restored",
+            reason=f"native TrainResume component {component!r} from tpen/checkpoint/save.py and restore.py",
+            source="tpen/checkpoint/save.py:171-196; tpen/checkpoint/restore.py:203-208",
+        )
+        for path, target, component in _TRAIN_RESUME_STATE
+    )
+    entries.extend(
+        MutableStateEntry(
+            path=path,
+            target=target,
+            classification="allocation-local",
+            reason=f"{component} is regenerated for each training attempt",
+            source="tpen/callback/checkpoint.py:228-283,410-417; tpen/logging/csv.py:33-52",
+        )
+        for path, target, component in _ATTEMPT_LOCAL_STATE
+    )
     if not entries:
         raise ValueError("HI train config constructs no inventory objects")
     return tuple(entries)
 
 
 def validate_mutable_state_inventory(config: Any | None = None) -> tuple[MutableStateEntry, ...]:
-    """Return the inventory, refusing any unclassified constructed object."""
+    """Return the inventory, refusing any unclassified object.
+
+    Parameters
+    ----------
+    config : object, optional
+        HI configuration to validate.
+
+    Returns
+    -------
+    tuple of MutableStateEntry
+        Validated inventory records.
+
+    Raises
+    ------
+    ValueError
+        If a constructor or disposition is not explicitly admitted.
+    """
 
     entries = build_mutable_state_inventory(config)
     allowed = {"restored", "reconstructible", "allocation-local", "typed-refused"}
@@ -237,7 +369,23 @@ def validate_mutable_state_inventory(config: Any | None = None) -> tuple[Mutable
 
 
 def refused_inventory_entries(config: Any | None = None) -> tuple[MutableStateEntry, ...]:
-    """Return the typed-refused entries used in the stable refusal reason."""
+    """Return typed-refused entries used in the stable refusal reason.
+
+    Parameters
+    ----------
+    config : object, optional
+        HI configuration to inspect.
+
+    Returns
+    -------
+    tuple of MutableStateEntry
+        Entries that prevent continuation qualification.
+
+    Raises
+    ------
+    ValueError
+        If the inventory is not closed.
+    """
 
     return tuple(
         entry

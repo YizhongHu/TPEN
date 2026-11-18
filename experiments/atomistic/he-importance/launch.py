@@ -37,12 +37,28 @@ class HIContinuationRefusal(ValueError):
 
 
 def refuse_hi_continuation(restore_request: object | None) -> None:
-    """Refuse HI continuation before resolution, construction, or any write."""
+    """Refuse HI continuation before resolution, construction, or any write.
+
+    Parameters
+    ----------
+    restore_request : object, optional
+        Continuation payload; ``None`` means this is a fresh attempt.
+
+    Raises
+    ------
+    HIContinuationRefusal
+        If a continuation payload is supplied or inventory validation fails.
+    """
 
     if restore_request is None:
         return
     inventory = import_module("experiments.atomistic.he-importance.mutable_state_inventory")
-    refused = inventory.refused_inventory_entries()
+    try:
+        refused = inventory.refused_inventory_entries()
+    except Exception as error:
+        raise HIContinuationRefusal(
+            f"mutable-state inventory validation failed: {error}"
+        ) from error
     if not refused:
         raise HIContinuationRefusal(
             "inventory contains no typed-refused entry; refusing closed-boundary "
@@ -491,6 +507,8 @@ def prepare_train_launch(
     ------
     HIContinuationRefusal
         If ``restore_request`` is not ``None``.
+    ValueError
+        If the HI inventory cannot be validated while constructing the refusal.
     """
 
     refuse_hi_continuation(restore_request)

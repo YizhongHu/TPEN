@@ -19,6 +19,9 @@ launch = importlib.import_module("experiments.atomistic.he-importance.launch")
 stage_q = importlib.import_module("experiments.atomistic.he-importance.run_stage_q")
 train_config = importlib.import_module("experiments.atomistic.he-importance.train_config")
 context_mapping = importlib.import_module("experiments.atomistic.he-importance.context_mapping")
+architecture_stage_family = importlib.import_module(
+    "experiments.atomistic.he-importance.architecture_stage_family"
+)
 
 
 def test_real_hi_train_config_is_fully_classified() -> None:
@@ -39,6 +42,21 @@ def test_real_hi_train_config_is_fully_classified() -> None:
     assert all(":line " in entry.source for entry in refused)
 
 
+def test_restored_entries_name_real_train_resume_components() -> None:
+    """Every restored disposition maps to a native TrainResume component."""
+
+    entries = inventory.validate_mutable_state_inventory()
+    restored = [entry for entry in entries if entry.classification == "restored"]
+    assert restored
+    assert {entry.target for entry in restored} == {
+        "TrainResume.model",
+        "TrainResume.optimizer",
+        "TrainResume.trainer",
+        "TrainResume.sampler",
+        "TrainResume.rng",
+    }
+
+
 def test_o_composite_hi_config_is_fully_classified() -> None:
     config = train_config._compose_base_config()
     config.model = context_mapping.compose_package(config.model, "B11")
@@ -51,6 +69,48 @@ def test_o_composite_hi_config_is_fully_classified() -> None:
     )
     entries = inventory.validate_mutable_state_inventory(config)
     assert any(entry.target == "tpen.nn.CompositeMixing" for entry in entries)
+
+
+def test_real_o_and_ab_rows_are_closed_inventory_inputs(tmp_path: Path) -> None:
+    """Run real O/A/B resolver outputs through the closed inventory checker."""
+
+    raw = train_config._compose_base_config()
+    composite = train_config._compose_base_config()
+    composite.model = context_mapping.compose_package(composite.model, "B11")
+    family_configs = []
+    for stage in ("A", "B"):
+        cells = architecture_stage_family.materialize_family_stage(
+            stage, tmp_path / stage
+        )
+        family_configs.append(train_config.resolve_train_config(cells[0]))
+
+    failures = []
+    for label, config in (("O-raw", raw), ("O-composite", composite),
+                          ("A", family_configs[0]), ("B", family_configs[1])):
+        try:
+            entries = inventory.validate_mutable_state_inventory(config)
+            assert entries
+            assert all(entry.source for entry in entries)
+        except Exception as error:
+            failures.append(f"{label}: {error}")
+    assert not failures, "valid admitted rows failed inventory: " + "; ".join(failures)
+
+
+@pytest.mark.parametrize("update", ["replacement", "Gaussian residual"])
+def test_admitted_architecture_update_variants_are_classified(update: str) -> None:
+    """Admitted update variants are explicit inventory constructors."""
+
+    config = train_config._compose_base_config()
+    config.model = context_mapping.compose_architecture_package(
+        config.model,
+        producer_path="hybrid/coordinate-neighbor",
+        activation="SiLU,SiLU",
+        update=update,
+        package="B11",
+        seed=0,
+    )
+    entries = inventory.validate_mutable_state_inventory(config)
+    assert entries
 
 
 @pytest.mark.parametrize(
@@ -76,16 +136,6 @@ def test_registered_constructor_target_change_fails_closed() -> None:
     config["model"]["_target_"] = "tests.ReplacementWaveFunction"
     with pytest.raises(ValueError, match="model.*ReplacementWaveFunction"):
         inventory.validate_mutable_state_inventory(config)
-
-
-def test_native_profile_refuses_hi_train_config_at_expected_entries() -> None:
-    native_profile = importlib.import_module("tpen." + "execution.native_profile")
-    train_config = importlib.import_module(
-        "experiments.atomistic.he-importance.train_config"
-    )
-
-    with pytest.raises(native_profile.UnsupportedMutableStateError, match=r"callbacks\[8\]"):
-        native_profile.validate_native_recovery_profile(train_config._compose_base_config())
 
 
 def test_continuation_refuses_before_runner_or_leaf_write(tmp_path: Path) -> None:
@@ -168,6 +218,63 @@ def test_prepare_refusal_precedes_malformed_topology() -> None:
         launch.prepare_train_launch(
             object(), topology=object(), restore_request=object()
         )
+
+
+@pytest.mark.parametrize("restore_payload", [{}, False, 0, ""])
+def test_falsey_non_none_restore_requests_use_typed_refusal_before_validation(
+    restore_payload: object,
+) -> None:
+    """Falsey continuation payloads cannot bypass the stable refusal code."""
+
+    with pytest.raises(launch.HIContinuationRefusal, match="hi-continuation-refused"):
+        launch.prepare_train_launch(
+            object(), topology=object(), restore_request=restore_payload
+        )
+
+
+def test_subprocess_execute_refusal_preserves_predecessor_path(tmp_path: Path) -> None:
+    """The real execute route leaves the complete predecessor tree untouched."""
+
+    predecessor = tmp_path / "predecessor"
+    predecessor.mkdir()
+    marker = predecessor / "state"
+    marker.write_bytes(b"predecessor bytes")
+    before = {path.relative_to(predecessor): path.read_bytes()
+              for path in predecessor.rglob("*") if path.is_file()}
+    output_root = tmp_path / "successor"
+    code = (
+        "import importlib, sys; "
+        "m=importlib.import_module('experiments.atomistic.he-importance.run_stage_q'); "
+        "args=m.build_parser().parse_args(['--stage','O1','--context','O-raw',"
+        "'--output-root',sys.argv[1]]); "
+        "m.execute(args, restore_request={'predecessor': sys.argv[2]})"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[3])
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(output_root), str(predecessor)],
+        cwd=env["PYTHONPATH"], env=env, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0
+    assert "hi-continuation-refused" in result.stderr
+    assert {path.relative_to(predecessor): path.read_bytes()
+            for path in predecessor.rglob("*") if path.is_file()} == before
+    assert not output_root.exists()
+
+
+def test_inventory_drift_is_typed_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inventory errors on restore are translated to the stable refusal."""
+
+    original = train_config._compose_base_config
+
+    def drifted_config():
+        config = OmegaConf.to_container(original(), resolve=False)
+        config["model"]["injected"] = {"_target_": "tests.DriftedConstructor"}
+        return OmegaConf.create(config)
+
+    monkeypatch.setattr(train_config, "_compose_base_config", drifted_config)
+    with pytest.raises(launch.HIContinuationRefusal, match="hi-continuation-refused"):
+        launch.prepare_train_launch(object(), restore_request=object())
 
 
 def test_stage_q_execute_refuses_before_selection_or_leaf_write(tmp_path: Path, monkeypatch) -> None:
