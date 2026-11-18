@@ -53,10 +53,10 @@ from tpen_executor import cli, composition
 from tpen_executor.contracts import AllocationId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
 from tpen_executor.dispatch import LocalDispatcher
 from tpen_executor.dispatch import parsl as parsl_dispatch
-from tpen_executor.dispatch.transport import LeafRequest, LeafResult, run_leaf
+from tpen_executor.dispatch.transport import LeafRequest, LeafResult, LeafTeardownReceipt, run_leaf
 from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.lifecycle import AttachedAllocation
-from tpen_executor.placement import AllocationSlot
+from tpen_executor.placement import AllocationSlot, ChildPlacementObservation
 from tpen_executor.programs import WorkerProgram
 from tpen_executor.storage import DirectoryStore
 from tpen_executor.tasks import ConfiguredRun, ConfiguredRunTable
@@ -442,6 +442,88 @@ def _attach_routed_probe_answers(dispatcher: object, fake_parsl: _Parsl, hosts: 
     return fake_parsl.routed_probe_labels
 
 
+def _attach_routed_leaf_answers(fake_parsl: _Parsl) -> None:
+    """Return valid leaf facts without pretending synthetic nodes are local hosts."""
+
+    def completed(_index, _function, args, _kwargs):
+        request = LeafRequest.decode(args[0])
+        output_dir, core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = request.paths()
+        values = request.environment.env
+        declared_cpus = tuple(int(item) for item in values["TPEN_SLOT_CPUS"].split(","))
+        sidecar = ChildPlacementObservation(
+            request.task_id,
+            request.attempt_id,
+            request.group_digest,
+            request.allocation_id,
+            request.backend_job_id,
+            values["TPEN_SLOT_ID"],
+            request.payload_digest,
+            output_dir,
+            values["TPEN_SLOT_NODE"],
+            4243,
+            55,
+            declared_cpus,
+            {"OMP_NUM_THREADS": None},
+            values.get("CUDA_VISIBLE_DEVICES"),
+            "2026-11-18T00:00:00Z",
+            None,
+        )
+        Path(values["TPEN_PLACEMENT_OUTPUT"]).write_text(json.dumps(sidecar.to_dict()) + "\n", encoding="utf-8")
+        return LeafResult(
+            request.digest(),
+            request.group_digest,
+            request.task_id,
+            request.attempt_id,
+            request.allocation_id,
+            request.backend_job_id,
+            request.slot_id,
+            request.payload_digest,
+            values["TPEN_SLOT_NODE"],
+            4242,
+            sys.executable,
+            ("science", "inspection"),
+            {
+                "argv": [request.environment.python, *request.science_args()],
+                "returncode": 0,
+                "timed_out": False,
+                "pid": 4243,
+                "proc_start_ticks": 55,
+                "stdout_path": stdout_path,
+                "stderr_path": stderr_path,
+            },
+            None,
+            None,
+            "evidence",
+            {
+                "schema": "tpen.run-evidence/v2",
+                "run_dir": core_dir,
+                "verdict": "completed",
+                "run_status": "completed",
+                "checkpoint": {
+                    "checkpoint_dir": core_dir + "/checkpoint",
+                    "schema_version": 1,
+                    "next_iteration": 1,
+                    "completed_updates": 1,
+                },
+                "refusal": None,
+                "resolved_config_identity": {
+                    "schema": "tpen-config-identity-v1",
+                    "sha256": "a" * 64,
+                },
+            },
+            None,
+            LeafTeardownReceipt.for_request(request, inspection="complete", child_group_reaped=True).to_dict(),
+        ).encode()
+
+    fake_parsl.hooks["run_leaf"] = completed
+
+
+def _manifest_attempts(manifest) -> dict[str, dict]:
+    """Expose each member's durable outcome and placement receipt in failures."""
+
+    return {attempt.task_id: attempt.to_dict() for attempt in manifest.attempts}
+
+
 def _cli_inputs(tmp_path: Path, allocation: ConfiguredAllocation, *, runner: str = "tpen_executor.runners.TPENCommand") -> dict[str, Path | ReadyGroup]:
     """Write one CLI-shaped group, allocation, worker, and run table."""
 
@@ -741,9 +823,10 @@ def test_routed_composition_dispatches_v2_transport_file(tmp_path: Path, fake_pa
         dispatcher_name="parsl", transport_path=transport,
     )
     probe_labels = _attach_routed_probe_answers(plan.dispatcher, fake_parsl, {"pool-a": "node-a", "pool-b": "node-b"})
+    _attach_routed_leaf_answers(fake_parsl)
     manifest = composition.dispatch(plan)
 
-    assert _summary(manifest) == {"member": ("completed", False)}
+    assert _summary(manifest) == {"member": ("completed", False)}, f"manifest attempts={_manifest_attempts(manifest)!r}"
     assert json.loads((Path(paths["store"]) / "run-manifest.json").read_text(encoding="utf-8"))["schema"] == "tpen-executor/run-manifest-v2"
     assert probe_labels == ["pool-a", "pool-b"]
     assert [record["executors"] for record in fake_parsl.submissions[:2]] == [["pool-a"], ["pool-b"]]
@@ -759,7 +842,9 @@ def test_routed_run_rejects_wrong_probe_hostname_before_begin(tmp_path: Path, fa
     """D2a public run path: a wrong routed probe has no lifecycle or science side effect."""
 
     group = _group("s3b-routed-wrong-host", "member")
-    lifecycle = AttachedAllocation(_routed_allocation(), DirectoryStore(tmp_path / "store"))
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    lifecycle = AttachedAllocation(_routed_allocation(), DirectoryStore(store_root))
     dispatcher = parsl_dispatch.ParslDispatcher(
         _worker(tmp_path), transport=parsl_dispatch.RoutedAttachedTransportSpec.from_mapping(_routed_transport_payload()),
     )
@@ -768,25 +853,29 @@ def test_routed_run_rejects_wrong_probe_hostname_before_begin(tmp_path: Path, fa
     with pytest.raises(parsl_dispatch.RoutedTransportPreflightError):
         dispatcher.run(group, _runs(tmp_path, "member"), lifecycle, timeout=60)
 
-    assert not (Path(lifecycle.store.root) / "groups").exists()
-    assert lifecycle.store.manifest(group).attempts == ()
-    assert fake_parsl.leaf_submissions() == []
-    assert not list(Path(tmp_path).rglob("observed.json"))
+    manifest = lifecycle.store.manifest(group)
+    assert not (Path(lifecycle.store.root) / "groups").exists(), f"manifest attempts={_manifest_attempts(manifest)!r}"
+    assert manifest.attempts == (), f"manifest attempts={_manifest_attempts(manifest)!r}"
+    assert fake_parsl.leaf_submissions() == [], f"manifest attempts={_manifest_attempts(manifest)!r}"
+    assert not list(Path(tmp_path).rglob("observed.json")), f"manifest attempts={_manifest_attempts(manifest)!r}"
 
 
 def test_routed_run_uses_routed_validator(tmp_path: Path, fake_parsl: _Parsl) -> None:
     """The public run path must accept its two-executor v2 config with the v2 validator."""
 
     group = _group("s3b-routed-validator", "member")
-    lifecycle = AttachedAllocation(_routed_allocation(), DirectoryStore(tmp_path / "store"))
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    lifecycle = AttachedAllocation(_routed_allocation(), DirectoryStore(store_root))
     dispatcher = parsl_dispatch.ParslDispatcher(
         _worker(tmp_path), transport=parsl_dispatch.RoutedAttachedTransportSpec.from_mapping(_routed_transport_payload()),
     )
     _attach_routed_probe_answers(dispatcher, fake_parsl, {"pool-a": "node-a", "pool-b": "node-b"})
+    _attach_routed_leaf_answers(fake_parsl)
 
     manifest = dispatcher.run(group, _runs(tmp_path, "member"), lifecycle, timeout=60)
 
-    assert _summary(manifest) == {"member": ("completed", False)}
+    assert _summary(manifest) == {"member": ("completed", False)}, f"manifest attempts={_manifest_attempts(manifest)!r}"
     assert len(fake_parsl.dfks[0].config.executors) == 2
 
 
