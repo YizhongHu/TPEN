@@ -164,23 +164,14 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
             raise CollectionError(f"row {row_id}: {exc}") from exc
         if record.finite_count != record.row_count:
             raise CollectionError(f"row {row_id}: non-finite trajectory rows are not admissible")
-        # Match tpen.evaluation.trajectory_records._scan_complete_grid exactly:
-        # draw-ordered plain-float sums and E[x^2] - mean^2, avoiding a fixed
-        # absolute tolerance that would be unjustified after cancellation.
-        draw_sums = {index: sum(draw) for index, draw in enumerate(grid)}
-        draw_square_sums = {index: sum(value * value for value in draw)
-                            for index, draw in enumerate(grid)}
-        total = 0.0
-        total_square = 0.0
-        for index in range(len(grid)):
-            total += draw_sums[index]
-            total_square += draw_square_sums[index]
-        mean = total / record.row_count
-        variance = total_square / record.row_count - mean * mean
-        if math.isfinite(variance) and variance < 0.0:
-            variance = 0.0
-        if mean != record.mean or variance != record.variance:
-            raise CollectionError(f"row {row_id}: pooled statistics do not reconcile with inspection")
+        # ``inspect_trajectory_record`` independently reconciles the CSV and
+        # sidecar using the reader's reduction semantics.  Keep those
+        # inspected scalars as the one pooled-statistics owner: recomputing
+        # them here with Python's float reductions would reject valid records
+        # when the writer used Torch's reduction order.  ``read_energy_grid``
+        # still rechecks the CSV hash, grid shape, and finite values above.
+        mean = record.mean
+        variance = record.variance
         draw_means = [_moments(draw)[0] for draw in grid]
         _, draw_mean_variance = _moments(draw_means)
         reference, confidence = _reference(str(row["system_id"]), registry_path)
