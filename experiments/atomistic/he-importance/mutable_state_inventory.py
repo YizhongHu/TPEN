@@ -52,11 +52,14 @@ _REGISTRY: dict[tuple[str, str], tuple[str, str]] = {
     **_registry_entries(
         [
             ("callbacks.8", "tpen.callback.RuntimeEquivariance"),
-            ("callbacks.9.payload", "tpen.checkpoint.TrainResume"),
             ("callbacks.10", "tpen.callback.ResourceUsage"),
         ],
         _TYPED_REFUSED,
     ),
+    (
+        "callbacks.9.payload",
+        "tpen.checkpoint.TrainResume",
+    ): _RECONSTRUCTIBLE,
     ("callbacks.10.allocator_probe", "tpen.accelerator.TorchAllocatorPeakProbe"): _ALLOCATION_LOCAL,
 }
 

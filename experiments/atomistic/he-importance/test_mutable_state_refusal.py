@@ -32,7 +32,7 @@ def test_real_hi_train_config_is_fully_classified() -> None:
     }
     assert {"sampler", "trainer"} <= {entry.path for entry in entries}
     refused = inventory.refused_inventory_entries()
-    assert {entry.target for entry in refused} >= {
+    assert {entry.target for entry in refused} == {
         "tpen.callback.RuntimeEquivariance",
         "tpen.callback.ResourceUsage",
     }
@@ -140,6 +140,34 @@ def test_prepare_and_launch_refuse_before_runner_construction() -> None:
     with pytest.raises(launch.HIContinuationRefusal, match="hi-continuation-refused"):
         launch.launch_train(object(), runner=runner, restore_request=object())
     assert runner_calls == []
+
+
+def test_launch_refusal_precedes_malformed_topology(tmp_path: Path) -> None:
+    marker = tmp_path / "must-not-be-written"
+    runner_calls: list[object] = []
+
+    def runner(config: object) -> int:
+        runner_calls.append(config)
+        marker.write_text("runner reached", encoding="utf-8")
+        return 0
+
+    with pytest.raises(launch.HIContinuationRefusal, match="hi-continuation-refused"):
+        launch.launch_train(
+            object(),
+            topology=object(),
+            runner=runner,
+            restore_request=object(),
+        )
+
+    assert runner_calls == []
+    assert not marker.exists()
+
+
+def test_prepare_refusal_precedes_malformed_topology() -> None:
+    with pytest.raises(launch.HIContinuationRefusal, match="hi-continuation-refused"):
+        launch.prepare_train_launch(
+            object(), topology=object(), restore_request=object()
+        )
 
 
 def test_stage_q_execute_refuses_before_selection_or_leaf_write(tmp_path: Path, monkeypatch) -> None:
