@@ -151,6 +151,7 @@ for row in rows:
     row_root = Path(str(row.get("results_root", "")))
     if row.get("source_sha") != source_sha:
         raise SystemExit("row source_sha does not match wrapper SOURCE_SHA")
+    # Replace launch.render's GPU-row admission before any guard or driver.
     if row.get("device") != "cuda":
         raise SystemExit(f"row {row.get('row_id', '<unknown>')} must have device=cuda")
     if any(part == ".." for part in row_root.parts):

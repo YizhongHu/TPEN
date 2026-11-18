@@ -65,14 +65,14 @@
   {
     "id": "polaris-resolved-root-check-dropped",
     "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
-    "old": "if any(part == \"..\" for part in candidate.parts):",
+    "old": "if any(part == \"..\" for part in candidate.parts):\n    raise SystemExit(\"results root contains '..'\")",
     "new": "if False:",
     "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_dot_dot_escape_before_any_write"
   },
   {
     "id": "polaris-cuda-row-admission-dropped",
     "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
-    "old": "if row.get(\"device\") != \"cuda\":",
+    "old": "# Replace launch.render's GPU-row admission before any guard or driver.\n    if row.get(\"device\") != \"cuda\":",
     "new": "if False:",
     "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
   },
