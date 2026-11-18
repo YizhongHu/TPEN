@@ -3,7 +3,7 @@
 # removed because checkpoint retention is manifest-owned.
 # Modeled directly on the APPROVED
 # ~/.paseo/stage1-evidence/hooke2-30k-template-v3/hooke2-30k-overlay.yaml
-# (same callback set, same JSONL logger), adapted only where He/H2's own
+# (same diagnostic callback set, same JSONL logger), adapted only where He/H2's own
 # base config already differs from Hooke-2e's:
 #   - sampler/optimizer values below are copied from He/H2's OWN resolved
 #     base config (burn_in=100, n_steps=10, proposal_scale=0.5, lr=0.005,
