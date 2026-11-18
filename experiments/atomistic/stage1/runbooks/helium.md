@@ -4,12 +4,14 @@ Status: reviewed-runbook candidate.  Do not submit from a `dev` commit.  The
 science source is one released `main` commit, `SOURCE_SHA`, that contains this
 reviewed file, #537 (`4f8ebb0f`), and the Stage-1 launch layers S1-A6 #742
 (`1c15b144`), S1-A7 #746 (`59e57433`), S1-A8 #747 (`4ec84737`) and S1-A9 #750
-(`a5ad17d7`).  Until that release exists `SOURCE_SHA` is a placeholder; the
-expected release is v0.5.4.  The runner records `SOURCE_SHA` and this file's
+(`a5ad17d7`).  The released source is v0.5.4.  The runner records `SOURCE_SHA` and this file's
 blob SHA at `SOURCE_SHA` in the submission receipt.
 
 Facility: FASRC Cannon (operator decision 2026-11-18, TO note
 `operator-he-facility-cannon-20261118` on c6fc9dc3).  Deadline: 2026-11-24.
+Science is HELD until the operator reviews the Hooke-1e/2e results and
+approves the nonfree GPU run (TO note
+`operator-hooke-first-he-h2-smoke-20261118` on 6f4c431e).
 
 ## Scientific question and fixed analysis
 
@@ -59,14 +61,17 @@ All paths below are fixed by `SOURCE_SHA`; set them once and never edit them
 in place.  `SOURCE_SHA` is the full 40-hex released main SHA.
 
 ```bash
-SOURCE_SHA=<released-main-sha>          # placeholder until v0.5.4 is released
+SOURCE_SHA=7272dca6872fd32b0e98118ed217c0e0226d6a74
 SYSTEM=he
 RESULTS_ROOT=/n/netscratch/kozinsky_lab/Lab/rhu/stage1-$SYSTEM/$SOURCE_SHA
 BUNDLE=$RESULTS_ROOT/inputs/TPEN-$SOURCE_SHA.bundle
 ENV_PREFIX=/n/holystore01/LABS/kozinsky_lab/Lab/User/rhu/envs
-LOCK12=<first 12 hex of sha256(uv.lock at SOURCE_SHA)>
-SHARED_ENV=$ENV_PREFIX/tpen-$LOCK12-cu128-py3.12
+LOCK12=e0b586c3390f
+CPU_ENV=$ENV_PREFIX/tpen-e0b586c3390f-cpu-py3.12
+SHARED_ENV=$ENV_PREFIX/tpen-e0b586c3390f-cu128-py3.12
 UV_BIN=/n/home10/rhu/.local/bin/uv
+
+git rev-parse 7272dca6872fd32b0e98118ed217c0e0226d6a74^{tree}  # must equal 978893d85037ecd6194217a93a2ed93e242609cf
 ```
 
 - `RESULTS_ROOT` is the only external write root.  Every script asserts the
@@ -78,10 +83,9 @@ UV_BIN=/n/home10/rhu/.local/bin/uv
   `nested` artifact layout), and `collection.json`.
 - The shared CUDA env is reused read-only; it is never built in a job.  The
   env name must equal `tpen-<sha256(uv.lock)[:12]>-cu128-py3.12` for the
-  `uv.lock` at `SOURCE_SHA`.  `tpen-e6110e5b3363-cu128-py3.12` matches v0.5.3
-  and current `dev`.  A release version bump edits the `tpen` version line in
-  `uv.lock` (v0.5.3 did, commit `0cc1de6d`), so v0.5.4 is expected to need a
-  new env name; building it is an orchestrator task, not a runner task.
+  `uv.lock` at `SOURCE_SHA`.  The released envs are
+  `tpen-e0b586c3390f-cpu-py3.12` and `tpen-e0b586c3390f-cu128-py3.12`; building
+  them is an orchestrator task, not a runner task.
 - Per-job work is on node-local scratch only.  A wrapper job uses
   `BOOT_ROOT=/scratch/$USER/${SLURM_JOB_ID}.stage1-he` for the exact-SHA
   checkout, its overlay venv, `TMPDIR` and `UV_CACHE_DIR`, removed by an EXIT
@@ -139,7 +143,8 @@ Abort before submission unless all of these hold, each with a receipt:
    checkout equals it.
 2. The shared env exists at `$SHARED_ENV` for `LOCK12` computed from
    `uv.lock` at `SOURCE_SHA`, and `uv lock --check` passes in the job.
-3. The manager has relayed the operator's per-run approval for the exact
+3. The Hooke-1e/2e results have been reviewed by the operator, and the manager
+   has relayed the operator's approval for the exact
    shape in this file (partitions, GPU, caps, job count).
 4. A Netscratch quota/access check for `Lab/rhu` is satisfactory.
 5. The staging job (step 1) passed, including the dry-execute of the train
