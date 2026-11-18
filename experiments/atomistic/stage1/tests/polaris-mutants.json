@@ -70,6 +70,13 @@
     "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_dot_dot_escape_before_any_write"
   },
   {
+    "id": "polaris-lexical-dot-dot-check-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "if [[ \"$RESULTS_ROOT\" == .. || \"$RESULTS_ROOT\" == ../* || \"$RESULTS_ROOT\" == */../* || \"$RESULTS_ROOT\" == */.. ]]; then",
+    "new": "if false; then",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_dot_dot_escape_before_any_write"
+  },
+  {
     "id": "polaris-cuda-row-admission-dropped",
     "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
     "old": "# Replace launch.render's GPU-row admission before any guard or driver.\n    if row.get(\"device\") != \"cuda\":\n        raise SystemExit(f\"row {row.get('row_id', '<unknown>')} must have device=cuda\")",

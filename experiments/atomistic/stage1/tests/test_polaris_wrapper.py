@@ -288,7 +288,8 @@ def test_guard_rejects_multiple_visible_devices(tmp_path: Path) -> None:
 def test_guard_rejects_non_eagle_results_root(tmp_path: Path) -> None:
     result = _run("guard", _env(tmp_path, RESULTS_ROOT=str(tmp_path / "outside")))
     assert result.returncode == 2
-    assert "outside Eagle prefix" in result.stderr
+    assert "outside /eagle/HetRxnEnergy/rhu" in result.stderr
+    assert not (tmp_path / "outside").exists()
 
 
 def test_dry_exec_runs_three_train_control_rows(tmp_path: Path) -> None:

@@ -68,6 +68,9 @@ require_value() {
 
 assert_results_root() {
   require_value RESULTS_ROOT
+  if [[ "$RESULTS_ROOT" == .. || "$RESULTS_ROOT" == ../* || "$RESULTS_ROOT" == */../* || "$RESULTS_ROOT" == */.. ]]; then
+    die "RESULTS_ROOT is outside $RESULTS_PREFIX: lexical '..' component"
+  fi
   assert_contained_path "$RESULTS_ROOT" "$RESULTS_PREFIX" RESULTS_ROOT
 }
 
