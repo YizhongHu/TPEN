@@ -1463,6 +1463,7 @@ def execute(
     args: argparse.Namespace,
     *,
     runtime_callbacks: Sequence[object] = (),
+    restore_request: object | None = None,
 ) -> int:
     """Select, resolve and (unless ``--dry-run``) launch one stage cell.
 
@@ -1486,6 +1487,7 @@ def execute(
         truthful admitted cell, or the walker count is not declared.
     """
 
+    launch.refuse_hi_continuation(restore_request)
     manifest_path = getattr(args, "manifest", None)
     row_id = getattr(args, "row", None)
     if (manifest_path is None) != (row_id is None):

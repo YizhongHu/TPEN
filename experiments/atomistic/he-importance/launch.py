@@ -26,6 +26,36 @@ _STAGE_API = import_module("experiments.atomistic.he-importance.stage_coordinate
 _TRAIN_CONFIG = import_module("experiments.atomistic.he-importance.train_config")
 
 
+class HIContinuationRefusal(ValueError):
+    """Stable study-boundary refusal for HI continuation requests."""
+
+    code = "hi-continuation-refused"
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"{self.code}: {reason}")
+
+
+def refuse_hi_continuation(restore_request: object | None) -> None:
+    """Refuse HI continuation before resolution, construction, or any write."""
+
+    if restore_request is None:
+        return
+    inventory = import_module("experiments.atomistic.he-importance.mutable_state_inventory")
+    refused = inventory.refused_inventory_entries()
+    if not refused:
+        raise HIContinuationRefusal(
+            "inventory contains no typed-refused entry; refusing closed-boundary "
+            "continuation rather than silently qualifying an empty refusal"
+        )
+    entries = ", ".join(
+        f"{entry.path}={entry.target} ({entry.source})" for entry in refused
+    )
+    raise HIContinuationRefusal(
+        "HI continuation is not qualified; typed-refused mutable owners: " + entries
+    )
+
+
 @dataclass(frozen=True)
 class _OwnedLaunchCell:
     """Launch-owned view of a bound row handed to downstream consumers."""
@@ -440,6 +470,7 @@ def prepare_train_launch(
     topology: object | None = None,
     *,
     overrides: Mapping[str, Any] | Sequence[str] | None = None,
+    restore_request: object | None = None,
 ) -> LaunchPlan:
     """Populate topology and resolve one source row through L1.
 
@@ -454,6 +485,7 @@ def prepare_train_launch(
         readback. ``None`` preserves the default resolved configuration.
     """
 
+    refuse_hi_continuation(restore_request)
     facts = execution_topology_facts(topology) if topology is not None else {}
     cell = populate_execution_topology(source, facts)
     # Preserve the default call shape for existing callers and test doubles.
@@ -481,6 +513,7 @@ def launch_train(
     runner: Callable[..., object] = run_from_config,
     runtime_callbacks: Sequence[object] = (),
     overrides: Mapping[str, Any] | Sequence[str] | None = None,
+    restore_request: object | None = None,
 ) -> int:
     """Resolve one topology-bound row and execute TPEN's production runner.
 
@@ -518,8 +551,14 @@ def launch_train(
         If launch facts, the runner contract, or the returned code is invalid.
     """
 
+    refuse_hi_continuation(restore_request)
     facts = execution_topology_facts(topology) if topology is not None else {}
-    plan = prepare_train_launch(source, facts, overrides=overrides)
+    plan = prepare_train_launch(
+        source,
+        facts,
+        overrides=overrides,
+        restore_request=restore_request,
+    )
     if topology is not None:
         # Topology is caller-open, so config-only runners retain extra facts.
         # Strict key rejection remains below when the mapping crosses into TPEN.
@@ -580,10 +619,12 @@ def launch_train(
 
 
 __all__ = [
+    "HIContinuationRefusal",
     "LaunchPlan",
     "LaunchValidationError",
     "execution_topology_facts",
     "launch_train",
     "populate_execution_topology",
     "prepare_train_launch",
+    "refuse_hi_continuation",
 ]
