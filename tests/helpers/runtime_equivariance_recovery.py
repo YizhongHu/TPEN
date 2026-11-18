@@ -25,6 +25,8 @@ from tpen.training.trainer import VMCTrainer
 
 
 _PERMUTATION_SEED = 19
+_PREFIX_CURSOR = 5
+_RUN_LENGTH = 16
 
 
 class _ProbeModel(nn.Module):
@@ -245,7 +247,11 @@ def run(mode: str, root: Path, *, failure: bool) -> dict[str, object]:
     model = _ProbeModel(non_equivariant=failure)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     sampler = _Sampler()
-    trainer = VMCTrainer(max_steps=5 if mode == "prefix" else 16, log_every_n_steps=1)
+    trainer = VMCTrainer(
+        max_steps=_PREFIX_CURSOR if mode == "prefix" else _RUN_LENGTH,
+        log_every_n_steps=1,
+    )
+    run_start = trainer.next_iteration
     checkpoint_root = root / "checkpoint"
     restored = False
     failure_message = None
@@ -281,6 +287,7 @@ def run(mode: str, root: Path, *, failure: bool) -> dict[str, object]:
                 context=context,
             )
             restored = True
+            run_start = trainer.next_iteration
 
         context.callbacks.append(_callback(config))
         try:
@@ -341,6 +348,12 @@ def run(mode: str, root: Path, *, failure: bool) -> dict[str, object]:
         "selection_calls": selection_calls,
         "failure_message": failure_message,
         "artifact_records": artifact_records,
+        "schedule": {
+            "every_n_steps": int(config.callbacks[0].get("every_n_steps", 1)),
+            "start_step": int(config.callbacks[0].get("start_step", 0)),
+            "run_start": int(run_start),
+            "run_end": int(trainer.max_steps),
+        },
     }
 
 
