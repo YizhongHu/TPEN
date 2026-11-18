@@ -797,12 +797,10 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         previous = config_by_system.setdefault(system, digest)
         if previous != digest:
             raise ProtocolError(f"phase-1 manifest has inconsistent config_sha256 for {system}")
-    if not isinstance(evidence, Mapping):
+    if not isinstance(evidence, Mapping) or evidence.get("schema") != CHECKPOINT_EVIDENCE_SCHEMA:
         raise ProtocolError(
             "phase-2 requires structured checkpoint evidence; bare maps are not accepted"
         )
-    if evidence.get("schema") != CHECKPOINT_EVIDENCE_SCHEMA:
-        raise ProtocolError("phase-2 checkpoint evidence has an unsupported schema")
     evidence_manifest_hash = _require_sha(
         evidence.get("phase1_manifest_hash"), length=64,
         field="checkpoint evidence phase1_manifest_hash",
