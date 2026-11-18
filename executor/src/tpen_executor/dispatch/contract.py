@@ -199,6 +199,7 @@ def _with_child_placement(
     *,
     check_controller_affinity: bool = True,
     slot_resolver: Any = None,
+    strict_host: bool = False,
 ) -> Any:
     """Overlay the one concrete slot and fenced identities for the child.
 
@@ -217,6 +218,11 @@ def _with_child_placement(
         Resolve allocation slots for a caller-specific placement path.  The
         default retains the allocation-slots-v1 resolver and its legacy
         refusal behavior.
+
+    strict_host : bool, optional
+        Turn the routed child-host mismatch sidecar into a pre-core refusal.
+        The default keeps the advisory behavior used by local, ThreadPool,
+        and v1 attached paths.
 
     A declared-GPU v2-placement slot also receives a worker-only GPU sampler
     evidence path and the slot's durable quarantine directory in the attempt
@@ -335,7 +341,7 @@ def _with_child_placement(
             quarantine_dir = slot_quarantine_dir(fence.root, placement_values)
             if quarantine_dir is not None:
                 placement_values[SLOT_QUARANTINE_ENV] = quarantine_dir
-    if routed_transport:
+    if strict_host:
         # Only routed attached dispatch turns a child host mismatch into a
         # pre-core refusal; v1 and local paths remain advisory.
         placement_values[ROUTED_STRICT_HOST_ENV] = "1"

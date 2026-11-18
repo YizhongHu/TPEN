@@ -1158,6 +1158,7 @@ class ParslDispatcher(DispatcherContract):
                         if type(self.transport) is RoutedAttachedTransportSpec
                         else None
                     ),
+                    strict_host=type(self.transport) is RoutedAttachedTransportSpec,
                 )
                 placement_refusal = _placement_refusal_from_environment(environment)
                 if placement_refusal is not None:
