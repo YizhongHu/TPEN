@@ -11,12 +11,14 @@ import json
 import re
 import base64
 import binascii
+import copy
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from omegaconf import OmegaConf
+import yaml
 
 from experiments.baselines.systems import load_registry
 from experiments.toolkit.run_paths import resolve_run_dir
@@ -25,6 +27,9 @@ SYSTEMS = ("hooke1", "hooke2", "he", "h2")
 KINDS = ("smoke", "train", "eval")
 CONFIG_IDENTITY_RULE = "stage1-config-v1"
 LEGACY_CONFIG_IDENTITY_RULE = "legacy-config-sha256"
+OVERLAY_RELATIVE_PATH = "configs/overlays/diagnostics-v1.yaml"
+OVERLAY_SYSTEMS = frozenset({"he", "h2"})
+OVERLAY_COMPOSITION_ORDER = "base-config -> diagnostics-v1 overlay -> manifest overrides"
 CHECKPOINT_EVIDENCE_SCHEMA = "stage1-checkpoint-evidence/v1"
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -104,6 +109,78 @@ def resolve_config_path(config: str | Path) -> Path:
     if path.is_absolute():
         return path
     return Path(__file__).resolve().parent / path
+
+
+def resolve_overlay_path(overlay: str | Path) -> Path:
+    """Resolve one Stage-1 overlay relative to the study directory."""
+
+    path = Path(overlay)
+    return path if path.is_absolute() else Path(__file__).resolve().parent / path
+
+
+def overlay_sha256(overlay: str | Path) -> str:
+    """Return the SHA-256 digest of one overlay file's exact bytes."""
+
+    path = resolve_overlay_path(overlay)
+    if not path.is_file():
+        raise ProtocolError(f"overlay file does not exist: {path}")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _overlay_binding(*, overlay: str | Path, expected_sha256: object) -> tuple[str, str, Path]:
+    """Validate the canonical overlay path and its exact content digest."""
+
+    path = resolve_overlay_path(overlay).resolve()
+    canonical = resolve_overlay_path(OVERLAY_RELATIVE_PATH).resolve()
+    if path != canonical:
+        raise ProtocolError(
+            f"overlay path must be the committed {OVERLAY_RELATIVE_PATH!r}"
+        )
+    digest = _require_sha(expected_sha256, length=64, field="overlay_sha256")
+    actual = overlay_sha256(path)
+    if actual != digest:
+        raise ProtocolError("overlay sha256 does not match the committed overlay bytes")
+    return OVERLAY_RELATIVE_PATH, digest, path
+
+
+def compose_train_overlay(cfg: Any, *, overlay: str | Path, expected_sha256: str) -> Any:
+    """Compose the approved train overlay without touching physics sections.
+
+    The overlay owns complete observability sections (callbacks and loggers)
+    plus train-side runtime/sampler/optimizer/trainer leaves.  Each top-level
+    section is replaced explicitly; a blind ``OmegaConf.merge`` is avoided so
+    a future list or nested model section cannot be silently replaced.
+    """
+
+    relative, digest, path = _overlay_binding(
+        overlay=overlay, expected_sha256=expected_sha256
+    )
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ProtocolError("overlay must contain a YAML mapping")
+    allowed = {"runtime", "sampler", "optimizer", "trainer", "checkpoint_steps",
+               "callbacks", "loggers"}
+    if set(payload) != allowed:
+        raise ProtocolError("overlay contains unsupported or missing top-level sections")
+    if any(key in payload for key in ("system", "atoms", "model", "hamiltonian_terms")):
+        raise ProtocolError("overlay must not declare physics or model sections")
+    for key in ("runtime", "sampler", "optimizer", "trainer", "checkpoint_steps",
+                "callbacks", "loggers"):
+        OmegaConf.update(cfg, key, copy.deepcopy(payload[key]), merge=False)
+    OmegaConf.update(
+        cfg,
+        "stage1_overlay",
+        {
+            "schema": "stage1-overlay/v1",
+            "path": relative,
+            "sha256": digest,
+            "composition_order": OVERLAY_COMPOSITION_ORDER,
+            "stream": "train",
+        },
+        merge=False,
+        force_add=True,
+    )
+    return cfg
 
 
 def _config_files_for_system(system: str, config_root: str | Path) -> tuple[Path, ...]:
@@ -360,7 +437,9 @@ def decode_binding(token: str) -> dict[str, Any]:
 
 
 def validate_gateway_binding(*, binding: str, config: str, overrides: list[str], kind: str,
-                             expected_checkpoint_sha256: str | None = None) -> dict[str, Any]:
+                             expected_checkpoint_sha256: str | None = None,
+                             overlay: str | None = None,
+                             overlay_sha256: str | None = None) -> dict[str, Any]:
     """Validate that gateway arguments still match the rendered row binding."""
 
     row = decode_binding(binding)
@@ -375,6 +454,19 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
         raise ProtocolError("binding config identity rule is unsupported")
     if resolve_config_path(config) != resolve_config_path(row_config):
         raise ProtocolError("gateway config does not match binding")
+    declared_overlay = row.get("overlay")
+    declared_overlay_sha = row.get("overlay_sha256")
+    if (declared_overlay is None) != (declared_overlay_sha is None):
+        raise ProtocolError("binding overlay declaration is incomplete")
+    if declared_overlay is None or declared_overlay_sha is None:
+        if overlay is not None or overlay_sha256 is not None:
+            raise ProtocolError("overlay was applied without being declared in the binding")
+    else:
+        if kind != "train":
+            raise ProtocolError("overlay is supported only on train rows")
+        if overlay != declared_overlay or overlay_sha256 != declared_overlay_sha:
+            raise ProtocolError("gateway overlay does not match binding")
+        _overlay_binding(overlay=overlay, expected_sha256=overlay_sha256)
     _validate_config_identity_for_row(row, resolve_config_path(config))
     _validate_run_identity(row)
     expected = {
@@ -596,7 +688,9 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                    results_root: str,
                    expected_physical_system_id: Mapping[str, str] | None = None,
                    systems: tuple[str, ...] | list[str] | None = None,
-                   phase: int = 2, device: str | None = None) -> list[dict[str, Any]]:
+                   phase: int = 2, device: str | None = None,
+                   overlay: str | Path | None = None,
+                   overlay_sha256: str | None = None) -> list[dict[str, Any]]:
     """Expand systems into validated smoke, train, and eval rows.
 
     Parameters are explicit rather than defaulted so a missing identity or
@@ -614,6 +708,16 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         raise ProtocolError("systems must contain distinct known Stage-1 systems")
     if device is not None and device not in {"cpu", "cuda"}:
         raise ProtocolError("device must be 'cpu' or 'cuda'")
+    if (overlay is None) != (overlay_sha256 is None):
+        raise ProtocolError("overlay and overlay_sha256 must be supplied together")
+    overlay_name: str | None = None
+    overlay_digest: str | None = None
+    if overlay is not None:
+        if not set(selected).issubset(OVERLAY_SYSTEMS):
+            raise ProtocolError("the diagnostics overlay is approved only for He/H2 rows")
+        overlay_name, overlay_digest, _ = _overlay_binding(
+            overlay=overlay, expected_sha256=overlay_sha256
+        )
     if not checkpoints or any(type(step) is not int or step < 0 for step in checkpoints):
         raise ProtocolError("checkpoints must be a non-empty list of non-negative updates")
     if len(set(checkpoints)) != len(checkpoints):
@@ -686,7 +790,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                 raise ProtocolError("seed collision across Stage-1 rows")
             seen_seeds.add(train_seed)
             train_id = stable_row_id(system=spec.name, kind="train", lineage=lineage)
-            rows.append({
+            row: dict[str, Any] = {
                 "row_id": train_id, "system": spec.name, "system_id": spec.system_id,
                 "kind": "train", "lineage": lineage, "seed": train_seed,
                 "source_sha": source_sha, "config_sha256": config_ids[spec.name],
@@ -697,7 +801,11 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                 "updates": protocol.lineage_updates,
                 "walkers": protocol.lineage_walkers,
                 "checkpoint_steps": list(checkpoints),
-            })
+            }
+            if overlay_name is not None:
+                row["overlay"] = overlay_name
+                row["overlay_sha256"] = overlay_digest
+            rows.append(row)
             train_row = rows[-1]
             if phase == 1:
                 continue

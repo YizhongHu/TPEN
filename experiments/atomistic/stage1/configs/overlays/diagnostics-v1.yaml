@@ -1,0 +1,110 @@
+# PROPOSED, non-repository overlay for He/H2 Stage-1 TRAIN (50k-update
+# lineage), for operator decision only -- not applied, not merged into the
+# checked-in configs/{he,h2}/train.yaml. Modeled directly on the APPROVED
+# ~/.paseo/stage1-evidence/hooke2-30k-template-v3/hooke2-30k-overlay.yaml
+# (same callback set, same JSONL logger), adapted only where He/H2's own
+# base config already differs from Hooke-2e's:
+#   - sampler/optimizer values below are copied from He/H2's OWN resolved
+#     base config (burn_in=100, n_steps=10, proposal_scale=0.5, lr=0.005,
+#     n_walkers=4096), NOT Hooke-2e's -- no physics change, this overlay
+#     only ADDS observability.
+#   - checkpoint_steps is the single real-science checkpoint [50000], matching
+#     He/H2's approved plan.py --checkpoints 50000 (NOT Hooke-2e's dense
+#     30-checkpoint ladder, which is Hooke-specific tooling, not part of the
+#     approved He/H2 shape).
+#   - trainer.max_steps is 50000, matching He/H2's real science budget
+#     (STAGE1_PROTOCOL.lineage_updates), not Hooke-2e's 30000.
+# Same ElectronNucleusDistanceQuantiles omission note as the Hooke-2e
+# overlay: this diagnostic is H-specific and not carried over here either.
+
+runtime:
+  device: cuda
+  dtype: float64
+
+sampler:
+  n_walkers: 4096
+  burn_in: 100
+  n_steps: 10
+  proposal_scale: 0.5
+
+optimizer:
+  _target_: torch.optim.Adam
+  _partial_: true
+  lr: 0.005
+
+trainer:
+  max_steps: 50000
+  log_every_n_steps: 1
+  return_terms: true
+
+checkpoint_steps: [50000]
+
+callbacks:
+  - _target_: tpen.callback.ConfigSnapshot
+    output_path: ${run.dir}/config.yaml
+  - _target_: tpen.callback.ResolvedConfigSnapshot
+    output_path: ${run.dir}/resolved_config.yaml
+  - _target_: tpen.callback.Metadata
+    output_path: ${run.dir}/metadata.json
+  - _target_: tpen.callback.Status
+    output_path: ${run.dir}/status.json
+  - _target_: tpen.callback.DataIntegrity
+    every_n_steps: 1
+    fail_fast: true
+    max_nonfinite_energy_fraction: 0.0
+    max_nonfinite_logabs_fraction: 0.0
+    check_loss: true
+    check_wavefunction_output: true
+    check_batch: true
+    strict_sign_values: true
+  - _target_: tpen.callback.GradientStats
+    every_n_steps: 1
+    fail_fast: true
+    check_finite: true
+  - _target_: tpen.callback.SamplerHealth
+    every_n_steps: 1
+    fail_fast: false
+  - _target_: tpen.callback.FactorScalars
+    every_n_steps: 1
+    fail_fast: false
+  - _target_: tpen.callback.ModuleNorms
+    every_n_steps: 1
+    groups:
+      embedding: [embedding]
+      readout: [readout]
+      factors: [factors]
+      layer_0_mixing: [stack.layers.0.mixing]
+      layer_0_path_aggregation: [stack.layers.0.path_aggregation]
+  - _target_: tpen.callback.OptimizerState
+    every_n_steps: 1
+    groups:
+      embedding: [embedding]
+      readout: [readout]
+      factors: [factors]
+      layer_0_mixing: [stack.layers.0.mixing]
+      layer_0_path_aggregation: [stack.layers.0.path_aggregation]
+  - _target_: tpen.callback.RawTrainingBatchRecorder
+    path: ${run.dir}/training_history
+    every_n_steps: 50
+    partition_size_steps: 1000
+  - _target_: tpen.callback.InitialCheckpoint
+    output_dir: ${run.dir}/checkpoints
+  - _target_: tpen.callback.ParameterActivity
+    output_path: ${run.dir}/parameter_activity.json
+  - _target_: tpen.callback.Checkpoint
+    terminal: true
+    schedule:
+      _target_: tpen.checkpoint.ExplicitUpdates
+      updates: ${checkpoint_steps}
+    payload:
+      _target_: tpen.checkpoint.TrainResume
+    output_dir: ${run.dir}/checkpoints
+  - _target_: tpen.callback.RunTiming
+  - _target_: tpen.callback.TrainStepTiming
+    every_n_steps: 1
+    rolling_window: 20
+    accelerator_synchronize: false
+
+loggers:
+  - _target_: tpen.logging.JSONL
+    path: ${run.dir}/metrics.jsonl
