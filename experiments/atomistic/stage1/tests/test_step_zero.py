@@ -125,9 +125,9 @@ def test_positive_row_identity_does_not_depend_on_zero_prefix(
             source_sha="a" * 40,
             config_sha256={system: "b" * 64 for system in SYSTEMS},
             checkpoints=checkpoints,
-            lineage_seeds=[11],
+            lineage_seeds=[11, 12, 13],
             checkpoint_sha256={
-                (system, 0, checkpoint): "c" * 64
+                (system, lineage, checkpoint): "c" * 64
                 for system in SYSTEMS
                 for lineage in range(tiny_protocol.lineages)
                 for checkpoint in checkpoints
@@ -320,8 +320,8 @@ def test_zero_and_positive_checkpoint_real_producer_chain(
 
     document = {
         "schema": "stage1/v3",
-        "manifest_hash": manifest_hash(phase2_rows),
-        "rows": phase2_rows,
+        "manifest_hash": manifest_hash(phase1_rows + phase2_rows),
+        "rows": phase1_rows + phase2_rows,
     }
     collected = collect(document)
     assert len(collected["records"]) == protocol.lineages * protocol.eval_streams * 2
