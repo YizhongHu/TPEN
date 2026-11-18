@@ -392,7 +392,7 @@ def _make_exact_fixture(tmp_path: Path) -> tuple[Path, str]:
         "import os, sys\n"
         "record = os.environ['DRIVER_RECORD']\n"
         "with open(record, 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(f\"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}\\n\")\n"
+        "    handle.write(f\"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')} OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS')} MKL_NUM_THREADS={os.environ.get('MKL_NUM_THREADS')}\\n\")\n"
         "if os.environ.get('FAIL_DRIVER') == 'all' or (os.environ.get('FAIL_DRIVER') == '1' and os.environ.get('CUDA_VISIBLE_DEVICES') == '1'):\n"
         "    raise SystemExit(9)\n"
     )
@@ -513,13 +513,16 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
     assert uv_controls
     assert all(line.endswith("|1|never|copy") for line in uv_controls)
     records = Path(env["DRIVER_RECORD"]).read_text(encoding="utf-8").splitlines()
-    assert sorted(records) == [
-        "CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=10 MKL_NUM_THREADS=10",
-        "CUDA_VISIBLE_DEVICES=1 OMP_NUM_THREADS=10 MKL_NUM_THREADS=10",
-        "CUDA_VISIBLE_DEVICES=2 OMP_NUM_THREADS=10 MKL_NUM_THREADS=10",
-    ]
     statuses = list(results_root.glob("logs/*.status"))
-    assert {"cpu=0,1,2,3,4,5,6,7,8,9", "cpu=10,11,12,13,14,15,16,17,18,19", "cpu=20,21,22,23,24,25,26,27,28,29"} <= {line.split()[2] for path in statuses for line in path.read_text().splitlines()}
+    expected_core_counts = {}
+    for path in statuses:
+        fields = dict(field.split("=", 1) for field in path.read_text().split())
+        expected_core_counts[fields["gpu"]] = len(fields["cpu"].split(","))
+    assert sorted(records) == sorted(
+        f"CUDA_VISIBLE_DEVICES={gpu} OMP_NUM_THREADS={core_count} "
+        f"MKL_NUM_THREADS={core_count}"
+        for gpu, core_count in expected_core_counts.items()
+    )
 
     invalid_manifest = results_root / "plan" / "cpu-row.json"
     invalid_doc = json.loads(plan_path.read_text(encoding="utf-8"))
