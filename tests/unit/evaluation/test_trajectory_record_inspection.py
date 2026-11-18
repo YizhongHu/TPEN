@@ -9,6 +9,7 @@ its re-export through the public ``tpen.inspection`` boundary (see
 from __future__ import annotations
 
 import csv
+import importlib
 import json
 import math
 import shutil
@@ -33,6 +34,9 @@ from tpen.evaluation.trajectory_records import (
     inspect_trajectory_record,
 )
 from tpen.statistics.trajectory import ObservableTrajectory
+
+stage1_collect = importlib.import_module("experiments.atomistic.stage1.collect")
+from experiments.atomistic.stage1.protocol import manifest_hash
 
 
 def _write_v1_artifact(
@@ -379,6 +383,40 @@ def test_reconciliation_bound_uses_writer_moments_at_real_sample_count() -> None
     )
 
 
+def test_reconciliation_bound_has_the_reviewed_numeric_boundaries() -> None:
+    """The n=256 boundary distinguishes the writer's second moment from RMS."""
+
+    mean = -2.7898603079784103
+    variance = 0.24156005183916118
+    assert trajectory_records._reconciliation_tolerance(
+        mean=mean, variance=variance, sample_count=256, metric="variance"
+    ) == 1.824646594712426e-12
+    assert trajectory_records._close_or_same_nonfinite(
+        variance,
+        variance + 1.0e-12,
+        mean=mean,
+        variance=variance,
+        sample_count=256,
+        metric="variance",
+    )
+    assert not trajectory_records._close_or_same_nonfinite(
+        variance,
+        variance + 3.0e-12,
+        mean=mean,
+        variance=variance,
+        sample_count=256,
+        metric="variance",
+    )
+    assert not trajectory_records._close_or_same_nonfinite(
+        variance,
+        variance * (1.0 + 1.0e-6),
+        mean=mean,
+        variance=variance,
+        sample_count=1_048_576,
+        metric="variance",
+    )
+
+
 def test_reconciliation_bound_has_no_unit_floor_for_small_variance() -> None:
     """Small-variance bounds remain proportional to the data's second moment."""
 
@@ -401,6 +439,91 @@ def test_reconciliation_bound_has_no_unit_floor_for_small_variance() -> None:
         sample_count=sample_count,
         metric="variance",
     )
+
+
+def test_equal_finite_mean_survives_an_infinite_variance_scale() -> None:
+    """Exact equality avoids deriving a tolerance from an overflowed moment."""
+
+    assert trajectory_records._close_or_same_nonfinite(
+        0.0,
+        0.0,
+        mean=0.0,
+        variance=float("inf"),
+        sample_count=2,
+        metric="mean",
+    )
+    with pytest.raises(TamperedTrajectoryRecordError, match="finite non-negative second moment"):
+        trajectory_records._close_or_same_nonfinite(
+            0.0,
+            1.0,
+            mean=0.0,
+            variance=float("inf"),
+            sample_count=2,
+            metric="mean",
+        )
+
+
+def test_v1_roundtrip_preserves_equal_mean_with_infinite_variance(tmp_path: Path) -> None:
+    """Finite rows whose square sum overflows remain readable as v1 records."""
+
+    artifact = _write_v1_artifact(
+        tmp_path,
+        torch.tensor([[1.0e200, -1.0e200]], dtype=torch.float64),
+    )
+    inspected = inspect_trajectory_record(artifact.metadata_path)
+    assert inspected.mean == 0.0
+    assert inspected.variance == float("inf")
+
+
+def test_stage1_collector_reuses_reader_reconciliation_boundary(tmp_path: Path, monkeypatch) -> None:
+    """Collection accepts a real pair and exposes reader rejection as CollectionError."""
+
+    run_dir = tmp_path / "results" / "he-run"
+    task_dir = run_dir / "mcmc_energy"
+    shutil.copytree(_REAL_STAGE1_HE_FIXTURE, task_dir)
+    metadata_path = task_dir / "sampled_eval_table.metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    rows = []
+    for stream in range(4):
+        rows.append({
+            "row_id": f"he-eval-control-{stream}",
+            "system_id": "he_atom",
+            "kind": "eval",
+            "lineage": 0,
+            "checkpoint": 1000,
+            "stream": stream,
+            "draws": metadata["draw_count"],
+            "walkers": metadata["walker_count"],
+            "results_root": str(tmp_path / "results"),
+            "experiment_name": "ignored-by-control",
+            "sector": "eval",
+            "run_id": "ignored-by-control",
+            "source_sha": "source-sha",
+            "checkpoint_sha256": metadata["checkpoint_sha256"],
+            "expected_physical_system_id": metadata["system_descriptor_id"],
+        })
+    manifest = {"schema": "stage1/v3", "rows": rows}
+    manifest["manifest_hash"] = manifest_hash(rows)
+    monkeypatch.setattr(stage1_collect, "resolve_run_dir", lambda _row: run_dir)
+    monkeypatch.setattr(
+        stage1_collect,
+        "inspect_eval_run",
+        lambda _run_dir: {
+            "verdict": "completed",
+            "resolved_config_identity": metadata["resolved_config_identity"],
+            "source_git_sha": "source-sha",
+        },
+    )
+    monkeypatch.setattr(stage1_collect, "_reference", lambda *_args: (0.0, "test"))
+
+    result = stage1_collect.collect(manifest)
+    assert result["records"][0]["statistics"]["mean"] == metadata["mean"]
+
+    metadata["variance"] *= 1.0 + 1.0e-6
+    metadata["record_content_id"] = trajectory_records._record_content_id(metadata)
+    metadata_path.write_text(json.dumps(metadata, sort_keys=True, indent=2), encoding="utf-8")
+    with pytest.raises(stage1_collect.CollectionError, match="mean/variance"):
+        stage1_collect.collect(manifest)
 
 
 def test_real_stage1_fixture_can_be_replayed_from_a_copied_pair(tmp_path: Path) -> None:

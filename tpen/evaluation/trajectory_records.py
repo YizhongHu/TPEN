@@ -2366,18 +2366,25 @@ def _reconciliation_tolerance(
     -----
     A binary64 operation has unit roundoff ``u = 2**-53``. The standard
     first-order bound for a sequence of ``n`` rounded operations is
-    ``gamma_n = n*u/(1 - n*u)``. The writer and reader each perform a
-    reduction, then perform the mean/variance arithmetic, so eight ``gamma_n``
-    units cover those reductions and surrounding operations conservatively.
-    The scale is dimensionally tied to the writer's second-moment algorithm;
-    there is deliberately no unit floor that would hide small variances.
+    ``gamma_n = n*u/(1 - n*u)``. The writer reduces per-draw sums and squared
+    sums, then computes ``E[x**2] - mean**2``; the reader independently
+    reduces the CSV and repeats that arithmetic. Eight ``gamma_n`` units
+    conservatively account for those two reductions and the surrounding
+    mean/variance operations. This is an engineering leading-order accounting,
+    not a probabilistic confidence bound or an all-input proof. It assumes
+    finite binary64 inputs, no overflow or material underflow in the reductions,
+    and ``n*u < 1``. The scale is dimensionally tied to the writer's
+    second-moment algorithm; there is deliberately no unit floor that would
+    hide small variances.
     """
 
     if sample_count < 1:
         raise ValueError("sample_count must be positive")
     second_moment = variance + mean * mean
     if not math.isfinite(second_moment) or second_moment < 0.0:
-        raise ValueError("mean and variance must define a finite non-negative second moment")
+        raise TamperedTrajectoryRecordError(
+            "trajectory record mean/variance do not define a finite non-negative second moment"
+        )
     unit_roundoff = sys.float_info.epsilon / 2.0
     n_times_u = sample_count * unit_roundoff
     gamma_n = n_times_u / (1.0 - n_times_u)
@@ -2406,6 +2413,10 @@ def _close_or_same_nonfinite(
     mismatch is not hidden by a fixed absolute tolerance.
     """
 
+    if _same_float(left, right):
+        # Equal finite values need no scale estimate. In particular, an
+        # overflowed second moment must not reject an exactly equal mean.
+        return True
     if math.isfinite(left) and math.isfinite(right):
         return abs(left - right) <= _reconciliation_tolerance(
             mean=mean,
@@ -2413,7 +2424,7 @@ def _close_or_same_nonfinite(
             sample_count=sample_count,
             metric=metric,
         )
-    return _same_float(left, right)
+    return False
 
 
 def _same_reconciliation(
