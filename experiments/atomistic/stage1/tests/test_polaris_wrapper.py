@@ -292,6 +292,34 @@ def test_guard_rejects_non_eagle_results_root(tmp_path: Path) -> None:
     assert not (tmp_path / "outside").exists()
 
 
+def test_guard_rejects_symlinked_results_root_before_any_write(tmp_path: Path) -> None:
+    prefix = tmp_path / "test-prefix"
+    prefix.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"preserve-me\0")
+    results_root = prefix / "results"
+    results_root.symlink_to(outside, target_is_directory=True)
+    before_outside = sorted(path.relative_to(outside) for path in outside.rglob("*"))
+
+    result = _run(
+        "guard",
+        _env(
+            tmp_path,
+            RESULTS_ROOT=str(results_root),
+            TPEN_POLARIS_TEST_RESULTS_PREFIX=str(prefix),
+            PBS_ENVIRONMENT="",
+            PBS_JOBID="",
+        ),
+    )
+
+    assert result.returncode == 2
+    assert "RESULTS_ROOT is outside" in result.stderr
+    assert sentinel.read_bytes() == b"preserve-me\0"
+    assert sorted(path.relative_to(outside) for path in outside.rglob("*")) == before_outside
+
+
 def test_dry_exec_runs_three_train_control_rows(tmp_path: Path) -> None:
     rows = [
         {
