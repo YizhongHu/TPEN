@@ -312,15 +312,25 @@ def test_writer_statistics_are_forwarded_without_reducing_again(
 
 
 def test_writer_statistics_exact_recompute_matches(monkeypatch, tmp_path: Path) -> None:
-    """Control: an exactly recomputed sidecar scalar passes identically on the base collector."""
+    """Control: an exactly recomputed sidecar scalar passes identically on the base collector.
+
+    Mirrors ``collect.py``'s (pre-fix) base reduction loop exactly: a plain
+    ``sum()`` over the full pooled list of 256 values is not bit-identical to
+    draw-ordered partial sums accumulated with ``+=`` (CPython's ``sum()``
+    uses a compensated summation algorithm since 3.12), so the per-draw
+    partial sums must be accumulated the same way the collector does.
+    """
     values = [
         [0.75 + ((draw * 64 + walker) % 17 - 8) * 1.0e-5 for walker in range(64)]
         for draw in range(4)
     ]
-    draw_sums = [sum(draw) for draw in values]
-    draw_square_sums = [sum(value * value for value in draw) for draw in values]
-    total = sum(draw_sums)
-    total_square = sum(draw_square_sums)
+    draw_sums = {index: sum(draw) for index, draw in enumerate(values)}
+    draw_square_sums = {index: sum(value * value for value in draw) for index, draw in enumerate(values)}
+    total = 0.0
+    total_square = 0.0
+    for index in range(len(values)):
+        total += draw_sums[index]
+        total_square += draw_square_sums[index]
     collector_mean = total / 256
     collector_variance = total_square / 256 - collector_mean * collector_mean
     document = _install_single_fake(
