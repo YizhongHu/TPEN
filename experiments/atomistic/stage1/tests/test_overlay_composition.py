@@ -36,7 +36,7 @@ ROOT = Path(__file__).parents[1]
 CONFIG_ROOT = ROOT / "configs"
 OVERLAY = CONFIG_ROOT / "overlays" / "diagnostics-v1.yaml"
 APPROVED_PROPOSAL_SHA256 = "8bbaf291e90ec6c90b5a8afbe664bded96dcb9743ad0c24cda1f66ddcb4634c1"
-COMMITTED_OVERLAY_SHA256 = "5f766c2058eb6b6b0d271c025784975cfe3f9a71beb726869356d10a77d4763b"
+COMMITTED_OVERLAY_SHA256 = "8d59fa8dd43291ca541b3c87477fc836b3da461ba035acaa1dcccedc8fb9fc14"
 
 
 def _protocol() -> Protocol:
