@@ -41,10 +41,10 @@ def test_runtime_equivariance_train_resume_reconstructs_across_processes(tmp_pat
 
     assert len({prefix["pid"], reference["pid"], successor["pid"]}) == 3
     assert successor["restored"] is True
-    assert successor["trainer_next_iteration"] == 2
+    assert successor["trainer_next_iteration"] == 5
     assert reference["selected"] == successor["selected"]
     assert reference["records"] == successor["records"]
-    assert [record["step"] for record in successor["records"]] == [2, 2, 7, 7]
+    assert [record["step"] for record in successor["records"]] == [5, 5, 10, 10]
     assert all(record["metrics"]["n_comparisons"] > 0 for record in successor["records"][::2])
     assert all(record["metrics"]["passed"] is True for record in successor["records"])
 
@@ -58,7 +58,7 @@ def test_runtime_equivariance_failure_artifact_uses_event_step_after_restore(
     failure = _launch(tmp_path, "successor", failure=True)
 
     assert failure["restored"] is True
-    assert "failed at step 2" in failure["failure_message"]
+    assert "failed at step 5" in failure["failure_message"]
     assert failure["artifact_paths"] == [
-        "equivariance-artifacts/full_model/step_000002/failure.json"
+        "equivariance-artifacts/full_model/step_000005/failure.json"
     ]

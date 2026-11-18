@@ -49,7 +49,7 @@ class _ProbeModel(nn.Module):
 class _Trainer:
     """Minimal trainer state owner accepted by the TrainResume payload."""
 
-    def __init__(self, *, next_iteration: int = 2, completed_updates: int = 2) -> None:
+    def __init__(self, *, next_iteration: int = 5, completed_updates: int = 5) -> None:
         self.next_iteration = next_iteration
         self.completed_updates = completed_updates
 
@@ -169,8 +169,8 @@ def run(mode: str, root: Path, *, failure: bool) -> dict[str, object]:
     if mode == "prefix":
         save_checkpoint(
             output_dir=checkpoint_root,
-            next_iteration=2,
-            completed_updates=2,
+            next_iteration=5,
+            completed_updates=5,
             model=model,
             optimizer=optimizer,
             trainer=trainer,
@@ -192,7 +192,7 @@ def run(mode: str, root: Path, *, failure: bool) -> dict[str, object]:
     batch = _batch()
     records: list[dict[str, object]] = []
     failure_message = None
-    for step in (2, 7):
+    for step in (5, 10):
         state = TrainerState(step=-1, model=model, batch=batch)
         try:
             _deliver(callback, context, state, step)
@@ -201,7 +201,7 @@ def run(mode: str, root: Path, *, failure: bool) -> dict[str, object]:
             break
     selected = [
         list(permutation.image)
-        for step in (2, 7)
+        for step in (5, 10)
         for permutation in select_nonidentity_permutations(
             n_particles=3, fraction=0.5, max_count=1, seed=19, step=step
         )
