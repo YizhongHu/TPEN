@@ -146,10 +146,11 @@ def _overlay_binding(*, overlay: str | Path, expected_sha256: object) -> tuple[s
 def compose_train_overlay(cfg: Any, *, overlay: str | Path, expected_sha256: str) -> Any:
     """Compose the approved train overlay without touching physics sections.
 
-    The overlay owns complete observability sections (callbacks and loggers)
-    plus train-side runtime/sampler/optimizer/trainer leaves.  Each top-level
-    section is replaced explicitly; a blind ``OmegaConf.merge`` is avoided so
-    a future list or nested model section cannot be silently replaced.
+    The overlay owns train-side runtime/sampler/optimizer/trainer leaves plus
+    diagnostic callbacks and loggers.  Base callbacks are retained and the
+    diagnostics are appended explicitly; checkpoint retention therefore stays
+    manifest-owned.  A blind ``OmegaConf.merge`` is avoided so a future list
+    or nested model section cannot be silently replaced.
     """
 
     relative, digest, path = _overlay_binding(
@@ -158,15 +159,20 @@ def compose_train_overlay(cfg: Any, *, overlay: str | Path, expected_sha256: str
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
         raise ProtocolError("overlay must contain a YAML mapping")
-    allowed = {"runtime", "sampler", "optimizer", "trainer", "checkpoint_steps",
-               "callbacks", "loggers"}
+    allowed = {"runtime", "sampler", "optimizer", "trainer", "callbacks", "loggers"}
     if set(payload) != allowed:
         raise ProtocolError("overlay contains unsupported or missing top-level sections")
     if any(key in payload for key in ("system", "atoms", "model", "hamiltonian_terms")):
         raise ProtocolError("overlay must not declare physics or model sections")
-    for key in ("runtime", "sampler", "optimizer", "trainer", "checkpoint_steps",
-                "callbacks", "loggers"):
+    for key in ("runtime", "sampler", "optimizer", "trainer", "loggers"):
         OmegaConf.update(cfg, key, copy.deepcopy(payload[key]), merge=False)
+    base_callbacks = OmegaConf.to_container(cfg.get("callbacks", []), resolve=False)
+    diagnostic_callbacks = copy.deepcopy(payload["callbacks"])
+    if not isinstance(base_callbacks, list) or not isinstance(diagnostic_callbacks, list):
+        raise ProtocolError("overlay callbacks must be lists")
+    OmegaConf.update(
+        cfg, "callbacks", base_callbacks + diagnostic_callbacks, merge=False,
+    )
     OmegaConf.update(
         cfg,
         "stage1_overlay",

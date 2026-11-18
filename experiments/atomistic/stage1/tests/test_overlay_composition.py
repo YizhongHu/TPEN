@@ -35,7 +35,8 @@ from tpen.run import run_from_config
 ROOT = Path(__file__).parents[1]
 CONFIG_ROOT = ROOT / "configs"
 OVERLAY = CONFIG_ROOT / "overlays" / "diagnostics-v1.yaml"
-APPROVED_OVERLAY_SHA256 = "8bbaf291e90ec6c90b5a8afbe664bded96dcb9743ad0c24cda1f66ddcb4634c1"
+APPROVED_PROPOSAL_SHA256 = "8bbaf291e90ec6c90b5a8afbe664bded96dcb9743ad0c24cda1f66ddcb4634c1"
+COMMITTED_OVERLAY_SHA256 = "5f766c2058eb6b6b0d271c025784975cfe3f9a71beb726869356d10a77d4763b"
 
 
 def _protocol() -> Protocol:
@@ -63,10 +64,16 @@ def _phase1(*, overlay: bool) -> list[dict[str, object]]:
     )
 
 
-def test_repository_overlay_is_byte_identical_to_approved_proposal() -> None:
-    """The committed overlay is copied from the approved evidence packet."""
+def test_repository_overlay_is_versioned_and_checkpoint_free() -> None:
+    """The committed variant records its deliberate checkpoint deviation."""
 
-    assert overlay_sha256(OVERLAY) == APPROVED_OVERLAY_SHA256
+    assert overlay_sha256(OVERLAY) == COMMITTED_OVERLAY_SHA256
+    assert COMMITTED_OVERLAY_SHA256 != APPROVED_PROPOSAL_SHA256
+    overlay_cfg = OmegaConf.load(OVERLAY)
+    assert "checkpoint_steps" not in overlay_cfg
+    targets = [entry["_target_"] for entry in overlay_cfg.callbacks]
+    assert "tpen.callback.InitialCheckpoint" not in targets
+    assert "tpen.callback.Checkpoint" not in targets
 
 
 def test_no_overlay_manifest_keeps_existing_identity_shape() -> None:
@@ -149,15 +156,23 @@ def test_gateway_accepts_declared_overlay_and_rejects_hash_or_undeclared_use() -
         )
 
 
-def test_train_composition_records_order_and_replaces_observability_sections() -> None:
-    """Composition records provenance and leaves the model/physics untouched."""
+def test_train_composition_appends_diagnostics_and_preserves_base_callbacks() -> None:
+    """Composition records provenance without replacing checkpoint ownership."""
 
     cfg = load_config(str(CONFIG_ROOT / "he" / "train.yaml"))
     original_model = OmegaConf.to_container(cfg.model, resolve=False)
     original_terms = OmegaConf.to_container(cfg.hamiltonian_terms, resolve=False)
+    base_callbacks = OmegaConf.to_container(cfg.callbacks, resolve=False)
+    base_targets = [entry["_target_"] for entry in base_callbacks]
+    overlay_cfg = OmegaConf.load(OVERLAY)
+    diagnostic_callbacks = OmegaConf.to_container(overlay_cfg.callbacks, resolve=False)
     compose_train_overlay(cfg, overlay=str(OVERLAY), expected_sha256=overlay_sha256(OVERLAY))
     assert OmegaConf.to_container(cfg.model, resolve=False) == original_model
     assert OmegaConf.to_container(cfg.hamiltonian_terms, resolve=False) == original_terms
+    assert len(cfg.callbacks) == len(base_callbacks) + len(diagnostic_callbacks)
+    assert [entry["_target_"] for entry in cfg.callbacks[:len(base_callbacks)]] == base_targets
+    assert "tpen.callback.Checkpoint" in [entry["_target_"] for entry in cfg.callbacks]
+    assert "tpen.callback.InitialCheckpoint" not in [entry["_target_"] for entry in cfg.callbacks]
     assert cfg.stage1_overlay.sha256 == overlay_sha256(OVERLAY)
     assert cfg.stage1_overlay.composition_order == protocol_module.OVERLAY_COMPOSITION_ORDER
     assert any(entry.get("_target_") == "tpen.callback.ModuleNorms" for entry in cfg.callbacks)

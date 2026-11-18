@@ -1,6 +1,7 @@
-# PROPOSED, non-repository overlay for He/H2 Stage-1 TRAIN (50k-update
-# lineage), for operator decision only -- not applied, not merged into the
-# checked-in configs/{he,h2}/train.yaml. Modeled directly on the APPROVED
+# Versioned He/H2 Stage-1 TRAIN (50k-update lineage) diagnostics overlay.
+# This is copied from the approved proposal with checkpoint-retention keys
+# removed because checkpoint retention is manifest-owned.
+# Modeled directly on the APPROVED
 # ~/.paseo/stage1-evidence/hooke2-30k-template-v3/hooke2-30k-overlay.yaml
 # (same callback set, same JSONL logger), adapted only where He/H2's own
 # base config already differs from Hooke-2e's:
@@ -37,17 +38,7 @@ trainer:
   log_every_n_steps: 1
   return_terms: true
 
-checkpoint_steps: [50000]
-
 callbacks:
-  - _target_: tpen.callback.ConfigSnapshot
-    output_path: ${run.dir}/config.yaml
-  - _target_: tpen.callback.ResolvedConfigSnapshot
-    output_path: ${run.dir}/resolved_config.yaml
-  - _target_: tpen.callback.Metadata
-    output_path: ${run.dir}/metadata.json
-  - _target_: tpen.callback.Status
-    output_path: ${run.dir}/status.json
   - _target_: tpen.callback.DataIntegrity
     every_n_steps: 1
     fail_fast: true
@@ -87,18 +78,8 @@ callbacks:
     path: ${run.dir}/training_history
     every_n_steps: 50
     partition_size_steps: 1000
-  - _target_: tpen.callback.InitialCheckpoint
-    output_dir: ${run.dir}/checkpoints
   - _target_: tpen.callback.ParameterActivity
     output_path: ${run.dir}/parameter_activity.json
-  - _target_: tpen.callback.Checkpoint
-    terminal: true
-    schedule:
-      _target_: tpen.checkpoint.ExplicitUpdates
-      updates: ${checkpoint_steps}
-    payload:
-      _target_: tpen.checkpoint.TrainResume
-    output_dir: ${run.dir}/checkpoints
   - _target_: tpen.callback.RunTiming
   - _target_: tpen.callback.TrainStepTiming
     every_n_steps: 1
