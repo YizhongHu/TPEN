@@ -210,6 +210,26 @@ def test_routed_child_host_mismatch_aborts_before_core(tmp_path: Path) -> None:
     )
 
 
+def test_routed_refusal_sidecar_and_teardown_are_json_serializable() -> None:
+    """Public refusal and teardown records must remain JSON-shaped."""
+
+    group_digest = "a" * 64
+    refusal = {"code": "routed-child-node-mismatch", "reason": "synthetic wrong child host"}
+    observation = ChildPlacementObservation(
+        "task", "attempt", group_digest, "allocation", "backend", "slot", "b" * 64,
+        "/tmp/output", "wrong-child-node", 4243, 55, (), {"OMP_NUM_THREADS": None}, None,
+        "2026-11-18T00:00:00Z", refusal,
+    )
+    teardown = LeafTeardownReceipt(
+        group_digest, "task", "attempt", "allocation", "backend", True, "not-run",
+    )
+
+    encoded = json.dumps({"placement": observation.to_dict(), "teardown": teardown.to_dict()})
+    decoded = json.loads(encoded)
+    assert decoded["placement"]["refusal"] == refusal
+    assert decoded["teardown"]["child_group_reaped"] is True
+
+
 def _attach_routed_mismatch_leaf_answers(fake_parsl, errors: list[str] | None = None) -> None:
     """Return a valid remote refusal result with an identity-bound sidecar."""
 
