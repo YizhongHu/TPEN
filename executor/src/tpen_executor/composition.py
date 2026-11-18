@@ -14,7 +14,12 @@ from .allocations import ConfiguredAllocation
 from .configuration import StagedHydra
 from .contracts import ReadyGroup
 from .dispatch import LocalDispatcher, ParslDispatcher, ParslUnavailableError
-from .dispatch.parsl import AttachedTransportSpec, UnsupportedTransportError
+from .dispatch.parsl import (
+    AttachedTransportSpec,
+    RoutedAttachedTransportSpec,
+    UnsupportedTransportError,
+    decode_attached_transport,
+)
 from .environments import PreparedPythonEnvironment
 from .lifecycle import AttachedAllocation
 from .placement import BindingError, PlacementRefusal, bindings_from_allocation
@@ -207,7 +212,7 @@ class DispatchPlan:
     dispatcher: Any
     lifecycle: AttachedAllocation
     timeout: float | None
-    transport: AttachedTransportSpec | None = None
+    transport: AttachedTransportSpec | RoutedAttachedTransportSpec | None = None
 
 
 def admit(
@@ -253,13 +258,13 @@ def admit(
     if timeout is not None and (type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0):
         raise CLIRefusal("invalid-timeout", "timeout must be finite and strictly positive")
 
-    transport: AttachedTransportSpec | None = None
+    transport: AttachedTransportSpec | RoutedAttachedTransportSpec | None = None
     if transport_path is not None:
         if dispatcher_name != "parsl":
             raise CLIRefusal("transport-requires-parsl", "transport requires the parsl dispatcher")
         try:
             raw_transport = _decode(_path(transport_path, "transport"), "transport")
-            transport = AttachedTransportSpec.from_mapping(raw_transport)
+            transport = decode_attached_transport(raw_transport)
         except CLIRefusal as error:
             raise CLIRefusal("invalid-transport", error.reason) from error
         except (OverflowError, RecursionError, TypeError, ValueError) as error:
