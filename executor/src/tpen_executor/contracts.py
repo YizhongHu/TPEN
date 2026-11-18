@@ -65,6 +65,27 @@ class BackendJobId(_Identity):
 
 
 @frozen_record
+class GroupId(_Identity):
+    """Opaque identity of one immutable logical execution group."""
+
+    schema: ClassVar[str] = "tpen-executor/group-id-v2"
+
+
+@frozen_record
+class AllocationAttemptId(_Identity):
+    """Opaque identity of one controller/allocation lease generation."""
+
+    schema: ClassVar[str] = "tpen-executor/allocation-attempt-id-v2"
+
+
+@frozen_record
+class InvocationId(_Identity):
+    """Opaque identity of one fresh controller-issued process invocation."""
+
+    schema: ClassVar[str] = "tpen-executor/invocation-id-v2"
+
+
+@frozen_record
 class ProgramSpecRef:
     """Opaque unresolved program configuration and its content digest.
 
@@ -207,4 +228,127 @@ class ReadyGroup:
         members = sequence(data["members"], "members")
         return cls(data["group_id"], tuple(TaskSpec.from_mapping(member) for member in members), data["execution_plan_digest"])
 
-__all__ = ["AllocationId", "AttemptId", "BackendJobId", "ProgramSpecRef", "ReadyGroup", "TaskSpec"]
+
+@frozen_record
+class ExecutionPlanV2:
+    """Closed, content-bound plan and ordered member binding for B1a.
+
+    ``plan_ref`` is intentionally opaque JSON owned by the producer.  The
+    executor binds it to ``content_digest`` but does not interpret scheduler,
+    facility, or science-specific values.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/execution-plan-v2"
+    plan_ref: Any
+    content_digest: str
+    member_task_ids: tuple[str, ...]
+    continuation_protocol: str
+    reconciliation_policy: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "plan_ref", _freeze(self.plan_ref, "plan_ref"))
+        if digest(self.plan_ref) != sha256_text(self.content_digest, "content_digest"):
+            raise ValueError("content_digest does not match plan_ref")
+        member_task_ids = sequence(self.member_task_ids, "member_task_ids")
+        if not member_task_ids or any(type(item) is not str or not item.strip() for item in member_task_ids):
+            raise TypeError("member_task_ids must contain non-empty strings")
+        if len(set(member_task_ids)) != len(member_task_ids):
+            raise ValueError("member_task_ids must be unique")
+        object.__setattr__(self, "member_task_ids", member_task_ids)
+        object.__setattr__(self, "continuation_protocol", text(self.continuation_protocol, "continuation_protocol"))
+        object.__setattr__(self, "reconciliation_policy", text(self.reconciliation_policy, "reconciliation_policy"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "plan_ref": thaw(self.plan_ref),
+            "content_digest": self.content_digest,
+            "member_task_ids": list(self.member_task_ids),
+            "continuation_protocol": self.continuation_protocol,
+            "reconciliation_policy": self.reconciliation_policy,
+        }
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "ExecutionPlanV2":
+        fields(
+            data,
+            {"schema", "plan_ref", "content_digest", "member_task_ids", "continuation_protocol", "reconciliation_policy"},
+            cls.schema,
+            cls.__name__,
+        )
+        if type(data["content_digest"]) is not str or type(data["continuation_protocol"]) is not str or type(data["reconciliation_policy"]) is not str:
+            raise TypeError("ExecutionPlanV2 scalar fields have invalid types")
+        return cls(
+            data["plan_ref"],
+            data["content_digest"],
+            sequence(data["member_task_ids"], "member_task_ids"),
+            data["continuation_protocol"],
+            data["reconciliation_policy"],
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "ExecutionPlanV2":
+        return cls.from_mapping(decode_json(data))
+
+
+@frozen_record
+class ReadyGroupV2:
+    """Immutable v2 group whose identity is its canonical record bytes."""
+
+    schema: ClassVar[str] = "tpen-executor/ready-group-v2"
+    group_id: GroupId
+    members: tuple[TaskSpec, ...]
+    execution_plan: ExecutionPlanV2
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.group_id, GroupId):
+            raise TypeError("group_id must be GroupId")
+        members = sequence(self.members, "members")
+        if not members or any(not isinstance(member, TaskSpec) for member in members):
+            raise TypeError("members must be a non-empty sequence of TaskSpec")
+        if len({member.task_id for member in members}) != len(members):
+            raise ValueError("duplicate task_id in v2 group")
+        if not isinstance(self.execution_plan, ExecutionPlanV2):
+            raise TypeError("execution_plan must be ExecutionPlanV2")
+        if tuple(member.task_id for member in members) != self.execution_plan.member_task_ids:
+            raise ValueError("execution plan member binding disagrees with group members")
+        object.__setattr__(self, "members", members)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "group_id": self.group_id.to_dict(),
+            "members": [member.to_dict() for member in self.members],
+            "execution_plan": self.execution_plan.to_dict(),
+        }
+
+    @property
+    def identity(self) -> str:
+        """Return the order-sensitive canonical identity of this group."""
+
+        return digest(self.to_dict())
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "ReadyGroupV2":
+        fields(data, {"schema", "group_id", "members", "execution_plan"}, cls.schema, cls.__name__)
+        members = sequence(data["members"], "members")
+        return cls(
+            GroupId.from_mapping(data["group_id"]),
+            tuple(TaskSpec.from_mapping(member) for member in members),
+            ExecutionPlanV2.from_mapping(data["execution_plan"]),
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "ReadyGroupV2":
+        return cls.from_mapping(decode_json(data))
+
+__all__ = [
+    "AllocationAttemptId", "AllocationId", "AttemptId", "BackendJobId", "ExecutionPlanV2",
+    "GroupId", "InvocationId", "ProgramSpecRef", "ReadyGroup", "ReadyGroupV2", "TaskSpec",
+]

@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 import os
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Protocol
 
-from ._codec import canonical_bytes, decode_json, fields, sequence
+from ._codec import canonical_bytes, decode_json, fields, sequence, sha256_text, text
+from .contracts import AttemptId, GroupId, ReadyGroupV2
 from .environments import PreparedPythonEnvironment
 from ._records import frozen_record
+from .results import OutcomeReceipt, StartReceipt
 from .workers import SubprocessWorker
 
 PROFILE_CHECK_SCHEMA = "tpen.profile-check/v1"
@@ -183,10 +185,403 @@ class CoreProfileReference:
         return result
 
 
+CORE_RECOVERY_OUTCOMES = frozenset({"completed", "successor", "terminal", "unknown"})
+CORE_ADMISSION_VERDICTS = frozenset({"admitted", "refused", "unknown"})
+CORE_CHECKPOINT_VERDICTS = frozenset({"valid", "invalid", "absent", "unknown"})
+CORE_QUIESCENCE_VERDICTS = frozenset({"valid", "invalid", "unknown"})
+RECONCILIATION_ACTIONS = frozenset(
+    {"preserve_completed", "admit_successor", "start_fresh", "preserve_terminal", "park"}
+)
+
+
+@frozen_record
+class CoreAdmissionVerdictV2:
+    """Typed core-owned recovery/admission facts consumed by B1a.
+
+    The executor only validates this closed reference.  It does not inspect
+    checkpoints, reconstruct core state, or import the core package.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/core-admission-verdict-v2"
+    outcome: str
+    admission: str
+    checkpoint: str
+    quiescence: str
+    profile: ProfileCheck | None
+    reason: str
+
+    def __post_init__(self) -> None:
+        if self.outcome not in CORE_RECOVERY_OUTCOMES:
+            raise ValueError("unknown core recovery outcome")
+        if self.admission not in CORE_ADMISSION_VERDICTS:
+            raise ValueError("unknown core admission verdict")
+        if self.checkpoint not in CORE_CHECKPOINT_VERDICTS:
+            raise ValueError("unknown core checkpoint verdict")
+        if self.quiescence not in CORE_QUIESCENCE_VERDICTS:
+            raise ValueError("unknown core quiescence verdict")
+        if self.profile is not None and not isinstance(self.profile, ProfileCheck):
+            raise TypeError("profile must be ProfileCheck or None")
+        object.__setattr__(self, "reason", text(self.reason, "reason"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "outcome": self.outcome,
+            "admission": self.admission,
+            "checkpoint": self.checkpoint,
+            "quiescence": self.quiescence,
+            "profile": None if self.profile is None else self.profile.to_dict(),
+            "reason": self.reason,
+        }
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "CoreAdmissionVerdictV2":
+        fields(
+            data,
+            {"schema", "outcome", "admission", "checkpoint", "quiescence", "profile", "reason"},
+            cls.schema,
+            cls.__name__,
+        )
+        if any(type(data[key]) is not str for key in ("outcome", "admission", "checkpoint", "quiescence", "reason")):
+            raise TypeError("CoreAdmissionVerdictV2 scalar fields have invalid types")
+        profile = None if data["profile"] is None else ProfileCheck.from_mapping(data["profile"])
+        return cls(data["outcome"], data["admission"], data["checkpoint"], data["quiescence"], profile, data["reason"])
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "CoreAdmissionVerdictV2":
+        return cls.from_mapping(decode_json(data))
+
+
+@frozen_record
+class MemberRecoveryInputV2:
+    """Closed references used to reconcile one v2 group member."""
+
+    schema: ClassVar[str] = "tpen-executor/member-recovery-input-v2"
+    task_id: str
+    lineage_id: str
+    attempt_id: AttemptId | None = None
+    start_receipt: StartReceipt | None = None
+    outcome_receipt: OutcomeReceipt | None = None
+    core_verdict: CoreAdmissionVerdictV2 | None = None
+    receipt_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
+        object.__setattr__(self, "lineage_id", text(self.lineage_id, "lineage_id"))
+        if self.attempt_id is not None and not isinstance(self.attempt_id, AttemptId):
+            raise TypeError("attempt_id must be AttemptId or None")
+        if self.start_receipt is not None and not isinstance(self.start_receipt, StartReceipt):
+            raise TypeError("start_receipt must be StartReceipt or None")
+        if self.outcome_receipt is not None and not isinstance(self.outcome_receipt, OutcomeReceipt):
+            raise TypeError("outcome_receipt must be OutcomeReceipt or None")
+        if self.core_verdict is not None and not isinstance(self.core_verdict, CoreAdmissionVerdictV2):
+            raise TypeError("core_verdict must be CoreAdmissionVerdictV2 or None")
+        identities = [
+            value for value in (
+                None if self.attempt_id is None else self.attempt_id,
+                None if self.start_receipt is None else self.start_receipt.attempt_id,
+                None if self.outcome_receipt is None else self.outcome_receipt.attempt_id,
+            )
+            if value is not None
+        ]
+        if len(set(identities)) > 1:
+            raise ValueError("member recovery receipts cross attempt identity")
+        if self.start_receipt is not None and self.start_receipt.task_id != self.task_id:
+            raise ValueError("start receipt crosses member task identity")
+        if self.outcome_receipt is not None and self.outcome_receipt.task_id != self.task_id:
+            raise ValueError("outcome receipt crosses member task identity")
+        if self.start_receipt is not None and self.outcome_receipt is not None:
+            if self.start_receipt.group_digest != self.outcome_receipt.group_digest or self.start_receipt.output_dir != self.outcome_receipt.output_dir:
+                raise ValueError("member recovery receipts cross group or output identity")
+        if self.receipt_digest is not None:
+            object.__setattr__(self, "receipt_digest", sha256_text(self.receipt_digest, "receipt_digest"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "task_id": self.task_id,
+            "lineage_id": self.lineage_id,
+            "attempt_id": None if self.attempt_id is None else self.attempt_id.to_dict(),
+            "start_receipt": None if self.start_receipt is None else self.start_receipt.to_dict(),
+            "outcome_receipt": None if self.outcome_receipt is None else self.outcome_receipt.to_dict(),
+            "core_verdict": None if self.core_verdict is None else self.core_verdict.to_dict(),
+            "receipt_digest": self.receipt_digest,
+        }
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "MemberRecoveryInputV2":
+        fields(
+            data,
+            {"schema", "task_id", "lineage_id", "attempt_id", "start_receipt", "outcome_receipt", "core_verdict", "receipt_digest"},
+            cls.schema,
+            cls.__name__,
+        )
+        if type(data["task_id"]) is not str or type(data["lineage_id"]) is not str:
+            raise TypeError("MemberRecoveryInputV2 identity fields must be strings")
+        return cls(
+            data["task_id"],
+            data["lineage_id"],
+            None if data["attempt_id"] is None else AttemptId.from_mapping(data["attempt_id"]),
+            None if data["start_receipt"] is None else StartReceipt.from_mapping(data["start_receipt"]),
+            None if data["outcome_receipt"] is None else OutcomeReceipt.from_mapping(data["outcome_receipt"]),
+            None if data["core_verdict"] is None else CoreAdmissionVerdictV2.from_mapping(data["core_verdict"]),
+            data["receipt_digest"],
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "MemberRecoveryInputV2":
+        return cls.from_mapping(decode_json(data))
+
+
+@frozen_record
+class MemberReconciliationV2:
+    """One derived action and stable reason for a group member."""
+
+    schema: ClassVar[str] = "tpen-executor/member-reconciliation-v2"
+    task_id: str
+    action: str
+    reason_code: str
+    attempt_id: AttemptId | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
+        if self.action not in RECONCILIATION_ACTIONS:
+            raise ValueError("unknown member reconciliation action")
+        object.__setattr__(self, "reason_code", text(self.reason_code, "reason_code"))
+        if self.attempt_id is not None and not isinstance(self.attempt_id, AttemptId):
+            raise TypeError("attempt_id must be AttemptId or None")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "task_id": self.task_id,
+            "action": self.action,
+            "reason_code": self.reason_code,
+            "attempt_id": None if self.attempt_id is None else self.attempt_id.to_dict(),
+        }
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "MemberReconciliationV2":
+        fields(data, {"schema", "task_id", "action", "reason_code", "attempt_id"}, cls.schema, cls.__name__)
+        if any(type(data[key]) is not str for key in ("task_id", "action", "reason_code")):
+            raise TypeError("MemberReconciliationV2 scalar fields have invalid types")
+        return cls(data["task_id"], data["action"], data["reason_code"], None if data["attempt_id"] is None else AttemptId.from_mapping(data["attempt_id"]))
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "MemberReconciliationV2":
+        return cls.from_mapping(decode_json(data))
+
+
+@frozen_record
+class GroupReconciliationV2:
+    """Derived aggregate of every member outcome in one v2 group."""
+
+    schema: ClassVar[str] = "tpen-executor/group-reconciliation-v2"
+    group_id: GroupId
+    group_digest: str
+    members: tuple[MemberReconciliationV2, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.group_id, GroupId):
+            raise TypeError("group_id must be GroupId")
+        object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
+        members = sequence(self.members, "members")
+        if not members or any(not isinstance(member, MemberReconciliationV2) for member in members):
+            raise TypeError("members must be a non-empty sequence of MemberReconciliationV2")
+        if len({member.task_id for member in members}) != len(members):
+            raise ValueError("group reconciliation members must be unique")
+        object.__setattr__(self, "members", members)
+
+    @property
+    def aggregate(self) -> str:
+        if any(member.action == "park" for member in self.members):
+            return "parked"
+        if any(member.action in {"admit_successor", "start_fresh"} for member in self.members):
+            return "replacement_required"
+        return "settled"
+
+    @property
+    def completed_count(self) -> int:
+        return sum(member.action == "preserve_completed" for member in self.members)
+
+    @property
+    def terminal_count(self) -> int:
+        return sum(member.action == "preserve_terminal" for member in self.members)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "group_id": self.group_id.to_dict(),
+            "group_digest": self.group_digest,
+            "members": [member.to_dict() for member in self.members],
+            "aggregate": self.aggregate,
+            "completed_count": self.completed_count,
+            "terminal_count": self.terminal_count,
+        }
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "GroupReconciliationV2":
+        fields(
+            data,
+            {"schema", "group_id", "group_digest", "members", "aggregate", "completed_count", "terminal_count"},
+            cls.schema,
+            cls.__name__,
+        )
+        if type(data["group_digest"]) is not str or type(data["aggregate"]) is not str or type(data["completed_count"]) is not int or type(data["terminal_count"]) is not int:
+            raise TypeError("GroupReconciliationV2 derived fields have invalid types")
+        record = cls(
+            GroupId.from_mapping(data["group_id"]),
+            data["group_digest"],
+            tuple(MemberReconciliationV2.from_mapping(item) for item in sequence(data["members"], "members")),
+        )
+        if (record.aggregate, record.completed_count, record.terminal_count) != (data["aggregate"], data["completed_count"], data["terminal_count"]):
+            raise ValueError("GroupReconciliationV2 aggregate is not derived from members")
+        return record
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "GroupReconciliationV2":
+        return cls.from_mapping(decode_json(data))
+
+
+class CoreAdmissionPort(Protocol):
+    """Fake-friendly seam for typed core admission/profile verdicts."""
+
+    def admit(self, member: MemberRecoveryInputV2) -> CoreAdmissionVerdictV2 | None:
+        """Return a typed verdict, or ``None`` when core evidence is absent."""
+
+
+def _park(member: MemberRecoveryInputV2, reason_code: str) -> MemberReconciliationV2:
+    return MemberReconciliationV2(member.task_id, "park", reason_code, member.attempt_id)
+
+
+def _member_reconciliation(
+    member: MemberRecoveryInputV2,
+    *,
+    group_digest: str,
+    admission_port: CoreAdmissionPort | None,
+    restore_callback: Callable[[MemberRecoveryInputV2], Any] | None,
+) -> MemberReconciliationV2:
+    """Classify one member without creating an allocation or process."""
+
+    if member.start_receipt is None:
+        if member.outcome_receipt is None and member.core_verdict is None and member.receipt_digest is None:
+            return MemberReconciliationV2(member.task_id, "start_fresh", "no-durable-start", None)
+        return _park(member, "crossed-or-incomplete-receipt")
+    if member.start_receipt.group_digest != group_digest or (
+        member.outcome_receipt is not None and member.outcome_receipt.group_digest != group_digest
+    ):
+        return _park(member, "crossed-group-receipt")
+    if member.outcome_receipt is None:
+        return _park(member, "missing-settled-outcome")
+    verdict = member.core_verdict
+    if admission_port is not None:
+        try:
+            verdict = admission_port.admit(member)
+        except (TypeError, ValueError, RuntimeError):
+            verdict = None
+        if verdict is None:
+            return _park(member, "core-admission-unavailable")
+        if not isinstance(verdict, CoreAdmissionVerdictV2):
+            return _park(member, "malformed-core-admission")
+    if verdict is None:
+        return _park(member, "missing-core-verdict")
+    if verdict.outcome == "completed":
+        if member.outcome_receipt.status != "completed":
+            return _park(member, "contradictory-completion")
+        return MemberReconciliationV2(member.task_id, "preserve_completed", "completed-and-settled", member.attempt_id)
+    if verdict.outcome == "terminal":
+        return MemberReconciliationV2(member.task_id, "preserve_terminal", "core-terminal", member.attempt_id)
+    if verdict.outcome == "unknown":
+        return _park(member, "unknown-core-result")
+    if verdict.profile is None or verdict.profile.verdict != "supported":
+        return _park(member, "unsupported-profile")
+    if verdict.admission != "admitted":
+        return _park(member, "core-admission-refused")
+    if verdict.checkpoint != "valid" or verdict.quiescence != "valid":
+        return _park(member, "invalid-successor-evidence")
+    if restore_callback is not None:
+        try:
+            if restore_callback(member) is False:
+                return _park(member, "restore-refused")
+        except Exception:
+            return _park(member, "restore-failed")
+    return MemberReconciliationV2(member.task_id, "admit_successor", "valid-successor-admission", member.attempt_id)
+
+
+def reconcile_group(
+    group: ReadyGroupV2,
+    inputs: Sequence[MemberRecoveryInputV2],
+    *,
+    admission_port: CoreAdmissionPort | None = None,
+    restore_callback: Callable[[MemberRecoveryInputV2], Any] | None = None,
+) -> GroupReconciliationV2:
+    """Purely reconcile one v2 group from typed fake/durable references.
+
+    The function only derives actions.  It never submits, replaces, signals,
+    scans checkpoints, writes a ledger, or maps an outcome to a scheduler
+    status.  Missing or crossed evidence becomes a member-level ``park``.
+    """
+
+    if not isinstance(group, ReadyGroupV2):
+        raise TypeError("group must be ReadyGroupV2")
+    if isinstance(inputs, (str, bytes, bytearray)) or not isinstance(inputs, Sequence):
+        raise TypeError("inputs must be a sequence")
+    by_task: dict[str, MemberRecoveryInputV2] = {}
+    for item in inputs:
+        if not isinstance(item, MemberRecoveryInputV2):
+            raise TypeError("inputs must contain MemberRecoveryInputV2 records")
+        if item.task_id in by_task:
+            raise ValueError("duplicate member recovery input")
+        by_task[item.task_id] = item
+    outcomes: list[MemberReconciliationV2] = []
+    for task in group.members:
+        item = by_task.get(task.task_id)
+        if item is None:
+            outcomes.append(MemberReconciliationV2(task.task_id, "park", "missing-member-evidence", None))
+            continue
+        if item.lineage_id != task.lineage_id:
+            outcomes.append(_park(item, "crossed-lineage"))
+            continue
+        outcomes.append(
+            _member_reconciliation(
+                item,
+                group_digest=group.identity,
+                admission_port=admission_port,
+                restore_callback=restore_callback,
+            )
+        )
+    foreign = set(by_task) - {member.task_id for member in group.members}
+    if foreign:
+        # A foreign input cannot be attributed to any group member; the group
+        # remains parked rather than silently discarding the contradictory fact.
+        outcomes = [MemberReconciliationV2(item.task_id, "park", "foreign-member-evidence", item.attempt_id) for item in by_task.values() if item.task_id in {member.task_id for member in group.members}]
+        outcomes.extend(MemberReconciliationV2(task.task_id, "park", "foreign-member-evidence", None) for task in group.members if task.task_id not in {item.task_id for item in outcomes})
+    return GroupReconciliationV2(group.group_id, group.identity, tuple(outcomes))
+
+
+reconcile_allocation_group = reconcile_group
+reconcile = reconcile_group
+
+
 __all__ = [
+    "CORE_ADMISSION_VERDICTS", "CORE_CHECKPOINT_VERDICTS", "CORE_QUIESCENCE_VERDICTS", "CORE_RECOVERY_OUTCOMES",
     "CoreProfileReference",
+    "CoreAdmissionPort", "CoreAdmissionVerdictV2", "GroupReconciliationV2", "MemberReconciliationV2", "MemberRecoveryInputV2",
     "PROFILE_REFUSAL_CODES",
     "ProfileCheck",
     "ProfileUnavailable",
+    "RECONCILIATION_ACTIONS", "reconcile", "reconcile_allocation_group", "reconcile_group",
     "REFUSAL_CODES",
 ]
