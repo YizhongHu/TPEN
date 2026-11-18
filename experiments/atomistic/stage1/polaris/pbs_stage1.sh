@@ -5,8 +5,8 @@
 # guards, and row-level CPU/GPU placement.  Stage-1 identity and argv remain
 # owned by experiments.atomistic.stage1.launch.command_for_row.
 #
-# The submission driver supplies MODE=train|eval, SOURCE_SHA, SOURCE_REPO,
-# RESULTS_ROOT, PLAN_MANIFEST, and EXPECTED_QUEUE.  The checked-in header is a
+# The submission driver supplies MODE=train|eval, SOURCE_SHA, CHECKOUT_ROOT,
+# UV_CACHE_DIR, RESULTS_ROOT, PLAN_MANIFEST, and EXPECTED_QUEUE.  The checked-in header is a
 # debug/evaluation shape; the training runbook supplies the capacity queue and
 # wall cap explicitly at qsub time.
 #PBS -A HetRxnEnergy
@@ -21,7 +21,7 @@ set -Eeuo pipefail
 RESULTS_PREFIX="/eagle/HetRxnEnergy/rhu/"
 MODE="${MODE:-${1:-}}"
 SOURCE_SHA="${SOURCE_SHA:-}"
-SOURCE_REPO="${SOURCE_REPO:-https://github.com/YizhongHu/TPEN.git}"
+CHECKOUT_ROOT="${CHECKOUT_ROOT:-}"
 RESULTS_ROOT="${RESULTS_ROOT:-}"
 PLAN_MANIFEST="${PLAN_MANIFEST:-}"
 EXPECTED_QUEUE="${EXPECTED_QUEUE:-}"
@@ -33,6 +33,14 @@ PYTHON_BIN="${PYTHON_BIN:-}"
 GUARD_PYTHON_BIN="${GUARD_PYTHON_BIN:-}"
 NVIDIA_SMI_BIN="${NVIDIA_SMI_BIN:-nvidia-smi}"
 BOOT_ROOT="${BOOT_ROOT:-}"
+BOOT_PARENT="${BOOT_PARENT:-/local/scratch/${USER:?}}"
+OWNED_BOOT_ROOT=""
+
+cleanup_owned_boot_root() {
+  if [[ -n "$OWNED_BOOT_ROOT" && -d "$OWNED_BOOT_ROOT" ]]; then
+    rm -rf -- "$OWNED_BOOT_ROOT"
+  fi
+}
 
 die() {
   printf '%s\n' "POLARIS_GUARD FAIL $*" >&2
@@ -45,10 +53,103 @@ require_value() {
 }
 
 assert_results_root() {
-  case "$RESULTS_ROOT" in
-    "$RESULTS_PREFIX"*) ;;
-    *) die "results root outside Eagle prefix: $RESULTS_ROOT" ;;
+  require_value RESULTS_ROOT
+  local error
+  if ! error="$("$PYBIN" - "$RESULTS_ROOT" "$RESULTS_PREFIX" 2>&1 <<'PY'
+import sys
+from pathlib import Path
+
+candidate, prefix = (Path(value) for value in sys.argv[1:])
+if any(part == ".." for part in candidate.parts):
+    raise SystemExit("results root contains '..'")
+try:
+    candidate.resolve().relative_to(prefix.resolve())
+except ValueError as exc:
+    raise SystemExit(f"results root outside Eagle prefix: {candidate}") from exc
+PY
+)"; then
+    die "$error"
+  fi
+}
+
+assert_contained_path() {
+  local candidate="$1" root="$2" label="$3"
+  local error
+  if ! error="$("$PYBIN" - "$candidate" "$root" "$label" 2>&1 <<'PY'
+import sys
+from pathlib import Path
+
+candidate, root, label = (Path(value) for value in sys.argv[1:])
+if any(part == ".." for part in candidate.parts):
+    raise SystemExit(f"{label} contains '..': {candidate}")
+try:
+    candidate.resolve().relative_to(root.resolve())
+except ValueError as exc:
+    raise SystemExit(f"{label} is outside {root}: {candidate}") from exc
+PY
+  )"; then
+    die "$error"
+  fi
+}
+
+validate_mode_paths() {
+  case "$MODE" in
+    guard)
+      ;;
+    dry-exec|train|eval)
+      require_value PLAN_MANIFEST
+      ;;
+    plan)
+      require_value PLAN_OUTPUT
+      assert_contained_path "$PLAN_OUTPUT" "$RESULTS_ROOT" PLAN_OUTPUT
+      if [[ -n "${PHASE1_MANIFEST:-}" ]]; then
+        assert_contained_path "$PHASE1_MANIFEST" "$RESULTS_ROOT" PHASE1_MANIFEST
+      fi
+      if [[ -n "${CHECKPOINT_BINDINGS:-}" ]]; then
+        assert_contained_path "$CHECKPOINT_BINDINGS" "$RESULTS_ROOT" CHECKPOINT_BINDINGS
+      fi
+      ;;
+    collect)
+      require_value COLLECT_MANIFEST
+      require_value COLLECT_OUTPUT
+      assert_contained_path "$COLLECT_MANIFEST" "$RESULTS_ROOT" COLLECT_MANIFEST
+      assert_contained_path "$COLLECT_OUTPUT" "$RESULTS_ROOT" COLLECT_OUTPUT
+      ;;
+    *)
+      die "unsupported mode for path validation: $MODE"
+      ;;
   esac
+}
+
+validate_selected_rows() {
+  local manifest="$1" kind="$2"
+  "$PYBIN" - "$manifest" "$kind" "$SOURCE_SHA" "$RESULTS_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest, kind, source_sha, results_root = sys.argv[1:]
+manifest_path = Path(manifest)
+root = Path(results_root)
+document = json.loads(manifest_path.read_text(encoding="utf-8"))
+rows = [row for row in document.get("rows", []) if row.get("kind") == kind]
+if kind == "train" and [int(row["lineage"]) for row in sorted(rows, key=lambda row: int(row["lineage"]))] != [0, 1, 2]:
+    raise SystemExit("expected train lineages 0,1,2")
+if kind == "eval" and len(rows) != 12:
+    raise SystemExit(f"expected 12 eval rows, got {len(rows)}")
+for row in rows:
+    row_root = Path(str(row.get("results_root", "")))
+    if row.get("source_sha") != source_sha:
+        raise SystemExit("row source_sha does not match wrapper SOURCE_SHA")
+    if row.get("device") != "cuda":
+        raise SystemExit(f"row {row.get('row_id', '<unknown>')} must have device=cuda")
+    if any(part == ".." for part in row_root.parts):
+        raise SystemExit(f"row results_root contains '..': {row_root}")
+    try:
+        row_root.resolve().relative_to(root.resolve())
+    except ValueError as exc:
+        raise SystemExit(f"row results_root is outside wrapper RESULTS_ROOT: {row_root}") from exc
+PY
 }
 
 assert_pbs_context() {
@@ -72,11 +173,18 @@ write_job_receipt() {
     printf 'SOURCE_SHA=%s\n' "$SOURCE_SHA"
     printf 'MODE=%s\n' "$MODE"
     printf 'RESULTS_ROOT=%s\n' "$RESULTS_ROOT"
+    printf 'CHECKOUT_ROOT=%s\n' "$CHECKOUT_ROOT"
+    printf 'UV_CACHE_DIR=%s\n' "$UV_CACHE_DIR"
+    printf 'BASE_PYTHON=%s\n' "$PYBIN"
+    printf 'BASE_PYTHON_VERSION='; "$PYBIN" --version 2>&1
+    printf 'UV_PYTHON=%s\n' "$UV_PYTHON"
+    printf 'UV_NO_MANAGED_PYTHON=%s\n' "$UV_NO_MANAGED_PYTHON"
+    printf 'UV_PYTHON_DOWNLOADS=%s\n' "$UV_PYTHON_DOWNLOADS"
+    printf 'UV_LINK_MODE=%s\n' "$UV_LINK_MODE"
   } > "$RESULTS_ROOT/logs/polaris-${MODE}-${PBS_JOBID}.env"
 }
 
 guard_gpus() {
-  require_value GUARD_PYTHON_BIN
   local gpu_info gpu_inventory mig_info line count i
   local -a gpu_lines inventory_lines mig_lines
 
@@ -117,37 +225,65 @@ guard_gpus() {
 }
 
 prepare_job() {
+  require_value SOURCE_SHA
+  require_value CHECKOUT_ROOT
+  require_value UV_CACHE_DIR
+  if [[ -e "$BOOT_ROOT" || -L "$BOOT_ROOT" ]]; then
+    die "BOOT_ROOT already exists and is not owned: $BOOT_ROOT"
+  fi
+  mkdir -p -- "$BOOT_PARENT"
+  BOOT_ROOT="$(mktemp -d -- "$BOOT_PARENT/tpen-polaris-${MODE}.XXXXXX")"
+  OWNED_BOOT_ROOT="$BOOT_ROOT"
+  trap cleanup_owned_boot_root EXIT
+  CHECKOUT="$BOOT_ROOT/checkout"
+  JOB_ENV="$BOOT_ROOT/env"
+  export TMPDIR="$BOOT_ROOT/tmp"
+  export UV_CACHE_DIR
+  [[ -d "$UV_CACHE_DIR" ]] || die "UV_CACHE_DIR is missing: $UV_CACHE_DIR"
+  if "$PYBIN" - "$UV_CACHE_DIR" "$BOOT_ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+cache, boot = (Path(value).resolve() for value in sys.argv[1:])
+try:
+    cache.relative_to(boot)
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+  then
+    die "UV_CACHE_DIR must be external to BOOT_ROOT: $UV_CACHE_DIR"
+  fi
+  export UV_PYTHON="$PYBIN" UV_NO_MANAGED_PYTHON=1 UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy
+  mkdir -p -- "$TMPDIR"
+
   if [[ "$DRY_EXEC" == 1 ]]; then
-    BOOT_ROOT="${BOOT_ROOT:-${TMPDIR:-/tmp}/tpen-polaris-dry-${$}}"
-    mkdir -p -- "$BOOT_ROOT"
-    trap 'rm -rf -- "$BOOT_ROOT"' EXIT
-    CHECKOUT="${CHECKOUT_ROOT:-$PWD}"
-    PYTHON_BIN="${PYTHON_BIN:-python}"
+    CHECKOUT="$CHECKOUT_ROOT"
+    PYTHON_BIN="${PYTHON_BIN:-$PYBIN}"
+    GUARD_PYTHON_BIN="${GUARD_PYTHON_BIN:-$PYBIN}"
     printf 'DRY_EXEC bootstrap=SKIPPED checkout=%s\n' "$CHECKOUT"
     return 0
   fi
 
-  require_value SOURCE_SHA
-  require_value SOURCE_REPO
-  BOOT_ROOT="${BOOT_ROOT:-/local/scratch/${USER:?}/${PBS_JOBID}.stage1-${MODE}}"
-  CHECKOUT="$BOOT_ROOT/checkout"
-  JOB_ENV="$BOOT_ROOT/env"
-  export TMPDIR="$BOOT_ROOT/tmp"
-  export UV_CACHE_DIR="$BOOT_ROOT/uv-cache"
-  mkdir -p -- "$BOOT_ROOT" "$TMPDIR" "$UV_CACHE_DIR"
-  trap 'rm -rf -- "$BOOT_ROOT"' EXIT
-
-  git clone --filter=blob:none --no-tags "$SOURCE_REPO" "$CHECKOUT"
-  git -C "$CHECKOUT" checkout --detach "$SOURCE_SHA"
+  [[ -d "$CHECKOUT_ROOT/.git" || -f "$CHECKOUT_ROOT/.git" ]] || die "CHECKOUT_ROOT is not a git checkout"
+  CHECKOUT="$CHECKOUT_ROOT"
   [[ "$(git -C "$CHECKOUT" rev-parse HEAD)" == "$SOURCE_SHA" ]] ||
     die "detached checkout does not match SOURCE_SHA"
   [[ -z "$(git -C "$CHECKOUT" status --porcelain)" ]] || die "checkout is dirty"
+  [[ "$(git -C "$CHECKOUT" rev-parse --is-shallow-repository)" == false ]] ||
+    die "CHECKOUT_ROOT must be a full clone"
+  [[ -z "$(git -C "$CHECKOUT" config --local --get-regexp '^remote\..*\.promisor$' || true)" ]] ||
+    die "CHECKOUT_ROOT has a promisor remote"
+  [[ -z "$(git -C "$CHECKOUT" config --local --get extensions.partialclone || true)" ]] ||
+    die "CHECKOUT_ROOT is a partial clone"
   "$PYBIN" -m uv lock --check --project "$CHECKOUT"
   UV_PROJECT_ENVIRONMENT="$JOB_ENV" "$PYBIN" -m uv sync --offline \
     --project "$CHECKOUT" --extra cu128 --locked
   PYTHON_BIN="$JOB_ENV/bin/python"
   [[ -x "$PYTHON_BIN" ]] || die "job-local cu128 interpreter missing"
+  GUARD_PYTHON_BIN="${GUARD_PYTHON_BIN:-$PYTHON_BIN}"
   printf 'POLARIS_ENV python=%s\n' "$PYTHON_BIN"
+  printf 'POLARIS_ENV base_python=%s version=' "$PYBIN"; "$PYBIN" --version 2>&1
   printf 'POLARIS_ENV uv='; "$PYBIN" -m uv --version
 }
 
@@ -175,12 +311,20 @@ else:
     rows.sort(key=lambda row: (int(row["lineage"]), int(row["stream"])))
     if len(rows) != 12:
         raise SystemExit(f"expected 12 eval rows, got {len(rows)}")
+root = Path(results_root)
 for row in rows:
     if row.get("source_sha") != source_sha:
         raise SystemExit("row source_sha does not match wrapper SOURCE_SHA")
     row_root = str(row.get("results_root", ""))
-    if not row_root.startswith(results_root.rstrip("/") + "/") and row_root != results_root.rstrip("/"):
-        raise SystemExit("row results_root is outside wrapper RESULTS_ROOT")
+    row_root_path = Path(row_root)
+    if any(part == ".." for part in row_root_path.parts):
+        raise SystemExit("row results_root contains '..'")
+    try:
+        row_root_path.resolve().relative_to(root.resolve())
+    except ValueError as exc:
+        raise SystemExit("row results_root is outside wrapper RESULTS_ROOT") from exc
+    if row.get("device") != "cuda":
+        raise SystemExit(f"row {row.get('row_id', '<unknown>')} must have device=cuda")
     row_id = str(row["row_id"])
     (output_dir / f"{row_id}.json").write_text(
         json.dumps(row, sort_keys=True, indent=2) + "\n", encoding="utf-8",
@@ -278,10 +422,7 @@ run_plan() {
   [[ "$PLAN_PHASE" == 1 || "$PLAN_PHASE" == 2 ]] || die "PLAN_PHASE must be 1 or 2"
   CHECKPOINTS="${CHECKPOINTS//:/ }"
   LINEAGE_SEEDS="${LINEAGE_SEEDS//:/ }"
-  case "$PLAN_OUTPUT" in
-    "$RESULTS_ROOT"/*) ;;
-    *) die "plan output is outside RESULTS_ROOT: $PLAN_OUTPUT" ;;
-  esac
+  assert_contained_path "$PLAN_OUTPUT" "$RESULTS_ROOT" PLAN_OUTPUT
   read -r -a checkpoints <<< "$CHECKPOINTS"
   read -r -a lineage_seeds <<< "$LINEAGE_SEEDS"
   command+=(--phase "$PLAN_PHASE" --output "$PLAN_OUTPUT"
@@ -304,10 +445,7 @@ run_plan() {
 run_collect() {
   require_value COLLECT_MANIFEST
   require_value COLLECT_OUTPUT
-  case "$COLLECT_OUTPUT" in
-    "$RESULTS_ROOT"/*) ;;
-    *) die "collection output is outside RESULTS_ROOT: $COLLECT_OUTPUT" ;;
-  esac
+  assert_contained_path "$COLLECT_OUTPUT" "$RESULTS_ROOT" COLLECT_OUTPUT
   "$PYTHON_BIN" -c \
     'import sys; from experiments.atomistic.stage1.collect import collect; collect(sys.argv[1], output=sys.argv[2])' \
     "$COLLECT_MANIFEST" "$COLLECT_OUTPUT"
@@ -330,7 +468,9 @@ main() {
       require_value PLAN_MANIFEST
       assert_results_root
       assert_pbs_context
+      validate_mode_paths
       prepare_job
+      validate_selected_rows "$PLAN_MANIFEST" train
       guard_gpus
       cd "$CHECKOUT"
       run_mode
@@ -342,8 +482,9 @@ main() {
       require_value SOURCE_SHA
       assert_results_root
       assert_pbs_context
-      write_job_receipt
+      validate_mode_paths
       prepare_job
+      write_job_receipt
       guard_gpus
       cd "$CHECKOUT"
       run_plan
@@ -354,8 +495,9 @@ main() {
       require_value SOURCE_SHA
       assert_results_root
       assert_pbs_context
-      write_job_receipt
+      validate_mode_paths
       prepare_job
+      write_job_receipt
       cd "$CHECKOUT"
       run_collect
       ;;
@@ -367,8 +509,10 @@ main() {
       require_value SOURCE_SHA
       assert_results_root
       assert_pbs_context
-      write_job_receipt
+      validate_mode_paths
       prepare_job
+      validate_selected_rows "$PLAN_MANIFEST" "$MODE"
+      write_job_receipt
       guard_gpus
       cd "$CHECKOUT"
       run_mode

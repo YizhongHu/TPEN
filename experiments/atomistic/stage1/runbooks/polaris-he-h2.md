@@ -47,10 +47,12 @@ Set these once for one retained run root.  `SOURCE_SHA` is a full released
 
 ```bash
 SOURCE_SHA=<released-main-sha>
-SOURCE_REPO=https://github.com/YizhongHu/TPEN.git
+SOURCE_REPO=https://github.com/YizhongHu/TPEN.git   # staging only; never passed to qsub
 SYSTEM=he                         # repeat the complete sequence with h2
 RESULTS_ROOT=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>
 WRAPPER=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/inputs/pbs_stage1.sh
+CHECKOUT_ROOT=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/checkout
+UV_CACHE_DIR=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/uv-cache
 PYBIN=/soft/applications/conda/2025-09-25/mconda3/bin/python
 ```
 
@@ -60,11 +62,37 @@ The run root must be created before any `qsub` so PBS can open its `-o` and
 SHA-256.  Do not copy a git tree with `cp -a` from `/home` to Eagle; the
 current Polaris note records that this fails while preserving ownership.
 
-The wrapper clones `SOURCE_REPO` into node-local `/local/scratch/$USER/$PBS_JOBID.stage1-<mode>`, detaches
-`SOURCE_SHA`, checks a clean tree, runs the facility interpreter as
-`$PYBIN -m uv`, and builds the cu128 environment with `uv sync --offline
---extra cu128 --locked`.  The cache and `TMPDIR` are job-local.  The P1 R2
-receipt measured the same lock-bound operation at 25 seconds and proved
+Stage the source and prime the cache on the login side, before any qsub. The
+clone is deliberately full (no `--filter`), detached at the exact SHA, and
+must be clean with no promisor or partial-clone configuration:
+
+```bash
+mkdir -p "$RESULTS_ROOT"/{inputs,logs,plan}
+git clone "$SOURCE_REPO" "$CHECKOUT_ROOT"
+git -C "$CHECKOUT_ROOT" checkout --detach "$SOURCE_SHA"
+test "$(git -C "$CHECKOUT_ROOT" rev-parse HEAD)" = "$SOURCE_SHA"
+test -z "$(git -C "$CHECKOUT_ROOT" status --porcelain)"
+test "$(git -C "$CHECKOUT_ROOT" rev-parse --is-shallow-repository)" = false
+test -z "$(git -C "$CHECKOUT_ROOT" config --local --get-regexp '^remote\..*\.promisor$' || true)"
+test -z "$(git -C "$CHECKOUT_ROOT" config --local --get extensions.partialclone || true)"
+cp experiments/atomistic/stage1/polaris/pbs_stage1.sh "$WRAPPER"
+chmod 750 "$WRAPPER"
+sha256sum "$WRAPPER" > "$WRAPPER.sha256"
+mkdir -p "$UV_CACHE_DIR"
+export UV_CACHE_DIR
+export UV_PYTHON="$PYBIN" UV_NO_MANAGED_PYTHON=1
+export UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy
+"$PYBIN" -m uv lock --check --project "$CHECKOUT_ROOT"
+UV_PROJECT_ENVIRONMENT="$RESULTS_ROOT/prime-env" \
+  "$PYBIN" -m uv sync --project "$CHECKOUT_ROOT" --extra cu128 --locked
+```
+
+The wrapper takes `CHECKOUT_ROOT` and `UV_CACHE_DIR` as required inputs; it
+does not clone, fetch, or otherwise use network Git on a compute node. Before
+the lock/sync it sets `UV_PYTHON=$PYBIN`, `UV_NO_MANAGED_PYTHON=1`,
+`UV_PYTHON_DOWNLOADS=never`, and `UV_LINK_MODE=copy`. The cache is external
+to the disposable job root and must already exist. The P1 R2 receipt measured
+the same lock-bound operation at 25 seconds and proved
 Torch `2.11.0+cu128`, four `NVIDIA A100-SXM4-40GB` devices, 40,960 MiB, and
 MIG `Disabled`.  Prime the cache in the same login session with the same
 `$PYBIN -m uv` binary before a real submission; never use bare `uv`.
@@ -82,13 +110,18 @@ The PBS wrapper replaces only the Slurm execution shell around that contract:
 - `launch.py:193-277` remains the Cannon renderer and its Slurm/Netscratch
   `FACILITY_RESULTS_PREFIX` and A7 80-GB guard are untouched;
 - `pbs_stage1.sh:54-110` supplies the PBS queue/job/GPU guards for Polaris;
-- `pbs_stage1.sh:123-153` supplies detached checkout, job-local cu128
-  provisioning, and cleanup;
+- `pbs_stage1.sh:123-185` verifies the pre-staged detached checkout, provisions
+  the job-local cu128 environment from the external cache, and cleans only a
+  unique owned temporary child;
 - `pbs_stage1.sh:203-269` runs three train rows in parallel or eval rows
   sequentially, with `CUDA_VISIBLE_DEVICES` and `taskset` CPU ranges.
 
 The wrapper never silently routes a Polaris job through the Cannon Slurm
 template and never edits `launch.py`.
+
+Because the wrapper calls `launch.command_for_row` directly, it explicitly
+replaces `launch.render`'s GPU-row admission with a `device=cuda` check before
+the Polaris GPU guards.
 
 ## Exact command sequence
 
@@ -111,7 +144,7 @@ sha256sum "$RESULTS_ROOT/inputs/pbs_stage1.sh" > "$RESULTS_ROOT/inputs/pbs_stage
 qsub -A HetRxnEnergy -q debug \
   -l select=1:system=polaris:ngpus=4:ncpus=64,walltime=00:55:00,filesystems=home:eagle,place=scatter \
   -o "$RESULTS_ROOT/logs/plan.pbs.out" -e "$RESULTS_ROOT/logs/plan.pbs.err" \
-  -v MODE=plan,SOURCE_SHA="$SOURCE_SHA",SOURCE_REPO="$SOURCE_REPO",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",PLAN_PHASE=1,SYSTEM="$SYSTEM",PLAN_OUTPUT="$RESULTS_ROOT/plan/phase1-manifest.json",CHECKPOINTS=50000,LINEAGE_SEEDS=1:2:3 \
+  -v MODE=plan,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",PLAN_PHASE=1,SYSTEM="$SYSTEM",PLAN_OUTPUT="$RESULTS_ROOT/plan/phase1-manifest.json",CHECKPOINTS=50000,LINEAGE_SEEDS=1:2:3 \
   "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 ```
 
@@ -132,7 +165,7 @@ directory exists.
 qsub -A HetRxnEnergy -q capacity \
   -l select=1:system=polaris:ngpus=4:ncpus=64,walltime=11:00:00,filesystems=home:eagle,place=scatter \
   -o "$RESULTS_ROOT/logs/train.pbs.out" -e "$RESULTS_ROOT/logs/train.pbs.err" \
-  -v MODE=train,SOURCE_SHA="$SOURCE_SHA",SOURCE_REPO="$SOURCE_REPO",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=capacity,PYBIN="$PYBIN",PLAN_MANIFEST="$RESULTS_ROOT/plan/phase1-manifest.json" \
+  -v MODE=train,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=capacity,PYBIN="$PYBIN",PLAN_MANIFEST="$RESULTS_ROOT/plan/phase1-manifest.json" \
   "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 ```
 
@@ -153,7 +186,7 @@ SHA-256.  Do not search the Eagle tree recursively.  Then submit:
 qsub -A HetRxnEnergy -q debug \
   -l select=1:system=polaris:ngpus=4:ncpus=64,walltime=00:55:00,filesystems=home:eagle,place=scatter \
   -o "$RESULTS_ROOT/logs/phase2.pbs.out" -e "$RESULTS_ROOT/logs/phase2.pbs.err" \
-  -v MODE=plan,SOURCE_SHA="$SOURCE_SHA",SOURCE_REPO="$SOURCE_REPO",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",PLAN_PHASE=2,PLAN_OUTPUT="$RESULTS_ROOT/plan/phase2-manifest.json",PHASE1_MANIFEST="$RESULTS_ROOT/plan/phase1-manifest.json",CHECKPOINT_BINDINGS="$RESULTS_ROOT/plan/checkpoint-evidence.json",CHECKPOINTS=50000,LINEAGE_SEEDS=1:2:3 \
+  -v MODE=plan,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",PLAN_PHASE=2,PLAN_OUTPUT="$RESULTS_ROOT/plan/phase2-manifest.json",PHASE1_MANIFEST="$RESULTS_ROOT/plan/phase1-manifest.json",CHECKPOINT_BINDINGS="$RESULTS_ROOT/plan/checkpoint-evidence.json",CHECKPOINTS=50000,LINEAGE_SEEDS=1:2:3 \
   "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 ```
 
@@ -165,13 +198,15 @@ absolute `model.pt`, and `device=cuda`.
 
 The wrapper runs the 12 eval rows sequentially on GPU 0, one fresh strict
 `model_only` restore per row.  The debug one-hour limit is suitable for this
-bounded evaluation shape; stop on the first nonzero row status.
+bounded evaluation shape. It continues through all selected eval rows,
+records every row status, and returns an aggregate nonzero exit if any lineage
+fails.
 
 ```bash
 qsub -A HetRxnEnergy -q debug \
   -l select=1:system=polaris:ngpus=4:ncpus=64,walltime=00:55:00,filesystems=home:eagle,place=scatter \
   -o "$RESULTS_ROOT/logs/eval.pbs.out" -e "$RESULTS_ROOT/logs/eval.pbs.err" \
-  -v MODE=eval,SOURCE_SHA="$SOURCE_SHA",SOURCE_REPO="$SOURCE_REPO",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",PLAN_MANIFEST="$RESULTS_ROOT/plan/phase2-manifest.json" \
+  -v MODE=eval,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",PLAN_MANIFEST="$RESULTS_ROOT/plan/phase2-manifest.json" \
   "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 ```
 
@@ -184,7 +219,7 @@ environment.  It writes only the named collection output beneath Eagle.
 qsub -A HetRxnEnergy -q debug \
   -l select=1:system=polaris:ncpus=4,walltime=00:30:00,filesystems=home:eagle,place=scatter \
   -o "$RESULTS_ROOT/logs/collect.pbs.out" -e "$RESULTS_ROOT/logs/collect.pbs.err" \
-  -v MODE=collect,SOURCE_SHA="$SOURCE_SHA",SOURCE_REPO="$SOURCE_REPO",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",COLLECT_MANIFEST="$RESULTS_ROOT/plan/phase2-manifest.json",COLLECT_OUTPUT="$RESULTS_ROOT/collection.json" \
+  -v MODE=collect,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",COLLECT_MANIFEST="$RESULTS_ROOT/plan/phase2-manifest.json",COLLECT_OUTPUT="$RESULTS_ROOT/collection.json" \
   "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 ```
 

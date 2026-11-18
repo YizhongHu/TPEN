@@ -26,5 +26,54 @@
     "old": "case \"$RESULTS_ROOT\" in\n    \"$RESULTS_PREFIX\"*) ;;\n    *) die \"results root outside Eagle prefix: $RESULTS_ROOT\" ;;\n  esac",
     "new": "true",
     "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_non_eagle_results_root"
+  },
+  {
+    "id": "polaris-external-cache-check-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "[[ -d \"$UV_CACHE_DIR\" ]] || die \"UV_CACHE_DIR is missing: $UV_CACHE_DIR\"",
+    "new": "true",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_dry_exec_rejects_missing_external_cache"
+  },
+  {
+    "id": "polaris-guard-interpreter-default-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "GUARD_PYTHON_BIN=\"${GUARD_PYTHON_BIN:-$PYTHON_BIN}\"",
+    "new": "GUARD_PYTHON_BIN=\"\"",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
+  },
+  {
+    "id": "polaris-promisor-check-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "[[ -z \"$(git -C \"$CHECKOUT\" config --local --get-regexp '^remote\\..*\\.promisor$' || true)\" ]] ||",
+    "new": "true ||",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_rejects_promisor_checkout_before_uv"
+  },
+  {
+    "id": "polaris-uv-interpreter-controls-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "export UV_PYTHON=\"$PYBIN\" UV_NO_MANAGED_PYTHON=1 UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy",
+    "new": "export UV_PYTHON=\"$PYBIN\" UV_NO_MANAGED_PYTHON=1 UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=hardlink",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
+  },
+  {
+    "id": "polaris-owned-boot-rejection-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "die \"BOOT_ROOT already exists and is not owned: $BOOT_ROOT\"",
+    "new": "true",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_dry_exec_rejects_existing_boot_root_without_touching_it"
+  },
+  {
+    "id": "polaris-resolved-root-check-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "if any(part == \"..\" for part in candidate.parts):",
+    "new": "if False:",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_dot_dot_escape_before_any_write"
+  },
+  {
+    "id": "polaris-cuda-row-admission-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "if row.get(\"device\") != \"cuda\":",
+    "new": "if False:",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
   }
 ]
