@@ -64,7 +64,8 @@ def _stub_bin(tmp_path: Path, *, gpu_lines: str | None = None,
     return {"NVIDIA_SMI_BIN": str(nvidia), "GUARD_PYTHON_BIN": str(python)}
 
 
-def _env(tmp_path: Path, **overrides: str) -> dict[str, str]:
+def _env(tmp_path: Path, *, stubs: dict[str, str] | None = None,
+         **overrides: str) -> dict[str, str]:
     """Build a dry, non-writing PBS context for one guard invocation."""
 
     env = os.environ.copy()
@@ -76,7 +77,7 @@ def _env(tmp_path: Path, **overrides: str) -> dict[str, str]:
         "EXPECTED_QUEUE": "debug",
         "DRY_EXEC": "1",
     })
-    env.update(_stub_bin(tmp_path))
+    env.update(stubs if stubs is not None else _stub_bin(tmp_path))
     env.update(overrides)
     env.pop("MODE", None)
     return env
@@ -107,10 +108,14 @@ def test_guard_replays_p1_r2_capture(tmp_path: Path) -> None:
 
 
 def test_guard_rejects_wrong_gpu_count(tmp_path: Path) -> None:
+    stubs = _stub_bin(
+        tmp_path,
+        gpu_lines="NVIDIA A100-SXM4-40GB, 40960\n"
+        "NVIDIA A100-SXM4-40GB, 40960\n",
+    )
     result = _run(
         "guard",
-        _env(tmp_path, NVIDIA_SMI_BIN=_stub_bin(tmp_path, gpu_lines="NVIDIA A100-SXM4-40GB, 40960\n"
-                                                   "NVIDIA A100-SXM4-40GB, 40960\n")["NVIDIA_SMI_BIN"]),
+        _env(tmp_path, stubs=stubs),
     )
     assert result.returncode == 2
     assert "expected 4 GPUs" in result.stderr
@@ -118,14 +123,14 @@ def test_guard_rejects_wrong_gpu_count(tmp_path: Path) -> None:
 
 def test_guard_rejects_mig_enabled(tmp_path: Path) -> None:
     stubs = _stub_bin(tmp_path, mig_lines="Enabled\nEnabled\nEnabled\nEnabled\n")
-    result = _run("guard", _env(tmp_path, **stubs))
+    result = _run("guard", _env(tmp_path, stubs=stubs))
     assert result.returncode == 2
     assert "MIG mode is not Disabled" in result.stderr
 
 
 def test_guard_rejects_multiple_visible_devices(tmp_path: Path) -> None:
     stubs = _stub_bin(tmp_path, device_count="0")
-    result = _run("guard", _env(tmp_path, **stubs))
+    result = _run("guard", _env(tmp_path, stubs=stubs))
     assert result.returncode == 2
     assert "expected one visible GPU" in result.stderr
 
