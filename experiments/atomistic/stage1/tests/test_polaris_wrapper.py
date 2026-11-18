@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import shlex
 import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 from experiments.atomistic.stage1.protocol import CHECKPOINT_EVIDENCE_SCHEMA, manifest_hash
@@ -154,6 +156,20 @@ def test_guard_replays_p1_r2_capture(tmp_path: Path) -> None:
     assert "POLARIS_GUARD mig=Disabled" in result.stdout
     assert "POLARIS_GUARD binding=0 device_count=1" in result.stdout
     assert "POLARIS_GUARD binding=3 device_count=1" in result.stdout
+
+
+def test_guard_replays_real_polaris_lscpu_capture(tmp_path: Path) -> None:
+    capture = (FIXTURES / "lscpu-p-CPU-CORE-NODE.txt").read_text(encoding="utf-8")
+    result = _run("guard", _env(tmp_path, stubs=_stub_bin(tmp_path, lscpu_text=capture)))
+    assert result.returncode == 0, result.stderr
+    layout = [line for line in result.stdout.splitlines() if line.startswith("POLARIS_LAYOUT ")]
+    assert len(layout) == 3
+    expected = [set(range(0, 10)), set(range(10, 20)), set(range(20, 30))]
+    for index, line in enumerate(layout):
+        fields = dict(field.split("=", 1) for field in line.split()[1:])
+        assert fields["lineage"] == str(index)
+        assert fields["cores"] == "10"
+        assert set(int(cpu) for cpu in fields["cpus"].split(",")) == expected[index]
 
 
 def test_guard_derives_smt_deduplicated_disjoint_layout(tmp_path: Path) -> None:
@@ -345,7 +361,7 @@ def test_dry_exec_rejects_cache_named_inside_caller_boot_root(tmp_path: Path) ->
 def test_guard_rejects_dot_dot_escape_before_any_write(tmp_path: Path) -> None:
     result = _run("guard", _env(tmp_path, RESULTS_ROOT=EAGLE_ROOT + "/../outside"))
     assert result.returncode == 2
-    assert "contains '..'" in result.stderr
+    assert "RESULTS_ROOT is outside" in result.stderr
 
 
 def test_test_prefix_override_refused_in_pbs_batch(tmp_path: Path) -> None:
@@ -358,12 +374,178 @@ def test_test_prefix_override_refused_in_pbs_batch(tmp_path: Path) -> None:
         RESULTS_ROOT=str(prefix / "results"),
         TPEN_POLARIS_TEST_RESULTS_PREFIX=str(prefix),
         PBS_ENVIRONMENT="PBS_BATCH",
+        PBS_JOBID="",
+    )
+    result = _run("guard", env)
+    assert result.returncode == 2
+    assert "TPEN_POLARIS_TEST_RESULTS_PREFIX is forbidden" in result.stderr
+    assert sentinel.read_bytes() == b"preserve-me\0"
+
+
+def test_test_prefix_override_refused_in_pbs_interactive(tmp_path: Path) -> None:
+    prefix = tmp_path / "test-prefix"
+    prefix.mkdir()
+    sentinel = prefix / "sentinel"
+    sentinel.write_bytes(b"preserve-me\0")
+    env = _env(
+        tmp_path,
+        RESULTS_ROOT=str(prefix / "results"),
+        TPEN_POLARIS_TEST_RESULTS_PREFIX=str(prefix),
+        PBS_ENVIRONMENT="PBS_INTERACTIVE",
+        PBS_JOBID="",
+    )
+    result = _run("guard", env)
+    assert result.returncode == 2
+    assert "TPEN_POLARIS_TEST_RESULTS_PREFIX is forbidden" in result.stderr
+    assert sentinel.read_bytes() == b"preserve-me\0"
+
+
+def test_test_prefix_override_refused_with_pbs_jobid(tmp_path: Path) -> None:
+    prefix = tmp_path / "test-prefix"
+    prefix.mkdir()
+    sentinel = prefix / "sentinel"
+    sentinel.write_bytes(b"preserve-me\0")
+    env = _env(
+        tmp_path,
+        RESULTS_ROOT=str(prefix / "results"),
+        TPEN_POLARIS_TEST_RESULTS_PREFIX=str(prefix),
+        PBS_ENVIRONMENT="",
         PBS_JOBID="pbs-123.server",
     )
     result = _run("guard", env)
     assert result.returncode == 2
     assert "TPEN_POLARIS_TEST_RESULTS_PREFIX is forbidden" in result.stderr
     assert sentinel.read_bytes() == b"preserve-me\0"
+
+
+def test_plan_rejects_relative_output_before_any_checkout_write(tmp_path: Path) -> None:
+    prefix = tmp_path / "test-prefix"
+    prefix.mkdir()
+    relative_output = "relative-plan-r2-2.json"
+    env = _env(
+        tmp_path,
+        RESULTS_ROOT=str(prefix / "results"),
+        TPEN_POLARIS_TEST_RESULTS_PREFIX=str(prefix),
+        PBS_ENVIRONMENT="",
+        PBS_JOBID="",
+        PLAN_OUTPUT=relative_output,
+        PLAN_PHASE="1",
+        SYSTEM="he",
+        CHECKPOINTS="50000",
+        LINEAGE_SEEDS="1:2:3",
+    )
+    env["MODE"] = "plan"
+    result = _run("plan", env)
+    assert result.returncode == 2
+    assert "PLAN_OUTPUT must be absolute" in result.stderr
+    assert not (REPO_ROOT / relative_output).exists()
+
+
+def test_job_receipt_rejects_symlinked_logs_before_write(tmp_path: Path) -> None:
+    prefix = tmp_path / "test-prefix"
+    results_root = prefix / "results"
+    results_root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"preserve-me\0")
+    (results_root / "logs").symlink_to(outside, target_is_directory=True)
+    plan_dir = results_root / "plan"
+    plan_dir.mkdir()
+    env = _env(
+        tmp_path,
+        RESULTS_ROOT=str(results_root),
+        TPEN_POLARIS_TEST_RESULTS_PREFIX=str(prefix),
+        PBS_ENVIRONMENT="",
+        PBS_JOBID="",
+        PLAN_OUTPUT=str(plan_dir / "phase1.json"),
+        PLAN_PHASE="1",
+        SYSTEM="he",
+        CHECKPOINTS="50000",
+        LINEAGE_SEEDS="1:2:3",
+    )
+    env["MODE"] = "plan"
+    result = _run("plan", env)
+    assert result.returncode == 2
+    assert "RESULTS_LOGS is outside" in result.stderr
+    assert sentinel.read_bytes() == b"preserve-me\0"
+
+
+def test_collect_skips_gpu_layout_guard_with_four_cpu_mask(tmp_path: Path) -> None:
+    prefix = tmp_path / "test-prefix"
+    results_root = prefix / "results"
+    manifest_path = results_root / "plan" / "phase2.json"
+    output_path = results_root / "collection.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(json.dumps({
+        "schema": "stage1/v3", "rows": [], "manifest_hash": manifest_hash([]),
+    }) + "\n", encoding="utf-8")
+    env = _env(
+        tmp_path,
+        RESULTS_ROOT=str(results_root),
+        TPEN_POLARIS_TEST_RESULTS_PREFIX=str(prefix),
+        PBS_ENVIRONMENT="",
+        PBS_JOBID="",
+        COLLECT_MANIFEST=str(manifest_path),
+        COLLECT_OUTPUT=str(output_path),
+        TASKSET_ALLOWED="0-3",
+    )
+    env["MODE"] = "collect"
+    result = _run("collect", env)
+    assert result.returncode == 0, result.stderr
+    assert output_path.is_file()
+    assert "POLARIS_LAYOUT" not in result.stdout
+
+
+def test_plan_reports_small_cpu_layout_without_gpu_guard(tmp_path: Path) -> None:
+    prefix = tmp_path / "test-prefix"
+    results_root = prefix / "results"
+    plan_dir = results_root / "plan"
+    plan_dir.mkdir(parents=True)
+    output_path = plan_dir / "phase1.json"
+    env = _env(
+        tmp_path,
+        RESULTS_ROOT=str(results_root),
+        TPEN_POLARIS_TEST_RESULTS_PREFIX=str(prefix),
+        PBS_ENVIRONMENT="",
+        PBS_JOBID="",
+        PLAN_OUTPUT=str(output_path),
+        PLAN_PHASE="1",
+        SYSTEM="he",
+        CHECKPOINTS="50000",
+        LINEAGE_SEEDS="1:2:3",
+        TASKSET_ALLOWED="0-3",
+    )
+    env["MODE"] = "plan"
+    result = _run("plan", env)
+    assert result.returncode == 0, result.stderr
+    assert "POLARIS_LAYOUT report-only=1 cores=4 cpus=0,1,2,3" in result.stdout
+    assert output_path.is_file()
+
+
+def test_mutant_python_replacements_parse_and_killers_are_collected() -> None:
+    mutants = json.loads((HERE / "polaris-mutants.json").read_text(encoding="utf-8"))
+    python_mutants = {
+        "polaris-resolved-root-check-dropped",
+        "polaris-cuda-row-admission-dropped",
+        "polaris-smt-dedup-dropped",
+        "polaris-layout-disjoint-assert-dropped",
+    }
+    source_cache: dict[Path, set[str]] = {}
+    for mutant in mutants:
+        if mutant["id"] in python_mutants:
+            ast.parse(textwrap.dedent(mutant["new"]))
+        path_text, node_text = mutant["killer"].split("::", 1)
+        path = REPO_ROOT / path_text
+        assert path.is_file(), mutant["killer"]
+        if path not in source_cache:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            source_cache[path] = {
+                node.name for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+        node_name = node_text.split("[", 1)[0]
+        assert node_name in source_cache[path], mutant["killer"]
 
 
 def test_production_rejects_promisor_checkout_before_uv(tmp_path: Path) -> None:
@@ -482,6 +664,7 @@ def _production_env(tmp_path: Path, checkout: Path, source_sha: str) -> dict[str
     Path(env["UV_CACHE_DIR"]).mkdir()
     env.update(_stub_bin(tmp_path))
     env.update(stubs)
+    env.pop("GUARD_PYTHON_BIN", None)
     # The shim is named `git` and `pybin` invokes the real interpreter, while
     # only the requested external boundaries are stubbed.
     env["PATH"] = f"{tmp_path}:{os.environ['PATH']}"

@@ -23,8 +23,8 @@
   {
     "id": "polaris-eagle-prefix-check-dropped",
     "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
-    "old": "candidate.resolve().relative_to(prefix.resolve())",
-    "new": "candidate.resolve()",
+    "old": "assert_contained_path \"$RESULTS_ROOT\" \"$RESULTS_PREFIX\" RESULTS_ROOT",
+    "new": ":",
     "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_non_eagle_results_root"
   },
   {
@@ -38,7 +38,7 @@
     "id": "polaris-guard-interpreter-default-dropped",
     "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
     "old": "GUARD_PYTHON_BIN=\"${GUARD_PYTHON_BIN:-$PYTHON_BIN}\"",
-    "new": "GUARD_PYTHON_BIN=\"\"",
+    "new": ":",
     "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
   },
   {
@@ -65,15 +65,15 @@
   {
     "id": "polaris-resolved-root-check-dropped",
     "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
-    "old": "if any(part == \"..\" for part in candidate.parts):\n    raise SystemExit(\"results root contains '..'\")",
-    "new": "if False:",
+    "old": "canonical.relative_to(root.resolve())",
+    "new": "pass",
     "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_dot_dot_escape_before_any_write"
   },
   {
     "id": "polaris-cuda-row-admission-dropped",
     "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
-    "old": "# Replace launch.render's GPU-row admission before any guard or driver.\n    if row.get(\"device\") != \"cuda\":",
-    "new": "if False:",
+    "old": "# Replace launch.render's GPU-row admission before any guard or driver.\n    if row.get(\"device\") != \"cuda\":\n        raise SystemExit(f\"row {row.get('row_id', '<unknown>')} must have device=cuda\")",
+    "new": "# Mutant drops launch.render's GPU-row admission.\nif False:\n    raise SystemExit(\"mutated row admission\")",
     "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
   },
   {
@@ -93,8 +93,8 @@
   {
     "id": "polaris-layout-disjoint-assert-dropped",
     "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
-    "old": "assert not (core_sets[left] & core_sets[right]), (",
-    "new": "assert True, (",
+    "old": "assert not (core_sets[left] & core_sets[right]), (\n            f\"lineage core sets overlap: {left} and {right}\"\n        )",
+    "new": "assert True",
     "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_derives_smt_deduplicated_disjoint_layout"
   },
   {
@@ -109,6 +109,6 @@
     "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
     "old": "lineage=0\n      cpu_set=\"${LINEAGE_CPU_SETS[$lineage]}\"\n      core_count=\"${LINEAGE_CORE_COUNTS[$lineage]}\"",
     "new": "lineage=0\n      cpu_set=\"0-15\"\n      core_count=\"${LINEAGE_CORE_COUNTS[$lineage]}\"",
-    "killer": "experiments/atomistic/stage1/tests/test_production_plan_train_eval_use_real_rows_and_uv_controls"
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
   }
 ]
