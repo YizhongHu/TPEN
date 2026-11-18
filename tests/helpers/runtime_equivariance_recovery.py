@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
 from tpen.artifacts import ArtifactManager
@@ -79,19 +80,21 @@ class _Sampler:
         self.marker = int(state["marker"])
 
 
-def _config(root: Path) -> dict[str, object]:
+def _config(root: Path) -> DictConfig:
     """Return a stable config whose hashes are identical across child PIDs."""
 
-    return {
-        "experiment": {"name": "runtime-equivariance-recovery"},
-        "run": {"root": str(root), "run_id": "fixture", "dir": str(root)},
-        "runtime": {"device": "cpu", "dtype": "float64", "seed": 19},
-        "model": {"_target_": "tests.helpers.runtime_equivariance_recovery._ProbeModel"},
-        "optimizer": {"_target_": "torch.optim.SGD", "lr": 0.01},
-        "trainer": {"_target_": "tests.helpers.runtime_equivariance_recovery._Trainer"},
-        "sampler": {"_target_": "tests.helpers.runtime_equivariance_recovery._Sampler"},
-        "hamiltonian_terms": {"fixture": "none"},
-    }
+    return OmegaConf.create(
+        {
+            "experiment": {"name": "runtime-equivariance-recovery"},
+            "run": {"root": str(root), "run_id": "fixture", "dir": str(root)},
+            "runtime": {"device": "cpu", "dtype": "float64", "seed": 19},
+            "model": {"_target_": "tests.helpers.runtime_equivariance_recovery._ProbeModel"},
+            "optimizer": {"_target_": "torch.optim.SGD", "lr": 0.01},
+            "trainer": {"_target_": "tests.helpers.runtime_equivariance_recovery._Trainer"},
+            "sampler": {"_target_": "tests.helpers.runtime_equivariance_recovery._Sampler"},
+            "hamiltonian_terms": {"fixture": "none"},
+        }
+    )
 
 
 def _context(root: Path) -> RecordingContext:

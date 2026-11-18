@@ -8,6 +8,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 
 ROOT = Path(__file__).parents[3]
 WORKER = ROOT / "tests" / "helpers" / "runtime_equivariance_recovery.py"
@@ -21,14 +23,21 @@ def _launch(root: Path, mode: str, *, failure: bool = False) -> dict[str, object
     command = [sys.executable, str(WORKER), "--mode", mode, "--root", str(root)]
     if failure:
         command.append("--failure")
-    completed = subprocess.run(
-        command,
-        cwd=ROOT,
-        env=environment,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        pytest.fail(
+            f"recovery worker failed with exit code {exc.returncode}\n"
+            f"stdout:\n{exc.stdout}\n"
+            f"stderr:\n{exc.stderr}"
+        )
     return json.loads(completed.stdout)
 
 
