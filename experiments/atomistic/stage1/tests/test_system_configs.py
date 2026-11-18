@@ -95,3 +95,26 @@ def test_train_launch_binds_declared_checkpoint_steps() -> None:
            "walkers": 256, "updates": 101, "checkpoint_steps": [7, 101]}
     overrides = row_overrides(row)
     assert "checkpoint_steps=[7,101]" in overrides
+
+
+@pytest.mark.parametrize("system", SYSTEMS)
+@pytest.mark.parametrize("kind", ("train", "eval"))
+def test_stage1_configs_declare_jsonl_metrics_logger(system: str, kind: str) -> None:
+    """Every Stage-1 run writes the canonical JSONL metrics artifact."""
+
+    cfg = load_config(str(ROOT / system / f"{kind}.yaml"))
+    loggers = OmegaConf.to_container(cfg.loggers, resolve=False)
+    assert loggers == [
+        {"_target_": "tpen.logging.JSONL", "path": "${run.dir}/metrics.jsonl"}
+    ]
+    if kind == "train":
+        assert cfg.trainer.log_every_n_steps == 1
+    else:
+        summary_targets = {
+            summary["_target_"]
+            for summary in OmegaConf.to_container(
+                cfg.evaluation_tasks.mcmc_energy.summaries, resolve=False
+            )
+        }
+        assert "tpen.evaluation.summaries.LocalEnergySummary" in summary_targets
+        assert "tpen.evaluation.summaries.SamplerStatsSummary" in summary_targets

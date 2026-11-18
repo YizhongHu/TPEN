@@ -9,7 +9,7 @@ model: {_target_: tpen.nn.TPENWaveFunction, trace_name: tpen, embedding: {_targe
 hamiltonian_terms: {kinetic: {_target_: tpen.physics.kinetic.KineticEnergy}, electron_nucleus: {_target_: tpen.physics.potential.ElectronNucleusPotential, atoms: "${atoms}", eps: 0.0}, electron_electron: {_target_: tpen.physics.potential.ElectronElectronInteraction}}
 optimizer: {_target_: torch.optim.Adam, _partial_: true, lr: 0.005}
 sampler: {_target_: tpen.sampling.metropolis.MetropolisSampler, n_walkers: 256, burn_in: 100, n_steps: 10, proposal_scale: 0.5, seed: "${runtime.seed}", n_electrons: "${system.n_particles}", spatial_dim: "${system.spatial_dim}", n_up: "${system.spin.n_up}", n_down: "${system.spin.n_down}", nuclear_positions: {_target_: torch.tensor, data: "${system.nuclei.positions}"}, nuclear_charges: {_target_: torch.tensor, data: "${system.nuclei.charges}"}, dtype: "${runtime.dtype}"}
-trainer: {_target_: tpen.training.trainer.VMCTrainer, max_steps: 1000, log_every_n_steps: 100, return_terms: true}
+trainer: {_target_: tpen.training.trainer.VMCTrainer, max_steps: 1000, log_every_n_steps: 1, return_terms: true}
 runner: {_target_: tpen.runner.Train, model: "${model}", sampler: "${sampler}", hamiltonian_terms: "${hamiltonian_terms}", optimizer: "${optimizer}", trainer: "${trainer}"}
 callbacks:
   - _target_: tpen.callback.ConfigSnapshot
@@ -25,3 +25,6 @@ callbacks:
     schedule: {_target_: tpen.checkpoint.ExplicitUpdates, updates: "${checkpoint_steps}"}
     payload: {_target_: tpen.checkpoint.TrainResume}
     output_dir: ${run.dir}/checkpoints
+loggers:
+  - _target_: tpen.logging.JSONL
+    path: ${run.dir}/metrics.jsonl

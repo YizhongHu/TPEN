@@ -72,13 +72,19 @@ training updates.
 | He eval sampler | he-v1: 4096 walkers, burn-in 100, steps 20 | 4096 walkers, burn-in 100, steps 10 | Keep the shared Stage-1 cadence; the he-v1 stride-20 tie-break is not silently carried into this protocol. |
 | H2 model width | h2-v1: 4 output / 16 hidden channels | 4 output / 16 hidden channels | No width change is made; this row documents the retained source value and corrects the prior “width reduction” wording. |
 | H2 train/eval walkers | h2-v1: 128 train / 1024 eval | 256 train / 4096 eval | Use the shared Stage-1 train/eval walker defaults across all four systems. |
-| Hooke-1e train observability | h-v2: `DataIntegrity`/`GradientStats` every 100 updates; JSONL logger | Both callbacks and logger omitted | Keep the science-default config small and portable; Stage-1 collection relies on its run/record provenance contract. |
-| He train observability | he-v1: `DataIntegrity` every 1, `GradientStats` every 5; CSV and JSONL loggers | Both callbacks and both loggers omitted | Same bounded Stage-1 config surface; these diagnostics are outside the Stage-1 manifest contract. |
-| H2 train observability | h2-v1: `DataIntegrity` every 1, `GradientStats` every 5; CSV and JSONL loggers | Both callbacks and both loggers omitted | Same bounded Stage-1 config surface; these diagnostics are outside the Stage-1 manifest contract. |
-| Evaluation loggers | h-v2, he-v1, and h2-v1 each write CSV/JSONL or JSONL metrics | No metric logger in the Stage-1 eval configs | Stage-1 evaluation retains trajectory records and summaries as its required evidence; study-specific metric logging is not part of this layer. |
+| Stage-1 train observability | Source studies use mixed callback/logger cadences | Every train config uses `tpen.logging.JSONL` at `${run.dir}/metrics.jsonl` and `trainer.log_every_n_steps: 1` | Per-update `train` and `train/sampler` records make convergence and dip-and-rise behavior inspectable; heavy diagnostic callbacks remain opt-in. |
+| Stage-1 eval observability | Source studies use study-specific CSV/JSONL metrics | Every eval config uses the same JSONL logger plus `LocalEnergySummary` and `SamplerStatsSummary` | Each evaluation stream records its local-energy statistics and sampler diagnostics in `eval/mcmc_energy`, alongside the existing trajectory record artifact. |
 | Manifest seed encoding | Prior mixed-radix coordinates could exceed Torch's signed int64 seed range | Deterministic SHA-256 digest mapped to `[0, 2**63-2]`; manifest-wide collision refusal and boundary tests | The real producer exposed Torch overflow. Retaining unbounded mixed-radix values was rejected because every run seeds Torch generators. |
-| Stage-1 evaluation statistics summary | `TrajectoryStatisticsSummary` without its required identity fields | Removed from Stage-1 eval configs; provenance remains from `Evaluator._evaluation_identity`, and collection computes statistics from the inspected grid | Supplying `stage`, `run_id`, `attempt_id`, `evaluator_id`, and `config_sha256` from `launch.py` was rejected because it would broaden the launcher contract without an owned evaluator identity. |
+| Stage-1 trajectory statistics summary | `TrajectoryStatisticsSummary` without its required identity fields | Still absent from Stage-1 eval configs; the logger records the per-stream snapshot summaries above | Supplying `stage`, `run_id`, `attempt_id`, `evaluator_id`, and `config_sha256` from `launch.py` would broaden the launcher contract; correlation-aware collection statistics remain a separate join. |
 | Stage-1 record calculators | Eval configs supplied only `LocalEnergyCalculator` | Add `WavefunctionCalculator` beside it | `SampledRecordWriter` requires the wavefunction bundle field for durable records; the canonical producer wiring supplies both calculators. |
+
+All eight train/eval configs write to the run-local `metrics.jsonl`. Training emits
+the core `train` and `train/sampler` records on every update; evaluation emits one
+per-stream statistics record plus its status records. The core train payload is
+about 0.7--1.0 KiB per update across those two records, so a 50,000-update
+science lineage is expected to use roughly 35--50 MiB before any opt-in diagnostic
+callbacks. This estimate is a planning bound for the JSONL artifact, not a claim
+about checkpoint or trajectory-record size.
 
 `plan.py` writes a manifest only. `launch.py` renders a script only; submission
 is an explicit operator action. The generated script requires Slurm, checks the

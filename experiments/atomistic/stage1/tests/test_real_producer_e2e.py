@@ -165,6 +165,20 @@ def test_real_train_eval_inspect_collect_chain_for_all_stage1_systems(
         checkpoint_file = checkpoint_dir / "model.pt"
         assert checkpoint_file.is_file()
         checkpoint_digests[system] = hashlib.sha256(checkpoint_file.read_bytes()).hexdigest()
+        train_metrics_path = resolve_run_dir(row) / "metrics.jsonl"
+        assert train_metrics_path.is_file()
+        train_metrics = [
+            json.loads(line)
+            for line in train_metrics_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        train_records = [record for record in train_metrics if record["namespace"] == "train"]
+        assert train_records
+        assert all({"energy", "loss"} <= set(record["metrics"]) for record in train_records)
+        print(
+            f"{system} train metrics.jsonl lines={len(train_metrics)} "
+            f"namespaces={sorted({record['namespace'] for record in train_metrics})}"
+        )
 
         for eval_row in eval_rows:
             if eval_row["system"] != system:
@@ -180,6 +194,24 @@ def test_real_train_eval_inspect_collect_chain_for_all_stage1_systems(
                 command=f"stage1 real-producer eval {system} stream {eval_row['stream']}",
             )
             run_dir = resolve_run_dir(eval_row)
+            eval_metrics_path = run_dir / "metrics.jsonl"
+            assert eval_metrics_path.is_file()
+            eval_metrics = [
+                json.loads(line)
+                for line in eval_metrics_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            stream_records = [
+                record for record in eval_metrics if record["namespace"] == "eval/mcmc_energy"
+            ]
+            assert stream_records
+            assert {"local_energy_mean", "sampler_acceptance_rate"} <= set(
+                stream_records[0]["metrics"]
+            )
+            print(
+                f"{system} eval stream={eval_row['stream']} metrics.jsonl lines={len(eval_metrics)} "
+                f"namespaces={sorted({record['namespace'] for record in eval_metrics})}"
+            )
             evidence = inspect_eval_run(run_dir)
             assert evidence["verdict"] == "completed"
             identity = evidence["resolved_config_identity"]

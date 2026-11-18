@@ -18,7 +18,7 @@ evaluation_tasks:
     output_dir: "${run.dir}/mcmc_energy"
     generator: {_target_: tpen.evaluation.generators.TrajectoryMCMCGenerator, sampler: "${evaluation_sampler}", hamiltonian_terms: "${hamiltonian_terms}", n_draws: 256, discard_draws: 0, seed: "${runtime.seed}", reset: true, verify_model_unchanged: true, system: "${system_descriptor}", evaluator: {_target_: tpen.physics.hamiltonian.NaiveLocalEnergyEvaluator}}
     calculators: [{_target_: tpen.evaluation.calculators.LocalEnergyCalculator, hamiltonian_terms: "${hamiltonian_terms}", return_terms: true}, {_target_: tpen.evaluation.calculators.WavefunctionCalculator}]
-    summaries: [{_target_: tpen.evaluation.summaries.SampledRecordWriter, max_samples: 1048576, include_term_energies: true}]
+    summaries: [{_target_: tpen.evaluation.summaries.LocalEnergySummary}, {_target_: tpen.evaluation.summaries.SamplerStatsSummary}, {_target_: tpen.evaluation.summaries.SampledRecordWriter, max_samples: 1048576, include_term_energies: true}]
 runner: {_target_: tpen.runner.Evaluate, model: "${model}", load: "${load}", evaluator: "${evaluator}"}
 callbacks:
   - _target_: tpen.callback.ConfigSnapshot
@@ -29,3 +29,6 @@ callbacks:
     output_path: ${run.dir}/metadata.json
   - _target_: tpen.callback.Status
     output_path: ${run.dir}/status.json
+loggers:
+  - _target_: tpen.logging.JSONL
+    path: ${run.dir}/metrics.jsonl
