@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 from types import MappingProxyType
 from typing import Any, Callable, ClassVar
 
@@ -306,32 +307,77 @@ _RESOURCE_USAGE_TARGET = "tpen.callback.ResourceUsage"
 _TORCH_ALLOCATOR_PROBE_TARGET = "tpen.accelerator.TorchAllocatorPeakProbe"
 
 
-def _is_unresolved_scalar(value: Any) -> bool:
-    """Return whether ``value`` is a literal scalar or unresolved interpolation."""
+_PLAIN_REFERENCE = re.compile(
+    r"^\$\{[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\}$"
+)
+_INVALID_SCALAR = object()
+
+
+def _resolve_plain_reference(config: Mapping[str, Any], value: str) -> Any:
+    """Follow only same-config dotted references to a literal scalar.
+
+    This is deliberately a syntax-only resolver.  It does not call OmegaConf,
+    import a target, or evaluate a resolver.  A reference chain is accepted
+    only when every hop is a plain dotted reference and its terminal value is a
+    literal scalar; cycles, missing paths, containers, targets, and callables
+    are all refused.
+    """
+
+    current: Any = value
+    visited: set[str] = set()
+    while isinstance(current, str) and current.startswith("${"):
+        match = _PLAIN_REFERENCE.fullmatch(current)
+        if match is None:
+            return _INVALID_SCALAR
+        path = current[2:-1]
+        if path in visited:
+            return _INVALID_SCALAR
+        visited.add(path)
+        node: Any = config
+        for segment in path.split("."):
+            if not isinstance(node, Mapping) or segment not in node:
+                return _INVALID_SCALAR
+            node = node[segment]
+        current = node
+    if type(current) in (bool, int, float, str):
+        return current
+    return _INVALID_SCALAR
+
+
+def _scalar_value(value: Any, config: Mapping[str, Any]) -> Any:
+    """Return a literal scalar or a scalar reached by a plain reference."""
 
     if type(value) in (bool, int, float):
-        return True
-    return (
-        type(value) is str
-        and value.startswith("${")
-        and value.endswith("}")
-    )
+        return value
+    if type(value) is str:
+        if not value.startswith("${"):
+            return value
+        return _resolve_plain_reference(config, value)
+    return _INVALID_SCALAR
 
 
-def _numeric_scalar(value: Any, *, integer: bool = False) -> bool:
-    """Validate a numeric constructor scalar without resolving Hydra values."""
+def _numeric_scalar(
+    value: Any, config: Mapping[str, Any], *, integer: bool = False
+) -> bool:
+    """Validate a numeric scalar without resolving Hydra values."""
 
-    if not _is_unresolved_scalar(value):
+    resolved = _scalar_value(value, config)
+    if resolved is _INVALID_SCALAR:
         return False
-    if isinstance(value, str):
-        return True
     if integer:
-        return type(value) is int
-    return type(value) in (int, float)
+        return type(resolved) is int
+    return type(resolved) in (int, float)
+
+
+def _string_scalar(value: Any, config: Mapping[str, Any]) -> bool:
+    """Validate a literal string or a plain reference to a literal string."""
+
+    resolved = _scalar_value(value, config)
+    return type(resolved) is str
 
 
 def _runtime_equivariance_contract_refusal(
-    entry: Mapping[str, Any], path: str
+    entry: Mapping[str, Any], path: str, config: Mapping[str, Any]
 ) -> tuple[str, str] | None:
     """Refuse RuntimeEquivariance constructors outside the audited HI shape."""
 
@@ -363,7 +409,9 @@ def _runtime_equivariance_contract_refusal(
             "unsupported-callback",
             f"{path} {_RUNTIME_EQUIVARIANCE_TARGET!r} requires a routed artifact_dir",
         )
-    if "every_n_steps" in entry and not _numeric_scalar(entry["every_n_steps"], integer=True):
+    if "every_n_steps" in entry and not _numeric_scalar(
+        entry["every_n_steps"], config, integer=True
+    ):
         return (
             "unsupported-callback",
             f"{path}.every_n_steps must be an integer or unresolved interpolation",
@@ -373,7 +421,9 @@ def _runtime_equivariance_contract_refusal(
             "unsupported-callback",
             f"{path}.every_n_steps must be positive",
         )
-    if "start_step" in entry and not _numeric_scalar(entry["start_step"], integer=True):
+    if "start_step" in entry and not _numeric_scalar(
+        entry["start_step"], config, integer=True
+    ):
         return (
             "unsupported-callback",
             f"{path}.start_step must be an integer or unresolved interpolation",
@@ -384,7 +434,7 @@ def _runtime_equivariance_contract_refusal(
             f"{path}.start_step must be nonnegative",
         )
     if "seed" in entry and entry["seed"] is not None and not _numeric_scalar(
-        entry["seed"], integer=True
+        entry["seed"], config, integer=True
     ):
         return (
             "unsupported-callback",
@@ -420,7 +470,7 @@ def _runtime_equivariance_contract_refusal(
                 "unsupported-callback",
                 f"{checker_path} has unknown constructor field(s): {sorted(unknown_checker)!r}",
             )
-        if not _numeric_scalar(checker.get("permutation_fraction")):
+        if not _numeric_scalar(checker.get("permutation_fraction"), config):
             return (
                 "unsupported-callback",
                 f"{checker_path}.permutation_fraction must be an audited numeric scalar",
@@ -432,7 +482,7 @@ def _runtime_equivariance_contract_refusal(
                 "unsupported-callback",
                 f"{checker_path}.permutation_fraction must be between 0 and 1",
             )
-        if not _numeric_scalar(checker.get("max_permutations"), integer=True):
+        if not _numeric_scalar(checker.get("max_permutations"), config, integer=True):
             return (
                 "unsupported-callback",
                 f"{checker_path}.max_permutations must be an audited integer scalar",
@@ -442,12 +492,16 @@ def _runtime_equivariance_contract_refusal(
                 "unsupported-callback",
                 f"{checker_path}.max_permutations must be positive",
             )
-        if checker.get("seed") is not None and not _numeric_scalar(checker["seed"], integer=True):
+        if checker.get("seed") is not None and not _numeric_scalar(
+            checker["seed"], config, integer=True
+        ):
             return (
                 "unsupported-callback",
                 f"{checker_path}.seed must be an integer, null, or unresolved interpolation",
             )
-        if not _numeric_scalar(checker.get("atol")) or not _numeric_scalar(checker.get("rtol")):
+        if not _numeric_scalar(checker.get("atol"), config) or not _numeric_scalar(
+            checker.get("rtol"), config
+        ):
             return (
                 "unsupported-callback",
                 f"{checker_path} requires audited atol and rtol scalars",
@@ -469,7 +523,7 @@ def _runtime_equivariance_contract_refusal(
 
 
 def _resource_usage_contract_refusal(
-    entry: Mapping[str, Any], path: str
+    entry: Mapping[str, Any], path: str, config: Mapping[str, Any]
 ) -> tuple[str, str] | None:
     """Refuse ResourceUsage constructor state outside allocation-local telemetry."""
 
@@ -490,8 +544,7 @@ def _resource_usage_contract_refusal(
         )
     if (
         probe.get("_target_") != _TORCH_ALLOCATOR_PROBE_TARGET
-        or not isinstance(probe.get("device"), str)
-        or not probe["device"]
+        or not _string_scalar(probe.get("device"), config)
     ):
         return (
             "unsupported-callback",
@@ -505,7 +558,9 @@ class _CallbackContract:
     """Sealed syntax-only contract for one admitted callback target."""
 
     category: str
-    validate: Callable[[Mapping[str, Any], str], tuple[str, str] | None]
+    validate: Callable[
+        [Mapping[str, Any], str, Mapping[str, Any]], tuple[str, str] | None
+    ]
 
 
 CALLBACK_CONTRACT_REGISTRY: Mapping[str, _CallbackContract] = MappingProxyType(
@@ -658,7 +713,7 @@ def _callback_contract_refusal(config: Any) -> tuple[str, str] | None:
         contract = CALLBACK_CONTRACT_REGISTRY.get(target)
         if contract is None:
             continue
-        refusal = contract.validate(entry, f"callbacks[{index}]")
+        refusal = contract.validate(entry, f"callbacks[{index}]", config)
         if refusal is not None:
             return refusal
     return None

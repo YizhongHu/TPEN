@@ -50,11 +50,35 @@ def test_runtime_equivariance_train_resume_reconstructs_across_processes(tmp_pat
 
     assert len({prefix["pid"], reference["pid"], successor["pid"]}) == 3
     assert successor["restored"] is True
-    assert successor["trainer_next_iteration"] == 5
-    assert reference["selected"] == successor["selected"]
-    assert reference["records"] == successor["records"]
-    assert [record["step"] for record in successor["records"]] == [5, 5, 10, 10]
-    assert all(record["metrics"]["n_comparisons"] > 0 for record in successor["records"][::2])
+    assert successor["trainer_next_iteration"] == 16
+    assert successor["checker_types"] == [
+        "FullModelEquivarianceChecker",
+        "TraceEquivarianceChecker",
+    ]
+    assert all(
+        event["event_step"] == event["state_step"]
+        for event in successor["completed_events"]
+    )
+    assert 6 in [event["event_step"] for event in successor["completed_events"]]
+    assert [record["step"] for record in successor["records"]] == [
+        5,
+        5,
+        10,
+        10,
+        15,
+        15,
+    ]
+    assert [call["step"] for call in successor["selection_calls"]] == [
+        5,
+        5,
+        10,
+        10,
+        15,
+        15,
+    ]
+    assert reference["selection_calls"] == successor["selection_calls"]
+    assert reference["records"][2:] == successor["records"]
+    assert all(record["metrics"]["n_comparisons"] > 0 for record in successor["records"])
     assert all(record["metrics"]["passed"] is True for record in successor["records"])
 
 
@@ -68,6 +92,9 @@ def test_runtime_equivariance_failure_artifact_uses_event_step_after_restore(
 
     assert failure["restored"] is True
     assert "failed at step 5" in failure["failure_message"]
-    assert failure["artifact_paths"] == [
-        "equivariance-artifacts/full_model/step_000005/failure.json"
+    assert failure["artifact_records"] == [
+        {
+            "path": "equivariance-artifacts/full_model/step_000005/failure.json",
+            "step": 5,
+        }
     ]

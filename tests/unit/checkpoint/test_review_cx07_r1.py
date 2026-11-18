@@ -91,10 +91,11 @@ def test_recovery_fixture_observes_the_checker_step_and_selection(tmp_path, monk
     monkeypatch.setattr(checks, "select_nonidentity_permutations", record_selection)
     result = worker.run("reference", tmp_path, failure=False)
     assert [step for step, _ in observed] == [
-        record["step"] for record in result["records"]
+        call["step"] for call in result["selection_calls"]
     ]
-    # Select the full-model calls; the trace calls use the same seed/options.
-    assert [image for _, images in observed[::2] for image in images] == result["selected"]
+    assert [
+        images for _, images in observed
+    ] == [call["images"] for call in result["selection_calls"]]
 
 
 def test_recovery_fixture_exercises_both_checker_comparisons(tmp_path):
