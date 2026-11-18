@@ -249,17 +249,18 @@ guard_gpus() {
 }
 
 derive_cpu_layout() {
-  local affinity_output layout_output line lineage core_count cpu_set
+  local report_only="${1:-0}" affinity_output layout_output line lineage core_count cpu_set
   local -a layout_lines
 
   affinity_output="$("$TASKSET_BIN" -pc $$ 2>&1)" ||
     die "could not determine process CPU affinity: $affinity_output"
-  if ! layout_output="$($PYBIN - "$POLARIS_LSCPU_BIN" "$affinity_output" <<'PY'
+  if ! layout_output="$($PYBIN - "$POLARIS_LSCPU_BIN" "$affinity_output" "$report_only" <<'PY'
 import subprocess
 import sys
 
 
-lscpu_bin, affinity_text = sys.argv[1:]
+lscpu_bin, affinity_text, report_only_text = sys.argv[1:]
+report_only = report_only_text == "1"
 
 
 def parse_cpu_list(text: str) -> set[int]:
@@ -317,6 +318,10 @@ for node, core, cpu in sorted(records):
 ordered = sorted(selected, key=lambda record: (record[0], record[1], record[2]))
 usable = len(ordered) - len(ordered) % 3
 per_lineage = usable // 3
+if per_lineage < 3 and report_only:
+    cpus = ",".join(str(cpu) for _, _, cpu in ordered)
+    print(f"report\t{len(ordered)}\t{cpus}")
+    raise SystemExit(0)
 if per_lineage < 3:
     raise SystemExit(
         f"fewer than 3 physical cores per lineage: allowed={len(ordered)}"
@@ -338,6 +343,13 @@ PY
     die "$layout_output"
   fi
   mapfile -t layout_lines <<< "$layout_output"
+  if [[ "$report_only" == 1 && "${#layout_lines[@]}" == 1 ]]; then
+    IFS=$'\t' read -r lineage core_count cpu_set <<< "${layout_lines[0]}"
+    [[ "$lineage" == report && "$core_count" =~ ^[0-9]+$ ]] ||
+      die "malformed report-only CPU layout: ${layout_lines[0]}"
+    printf 'POLARIS_LAYOUT report-only=1 cores=%s cpus=%s\n' "$core_count" "$cpu_set"
+    return 0
+  fi
   [[ "${#layout_lines[@]}" == 3 ]] ||
     die "expected three lineage CPU layouts, got ${#layout_lines[@]}"
   LINEAGE_CPU_SETS=()
@@ -354,8 +366,21 @@ PY
 }
 
 guard_runtime() {
-  guard_gpus
-  derive_cpu_layout
+  case "$MODE" in
+    train|eval)
+      guard_gpus
+      derive_cpu_layout
+      ;;
+    plan)
+      derive_cpu_layout 1
+      ;;
+    collect)
+      ;;
+    *)
+      guard_gpus
+      derive_cpu_layout
+      ;;
+  esac
 }
 
 prepare_job() {
@@ -500,7 +525,7 @@ PY
 
 run_mode() {
   local row_dir="$BOOT_ROOT/rows/$MODE"
-  local row_list row gpu cpu_set core_count log status lineage
+  local row_list row gpu cpu_set core_count log status lineage destination_root
   local rc=0
   row_list="$BOOT_ROOT/$MODE-row-list.txt"
   extract_rows "$PLAN_MANIFEST" "$MODE" "$row_dir" > "$row_list"
@@ -523,7 +548,12 @@ run_mode() {
       if [[ "$DRY_EXEC" == 1 ]]; then
         log="$BOOT_ROOT/$(basename "$row" .json).log"
         status="$BOOT_ROOT/$(basename "$row" .json).status"
+        destination_root="$BOOT_ROOT"
+      else
+        destination_root="$RESULTS_ROOT"
       fi
+      assert_contained_path "$log" "$destination_root" log
+      assert_contained_path "$status" "$destination_root" status
       run_command_for_row "$row" "$CHECKOUT/experiments/atomistic/stage1/train.py" \
         "$gpu" "$cpu_set" "$core_count" "$log" "$status" &
       pids+=("$!")
@@ -543,7 +573,12 @@ run_mode() {
       if [[ "$DRY_EXEC" == 1 ]]; then
         log="$BOOT_ROOT/$(basename "$row" .json).log"
         status="$BOOT_ROOT/$(basename "$row" .json).status"
+        destination_root="$BOOT_ROOT"
+      else
+        destination_root="$RESULTS_ROOT"
       fi
+      assert_contained_path "$log" "$destination_root" log
+      assert_contained_path "$status" "$destination_root" status
       run_command_for_row "$row" "$CHECKOUT/experiments/atomistic/stage1/eval.py" \
         "$gpu" "$cpu_set" "$core_count" "$log" "$status" || rc=1
     done < "$row_list"
