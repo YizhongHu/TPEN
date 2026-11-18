@@ -50,40 +50,55 @@ def _receipt(group: ReadyGroupV2, task_id: str, status: str = "failed") -> tuple
     return start, outcome
 
 
-def _input(group: ReadyGroupV2, task_id: str, verdict: CoreAdmissionVerdictV2 | None) -> MemberRecoveryInputV2:
-    start, outcome = _receipt(group, task_id)
+def _input(
+    group: ReadyGroupV2,
+    task_id: str,
+    verdict: CoreAdmissionVerdictV2 | None,
+    *,
+    status: str = "failed",
+) -> MemberRecoveryInputV2:
+    start, outcome = _receipt(group, task_id, status)
     return MemberRecoveryInputV2(task_id, f"lineage-{task_id}", start.attempt_id, start, outcome, verdict)
+
+
+def _assert_reconciliation(condition: bool, result: GroupReconciliationV2, message: str) -> None:
+    reason_codes = ", ".join(f"{member.task_id}={member.reason_code}" for member in result.members)
+    assert condition, f"{message}; member reason codes: {reason_codes}"
 
 
 def test_mixed_group_emits_all_five_actions_and_park_dominates() -> None:
     group = _group()
     inputs = (
-        _input(group, "completed", _core("completed")),
+        _input(group, "completed", _core("completed"), status="completed"),
         _input(group, "successor", _core("successor", profile=_profile(), admission="admitted", checkpoint="valid", quiescence="valid")),
         MemberRecoveryInputV2("fresh", "lineage-fresh"),
         _input(group, "terminal", _core("terminal")),
         _input(group, "ambiguous", _core("unknown")),
     )
     result = reconcile_group(group, inputs)
-    assert [member.action for member in result.members] == [
-        "preserve_completed", "admit_successor", "start_fresh", "preserve_terminal", "park"
-    ]
-    assert result.aggregate == "parked"
-    assert result.completed_count == 1
-    assert result.terminal_count == 1
-    assert GroupReconciliationV2.from_mapping(result.to_dict()) == result
+    _assert_reconciliation(
+        [member.action for member in result.members] == [
+            "preserve_completed", "admit_successor", "start_fresh", "preserve_terminal", "park"
+        ],
+        result,
+        "mixed group actions",
+    )
+    _assert_reconciliation(result.aggregate == "parked", result, "park dominates aggregate")
+    _assert_reconciliation(result.completed_count == 1, result, "completed member count")
+    _assert_reconciliation(result.terminal_count == 1, result, "terminal member count")
+    _assert_reconciliation(GroupReconciliationV2.from_mapping(result.to_dict()) == result, result, "reconciliation round trip")
 
 
 def test_without_ambiguity_aggregate_requires_replacement() -> None:
     group = _group(("completed", "successor", "fresh", "terminal"))
     inputs = (
-        _input(group, "completed", _core("completed")),
+        _input(group, "completed", _core("completed"), status="completed"),
         _input(group, "successor", _core("successor", profile=_profile(), admission="admitted", checkpoint="valid", quiescence="valid")),
         MemberRecoveryInputV2("fresh", "lineage-fresh"),
         _input(group, "terminal", _core("terminal")),
     )
     result = reconcile_group(group, inputs)
-    assert result.aggregate == "replacement_required"
+    _assert_reconciliation(result.aggregate == "replacement_required", result, "replacement aggregate")
 
 
 def test_unsupported_profile_is_parked_before_restore_callback() -> None:
@@ -94,21 +109,21 @@ def test_unsupported_profile_is_parked_before_restore_callback() -> None:
         (_input(group, "successor", _core("successor", profile=None, admission="admitted", checkpoint="valid", quiescence="valid")),),
         restore_callback=lambda member: called.append(member.task_id),
     )
-    assert result.members[0].action == "park"
-    assert result.members[0].reason_code == "unsupported-profile"
-    assert called == []
+    _assert_reconciliation(result.members[0].action == "park", result, "unsupported profile action")
+    _assert_reconciliation(result.members[0].reason_code == "unsupported-profile", result, "unsupported profile reason")
+    _assert_reconciliation(called == [], result, "unsupported profile restore callback")
 
 
 def test_start_receipt_never_becomes_start_fresh_and_completed_is_not_relaunched() -> None:
     group = _group(("started", "completed"))
     called: list[str] = []
     started = _input(group, "started", _core("unknown"))
-    completed = _input(group, "completed", _core("completed"))
+    completed = _input(group, "completed", _core("completed"), status="completed")
     result = reconcile_group(group, (started, completed), restore_callback=lambda member: called.append(member.task_id))
-    assert result.members[0].action == "park"
-    assert result.members[0].reason_code == "unknown-core-result"
-    assert result.members[1].action == "preserve_completed"
-    assert called == []
+    _assert_reconciliation(result.members[0].action == "park", result, "unknown core action")
+    _assert_reconciliation(result.members[0].reason_code == "unknown-core-result", result, "unknown core reason")
+    _assert_reconciliation(result.members[1].action == "preserve_completed", result, "completed member action")
+    _assert_reconciliation(called == [], result, "completed member restore callback")
 
 
 def test_injected_port_is_used_and_foreign_or_missing_evidence_parks() -> None:
@@ -123,9 +138,9 @@ def test_injected_port_is_used_and_foreign_or_missing_evidence_parks() -> None:
 
     port = RefusingPort()
     result = reconcile_group(group, (_input(group, "successor", None),), admission_port=port)
-    assert port.calls == 1
-    assert result.members[0].reason_code == "unsupported-profile"
-    assert result.members[1].reason_code == "missing-member-evidence"
+    _assert_reconciliation(port.calls == 1, result, "injected admission port calls")
+    _assert_reconciliation(result.members[0].reason_code == "unsupported-profile", result, "injected port refusal reason")
+    _assert_reconciliation(result.members[1].reason_code == "missing-member-evidence", result, "missing member reason")
 
 
 def test_crossed_group_receipt_is_parked() -> None:
@@ -137,6 +152,6 @@ def test_crossed_group_receipt_is_parked() -> None:
         group,
         (MemberRecoveryInputV2("completed", "lineage-completed", attempt, start, outcome, _core("completed")),),
     )
-    assert result.members[0].action == "park"
-    assert result.members[0].reason_code == "crossed-group-receipt"
+    _assert_reconciliation(result.members[0].action == "park", result, "crossed group action")
+    _assert_reconciliation(result.members[0].reason_code == "crossed-group-receipt", result, "crossed group reason")
 
