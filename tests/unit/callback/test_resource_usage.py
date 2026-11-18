@@ -59,6 +59,52 @@ class _FakeAllocatorProbe:
         return self.usage
 
 
+class _AttemptAllocatorProbe(_FakeAllocatorProbe):
+    """Probe fake with attempt-specific reset evidence."""
+
+    def __init__(self, usage: AllocatorUsage, reset_result: object) -> None:
+        super().__init__(usage)
+        self.reset_result = reset_result
+
+    def reset(self) -> object:
+        self.reset_calls += 1
+        return self.reset_result
+
+
+class _CountingProcessProbe(ProcessRUsageProbe):
+    """Process fake proving each RunStarted captures a new baseline."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.baselines: list[ProcessResourceBaseline] = []
+        self.result_baselines: list[ProcessResourceBaseline] = []
+
+    def read(self) -> ProcessResourceBaseline:
+        baseline = ProcessResourceBaseline(
+            user_cpu_seconds=len(self.baselines),
+            system_cpu_seconds=0,
+            read_block_operations=0,
+            write_block_operations=0,
+            voluntary_context_switches=0,
+            involuntary_context_switches=0,
+            peak_rss_mb=0,
+        )
+        self.baselines.append(baseline)
+        return baseline
+
+    def result(self, baseline: ProcessResourceBaseline) -> ProcessResourceResult:
+        self.result_baselines.append(baseline)
+        return ProcessResourceResult(
+            user_cpu_seconds=float(baseline.user_cpu_seconds) + 10.0,
+            system_cpu_seconds=1.0,
+            read_block_operations=2,
+            write_block_operations=3,
+            voluntary_context_switches=4,
+            involuntary_context_switches=5,
+            peak_rss_mb=6.0,
+        )
+
+
 def test_resource_usage_logs_peak_rss_at_run_completion(monkeypatch: pytest.MonkeyPatch) -> None:
     context = RecordingContext()
     callback = ResourceUsage(peak_rss_mb_reader=lambda: 512.0)
@@ -271,6 +317,54 @@ def test_resource_usage_recreates_auto_probe_for_each_context(
     assert devices == ["cuda:0", "xpu:1"]
     assert [probe.reset_calls for probe in probes] == [1, 1]
     assert contexts[0].latest("runtime")["accelerator_max_memory_allocated_mb"] == 1.0
+    assert contexts[1].latest("runtime")["accelerator_max_memory_allocated_mb"] == 2.0
+
+
+def test_resource_usage_starts_each_attempt_with_fresh_baseline_device_reset_and_terminal_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resource telemetry is fresh and observational at each attempt boundary."""
+
+    contexts = (RecordingContext(), RecordingContext())
+    contexts[0].metadata.device = "cuda:0"
+    contexts[1].metadata.device = "cuda:1"
+    probes: list[_AttemptAllocatorProbe] = []
+    process_probe = _CountingProcessProbe()
+
+    def build_probe(device: str) -> _AttemptAllocatorProbe:
+        index = int(device.rsplit(":", 1)[1])
+        probe = _AttemptAllocatorProbe(
+            AllocatorUsage(
+                identity=AcceleratorIdentity(AcceleratorKind.CUDA, index, f"GPU-{index}"),
+                allocated_mb=float(index + 1),
+                reserved_mb=float(index + 2),
+                device_count=1,
+            ),
+            AllocatorUnavailable("reset failed") if index == 0 else AcceleratorIdentity(
+                AcceleratorKind.CUDA, index, f"GPU-{index}"
+            ),
+        )
+        probes.append(probe)
+        return probe
+
+    monkeypatch.setattr(resource_usage_module, "TorchAllocatorPeakProbe", build_probe)
+    callback = ResourceUsage(process_probe=process_probe)
+
+    _deliver(callback, contexts[0], RunStarted())
+    _deliver(callback, contexts[0], RunCompleted())
+    _deliver(callback, contexts[0], RunFailed(exception_type="RuntimeError", exception_message="late"))
+    _deliver(callback, contexts[1], RunStarted())
+    _deliver(callback, contexts[1], RunFailed(exception_type="RuntimeError", exception_message="boom"))
+    _deliver(callback, contexts[1], RunCompleted())
+
+    assert [probe.reset_calls for probe in probes] == [1, 1]
+    assert [baseline.user_cpu_seconds for baseline in process_probe.baselines] == [0, 1]
+    assert [baseline.user_cpu_seconds for baseline in process_probe.result_baselines] == [0, 1]
+    assert len(contexts[0].by_namespace("runtime")) == 1
+    assert len(contexts[1].by_namespace("runtime")) == 1
+    assert len(contexts[0].by_namespace("process")) == 1
+    assert len(contexts[1].by_namespace("process")) == 1
+    assert contexts[0].latest("runtime")["accelerator_max_memory_allocated_unavailable"] is True
     assert contexts[1].latest("runtime")["accelerator_max_memory_allocated_mb"] == 2.0
 
 

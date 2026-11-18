@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, ClassVar
+from typing import Any, Callable, ClassVar
 
 PROFILE_CHECK_SCHEMA = "tpen.profile-check/v1"
 NATIVE_RECOVERY_PROFILE = "tpen.native-recovery/v1"
@@ -180,6 +180,7 @@ CADENCE_SENSITIVE_CALLBACK_TARGETS = frozenset(
         "tpen.callback.FactorScalars",
         "tpen.callback.RawTrainingBatchRecorder",
         "tpen.callback.TrainingBatchRecorder",
+        "tpen.callback.RuntimeEquivariance",
     }
 )
 # These schedules make decisions only from the durable completed-update
@@ -194,8 +195,13 @@ AUDITED_CHECKPOINT_SCHEDULE_TARGETS = frozenset(
         "tpen.checkpoint.ExplicitUpdates",
     }
 )
+RECONSTRUCTED_CALLBACK_TARGETS = frozenset({"tpen.callback.RuntimeEquivariance"})
+ALLOCATION_LOCAL_CALLBACK_TARGETS = frozenset({"tpen.callback.ResourceUsage"})
 SUPPORTED_CALLBACK_TARGETS = (
-    OBSERVATIONAL_CALLBACK_TARGETS | RESUME_SENSITIVE_CALLBACK_TARGETS
+    OBSERVATIONAL_CALLBACK_TARGETS
+    | RESUME_SENSITIVE_CALLBACK_TARGETS
+    | RECONSTRUCTED_CALLBACK_TARGETS
+    | ALLOCATION_LOCAL_CALLBACK_TARGETS
 )
 SUPPORTED_LOGGER_TARGETS = frozenset({"tpen.logging.CSV", "tpen.logging.JSONL"})
 SUPPORTED_STATE_OWNERS = frozenset(
@@ -291,6 +297,240 @@ def _plain_config(config: Any) -> Any:
     except (ImportError, TypeError, ValueError):
         return config
     return config
+
+
+_RUNTIME_EQUIVARIANCE_TARGET = "tpen.callback.RuntimeEquivariance"
+_FULL_EQUIVARIANCE_CHECKER_TARGET = "tpen.equivariance.checks.FullModelEquivarianceChecker"
+_TRACE_EQUIVARIANCE_CHECKER_TARGET = "tpen.equivariance.checks.TraceEquivarianceChecker"
+_RESOURCE_USAGE_TARGET = "tpen.callback.ResourceUsage"
+_TORCH_ALLOCATOR_PROBE_TARGET = "tpen.accelerator.TorchAllocatorPeakProbe"
+
+
+def _is_unresolved_scalar(value: Any) -> bool:
+    """Return whether ``value`` is a literal scalar or unresolved interpolation."""
+
+    if type(value) in (bool, int, float):
+        return True
+    return (
+        type(value) is str
+        and value.startswith("${")
+        and value.endswith("}")
+    )
+
+
+def _numeric_scalar(value: Any, *, integer: bool = False) -> bool:
+    """Validate a numeric constructor scalar without resolving Hydra values."""
+
+    if not _is_unresolved_scalar(value):
+        return False
+    if isinstance(value, str):
+        return True
+    if integer:
+        return type(value) is int
+    return type(value) in (int, float)
+
+
+def _runtime_equivariance_contract_refusal(
+    entry: Mapping[str, Any], path: str
+) -> tuple[str, str] | None:
+    """Refuse RuntimeEquivariance constructors outside the audited HI shape."""
+
+    expected = {
+        "_target_",
+        "every_n_steps",
+        "start_step",
+        "max_calls",
+        "probability",
+        "seed",
+        "fail_fast",
+        "artifact_dir",
+        "checkers",
+    }
+    unknown = set(entry) - expected
+    if unknown:
+        return (
+            "unsupported-callback",
+            f"{path} {_RUNTIME_EQUIVARIANCE_TARGET!r} has unknown constructor "
+            f"field(s): {sorted(unknown)!r}",
+        )
+    if entry.get("fail_fast") is not True:
+        return (
+            "unsupported-callback",
+            f"{path} {_RUNTIME_EQUIVARIANCE_TARGET!r} requires fail_fast=true",
+        )
+    if "artifact_dir" not in entry or not isinstance(entry["artifact_dir"], str) or not entry["artifact_dir"]:
+        return (
+            "unsupported-callback",
+            f"{path} {_RUNTIME_EQUIVARIANCE_TARGET!r} requires a routed artifact_dir",
+        )
+    if "every_n_steps" in entry and not _numeric_scalar(entry["every_n_steps"], integer=True):
+        return (
+            "unsupported-callback",
+            f"{path}.every_n_steps must be an integer or unresolved interpolation",
+        )
+    if "every_n_steps" in entry and not isinstance(entry["every_n_steps"], str) and entry["every_n_steps"] < 1:
+        return (
+            "unsupported-callback",
+            f"{path}.every_n_steps must be positive",
+        )
+    if "start_step" in entry and not _numeric_scalar(entry["start_step"], integer=True):
+        return (
+            "unsupported-callback",
+            f"{path}.start_step must be an integer or unresolved interpolation",
+        )
+    if "start_step" in entry and not isinstance(entry["start_step"], str) and entry["start_step"] < 0:
+        return (
+            "unsupported-callback",
+            f"{path}.start_step must be nonnegative",
+        )
+    if "seed" in entry and entry["seed"] is not None and not _numeric_scalar(
+        entry["seed"], integer=True
+    ):
+        return (
+            "unsupported-callback",
+            f"{path}.seed must be an integer, null, or unresolved interpolation",
+        )
+    if "max_calls" in entry and entry["max_calls"] is not None:
+        return (
+            CALLBACK_CADENCE_REFUSAL_CODE,
+            f"{path}.max_calls must be null because callback-local call count is not restored",
+        )
+    if "probability" in entry and (
+        type(entry["probability"]) not in (int, float) or entry["probability"] != 1
+    ):
+        return (
+            CALLBACK_CADENCE_REFUSAL_CODE,
+            f"{path}.probability must be exactly 1 because callback-local RNG is not restored",
+        )
+
+    checkers = entry.get("checkers")
+    if not isinstance(checkers, (list, tuple)) or len(checkers) != 2:
+        return (
+            "unsupported-callback",
+            f"{path}.checkers must contain exactly the ordered full-model and trace checkers",
+        )
+    expected_targets = (_FULL_EQUIVARIANCE_CHECKER_TARGET, _TRACE_EQUIVARIANCE_CHECKER_TARGET)
+    for index, (checker, expected_target) in enumerate(zip(checkers, expected_targets, strict=True)):
+        checker_path = f"{path}.checkers[{index}]"
+        if not isinstance(checker, Mapping) or checker.get("_target_") != expected_target:
+            return (
+                "unsupported-callback",
+                f"{checker_path} must use the exact audited target {expected_target!r}",
+            )
+        checker_expected = {
+            "_target_",
+            "permutation_fraction",
+            "max_permutations",
+            "seed",
+            "atol",
+            "rtol",
+        }
+        if expected_target == _TRACE_EQUIVARIANCE_CHECKER_TARGET:
+            checker_expected.add("compare_output")
+        unknown_checker = set(checker) - checker_expected
+        if unknown_checker:
+            return (
+                "unsupported-callback",
+                f"{checker_path} has unknown constructor field(s): {sorted(unknown_checker)!r}",
+            )
+        if not _numeric_scalar(checker.get("permutation_fraction")):
+            return (
+                "unsupported-callback",
+                f"{checker_path}.permutation_fraction must be an audited numeric scalar",
+            )
+        if not isinstance(checker["permutation_fraction"], str) and not 0 <= checker[
+            "permutation_fraction"
+        ] <= 1:
+            return (
+                "unsupported-callback",
+                f"{checker_path}.permutation_fraction must be between 0 and 1",
+            )
+        if not _numeric_scalar(checker.get("max_permutations"), integer=True):
+            return (
+                "unsupported-callback",
+                f"{checker_path}.max_permutations must be an audited integer scalar",
+            )
+        if not isinstance(checker["max_permutations"], str) and checker["max_permutations"] < 1:
+            return (
+                "unsupported-callback",
+                f"{checker_path}.max_permutations must be positive",
+            )
+        if checker.get("seed") is not None and not _numeric_scalar(checker["seed"], integer=True):
+            return (
+                "unsupported-callback",
+                f"{checker_path}.seed must be an integer, null, or unresolved interpolation",
+            )
+        if not _numeric_scalar(checker.get("atol")) or not _numeric_scalar(checker.get("rtol")):
+            return (
+                "unsupported-callback",
+                f"{checker_path} requires audited atol and rtol scalars",
+            )
+        if any(
+            not isinstance(checker[key], str) and checker[key] < 0
+            for key in ("atol", "rtol")
+        ):
+            return (
+                "unsupported-callback",
+                f"{checker_path}.atol and rtol must be nonnegative",
+            )
+        if expected_target == _TRACE_EQUIVARIANCE_CHECKER_TARGET and checker.get("compare_output") is not False:
+            return (
+                "unsupported-callback",
+                f"{checker_path}.compare_output must be false in the audited profile",
+            )
+    return None
+
+
+def _resource_usage_contract_refusal(
+    entry: Mapping[str, Any], path: str
+) -> tuple[str, str] | None:
+    """Refuse ResourceUsage constructor state outside allocation-local telemetry."""
+
+    unknown = set(entry) - {"_target_", "allocator_probe"}
+    if unknown:
+        return (
+            "unsupported-callback",
+            f"{path} {_RESOURCE_USAGE_TARGET!r} has unknown constructor field(s): "
+            f"{sorted(unknown)!r}",
+        )
+    if "allocator_probe" not in entry or entry["allocator_probe"] is None:
+        return None
+    probe = entry["allocator_probe"]
+    if not isinstance(probe, Mapping) or set(probe) != {"_target_", "device"}:
+        return (
+            "unsupported-callback",
+            f"{path}.allocator_probe must be the exact audited TorchAllocatorPeakProbe shape",
+        )
+    if (
+        probe.get("_target_") != _TORCH_ALLOCATOR_PROBE_TARGET
+        or not isinstance(probe.get("device"), str)
+        or not probe["device"]
+    ):
+        return (
+            "unsupported-callback",
+            f"{path}.allocator_probe must target {_TORCH_ALLOCATOR_PROBE_TARGET!r} with a device",
+        )
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class _CallbackContract:
+    """Sealed syntax-only contract for one admitted callback target."""
+
+    category: str
+    validate: Callable[[Mapping[str, Any], str], tuple[str, str] | None]
+
+
+CALLBACK_CONTRACT_REGISTRY: Mapping[str, _CallbackContract] = MappingProxyType(
+    {
+        _RUNTIME_EQUIVARIANCE_TARGET: _CallbackContract(
+            "RECONSTRUCTED", _runtime_equivariance_contract_refusal
+        ),
+        _RESOURCE_USAGE_TARGET: _CallbackContract(
+            "ALLOCATION_LOCAL", _resource_usage_contract_refusal
+        ),
+    }
+)
 
 
 def check_resume_sensitive_callback_cadence(
@@ -416,6 +656,27 @@ def _nested_cadence_refusal(value: Any, path: str) -> tuple[str, str] | None:
     return None
 
 
+def _callback_contract_refusal(config: Any) -> tuple[str, str] | None:
+    """Validate the sealed constructor contracts of newly admitted callbacks."""
+
+    if not isinstance(config, Mapping):
+        return None
+    callbacks = config.get("callbacks", ()) or ()
+    if not isinstance(callbacks, Sequence) or isinstance(callbacks, (str, bytes, bytearray)):
+        return None
+    for index, entry in enumerate(callbacks):
+        if not isinstance(entry, Mapping):
+            continue
+        target = entry.get("_target_")
+        contract = CALLBACK_CONTRACT_REGISTRY.get(target)
+        if contract is None:
+            continue
+        refusal = contract.validate(entry, f"callbacks[{index}]")
+        if refusal is not None:
+            return refusal
+    return None
+
+
 def _syntax_refusal(config: Any, profile: Profile) -> tuple[str, str] | None:
     """Find malformed syntax or the first disallowed mutable target."""
 
@@ -441,13 +702,16 @@ def _syntax_refusal(config: Any, profile: Profile) -> tuple[str, str] | None:
     return None
 
 
-def _check_refusal(config: Any, profile: Profile) -> tuple[str, str] | None:
-    """Validate syntax and callback-owned cadence state for this profile."""
+def check_profile_refusal(config: Any, profile: Profile) -> tuple[str, str] | None:
+    """Return the shared syntax, shape, and cadence refusal for a profile."""
 
     plain = _plain_config(config)
     syntax_refusal = _syntax_refusal(plain, profile)
     if syntax_refusal is not None:
         return syntax_refusal
+    contract_refusal = _callback_contract_refusal(plain)
+    if contract_refusal is not None:
+        return contract_refusal
     return check_resume_sensitive_callback_cadence(plain)
 
 
@@ -481,7 +745,7 @@ def check_profile(config: Any, profile_name: str) -> ProfileCheck:
             frozenset(),
             {"code": "unknown-profile", "reason": "profile is not declared by core"},
         )
-    refusal = _check_refusal(config, profile)
+    refusal = check_profile_refusal(config, profile)
     return ProfileCheck(
         profile.name,
         "refused" if refusal is not None else "supported",
@@ -533,9 +797,13 @@ __all__ = [
     "REFUSAL_CODES",
     "PROFILE_REFUSAL_CODES",
     "CALLBACK_CADENCE_REFUSAL_CODE",
+    "ALLOCATION_LOCAL_CALLBACK_TARGETS",
     "AUDITED_CHECKPOINT_SCHEDULE_TARGETS",
+    "CALLBACK_CONTRACT_REGISTRY",
     "CADENCE_SENSITIVE_CALLBACK_TARGETS",
+    "RECONSTRUCTED_CALLBACK_TARGETS",
     "check_resume_sensitive_callback_cadence",
+    "check_profile_refusal",
     "SUPPORTED_CALLBACK_TARGETS",
     "SUPPORTED_LOGGER_TARGETS",
     "SUPPORTED_STATE_OWNERS",

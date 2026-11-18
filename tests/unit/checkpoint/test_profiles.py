@@ -10,6 +10,8 @@ from omegaconf import OmegaConf
 
 from tpen.checkpoint.profiles import (
     CALLBACK_CADENCE_REFUSAL_CODE,
+    CALLBACK_CONTRACT_REGISTRY,
+    ALLOCATION_LOCAL_CALLBACK_TARGETS,
     NATIVE_PROFILE,
     NATIVE_RECOVERY_PROFILE,
     Profile,
@@ -17,6 +19,7 @@ from tpen.checkpoint.profiles import (
     REFUSAL_CODES,
     SUPPORTED_STATE_OWNERS,
     ProfileCheck,
+    RECONSTRUCTED_CALLBACK_TARGETS,
     check_resume_sensitive_callback_cadence,
     check_profile,
 )
@@ -41,6 +44,7 @@ def _config(**overrides: object) -> dict[str, object]:
 
 ROOT = Path(__file__).parents[3]
 H_V2_TRAIN_CONFIG = ROOT / "experiments" / "atomistic" / "h-v2" / "configs" / "train.yaml"
+HI_TRAIN_CONFIG = ROOT / "experiments" / "atomistic" / "he-importance" / "configs" / "train.yaml"
 NEW_CALLBACK_TARGETS = frozenset(
     {
         "tpen.callback.Checkpoint",
@@ -89,6 +93,96 @@ def test_h_v2_real_train_config_is_admitted_through_profile_loader() -> None:
 
     assert result.verdict == "supported"
     assert result.refusal is None
+
+
+def _hi_callback(target: str) -> dict[str, object]:
+    """Return one unresolved callback entry from the reviewed HI config."""
+
+    config = OmegaConf.to_container(OmegaConf.load(HI_TRAIN_CONFIG), resolve=False)
+    return next(entry for entry in config["callbacks"] if entry["_target_"] == target)
+
+
+def test_callback_contract_registry_is_sealed_and_categorized() -> None:
+    assert RECONSTRUCTED_CALLBACK_TARGETS == {"tpen.callback.RuntimeEquivariance"}
+    assert ALLOCATION_LOCAL_CALLBACK_TARGETS == {"tpen.callback.ResourceUsage"}
+    assert set(CALLBACK_CONTRACT_REGISTRY) == (
+        RECONSTRUCTED_CALLBACK_TARGETS | ALLOCATION_LOCAL_CALLBACK_TARGETS
+    )
+    assert CALLBACK_CONTRACT_REGISTRY["tpen.callback.RuntimeEquivariance"].category == "RECONSTRUCTED"
+    assert CALLBACK_CONTRACT_REGISTRY["tpen.callback.ResourceUsage"].category == "ALLOCATION_LOCAL"
+    with pytest.raises(TypeError):
+        CALLBACK_CONTRACT_REGISTRY["new.target"] = object()  # type: ignore[index]
+
+
+def test_hi_callback_pair_is_admitted_by_both_validators() -> None:
+    config = OmegaConf.to_container(OmegaConf.load(HI_TRAIN_CONFIG), resolve=False)
+
+    result = check_profile(config, NATIVE_RECOVERY_PROFILE)
+
+    assert result.verdict == "supported"
+    assert result.refusal is None
+    validate_native_recovery_profile(config)
+
+
+@pytest.mark.parametrize(
+    ("target", "mutate", "reason"),
+    [
+        (
+            "tpen.callback.RuntimeEquivariance",
+            lambda entry: entry["checkers"][0].update({"nested": {"_target_": "tests.helpers.PrivateMutableCallback"}}),
+            "unknown constructor field",
+        ),
+        (
+            "tpen.callback.RuntimeEquivariance",
+            lambda entry: entry["checkers"].reverse(),
+            "exact audited target",
+        ),
+        (
+            "tpen.callback.RuntimeEquivariance",
+            lambda entry: entry.update({"max_calls": 1}),
+            "max_calls",
+        ),
+        (
+            "tpen.callback.RuntimeEquivariance",
+            lambda entry: entry.update({"probability": 0.5}),
+            "probability",
+        ),
+        (
+            "tpen.callback.ResourceUsage",
+            lambda entry: entry.update({"process_probe": "tests.helpers.PrivateProbe"}),
+            "unknown constructor field",
+        ),
+        (
+            "tpen.callback.ResourceUsage",
+            lambda entry: entry.update(
+                {"allocator_probe": {"_target_": "tests.helpers.PrivateProbe", "device": "cpu"}}
+            ),
+            "exact audited TorchAllocatorPeakProbe",
+        ),
+    ],
+    ids=[
+        "runtime-unknown-checker-field",
+        "runtime-nested-order-wrapper",
+        "runtime-finite-max-calls",
+        "runtime-probabilistic-cadence",
+        "resource-arbitrary-process-probe",
+        "resource-arbitrary-allocator-probe",
+    ],
+)
+def test_new_callback_contract_refusals_are_shared(
+    target: str, mutate, reason: str
+) -> None:
+    entry = _hi_callback(target)
+    mutate(entry)
+    config = _config(callbacks=[entry])
+
+    result = check_profile(config, NATIVE_RECOVERY_PROFILE)
+
+    assert result.verdict == "refused"
+    assert result.refusal is not None
+    assert reason in result.refusal["reason"]
+    with pytest.raises(UnsupportedMutableStateError, match=reason):
+        validate_native_recovery_profile(config)
 
 
 def test_unknown_callback_target_remains_refused() -> None:
