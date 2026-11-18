@@ -10,12 +10,12 @@ import sys
 import pytest
 
 from tpen_executor.dispatch import parsl as parsl_dispatch
-from tpen_executor.dispatch.contract import _child_precore_refusal
+from tpen_executor.dispatch.contract import _child_precore_refusal, _with_child_placement
 from tpen_executor.dispatch.transport import LeafRequest, LeafResult, LeafTeardownReceipt
 from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.placement import ChildPlacementObservation, WorkerBinding, read_child_placement
-from tpen_executor.runners import ROUTED_STRICT_HOST_ENV, RUN_SHIM
+from tpen_executor.runners import RUN_SHIM
 from tpen_executor.storage import DirectoryStore
 from tpen_executor.workers import SubprocessWorker
 
@@ -152,7 +152,7 @@ def test_missing_routed_binding_is_refused_before_begin(tmp_path: Path, fake_par
     assert fake_parsl.submissions == [], details
 
 
-def _placement_environment(tmp_path: Path, *, strict: bool, group_digest: str) -> PreparedPythonEnvironment:
+def _placement_environment(tmp_path: Path, *, strict: bool) -> PreparedPythonEnvironment:
     package = tmp_path / "core" / "tpen"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
@@ -163,28 +163,32 @@ def _placement_environment(tmp_path: Path, *, strict: bool, group_digest: str) -
         "    return 0\n",
         encoding="utf-8",
     )
-    values = {
-        "PYTHONPATH": str(tmp_path / "core"),
-        "TPEN_PLACEMENT_OUTPUT": str(tmp_path / "child-placement.json"),
-        "TPEN_PLACEMENT_OUTPUT_DIR": str(tmp_path),
-        "TPEN_PLACEMENT_TASK_ID": "member",
-        "TPEN_PLACEMENT_ATTEMPT_ID": "attempt",
-        "TPEN_PLACEMENT_GROUP_DIGEST": group_digest,
-        "TPEN_PLACEMENT_ALLOCATION_ID": "allocation",
-        "TPEN_PLACEMENT_BACKEND_JOB_ID": "job",
-        "TPEN_PLACEMENT_SLOT_ID": "slot",
-        "TPEN_PLACEMENT_PAYLOAD_DIGEST": "payload",
-        "TPEN_PLACEMENT_DECLARED_HOST": "node-that-cannot-be-this-host",
-        "CORE_MARKER": str(tmp_path / "core-ran.txt"),
-    }
-    if strict:
-        values[ROUTED_STRICT_HOST_ENV] = "1"
-    return PreparedPythonEnvironment(sys.executable, None, values)
+    group = _group("s3d2b-placement", "member")
+    allocation = _routed_allocation(("node-that-cannot-be-this-host",))
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    lifecycle = AttachedAllocation(allocation, DirectoryStore(store_root))
+    fence = lifecycle.begin(group, "member", "2026-11-18T00:00:00+00:00", transport_kind="remote")
+    configured = _runs(tmp_path, "member")["member"]
+    return _with_child_placement(
+        PreparedPythonEnvironment(
+            sys.executable,
+            None,
+            {"PYTHONPATH": str(tmp_path / "core")},
+        ),
+        allocation,
+        fence,
+        group,
+        group.members[0],
+        configured,
+        check_controller_affinity=False,
+        slot_resolver=parsl_dispatch.routed_slots_from_allocation,
+        strict_host=strict,
+    )
 
 
 def test_routed_child_host_mismatch_aborts_before_core(tmp_path: Path) -> None:
-    group = _group("s3d2b-placement-routed", "member")
-    environment = _placement_environment(tmp_path, strict=True, group_digest=group.identity)
+    environment = _placement_environment(tmp_path, strict=True)
     outcome = SubprocessWorker().run(
         environment,
         ("-c", RUN_SHIM, f"run.root={tmp_path}"),
@@ -196,7 +200,7 @@ def test_routed_child_host_mismatch_aborts_before_core(tmp_path: Path) -> None:
     details = f"returncode={outcome.returncode!r}; stdout={outcome.stdout_path!r}; stderr={outcome.stderr_path!r}"
     assert outcome.returncode == 2, details
     assert not (tmp_path / "core-ran.txt").exists(), details
-    observation = read_child_placement(tmp_path / "child-placement.json")
+    observation = read_child_placement(environment.env["TPEN_PLACEMENT_OUTPUT"])
     details = f"returncode={outcome.returncode!r}; observation={observation.to_dict()!r}"
     assert observation.refusal is not None, details
     assert observation.refusal["code"] == "routed-child-node-mismatch", details
@@ -206,12 +210,20 @@ def test_routed_child_host_mismatch_aborts_before_core(tmp_path: Path) -> None:
     )
 
 
-def _attach_routed_mismatch_leaf_answers(fake_parsl) -> None:
+def _attach_routed_mismatch_leaf_answers(fake_parsl, errors: list[str] | None = None) -> None:
     """Return a valid remote refusal result with an identity-bound sidecar."""
 
     def refused(_index, _function, args, _kwargs):
+        try:
+            return build_refusal(args)
+        except BaseException as error:
+            if errors is not None:
+                errors.append(f"{type(error).__name__}: {error}")
+            raise
+
+    def build_refusal(args):
         request = LeafRequest.decode(args[0])
-        output_dir, core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = request.paths()
+        output_dir, _core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = request.paths()
         values = request.environment.env
         declared_cpus = tuple(int(item) for item in values["TPEN_SLOT_CPUS"].split(","))
         refusal = {"code": "routed-child-node-mismatch", "reason": "synthetic wrong child host"}
@@ -269,7 +281,9 @@ def _attach_routed_mismatch_leaf_answers(fake_parsl) -> None:
     fake_parsl.hooks["run_leaf"] = refused
 
 
-def test_routed_child_mismatch_is_launch_failed_without_segment(tmp_path: Path, fake_parsl) -> None:
+def test_routed_child_mismatch_is_launch_failed_without_segment(
+    tmp_path: Path, fake_parsl, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     allocation = _routed_allocation()
     group = _group("s3d2b-strict-refusal", "member")
     store_root = tmp_path / "store"
@@ -279,14 +293,29 @@ def test_routed_child_mismatch_is_launch_failed_without_segment(tmp_path: Path, 
         _worker(tmp_path),
         transport=parsl_dispatch.RoutedAttachedTransportSpec.from_mapping(_routed_transport_payload()),
     )
+    resolve_errors: list[str] = []
+    real_resolve = parsl_dispatch._RemoteLeaf.resolve
+
+    def tracing_resolve(handle, payload):
+        try:
+            return real_resolve(handle, payload)
+        except BaseException as error:
+            resolve_errors.append(f"{type(error).__name__}: {error}")
+            raise
+
+    # Preserve the production exception path while making a swallowed decode
+    # or identity error visible in this test's assertion details.
+    monkeypatch.setattr(parsl_dispatch._RemoteLeaf, "resolve", tracing_resolve)
     _attach_routed_probe_answers(dispatcher, fake_parsl, {"pool-a": "node-a", "pool-b": "node-b"})
-    _attach_routed_mismatch_leaf_answers(fake_parsl)
+    leaf_errors: list[str] = []
+    _attach_routed_mismatch_leaf_answers(fake_parsl, leaf_errors)
 
     manifest = dispatcher.run(group, _runs(tmp_path, "member"), lifecycle, timeout=60)
 
     details = (
         f"attempts={_manifest_attempts(manifest)!r}; segments={manifest.segments!r}; "
-        f"remote_teardowns={list(store_root.rglob('remote-teardown.json'))!r}"
+        f"remote_teardowns={list(store_root.rglob('remote-teardown.json'))!r}; "
+        f"leaf_errors={leaf_errors!r}; resolve_errors={resolve_errors!r}"
     )
     assert [attempt.outcome_receipt.status for attempt in manifest.attempts] == ["launch_failed"], details
     assert manifest.segments == (), details
@@ -294,8 +323,7 @@ def test_routed_child_mismatch_is_launch_failed_without_segment(tmp_path: Path, 
 
 
 def test_v1_child_host_mismatch_remains_advisory(tmp_path: Path) -> None:
-    group = _group("s3d2b-placement-v1", "member")
-    environment = _placement_environment(tmp_path, strict=False, group_digest=group.identity)
+    environment = _placement_environment(tmp_path, strict=False)
     # The shim passes the first argument to the fake core, which proves that
     # advisory v1 mismatch handling still reaches core.
     outcome = SubprocessWorker().run(
@@ -308,7 +336,7 @@ def test_v1_child_host_mismatch_remains_advisory(tmp_path: Path) -> None:
 
     details = f"returncode={outcome.returncode!r}; stdout={outcome.stdout_path!r}; stderr={outcome.stderr_path!r}"
     assert outcome.returncode == 0 and (tmp_path / "core-ran.txt").read_text(encoding="utf-8") == "core-ran", details
-    observation = read_child_placement(tmp_path / "child-placement.json")
+    observation = read_child_placement(environment.env["TPEN_PLACEMENT_OUTPUT"])
     details = f"returncode={outcome.returncode!r}; observation={observation.to_dict()!r}"
     assert observation.refusal is not None and observation.refusal["code"] == "child-placement-mismatch", details
     assert _child_precore_refusal(environment, outcome) is None, (
