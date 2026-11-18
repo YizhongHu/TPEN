@@ -180,8 +180,15 @@ python -m tpen_executor dispatch \
   --allocation <allocation.json> \
   --worker-config <worker.yaml> \
   --runs <configured-runs.json> \
-  [--dispatcher local|parsl] [--timeout SECONDS]
+  [--dispatcher local|parsl] [--transport <attached-transport.json>] \
+  [--timeout SECONDS]
 ```
+
+`--transport` is optional and is accepted only with `--dispatcher parsl`. Its
+file must be a strict `tpen-executor/attached-transport-v1` mapping accepted by
+`AttachedTransportSpec`; without it, Parsl uses the unchanged in-process
+ThreadPool route. The transport profile supplies only generic attached-route
+values; the executor does not provide facility defaults.
 
 The command writes a JSON manifest to stdout on dispatch and a typed
 `tpen-executor/cli-error-v1` envelope to stderr on refusal or failure. Exit
@@ -192,6 +199,10 @@ codes are:
 * `3`: dispatch completed with a failed, timed-out, or launch-failed member;
 * `4`: unexpected dispatch or publication failure after admission;
 * `130`: cancellation after an attempt began.
+
+Attached transport capacity and standard-worker shape refusals are reported as
+typed `dispatcher-admission` errors with exit code `2`, before the store is
+reserved. Shared-store reachability checks remain runtime dispatch failures.
 
 ## Remote-leaf wire (S3 Layer A)
 

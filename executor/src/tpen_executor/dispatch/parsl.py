@@ -836,22 +836,47 @@ class ParslDispatcher(DispatcherContract):
         """
 
         super(ParslDispatcher, self).validate(group, runs, lifecycle, env, timeout)
-        bindings = self._resolve_bindings(lifecycle)
+        self._resolve_bindings(lifecycle)
         if self.transport is not None:
-            self._admit_transport(lifecycle, env, len(bindings))
+            self._admit_transport(lifecycle, env)
 
-    def _admit_transport(self, lifecycle: AttachedAllocation, env: Mapping[str, Any] | None, slots: int) -> None:
-        """Refuse an attached remote run that cannot be dispatched faithfully."""
+    def admit_transport_shape(
+        self, allocation_or_lifecycle: Any, env: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Refuse an attached route with an invalid allocation or worker shape.
+
+        Parameters
+        ----------
+        allocation_or_lifecycle : object
+            A configured allocation, or an attached lifecycle carrying one.
+            Both paths use the runtime binding-resolution policy.
+        env : mapping, optional
+            Owner-process materialization environment for the worker handle.
+
+        Raises
+        ------
+        BindingError, PlacementRefusal, UnsupportedTransportError
+            If the transport, allocation capacity, or worker shape is refused.
+        """
 
         transport = self.transport
         if type(transport) is not AttachedTransportSpec:
             raise UnsupportedTransportError("transport must be an admitted AttachedTransportSpec")
-        if not isinstance(lifecycle, AttachedAllocation):
-            raise UnsupportedTransportError("the attached transport requires an AttachedAllocation lifecycle")
-        if slots > transport.workers:
+        if isinstance(allocation_or_lifecycle, AttachedAllocation):
+            bindings = self._resolve_bindings(allocation_or_lifecycle)
+        else:
+            bindings = self._resolve_bindings_for_allocation(allocation_or_lifecycle)
+        if len(bindings) > transport.workers:
             raise UnsupportedTransportError("attached transport has fewer workers than admitted slots")
         # The leaf always runs the standard worker; refuse any other program.
         _require_standard_worker(self.worker.materialize(env))
+
+    def _admit_transport(self, lifecycle: AttachedAllocation, env: Mapping[str, Any] | None) -> None:
+        """Refuse an attached remote run that cannot be dispatched faithfully."""
+
+        if not isinstance(lifecycle, AttachedAllocation):
+            raise UnsupportedTransportError("the attached transport requires an AttachedAllocation lifecycle")
+        self.admit_transport_shape(lifecycle, env)
         root = getattr(lifecycle.store, "root", None)
         if os.name != "posix" or type(root) is not str or not os.path.isabs(root):
             raise SharedStorePreflightError("attempt store root must be an absolute POSIX path")
@@ -865,8 +890,13 @@ class ParslDispatcher(DispatcherContract):
             if self.binding is None:
                 raise BindingError("binding is required when lifecycle is not AttachedAllocation")
             return (WorkerBinding.from_mapping(self.binding),)
+        return self._resolve_bindings_for_allocation(lifecycle.allocation)
+
+    def _resolve_bindings_for_allocation(self, allocation: Any) -> tuple[WorkerBinding, ...]:
+        """Resolve immutable bindings from allocation facts for both gates."""
+
         try:
-            slots = physical_slots_from_allocation(lifecycle.allocation)
+            slots = physical_slots_from_allocation(allocation)
         except PlacementRefusal:
             # Keep the raw slot binding long enough for the shared completion
             # path to publish the typed prelaunch v2 refusal.
@@ -877,7 +907,7 @@ class ParslDispatcher(DispatcherContract):
             return tuple(slot.binding() for slot in slots)
         if self.binding is not None:
             return (WorkerBinding.from_mapping(self.binding),)
-        return bindings_from_allocation(lifecycle.allocation)
+        return bindings_from_allocation(allocation)
 
     def _run_slot_pool(
         self,
