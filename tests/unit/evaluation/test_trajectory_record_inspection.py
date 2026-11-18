@@ -344,6 +344,65 @@ def test_stage1_scale_rejects_one_e_6_relative_variance_tamper(tmp_path: Path) -
         inspect_trajectory_record(artifact.metadata_path)
 
 
+def test_reconciliation_bound_uses_writer_moments_at_real_sample_count() -> None:
+    """Full-size tolerance scales follow the writer's mean and variance units."""
+
+    sample_count = 1_048_576
+    mean = -2.7898603079784103
+    variance = 0.24156005183916118
+
+    # These differences are within the full-size float64 bound, but not within
+    # the bound for a tiny sample count or one that omits mean**2.
+    assert trajectory_records._close_or_same_nonfinite(
+        mean,
+        mean + 1.0e-9,
+        mean=mean,
+        variance=variance,
+        sample_count=sample_count,
+        metric="mean",
+    )
+    assert trajectory_records._close_or_same_nonfinite(
+        variance,
+        variance + 1.0e-9,
+        mean=mean,
+        variance=variance,
+        sample_count=sample_count,
+        metric="variance",
+    )
+    assert not trajectory_records._close_or_same_nonfinite(
+        mean,
+        mean + 1.0e-9,
+        mean=mean,
+        variance=variance,
+        sample_count=256,
+        metric="mean",
+    )
+
+
+def test_reconciliation_bound_has_no_unit_floor_for_small_variance() -> None:
+    """Small-variance bounds remain proportional to the data's second moment."""
+
+    sample_count = 1_048_576
+    mean = 0.0
+    variance = 7.0e-6
+    assert not trajectory_records._close_or_same_nonfinite(
+        0.0,
+        1.0e-10,
+        mean=mean,
+        variance=variance,
+        sample_count=sample_count,
+        metric="mean",
+    )
+    assert not trajectory_records._close_or_same_nonfinite(
+        variance,
+        variance + 7.0e-12,
+        mean=mean,
+        variance=variance,
+        sample_count=sample_count,
+        metric="variance",
+    )
+
+
 def test_real_stage1_fixture_can_be_replayed_from_a_copied_pair(tmp_path: Path) -> None:
     """The committed pair remains usable when copied as a run artifact would be."""
 

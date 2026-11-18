@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import torch
 
@@ -1393,9 +1393,19 @@ def _inspect_v1(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryReco
     declared_mean = _as_float(metadata["mean"])
     declared_variance = _as_float(metadata["variance"])
     if not _close_or_same_nonfinite(
-        scan.mean, declared_mean, sample_count=scan.row_count
+        scan.mean,
+        declared_mean,
+        mean=scan.mean,
+        variance=scan.variance,
+        sample_count=scan.row_count,
+        metric="mean",
     ) or not _close_or_same_nonfinite(
-        scan.variance, declared_variance, sample_count=scan.row_count
+        scan.variance,
+        declared_variance,
+        mean=scan.mean,
+        variance=scan.variance,
+        sample_count=scan.row_count,
+        metric="variance",
     ):
         raise TamperedTrajectoryRecordError(
             "trajectory record mean/variance disagrees with its CSV: "
@@ -1534,9 +1544,19 @@ def _inspect_v2(
             "trajectory record mean/variance must be finite or valid non-finite sentinels"
         ) from exc
     if not _close_or_same_nonfinite(
-        scan.mean, declared_mean, sample_count=scan.row_count
+        scan.mean,
+        declared_mean,
+        mean=scan.mean,
+        variance=scan.variance,
+        sample_count=scan.row_count,
+        metric="mean",
     ) or not _close_or_same_nonfinite(
-        scan.variance, declared_variance, sample_count=scan.row_count
+        scan.variance,
+        declared_variance,
+        mean=scan.mean,
+        variance=scan.variance,
+        sample_count=scan.row_count,
+        metric="variance",
     ):
         raise TamperedTrajectoryRecordError(
             "trajectory record mean/variance disagrees with its CSV: "
@@ -2320,15 +2340,22 @@ def _same_float(left: float, right: float) -> bool:
     return left == right or (math.isnan(left) and math.isnan(right))
 
 
-def _reconciliation_tolerance(*, left: float, right: float, sample_count: int) -> float:
-    """Return a conservative float64 summation-error bound.
+def _reconciliation_tolerance(
+    *, mean: float, variance: float, sample_count: int, metric: Literal["mean", "variance"]
+) -> float:
+    """Return a conservative float64 bound for one reduced statistic.
 
     Parameters
     ----------
-    left, right : float
-        The independently reduced values being compared.
+    mean, variance : float
+        The independently reduced CSV values that define the writer's second
+        moment, ``E[x**2] = variance + mean**2``.
     sample_count : int
         Number of CSV rows contributing to the reduction.
+    metric : {"mean", "variance"}
+        Statistic being compared. The mean scales with the RMS value, while
+        the variance scales with the second moment because the writer computes
+        ``E[x**2] - mean**2``.
 
     Returns
     -------
@@ -2337,27 +2364,41 @@ def _reconciliation_tolerance(*, left: float, right: float, sample_count: int) -
 
     Notes
     -----
-    A binary64 operation has unit roundoff ``u = 2**-53``.  The standard
+    A binary64 operation has unit roundoff ``u = 2**-53``. The standard
     first-order bound for a sequence of ``n`` rounded operations is
-    ``gamma_n = n*u/(1 - n*u)``.  The writer and reader each perform a
+    ``gamma_n = n*u/(1 - n*u)``. The writer and reader each perform a
     reduction, then perform the mean/variance arithmetic, so eight ``gamma_n``
-    units cover those two reductions and the surrounding operations with a
-    conservative constant.  The ``max(..., 1.0)`` floor gives values near zero
-    a finite absolute allowance while retaining scale-aware relative behavior
-    for Stage 1 values.  This is many orders tighter than the former fixed
-    ``1e-9`` absolute allowance at variances around ``7e-6``.
+    units cover those reductions and surrounding operations conservatively.
+    The scale is dimensionally tied to the writer's second-moment algorithm;
+    there is deliberately no unit floor that would hide small variances.
     """
 
     if sample_count < 1:
         raise ValueError("sample_count must be positive")
+    second_moment = variance + mean * mean
+    if not math.isfinite(second_moment) or second_moment < 0.0:
+        raise ValueError("mean and variance must define a finite non-negative second moment")
     unit_roundoff = sys.float_info.epsilon / 2.0
     n_times_u = sample_count * unit_roundoff
     gamma_n = n_times_u / (1.0 - n_times_u)
-    scale = max(abs(left), abs(right), 1.0)
+    if metric == "mean":
+        scale = math.sqrt(second_moment)
+    elif metric == "variance":
+        scale = second_moment
+    else:
+        raise ValueError(f"unsupported reconciliation metric: {metric!r}")
     return 8.0 * gamma_n * scale
 
 
-def _close_or_same_nonfinite(left: float, right: float, *, sample_count: int) -> bool:
+def _close_or_same_nonfinite(
+    left: float,
+    right: float,
+    *,
+    mean: float,
+    variance: float,
+    sample_count: int,
+    metric: Literal["mean", "variance"],
+) -> bool:
     """Compare independently reduced floats using a dtype/size-aware bound.
 
     Matching non-finite values remain exact sentinels.  Finite values are
@@ -2367,7 +2408,10 @@ def _close_or_same_nonfinite(left: float, right: float, *, sample_count: int) ->
 
     if math.isfinite(left) and math.isfinite(right):
         return abs(left - right) <= _reconciliation_tolerance(
-            left=left, right=right, sample_count=sample_count
+            mean=mean,
+            variance=variance,
+            sample_count=sample_count,
+            metric=metric,
         )
     return _same_float(left, right)
 
