@@ -48,6 +48,7 @@ from ..placement import (
     physical_slots_from_allocation,
     placement_environment,
     read_child_placement,
+    routed_slots_from_allocation,
     slots_from_allocation,
     validate_physical_device_entitlements,
 )
@@ -192,6 +193,7 @@ def _with_child_placement(
     configured: ConfiguredRun,
     *,
     check_controller_affinity: bool = True,
+    routed_transport: bool = False,
 ) -> Any:
     """Overlay the one concrete slot and fenced identities for the child.
 
@@ -205,6 +207,11 @@ def _with_child_placement(
     enforcement is enabled only by the explicit sidecar output path.
 
     CPU-only slots intentionally retain an empty declared-device field.
+
+    routed_transport : bool, optional
+        Select the allocation-slots-v2 resolver for an attached routed
+        transport.  The default retains the allocation-slots-v1 resolver and
+        its legacy refusal behavior.
 
     A declared-GPU v2-placement slot also receives a worker-only GPU sampler
     evidence path and the slot's durable quarantine directory in the attempt
@@ -238,9 +245,10 @@ def _with_child_placement(
             "preset slot environment is missing declared device entitlement",
         )
     devices = values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "")
+    resolve_slots = routed_slots_from_allocation if routed_transport else physical_slots_from_allocation
     if not (slot_id and host and cpus):
         try:
-            slots = physical_slots_from_allocation(allocation)
+            slots = resolve_slots(allocation)
         except PlacementRefusal:
             raise
         except (BindingError, TypeError, ValueError) as error:
@@ -261,7 +269,7 @@ def _with_child_placement(
         # A prepared logical slot is not a physical host map.  Resolve it by
         # slot_id from the immutable scheduler metadata captured at attach.
         try:
-            slots = physical_slots_from_allocation(allocation)
+            slots = resolve_slots(allocation)
         except PlacementRefusal:
             raise
         except (BindingError, TypeError, ValueError) as error:
@@ -274,7 +282,7 @@ def _with_child_placement(
         values.update(slot.env)
     if v2_requested:
         try:
-            slots = physical_slots_from_allocation(allocation)
+            slots = resolve_slots(allocation)
             validate_physical_device_entitlements(slots)
             devices = ",".join(canonical_device_uuid(device) for device in devices.split(",") if device)
         except PlacementRefusal:

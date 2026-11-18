@@ -1130,6 +1130,7 @@ class ParslDispatcher(DispatcherContract):
                     # A remote slot's CPUs are not the controller's: the
                     # attached leaf checks them on its worker before science.
                     check_controller_affinity=self.transport is None,
+                    routed_transport=type(self.transport) is RoutedAttachedTransportSpec,
                 )
                 placement_refusal = _placement_refusal_from_environment(environment)
                 if placement_refusal is not None:

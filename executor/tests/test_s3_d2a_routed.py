@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 from concurrent.futures import Future
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -18,6 +19,8 @@ import pytest
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.contracts import AllocationId, BackendJobId
 from tpen_executor.dispatch import parsl as parsl_dispatch
+from tpen_executor.dispatch.contract import _with_child_placement
+from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.placement import AllocationSlot, PlacementRefusal, routed_slots_from_allocation
 from tpen_executor.storage import DirectoryStore
 from tpen_executor.lifecycle import AttachedAllocation
@@ -69,6 +72,13 @@ D2A_MUTANT_TABLE = (
         "new": "                if False:\n",
         "killer": "test_routed_cli_rejects_v2_node_set_or_capacity_mismatch",
         "suite": "executor", "assertion": "each pool worker count equals its node's slot count",
+    },
+    {
+        "id": "H7", "target": "executor/src/tpen_executor/dispatch/contract.py",
+        "old": "    resolve_slots = routed_slots_from_allocation if routed_transport else physical_slots_from_allocation\n",
+        "new": "    resolve_slots = physical_slots_from_allocation\n",
+        "killer": "test_launch_placement_accepts_routed_v2_declared_host_and_preserves_v1",
+        "suite": "executor", "assertion": "routed v2 launch placement resolves the declared host without v1 refusal",
     },
 )
 
@@ -202,6 +212,71 @@ def test_routed_slots_allow_multiple_slots_per_node_and_use_exact_captured_nodes
         routed_slots_from_allocation(_allocation(scheduler="node-a.example\nnode-b\n"))
 
 
+def test_launch_placement_accepts_routed_v2_declared_host_and_preserves_v1(tmp_path: Path) -> None:
+    """The routed launch path resolves v2 hosts while the default stays v1."""
+
+    cpu = min(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else 0
+    slot = AllocationSlot("slot-a", "node-a", (), (cpu,), (), ())
+    routed = ConfiguredAllocation(
+        AllocationId("placement-routed"),
+        BackendJobId("placement-job"),
+        {
+            "scheduler": {"pbs_nodefile_text": "node-a\n"},
+            "slots": {"schema": "tpen-executor/allocation-slots-v2", "slots": [slot.to_dict()]},
+        },
+    )
+    fence = SimpleNamespace(attempt_id=SimpleNamespace(value="attempt-a"), output_dir=str(tmp_path / "output"))
+    group = SimpleNamespace(identity="group-digest")
+    member = SimpleNamespace(task_id="task-a")
+    configured = SimpleNamespace(config={}, overrides=())
+    prepared = PreparedPythonEnvironment(sys.executable, None, dict(slot.env))
+
+    routed_environment = _with_child_placement(
+        prepared,
+        routed,
+        fence,
+        group,
+        member,
+        configured,
+        check_controller_affinity=False,
+        routed_transport=True,
+    )
+    assert routed_environment.env["TPEN_SLOT_NODE"] == "node-a"
+    assert routed_environment.env["TPEN_PLACEMENT_DECLARED_HOST"] == "node-a"
+    assert "TPEN_PLACEMENT_REFUSAL" not in routed_environment.env
+
+    with pytest.raises(PlacementRefusal, match="allocation slots must use schema 'tpen-executor/allocation-slots-v1'"):
+        _with_child_placement(
+            prepared,
+            routed,
+            fence,
+            group,
+            member,
+            configured,
+            check_controller_affinity=False,
+        )
+
+    legacy = ConfiguredAllocation(
+        AllocationId("placement-v1"),
+        BackendJobId("placement-job-v1"),
+        {
+            "scheduler": {"pbs_nodefile_text": "physical-a\n"},
+            "slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": [slot.with_node("logical-a").to_dict()]},
+        },
+    )
+    legacy_environment = _with_child_placement(
+        PreparedPythonEnvironment(sys.executable, None, {}),
+        legacy,
+        fence,
+        group,
+        member,
+        configured,
+        check_controller_affinity=False,
+    )
+    assert legacy_environment.env["TPEN_SLOT_NODE"] == "physical-a"
+    assert legacy_environment.env["TPEN_PLACEMENT_DECLARED_HOST"] == "physical-a"
+
+
 def test_routed_shape_requires_exact_node_set_and_capacity(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_parsl(monkeypatch)
     monkeypatch.setattr(parsl_dispatch, "_require_standard_worker", lambda _: None)
@@ -266,7 +341,7 @@ def test_d2a_mutant_table_targets_unique_executable_anchors() -> None:
     root = Path(__file__).parents[2]
     module = Path(__file__).read_text(encoding="utf-8")
     public_module = (root / "executor/tests/test_s3_transport_parsl.py").read_text(encoding="utf-8")
-    assert [row["id"] for row in D2A_MUTANT_TABLE] == ["H1", "H2", "H3", "H4", "H5", "H6"]
+    assert [row["id"] for row in D2A_MUTANT_TABLE] == ["H1", "H2", "H3", "H4", "H5", "H6", "H7"]
     for row in D2A_MUTANT_TABLE:
         source = (root / row["target"]).read_text(encoding="utf-8")
         assert source.count(row["old"]) == 1, row
