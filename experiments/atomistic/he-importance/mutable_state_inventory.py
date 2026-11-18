@@ -71,6 +71,18 @@ def _classification(path: str, target: str) -> tuple[str, str]:
         )
     if path == "sampler" or path == "trainer":
         return _ROOT_CLASSIFICATIONS[path]
+    if ".checkers." in path:
+        return (
+            "reconstructible",
+            "checker has explicit constructor state and is rebuilt by its owning callback",
+        )
+    if path.endswith(".schedule"):
+        return (
+            "reconstructible",
+            "schedule is a pure completed-update function, not a private counter",
+        )
+    if path.endswith(".allocator_probe"):
+        return ("allocation-local", "allocator measurement is local to one process allocation")
     if path.startswith("callbacks."):
         if target in SUPPORTED_CALLBACK_TARGETS:
             return (
@@ -85,18 +97,6 @@ def _classification(path: str, target: str) -> tuple[str, str]:
                 "explicit native logger allowlist entry; logger state is rebuilt from config",
             )
         return ("typed-refused", "logger target is absent from the native profile")
-    if ".checkers." in path:
-        return (
-            "reconstructible",
-            "checker has explicit constructor state and is rebuilt by its owning callback",
-        )
-    if path.endswith(".schedule"):
-        return (
-            "reconstructible",
-            "schedule is a pure completed-update function, not a private counter",
-        )
-    if path.endswith(".allocator_probe"):
-        return ("allocation-local", "allocator measurement is local to one process allocation")
     return ("reconstructible", "nested constructor is rebuilt from the committed config")
 
 
