@@ -348,3 +348,121 @@ def test_d2a_mutant_table_targets_unique_executable_anchors() -> None:
         assert row["old"] != row["new"] and row["suite"] == "executor"
         ast.parse(source.replace(row["old"], row["new"]))
         assert f"def {row['killer']}(" in module + public_module
+
+
+@pytest.mark.parametrize("same_node", [False, True], ids=["different-nodes", "same-node"])
+def test_review_r1_cpu_ownership_is_node_local(same_node: bool) -> None:
+    """CPU zero on another machine is not the same CPU entitlement."""
+
+    from tpen_executor.placement import BindingError
+
+    nodes = ("node-a", "node-a" if same_node else "node-b")
+    slots = [AllocationSlot(f"slot-{index}", node, (), (0,), (), ()) for index, node in enumerate(nodes)]
+    allocation = ConfiguredAllocation(
+        AllocationId("review-cpus"), BackendJobId("review-job"),
+        {
+            "scheduler": {"pbs_nodefile_text": "\n".join(dict.fromkeys(nodes)) + "\n"},
+            "slots": {"schema": "tpen-executor/allocation-slots-v2", "slots": [slot.to_dict() for slot in slots]},
+        },
+    )
+    if same_node:
+        with pytest.raises(BindingError, match="CPU entitlements"):
+            routed_slots_from_allocation(allocation)
+    else:
+        assert routed_slots_from_allocation(allocation) == tuple(slots)
+
+
+def test_review_r1_real_htex_routed_config_passes_its_validator(tmp_path: Path) -> None:
+    """Consume real HTEX constructor output without starting a DFK or workers."""
+
+    pytest.importorskip("parsl")
+    spec = _spec()
+    dispatcher = parsl_dispatch.ParslDispatcher(SimpleNamespace(materialize=lambda _env=None: {}), transport=spec)
+    config = dispatcher._attached_routed_config(spec, str(tmp_path / "parsl"))
+    assert dispatcher._validate_routed_config(config, spec) == ("pool-a", "pool-b")
+
+
+@pytest.mark.parametrize("via_path", [False, True], ids=["captured-text", "nodefile-path"])
+def test_review_r1_pbs_capture_preserves_exact_routed_names(tmp_path: Path, via_path: bool) -> None:
+    """Real allocation capture must preserve the spelling used by v2 pools."""
+
+    raw_hosts = "Node-A.example\nnode-b.example\n"
+    nodefile = tmp_path / "nodes"
+    nodefile.write_text(raw_hosts, encoding="utf-8")
+    scheduler = {"pbs_nodefile_path": str(nodefile)} if via_path else {"pbs_nodefile_text": raw_hosts}
+    slots = [
+        AllocationSlot(f"slot-{index}", node, (), (index,), (), ())
+        for index, node in enumerate(("Node-A.example", "node-b.example"))
+    ]
+    allocation = ConfiguredAllocation(
+        AllocationId("review-pbs"), BackendJobId("review-job"),
+        {"scheduler": scheduler, "slots": {"schema": "tpen-executor/allocation-slots-v2", "slots": [slot.to_dict() for slot in slots]}},
+    )
+    # Consume the actual frozen producer output after the input file changes.
+    nodefile.write_text("replacement-node\n", encoding="utf-8")
+    round_tripped = ConfiguredAllocation.from_mapping(allocation.to_dict())
+    assert [slot.node for slot in routed_slots_from_allocation(round_tripped)] == ["Node-A.example", "node-b.example"]
+
+
+def test_review_r1_pbs_v1_path_keeps_legacy_normalization(tmp_path: Path) -> None:
+    """An exact-name v2 repair must leave v1's short-host policy intact."""
+
+    from tpen_executor.placement import physical_slots_from_allocation
+
+    nodefile = tmp_path / "nodes"
+    nodefile.write_text("Node-A.example\n", encoding="utf-8")
+    slot = AllocationSlot("slot-a", "logical-a", (), (0,), (), ())
+    allocation = ConfiguredAllocation(
+        AllocationId("review-pbs-v1"), BackendJobId("review-job"),
+        {
+            "scheduler": {"pbs_nodefile_path": str(nodefile)},
+            "slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": [slot.to_dict()]},
+        },
+    )
+    nodefile.write_text("replacement-node\n", encoding="utf-8")
+    assert [slot.node for slot in physical_slots_from_allocation(allocation)] == ["node-a"]
+
+
+@pytest.mark.parametrize("reply_time", [0.0, 6.0], ids=["on-time", "late"])
+def test_review_r1_routed_preflight_checks_completion_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reply_time: float,
+) -> None:
+    """Successful facts arriving after the shared bound must still refuse."""
+
+    _install_fake_parsl(monkeypatch)
+    now = [0.0]
+    monkeypatch.setattr(parsl_dispatch, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    spec = _spec()  # preflight_timeout=5, two workers on A and one on B
+    hosts = {pool.label: pool.node for pool in spec.pools}
+
+    def python_app(*, executors, **_kwargs):
+        label, = executors
+
+        def decorate(_function):
+            def submit(root, *_args):
+                class ProbeFuture:
+                    def result(self, timeout):
+                        # Model a reply which arrives during the currently
+                        # allowed five-second grace, without sleeping.
+                        delay = max(reply_time - now[0], 0)
+                        if delay > timeout:
+                            now[0] += timeout
+                            raise TimeoutError("probe is still pending")
+                        now[0] += delay
+                        return {"host": hosts[label], "pid": 1, "root": os.path.realpath(root)}
+
+                return ProbeFuture()
+
+            return submit
+
+        return decorate
+
+    monkeypatch.setattr(sys.modules["parsl.app.app"], "python_app", python_app)
+    dispatcher = parsl_dispatch.ParslDispatcher(SimpleNamespace(materialize=lambda _env=None: {}), transport=spec)
+    lifecycle = AttachedAllocation(_allocation(), DirectoryStore(tmp_path / "store"))
+    if reply_time > spec.preflight_timeout:
+        with pytest.raises(parsl_dispatch.RoutedTransportPreflightError):
+            dispatcher._preflight_routed_store(lifecycle, spec)
+    else:
+        dispatcher._preflight_routed_store(lifecycle, spec)
+    assert not (Path(lifecycle.store.root) / "groups").exists()
