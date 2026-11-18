@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -12,9 +15,16 @@ from experiments.atomistic.stage1.protocol import (
     SYSTEMS,
     bind_evaluation_manifest,
     build_manifest,
+    config_identities,
     evaluation_seed,
     manifest_hash,
 )
+from experiments.atomistic.stage1 import eval as stage1_eval
+from experiments.atomistic.stage1 import train as stage1_train
+from experiments.atomistic.stage1.collect import collect
+from experiments.atomistic.stage1.launch import _binding_token, row_overrides
+from experiments.toolkit.run_paths import resolve_run_dir
+from experiments.toolkit.trajectory_records import inspect_eval_run, inspect_trajectory_record
 from experiments.atomistic.stage1.train import prepare_initial_checkpoint_config
 from tpen.run import load_config
 
@@ -172,3 +182,122 @@ def test_positive_only_config_is_unchanged_by_zero_preparation(system: str = "he
     assert list(cfg.checkpoint_steps) == before == [7]
     assert list(cfg.callbacks[4].schedule.updates) == [7]
     assert len(cfg.callbacks) == callback_count
+
+
+@pytest.mark.integration
+@pytest.mark.stage1_real_producer
+def test_zero_and_positive_checkpoint_real_producer_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Produce, evaluate, inspect, and collect zero plus one on Cannon."""
+
+    source_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True,
+        cwd=Path(__file__).resolve().parents[4],
+    ).strip()
+    protocol = Protocol(
+        smoke_updates=1,
+        smoke_walkers=1,
+        lineage_updates=1,
+        lineage_walkers=2,
+        lineages=1,
+        eval_streams=4,
+        eval_walkers=2,
+        eval_draws=2,
+    )
+    systems = ("he",)
+    config_sha256 = config_identities(config_root=CONFIG_ROOT, systems=systems)
+    phase1_rows = build_manifest(
+        protocol=protocol,
+        source_sha=source_sha,
+        config_sha256=config_sha256,
+        checkpoints=[0, 1],
+        lineage_seeds=[11],
+        checkpoint_sha256={},
+        results_root=str(tmp_path / "results"),
+        systems=systems,
+        phase=1,
+        device="cpu",
+    )
+    train_row = next(row for row in phase1_rows if row["kind"] == "train")
+    train_overrides = row_overrides(train_row) + [
+        "sampler.burn_in=1", "sampler.n_steps=1",
+    ]
+
+    def run_train() -> None:
+        monkeypatch.setattr(
+            sys, "argv", [
+                "stage1-train", "--config", str(CONFIG_ROOT / "he" / "train.yaml"),
+                "--kind", "train", *train_overrides,
+                "--binding", _binding_token(train_row),
+            ],
+        )
+        assert stage1_train.main() == 0
+
+    run_train()
+    run_dir = resolve_run_dir(train_row)
+    digests = {
+        checkpoint: hashlib.sha256(
+            (run_dir / "checkpoints" / f"step_{checkpoint:06d}" / "model.pt").read_bytes()
+        ).hexdigest()
+        for checkpoint in (0, 1)
+    }
+    assert all(
+        (run_dir / "checkpoints" / f"step_{checkpoint:06d}" / "COMPLETE").is_file()
+        for checkpoint in (0, 1)
+    )
+    phase1_hash = manifest_hash(phase1_rows)
+    phase2_rows = bind_evaluation_manifest(
+        phase1_rows=phase1_rows,
+        checkpoints=[0, 1],
+        checkpoint_evidence={
+            "schema": "stage1-checkpoint-evidence/v1",
+            "phase1_manifest_hash": phase1_hash,
+            "phase1_train_row_hashes": {
+                f"{train_row['system']}:{train_row['lineage']}": manifest_hash([train_row]),
+            },
+            "checkpoints": {
+                f"he:0:{checkpoint}": digest for checkpoint, digest in digests.items()
+            },
+        },
+        protocol=protocol,
+        phase1_manifest_hash=phase1_hash,
+        source_sha=source_sha,
+        config_sha256=config_sha256,
+        device="cpu",
+    )
+    eval_rows = [row for row in phase2_rows if row["kind"] == "eval"]
+    for row in eval_rows:
+        overrides = row_overrides(row) + [
+            "evaluation_sampler.burn_in=1", "evaluation_sampler.n_steps=1",
+        ]
+        monkeypatch.setattr(
+            sys, "argv", [
+                "stage1-eval", "--config", str(CONFIG_ROOT / "he" / "eval.yaml"),
+                "--kind", "eval", *overrides,
+                "--binding", _binding_token(row),
+                "--expected-checkpoint-sha256", str(row["checkpoint_sha256"]),
+            ],
+        )
+        assert stage1_eval.main() == 0
+        evaluated = inspect_eval_run(resolve_run_dir(row))
+        assert evaluated["verdict"] == "completed"
+        metadata = resolve_run_dir(row) / "mcmc_energy" / "sampled_eval_table.metadata.json"
+        inspected = inspect_trajectory_record(
+            metadata,
+            expected_checkpoint_sha256=str(row["checkpoint_sha256"]),
+        )
+        assert inspected.model_provenance == "checkpoint"
+        assert inspected.checkpoint_sha256 == row["checkpoint_sha256"]
+
+    document = {
+        "schema": "stage1/v3",
+        "manifest_hash": manifest_hash(phase2_rows),
+        "rows": phase2_rows,
+    }
+    collected = collect(document)
+    assert len(collected["records"]) == protocol.eval_streams * 2
+    assert len(collected["aggregates"]) == 2
+    assert {aggregate["checkpoint"] for aggregate in collected["aggregates"]} == {0, 1}
+    assert all(aggregate["stream_count"] == protocol.eval_streams
+               for aggregate in collected["aggregates"])
