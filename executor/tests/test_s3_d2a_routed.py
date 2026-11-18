@@ -32,42 +32,42 @@ D2A_MUTANT_TABLE = (
         "id": "H1", "target": PARSL_MODULE,
         "old": '            if facts["root"] != real_root or facts["host"] != pool.node or type(facts["pid"]) is not int or facts["pid"] <= 0:\n',
         "new": '            if facts["root"] != real_root or type(facts["pid"]) is not int or facts["pid"] <= 0:\n',
-        "killer": "test_routed_preflight_rejects_wrong_hostname_before_begin",
+        "killer": "test_routed_run_rejects_wrong_probe_hostname_before_begin",
         "suite": "executor", "assertion": "every probe host equals its pool node before lifecycle.begin",
     },
     {
         "id": "H2", "target": PARSL_MODULE,
         "old": "            if pool_nodes != set(counts):\n",
         "new": "            if False:\n",
-        "killer": "test_routed_shape_requires_exact_node_set_and_capacity",
+        "killer": "test_routed_cli_rejects_v2_node_set_or_capacity_mismatch",
         "suite": "executor", "assertion": "pool and captured allocation node sets are equal",
     },
     {
         "id": "H3", "target": PARSL_MODULE,
         "old": "                nodes_per_block=1,\n",
         "new": "                nodes_per_block=len(transport.pools),\n",
-        "killer": "test_routed_config_builds_one_single_node_pool_per_node",
+        "killer": "test_routed_composition_dispatches_v2_transport_file",
         "suite": "executor", "assertion": "each v2 pool is a single-node provider",
     },
     {
         "id": "H4", "target": PARSL_MODULE,
         "old": "                executors=[pool.label],\n",
         "new": "                executors=list(self._active_executor_labels),\n",
-        "killer": "test_routed_preflight_submits_exact_workers_to_each_label",
+        "killer": "test_routed_composition_dispatches_v2_transport_file",
         "suite": "executor", "assertion": "a pool's probes use only that pool label",
     },
     {
         "id": "H5", "target": PARSL_MODULE,
-        "old": "                if type(self.transport) is RoutedAttachedTransportSpec:\n                    config = self._attached_routed_config(self.transport, run_dir)\n",
-        "new": "                if False:\n                    config = self._attached_routed_config(self.transport, run_dir)\n",
-        "killer": "test_routed_config_is_not_validated_as_v1",
+        "old": "                    labels = self._validate_routed_config(config, self.transport)\n",
+        "new": "                    labels = self._validate_attached_config(config, self.transport)\n",
+        "killer": "test_routed_run_uses_routed_validator",
         "suite": "executor", "assertion": "v2 dispatch selects its multi-pool validator",
     },
     {
         "id": "H6", "target": PARSL_MODULE,
         "old": "                if counts[pool.node] != pool.workers:\n",
         "new": "                if False:\n",
-        "killer": "test_routed_shape_requires_exact_node_set_and_capacity",
+        "killer": "test_routed_cli_rejects_v2_node_set_or_capacity_mismatch",
         "suite": "executor", "assertion": "each pool worker count equals its node's slot count",
     },
 )
@@ -259,10 +259,11 @@ def test_routed_config_is_not_validated_as_v1(monkeypatch: pytest.MonkeyPatch) -
 def test_d2a_mutant_table_targets_unique_executable_anchors() -> None:
     root = Path(__file__).parents[2]
     module = Path(__file__).read_text(encoding="utf-8")
+    public_module = (root / "executor/tests/test_s3_transport_parsl.py").read_text(encoding="utf-8")
     assert [row["id"] for row in D2A_MUTANT_TABLE] == ["H1", "H2", "H3", "H4", "H5", "H6"]
     for row in D2A_MUTANT_TABLE:
         source = (root / row["target"]).read_text(encoding="utf-8")
         assert source.count(row["old"]) == 1, row
         assert row["old"] != row["new"] and row["suite"] == "executor"
         ast.parse(source.replace(row["old"], row["new"]))
-        assert f"def {row['killer']}(" in module
+        assert f"def {row['killer']}(" in module + public_module

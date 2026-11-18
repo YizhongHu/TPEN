@@ -373,6 +373,92 @@ def _transport(**changes) -> dict:
     return spec
 
 
+def _routed_transport_payload() -> dict:
+    return {
+        "schema": parsl_dispatch.ROUTED_ATTACHED_TRANSPORT_SCHEMA,
+        "executor": "htex",
+        "provider": "local",
+        "launcher": "mpiexec",
+        "pools": [
+            {
+                "node": "node-a",
+                "label": "pool-a",
+                "workers": 1,
+                "worker_init": "export D2A_POOL=A",
+                "address": None,
+                "mpiexec_bind_cmd": "--bind-to",
+                "mpiexec_overrides": "--a",
+            },
+            {
+                "node": "node-b",
+                "label": "pool-b",
+                "workers": 1,
+                "worker_init": "export D2A_POOL=B",
+                "address": "127.0.0.1",
+                "mpiexec_bind_cmd": "--bind-to",
+                "mpiexec_overrides": "--b",
+            },
+        ],
+        "preflight_timeout": 5,
+        "teardown_timeout": 2,
+    }
+
+
+def _routed_allocation(nodes: tuple[str, ...] = ("node-a", "node-b")) -> ConfiguredAllocation:
+    available_cpus = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(len(nodes)))
+    if len(available_cpus) < len(nodes):
+        available_cpus = list(range(len(nodes)))
+    slots = [
+        AllocationSlot(f"routed-slot-{index}", node, (), (available_cpus[index],), (), ()).to_dict()
+        for index, node in enumerate(nodes)
+    ]
+    return ConfiguredAllocation(
+        AllocationId("s3b-routed-allocation"),
+        BackendJobId("s3b-routed-job"),
+        {
+            "scheduler": {"pbs_nodefile_text": "\n".join(dict.fromkeys(nodes)) + "\n"},
+            "slots": {"schema": "tpen-executor/allocation-slots-v2", "slots": slots},
+        },
+    )
+
+
+def _attach_routed_probe_answers(dispatcher: object, fake_parsl: _Parsl, hosts: dict[str, str]) -> list[str]:
+    """Make only the production probe app synthetic; leaves stay fake-Parsl remote apps."""
+
+    probe_labels: list[str] = []
+    base_factory = dispatcher._python_app_factory  # type: ignore[attr-defined]
+
+    def app_factory(*, data_flow_kernel=None, cache=False, executors="all"):
+        labels = tuple(executors) if not isinstance(executors, str) else (executors,)
+
+        def decorate(function):
+            if function.__name__ != "_shared_store_probe":
+                return base_factory(data_flow_kernel=data_flow_kernel, cache=cache, executors=executors)(function)
+
+            def submit(*args, **_kwargs):
+                label = labels[0]
+                probe_labels.append(label)
+                fake_parsl.submissions.append(
+                    {
+                        "function": function.__name__,
+                        "executors": list(labels),
+                        "args": args,
+                        "dfk": data_flow_kernel,
+                        "remote": True,
+                    }
+                )
+                future: Future = Future()
+                future.set_result({"host": hosts[label], "pid": 1, "root": os.path.realpath(args[0])})
+                return future
+
+            return submit
+
+        return decorate
+
+    dispatcher._python_app_factory = app_factory  # type: ignore[attr-defined]
+    return probe_labels
+
+
 def _cli_inputs(tmp_path: Path, allocation: ConfiguredAllocation, *, runner: str = "tpen_executor.runners.TPENCommand") -> dict[str, Path | ReadyGroup]:
     """Write one CLI-shaped group, allocation, worker, and run table."""
 
@@ -657,6 +743,95 @@ def test_cli_admitted_plan_dispatches_allocation_binding_with_real_dispatcher(
     assert [type(executor) for executor in dfk.config.executors] == [_HTEX]
     assert dfk.config.executors[0].label == LABEL
     assert [item["function"] for item in fake_parsl.submissions] == ["_shared_store_probe", "run_leaf"]
+
+
+def test_routed_composition_dispatches_v2_transport_file(tmp_path: Path, fake_parsl: _Parsl) -> None:
+    """D2a public path: decode, admit, run and publish a two-pool v2 manifest."""
+
+    allocation = _routed_allocation()
+    paths = _cli_inputs(tmp_path, allocation)
+    transport = tmp_path / "routed-transport.json"
+    transport.write_text(json.dumps(_routed_transport_payload()), encoding="utf-8")
+
+    plan = composition.admit(
+        paths["input"], paths["store"], paths["allocation"], paths["worker"], paths["runs"],
+        dispatcher_name="parsl", transport_path=transport,
+    )
+    probe_labels = _attach_routed_probe_answers(plan.dispatcher, fake_parsl, {"pool-a": "node-a", "pool-b": "node-b"})
+    manifest = composition.dispatch(plan)
+
+    assert _summary(manifest) == {"member": ("completed", False)}
+    assert json.loads((Path(paths["store"]) / "run-manifest.json").read_text(encoding="utf-8"))["schema"] == "tpen-executor/run-manifest-v2"
+    assert probe_labels == ["pool-a", "pool-b"]
+    assert [record["executors"] for record in fake_parsl.submissions[:2]] == [["pool-a"], ["pool-b"]]
+    [dfk] = fake_parsl.dfks
+    assert [executor.label for executor in dfk.config.executors] == ["pool-a", "pool-b"]
+    assert [executor.provider.options["nodes_per_block"] for executor in dfk.config.executors] == [1, 1]
+    assert [executor.provider.options["worker_init"] for executor in dfk.config.executors] == [
+        "export D2A_POOL=A", "export D2A_POOL=B",
+    ]
+
+
+def test_routed_run_rejects_wrong_probe_hostname_before_begin(tmp_path: Path, fake_parsl: _Parsl) -> None:
+    """D2a public run path: a wrong routed probe has no lifecycle or science side effect."""
+
+    group = _group("s3b-routed-wrong-host", "member")
+    lifecycle = AttachedAllocation(_routed_allocation(), DirectoryStore(tmp_path / "store"))
+    dispatcher = parsl_dispatch.ParslDispatcher(
+        _worker(tmp_path), transport=parsl_dispatch.RoutedAttachedTransportSpec.from_mapping(_routed_transport_payload()),
+    )
+    _attach_routed_probe_answers(dispatcher, fake_parsl, {"pool-a": "node-a", "pool-b": "wrong-node"})
+
+    with pytest.raises(parsl_dispatch.RoutedTransportPreflightError):
+        dispatcher.run(group, _runs(tmp_path, "member"), lifecycle, timeout=60)
+
+    assert not (Path(lifecycle.store.root) / "groups").exists()
+    assert lifecycle.store.manifest(group).attempts == ()
+    assert fake_parsl.leaf_submissions() == []
+    assert not list(Path(tmp_path).rglob("observed.json"))
+
+
+def test_routed_run_uses_routed_validator(tmp_path: Path, fake_parsl: _Parsl) -> None:
+    """The public run path must accept its two-executor v2 config with the v2 validator."""
+
+    group = _group("s3b-routed-validator", "member")
+    lifecycle = AttachedAllocation(_routed_allocation(), DirectoryStore(tmp_path / "store"))
+    dispatcher = parsl_dispatch.ParslDispatcher(
+        _worker(tmp_path), transport=parsl_dispatch.RoutedAttachedTransportSpec.from_mapping(_routed_transport_payload()),
+    )
+    _attach_routed_probe_answers(dispatcher, fake_parsl, {"pool-a": "node-a", "pool-b": "node-b"})
+
+    manifest = dispatcher.run(group, _runs(tmp_path, "member"), lifecycle, timeout=60)
+
+    assert _summary(manifest) == {"member": ("completed", False)}
+    assert len(fake_parsl.dfks[0].config.executors) == 2
+
+
+@pytest.mark.parametrize("case", ["node-set", "capacity"], ids=["node-set-mismatch", "capacity-mismatch"])
+def test_routed_cli_rejects_v2_node_set_or_capacity_mismatch(
+    tmp_path: Path, fake_parsl: _Parsl, capsys: pytest.CaptureFixture[str], case: str,
+) -> None:
+    """D2a public CLI admission refuses v2 topology before reserving the store."""
+
+    nodes = ("node-a", "node-c") if case == "node-set" else ("node-a", "node-a", "node-b")
+    paths = _cli_inputs(tmp_path, _routed_allocation(nodes))
+    transport = tmp_path / "routed-transport.json"
+    transport.write_text(json.dumps(_routed_transport_payload()), encoding="utf-8")
+
+    code = cli.main(
+        [
+            "dispatch", "--input", str(paths["input"]), "--store", str(paths["store"]),
+            "--allocation", str(paths["allocation"]), "--worker-config", str(paths["worker"]),
+            "--runs", str(paths["runs"]), "--dispatcher", "parsl", "--transport", str(transport),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 2 and captured.out == ""
+    error = json.loads(captured.err)
+    assert error["schema"] == "tpen-executor/cli-error-v1"
+    assert error["code"] == "dispatcher-admission"
+    assert not Path(paths["store"]).exists()
+    assert fake_parsl.dfks == [] and fake_parsl.submissions == []
 
 
 # ------------------------------------------------------------- submission
