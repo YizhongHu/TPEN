@@ -80,6 +80,34 @@ D2A_MUTANT_TABLE = (
         "killer": "test_launch_placement_accepts_routed_v2_declared_host_and_preserves_v1",
         "suite": "executor", "assertion": "v2 resolver not used under routed transport",
     },
+    {
+        "id": "F1", "target": PARSL_MODULE,
+        "old": "            if not isinstance(available_accelerators, (list, tuple)) or available_accelerators:\n",
+        "new": "            if available_accelerators != ():\n",
+        "killer": "test_review_r1_real_htex_routed_config_passes_its_validator",
+        "suite": "executor", "assertion": "an empty list from real HTEX is equivalent to an empty tuple",
+    },
+    {
+        "id": "F2", "target": PLACEMENT_MODULE,
+        "old": "    cpu_entitlements = [(slot.node, cpu) for slot in decoded for cpu in slot.cpus]\n",
+        "new": "    cpu_entitlements = [cpu for slot in decoded for cpu in slot.cpus]\n",
+        "killer": "test_review_r1_cpu_ownership_is_node_local",
+        "suite": "executor", "assertion": "CPU ownership is keyed by physical node and CPU",
+    },
+    {
+        "id": "F3", "target": "executor/src/tpen_executor/allocations.py",
+        "old": "                        captured_scheduler_host_map(scheduler)\n                        if routed_slots\n                        else scheduler_host_map(scheduler, environ={})\n",
+        "new": "                        scheduler_host_map(scheduler, environ={})\n",
+        "killer": "test_review_r1_pbs_capture_preserves_exact_routed_names",
+        "suite": "executor", "assertion": "v2 captures exact PBS host spellings before freezing the allocation",
+    },
+    {
+        "id": "F4", "target": PARSL_MODULE,
+        "old": "                facts = future.result(timeout=max(deadline - time.monotonic(), 0))\n",
+        "new": "                facts = future.result(timeout=max(deadline - time.monotonic(), 0) + 5)\n",
+        "killer": "test_review_r1_routed_preflight_checks_completion_deadline",
+        "suite": "executor", "assertion": "late successful preflight facts refuse before lifecycle.begin",
+    },
 )
 
 
@@ -341,7 +369,9 @@ def test_d2a_mutant_table_targets_unique_executable_anchors() -> None:
     root = Path(__file__).parents[2]
     module = Path(__file__).read_text(encoding="utf-8")
     public_module = (root / "executor/tests/test_s3_transport_parsl.py").read_text(encoding="utf-8")
-    assert [row["id"] for row in D2A_MUTANT_TABLE] == ["H1", "H2", "H3", "H4", "H5", "H6", "H7"]
+    assert [row["id"] for row in D2A_MUTANT_TABLE] == [
+        "H1", "H2", "H3", "H4", "H5", "H6", "H7", "F1", "F2", "F3", "F4",
+    ]
     for row in D2A_MUTANT_TABLE:
         source = (root / row["target"]).read_text(encoding="utf-8")
         assert source.count(row["old"]) == 1, row

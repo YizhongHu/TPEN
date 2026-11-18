@@ -880,8 +880,8 @@ def routed_slots_from_allocation(allocation: ConfiguredAllocation) -> tuple[Allo
     devices = [device for slot in decoded for device in slot.devices]
     if len(set(devices)) != len(devices):
         raise BindingError("routed allocation slots must have disjoint device entitlements")
-    cpus = [cpu for slot in decoded for cpu in slot.cpus]
-    if len(set(cpus)) != len(cpus):
+    cpu_entitlements = [(slot.node, cpu) for slot in decoded for cpu in slot.cpus]
+    if len(set(cpu_entitlements)) != len(cpu_entitlements):
         raise BindingError("routed allocation slots must have disjoint CPU entitlements")
     scheduler = allocation.facts.get("scheduler", allocation.facts.get("scheduler_host_map"))
     if scheduler is None:

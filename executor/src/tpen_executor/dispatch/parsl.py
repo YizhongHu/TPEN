@@ -1609,9 +1609,12 @@ class ParslDispatcher(DispatcherContract):
                 or getattr(launcher, "overrides", None) != pool.mpiexec_overrides
             ):
                 raise UnsupportedTransportError("routed pool launcher options differ from the transport")
+            available_accelerators = setting(executor, "available_accelerators")
+            if not isinstance(available_accelerators, (list, tuple)) or available_accelerators:
+                raise UnsupportedTransportError("routed pools must not assign accelerators")
             if any(setting(executor, name) != expected for name, expected in {
                 "address": pool.address, "max_workers_per_node": pool.workers,
-                "cpu_affinity": "none", "available_accelerators": (), "prefetch_capacity": 0,
+                "cpu_affinity": "none", "prefetch_capacity": 0,
             }.items()):
                 raise UnsupportedTransportError("routed pool executor options differ from the transport")
             labels.append(pool.label)
@@ -1692,11 +1695,15 @@ class ParslDispatcher(DispatcherContract):
                 futures.append((pool, app(root, real_root, nonce, expected, transport.preflight_timeout)))
         for pool, future in futures:
             try:
-                facts = future.result(timeout=max(deadline - time.monotonic(), 0) + 5)
+                facts = future.result(timeout=max(deadline - time.monotonic(), 0))
             except Exception as error:
                 raise RoutedTransportPreflightError(
                     f"routed pool {pool.label!r} failed the shared-store preflight: {error!r}"
                 ) from error
+            if time.monotonic() > deadline:
+                raise RoutedTransportPreflightError(
+                    f"routed pool {pool.label!r} returned preflight facts after the acceptance deadline"
+                )
             if not isinstance(facts, dict) or set(facts) != {"host", "pid", "root"}:
                 raise RoutedTransportPreflightError(f"routed pool {pool.label!r} returned malformed preflight facts")
             if facts["root"] != real_root or facts["host"] != pool.node or type(facts["pid"]) is not int or facts["pid"] <= 0:
