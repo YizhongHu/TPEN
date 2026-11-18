@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 from experiments.atomistic.stage1.protocol import (
     Protocol,
     ProtocolError,
+    STAGE1_PROTOCOL,
     SYSTEMS,
     bind_evaluation_manifest,
     build_manifest,
@@ -30,6 +32,40 @@ from tpen.run import load_config
 
 
 CONFIG_ROOT = Path(__file__).parents[1] / "configs"
+NO_ZERO_FIXTURE = Path(__file__).with_name("fixtures") / "no-zero-manifest-v3.json"
+
+
+def _no_zero_manifest_bytes() -> bytes:
+    """Render the fixed no-zero manifest using the current protocol code."""
+
+    fixture = json.loads(NO_ZERO_FIXTURE.read_text(encoding="utf-8"))
+    systems = tuple(fixture["systems"])
+    checkpoint = int(fixture["checkpoints"][0])
+    checkpoint_sha256 = {
+        (system, lineage, checkpoint): fixture["checkpoint_sha256"]
+        for system in systems
+        for lineage in range(len(fixture["lineage_seeds"]))
+    }
+    rows = build_manifest(
+        protocol=STAGE1_PROTOCOL,
+        source_sha=fixture["source_sha"],
+        config_sha256=fixture["config_sha256"],
+        checkpoints=fixture["checkpoints"],
+        lineage_seeds=fixture["lineage_seeds"],
+        checkpoint_sha256=checkpoint_sha256,
+        results_root=fixture["results_root"],
+        expected_physical_system_id=fixture["physical_system_id"],
+        systems=systems,
+        phase=int(fixture["phase"]),
+    )
+    document = {
+        "schema": "stage1/v3",
+        "phase": int(fixture["phase"]),
+        "config_identity_rule": "stage1-config-v1",
+        "manifest_hash": manifest_hash(rows),
+        "rows": rows,
+    }
+    return (json.dumps(document, indent=2) + "\n").encode("utf-8")
 
 
 @pytest.fixture
@@ -158,6 +194,21 @@ def test_positive_row_identity_does_not_depend_on_zero_prefix(
     assert evaluation_seed(system="he", lineage=0, checkpoint=7, stream=2) == expected_he_seed
 
 
+def test_no_zero_manifest_matches_pre_change_golden_and_detects_non_id_change() -> None:
+    """The no-zero full manifest stays byte-stable and compares every field."""
+
+    fixture = json.loads(NO_ZERO_FIXTURE.read_text(encoding="utf-8"))
+    rendered = _no_zero_manifest_bytes()
+    assert len(rendered) == fixture["manifest_bytes"]
+    assert hashlib.sha256(rendered).hexdigest() == fixture["manifest_sha256"]
+
+    perturbed = json.loads(rendered)
+    perturbed["rows"][0]["walkers"] += 1
+    perturbed_bytes = (json.dumps(perturbed, indent=2) + "\n").encode("utf-8")
+    assert perturbed_bytes != rendered
+    assert hashlib.sha256(perturbed_bytes).hexdigest() != fixture["manifest_sha256"]
+
+
 def test_phase2_refuses_missing_zero_digest(tiny_protocol: Protocol, tmp_path: Path) -> None:
     """A zero row cannot be created without its producer digest."""
 
@@ -174,6 +225,34 @@ def test_phase2_refuses_missing_zero_digest(tiny_protocol: Protocol, tmp_path: P
         "checkpoints": {},
     }
     with pytest.raises(ProtocolError, match="missing digest"):
+        bind_evaluation_manifest(
+            phase1_rows=phase1_rows,
+            checkpoints=[0],
+            checkpoint_evidence=evidence,
+            protocol=tiny_protocol,
+            phase1_manifest_hash=phase1_hash,
+        )
+
+
+def test_phase2_refuses_wrong_zero_digest(tiny_protocol: Protocol, tmp_path: Path) -> None:
+    """Phase 2 rejects a malformed digest for the step-0 checkpoint."""
+
+    phase1_rows = _phase1_rows(tiny_protocol, [0, 7], tmp_path)
+    phase1_hash = manifest_hash(phase1_rows)
+    train_rows = [row for row in phase1_rows if row["kind"] == "train"]
+    evidence = {
+        "schema": "stage1-checkpoint-evidence/v1",
+        "phase1_manifest_hash": phase1_hash,
+        "phase1_train_row_hashes": {
+            f"{row['system']}:{row['lineage']}": manifest_hash([row])
+            for row in train_rows
+        },
+        "checkpoints": {
+            f"{row['system']}:{row['lineage']}:0": "not-the-step-zero-digest"
+            for row in train_rows
+        },
+    }
+    with pytest.raises(ProtocolError, match="checkpoint evidence checkpoints"):
         bind_evaluation_manifest(
             phase1_rows=phase1_rows,
             checkpoints=[0],
