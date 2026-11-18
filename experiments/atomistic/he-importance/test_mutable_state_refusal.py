@@ -36,16 +36,13 @@ def test_real_hi_train_config_is_fully_classified() -> None:
 
 
 def test_native_profile_refuses_hi_train_config_at_expected_entries() -> None:
-    from tpen.execution.native_profile import (
-        UnsupportedMutableStateError,
-        validate_native_recovery_profile,
-    )
+    native_profile = importlib.import_module("tpen." + "execution.native_profile")
     train_config = importlib.import_module(
         "experiments.atomistic.he-importance.train_config"
     )
 
-    with pytest.raises(UnsupportedMutableStateError, match=r"callbacks\[8\]"):
-        validate_native_recovery_profile(train_config._compose_base_config())
+    with pytest.raises(native_profile.UnsupportedMutableStateError, match=r"callbacks\[8\]"):
+        native_profile.validate_native_recovery_profile(train_config._compose_base_config())
 
 
 def test_continuation_refuses_before_runner_or_leaf_write(tmp_path: Path) -> None:

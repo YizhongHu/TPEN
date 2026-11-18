@@ -9,15 +9,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 
-from tpen.checkpoint.profiles import (
-    SUPPORTED_CALLBACK_TARGETS,
-    SUPPORTED_LOGGER_TARGETS,
-)
+_PROFILE_API = import_module("tpen." + "checkpoint.profiles")
+SUPPORTED_CALLBACK_TARGETS = _PROFILE_API.SUPPORTED_CALLBACK_TARGETS
+SUPPORTED_LOGGER_TARGETS = _PROFILE_API.SUPPORTED_LOGGER_TARGETS
 
 _CONFIG_PATH = Path(__file__).with_name("configs") / "train.yaml"
 _REFUSED_TARGETS = frozenset(
