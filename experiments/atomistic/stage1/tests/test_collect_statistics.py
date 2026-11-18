@@ -6,7 +6,19 @@ from types import SimpleNamespace
 import pytest
 
 from experiments.atomistic.stage1 import collect as collector
-from experiments.atomistic.stage1.protocol import manifest_hash
+from experiments.atomistic.stage1.protocol import (
+    CHECKPOINT_EVIDENCE_SCHEMA,
+    Protocol,
+    bind_evaluation_manifest,
+    build_manifest,
+    config_identities,
+    manifest_hash,
+)
+
+
+_TWO_PHASE_CONFIG_ROOT = Path(__file__).parents[1] / "configs"
+_TWO_PHASE_SOURCE_SHA = "a" * 40
+_TWO_PHASE_PHYSICAL_ID = "c" * 64
 
 
 def _manifest(tmp_path: Path, streams: int = 4) -> dict:
@@ -300,6 +312,84 @@ def test_unknown_and_unsourced_references_are_refused(tmp_path: Path) -> None:
     registry.write_text("systems:\n  - id: x\n    confidence: unverified\n", encoding="utf-8")
     with pytest.raises(Exception, match="missing"):
         collector._reference("x", registry)
+
+
+def _two_phase_document(tmp_path: Path) -> dict:
+    """Build a real planner-shaped phase-1 + phase-2 document (no disk I/O)."""
+
+    protocol = Protocol(smoke_updates=1, smoke_walkers=2, lineage_updates=1, lineage_walkers=2,
+                        lineages=3, eval_streams=4, eval_walkers=2, eval_draws=2)
+    config_sha256 = config_identities(config_root=_TWO_PHASE_CONFIG_ROOT, systems=("he",))
+    phase1_rows = build_manifest(
+        protocol=protocol, source_sha=_TWO_PHASE_SOURCE_SHA, config_sha256=config_sha256,
+        checkpoints=[7], lineage_seeds=[11, 12, 13], checkpoint_sha256={},
+        results_root=str(tmp_path), systems=("he",), phase=1,
+    )
+    phase1_hash = manifest_hash(phase1_rows)
+    evidence = {
+        "schema": CHECKPOINT_EVIDENCE_SCHEMA,
+        "phase1_manifest_hash": phase1_hash,
+        "phase1_train_row_hashes": {
+            f"he:{row['lineage']}": manifest_hash([row])
+            for row in phase1_rows if row["kind"] == "train"
+        },
+        "checkpoints": {f"he:{lineage}:7": _TWO_PHASE_PHYSICAL_ID for lineage in range(protocol.lineages)},
+    }
+    eval_rows = bind_evaluation_manifest(
+        phase1_rows=phase1_rows, checkpoints=[7], checkpoint_evidence=evidence,
+        expected_physical_system_id={"he": _TWO_PHASE_PHYSICAL_ID}, source_sha=_TWO_PHASE_SOURCE_SHA,
+        config_sha256=config_sha256, protocol=protocol, phase1_manifest_hash=phase1_hash,
+    )
+    rows = list(phase1_rows) + eval_rows
+    return {"schema": "stage1/v3", "manifest_hash": manifest_hash(rows), "rows": rows}
+
+
+def _install_two_phase_fakes(monkeypatch) -> None:
+    identity = {"schema": "tpen-config-identity-v1", "sha256": "b" * 64}
+    monkeypatch.setattr(collector, "inspect_eval_run", lambda path: {
+        "verdict": "completed", "resolved_config_identity": identity,
+        "source_git_sha": _TWO_PHASE_SOURCE_SHA})
+    monkeypatch.setattr(collector, "_record_path", lambda path: path / "m.json")
+    monkeypatch.setattr(collector, "inspect_trajectory_record", lambda path, **kwargs: SimpleNamespace(
+        record_schema="trajectory_records/v2", draw_count=2, walker_count=2, row_count=4,
+        finite_count=4, mean=2.5, variance=1.25, csv_sha256="d" * 64,
+        system_id=_TWO_PHASE_PHYSICAL_ID, execution_method_id="method",
+        resolved_config_identity=identity, model_provenance="checkpoint",
+        checkpoint_sha256=_TWO_PHASE_PHYSICAL_ID, record_content_id="e" * 64))
+    monkeypatch.setattr(collector, "read_energy_grid", lambda record: [[1.0, 2.0], [3.0, 4.0]])
+    monkeypatch.setattr(collector, "_reference", lambda system_id, registry_path: (-2.9, "transcribed"))
+
+
+def test_computed_two_phase_producer_output_passes_collection(monkeypatch, tmp_path: Path) -> None:
+    """A real planner phase-1 + phase-2 manifest, with computed config identity, collects."""
+
+    document = _two_phase_document(tmp_path)
+    _install_two_phase_fakes(monkeypatch)
+    result = collector.collect(document)
+    assert len(result["records"]) == 12
+    assert len(result["aggregates"]) == 3
+
+
+def test_two_phase_collection_refuses_a_flipped_phase1_train_row_hash(monkeypatch, tmp_path: Path) -> None:
+    document = _two_phase_document(tmp_path)
+    _install_two_phase_fakes(monkeypatch)
+    rows = document["rows"]
+    eval_row = next(row for row in rows if row["kind"] == "eval")
+    eval_row["phase1_train_row_hash"] = "f" * 64
+    document["manifest_hash"] = manifest_hash(rows)
+    with pytest.raises(collector.CollectionError, match="not bound to its phase-1 train row"):
+        collector.collect(document)
+
+
+def test_two_phase_collection_refuses_a_changed_config_sha256(monkeypatch, tmp_path: Path) -> None:
+    document = _two_phase_document(tmp_path)
+    _install_two_phase_fakes(monkeypatch)
+    rows = document["rows"]
+    eval_row = next(row for row in rows if row["kind"] == "eval")
+    eval_row["config_sha256"] = "d" * 64
+    document["manifest_hash"] = manifest_hash(rows)
+    with pytest.raises(collector.CollectionError, match="config identity mismatch"):
+        collector.collect(document)
 
 
 def test_preserved_legacy_collectors_are_unchanged() -> None:
