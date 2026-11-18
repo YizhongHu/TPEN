@@ -328,7 +328,7 @@ each named node by operator-supplied launcher data, each slot submitted only
 to its node's label, and observed node identity preflighted, which revises
 Layer B's one-executor validator.
 
-### Routed attached transport v2 (Layer D2a)
+### Routed attached transport v2 (Layers D2a/D2b)
 
 The strict `tpen-executor/attached-routed-transport-v2` profile describes an
 ordered pool for each captured allocation node. Each pool carries its node,
@@ -349,9 +349,25 @@ shared-store probes through that pool's label. All probes join one aggregate
 barrier, and each returned hostname must equal the pool node exactly. A typed
 `RoutedTransportPreflightError` refuses wrong, missing, extra, or late facts.
 
-Task-to-label selection and strict child placement mismatch handling are
-deferred to D2b. The v1 attached profile remains the one-executor,
-single-label path described above.
+At each member launch, the controller resolves the binding's captured
+physical node to exactly one pool label and submits the leaf with only
+`executors=[that_label]`. An absent or ambiguous node-to-label mapping is an
+admission refusal before `begin`; the v1 attached profile remains the
+one-executor, single-label path described above.
+
+Routed children carry an internal strict-host flag. `RUN_SHIM` still writes
+the identity-bound placement sidecar, but a declared-host mismatch under that
+flag aborts before importing core. The controller recognizes only that
+routed sidecar case as `PlacementRefusal(code="routed-child-node-mismatch")`,
+publishes the refusal receipt, finishes the attempt as `launch_failed`, and
+accepts no segment. v1 and non-routed children retain the advisory
+`child-placement-mismatch` behavior and may complete.
+
+All routed normal and refusal replies continue through the CX-06 remote
+completion lifecycle. Cancellation or remote loss sweeps every active label
+under one bounded teardown deadline; missing or unacknowledged replies remain
+`remote-quiescence-unconfirmed` and close admission. D2b adds no retry,
+continuation, successor, or resubmission behavior.
 
 ## Local dispatch
 

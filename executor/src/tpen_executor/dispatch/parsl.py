@@ -1025,6 +1025,10 @@ class ParslDispatcher(DispatcherContract):
                     raise UnsupportedTransportError(
                         f"routed pool {pool.label!r} workers must equal its allocation slot count"
                     )
+            # Resolve every declared physical node to exactly one controller-
+            # owned label before any lifecycle fence can be begun.
+            for slot in slots:
+                self._routed_label_for_node(slot.node)
         else:
             if isinstance(allocation_or_lifecycle, AttachedAllocation):
                 bindings = self._resolve_bindings(allocation_or_lifecycle)
@@ -1041,11 +1045,30 @@ class ParslDispatcher(DispatcherContract):
         if not isinstance(lifecycle, AttachedAllocation):
             raise UnsupportedTransportError("the attached transport requires an AttachedAllocation lifecycle")
         self.admit_transport_shape(lifecycle, env)
+        if type(self.transport) is RoutedAttachedTransportSpec:
+            # Check the actual bindings used by this run as well as the raw
+            # slot topology.  This keeps a missing/ambiguous binding a
+            # pre-begin admission refusal rather than a member launch error.
+            for binding in self._resolve_bindings(lifecycle):
+                self._routed_label_for_node(binding.node)
         root = getattr(lifecycle.store, "root", None)
         if os.name != "posix" or type(root) is not str or not os.path.isabs(root):
             raise SharedStorePreflightError("attempt store root must be an absolute POSIX path")
         if not os.path.isdir(root):
             raise SharedStorePreflightError("attempt store root must already exist before an attached run")
+
+    def _routed_label_for_node(self, node: str | None) -> str:
+        """Return the one routed executor label owned by ``node``."""
+
+        transport = self.transport
+        if type(transport) is not RoutedAttachedTransportSpec:
+            raise UnsupportedTransportError("routed label lookup requires a routed attached transport")
+        labels = [pool.label for pool in transport.pools if pool.node == node]
+        if len(labels) != 1:
+            raise UnsupportedTransportError(
+                f"routed slot node {node!r} must resolve to exactly one executor label"
+            )
+        return labels[0]
 
     def _resolve_bindings(self, lifecycle: AttachedAllocation) -> tuple[WorkerBinding, ...]:
         """Resolve immutable per-slot bindings before any lifecycle write."""
@@ -1165,7 +1188,9 @@ class ParslDispatcher(DispatcherContract):
                 output_dir, _core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = _member_paths(fence)
                 args = (*configured.command().args, f"run.root={output_dir}", "run.layout=flat", "run.run_id=core")
                 if self.transport is not None:
-                    future, handle = self._submit_leaf(materialized, environment, lifecycle, fence, configured, timeout)
+                    future, handle = self._submit_leaf(
+                        materialized, environment, lifecycle, fence, configured, timeout, binding,
+                    )
                 else:
                     future, handle = self._submit_process(
                         materialized,
@@ -1719,6 +1744,7 @@ class ParslDispatcher(DispatcherContract):
         fence: Any,
         configured: ConfiguredRun,
         timeout: float | None,
+        binding: WorkerBinding,
     ) -> tuple[Any, _RemoteLeaf]:
         """Submit one begun member as a Layer A leaf on the attached HTEX.
 
@@ -1736,10 +1762,15 @@ class ParslDispatcher(DispatcherContract):
         dfk = self._active_dfk
         if dfk is None:
             raise RuntimeError("Parsl DFK is not active")
+        executors = (
+            [self._routed_label_for_node(binding.node)]
+            if type(self.transport) is RoutedAttachedTransportSpec
+            else list(self._active_executor_labels)
+        )
         app = self._python_app_factory(
             data_flow_kernel=dfk,
             cache=False,
-            executors=list(self._active_executor_labels),
+            executors=executors,
         )(run_leaf)
         handle = _RemoteLeaf(request)
         future = app(request.encode())
