@@ -86,13 +86,23 @@ D2B_MUTANT_TABLE = (
 def test_d2b_mutant_table_targets_unique_executable_anchors() -> None:
     root = Path(__file__).parents[2]
     module = Path(__file__).read_text(encoding="utf-8")
-    assert [row["id"] for row in D2B_MUTANT_TABLE] == ["M1", "M2", "M3", "M4", "M5", "M6"]
+    assert [row["id"] for row in D2B_MUTANT_TABLE] == ["M1", "M2", "M3", "M4", "M5", "M6"], (
+        f"anchor ids={tuple(row['id'] for row in D2B_MUTANT_TABLE)!r}; "
+        "outcome/receipt details unavailable before execution"
+    )
     for row in D2B_MUTANT_TABLE:
         source = (root / row["target"]).read_text(encoding="utf-8")
-        assert source.count(row["old"]) == 1, row
-        assert row["old"] != row["new"] and row["suite"] == "executor"
+        assert source.count(row["old"]) == 1, (
+            f"row={row!r}; anchor_count={source.count(row['old'])!r}; "
+            "outcome/receipt details unavailable before execution"
+        )
+        assert row["old"] != row["new"] and row["suite"] == "executor", (
+            f"row={row!r}; outcome/receipt details unavailable before execution"
+        )
         ast.parse(source.replace(row["old"], row["new"]))
-        assert f"def {row['killer']}(" in module, row
+        assert f"def {row['killer']}(" in module, (
+            f"row={row!r}; outcome/receipt details unavailable before execution"
+        )
 
 
 def test_routed_leaf_submission_uses_the_binding_node_label(tmp_path: Path, fake_parsl) -> None:
@@ -112,8 +122,9 @@ def test_routed_leaf_submission_uses_the_binding_node_label(tmp_path: Path, fake
 
     manifest = dispatcher.run(group, _runs(tmp_path, "first", "second"), lifecycle, timeout=60)
 
-    assert manifest.attempts, f"manifest attempts={_manifest_attempts(manifest)!r}"
-    assert [record["executors"] for record in fake_parsl.leaf_submissions()] == [["pool-b"], ["pool-a"]]
+    details = f"attempts={_manifest_attempts(manifest)!r}; segments={manifest.segments!r}"
+    assert manifest.attempts, details
+    assert [record["executors"] for record in fake_parsl.leaf_submissions()] == [["pool-b"], ["pool-a"]], details
 
 
 def test_missing_routed_binding_is_refused_before_begin(tmp_path: Path, fake_parsl, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -136,11 +147,12 @@ def test_missing_routed_binding_is_refused_before_begin(tmp_path: Path, fake_par
     with pytest.raises(parsl_dispatch.UnsupportedTransportError, match="exactly one executor label"):
         dispatcher.run(group, _runs(tmp_path, "member"), lifecycle, timeout=60)
 
-    assert not (store_root / "groups").exists()
-    assert fake_parsl.submissions == []
+    details = f"submissions={fake_parsl.submissions!r}; store_groups={(store_root / 'groups').exists()!r}"
+    assert not (store_root / "groups").exists(), details
+    assert fake_parsl.submissions == [], details
 
 
-def _placement_environment(tmp_path: Path, *, strict: bool) -> PreparedPythonEnvironment:
+def _placement_environment(tmp_path: Path, *, strict: bool, group_digest: str) -> PreparedPythonEnvironment:
     package = tmp_path / "core" / "tpen"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
@@ -157,7 +169,7 @@ def _placement_environment(tmp_path: Path, *, strict: bool) -> PreparedPythonEnv
         "TPEN_PLACEMENT_OUTPUT_DIR": str(tmp_path),
         "TPEN_PLACEMENT_TASK_ID": "member",
         "TPEN_PLACEMENT_ATTEMPT_ID": "attempt",
-        "TPEN_PLACEMENT_GROUP_DIGEST": "group",
+        "TPEN_PLACEMENT_GROUP_DIGEST": group_digest,
         "TPEN_PLACEMENT_ALLOCATION_ID": "allocation",
         "TPEN_PLACEMENT_BACKEND_JOB_ID": "job",
         "TPEN_PLACEMENT_SLOT_ID": "slot",
@@ -171,7 +183,8 @@ def _placement_environment(tmp_path: Path, *, strict: bool) -> PreparedPythonEnv
 
 
 def test_routed_child_host_mismatch_aborts_before_core(tmp_path: Path) -> None:
-    environment = _placement_environment(tmp_path, strict=True)
+    group = _group("s3d2b-placement-routed", "member")
+    environment = _placement_environment(tmp_path, strict=True, group_digest=group.identity)
     outcome = SubprocessWorker().run(
         environment,
         ("-c", RUN_SHIM, f"run.root={tmp_path}"),
@@ -180,13 +193,17 @@ def test_routed_child_host_mismatch_aborts_before_core(tmp_path: Path) -> None:
         stderr_path=tmp_path / "stderr.log",
     )
 
-    assert outcome.returncode == 2
-    assert not (tmp_path / "core-ran.txt").exists()
+    details = f"returncode={outcome.returncode!r}; stdout={outcome.stdout_path!r}; stderr={outcome.stderr_path!r}"
+    assert outcome.returncode == 2, details
+    assert not (tmp_path / "core-ran.txt").exists(), details
     observation = read_child_placement(tmp_path / "child-placement.json")
-    assert observation.refusal is not None
-    assert observation.refusal["code"] == "routed-child-node-mismatch"
+    details = f"returncode={outcome.returncode!r}; observation={observation.to_dict()!r}"
+    assert observation.refusal is not None, details
+    assert observation.refusal["code"] == "routed-child-node-mismatch", details
     refusal = _child_precore_refusal(environment, outcome)
-    assert refusal is not None and refusal.code == "routed-child-node-mismatch"
+    assert refusal is not None and refusal.code == "routed-child-node-mismatch", (
+        f"returncode={outcome.returncode!r}; observation={observation.to_dict()!r}; refusal={refusal!r}"
+    )
 
 
 def _attach_routed_mismatch_leaf_answers(fake_parsl) -> None:
@@ -267,12 +284,18 @@ def test_routed_child_mismatch_is_launch_failed_without_segment(tmp_path: Path, 
 
     manifest = dispatcher.run(group, _runs(tmp_path, "member"), lifecycle, timeout=60)
 
-    assert [attempt.outcome_receipt.status for attempt in manifest.attempts] == ["launch_failed"]
-    assert manifest.segments == ()
+    details = (
+        f"attempts={_manifest_attempts(manifest)!r}; segments={manifest.segments!r}; "
+        f"remote_teardowns={list(store_root.rglob('remote-teardown.json'))!r}"
+    )
+    assert [attempt.outcome_receipt.status for attempt in manifest.attempts] == ["launch_failed"], details
+    assert manifest.segments == (), details
+    assert list(store_root.rglob("remote-teardown.json")), details
 
 
 def test_v1_child_host_mismatch_remains_advisory(tmp_path: Path) -> None:
-    environment = _placement_environment(tmp_path, strict=False)
+    group = _group("s3d2b-placement-v1", "member")
+    environment = _placement_environment(tmp_path, strict=False, group_digest=group.identity)
     # The shim passes the first argument to the fake core, which proves that
     # advisory v1 mismatch handling still reaches core.
     outcome = SubprocessWorker().run(
@@ -283,10 +306,15 @@ def test_v1_child_host_mismatch_remains_advisory(tmp_path: Path) -> None:
         stderr_path=tmp_path / "stderr.log",
     )
 
-    assert outcome.returncode == 0 and (tmp_path / "core-ran.txt").read_text(encoding="utf-8") == "core-ran"
+    details = f"returncode={outcome.returncode!r}; stdout={outcome.stdout_path!r}; stderr={outcome.stderr_path!r}"
+    assert outcome.returncode == 0 and (tmp_path / "core-ran.txt").read_text(encoding="utf-8") == "core-ran", details
     observation = read_child_placement(tmp_path / "child-placement.json")
-    assert observation.refusal is not None and observation.refusal["code"] == "child-placement-mismatch"
-    assert _child_precore_refusal(environment, outcome) is None
+    details = f"returncode={outcome.returncode!r}; observation={observation.to_dict()!r}"
+    assert observation.refusal is not None and observation.refusal["code"] == "child-placement-mismatch", details
+    assert _child_precore_refusal(environment, outcome) is None, (
+        f"returncode={outcome.returncode!r}; observation={observation.to_dict()!r}; "
+        f"refusal={_child_precore_refusal(environment, outcome)!r}"
+    )
 
 
 def test_routed_success_uses_finish_remote(tmp_path: Path, fake_parsl, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -311,5 +339,6 @@ def test_routed_success_uses_finish_remote(tmp_path: Path, fake_parsl, monkeypat
     monkeypatch.setattr(AttachedAllocation, "finish_remote", spying_finish_remote)
     dispatcher.run(group, _runs(tmp_path, "member"), lifecycle, timeout=60)
 
-    assert calls == ["completed"]
-    assert list(store_root.rglob("remote-teardown.json"))
+    details = f"finish_remote_statuses={calls!r}; remote_teardowns={list(store_root.rglob('remote-teardown.json'))!r}"
+    assert calls == ["completed"], details
+    assert list(store_root.rglob("remote-teardown.json")), details
