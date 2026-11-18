@@ -152,7 +152,33 @@ def test_positive_row_identity_does_not_depend_on_zero_prefix(
         if row["kind"] == "eval" and row["system"] == "he"
         and row["checkpoint"] == 7 and row["stream"] == 2
     )
+    assert expected_he_seed == 1582742142991873901
     assert evaluation_seed(system="he", lineage=0, checkpoint=7, stream=2) == expected_he_seed
+
+
+def test_phase2_refuses_missing_zero_digest(tiny_protocol: Protocol, tmp_path: Path) -> None:
+    """A zero row cannot be created without its producer digest."""
+
+    phase1_rows = _phase1_rows(tiny_protocol, [0, 7], tmp_path)
+    phase1_hash = manifest_hash(phase1_rows)
+    train_rows = [row for row in phase1_rows if row["kind"] == "train"]
+    evidence = {
+        "schema": "stage1-checkpoint-evidence/v1",
+        "phase1_manifest_hash": phase1_hash,
+        "phase1_train_row_hashes": {
+            f"{row['system']}:{row['lineage']}": manifest_hash([row])
+            for row in train_rows
+        },
+        "checkpoints": {},
+    }
+    with pytest.raises(ProtocolError, match="missing digest"):
+        bind_evaluation_manifest(
+            phase1_rows=phase1_rows,
+            checkpoints=[0],
+            checkpoint_evidence=evidence,
+            protocol=tiny_protocol,
+            phase1_manifest_hash=phase1_hash,
+        )
 
 
 @pytest.mark.parametrize("system", SYSTEMS)
