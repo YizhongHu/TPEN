@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
+from tpen.artifacts import ArtifactManager
 from tpen.callback import RuntimeEquivariance
 from tpen.checkpoint import TrainResume, restore_checkpoint, save_checkpoint
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
@@ -96,7 +97,14 @@ def _config(root: Path) -> dict[str, object]:
 def _context(root: Path) -> RecordingContext:
     context = RecordingContext()
     context.cfg = _config(root)
-    context.run_dir = root
+    context.artifact_manager = ArtifactManager(
+        root,
+        experiment="runtime-equivariance-recovery",
+        sector="fixture",
+        run_id="fixture",
+        layout="flat",
+        logical_run_dir=root,
+    )
     context.metadata = SimpleNamespace(
         device="cpu",
         dtype="float64",

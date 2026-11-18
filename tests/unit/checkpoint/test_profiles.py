@@ -167,7 +167,7 @@ def test_runtime_equivariance_is_cadence_sensitive_in_shared_helper() -> None:
             lambda entry: entry.update(
                 {"allocator_probe": {"_target_": "tests.helpers.PrivateProbe", "device": "cpu"}}
             ),
-            "exact audited TorchAllocatorPeakProbe",
+            "must target 'tpen.accelerator.TorchAllocatorPeakProbe' with a device",
         ),
     ],
     ids=[
