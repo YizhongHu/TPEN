@@ -87,6 +87,11 @@ def _input(
     )
 
 
+def _assert_reconciliation(condition: bool, result, message: str) -> None:
+    reason_codes = ", ".join(f"{member.task_id}={member.reason_code}" for member in result.members)
+    assert condition, f"{message}; member reason codes: {reason_codes}"
+
+
 def test_remote_quiescence_unconfirmed_parks_before_restore() -> None:
     group = _group("successor")
     restored: list[str] = []
@@ -105,8 +110,13 @@ def test_remote_quiescence_unconfirmed_parks_before_restore() -> None:
         restore_callback=lambda member: restored.append(member.task_id),
     )
 
-    assert result.members[0].action == "park"
-    assert restored == []
+    _assert_reconciliation(result.members[0].action == "park", result, "unconfirmed remote action")
+    _assert_reconciliation(
+        result.members[0].reason_code == "remote-quiescence-unconfirmed",
+        result,
+        "unconfirmed remote reason",
+    )
+    _assert_reconciliation(restored == [], result, "unconfirmed remote restore callback")
 
 
 def test_foreign_input_parks_every_member_without_restore_callbacks() -> None:
@@ -121,9 +131,17 @@ def test_foreign_input_parks_every_member_without_restore_callbacks() -> None:
         restore_callback=lambda member: restored.append(member.task_id),
     )
 
-    assert [member.task_id for member in result.members] == ["first", "second"]
-    assert [member.action for member in result.members] == ["park", "park"]
-    assert restored == []
+    _assert_reconciliation(
+        [member.task_id for member in result.members] == ["first", "second"],
+        result,
+        "foreign result order",
+    )
+    _assert_reconciliation(
+        [member.action for member in result.members] == ["park", "park"],
+        result,
+        "foreign actions",
+    )
+    _assert_reconciliation(restored == [], result, "foreign restore callbacks")
 
 
 def test_foreign_input_preserves_group_order_under_input_permutation() -> None:
@@ -137,12 +155,16 @@ def test_foreign_input_preserves_group_order_under_input_permutation() -> None:
     canonical = reconcile_group(group, (inputs["first"], inputs["second"], inputs["third"], foreign))
     result = reconcile_group(group, (inputs["third"], foreign, inputs["first"], inputs["second"]))
 
-    assert [member.task_id for member in result.members] == ["first", "second", "third"]
-    assert all(member.action == "park" for member in result.members)
-    assert result.encode() == canonical.encode()
+    _assert_reconciliation(
+        [member.task_id for member in result.members] == ["first", "second", "third"],
+        result,
+        "permuted foreign result order",
+    )
+    _assert_reconciliation(all(member.action == "park" for member in result.members), result, "permuted foreign actions")
+    _assert_reconciliation(result.encode() == canonical.encode(), result, "permuted foreign canonical bytes")
 
 
-def test_missing_input_attempt_id_is_recovered_from_matching_receipts() -> None:
+def test_missing_input_attempt_id_parks_before_successor_admission() -> None:
     group = _group("successor")
     receipt_attempt = AttemptId("attempt-from-receipts")
     member = _input(
@@ -152,13 +174,17 @@ def test_missing_input_attempt_id_is_recovered_from_matching_receipts() -> None:
         verdict=_successor_verdict(),
     )
     member = replace(member, attempt_id=None)
-    result = reconcile_group(
-        group,
-        (member,),
-    )
+    restored: list[str] = []
+    result = reconcile_group(group, (member,), restore_callback=lambda item: restored.append(item.task_id))
 
-    assert result.members[0].action == "admit_successor"
-    assert result.members[0].attempt_id == receipt_attempt
+    _assert_reconciliation(result.members[0].action == "park", result, "missing top-level attempt action")
+    _assert_reconciliation(
+        result.members[0].reason_code == "missing-attempt-identity",
+        result,
+        "missing top-level attempt reason",
+    )
+    _assert_reconciliation(result.members[0].attempt_id is None, result, "missing top-level attempt output")
+    _assert_reconciliation(restored == [], result, "missing top-level attempt restore callback")
 
 
 def test_valid_successor_with_supplied_attempt_is_admitted() -> None:
@@ -169,8 +195,8 @@ def test_valid_successor_with_supplied_attempt_is_admitted() -> None:
         (_input(group, "successor", attempt_id=supplied_attempt, verdict=_successor_verdict()),),
     )
 
-    assert result.members[0].action == "admit_successor"
-    assert result.members[0].attempt_id == supplied_attempt
+    _assert_reconciliation(result.members[0].action == "admit_successor", result, "supported successor action")
+    _assert_reconciliation(result.members[0].attempt_id == supplied_attempt, result, "supported successor attempt")
 
 
 def test_missing_or_refused_profile_from_injected_port_parks_without_restore_callback() -> None:
@@ -199,5 +225,5 @@ def test_missing_or_refused_profile_from_injected_port_parks_without_restore_cal
             restore_callback=lambda member: restored.append(member.task_id),
         )
 
-        assert result.members[0].action == "park"
-        assert restored == []
+        _assert_reconciliation(result.members[0].action == "park", result, "injected profile action")
+        _assert_reconciliation(restored == [], result, "injected profile restore callback")

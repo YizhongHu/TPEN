@@ -192,6 +192,9 @@ CORE_QUIESCENCE_VERDICTS = frozenset({"valid", "invalid", "unknown"})
 RECONCILIATION_ACTIONS = frozenset(
     {"preserve_completed", "admit_successor", "start_fresh", "preserve_terminal", "park"}
 )
+# This outcome records that remote teardown was not confirmed. It is not a
+# settled operational result and must never reach successor admission.
+NON_SETTLED_OPERATIONAL_OUTCOMES = frozenset({"remote-quiescence-unconfirmed"})
 
 
 @frozen_record
@@ -479,12 +482,16 @@ def _member_reconciliation(
         if member.outcome_receipt is None and member.core_verdict is None and member.receipt_digest is None:
             return MemberReconciliationV2(member.task_id, "start_fresh", "no-durable-start", None)
         return _park(member, "crossed-or-incomplete-receipt")
+    if member.attempt_id is None:
+        return _park(member, "missing-attempt-identity")
     if member.start_receipt.group_digest != group_digest or (
         member.outcome_receipt is not None and member.outcome_receipt.group_digest != group_digest
     ):
         return _park(member, "crossed-group-receipt")
     if member.outcome_receipt is None:
         return _park(member, "missing-settled-outcome")
+    if member.outcome_receipt.status in NON_SETTLED_OPERATIONAL_OUTCOMES:
+        return _park(member, member.outcome_receipt.status)
     verdict = member.core_verdict
     if admission_port is not None:
         try:
@@ -545,6 +552,19 @@ def reconcile_group(
         if item.task_id in by_task:
             raise ValueError("duplicate member recovery input")
         by_task[item.task_id] = item
+    member_by_task = {member.task_id: member for member in group.members}
+    foreign = set(by_task) - set(member_by_task)
+    if foreign:
+        # Membership is a group-wide precondition. Do not invoke any port or
+        # restore callback while foreign evidence is present, and emit the
+        # fail-closed result in immutable ReadyGroup member order.
+        outcomes = tuple(
+            _park(by_task[task.task_id], "foreign-member-evidence")
+            if task.task_id in by_task
+            else MemberReconciliationV2(task.task_id, "park", "foreign-member-evidence", None)
+            for task in group.members
+        )
+        return GroupReconciliationV2(group.group_id, group.identity, outcomes)
     outcomes: list[MemberReconciliationV2] = []
     for task in group.members:
         item = by_task.get(task.task_id)
@@ -562,12 +582,6 @@ def reconcile_group(
                 restore_callback=restore_callback,
             )
         )
-    foreign = set(by_task) - {member.task_id for member in group.members}
-    if foreign:
-        # A foreign input cannot be attributed to any group member; the group
-        # remains parked rather than silently discarding the contradictory fact.
-        outcomes = [MemberReconciliationV2(item.task_id, "park", "foreign-member-evidence", item.attempt_id) for item in by_task.values() if item.task_id in {member.task_id for member in group.members}]
-        outcomes.extend(MemberReconciliationV2(task.task_id, "park", "foreign-member-evidence", None) for task in group.members if task.task_id not in {item.task_id for item in outcomes})
     return GroupReconciliationV2(group.group_id, group.identity, tuple(outcomes))
 
 
