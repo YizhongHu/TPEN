@@ -249,7 +249,7 @@ def _optimizer_entry(manifest: Mapping[str, Any]) -> Any:
         raise UnavailableOptimizerError(f"optimizer method {method!r} is absent from the HI roster")
     if not entry.admitted or status != "available" or not entry.target:
         reason = (
-            optimizer_cell.get("reason")
+            optimizer_cell.get("unavailable_reason")
             or "not admitted by HI_METHOD_ROSTER"
         )
         raise UnavailableOptimizerError(
