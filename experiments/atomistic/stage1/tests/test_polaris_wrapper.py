@@ -290,7 +290,7 @@ def _production_stubs(tmp_path: Path) -> dict[str, str]:
     uv = tmp_path / "uv"
     uv.write_text(
         "#!/bin/sh\n"
-        "printf '%s|%s|%s|%s\\n' \"$UV_PYTHON\" \"$UV_NO_MANAGED_PYTHON\" "
+            "printf '%%s|%%s|%%s|%%s\\n' \"$UV_PYTHON\" \"$UV_NO_MANAGED_PYTHON\" "
         "\"$UV_PYTHON_DOWNLOADS\" \"$UV_LINK_MODE\" >> \"$UV_RECORD\"\n"
         "case \"$1\" in\n"
         "  lock) exit 0 ;;\n"
