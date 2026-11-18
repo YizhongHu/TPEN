@@ -33,9 +33,13 @@ PYBIN="${PYBIN:-/soft/applications/conda/2025-09-25/mconda3/bin/python}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 GUARD_PYTHON_BIN="${GUARD_PYTHON_BIN:-}"
 NVIDIA_SMI_BIN="${NVIDIA_SMI_BIN:-nvidia-smi}"
+TASKSET_BIN="${TASKSET_BIN:-taskset}"
+POLARIS_LSCPU_BIN="${POLARIS_LSCPU_BIN:-lscpu}"
 BOOT_ROOT="${BOOT_ROOT:-}"
 BOOT_PARENT="${BOOT_PARENT:-/local/scratch/${USER:?}}"
 OWNED_BOOT_ROOT=""
+declare -a LINEAGE_CPU_SETS=()
+declare -a LINEAGE_CORE_COUNTS=()
 
 cleanup_owned_boot_root() {
   if [[ -n "$OWNED_BOOT_ROOT" && -d "$OWNED_BOOT_ROOT" ]]; then
@@ -248,6 +252,116 @@ guard_gpus() {
   done
 }
 
+derive_cpu_layout() {
+  local affinity_output layout_output line lineage core_count cpu_set
+  local -a layout_lines
+
+  affinity_output="$("$TASKSET_BIN" -pc $$ 2>&1)" ||
+    die "could not determine process CPU affinity: $affinity_output"
+  if ! layout_output="$($PYBIN - "$POLARIS_LSCPU_BIN" "$affinity_output" <<'PY'
+import subprocess
+import sys
+
+
+lscpu_bin, affinity_text = sys.argv[1:]
+
+
+def parse_cpu_list(text: str) -> set[int]:
+    spec = text.rsplit(":", 1)[-1].strip()
+    if not spec:
+        raise ValueError(f"missing CPU list in taskset output: {text!r}")
+    cpus: set[int] = set()
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            raise ValueError(f"empty CPU range in taskset output: {text!r}")
+        if "-" in chunk:
+            start_text, end_text = chunk.split("-", 1)
+            start, end = int(start_text), int(end_text)
+            if end < start:
+                raise ValueError(f"reversed CPU range in taskset output: {text!r}")
+            cpus.update(range(start, end + 1))
+        else:
+            cpus.add(int(chunk))
+    return cpus
+
+
+try:
+    allowed = parse_cpu_list(affinity_text)
+    completed = subprocess.run(
+        [lscpu_bin, "-p=CPU,CORE,NODE"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    records = []
+    for raw_line in completed.stdout.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) < 3:
+            raise ValueError(f"malformed lscpu record: {raw_line!r}")
+        cpu, core, node = (int(fields[index]) for index in range(3))
+        if cpu in allowed:
+            records.append((node, core, cpu))
+except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+    raise SystemExit(f"could not derive CPU layout: {exc}") from exc
+
+# Keep one logical CPU per physical core. Sorting by NUMA node then core keeps
+# each group as NUMA-contiguous as the allocation permits; GPU-NUMA locality is
+# intentionally not claimed because it is not derived from this topology.
+selected = []
+seen_cores = set()
+for node, core, cpu in sorted(records):
+    if core in seen_cores:
+        continue
+    seen_cores.add(core)
+    selected.append((node, core, cpu))
+ordered = sorted(selected, key=lambda record: (record[0], record[1], record[2]))
+usable = len(ordered) - len(ordered) % 3
+per_lineage = usable // 3
+if per_lineage < 3:
+    raise SystemExit(
+        f"fewer than 3 physical cores per lineage: allowed={len(ordered)}"
+    )
+groups = [ordered[index * per_lineage:(index + 1) * per_lineage] for index in range(3)]
+core_sets = [{core for _, core, _ in group} for group in groups]
+for left in range(3):
+    for right in range(left + 1, 3):
+        # Explicitly assert the invariant even though slicing currently makes
+        # overlap impossible; this protects future layout changes.
+        assert not (core_sets[left] & core_sets[right]), (
+            f"lineage core sets overlap: {left} and {right}"
+        )
+for lineage, group in enumerate(groups):
+    cpus = ",".join(str(cpu) for _, _, cpu in group)
+    print(f"{lineage}\t{per_lineage}\t{cpus}")
+PY
+  )"; then
+    die "$layout_output"
+  fi
+  mapfile -t layout_lines <<< "$layout_output"
+  [[ "${#layout_lines[@]}" == 3 ]] ||
+    die "expected three lineage CPU layouts, got ${#layout_lines[@]}"
+  LINEAGE_CPU_SETS=()
+  LINEAGE_CORE_COUNTS=()
+  for line in "${layout_lines[@]}"; do
+    IFS=$'\t' read -r lineage core_count cpu_set <<< "$line"
+    [[ "$lineage" =~ ^[0-2]$ && "$core_count" =~ ^[0-9]+$ && -n "$cpu_set" ]] ||
+      die "malformed derived CPU layout: $line"
+    LINEAGE_CPU_SETS[$lineage]="$cpu_set"
+    LINEAGE_CORE_COUNTS[$lineage]="$core_count"
+    printf 'POLARIS_LAYOUT lineage=%s gpu=%s cores=%s cpus=%s\n' \
+      "$lineage" "$lineage" "$core_count" "$cpu_set"
+  done
+}
+
+guard_runtime() {
+  guard_gpus
+  derive_cpu_layout
+}
+
 prepare_job() {
   require_value SOURCE_SHA
   require_value CHECKOUT_ROOT
@@ -358,14 +472,14 @@ PY
 }
 
 run_command_for_row() {
-  local row="$1" driver="$2" gpu="$3" cpu_range="$4" log="$5" status="$6"
+  local row="$1" driver="$2" gpu="$3" cpu_set="$4" core_count="$5" log="$6" status="$7"
   local rc=0 row_id
   row_id="$($PYTHON_BIN -c 'import json,sys; print(json.load(open(sys.argv[1]))["row_id"])' "$row")"
   if [[ "$DRY_EXEC" == 1 ]]; then
-    printf 'DRY_EXEC compute=SKIPPED row=%s gpu=%s cpu=%s\n' "$row_id" "$gpu" "$cpu_range" | tee "$log"
+    printf 'DRY_EXEC compute=SKIPPED row=%s gpu=%s cpu=%s\n' "$row_id" "$gpu" "$cpu_set" | tee "$log"
   else
-    export CUDA_VISIBLE_DEVICES="$gpu" OMP_NUM_THREADS=16 MKL_NUM_THREADS=16
-    taskset --cpu-list "$cpu_range" "$PYTHON_BIN" - "$row" "$driver" "$CHECKOUT" \
+    export CUDA_VISIBLE_DEVICES="$gpu" OMP_NUM_THREADS="$core_count" MKL_NUM_THREADS="$core_count"
+    "$TASKSET_BIN" --cpu-list "$cpu_set" "$PYTHON_BIN" - "$row" "$driver" "$CHECKOUT" \
       "$PYTHON_BIN" "$SOURCE_SHA" "$RESULTS_ROOT" > "$log" 2>&1 <<'PY' || rc=$?
 import json
 import os
@@ -384,13 +498,13 @@ completed = subprocess.run(argv, cwd=checkout, env=os.environ)
 raise SystemExit(completed.returncode)
 PY
   fi
-  printf 'row_id=%s gpu=%s cpu=%s exit_status=%s\n' "$row_id" "$gpu" "$cpu_range" "$rc" > "$status"
+  printf 'row_id=%s gpu=%s cpu=%s exit_status=%s\n' "$row_id" "$gpu" "$cpu_set" "$rc" > "$status"
   return "$rc"
 }
 
 run_mode() {
   local row_dir="$BOOT_ROOT/rows/$MODE"
-  local row_list row gpu cpu_range log status
+  local row_list row gpu cpu_set core_count log status lineage
   local rc=0
   row_list="$BOOT_ROOT/$MODE-row-list.txt"
   extract_rows "$PLAN_MANIFEST" "$MODE" "$row_dir" > "$row_list"
@@ -400,9 +514,12 @@ run_mode() {
     local index=0
     for row in "${rows[@]}"; do
       case "$index" in
-        0) gpu=0; cpu_range=0-15 ;;
-        1) gpu=1; cpu_range=16-31 ;;
-        2) gpu=2; cpu_range=32-47 ;;
+        0|1|2)
+          lineage="$index"
+          gpu="$lineage"
+          cpu_set="${LINEAGE_CPU_SETS[$lineage]}"
+          core_count="${LINEAGE_CORE_COUNTS[$lineage]}"
+          ;;
         *) die "unexpected train row index=$index" ;;
       esac
       log="$RESULTS_ROOT/logs/row-$(basename "$row" .json)-${PBS_JOBID}.log"
@@ -412,7 +529,7 @@ run_mode() {
         status="$BOOT_ROOT/$(basename "$row" .json).status"
       fi
       run_command_for_row "$row" "$CHECKOUT/experiments/atomistic/stage1/train.py" \
-        "$gpu" "$cpu_range" "$log" "$status" &
+        "$gpu" "$cpu_set" "$core_count" "$log" "$status" &
       pids+=("$!")
       index=$((index + 1))
     done
@@ -422,7 +539,9 @@ run_mode() {
   else
     while IFS= read -r row; do
       gpu=0
-      cpu_range=0-15
+      lineage=0
+      cpu_set="${LINEAGE_CPU_SETS[$lineage]}"
+      core_count="${LINEAGE_CORE_COUNTS[$lineage]}"
       log="$RESULTS_ROOT/logs/row-$(basename "$row" .json)-${PBS_JOBID}.log"
       status="$RESULTS_ROOT/logs/row-$(basename "$row" .json)-${PBS_JOBID}.status"
       if [[ "$DRY_EXEC" == 1 ]]; then
@@ -430,7 +549,7 @@ run_mode() {
         status="$BOOT_ROOT/$(basename "$row" .json).status"
       fi
       run_command_for_row "$row" "$CHECKOUT/experiments/atomistic/stage1/eval.py" \
-        "$gpu" "$cpu_range" "$log" "$status" || rc=1
+        "$gpu" "$cpu_set" "$core_count" "$log" "$status" || rc=1
     done < "$row_list"
   fi
   return "$rc"
@@ -483,7 +602,7 @@ main() {
       require_value RESULTS_ROOT
       assert_results_root
       assert_pbs_context
-      guard_gpus
+      guard_runtime
       ;;
     dry-exec)
       DRY_EXEC=1
@@ -496,7 +615,7 @@ main() {
       validate_mode_paths
       prepare_job
       validate_selected_rows_or_die "$PLAN_MANIFEST" train
-      guard_gpus
+      guard_runtime
       cd "$CHECKOUT"
       run_mode
       printf 'DRY_EXEC complete=PASS\n'
@@ -510,7 +629,7 @@ main() {
       validate_mode_paths
       prepare_job
       write_job_receipt
-      guard_gpus
+      guard_runtime
       cd "$CHECKOUT"
       run_plan
       ;;
@@ -523,6 +642,7 @@ main() {
       validate_mode_paths
       prepare_job
       write_job_receipt
+      guard_runtime
       cd "$CHECKOUT"
       run_collect
       ;;
@@ -538,7 +658,7 @@ main() {
       prepare_job
       validate_selected_rows_or_die "$PLAN_MANIFEST" "$MODE"
       write_job_receipt
-      guard_gpus
+      guard_runtime
       cd "$CHECKOUT"
       run_mode
       ;;

@@ -21,10 +21,24 @@ EAGLE_ROOT = "/eagle/HetRxnEnergy/rhu/stage1-p2-test"
 SOURCE_SHA = "f" * 40
 
 
+def _lscpu_fixture(*, physical_cores: int = 32, smt: bool = True) -> str:
+    """Return lscpu's comma-separated CPU/core/node format for a fake node."""
+
+    logical_cpus = physical_cores * 2 if smt else physical_cores
+    lines = ["# comment lines from lscpu are ignored"]
+    for cpu in range(logical_cpus):
+        core = cpu % physical_cores if smt else cpu
+        node = 0 if core < physical_cores // 2 else 1
+        lines.append(f"{cpu},{core},{node}")
+    return "\n".join(lines) + "\n"
+
+
 def _stub_bin(tmp_path: Path, *, gpu_lines: str | None = None,
-              mig_lines: str | None = None, device_count: str = "1") -> dict[str, str]:
+              mig_lines: str | None = None, device_count: str = "1",
+              lscpu_text: str | None = None) -> dict[str, str]:
     """Create command seams replaying the captured P1 R2 observations."""
 
+    tmp_path.mkdir(parents=True, exist_ok=True)
     nvidia = tmp_path / "nvidia-smi"
     query = gpu_lines if gpu_lines is not None else (FIXTURES / "nvidia-smi-query.txt").read_text()
     mig = mig_lines if mig_lines is not None else (FIXTURES / "nvidia-smi-mig.txt").read_text()
@@ -64,7 +78,32 @@ def _stub_bin(tmp_path: Path, *, gpu_lines: str | None = None,
         encoding="utf-8",
     )
     python.chmod(0o750)
-    return {"NVIDIA_SMI_BIN": str(nvidia), "GUARD_PYTHON_BIN": str(python)}
+    lscpu = tmp_path / "lscpu"
+    lscpu_path = tmp_path / "lscpu.txt"
+    lscpu_path.write_text(lscpu_text or _lscpu_fixture(), encoding="utf-8")
+    lscpu.write_text(
+        "#!/bin/sh\n"
+        f"cat {shlex.quote(str(lscpu_path))}\n",
+        encoding="utf-8",
+    )
+    lscpu.chmod(0o750)
+    taskset = tmp_path / "taskset"
+    taskset_record = tmp_path / "taskset-record.txt"
+    taskset.write_text(
+        "#!/bin/sh\n"
+        "case \"$1\" in\n"
+        "  -pc) printf \"pid %s's current affinity list: %s\\n\" \"$2\" \"${TASKSET_ALLOWED:-0-63}\" ;;\n"
+        "  --cpu-list) printf '%s\\n' \"$2\" >> \"${TASKSET_RECORD:?}\"; shift 2; exec \"$@\" ;;\n"
+        "  *) exit 64 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    taskset.chmod(0o750)
+    return {
+        "NVIDIA_SMI_BIN": str(nvidia), "GUARD_PYTHON_BIN": str(python),
+        "POLARIS_LSCPU_BIN": str(lscpu), "TASKSET_BIN": str(taskset),
+        "TASKSET_RECORD": str(taskset_record),
+    }
 
 
 def _env(tmp_path: Path, *, stubs: dict[str, str] | None = None,
@@ -83,6 +122,8 @@ def _env(tmp_path: Path, *, stubs: dict[str, str] | None = None,
         "CHECKOUT_ROOT": str(REPO_ROOT),
         "UV_CACHE_DIR": str(tmp_path / "uv-cache"),
         "BOOT_PARENT": str(tmp_path / "boot-parent"),
+        "TASKSET_ALLOWED": "0-63",
+        "TASKSET_RECORD": str(tmp_path / "taskset-record.txt"),
     })
     Path(env["UV_CACHE_DIR"]).mkdir()
     env.update(stubs if stubs is not None else _stub_bin(tmp_path))
@@ -113,6 +154,75 @@ def test_guard_replays_p1_r2_capture(tmp_path: Path) -> None:
     assert "POLARIS_GUARD mig=Disabled" in result.stdout
     assert "POLARIS_GUARD binding=0 device_count=1" in result.stdout
     assert "POLARIS_GUARD binding=3 device_count=1" in result.stdout
+
+
+def test_guard_derives_smt_deduplicated_disjoint_layout(tmp_path: Path) -> None:
+    assert "assert not (core_sets[left] & core_sets[right])" in WRAPPER.read_text(encoding="utf-8")
+    result = _run("guard", _env(tmp_path))
+    assert result.returncode == 0, result.stderr
+    layout = [line for line in result.stdout.splitlines() if line.startswith("POLARIS_LAYOUT ")]
+    assert len(layout) == 3
+    cpu_sets = []
+    for index, line in enumerate(layout):
+        fields = dict(field.split("=", 1) for field in line.split()[1:])
+        assert fields["lineage"] == str(index)
+        assert fields["cores"] == "10"
+        cpus = tuple(int(cpu) for cpu in fields["cpus"].split(","))
+        assert len(cpus) == len(set(cpus)) == 10
+        assert all(cpu < 32 for cpu in cpus)
+        cpu_sets.append(set(cpus))
+    assert not (cpu_sets[0] & cpu_sets[1] or cpu_sets[0] & cpu_sets[2] or cpu_sets[1] & cpu_sets[2])
+
+
+def test_guard_intersects_allowed_cpus_before_smt_deduplication(tmp_path: Path) -> None:
+    stubs = _stub_bin(tmp_path)
+    result = _run(
+        "guard",
+        _env(tmp_path, stubs=stubs, TASKSET_ALLOWED="0-7,32-39,48-55"),
+    )
+    assert result.returncode == 0, result.stderr
+    layout = [line for line in result.stdout.splitlines() if line.startswith("POLARIS_LAYOUT ")]
+    assert [line.split("cores=", 1)[1].split()[0] for line in layout] == ["5"] * 3
+    cpus = {
+        int(cpu)
+        for line in layout
+        for cpu in line.rsplit("cpus=", 1)[1].split(",")
+    }
+    assert cpus == set(range(8)) | set(range(48, 55))
+
+    non_smt_stubs = _stub_bin(tmp_path / "non-smt", lscpu_text=_lscpu_fixture(smt=False))
+    non_smt = _run(
+        "guard",
+        _env(tmp_path / "non-smt", stubs=non_smt_stubs, TASKSET_ALLOWED="0-31"),
+    )
+    assert non_smt.returncode == 0, non_smt.stderr
+    non_smt_layout = [
+        line for line in non_smt.stdout.splitlines() if line.startswith("POLARIS_LAYOUT ")
+    ]
+    assert all("cores=10" in line for line in non_smt_layout)
+    assert all(len(line.rsplit("cpus=", 1)[1].split(",")) == 10 for line in non_smt_layout)
+
+
+def test_guard_rejects_too_few_physical_cores_before_driver(tmp_path: Path) -> None:
+    rows = [
+        {
+            "kind": "train",
+            "lineage": lineage,
+            "row_id": f"he-train-{lineage}",
+            "source_sha": SOURCE_SHA,
+            "results_root": EAGLE_ROOT,
+            "device": "cuda",
+        }
+        for lineage in range(3)
+    ]
+    manifest = tmp_path / "phase1.json"
+    manifest.write_text(json.dumps({"rows": rows}), encoding="utf-8")
+    result = _run(
+        "dry-exec",
+        _env(tmp_path, TASKSET_ALLOWED="0-7", PLAN_MANIFEST=str(manifest)),
+    )
+    assert result.returncode == 2
+    assert "fewer than 3 physical cores per lineage" in result.stderr
 
 
 def test_guard_rejects_wrong_gpu_count(tmp_path: Path) -> None:
@@ -326,7 +436,7 @@ def _production_stubs(tmp_path: Path) -> dict[str, str]:
     driver = tmp_path / "driver.py"
     driver.write_text(
         "#!/bin/sh\n"
-        "printf '%s\\n' \"CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES\" >> \"$DRIVER_RECORD\"\n"
+        "printf '%s\\n' \"CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES OMP_NUM_THREADS=$OMP_NUM_THREADS MKL_NUM_THREADS=$MKL_NUM_THREADS\" >> \"$DRIVER_RECORD\"\n"
         "case \"${FAIL_DRIVER:-0}:$CUDA_VISIBLE_DEVICES\" in 1:1) exit 9 ;; esac\n"
         "exit 0\n",
         encoding="utf-8",
@@ -366,10 +476,11 @@ def _production_env(tmp_path: Path, checkout: Path, source_sha: str) -> dict[str
         "TPEN_POLARIS_TEST_RESULTS_PREFIX": str(results_prefix),
         "PBS_JOBID": "", "PBS_ENVIRONMENT": "", "PBS_QUEUE": "debug",
         "EXPECTED_QUEUE": "debug", "DRY_EXEC": "0", "UV_CACHE_DIR": str(tmp_path / "uv-cache"),
-        "BOOT_PARENT": str(tmp_path / "boot-parent"), "NVIDIA_SMI_BIN": _stub_bin(tmp_path)["NVIDIA_SMI_BIN"],
+        "BOOT_PARENT": str(tmp_path / "boot-parent"),
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
     })
     Path(env["UV_CACHE_DIR"]).mkdir()
+    env.update(_stub_bin(tmp_path))
     env.update(stubs)
     # The shim is named `git` and `pybin` invokes the real interpreter, while
     # only the requested external boundaries are stubbed.
@@ -402,9 +513,13 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
     assert uv_controls
     assert all(line.endswith("|1|never|copy") for line in uv_controls)
     records = Path(env["DRIVER_RECORD"]).read_text(encoding="utf-8").splitlines()
-    assert sorted(records) == ["CUDA_VISIBLE_DEVICES=0", "CUDA_VISIBLE_DEVICES=1", "CUDA_VISIBLE_DEVICES=2"]
+    assert sorted(records) == [
+        "CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=10 MKL_NUM_THREADS=10",
+        "CUDA_VISIBLE_DEVICES=1 OMP_NUM_THREADS=10 MKL_NUM_THREADS=10",
+        "CUDA_VISIBLE_DEVICES=2 OMP_NUM_THREADS=10 MKL_NUM_THREADS=10",
+    ]
     statuses = list(results_root.glob("logs/*.status"))
-    assert {"cpu=0-15", "cpu=16-31", "cpu=32-47"} <= {line.split()[2] for path in statuses for line in path.read_text().splitlines()}
+    assert {"cpu=0,1,2,3,4,5,6,7,8,9", "cpu=10,11,12,13,14,15,16,17,18,19", "cpu=20,21,22,23,24,25,26,27,28,29"} <= {line.split()[2] for path in statuses for line in path.read_text().splitlines()}
 
     invalid_manifest = results_root / "plan" / "cpu-row.json"
     invalid_doc = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -459,3 +574,8 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
     evaluated_fail = _run("eval", env)
     assert evaluated_fail.returncode != 0
     assert len(list(results_root.glob("logs/*.status"))) >= 12
+    assert set(Path(env["TASKSET_RECORD"]).read_text().splitlines()) == {
+        "0,1,2,3,4,5,6,7,8,9",
+        "10,11,12,13,14,15,16,17,18,19",
+        "20,21,22,23,24,25,26,27,28,29",
+    }

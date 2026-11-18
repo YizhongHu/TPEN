@@ -23,8 +23,8 @@
   {
     "id": "polaris-eagle-prefix-check-dropped",
     "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
-    "old": "case \"$RESULTS_ROOT\" in\n    \"$RESULTS_PREFIX\"*) ;;\n    *) die \"results root outside Eagle prefix: $RESULTS_ROOT\" ;;\n  esac",
-    "new": "true",
+    "old": "candidate.resolve().relative_to(prefix.resolve())",
+    "new": "candidate.resolve()",
     "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_non_eagle_results_root"
   },
   {
@@ -82,5 +82,33 @@
     "old": "if [[ \"${PBS_ENVIRONMENT:-}\" == PBS_BATCH || \"${PBS_ENVIRONMENT:-}\" == PBS_INTERACTIVE || -n \"${PBS_JOBID:-}\" ]]; then",
     "new": "if false; then",
     "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_test_prefix_override_refused_in_pbs_batch"
+  },
+  {
+    "id": "polaris-smt-dedup-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "if core in seen_cores:\n        continue",
+    "new": "if False:\n        continue",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_derives_smt_deduplicated_disjoint_layout"
+  },
+  {
+    "id": "polaris-layout-disjoint-assert-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "assert not (core_sets[left] & core_sets[right]), (",
+    "new": "assert True, (",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_derives_smt_deduplicated_disjoint_layout"
+  },
+  {
+    "id": "polaris-omp-core-count-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "export CUDA_VISIBLE_DEVICES=\"$gpu\" OMP_NUM_THREADS=\"$core_count\" MKL_NUM_THREADS=\"$core_count\"",
+    "new": "export CUDA_VISIBLE_DEVICES=\"$gpu\" OMP_NUM_THREADS=16 MKL_NUM_THREADS=16",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
+  },
+  {
+    "id": "polaris-hard-coded-cpu-range-restored",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "lineage=0\n      cpu_set=\"${LINEAGE_CPU_SETS[$lineage]}\"\n      core_count=\"${LINEAGE_CORE_COUNTS[$lineage]}\"",
+    "new": "lineage=0\n      cpu_set=\"0-15\"\n      core_count=\"${LINEAGE_CORE_COUNTS[$lineage]}\"",
+    "killer": "experiments/atomistic/stage1/tests/test_production_plan_train_eval_use_real_rows_and_uv_controls"
   }
 ]
