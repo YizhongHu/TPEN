@@ -9,34 +9,134 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from importlib import import_module
 from pathlib import Path
 from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 
-_PROFILE_API = import_module("tpen." + "checkpoint.profiles")
-SUPPORTED_CALLBACK_TARGETS = _PROFILE_API.SUPPORTED_CALLBACK_TARGETS
-SUPPORTED_LOGGER_TARGETS = _PROFILE_API.SUPPORTED_LOGGER_TARGETS
-
 _CONFIG_PATH = Path(__file__).with_name("configs") / "train.yaml"
-_REFUSED_TARGETS = frozenset(
-    {
-        "tpen.callback.RuntimeEquivariance",
-        "tpen.callback.ResourceUsage",
-    }
+_RESTORED = "restored", "native train_resume owns the corresponding state"
+_RECONSTRUCTIBLE = (
+    "reconstructible",
+    "the object is rebuilt from the committed HI configuration",
 )
-_ROOT_CLASSIFICATIONS = {
-    "sampler": ("restored", "native train_resume owns sampler_mcmc state"),
-    "trainer": ("restored", "native train_resume owns trainer_cursor state"),
+_TYPED_REFUSED = (
+    "typed-refused",
+    "native recovery profile does not admit this mutable owner; HI continuation refuses before construction",
+)
+_ALLOCATION_LOCAL = (
+    "allocation-local",
+    "the measurement is local to one process allocation",
+)
+
+
+def _registry_entries(
+    paths: Sequence[tuple[str, str]], disposition: tuple[str, str]
+) -> dict[tuple[str, str], tuple[str, str]]:
+    """Expand an explicit constructor list into the sealed registry."""
+
+    return {key: disposition for key in paths}
+
+
+# This is intentionally a path-and-target registry, rather than a target or
+# path-prefix allowlist.  The raw and O-composite trees are both listed so a
+# new nested Hydra constructor cannot acquire an accidental disposition.
+_REGISTRY: dict[tuple[str, str], tuple[str, str]] = {
+    **_registry_entries(
+        [
+            ("sampler", "tpen.sampling.metropolis.MetropolisSampler"),
+            ("trainer", "tpen.training.trainer.VMCTrainer"),
+        ],
+        _RESTORED,
+    ),
+    **_registry_entries(
+        [
+            ("callbacks.8", "tpen.callback.RuntimeEquivariance"),
+            ("callbacks.9.payload", "tpen.checkpoint.TrainResume"),
+            ("callbacks.10", "tpen.callback.ResourceUsage"),
+        ],
+        _TYPED_REFUSED,
+    ),
+    ("callbacks.10.allocator_probe", "tpen.accelerator.TorchAllocatorPeakProbe"): _ALLOCATION_LOCAL,
 }
-MUTANT_REFUSAL_MAP = {
-    "M1-omitted-sampler-rng": "refused by HI continuation boundary",
-    "M2-reset-cadence-counter": "refused by HI continuation boundary",
-    "M3-callback-private-rng-drift": "refused by HI continuation boundary",
-    "M4-event-before-restore": "refused by HI continuation boundary",
-    "M5-missing-state-classification": "refused by closed inventory",
-}
+
+_RAW_RECONSTRUCTIBLE = [
+    ("atoms", "tpen.data.atomic_configuration.AtomicConfiguration"),
+    ("atoms.positions", "torch.tensor"), ("atoms.charges", "torch.tensor"),
+    ("runner", "tpen.runner.Train"), ("model", "tpen.nn.TPENWaveFunction"),
+    ("model.embedding", "tpen.nn.Embedding"),
+    ("model.embedding.initializer", "tpen.nn.initialization.TorchInitializer"),
+    ("model.layers.0", "tpen.nn.TPENLayer"),
+    ("model.layers.0.mixing", "tpen.nn.EquivariantMixing"),
+    ("model.layers.0.mixing.activation", "torch.nn.SiLU"),
+    ("model.layers.0.path_aggregation", "tpen.nn.PathAggregation"),
+    ("model.layers.0.path_aggregation.activation", "torch.nn.SiLU"),
+    ("model.layers.0.path_aggregation.initializer", "tpen.nn.initialization.TorchInitializer"),
+    ("model.layers.0.update", "tpen.nn.ResidualUpdater"),
+    ("model.factors.0", "tpen.nn.ElectronElectronCusp"),
+    ("model.factors.1", "tpen.nn.ElectronNucleusCusp"),
+    ("model.factors.1.law", "tpen.nn.TailSafeElectronNucleusCuspLaw"),
+    ("model.readout", "tpen.nn.readout.PfaffianReadout"),
+    ("hamiltonian_terms.kinetic", "tpen.physics.kinetic.KineticEnergy"),
+    ("hamiltonian_terms.electron_nucleus", "tpen.physics.potential.ElectronNucleusPotential"),
+    ("hamiltonian_terms.electron_electron", "tpen.physics.potential.ElectronElectronInteraction"),
+    ("hamiltonian_terms.nucleus_nucleus", "tpen.physics.potential.NucleusNucleusPotential"),
+    ("sampler.nuclear_positions", "torch.tensor"), ("sampler.nuclear_charges", "torch.tensor"),
+    ("optimizer", "torch.optim.Adam"),
+    ("callbacks.0", "tpen.callback.ConfigSnapshot"), ("callbacks.1", "tpen.callback.ResolvedConfigSnapshot"),
+    ("callbacks.2", "tpen.callback.Metadata"), ("callbacks.3", "tpen.callback.Status"),
+    ("callbacks.4", "tpen.callback.DataIntegrity"), ("callbacks.5", "tpen.callback.GradientStats"),
+    ("callbacks.6", "tpen.callback.SamplerHealth"), ("callbacks.7", "tpen.callback.FactorScalars"),
+    ("callbacks.8.checkers.0", "tpen.equivariance.checks.FullModelEquivarianceChecker"),
+    ("callbacks.8.checkers.1", "tpen.equivariance.checks.TraceEquivarianceChecker"),
+    ("callbacks.9", "tpen.callback.Checkpoint"), ("callbacks.9.schedule", "tpen.checkpoint.EveryNUpdates"),
+    ("loggers.0", "tpen.logging.CSV"), ("loggers.1", "tpen.logging.JSONL"),
+]
+_REGISTRY.update(_registry_entries(_RAW_RECONSTRUCTIBLE, _RECONSTRUCTIBLE))
+_REGISTRY.update(
+    _registry_entries(
+        [
+            ("model.embedding", "tpen.nn.embedding.matched_start_embedding"),
+            ("model.embedding.raw", "tpen.nn.Embedding"),
+            ("model.embedding.raw.initializer", "tpen.nn.initialization.TorchInitializer"),
+            ("model.embedding.augmented", "tpen.nn.Embedding"),
+            ("model.embedding.augmented.initializer", "tpen.nn.initialization.TorchInitializer"),
+            ("model.layers.0.layout", "tpen.data.paths.compose_path_layout"),
+            ("model.layers.0.layout.linear", "tpen.data.paths.LinearPathMetadata.generate"),
+            ("model.layers.0.layout.linear.explicit.0", "tpen.data.paths.SupportPath"),
+            ("model.layers.0.layout.linear.explicit.1", "tpen.data.paths.SupportPath"),
+            ("model.layers.0.layout.linear.explicit.2", "tpen.data.paths.SupportPath"),
+            ("model.layers.0.layout.tensor_product", "tpen.data.paths.PathMetadata.generate"),
+            ("model.layers.0.layout.input_orders", "tpen.data.paths.NormalizedOrders"),
+            ("model.layers.0.layout.output_orders", "tpen.data.paths.NormalizedOrders"),
+            ("model.layers.0.layout.input_channels", "tpen.data.paths.NormalizedChannels"),
+            ("model.layers.0.layout.output_channels", "tpen.data.paths.NormalizedChannels"),
+            ("model.layers.0.mixing", "tpen.nn.CompositeMixing"),
+            ("model.layers.0.mixing.producers.0", "tpen.nn.LinearEquivariantMixing"),
+            ("model.layers.0.mixing.producers.1", "tpen.nn.EquivariantMixing"),
+            ("model.layers.0.mixing.activation", "tpen.nn.ChannelPreservingMLPActivation"),
+            ("model.layers.0.mixing.activation.layout", "tpen.nn.OrderMLPLayout"),
+            ("model.layers.0.mixing.activation.layout.axes", "tpen.nn.ChannelActivationAxes"),
+            ("model.layers.0.mixing.activation.layout.specs.0", "tpen.nn.OrderMLPSpec"),
+            ("model.layers.0.mixing.activation.layout.specs.0.activation", "torch.nn.SiLU"),
+            ("model.layers.0.mixing.activation.layout.specs.1", "tpen.nn.OrderMLPSpec"),
+            ("model.layers.0.mixing.activation.layout.specs.1.activation", "torch.nn.SiLU"),
+            ("model.layers.0.mixing.activation.initializer", "tpen.nn.TorchInitializer"),
+            ("model.layers.0.path_aggregation.activation", "tpen.nn.ChannelPreservingMLPActivation"),
+            ("model.layers.0.path_aggregation.activation.layout", "tpen.nn.OrderMLPLayout"),
+            ("model.layers.0.path_aggregation.activation.layout.axes", "tpen.nn.ChannelActivationAxes"),
+            ("model.layers.0.path_aggregation.activation.layout.specs.0", "tpen.nn.OrderMLPSpec"),
+            ("model.layers.0.path_aggregation.activation.layout.specs.0.activation", "torch.nn.SiLU"),
+            ("model.layers.0.path_aggregation.activation.layout.specs.1", "tpen.nn.OrderMLPSpec"),
+            ("model.layers.0.path_aggregation.activation.layout.specs.1.activation", "torch.nn.SiLU"),
+            ("model.layers.0.path_aggregation.activation.initializer", "tpen.nn.TorchInitializer"),
+            ("model.layers.0.path_aggregation.initializer", "tpen.nn.TorchInitializer"),
+            ("model.factors.2", "tpen.nn.jastrow.BoundedTwoCoefficientJastrow"),
+            ("model.basis", "tpen.nn.basis.BoundedDistanceBasis"), ("model.basis.inner", "tpen.nn.RawCoordinateBasis"),
+        ],
+        _RECONSTRUCTIBLE,
+    )
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,43 +161,14 @@ def _source_ref(path: str, target: str) -> str:
 
 
 def _classification(path: str, target: str) -> tuple[str, str]:
-    """Classify one target using the native profile and explicit HI boundary."""
+    """Look up one target in the sealed HI constructor registry."""
 
-    if target in _REFUSED_TARGETS:
-        return (
-            "typed-refused",
-            "native recovery profile does not admit this mutable owner; "
-            "HI continuation refuses before construction",
-        )
-    if path == "sampler" or path == "trainer":
-        return _ROOT_CLASSIFICATIONS[path]
-    if ".checkers." in path:
-        return (
-            "reconstructible",
-            "checker has explicit constructor state and is rebuilt by its owning callback",
-        )
-    if path.endswith(".schedule"):
-        return (
-            "reconstructible",
-            "schedule is a pure completed-update function, not a private counter",
-        )
-    if path.endswith(".allocator_probe"):
-        return ("allocation-local", "allocator measurement is local to one process allocation")
-    if path.startswith("callbacks."):
-        if target in SUPPORTED_CALLBACK_TARGETS:
-            return (
-                "reconstructible",
-                "explicit native callback allowlist entry; callback state is rebuilt from config",
-            )
-        return ("typed-refused", "callback target is absent from the native profile")
-    if path.startswith("loggers."):
-        if target in SUPPORTED_LOGGER_TARGETS:
-            return (
-                "reconstructible",
-                "explicit native logger allowlist entry; logger state is rebuilt from config",
-            )
-        return ("typed-refused", "logger target is absent from the native profile")
-    return ("reconstructible", "nested constructor is rebuilt from the committed config")
+    try:
+        return _REGISTRY[(path, target)]
+    except KeyError as error:
+        raise ValueError(
+            f"unclassified HI constructor: path={path!r}, target={target!r}"
+        ) from error
 
 
 def _walk_targets(value: Any, path: str = "") -> list[tuple[str, str]]:
@@ -173,7 +244,6 @@ def refused_inventory_entries(config: Any | None = None) -> tuple[MutableStateEn
 
 
 __all__ = [
-    "MUTANT_REFUSAL_MAP",
     "MutableStateEntry",
     "build_mutable_state_inventory",
     "refused_inventory_entries",

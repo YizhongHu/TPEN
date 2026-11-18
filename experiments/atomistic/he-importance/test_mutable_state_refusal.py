@@ -9,12 +9,16 @@ import subprocess
 import sys
 
 import pytest
+from omegaconf import OmegaConf
 
 
 inventory = importlib.import_module(
     "experiments.atomistic.he-importance.mutable_state_inventory"
 )
 launch = importlib.import_module("experiments.atomistic.he-importance.launch")
+stage_q = importlib.import_module("experiments.atomistic.he-importance.run_stage_q")
+train_config = importlib.import_module("experiments.atomistic.he-importance.train_config")
+context_mapping = importlib.import_module("experiments.atomistic.he-importance.context_mapping")
 
 
 def test_real_hi_train_config_is_fully_classified() -> None:
@@ -33,6 +37,45 @@ def test_real_hi_train_config_is_fully_classified() -> None:
         "tpen.callback.ResourceUsage",
     }
     assert all(":line " in entry.source for entry in refused)
+
+
+def test_o_composite_hi_config_is_fully_classified() -> None:
+    config = train_config._compose_base_config()
+    config.model = context_mapping.compose_package(config.model, "B11")
+    config.model.layers[0] = OmegaConf.create(
+        context_mapping.context_fragment(
+            "hybrid/coordinate-neighbor",
+            activation="channel-MLP,channel-MLP",
+            seed=0,
+        )
+    )
+    entries = inventory.validate_mutable_state_inventory(config)
+    assert any(entry.target == "tpen.nn.CompositeMixing" for entry in entries)
+
+
+@pytest.mark.parametrize(
+    ("path", "target"),
+    [
+        ("model.injected", "tests.NewConstructor"),
+        ("hamiltonian_terms.injected", "tests.NewHamiltonian"),
+    ],
+)
+def test_new_nested_constructor_fails_closed(path: str, target: str) -> None:
+    config = OmegaConf.to_container(train_config._compose_base_config(), resolve=False)
+    parent, _, key = path.rpartition(".")
+    nested = config
+    for part in parent.split("."):
+        nested = nested[part]
+    nested[key] = {"_target_": target}
+    with pytest.raises(ValueError, match="unclassified HI constructor"):
+        inventory.validate_mutable_state_inventory(config)
+
+
+def test_registered_constructor_target_change_fails_closed() -> None:
+    config = OmegaConf.to_container(train_config._compose_base_config(), resolve=False)
+    config["model"]["_target_"] = "tests.ReplacementWaveFunction"
+    with pytest.raises(ValueError, match="model.*ReplacementWaveFunction"):
+        inventory.validate_mutable_state_inventory(config)
 
 
 def test_native_profile_refuses_hi_train_config_at_expected_entries() -> None:
@@ -85,12 +128,32 @@ def test_two_process_successor_refusal_preserves_fixture_leaf(tmp_path: Path) ->
     assert marker.read_bytes() == before
 
 
-def test_contract_mutants_are_mapped_to_refusal() -> None:
-    assert set(inventory.MUTANT_REFUSAL_MAP) == {
-        "M1-omitted-sampler-rng",
-        "M2-reset-cadence-counter",
-        "M3-callback-private-rng-drift",
-        "M4-event-before-restore",
-        "M5-missing-state-classification",
-    }
-    assert all("refused" in result for result in inventory.MUTANT_REFUSAL_MAP.values())
+def test_prepare_and_launch_refuse_before_runner_construction() -> None:
+    runner_calls: list[object] = []
+
+    def runner(config: object) -> int:
+        runner_calls.append(config)
+        return 0
+
+    with pytest.raises(launch.HIContinuationRefusal, match="hi-continuation-refused"):
+        launch.prepare_train_launch(object(), restore_request=object())
+    with pytest.raises(launch.HIContinuationRefusal, match="hi-continuation-refused"):
+        launch.launch_train(object(), runner=runner, restore_request=object())
+    assert runner_calls == []
+
+
+def test_stage_q_execute_refuses_before_selection_or_leaf_write(tmp_path: Path, monkeypatch) -> None:
+    calls: list[object] = []
+
+    def launch_double(*args: object, **kwargs: object) -> int:
+        calls.append((args, kwargs))
+        return 0
+
+    monkeypatch.setattr(stage_q.launch, "launch_train", launch_double)
+    args = stage_q.build_parser().parse_args(
+        ["--stage", "O1", "--context", "O-raw", "--output-root", str(tmp_path)]
+    )
+    with pytest.raises(launch.HIContinuationRefusal, match="hi-continuation-refused"):
+        stage_q.execute(args, restore_request=object())
+    assert calls == []
+    assert not any(tmp_path.iterdir())

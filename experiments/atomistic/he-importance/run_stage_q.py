@@ -1474,6 +1474,9 @@ def execute(
     runtime_callbacks : sequence of object, optional
         Operational observers forwarded to the guarded runner after configured
         callbacks, outside the science configuration.
+    restore_request : object, optional
+        Continuation request. HI continuation is refused before manifest
+        loading, row selection, model construction, or any output-leaf write.
 
     Returns
     -------
@@ -1485,6 +1488,8 @@ def execute(
     StageQSelectionError
         If the stage has no declared universe, selection is not exactly one
         truthful admitted cell, or the walker count is not declared.
+    launch.HIContinuationRefusal
+        If ``restore_request`` is not ``None``.
     """
 
     launch.refuse_hi_continuation(restore_request)

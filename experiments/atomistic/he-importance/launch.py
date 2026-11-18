@@ -483,6 +483,14 @@ def prepare_train_launch(
     overrides : mapping or sequence of str, optional
         Operational overlays applied by the resolver before configuration
         readback. ``None`` preserves the default resolved configuration.
+    restore_request : object, optional
+        Continuation request. HI continuation is not qualified and is refused
+        before topology binding, configuration resolution, or construction.
+
+    Raises
+    ------
+    HIContinuationRefusal
+        If ``restore_request`` is not ``None``.
     """
 
     refuse_hi_continuation(restore_request)
@@ -536,6 +544,9 @@ def launch_train(
     runtime_callbacks : sequence of object, optional
         Operational observers appended after configured callbacks. A non-empty
         sequence is refused when the runner cannot accept this keyword.
+    restore_request : object, optional
+        Continuation request. HI continuation is refused before runner
+        construction or any output-leaf write.
     overrides : mapping or sequence of str, optional
         Operational overlays applied by the resolver before configuration
         readback. ``None`` preserves the default resolved configuration.
@@ -549,6 +560,8 @@ def launch_train(
     ------
     LaunchValidationError
         If launch facts, the runner contract, or the returned code is invalid.
+    HIContinuationRefusal
+        If ``restore_request`` is not ``None``.
     """
 
     refuse_hi_continuation(restore_request)
