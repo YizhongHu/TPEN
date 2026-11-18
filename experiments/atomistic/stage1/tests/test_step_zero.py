@@ -41,7 +41,7 @@ def tiny_protocol() -> Protocol:
         smoke_walkers=1,
         lineage_updates=7,
         lineage_walkers=2,
-        lineages=1,
+        lineages=3,
         eval_streams=4,
         eval_walkers=2,
         eval_draws=2,
@@ -56,7 +56,7 @@ def _phase1_rows(protocol: Protocol, checkpoints: list[int], tmp_path: Path) -> 
         source_sha="a" * 40,
         config_sha256={system: "b" * 64 for system in SYSTEMS},
         checkpoints=checkpoints,
-        lineage_seeds=[11],
+        lineage_seeds=[11, 12, 13],
         checkpoint_sha256={},
         results_root=str(tmp_path / "results"),
         phase=1,
@@ -96,8 +96,9 @@ def test_phase2_binds_zero_digest_and_emits_four_streams(
                 for row in train_rows
             },
             "checkpoints": {
-                f"{system}:0:0": "c" * 64
+                f"{system}:{lineage}:0": "c" * 64
                 for system in SYSTEMS
+                for lineage in range(tiny_protocol.lineages)
             },
         },
         source_sha="a" * 40,
@@ -107,7 +108,7 @@ def test_phase2_binds_zero_digest_and_emits_four_streams(
     )
 
     zero_rows = [row for row in eval_rows if row["checkpoint"] == 0]
-    assert len(zero_rows) == len(SYSTEMS) * tiny_protocol.eval_streams
+    assert len(zero_rows) == len(SYSTEMS) * tiny_protocol.lineages * tiny_protocol.eval_streams
     assert {row["checkpoint_sha256"] for row in zero_rows} == {"c" * 64}
     assert all("step_000000" in row["checkpoint_dir"] for row in zero_rows)
     assert train_rows
@@ -128,6 +129,7 @@ def test_positive_row_identity_does_not_depend_on_zero_prefix(
             checkpoint_sha256={
                 (system, 0, checkpoint): "c" * 64
                 for system in SYSTEMS
+                for lineage in range(tiny_protocol.lineages)
                 for checkpoint in checkpoints
             },
             results_root=str(tmp_path / "results"),
@@ -226,7 +228,7 @@ def test_zero_and_positive_checkpoint_real_producer_chain(
         smoke_walkers=1,
         lineage_updates=1,
         lineage_walkers=2,
-        lineages=1,
+        lineages=3,
         eval_streams=4,
         eval_walkers=2,
         eval_draws=2,
@@ -238,19 +240,19 @@ def test_zero_and_positive_checkpoint_real_producer_chain(
         source_sha=source_sha,
         config_sha256=config_sha256,
         checkpoints=[0, 1],
-        lineage_seeds=[11],
+        lineage_seeds=[11, 12, 13],
         checkpoint_sha256={},
         results_root=str(tmp_path / "results"),
         systems=systems,
         phase=1,
         device="cpu",
     )
-    train_row = next(row for row in phase1_rows if row["kind"] == "train")
-    train_overrides = row_overrides(train_row) + [
-        "sampler.burn_in=1", "sampler.n_steps=1",
-    ]
+    train_rows = [row for row in phase1_rows if row["kind"] == "train"]
 
-    def run_train() -> None:
+    def run_train(train_row: dict) -> None:
+        train_overrides = row_overrides(train_row) + [
+            "sampler.burn_in=1", "sampler.n_steps=1",
+        ]
         monkeypatch.setattr(
             sys, "argv", [
                 "stage1-train", "--config", str(CONFIG_ROOT / "he" / "train.yaml"),
@@ -260,18 +262,16 @@ def test_zero_and_positive_checkpoint_real_producer_chain(
         )
         assert stage1_train.main() == 0
 
-    run_train()
-    run_dir = resolve_run_dir(train_row)
-    digests = {
-        checkpoint: hashlib.sha256(
-            (run_dir / "checkpoints" / f"step_{checkpoint:06d}" / "model.pt").read_bytes()
-        ).hexdigest()
-        for checkpoint in (0, 1)
-    }
-    assert all(
-        (run_dir / "checkpoints" / f"step_{checkpoint:06d}" / "COMPLETE").is_file()
-        for checkpoint in (0, 1)
-    )
+    digests: dict[tuple[int, int], str] = {}
+    for train_row in train_rows:
+        run_train(train_row)
+        run_dir = resolve_run_dir(train_row)
+        for checkpoint in (0, 1):
+            checkpoint_dir = run_dir / "checkpoints" / f"step_{checkpoint:06d}"
+            assert (checkpoint_dir / "COMPLETE").is_file()
+            digests[(int(train_row["lineage"]), checkpoint)] = hashlib.sha256(
+                (checkpoint_dir / "model.pt").read_bytes()
+            ).hexdigest()
     phase1_hash = manifest_hash(phase1_rows)
     phase2_rows = bind_evaluation_manifest(
         phase1_rows=phase1_rows,
@@ -280,10 +280,12 @@ def test_zero_and_positive_checkpoint_real_producer_chain(
             "schema": "stage1-checkpoint-evidence/v1",
             "phase1_manifest_hash": phase1_hash,
             "phase1_train_row_hashes": {
-                f"{train_row['system']}:{train_row['lineage']}": manifest_hash([train_row]),
+                f"{row['system']}:{row['lineage']}": manifest_hash([row])
+                for row in train_rows
             },
             "checkpoints": {
-                f"he:0:{checkpoint}": digest for checkpoint, digest in digests.items()
+                f"he:{lineage}:{checkpoint}": digest
+                for (lineage, checkpoint), digest in digests.items()
             },
         },
         protocol=protocol,
@@ -322,8 +324,8 @@ def test_zero_and_positive_checkpoint_real_producer_chain(
         "rows": phase2_rows,
     }
     collected = collect(document)
-    assert len(collected["records"]) == protocol.eval_streams * 2
-    assert len(collected["aggregates"]) == 2
+    assert len(collected["records"]) == protocol.lineages * protocol.eval_streams * 2
+    assert len(collected["aggregates"]) == protocol.lineages * 2
     assert {aggregate["checkpoint"] for aggregate in collected["aggregates"]} == {0, 1}
     assert all(aggregate["stream_count"] == protocol.eval_streams
                for aggregate in collected["aggregates"])
