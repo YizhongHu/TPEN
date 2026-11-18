@@ -298,6 +298,11 @@ def run(mode: str, root: Path, *, failure: bool) -> dict[str, object]:
         if mode == "prefix":
             save_checkpoint(
                 output_dir=checkpoint_root,
+                # These are independent trainer coordinates: the resume cursor
+                # advances for every completed iteration, while the update
+                # count advances only when optimizer.step() returns.
+                next_iteration=trainer.next_iteration,
+                completed_updates=trainer.completed_updates,
                 model=model,
                 optimizer=optimizer,
                 trainer=trainer,

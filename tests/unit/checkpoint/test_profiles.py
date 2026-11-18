@@ -35,6 +35,8 @@ from tpen.execution.native_profile import (
 
 def _config(**overrides: object) -> dict[str, object]:
     value: dict[str, object] = {
+        "run": {"dir": "/tmp/tpen-profile-fixture"},
+        "runtime": {"device": "cpu", "seed": 19},
         "callbacks": [{"_target_": "tpen.callback.Status"}],
         "loggers": [{"_target_": "tpen.logging.JSONL"}],
     }
