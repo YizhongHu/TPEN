@@ -1,0 +1,30 @@
+[
+  {
+    "id": "polaris-gpu-count-check-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "[[ \"${#gpu_lines[@]}\" == 4 ]] || die \"expected 4 GPUs, got ${#gpu_lines[@]}\"",
+    "new": "true",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_wrong_gpu_count"
+  },
+  {
+    "id": "polaris-mig-check-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "[[ \"$line\" == \"Disabled\" ]] || die \"MIG mode is not Disabled: $line\"",
+    "new": "true",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_mig_enabled"
+  },
+  {
+    "id": "polaris-single-visible-gpu-check-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "[[ \"$count\" == 1 ]] || die \"expected one visible GPU for binding $i, got $count\"",
+    "new": "true",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_multiple_visible_devices"
+  },
+  {
+    "id": "polaris-eagle-prefix-check-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "case \"$RESULTS_ROOT\" in\n    \"$RESULTS_PREFIX\"*) ;;\n    *) die \"results root outside Eagle prefix: $RESULTS_ROOT\" ;;\n  esac",
+    "new": "true",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_non_eagle_results_root"
+  }
+]
