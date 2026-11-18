@@ -356,24 +356,25 @@ def _scalar_value(value: Any, config: Mapping[str, Any]) -> Any:
     return _INVALID_SCALAR
 
 
+def _numeric_value(
+    value: Any, config: Mapping[str, Any], *, integer: bool = False
+) -> Any:
+    """Return a valid numeric scalar without evaluating a Hydra resolver."""
+
+    resolved = _scalar_value(value, config)
+    if resolved is _INVALID_SCALAR:
+        return _INVALID_SCALAR
+    if integer:
+        return resolved if type(resolved) is int else _INVALID_SCALAR
+    return resolved if type(resolved) in (int, float) else _INVALID_SCALAR
+
+
 def _numeric_scalar(
     value: Any, config: Mapping[str, Any], *, integer: bool = False
 ) -> bool:
     """Validate a numeric scalar without resolving Hydra values."""
 
-    resolved = _scalar_value(value, config)
-    if resolved is _INVALID_SCALAR:
-        return False
-    if integer:
-        return type(resolved) is int
-    return type(resolved) in (int, float)
-
-
-def _string_scalar(value: Any, config: Mapping[str, Any]) -> bool:
-    """Validate a literal string or a plain reference to a literal string."""
-
-    resolved = _scalar_value(value, config)
-    return type(resolved) is str
+    return _numeric_value(value, config, integer=integer) is not _INVALID_SCALAR
 
 
 def _runtime_equivariance_contract_refusal(
@@ -409,26 +410,26 @@ def _runtime_equivariance_contract_refusal(
             "unsupported-callback",
             f"{path} {_RUNTIME_EQUIVARIANCE_TARGET!r} requires a routed artifact_dir",
         )
-    if "every_n_steps" in entry and not _numeric_scalar(
-        entry["every_n_steps"], config, integer=True
-    ):
+    every_n_steps = _numeric_value(
+        entry.get("every_n_steps"), config, integer=True
+    )
+    if "every_n_steps" in entry and every_n_steps is _INVALID_SCALAR:
         return (
             "unsupported-callback",
             f"{path}.every_n_steps must be an integer or unresolved interpolation",
         )
-    if "every_n_steps" in entry and not isinstance(entry["every_n_steps"], str) and entry["every_n_steps"] < 1:
+    if "every_n_steps" in entry and every_n_steps < 1:
         return (
             "unsupported-callback",
             f"{path}.every_n_steps must be positive",
         )
-    if "start_step" in entry and not _numeric_scalar(
-        entry["start_step"], config, integer=True
-    ):
+    start_step = _numeric_value(entry.get("start_step"), config, integer=True)
+    if "start_step" in entry and start_step is _INVALID_SCALAR:
         return (
             "unsupported-callback",
             f"{path}.start_step must be an integer or unresolved interpolation",
         )
-    if "start_step" in entry and not isinstance(entry["start_step"], str) and entry["start_step"] < 0:
+    if "start_step" in entry and start_step < 0:
         return (
             "unsupported-callback",
             f"{path}.start_step must be nonnegative",
@@ -470,24 +471,28 @@ def _runtime_equivariance_contract_refusal(
                 "unsupported-callback",
                 f"{checker_path} has unknown constructor field(s): {sorted(unknown_checker)!r}",
             )
-        if not _numeric_scalar(checker.get("permutation_fraction"), config):
+        permutation_fraction = _numeric_value(
+            checker.get("permutation_fraction"), config
+        )
+        if permutation_fraction is _INVALID_SCALAR:
             return (
                 "unsupported-callback",
                 f"{checker_path}.permutation_fraction must be an audited numeric scalar",
             )
-        if not isinstance(checker["permutation_fraction"], str) and not 0 <= checker[
-            "permutation_fraction"
-        ] <= 1:
+        if not 0 <= permutation_fraction <= 1:
             return (
                 "unsupported-callback",
                 f"{checker_path}.permutation_fraction must be between 0 and 1",
             )
-        if not _numeric_scalar(checker.get("max_permutations"), config, integer=True):
+        max_permutations = _numeric_value(
+            checker.get("max_permutations"), config, integer=True
+        )
+        if max_permutations is _INVALID_SCALAR:
             return (
                 "unsupported-callback",
                 f"{checker_path}.max_permutations must be an audited integer scalar",
             )
-        if not isinstance(checker["max_permutations"], str) and checker["max_permutations"] < 1:
+        if max_permutations < 1:
             return (
                 "unsupported-callback",
                 f"{checker_path}.max_permutations must be positive",
@@ -499,17 +504,14 @@ def _runtime_equivariance_contract_refusal(
                 "unsupported-callback",
                 f"{checker_path}.seed must be an integer, null, or unresolved interpolation",
             )
-        if not _numeric_scalar(checker.get("atol"), config) or not _numeric_scalar(
-            checker.get("rtol"), config
-        ):
+        atol = _numeric_value(checker.get("atol"), config)
+        rtol = _numeric_value(checker.get("rtol"), config)
+        if atol is _INVALID_SCALAR or rtol is _INVALID_SCALAR:
             return (
                 "unsupported-callback",
                 f"{checker_path} requires audited atol and rtol scalars",
             )
-        if any(
-            not isinstance(checker[key], str) and checker[key] < 0
-            for key in ("atol", "rtol")
-        ):
+        if atol < 0 or rtol < 0:
             return (
                 "unsupported-callback",
                 f"{checker_path}.atol and rtol must be nonnegative",
@@ -542,9 +544,11 @@ def _resource_usage_contract_refusal(
             "unsupported-callback",
             f"{path}.allocator_probe must be the exact audited TorchAllocatorPeakProbe shape",
         )
+    device = _scalar_value(probe.get("device"), config)
     if (
         probe.get("_target_") != _TORCH_ALLOCATOR_PROBE_TARGET
-        or not _string_scalar(probe.get("device"), config)
+        or type(device) is not str
+        or not device
     ):
         return (
             "unsupported-callback",
