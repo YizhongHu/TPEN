@@ -19,6 +19,7 @@
 set -Eeuo pipefail
 
 RESULTS_PREFIX="/eagle/HetRxnEnergy/rhu/"
+TPEN_POLARIS_TEST_RESULTS_PREFIX="${TPEN_POLARIS_TEST_RESULTS_PREFIX:-}"
 MODE="${MODE:-${1:-}}"
 SOURCE_SHA="${SOURCE_SHA:-}"
 CHECKOUT_ROOT="${CHECKOUT_ROOT:-}"
@@ -45,6 +46,15 @@ cleanup_owned_boot_root() {
 die() {
   printf '%s\n' "POLARIS_GUARD FAIL $*" >&2
   exit 2
+}
+
+configure_results_prefix() {
+  [[ -n "$TPEN_POLARIS_TEST_RESULTS_PREFIX" ]] || return 0
+  if [[ "${PBS_ENVIRONMENT:-}" == PBS_BATCH || "${PBS_ENVIRONMENT:-}" == PBS_INTERACTIVE || -n "${PBS_JOBID:-}" ]]; then
+    die "TPEN_POLARIS_TEST_RESULTS_PREFIX is forbidden in PBS contexts or when PBS_JOBID is set"
+  fi
+  RESULTS_PREFIX="$TPEN_POLARIS_TEST_RESULTS_PREFIX"
+  printf 'POLARIS_TEST_PREFIX_OVERRIDE=%s\n' "$RESULTS_PREFIX" >&2
 }
 
 require_value() {
@@ -153,6 +163,9 @@ PY
 }
 
 assert_pbs_context() {
+  if [[ -n "$TPEN_POLARIS_TEST_RESULTS_PREFIX" && -z "$PBS_JOBID" ]]; then
+    PBS_JOBID="polaris-test-local"
+  fi
   require_value PBS_JOBID
   require_value PBS_QUEUE
   require_value EXPECTED_QUEUE
@@ -181,6 +194,9 @@ write_job_receipt() {
     printf 'UV_NO_MANAGED_PYTHON=%s\n' "$UV_NO_MANAGED_PYTHON"
     printf 'UV_PYTHON_DOWNLOADS=%s\n' "$UV_PYTHON_DOWNLOADS"
     printf 'UV_LINK_MODE=%s\n' "$UV_LINK_MODE"
+    if [[ -n "$TPEN_POLARIS_TEST_RESULTS_PREFIX" ]]; then
+      printf 'POLARIS_TEST_PREFIX_OVERRIDE=%s\n' "$RESULTS_PREFIX"
+    fi
   } > "$RESULTS_ROOT/logs/polaris-${MODE}-${PBS_JOBID}.env"
 }
 
@@ -452,6 +468,7 @@ run_collect() {
 }
 
 main() {
+  configure_results_prefix
   case "$MODE" in
     guard)
       EXPECTED_QUEUE="${EXPECTED_QUEUE:-debug}"

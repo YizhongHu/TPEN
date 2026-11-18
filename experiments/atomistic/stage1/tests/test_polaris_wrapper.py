@@ -238,6 +238,24 @@ def test_guard_rejects_dot_dot_escape_before_any_write(tmp_path: Path) -> None:
     assert "contains '..'" in result.stderr
 
 
+def test_test_prefix_override_refused_in_pbs_batch(tmp_path: Path) -> None:
+    prefix = tmp_path / "test-prefix"
+    prefix.mkdir()
+    sentinel = prefix / "sentinel"
+    sentinel.write_bytes(b"preserve-me\0")
+    env = _env(
+        tmp_path,
+        RESULTS_ROOT=str(prefix / "results"),
+        TPEN_POLARIS_TEST_RESULTS_PREFIX=str(prefix),
+        PBS_ENVIRONMENT="PBS_BATCH",
+        PBS_JOBID="pbs-123.server",
+    )
+    result = _run("guard", env)
+    assert result.returncode == 2
+    assert "TPEN_POLARIS_TEST_RESULTS_PREFIX is forbidden" in result.stderr
+    assert sentinel.read_bytes() == b"preserve-me\0"
+
+
 def test_production_rejects_promisor_checkout_before_uv(tmp_path: Path) -> None:
     checkout, source_sha = _make_exact_fixture(tmp_path)
     subprocess.run(
@@ -340,11 +358,13 @@ def _production_stubs(tmp_path: Path) -> dict[str, str]:
 
 def _production_env(tmp_path: Path, checkout: Path, source_sha: str) -> dict[str, str]:
     stubs = _production_stubs(tmp_path)
+    results_prefix = tmp_path / "test-results-prefix"
     env = os.environ.copy()
     env.update({
         "SOURCE_SHA": source_sha, "CHECKOUT_ROOT": str(checkout),
-        "RESULTS_ROOT": str(Path(EAGLE_ROOT) / f"t1-{tmp_path.name}"),
-        "PBS_JOBID": f"t1-{tmp_path.name}", "PBS_QUEUE": "debug",
+        "RESULTS_ROOT": str(results_prefix / f"t1-{tmp_path.name}"),
+        "TPEN_POLARIS_TEST_RESULTS_PREFIX": str(results_prefix),
+        "PBS_JOBID": "", "PBS_ENVIRONMENT": "", "PBS_QUEUE": "debug",
         "EXPECTED_QUEUE": "debug", "DRY_EXEC": "0", "UV_CACHE_DIR": str(tmp_path / "uv-cache"),
         "BOOT_PARENT": str(tmp_path / "boot-parent"), "NVIDIA_SMI_BIN": _stub_bin(tmp_path)["NVIDIA_SMI_BIN"],
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
@@ -369,6 +389,9 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
     })
     planned = _run("plan", env)
     assert planned.returncode == 0, planned.stderr
+    assert f"POLARIS_TEST_PREFIX_OVERRIDE={env['TPEN_POLARIS_TEST_RESULTS_PREFIX']}" in planned.stderr
+    receipt = next(results_root.glob("logs/polaris-plan-*.env"))
+    assert f"POLARIS_TEST_PREFIX_OVERRIDE={env['TPEN_POLARIS_TEST_RESULTS_PREFIX']}" in receipt.read_text()
     phase1 = json.loads(plan_path.read_text(encoding="utf-8"))
     assert [row["device"] for row in phase1["rows"] if row["kind"] == "train"] == ["cuda"] * 3
 
@@ -435,4 +458,4 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
     env["FAIL_DRIVER"] = "all"
     evaluated_fail = _run("eval", env)
     assert evaluated_fail.returncode != 0
-    assert len(list(results_root.glob("logs/*-t1-*.status"))) >= 12
+    assert len(list(results_root.glob("logs/*.status"))) >= 12

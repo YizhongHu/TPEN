@@ -75,5 +75,12 @@
     "old": "if row.get(\"device\") != \"cuda\":",
     "new": "if False:",
     "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
+  },
+  {
+    "id": "polaris-test-prefix-pbs-guard-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "if [[ \"${PBS_ENVIRONMENT:-}\" == PBS_BATCH || \"${PBS_ENVIRONMENT:-}\" == PBS_INTERACTIVE || -n \"${PBS_JOBID:-}\" ]]; then",
+    "new": "if false; then",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_test_prefix_override_refused_in_pbs_batch"
   }
 ]
