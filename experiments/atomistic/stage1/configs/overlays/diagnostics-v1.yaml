@@ -9,10 +9,6 @@
 #     base config (burn_in=100, n_steps=10, proposal_scale=0.5, lr=0.005,
 #     n_walkers=4096), NOT Hooke-2e's -- no physics change, this overlay
 #     only ADDS observability.
-#   - checkpoint_steps is the single real-science checkpoint [50000], matching
-#     He/H2's approved plan.py --checkpoints 50000 (NOT Hooke-2e's dense
-#     30-checkpoint ladder, which is Hooke-specific tooling, not part of the
-#     approved He/H2 shape).
 #   - trainer.max_steps is 50000, matching He/H2's real science budget
 #     (STAGE1_PROTOCOL.lineage_updates), not Hooke-2e's 30000.
 # Same ElectronNucleusDistanceQuantiles omission note as the Hooke-2e
