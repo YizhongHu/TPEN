@@ -115,11 +115,39 @@ class _DFK:
         self.config = config
 
 
-def _install_fake_parsl(monkeypatch: pytest.MonkeyPatch) -> None:
+def _install_fake_parsl(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    probe_hosts: dict[str, str] | None = None,
+    probe_labels: list[str] | None = None,
+) -> None:
+    probe_hosts = {} if probe_hosts is None else probe_hosts
+
+    def python_app(*, executors="all", **_kwargs):
+        labels = tuple(executors) if not isinstance(executors, str) else (executors,)
+
+        def decorate(function):
+            if function.__name__ != "_shared_store_probe" or not probe_hosts:
+                return function
+
+            def submit(*args, **_submit_kwargs):
+                label = labels[0]
+                if probe_labels is not None:
+                    probe_labels.append(label)
+                future: Future = Future()
+                future.set_result(
+                    {"host": probe_hosts[label], "pid": 1, "root": str(Path(args[0]).resolve())}
+                )
+                return future
+
+            return submit
+
+        return decorate
+
     modules = {
         "parsl.config": SimpleNamespace(Config=_Config),
         "parsl.dataflow.dflow": SimpleNamespace(DataFlowKernel=_DFK),
-        "parsl.app.app": SimpleNamespace(python_app=lambda **_: lambda function: function),
+        "parsl.app.app": SimpleNamespace(python_app=python_app),
         "parsl.executors": SimpleNamespace(HighThroughputExecutor=_HTEX),
         "parsl.executors.high_throughput.executor": SimpleNamespace(
             DEFAULT_LAUNCH_CMD="process_worker_pool.py {debug} {max_workers_per_node} -a {addresses} -p {prefetch_capacity}"
@@ -197,51 +225,29 @@ def test_routed_config_builds_one_single_node_pool_per_node(monkeypatch: pytest.
 
 
 def test_routed_preflight_submits_exact_workers_to_each_label(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_parsl(monkeypatch)
+    calls: list[str] = []
+    _install_fake_parsl(
+        monkeypatch,
+        probe_hosts={"pool-a": "node-a", "pool-b": "node-b"},
+        probe_labels=calls,
+    )
     spec = _spec()
     allocation = _allocation()
     lifecycle = AttachedAllocation(allocation, DirectoryStore(tmp_path / "store"))
     dispatcher = parsl_dispatch.ParslDispatcher(SimpleNamespace(materialize=lambda _env=None: {}), transport=spec)
-    calls: list[str] = []
-
-    def app_factory(*, executors, **_kwargs):
-        calls.extend(executors)
-
-        def decorate(function):
-            def submit(*args, **_submit_kwargs):
-                future: Future = Future()
-                pool = next(pool for pool in spec.pools if pool.label == executors[0])
-                future.set_result({"host": pool.node, "pid": 1, "root": str(Path(args[1]).resolve())})
-                return future
-            return submit
-        return decorate
-
-    # The fake's root fact is derived from the probe argument, matching the
-    # controller's realpath without launching a worker.
-    dispatcher._python_app_factory = app_factory
-    dispatcher._active_dfk = object()
     dispatcher._preflight_routed_store(lifecycle, spec)
     assert calls == ["pool-a", "pool-a", "pool-b"]
 
 
 def test_routed_preflight_rejects_wrong_hostname_before_begin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_parsl(monkeypatch)
+    _install_fake_parsl(
+        monkeypatch,
+        probe_hosts={"pool-a": "node-a", "pool-b": "wrong-node"},
+    )
     spec = _spec()
     lifecycle = AttachedAllocation(_allocation(), DirectoryStore(tmp_path / "store"))
     dispatcher = parsl_dispatch.ParslDispatcher(SimpleNamespace(materialize=lambda _env=None: {}), transport=spec)
 
-    def app_factory(*, executors, **_kwargs):
-        def decorate(_function):
-            def submit(*_args, **_submit_kwargs):
-                future: Future = Future()
-                pool = next(pool for pool in spec.pools if pool.label == executors[0])
-                future.set_result({"host": "wrong-node" if pool.label == "pool-b" else pool.node, "pid": 1, "root": str(Path(lifecycle.store.root).resolve())})
-                return future
-            return submit
-        return decorate
-
-    dispatcher._python_app_factory = app_factory
-    dispatcher._active_dfk = object()
     with pytest.raises(parsl_dispatch.RoutedTransportPreflightError):
         dispatcher._preflight_routed_store(lifecycle, spec)
     assert not (Path(lifecycle.store.root) / "groups").exists()
@@ -252,7 +258,7 @@ def test_routed_config_is_not_validated_as_v1(monkeypatch: pytest.MonkeyPatch) -
     spec = _spec()
     dispatcher = parsl_dispatch.ParslDispatcher(SimpleNamespace(materialize=lambda _env=None: {}), transport=spec)
     config = dispatcher._attached_routed_config(spec, "runinfo")
-    with pytest.raises(AttributeError, match="label"):
+    with pytest.raises(parsl_dispatch.UnsupportedTransportError, match="exactly one executor"):
         dispatcher._validate_attached_config(config, spec)  # type: ignore[arg-type]
 
 

@@ -73,8 +73,8 @@ LABEL = "s3b-htex"
 S3B_MUTANT_TABLE = (
     {
         "id": "M1", "target": PARSL_MODULE,
-        "old": "                config = self._attached_config(self.transport, run_dir)\n                labels = self._validate_attached_config(config, self.transport)\n",
-        "new": "                config = self._config_type(executors=[self._thread_pool_type(label=self.transport.label, max_threads=len(bindings))], run_dir=run_dir, usage_tracking=False)\n                labels = (self.transport.label,)\n",
+        "old": "                    config = self._attached_config(self.transport, run_dir)\n                    labels = self._validate_attached_config(config, self.transport)\n",
+        "new": "                    config = self._config_type(executors=[self._thread_pool_type(label=self.transport.label, max_threads=len(bindings))], run_dir=run_dir, usage_tracking=False)\n                    labels = (self.transport.label,)\n",
         "killer": "test_attached_run_submits_the_leaf_through_a_fresh_htex_dfk",
         "suite": "executor", "assertion": "a selected attached transport is never silently routed through an in-process ThreadPool",
     },
@@ -183,6 +183,8 @@ class _Parsl:
         self.submissions: list[dict] = []
         self.hooks: dict[str, object] = {}
         self.calls: dict[str, int] = {}
+        self.routed_probe_hosts: dict[str, str] | None = None
+        self.routed_probe_labels: list[str] = []
         recorder = self
 
         class DataFlowKernel:
@@ -216,7 +218,16 @@ class _Parsl:
                             index = recorder.calls[name] = recorder.calls.get(name, 0) + 1
                             hook = recorder.hooks.get(name)
                             try:
-                                result = hook(index, function_, args, kwargs) if hook else function_(*args, **kwargs)
+                                if name == "_shared_store_probe" and recorder.routed_probe_hosts is not None:
+                                    label = tuple(executors)[0]
+                                    recorder.routed_probe_labels.append(label)
+                                    result = {
+                                        "host": recorder.routed_probe_hosts[label],
+                                        "pid": 1,
+                                        "root": os.path.realpath(args[0]),
+                                    }
+                                else:
+                                    result = hook(index, function_, args, kwargs) if hook else function_(*args, **kwargs)
                             except Exception as caught:
                                 error = caught
                                 continue
@@ -425,38 +436,10 @@ def _routed_allocation(nodes: tuple[str, ...] = ("node-a", "node-b")) -> Configu
 def _attach_routed_probe_answers(dispatcher: object, fake_parsl: _Parsl, hosts: dict[str, str]) -> list[str]:
     """Make only the production probe app synthetic; leaves stay fake-Parsl remote apps."""
 
-    probe_labels: list[str] = []
-    base_factory = dispatcher._python_app_factory  # type: ignore[attr-defined]
-
-    def app_factory(*, data_flow_kernel=None, cache=False, executors="all"):
-        labels = tuple(executors) if not isinstance(executors, str) else (executors,)
-
-        def decorate(function):
-            if function.__name__ != "_shared_store_probe":
-                return base_factory(data_flow_kernel=data_flow_kernel, cache=cache, executors=executors)(function)
-
-            def submit(*args, **_kwargs):
-                label = labels[0]
-                probe_labels.append(label)
-                fake_parsl.submissions.append(
-                    {
-                        "function": function.__name__,
-                        "executors": list(labels),
-                        "args": args,
-                        "dfk": data_flow_kernel,
-                        "remote": True,
-                    }
-                )
-                future: Future = Future()
-                future.set_result({"host": hosts[label], "pid": 1, "root": os.path.realpath(args[0])})
-                return future
-
-            return submit
-
-        return decorate
-
-    dispatcher._python_app_factory = app_factory  # type: ignore[attr-defined]
-    return probe_labels
+    del dispatcher
+    fake_parsl.routed_probe_hosts = hosts
+    fake_parsl.routed_probe_labels.clear()
+    return fake_parsl.routed_probe_labels
 
 
 def _cli_inputs(tmp_path: Path, allocation: ConfiguredAllocation, *, runner: str = "tpen_executor.runners.TPENCommand") -> dict[str, Path | ReadyGroup]:

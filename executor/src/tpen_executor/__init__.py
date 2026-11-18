@@ -26,10 +26,10 @@ _LAZY_EXPORTS = {
     "LocalDispatcher": (".dispatch", "LocalDispatcher"),
     "ParslDispatcher": (".dispatch", "ParslDispatcher"),
     "ParslUnavailableError": (".dispatch", "ParslUnavailableError"),
-    "AttachedTransportSpec": (".dispatch", "AttachedTransportSpec"),
-    "RoutedAttachedTransportSpec": (".dispatch", "RoutedAttachedTransportSpec"),
-    "RoutedTransportPool": (".dispatch", "RoutedTransportPool"),
-    "decode_attached_transport": (".dispatch", "decode_attached_transport"),
+    "AttachedTransportSpec": (".dispatch.parsl", "AttachedTransportSpec"),
+    "RoutedAttachedTransportSpec": (".dispatch.parsl", "RoutedAttachedTransportSpec"),
+    "RoutedTransportPool": (".dispatch.parsl", "RoutedTransportPool"),
+    "decode_attached_transport": (".dispatch.parsl", "decode_attached_transport"),
 }
 
 
