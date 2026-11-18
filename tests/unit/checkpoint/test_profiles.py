@@ -124,6 +124,16 @@ def test_hi_callback_pair_is_admitted_by_both_validators() -> None:
     validate_native_recovery_profile(config)
 
 
+def test_runtime_equivariance_is_cadence_sensitive_in_shared_helper() -> None:
+    for field, value in (("max_calls", 1), ("probability", 0.5)):
+        refusal = check_resume_sensitive_callback_cadence(
+            _config(callbacks=[{"_target_": "tpen.callback.RuntimeEquivariance", field: value}])
+        )
+        assert refusal is not None
+        assert refusal[0] == CALLBACK_CADENCE_REFUSAL_CODE
+        assert field in refusal[1]
+
+
 @pytest.mark.parametrize(
     ("target", "mutate", "reason"),
     [

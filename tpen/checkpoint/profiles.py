@@ -390,19 +390,6 @@ def _runtime_equivariance_contract_refusal(
             "unsupported-callback",
             f"{path}.seed must be an integer, null, or unresolved interpolation",
         )
-    if "max_calls" in entry and entry["max_calls"] is not None:
-        return (
-            CALLBACK_CADENCE_REFUSAL_CODE,
-            f"{path}.max_calls must be null because callback-local call count is not restored",
-        )
-    if "probability" in entry and (
-        type(entry["probability"]) not in (int, float) or entry["probability"] != 1
-    ):
-        return (
-            CALLBACK_CADENCE_REFUSAL_CODE,
-            f"{path}.probability must be exactly 1 because callback-local RNG is not restored",
-        )
-
     checkers = entry.get("checkers")
     if not isinstance(checkers, (list, tuple)) or len(checkers) != 2:
         return (
