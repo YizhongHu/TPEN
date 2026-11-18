@@ -68,42 +68,32 @@ require_value() {
 
 assert_results_root() {
   require_value RESULTS_ROOT
-  local error
-  if ! error="$("$PYBIN" - "$RESULTS_ROOT" "$RESULTS_PREFIX" 2>&1 <<'PY'
-import sys
-from pathlib import Path
-
-candidate, prefix = (Path(value) for value in sys.argv[1:])
-if any(part == ".." for part in candidate.parts):
-    raise SystemExit("results root contains '..'")
-try:
-    candidate.resolve().relative_to(prefix.resolve())
-except ValueError as exc:
-    raise SystemExit(f"results root outside Eagle prefix: {candidate}") from exc
-PY
-)"; then
-    die "$error"
-  fi
+  assert_contained_path "$RESULTS_ROOT" "$RESULTS_PREFIX" RESULTS_ROOT
 }
 
 assert_contained_path() {
   local candidate="$1" root="$2" label="$3"
-  local error
-  if ! error="$("$PYBIN" - "$candidate" "$root" "$label" 2>&1 <<'PY'
+  local canonical
+  if ! canonical="$("$PYBIN" - "$candidate" "$root" "$label" 2>&1 <<'PY'
 import sys
 from pathlib import Path
 
 candidate, root, label = (Path(value) for value in sys.argv[1:])
-if any(part == ".." for part in candidate.parts):
-    raise SystemExit(f"{label} contains '..': {candidate}")
+if not candidate.is_absolute():
+    raise SystemExit(f"{label} must be absolute: {candidate}")
+if not root.is_absolute():
+    raise SystemExit(f"containment root must be absolute: {root}")
+canonical = candidate.resolve()
 try:
-    candidate.resolve().relative_to(root.resolve())
+    canonical.relative_to(root.resolve())
 except ValueError as exc:
     raise SystemExit(f"{label} is outside {root}: {candidate}") from exc
+print(canonical)
 PY
   )"; then
-    die "$error"
+    die "$canonical"
   fi
+  printf -v "$label" '%s' "$canonical"
 }
 
 validate_mode_paths() {
@@ -188,8 +178,14 @@ assert_pbs_context() {
 }
 
 write_job_receipt() {
+  local receipt_path
+  assert_contained_path "$RESULTS_ROOT/logs" "$RESULTS_ROOT" RESULTS_LOGS
+  assert_contained_path "$RESULTS_ROOT/launch" "$RESULTS_ROOT" RESULTS_LAUNCH
+  assert_contained_path "$RESULTS_ROOT/plan" "$RESULTS_ROOT" RESULTS_PLAN
+  receipt_path="$RESULTS_LOGS/polaris-${MODE}-${PBS_JOBID}.env"
+  assert_contained_path "$receipt_path" "$RESULTS_ROOT" receipt_path
   [[ "$DRY_EXEC" == 1 ]] && return 0
-  mkdir -p -- "$RESULTS_ROOT/logs" "$RESULTS_ROOT/launch" "$RESULTS_ROOT/plan"
+  mkdir -p -- "$RESULTS_LOGS" "$RESULTS_LAUNCH" "$RESULTS_PLAN"
   {
     printf 'PBS_JOBID=%s\n' "$PBS_JOBID"
     printf 'PBS_QUEUE=%s\n' "$PBS_QUEUE"
@@ -209,7 +205,7 @@ write_job_receipt() {
     if [[ -n "$TPEN_POLARIS_TEST_RESULTS_PREFIX" ]]; then
       printf 'POLARIS_TEST_PREFIX_OVERRIDE=%s\n' "$RESULTS_PREFIX"
     fi
-  } > "$RESULTS_ROOT/logs/polaris-${MODE}-${PBS_JOBID}.env"
+  } > "$receipt_path"
 }
 
 guard_gpus() {
