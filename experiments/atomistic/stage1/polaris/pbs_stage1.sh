@@ -162,6 +162,13 @@ for row in rows:
 PY
 }
 
+validate_selected_rows_or_die() {
+  local error
+  if ! error="$(validate_selected_rows "$1" "$2" 2>&1)"; then
+    die "$error"
+  fi
+}
+
 assert_pbs_context() {
   if [[ -n "$TPEN_POLARIS_TEST_RESULTS_PREFIX" && -z "$PBS_JOBID" ]]; then
     PBS_JOBID="polaris-test-local"
@@ -487,7 +494,7 @@ main() {
       assert_pbs_context
       validate_mode_paths
       prepare_job
-      validate_selected_rows "$PLAN_MANIFEST" train
+      validate_selected_rows_or_die "$PLAN_MANIFEST" train
       guard_gpus
       cd "$CHECKOUT"
       run_mode
@@ -528,7 +535,7 @@ main() {
       assert_pbs_context
       validate_mode_paths
       prepare_job
-      validate_selected_rows "$PLAN_MANIFEST" "$MODE"
+      validate_selected_rows_or_die "$PLAN_MANIFEST" "$MODE"
       write_job_receipt
       guard_gpus
       cd "$CHECKOUT"
