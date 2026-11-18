@@ -75,10 +75,10 @@ D2A_MUTANT_TABLE = (
     },
     {
         "id": "H7", "target": "executor/src/tpen_executor/dispatch/contract.py",
-        "old": "    resolve_slots = routed_slots_from_allocation if routed_transport else physical_slots_from_allocation\n",
+        "old": "    resolve_slots = slot_resolver or physical_slots_from_allocation\n",
         "new": "    resolve_slots = physical_slots_from_allocation\n",
         "killer": "test_launch_placement_accepts_routed_v2_declared_host_and_preserves_v1",
-        "suite": "executor", "assertion": "routed v2 launch placement resolves the declared host without v1 refusal",
+        "suite": "executor", "assertion": "v2 resolver not used under routed transport",
     },
 )
 
@@ -239,7 +239,7 @@ def test_launch_placement_accepts_routed_v2_declared_host_and_preserves_v1(tmp_p
         member,
         configured,
         check_controller_affinity=False,
-        routed_transport=True,
+        slot_resolver=routed_slots_from_allocation,
     )
     assert routed_environment.env["TPEN_SLOT_NODE"] == "node-a"
     assert routed_environment.env["TPEN_PLACEMENT_DECLARED_HOST"] == "node-a"

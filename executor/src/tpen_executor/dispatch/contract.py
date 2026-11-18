@@ -48,7 +48,6 @@ from ..placement import (
     physical_slots_from_allocation,
     placement_environment,
     read_child_placement,
-    routed_slots_from_allocation,
     slots_from_allocation,
     validate_physical_device_entitlements,
 )
@@ -193,7 +192,7 @@ def _with_child_placement(
     configured: ConfiguredRun,
     *,
     check_controller_affinity: bool = True,
-    routed_transport: bool = False,
+    slot_resolver: Any = None,
 ) -> Any:
     """Overlay the one concrete slot and fenced identities for the child.
 
@@ -208,10 +207,10 @@ def _with_child_placement(
 
     CPU-only slots intentionally retain an empty declared-device field.
 
-    routed_transport : bool, optional
-        Select the allocation-slots-v2 resolver for an attached routed
-        transport.  The default retains the allocation-slots-v1 resolver and
-        its legacy refusal behavior.
+    slot_resolver : callable, optional
+        Resolve allocation slots for a caller-specific placement path.  The
+        default retains the allocation-slots-v1 resolver and its legacy
+        refusal behavior.
 
     A declared-GPU v2-placement slot also receives a worker-only GPU sampler
     evidence path and the slot's durable quarantine directory in the attempt
@@ -245,7 +244,7 @@ def _with_child_placement(
             "preset slot environment is missing declared device entitlement",
         )
     devices = values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "")
-    resolve_slots = routed_slots_from_allocation if routed_transport else physical_slots_from_allocation
+    resolve_slots = slot_resolver or physical_slots_from_allocation
     if not (slot_id and host and cpus):
         try:
             slots = resolve_slots(allocation)

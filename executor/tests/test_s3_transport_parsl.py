@@ -448,6 +448,9 @@ def _attach_routed_leaf_answers(fake_parsl: _Parsl) -> None:
     def completed(_index, _function, args, _kwargs):
         request = LeafRequest.decode(args[0])
         output_dir, core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = request.paths()
+        # Match the v1 synthetic evidence fixture: the leaf owns the fenced
+        # core directory before publishing evidence that points to it.
+        Path(core_dir).mkdir(parents=True, exist_ok=True)
         values = request.environment.env
         declared_cpus = tuple(int(item) for item in values["TPEN_SLOT_CPUS"].split(","))
         sidecar = ChildPlacementObservation(
