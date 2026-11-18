@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +20,8 @@ from experiments.atomistic.stage1.protocol import (
     SYSTEMS,
     STAGE1_PROTOCOL,
     build_manifest,
+    bind_evaluation_manifest,
+    config_identity,
     evaluation_seed,
     identity_expectations,
     smoke_seed,
@@ -123,6 +126,17 @@ def test_manifest_refuses_forced_seed_collision(monkeypatch: pytest.MonkeyPatch)
         _manifest(checkpoints=[7])
 
 
+def test_manifest_rejects_duplicate_checkpoint() -> None:
+    with pytest.raises(ProtocolError, match="duplicates"):
+        build_manifest(
+            protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256=SHA256,
+            checkpoints=[7, 7], lineage_seeds=[11, 12, 13],
+            checkpoint_sha256={(system, lineage, 7): SHA256 for system in SYSTEMS
+                               for lineage in range(3)},
+            results_root="/external/stage1",
+        )
+
+
 def test_seeds_fit_torch_at_coordinate_maxima_and_reject_overflow() -> None:
     seeds = [
         smoke_seed(system="h2"),
@@ -224,3 +238,194 @@ def test_manifest_rejects_relative_results_root() -> None:
                                for l in range(3)},
             results_root="relative/stage1",
         )
+
+
+def _phase1_rows() -> list[dict[str, object]]:
+    return build_manifest(
+        protocol=STAGE1_PROTOCOL, source_sha=SHA1,
+        config_sha256={system: SHA256 for system in SYSTEMS},
+        checkpoints=[7], lineage_seeds=[11, 12, 13], checkpoint_sha256={},
+        results_root="/external/stage1", systems=("he",), phase=1,
+    )
+
+
+def _phase2_evidence(phase1: list[dict[str, object]] | None = None) -> dict[str, object]:
+    phase1 = _phase1_rows() if phase1 is None else phase1
+    return {
+        "schema": protocol_module.CHECKPOINT_EVIDENCE_SCHEMA,
+        "phase1_manifest_hash": protocol_module.manifest_hash(phase1),
+        "phase1_train_row_hashes": {
+            f"{row['system']}:{row['lineage']}": protocol_module.manifest_hash([row])
+            for row in phase1 if row["kind"] == "train"
+        },
+        "checkpoints": {f"he:{lineage}:7": SHA256 for lineage in range(3)},
+    }
+
+
+def test_phase1_selected_system_preserves_full_manifest_identity() -> None:
+    selected = _phase1_rows()
+    full = build_manifest(
+        protocol=STAGE1_PROTOCOL, source_sha=SHA1,
+        config_sha256={system: SHA256 for system in SYSTEMS},
+        checkpoints=[7], lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={(system, lineage, 7): SHA256 for system in SYSTEMS for lineage in range(3)},
+        results_root="/external/stage1",
+        expected_physical_system_id={system: "c" * 64 for system in SYSTEMS},
+    )
+    full_selected = [row for row in full if row["system"] == "he" and row["kind"] in {"smoke", "train"}]
+    assert selected == full_selected
+
+
+def test_phase2_rejects_changed_source_sha() -> None:
+    with pytest.raises(ProtocolError, match="source_sha"):
+        bind_evaluation_manifest(
+            phase1_rows=_phase1_rows(), checkpoints=[7], checkpoint_evidence=_phase2_evidence(),
+            expected_physical_system_id={"he": "c" * 64}, source_sha="d" * 40,
+        )
+
+
+def test_phase2_requires_checkpoint_binding() -> None:
+    with pytest.raises(ProtocolError, match="structured checkpoint evidence"):
+        bind_evaluation_manifest(
+            phase1_rows=_phase1_rows(), checkpoints=[7], checkpoint_evidence={},
+            expected_physical_system_id={"he": "c" * 64},
+        )
+
+
+def test_phase2_rejects_a_duplicate_checkpoint() -> None:
+    with pytest.raises(ProtocolError, match="duplicates"):
+        bind_evaluation_manifest(
+            phase1_rows=_phase1_rows(), checkpoints=[7, 7], checkpoint_evidence=_phase2_evidence(),
+            expected_physical_system_id={"he": "c" * 64},
+        )
+
+
+def test_phase2_requires_the_stored_phase1_manifest_hash() -> None:
+    rows = _phase1_rows()
+    with pytest.raises(ProtocolError, match="manifest_hash"):
+        bind_evaluation_manifest(
+            phase1_rows=rows, checkpoints=[7], checkpoint_evidence=_phase2_evidence(rows),
+            expected_physical_system_id={"he": "c" * 64}, phase1_manifest_hash="a" * 64,
+        )
+
+
+def test_phase2_rows_carry_phase1_manifest_and_train_identity() -> None:
+    phase1 = _phase1_rows()
+    phase1_hash = protocol_module.manifest_hash(phase1)
+    bound = bind_evaluation_manifest(
+        phase1_rows=phase1, checkpoints=[7], checkpoint_evidence=_phase2_evidence(phase1),
+        expected_physical_system_id={"he": "c" * 64}, phase1_manifest_hash=phase1_hash,
+    )
+    train_hashes = {
+        protocol_module.manifest_hash([row])
+        for row in phase1
+        if row["kind"] == "train"
+    }
+    assert {row["phase1_manifest_hash"] for row in bound} == {phase1_hash}
+    assert {row["phase1_train_row_hash"] for row in bound} == train_hashes
+
+
+def test_phase2_rejects_bare_checkpoint_digest_map() -> None:
+    with pytest.raises(ProtocolError, match="structured checkpoint evidence"):
+        bind_evaluation_manifest(
+            phase1_rows=_phase1_rows(), checkpoints=[7],
+            checkpoint_evidence={"he:0:7": SHA256},
+            expected_physical_system_id={"he": "c" * 64},
+        )
+
+
+def test_phase2_rejects_checkpoint_evidence_from_a_foreign_phase1_manifest() -> None:
+    phase1_a = _phase1_rows()
+    phase1_b = build_manifest(
+        protocol=STAGE1_PROTOCOL, source_sha=SHA1,
+        config_sha256={system: SHA256 for system in SYSTEMS},
+        checkpoints=[7], lineage_seeds=[21, 22, 23], checkpoint_sha256={},
+        results_root="/external/stage1", systems=("he",), phase=1,
+    )
+    with pytest.raises(ProtocolError, match="checkpoint evidence"):
+        bind_evaluation_manifest(
+            phase1_rows=phase1_b, checkpoints=[7],
+            checkpoint_evidence=_phase2_evidence(phase1_a),
+            expected_physical_system_id={"he": "c" * 64},
+        )
+
+
+def test_phase2_rejects_evidence_with_a_forged_manifest_hash() -> None:
+    phase1 = _phase1_rows()
+    evidence = _phase2_evidence(phase1)
+    evidence["phase1_manifest_hash"] = "e" * 64
+    with pytest.raises(ProtocolError, match="does not match phase-1 manifest"):
+        bind_evaluation_manifest(
+            phase1_rows=phase1, checkpoints=[7], checkpoint_evidence=evidence,
+            expected_physical_system_id={"he": "c" * 64},
+        )
+
+
+def test_phase2_rejects_checkpoint_outside_phase1_steps() -> None:
+    evidence = _phase2_evidence()
+    evidence["checkpoints"] = {
+        **evidence["checkpoints"], "he:0:101": SHA256,
+        "he:1:101": SHA256, "he:2:101": SHA256,
+    }
+    with pytest.raises(ProtocolError, match="checkpoint_steps"):
+        bind_evaluation_manifest(
+            phase1_rows=_phase1_rows(), checkpoints=[101], checkpoint_evidence=evidence,
+            expected_physical_system_id={"he": "c" * 64},
+        )
+
+
+def test_phase2_checks_combined_row_and_seed_uniqueness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phase1 = _phase1_rows()
+    evidence = _phase2_evidence(phase1)
+    monkeypatch.setattr(
+        protocol_module, "evaluation_seed",
+        lambda **_: int(next(row["seed"] for row in phase1 if row["kind"] == "train")),
+    )
+    with pytest.raises(ProtocolError, match="jointly unique"):
+        bind_evaluation_manifest(
+            phase1_rows=phase1, checkpoints=[7], checkpoint_evidence=evidence,
+            expected_physical_system_id={"he": "c" * 64},
+        )
+
+
+def test_phase2_rejects_a_conflicting_config_identity() -> None:
+    with pytest.raises(ProtocolError, match="config_sha256"):
+        bind_evaluation_manifest(
+            phase1_rows=_phase1_rows(), checkpoints=[7], checkpoint_evidence=_phase2_evidence(),
+            expected_physical_system_id={"he": "c" * 64},
+            config_sha256={"he": "d" * 64},
+        )
+
+
+def test_phase2_inherits_phase1_device_when_not_overridden() -> None:
+    rows = _phase1_rows()
+    for row in rows:
+        row["device"] = "cuda"
+    bound = bind_evaluation_manifest(
+        phase1_rows=rows, checkpoints=[7], checkpoint_evidence=_phase2_evidence(rows),
+        expected_physical_system_id={"he": "c" * 64},
+    )
+    assert all(row["device"] == "cuda" for row in bound)
+
+
+def test_phase2_rejects_missing_identity_rule() -> None:
+    rows = _phase1_rows()
+    next(row for row in rows if row["kind"] == "train").pop("config_identity_rule")
+    with pytest.raises(ProtocolError, match="identity rule"):
+        bind_evaluation_manifest(
+            phase1_rows=rows, checkpoints=[7], checkpoint_evidence=_phase2_evidence(rows),
+            expected_physical_system_id={"he": "c" * 64},
+        )
+
+
+def test_config_identity_changes_for_eval_only_and_ignores_unrelated_file(tmp_path: Path) -> None:
+    config_root = tmp_path / "configs"
+    shutil.copytree(REPO_ROOT / "experiments/atomistic/stage1/configs", config_root)
+    before = config_identity(config_root=config_root, systems=("he",))
+    (config_root / "unrelated.txt").write_text("unrelated", encoding="utf-8")
+    assert config_identity(config_root=config_root, systems=("he",)) == before
+    eval_path = config_root / "he" / "eval.yaml"
+    eval_path.write_bytes(eval_path.read_bytes() + b"\n")
+    assert config_identity(config_root=config_root, systems=("he",))["sha256"] != before["sha256"]

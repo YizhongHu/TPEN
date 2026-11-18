@@ -14,7 +14,12 @@ from experiments.atomistic.stage1.launch import (
     render as _render,
     row_overrides,
 )
-from experiments.atomistic.stage1.protocol import ProtocolError, validate_gateway_binding
+from experiments.atomistic.stage1.protocol import (
+    CONFIG_IDENTITY_RULE,
+    ProtocolError,
+    config_identity,
+    validate_gateway_binding,
+)
 from experiments.toolkit.run_paths import resolve_run_dir
 
 
@@ -41,6 +46,17 @@ def _run(script: str, tmp_path: Path, **slurm: str) -> subprocess.CompletedProce
     return subprocess.run(["bash"], input=script, text=True, capture_output=True, env=env)
 
 
+def _fake_gpu_python(fake_bin: Path, device_count: str = "1") -> Path:
+    """Create the rendered interpreter seam used by the in-job CUDA probe."""
+
+    python = fake_bin / "python"
+    python.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' '{device_count}'\n", encoding="utf-8",
+    )
+    python.chmod(0o750)
+    return python
+
+
 def test_render_contains_fail_closed_identity_and_cleanup_guards(tmp_path: Path) -> None:
     script = render(row=ROW, driver="driver.py", python="/usr/bin/python3",
                     head_sha="c" * 40,
@@ -60,10 +76,207 @@ def test_render_fails_for_unapproved_partition_or_results_root() -> None:
     with pytest.raises(ValueError, match="partition"):
         render(row=ROW, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
                results_root="/n/netscratch/kozinsky_lab/Lab/rhu/stage1",
-               partition="gpu", scratch_base="/tmp/stage1")
+               partition="not-a-partition", scratch_base="/tmp/stage1")
     with pytest.raises(ValueError, match="Netscratch"):
         render(row=ROW, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
                results_root="/tmp/stage1", scratch_base="/tmp/stage1")
+
+
+def test_gpu_render_requires_explicit_shape_and_cuda_binding() -> None:
+    gpu_row = {**ROW, "device": "cuda"}
+    with pytest.raises(ValueError, match="cpus_per_task"):
+        render(row=gpu_row, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
+               results_root=ROW["results_root"], partition="seas_gpu")
+    script = render(
+        row=gpu_row, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
+        results_root=ROW["results_root"], partition="seas_gpu,kozinsky_gpu",
+        cpus_per_task=8, mem="64G", time="08:00:00", scratch_base="/tmp/stage1",
+    )
+    assert "#SBATCH --gres=gpu:1" in script
+    assert "#SBATCH --constraint=a100" in script
+    assert "#SBATCH --cpus-per-task=8" in script
+    assert "#SBATCH --mem=64G" in script
+    assert "#SBATCH --time=08:00:00" in script
+    assert "runtime.device=cuda" in script
+    assert "expected exactly one management GPU" in script
+
+
+def test_gpu_render_rejects_cpu_binding_and_invalid_resources() -> None:
+    with pytest.raises(ValueError, match="cuda"):
+        render(row=ROW, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
+               results_root=ROW["results_root"], partition="gpu",
+               cpus_per_task=8, mem="64G", time="08:00:00")
+    gpu_row = {**ROW, "device": "cuda"}
+    for kwargs, message in [
+        ({"cpus_per_task": 0, "mem": "64G", "time": "08:00:00"}, "cpus_per_task"),
+        ({"cpus_per_task": 8, "mem": "64G", "time": "8:00:00"}, "time"),
+        ({"cpus_per_task": 8, "mem": "2049G", "time": "08:00:00"}, "mem"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            render(row=gpu_row, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
+                   results_root=ROW["results_root"], partition="gpu", **kwargs)
+
+
+@pytest.mark.parametrize("gpu_name", ["NVIDIA A100-SXM4-80GB", "NVIDIA A100-PCIE-80GB"])
+def test_gpu_partition_guard_accepts_one_requested_partition(
+    tmp_path: Path, gpu_name: str,
+) -> None:
+    gpu_row = {**ROW, "device": "cuda"}
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    nvidia = fake_bin / "nvidia-smi"
+    nvidia.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in *mig.mode.current*) printf 'Disabled\\n';; "
+        f"*) printf '{gpu_name}, 81920\\n';; esac\n",
+        encoding="utf-8",
+    )
+    nvidia.chmod(0o750)
+    python = _fake_gpu_python(fake_bin)
+    script = render(
+        row=gpu_row, driver="/bin/true", python=str(python), head_sha="c" * 40,
+        results_root=ROW["results_root"], partition="seas_gpu,gpu",
+        cpus_per_task=8, mem="64G", time="08:00:00", scratch_base=str(tmp_path),
+    )
+    result = _run(script, tmp_path, PATH=f"{fake_bin}:/usr/bin:/bin",
+                   SLURM_JOB_ID="123", SLURM_JOB_PARTITION="gpu")
+    assert result.returncode == 0, result.stderr
+    assert f"STAGE1_GUARD nvidia-smi={gpu_name}, 81920" in result.stdout
+
+
+@pytest.mark.parametrize("gpu_output", [
+    "NVIDIA A100-SXM4-80GB MIG, 81920\\n",
+    "NVIDIA A100-SXM4-40GB MIG 1g.5gb, 40960\\n",
+    "NVIDIA A100-SXM4-40GB, 40960\\n",
+    "NVIDIA A100-SXM4-80GB, 81920\\nNVIDIA A100-SXM4-80GB, 81920\\n",
+])
+def test_gpu_guard_rejects_mig_small_memory_and_multiple_gpus(
+    tmp_path: Path, gpu_output: str,
+) -> None:
+    gpu_row = {**ROW, "device": "cuda"}
+    script = render(
+        row=gpu_row, driver="/bin/true", python="/usr/bin/true", head_sha="c" * 40,
+        results_root=ROW["results_root"], partition="gpu",
+        cpus_per_task=8, mem="64G", time="08:00:00", scratch_base=str(tmp_path),
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    nvidia = fake_bin / "nvidia-smi"
+    nvidia.write_text(
+        f"#!/bin/sh\ncase \"$*\" in *mig.mode.current*) printf 'Disabled\\n';; "
+        f"*) printf '%b' '{gpu_output}';; esac\n",
+        encoding="utf-8",
+    )
+    nvidia.chmod(0o750)
+    python = _fake_gpu_python(fake_bin)
+    script = render(
+        row=gpu_row, driver="/bin/true", python=str(python), head_sha="c" * 40,
+        results_root=ROW["results_root"], partition="gpu",
+        cpus_per_task=8, mem="64G", time="08:00:00", scratch_base=str(tmp_path),
+    )
+    result = _run(script, tmp_path, PATH=f"{fake_bin}:/usr/bin:/bin",
+                   SLURM_JOB_ID="123", SLURM_JOB_PARTITION="gpu")
+    assert result.returncode == 2
+    assert "STAGE1_GUARD" in result.stderr
+
+
+def test_gpu_guard_rejects_delivered_partition_outside_requested_list_before_driver(
+    tmp_path: Path,
+) -> None:
+    gpu_row = {**ROW, "device": "cuda"}
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    python = _fake_gpu_python(fake_bin)
+    nvidia = fake_bin / "nvidia-smi"
+    nvidia.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    nvidia.chmod(0o750)
+    sentinel = tmp_path / "sentinel"
+    driver = tmp_path / "driver"
+    driver.write_text(f"#!/bin/sh\ntouch '{sentinel}'\n", encoding="utf-8")
+    driver.chmod(0o750)
+    script = render(
+        row=gpu_row, driver=str(driver), python=str(python), head_sha="c" * 40,
+        results_root=ROW["results_root"], partition="seas_gpu,gpu",
+        cpus_per_task=8, mem="64G", time="08:00:00", scratch_base=str(tmp_path),
+    )
+    result = _run(script, tmp_path, PATH=f"{fake_bin}:/usr/bin:/bin",
+                  SLURM_JOB_ID="123", SLURM_JOB_PARTITION="test")
+    assert result.returncode == 2
+    assert "partition delivered=test requested=seas_gpu,gpu" in result.stderr
+    assert not sentinel.exists()
+
+
+@pytest.mark.parametrize("device_count", ["0", "2"])
+def test_gpu_guard_rejects_cuda_device_count_before_driver(
+    tmp_path: Path, device_count: str,
+) -> None:
+    gpu_row = {**ROW, "device": "cuda"}
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    python = _fake_gpu_python(fake_bin, device_count)
+    nvidia = fake_bin / "nvidia-smi"
+    nvidia.write_text(
+        "#!/bin/sh\ncase \"$*\" in *mig.mode.current*) printf 'Disabled\\n';; "
+        "*) printf 'NVIDIA A100-SXM4-80GB, 81920\\n';; esac\n",
+        encoding="utf-8",
+    )
+    nvidia.chmod(0o750)
+    script = render(
+        row=gpu_row, driver="/bin/true", python=str(python), head_sha="c" * 40,
+        results_root=ROW["results_root"], partition="gpu",
+        cpus_per_task=8, mem="64G", time="08:00:00", scratch_base=str(tmp_path),
+    )
+    result = _run(script, tmp_path, PATH=f"{fake_bin}:/usr/bin:/bin",
+                  SLURM_JOB_ID="123", SLURM_JOB_PARTITION="gpu")
+    assert result.returncode == 2
+    assert "exactly one CUDA device" in result.stderr
+
+
+@pytest.mark.parametrize("mig_mode", ["Enabled", "[N/A]", "query-error"])
+def test_gpu_guard_rejects_mig_mode_before_driver(tmp_path: Path, mig_mode: str) -> None:
+    gpu_row = {**ROW, "device": "cuda"}
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    python = _fake_gpu_python(fake_bin)
+    nvidia = fake_bin / "nvidia-smi"
+    if mig_mode == "query-error":
+        body = (
+            "#!/bin/sh\ncase \"$*\" in *mig.mode.current*) exit 1;; "
+            "*) printf 'NVIDIA A100-SXM4-80GB, 81920\\n';; esac\n"
+        )
+    else:
+        body = (
+            f"#!/bin/sh\ncase \"$*\" in *mig.mode.current*) printf '{mig_mode}\\n';; "
+            "*) printf 'NVIDIA A100-SXM4-80GB, 81920\\n';; esac\n"
+        )
+    nvidia.write_text(body, encoding="utf-8")
+    nvidia.chmod(0o750)
+    script = render(
+        row=gpu_row, driver="/bin/true", python=str(python), head_sha="c" * 40,
+        results_root=ROW["results_root"], partition="gpu",
+        cpus_per_task=8, mem="64G", time="08:00:00", scratch_base=str(tmp_path),
+    )
+    result = _run(script, tmp_path, PATH=f"{fake_bin}:/usr/bin:/bin",
+                  SLURM_JOB_ID="123", SLURM_JOB_PARTITION="gpu")
+    assert result.returncode == 2
+    assert "MIG" in result.stderr
+
+
+@pytest.mark.parametrize("duration", ["99:59:59", "100:00:00", "168:00:00"])
+def test_gpu_resources_accept_two_or_three_digit_hours(duration: str) -> None:
+    gpu_row = {**ROW, "device": "cuda"}
+    render(row=gpu_row, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
+           results_root=ROW["results_root"], partition="gpu", cpus_per_task=8,
+           mem="64G", time=duration)
+
+
+@pytest.mark.parametrize("duration", ["168:00:01", "00:00:00", "1:00:00", "08:60:00", "08:00:60"])
+def test_gpu_resources_reject_overlong_zero_and_malformed_duration(duration: str) -> None:
+    gpu_row = {**ROW, "device": "cuda"}
+    with pytest.raises(ValueError, match="time"):
+        render(row=gpu_row, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
+               results_root=ROW["results_root"], partition="gpu", cpus_per_task=8,
+               mem="64G", time=duration)
 
 
 def test_partition_guard_is_exercised_by_fake_environment(tmp_path: Path) -> None:
@@ -171,6 +384,19 @@ def test_gateway_rejects_omitted_or_altered_binding_before_run() -> None:
     with pytest.raises(ProtocolError):
         validate_gateway_binding(binding=token, config="configs/he/other.yaml",
                                  overrides=overrides, kind="train")
+    gpu_row = {**ROW, "device": "cuda"}
+    gpu_overrides = row_overrides(gpu_row)
+    assert validate_gateway_binding(
+        binding=_binding_token(gpu_row), config=gpu_row["config"],
+        overrides=gpu_overrides, kind="train",
+    ) == gpu_row
+    with pytest.raises(ProtocolError):
+        validate_gateway_binding(
+            binding=_binding_token(gpu_row), config=gpu_row["config"],
+            overrides=[override for override in gpu_overrides
+                       if not override.startswith("runtime.device=")],
+            kind="train",
+        )
     eval_row = {
         **ROW, "kind": "eval", "draws": 256,
         "checkpoint_dir": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010",
@@ -206,6 +432,26 @@ def test_train_gateway_rejects_missing_config_path(monkeypatch: pytest.MonkeyPat
     )
     with pytest.raises(FileNotFoundError, match="config path does not exist"):
         train.main()
+
+
+def test_gateway_recomputes_the_bound_config_identity() -> None:
+    config_root = REPO_ROOT / "experiments" / "atomistic" / "stage1" / "configs"
+    row = {
+        **ROW,
+        "system": "he",
+        "config_identity_rule": CONFIG_IDENTITY_RULE,
+        "config_sha256": config_identity(config_root=config_root, systems=("he",))["sha256"],
+    }
+    validate_gateway_binding(
+        binding=_binding_token(row), config=row["config"],
+        overrides=row_overrides(row), kind="train",
+    )
+    wrong = {**row, "config_sha256": "d" * 64}
+    with pytest.raises(ProtocolError, match="config identity"):
+        validate_gateway_binding(
+            binding=_binding_token(wrong), config=wrong["config"],
+            overrides=row_overrides(wrong), kind="train",
+        )
 
 
 @pytest.mark.parametrize("checkpoint_override", [None, "/other/checkpoint.pt"])

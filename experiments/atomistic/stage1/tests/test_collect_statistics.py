@@ -1,15 +1,29 @@
 """Hand-computable collector statistics and join guards."""
 
+import hashlib
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from experiments.atomistic.stage1 import collect as collector
-from experiments.atomistic.stage1.protocol import manifest_hash
+from experiments.atomistic.stage1.protocol import (
+    CHECKPOINT_EVIDENCE_SCHEMA,
+    Protocol,
+    bind_evaluation_manifest,
+    build_manifest,
+    config_identities,
+    manifest_hash,
+)
 
 
-def _manifest(tmp_path: Path, streams: int = 4) -> dict:
+_TWO_PHASE_CONFIG_ROOT = Path(__file__).parents[1] / "configs"
+_TWO_PHASE_SOURCE_SHA = "a" * 40
+_TWO_PHASE_PHYSICAL_ID = "c" * 64
+
+
+def _manifest(tmp_path: Path, streams: int = 4, draws: int = 2, walkers: int = 2) -> dict:
     rows = []
     for stream in range(streams):
         rows.append({"row_id": f"row-{stream}", "kind": "eval", "system_id": "he_atom",
@@ -17,16 +31,18 @@ def _manifest(tmp_path: Path, streams: int = 4) -> dict:
                      "lineage": 0, "checkpoint": 10, "stream": stream,
                      "results_root": str(tmp_path), "experiment_name": "stage1",
                      "sector": "he", "run_id": f"run-{stream}",
-                     "draws": 2, "walkers": 2, "source_sha": "a" * 40,
+                     "draws": draws, "walkers": walkers, "source_sha": "a" * 40,
                      "checkpoint_sha256": "c" * 64})
     return {"schema": "stage1/v3", "manifest_hash": manifest_hash(rows), "rows": rows}
 
 
-def _install_single_fake(monkeypatch, tmp_path: Path, **changes):
-    document = _manifest(tmp_path, streams=1)
+def _install_single_fake(monkeypatch, tmp_path: Path, *, streams: int = 1, draws: int = 2,
+                          walkers: int = 2, **changes):
+    document = _manifest(tmp_path, streams=streams, draws=draws, walkers=walkers)
     identity = {"schema": "tpen-config-identity-v1", "sha256": "b" * 64}
-    base = dict(record_schema="trajectory_records/v2", draw_count=2, walker_count=2, row_count=4,
-                finite_count=4, mean=2.5, variance=1.25, csv_sha256="d" * 64,
+    row_count = draws * walkers
+    base = dict(record_schema="trajectory_records/v2", draw_count=draws, walker_count=walkers,
+                row_count=row_count, finite_count=row_count, mean=2.5, variance=1.25, csv_sha256="d" * 64,
                 system_id="he_atom", execution_method_id="method", resolved_config_identity=identity,
                 model_provenance="checkpoint", checkpoint_sha256="c" * 64, record_content_id="e" * 64)
     base.update(changes)
@@ -274,13 +290,108 @@ def test_join_guards_refuse_invalid_record(monkeypatch, tmp_path: Path, changes,
         collector.collect(_install_single_fake(monkeypatch, tmp_path, **changes))
 
 
-@pytest.mark.parametrize("changes", [
-    pytest.param({"mean": 2.6}, id="mean"),
-    pytest.param({"variance": 1.5}, id="variance"),
-])
-def test_inspection_statistics_must_reconcile_with_grid(monkeypatch, tmp_path: Path, changes) -> None:
-    with pytest.raises(collector.CollectionError, match="do not reconcile"):
-        collector.collect(_install_single_fake(monkeypatch, tmp_path, **changes))
+def test_writer_statistics_are_forwarded_without_reducing_again(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A realistic grid may round differently from the writer's reduction tree."""
+    document = _manifest(tmp_path, streams=1)
+    values = [
+        [0.75 + ((draw * 64 + walker) % 17 - 8) * 1.0e-5 for walker in range(64)]
+        for draw in range(4)
+    ]
+    draw_sums = [sum(draw) for draw in values]
+    draw_square_sums = [sum(value * value for value in draw) for draw in values]
+    total = sum(draw_sums)
+    total_square = sum(draw_square_sums)
+    collector_mean = total / 256
+    collector_variance = total_square / 256 - collector_mean * collector_mean
+    writer_mean = math.nextafter(collector_mean, math.inf)
+    writer_variance = math.nextafter(collector_variance, math.inf)
+    document = _install_single_fake(
+        monkeypatch,
+        tmp_path,
+        streams=4,
+        draws=4,
+        walkers=64,
+        mean=writer_mean,
+        variance=writer_variance,
+    )
+    monkeypatch.setattr(collector, "read_energy_grid", lambda record: values)
+    result = collector.collect(document)
+    stats = result["records"][0]["statistics"]
+    assert stats["mean"] == writer_mean
+    assert stats["variance"] == writer_variance
+
+
+def test_writer_statistics_exact_recompute_matches(monkeypatch, tmp_path: Path) -> None:
+    """Control: an exactly recomputed sidecar scalar passes identically on the base collector.
+
+    Mirrors ``collect.py``'s (pre-fix) base reduction loop exactly: a plain
+    ``sum()`` over the full pooled list of 256 values is not bit-identical to
+    draw-ordered partial sums accumulated with ``+=`` (CPython's ``sum()``
+    uses a compensated summation algorithm since 3.12), so the per-draw
+    partial sums must be accumulated the same way the collector does.
+    """
+    values = [
+        [0.75 + ((draw * 64 + walker) % 17 - 8) * 1.0e-5 for walker in range(64)]
+        for draw in range(4)
+    ]
+    draw_sums = {index: sum(draw) for index, draw in enumerate(values)}
+    draw_square_sums = {index: sum(value * value for value in draw) for index, draw in enumerate(values)}
+    total = 0.0
+    total_square = 0.0
+    for index in range(len(values)):
+        total += draw_sums[index]
+        total_square += draw_square_sums[index]
+    collector_mean = total / 256
+    collector_variance = total_square / 256 - collector_mean * collector_mean
+    document = _install_single_fake(
+        monkeypatch,
+        tmp_path,
+        streams=4,
+        draws=4,
+        walkers=64,
+        mean=collector_mean,
+        variance=collector_variance,
+    )
+    monkeypatch.setattr(collector, "read_energy_grid", lambda record: values)
+    result = collector.collect(document)
+    stats = result["records"][0]["statistics"]
+    assert stats["mean"] == collector_mean
+    assert stats["variance"] == collector_variance
+
+
+def test_tampered_csv_is_refused_after_inspection(monkeypatch, tmp_path: Path) -> None:
+    """A post-inspection energy edit remains fail-closed at the reader boundary."""
+    document = _manifest(tmp_path, streams=1)
+    csv_path = tmp_path / "values.csv"
+    csv_path.write_text(
+        "draw_index,walker_index,local_energy\n"
+        "0,0,1.0\n0,1,2.0\n1,0,3.0\n1,1,4.0\n",
+        encoding="utf-8",
+    )
+    identity = {"schema": "tpen-config-identity-v1", "sha256": "b" * 64}
+    record = SimpleNamespace(
+        record_schema="trajectory_records/v2", draw_count=2, walker_count=2,
+        row_count=4, finite_count=4, mean=2.5, variance=1.25,
+        csv_sha256=hashlib.sha256(csv_path.read_bytes()).hexdigest(),
+        path=csv_path, system_id="he_atom", execution_method_id="method",
+        resolved_config_identity=identity, model_provenance="checkpoint",
+        checkpoint_sha256="c" * 64, record_content_id="e" * 64,
+    )
+    monkeypatch.setattr(collector, "inspect_eval_run", lambda path: {
+        "verdict": "completed", "resolved_config_identity": identity,
+        "source_git_sha": "a" * 40,
+    })
+    monkeypatch.setattr(collector, "_record_path", lambda path: path / "m.json")
+
+    def inspect_and_tamper(path, **kwargs):
+        csv_path.write_text(csv_path.read_text(encoding="utf-8").replace("1.0", "9.0"), encoding="utf-8")
+        return record
+
+    monkeypatch.setattr(collector, "inspect_trajectory_record", inspect_and_tamper)
+    with pytest.raises(collector.CollectionError, match="changed after inspection"):
+        collector.collect(document)
 
 
 def test_missing_record_is_refused(monkeypatch, tmp_path: Path) -> None:
@@ -300,6 +411,84 @@ def test_unknown_and_unsourced_references_are_refused(tmp_path: Path) -> None:
     registry.write_text("systems:\n  - id: x\n    confidence: unverified\n", encoding="utf-8")
     with pytest.raises(Exception, match="missing"):
         collector._reference("x", registry)
+
+
+def _two_phase_document(tmp_path: Path) -> dict:
+    """Build a real planner-shaped phase-1 + phase-2 document (no disk I/O)."""
+
+    protocol = Protocol(smoke_updates=1, smoke_walkers=2, lineage_updates=1, lineage_walkers=2,
+                        lineages=3, eval_streams=4, eval_walkers=2, eval_draws=2)
+    config_sha256 = config_identities(config_root=_TWO_PHASE_CONFIG_ROOT, systems=("he",))
+    phase1_rows = build_manifest(
+        protocol=protocol, source_sha=_TWO_PHASE_SOURCE_SHA, config_sha256=config_sha256,
+        checkpoints=[7], lineage_seeds=[11, 12, 13], checkpoint_sha256={},
+        results_root=str(tmp_path), systems=("he",), phase=1,
+    )
+    phase1_hash = manifest_hash(phase1_rows)
+    evidence = {
+        "schema": CHECKPOINT_EVIDENCE_SCHEMA,
+        "phase1_manifest_hash": phase1_hash,
+        "phase1_train_row_hashes": {
+            f"he:{row['lineage']}": manifest_hash([row])
+            for row in phase1_rows if row["kind"] == "train"
+        },
+        "checkpoints": {f"he:{lineage}:7": _TWO_PHASE_PHYSICAL_ID for lineage in range(protocol.lineages)},
+    }
+    eval_rows = bind_evaluation_manifest(
+        phase1_rows=phase1_rows, checkpoints=[7], checkpoint_evidence=evidence,
+        expected_physical_system_id={"he": _TWO_PHASE_PHYSICAL_ID}, source_sha=_TWO_PHASE_SOURCE_SHA,
+        config_sha256=config_sha256, protocol=protocol, phase1_manifest_hash=phase1_hash,
+    )
+    rows = list(phase1_rows) + eval_rows
+    return {"schema": "stage1/v3", "manifest_hash": manifest_hash(rows), "rows": rows}
+
+
+def _install_two_phase_fakes(monkeypatch) -> None:
+    identity = {"schema": "tpen-config-identity-v1", "sha256": "b" * 64}
+    monkeypatch.setattr(collector, "inspect_eval_run", lambda path: {
+        "verdict": "completed", "resolved_config_identity": identity,
+        "source_git_sha": _TWO_PHASE_SOURCE_SHA})
+    monkeypatch.setattr(collector, "_record_path", lambda path: path / "m.json")
+    monkeypatch.setattr(collector, "inspect_trajectory_record", lambda path, **kwargs: SimpleNamespace(
+        record_schema="trajectory_records/v2", draw_count=2, walker_count=2, row_count=4,
+        finite_count=4, mean=2.5, variance=1.25, csv_sha256="d" * 64,
+        system_id=_TWO_PHASE_PHYSICAL_ID, execution_method_id="method",
+        resolved_config_identity=identity, model_provenance="checkpoint",
+        checkpoint_sha256=_TWO_PHASE_PHYSICAL_ID, record_content_id="e" * 64))
+    monkeypatch.setattr(collector, "read_energy_grid", lambda record: [[1.0, 2.0], [3.0, 4.0]])
+    monkeypatch.setattr(collector, "_reference", lambda system_id, registry_path: (-2.9, "transcribed"))
+
+
+def test_computed_two_phase_producer_output_passes_collection(monkeypatch, tmp_path: Path) -> None:
+    """A real planner phase-1 + phase-2 manifest, with computed config identity, collects."""
+
+    document = _two_phase_document(tmp_path)
+    _install_two_phase_fakes(monkeypatch)
+    result = collector.collect(document)
+    assert len(result["records"]) == 12
+    assert len(result["aggregates"]) == 3
+
+
+def test_two_phase_collection_refuses_a_flipped_phase1_train_row_hash(monkeypatch, tmp_path: Path) -> None:
+    document = _two_phase_document(tmp_path)
+    _install_two_phase_fakes(monkeypatch)
+    rows = document["rows"]
+    eval_row = next(row for row in rows if row["kind"] == "eval")
+    eval_row["phase1_train_row_hash"] = "f" * 64
+    document["manifest_hash"] = manifest_hash(rows)
+    with pytest.raises(collector.CollectionError, match="not bound to its phase-1 train row"):
+        collector.collect(document)
+
+
+def test_two_phase_collection_refuses_a_changed_config_sha256(monkeypatch, tmp_path: Path) -> None:
+    document = _two_phase_document(tmp_path)
+    _install_two_phase_fakes(monkeypatch)
+    rows = document["rows"]
+    eval_row = next(row for row in rows if row["kind"] == "eval")
+    eval_row["config_sha256"] = "d" * 64
+    document["manifest_hash"] = manifest_hash(rows)
+    with pytest.raises(collector.CollectionError, match="config identity mismatch"):
+        collector.collect(document)
 
 
 def test_preserved_legacy_collectors_are_unchanged() -> None:
