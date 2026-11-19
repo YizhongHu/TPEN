@@ -9,6 +9,7 @@ from omegaconf import OmegaConf
 
 from tpen.run import load_config
 from experiments.atomistic.stage1.protocol import (
+    ProtocolError,
     SYSTEMS,
     STAGE1_PROTOCOL,
     build_manifest,
@@ -86,6 +87,24 @@ def test_real_he_h2_phase1_rows_bind_protocol_horizon() -> None:
     assert {row["system"] for row in train_rows} == {"he", "h2"}
     assert all(row["updates"] == STAGE1_PROTOCOL.lineage_updates for row in train_rows)
     assert all(row["checkpoint_steps"] == checkpoints for row in train_rows)
+
+
+@pytest.mark.parametrize("system", ["he", "h2"])
+def test_real_phase1_rejects_missing_interior_retention(system: str) -> None:
+    """The real 100k train contract cannot silently thin its 101 checkpoints."""
+
+    with pytest.raises(ProtocolError, match="retention|checkpoint"):
+        build_manifest(
+            protocol=STAGE1_PROTOCOL,
+            source_sha="a" * 40,
+            config_sha256=config_identities(config_root=ROOT, systems=(system,)),
+            checkpoints=[0, STAGE1_PROTOCOL.lineage_updates],
+            lineage_seeds=[11, 12, 13],
+            checkpoint_sha256={},
+            results_root="/external/stage1",
+            systems=(system,),
+            phase=1,
+        )
 
 
 @pytest.mark.parametrize("system", ["he", "h2"])
