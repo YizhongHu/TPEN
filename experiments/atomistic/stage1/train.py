@@ -6,6 +6,8 @@ import argparse
 import sys
 from pathlib import Path
 
+from omegaconf import DictConfig
+
 # Direct script execution puts only this directory on sys.path.  Add the
 # checkout root before importing the source-owned experiments package.
 _REPO_ROOT = str(Path(__file__).resolve().parents[3])
@@ -14,6 +16,28 @@ if _REPO_ROOT not in sys.path:
 
 from tpen.run import run_from_config
 from experiments.atomistic.stage1.protocol import resolve_config_path, validate_gateway_binding
+
+
+def prepare_initial_checkpoint_config(cfg: DictConfig) -> None:
+    """Route checkpoint zero to the existing initial-state callback.
+
+    Stage-1 manifests retain zero as a checkpoint coordinate, but the core
+    ``ExplicitUpdates`` schedule intentionally accepts positive updates only.
+    Keep the manifest-facing value until gateway validation has completed, then
+    remove zero from the schedule and append the existing callback that writes
+    the pre-sampling zero boundary.
+    """
+
+    raw_steps = list(cfg.get("checkpoint_steps", ()))
+    if any(type(step) is not int or step < 0 for step in raw_steps):
+        raise ValueError("checkpoint_steps must contain non-negative integers")
+    if 0 not in raw_steps:
+        return
+    cfg.checkpoint_steps = [step for step in raw_steps if step > 0]
+    cfg.callbacks.append({
+        "_target_": "tpen.callback.InitialCheckpoint",
+        "output_dir": "${run.dir}/checkpoints",
+    })
 
 
 def main() -> int:
@@ -34,6 +58,7 @@ def main() -> int:
     # wrapper is intentionally only a gateway and does not duplicate Runner.
     from tpen.run import load_config
     cfg = load_config(str(config_path), args.overrides)
+    prepare_initial_checkpoint_config(cfg)
     return run_from_config(cfg, config_path=str(config_path), command="stage1 train")
 
 
