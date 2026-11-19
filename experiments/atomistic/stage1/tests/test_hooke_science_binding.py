@@ -99,6 +99,13 @@ def test_hooke_phase1_rows_bind_distinct_sampler_seeds_and_gateway() -> None:
             overrides=[item for item in overrides if not item.startswith("sampler.seed=")],
             kind="train",
         )
+    tampered = dict(train)
+    tampered["sampler_seed"] = tampered["seed"]
+    with pytest.raises(ProtocolError, match="must be distinct"):
+        validate_gateway_binding(
+            binding=_binding_token(tampered), config=str(tampered["config"]),
+            overrides=row_overrides(tampered), kind="train",
+        )
 
 
 def test_legacy_he_h2_rows_do_not_inherit_hooke_profile_fields() -> None:
@@ -123,6 +130,7 @@ def test_legacy_he_h2_rows_do_not_inherit_hooke_profile_fields() -> None:
 
 
 def test_hooke_grid_rejects_count_preserving_replacement() -> None:
+    assert HOOKE_EVAL_SELECTION == "A37"
     rows = [
         {"kind": "eval", "system": "hooke1", "lineage": lineage,
          "checkpoint": checkpoint, "stream": stream,
