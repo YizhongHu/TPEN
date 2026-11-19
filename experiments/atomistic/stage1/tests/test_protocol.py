@@ -267,8 +267,10 @@ def test_phase1_selected_system_preserves_full_manifest_identity() -> None:
     full = build_manifest(
         protocol=STAGE1_PROTOCOL, source_sha=SHA1,
         config_sha256={system: SHA256 for system in SYSTEMS},
-        checkpoints=[7], lineage_seeds=[11, 12, 13],
-        checkpoint_sha256={(system, lineage, 7): SHA256 for system in SYSTEMS for lineage in range(3)},
+        checkpoints=[0, 7, STAGE1_PROTOCOL.lineage_updates], lineage_seeds=[11, 12, 13],
+            checkpoint_sha256={(system, lineage, checkpoint): SHA256
+                               for system in SYSTEMS for lineage in range(3)
+                               for checkpoint in (0, 7, STAGE1_PROTOCOL.lineage_updates)},
         results_root="/external/stage1",
         expected_physical_system_id={system: "c" * 64 for system in SYSTEMS},
     )

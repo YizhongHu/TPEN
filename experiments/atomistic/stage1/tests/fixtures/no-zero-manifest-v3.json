@@ -1,6 +1,6 @@
 {
   "schema": "stage1-no-zero-manifest-fixture/v1",
-  "base_sha": "ca06697e04e41884e5d3a05dab7ffa27067597a1",
+  "base_sha": "20e5b915af954efb22e746c14f278dd64f2f56c9",
   "generation_command": "uv run --frozen python -c 'import hashlib,json; from experiments.atomistic.stage1.protocol import STAGE1_PROTOCOL,SYSTEMS,build_manifest,manifest_hash; ids={s:\"d\"*64 for s in SYSTEMS}; config_ids={s:\"b\"*64 for s in SYSTEMS}; rows=build_manifest(protocol=STAGE1_PROTOCOL,source_sha=\"a\"*40,config_sha256=config_ids,checkpoints=[7],lineage_seeds=[11,12,13],checkpoint_sha256={(s,l,7):\"c\"*64 for s in SYSTEMS for l in range(3)},results_root=\"/n/netscratch/kozinsky_lab/Lab/rhu/stage1-golden\",expected_physical_system_id=ids,phase=2); doc={\"schema\":\"stage1/v3\",\"phase\":2,\"config_identity_rule\":\"stage1-config-v1\",\"manifest_hash\":manifest_hash(rows),\"rows\":rows}; raw=(json.dumps(doc,indent=2)+\"\\n\").encode(); print(hashlib.sha256(raw).hexdigest())'",
   "systems": [
     "hooke1",
@@ -32,7 +32,7 @@
   "checkpoint_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
   "results_root": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1-golden",
   "phase": 2,
-  "manifest_sha256": "19a0fe17908abbc257bf4a751b9c34ac4ffa5de22eaa97b895e908637d040d86",
-  "manifest_bytes": 76037,
+  "manifest_sha256": "237cf925f243f2f50dbd9739bf1d4dd0129c389f18bf58630bac79d72f83ccd8",
+  "manifest_bytes": 76049,
   "manifest_row_count": 64
 }
