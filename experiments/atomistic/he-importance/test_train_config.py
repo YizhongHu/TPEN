@@ -237,7 +237,7 @@ def _assert_matches_prechange(
                 resolver(cell)
             except Exception as observed_error:  # noqa: BLE001 - compare oracle refusals
                 assert type(observed_error).__name__ == type(expected_error).__name__
-                assert str(observed_error) == str(expected_error)
+                _assert_prechange_error_matches(cell, expected_error, observed_error)
             else:
                 raise AssertionError("current resolver accepted a prechange-refused cell")
         else:
@@ -1265,6 +1265,25 @@ def test_resolver_requires_repo_root_on_sys_path(tmp_path: Path, monkeypatch: py
 
     with pytest.raises(train_config.CheckoutPreconditionError, match="checkout root"):
         train_config.resolve_train_config(cell)
+
+
+def _assert_prechange_error_matches(
+    cell: object, expected_error: Exception, observed_error: Exception
+) -> None:
+    """Compare oracle refusal text, allowing only the intentional reason routing change."""
+
+    assert type(observed_error).__name__ == type(expected_error).__name__
+    if type(expected_error).__name__ != "UnavailableOptimizerError":
+        assert str(observed_error) == str(expected_error)
+        return
+
+    optimizer_cell = cell.manifest["scientific_identity"]["optimizer_cell"]
+    reason = optimizer_cell.get("unavailable_reason")
+    if reason:
+        method = cell.manifest["scientific_identity"]["optimizer"]["method"]
+        assert str(observed_error) == f"optimizer method {method!r} is unavailable: {reason}"
+    else:
+        assert str(observed_error) == str(expected_error)
 
 
 # Pre-change pin guard ---------------------------------------------------------
