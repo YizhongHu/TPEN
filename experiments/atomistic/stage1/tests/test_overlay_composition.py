@@ -209,6 +209,12 @@ def test_gateway_accepts_declared_overlay_and_rejects_hash_or_undeclared_use() -
         "loggers=[]",
         "callbacks=[{_target_:tpen.callback.Status}]",
         "stage1_overlay.sha256=" + "d" * 64,
+        "[loggers]=[]",
+        "[callbacks]=[]",
+        "stage1_overlay[sha256]=" + "d" * 64,
+        "[stage1_overlay].sha256=" + "d" * 64,
+        "callbacks[0]._target_=tpen.callback.Status",
+        ".loggers=[]",
     ),
 )
 def test_actual_train_gateway_refuses_overlay_owned_overrides(
@@ -218,9 +224,21 @@ def test_actual_train_gateway_refuses_overlay_owned_overrides(
 
     row = _overlay_row()
     overrides = row_overrides(row) + [owned_override]
+    split_calls: list[str] = []
+    original_split_key = protocol_module.split_key
+    monkeypatch.setattr(
+        protocol_module,
+        "split_key",
+        lambda key: split_calls.append(key) or original_split_key(key),
+    )
     monkeypatch.setattr(
         "tpen.run.load_config",
         lambda *_args, **_kwargs: pytest.fail("rejected gateway loaded a config"),
+    )
+    monkeypatch.setattr(
+        stage1_train,
+        "run_from_config",
+        lambda *_args, **_kwargs: pytest.fail("rejected gateway ran a config"),
     )
     monkeypatch.setattr(
         sys,
@@ -240,8 +258,9 @@ def test_actual_train_gateway_refuses_overlay_owned_overrides(
             str(row["overlay_sha256"]),
         ],
     )
-    with pytest.raises(ProtocolError, match="overlay-owned path"):
+    with pytest.raises(ProtocolError):
         stage1_train.main()
+    assert owned_override.partition("=")[0] in split_calls
 
 
 def test_actual_train_gateway_accepts_bound_overlay_without_owned_override(

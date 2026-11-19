@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from omegaconf import OmegaConf
+from omegaconf._utils import split_key
 import yaml
 
 from experiments.baselines.systems import load_registry
@@ -481,6 +482,23 @@ def _is_overlay_owned_override(key: str) -> bool:
     )
 
 
+def _canonical_override_key(key: str, *, reject_noncanonical: bool) -> str:
+    """Return the path spelling used by OmegaConf's update implementation.
+
+    ``OmegaConf.update`` resolves both dotted and getitem-style paths through
+    ``split_key``.  Admission must inspect that same path, while science rows
+    require the unambiguous dotted spelling at the gateway boundary.
+    """
+
+    try:
+        canonical = ".".join(split_key(key))
+    except Exception as exc:
+        raise ProtocolError(f"invalid gateway override key: {key!r}") from exc
+    if reject_noncanonical and ("[" in key or "]" in key or key.startswith(".")):
+        raise ProtocolError(f"non-canonical gateway override key: {key!r}")
+    return canonical
+
+
 def validate_gateway_binding(*, binding: str, config: str, overrides: list[str], kind: str,
                              expected_checkpoint_sha256: str | None = None,
                              overlay: str | None = None,
@@ -555,11 +573,14 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
             raise ProtocolError("prefixed gateway overrides are not allowed")
         if not separator or not key:
             raise ProtocolError(f"invalid gateway override: {override!r}")
-        if declared_overlay is not None and _is_overlay_owned_override(key):
+        canonical_key = _canonical_override_key(
+            key, reject_noncanonical=kind in {"train", "eval"},
+        )
+        if declared_overlay is not None and _is_overlay_owned_override(canonical_key):
             raise ProtocolError(f"gateway override targets overlay-owned path: {key}")
-        if key in override_map:
+        if canonical_key in override_map:
             raise ProtocolError(f"duplicate gateway override: {key}")
-        override_map[key] = value
+        override_map[canonical_key] = value
     expected_map = {entry.partition("=")[0]: entry.partition("=")[2] for entry in expected}
     missing = sorted(key for key in expected_map if key not in override_map)
     mismatched = sorted(
