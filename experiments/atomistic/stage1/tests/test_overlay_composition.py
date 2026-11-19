@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,36 @@ CONFIG_ROOT = ROOT / "configs"
 OVERLAY = CONFIG_ROOT / "overlays" / "diagnostics-v1.yaml"
 APPROVED_PROPOSAL_SHA256 = "8bbaf291e90ec6c90b5a8afbe664bded96dcb9743ad0c24cda1f66ddcb4634c1"
 COMMITTED_OVERLAY_SHA256 = "fd80c4d7beb0a2c075e3ac85015ea975c0a505352e7dca58be951350b21fed7c"
+
+
+def _structured_diff(before: object, after: object, prefix: str = "") -> set[str]:
+    """Return changed leaf paths, including paths added or removed."""
+
+    if isinstance(before, Mapping) and isinstance(after, Mapping):
+        paths: set[str] = set()
+        for key in before.keys() | after.keys():
+            dotted = f"{prefix}.{key}" if prefix else str(key)
+            if key not in before or key not in after:
+                paths.add(dotted)
+            else:
+                paths.update(_structured_diff(before[key], after[key], dotted))
+        return paths
+    if isinstance(before, list) and isinstance(after, list):
+        return set() if before == after else {prefix}
+    return set() if before == after else {prefix}
+
+
+def _mapping_leaf_paths(value: Mapping[str, object], prefix: str) -> set[str]:
+    """Return dotted paths for scalar leaves in one overlay section."""
+
+    paths: set[str] = set()
+    for key, nested in value.items():
+        dotted = f"{prefix}.{key}"
+        if isinstance(nested, Mapping):
+            paths.update(_mapping_leaf_paths(nested, dotted))
+        else:
+            paths.add(dotted)
+    return paths
 
 
 def _protocol() -> Protocol:
@@ -134,7 +165,7 @@ def test_gateway_accepts_declared_overlay_and_rejects_hash_or_undeclared_use() -
         overlay_sha256=str(row["overlay_sha256"]),
     ) == row
 
-    with pytest.raises(ProtocolError, match="sha256"):
+    with pytest.raises(ProtocolError, match="gateway overlay does not match binding"):
         validate_gateway_binding(
             binding=token,
             config=str(row["config"]),
@@ -177,6 +208,28 @@ def test_train_composition_appends_diagnostics_and_preserves_base_callbacks() ->
     assert cfg.stage1_overlay.composition_order == protocol_module.OVERLAY_COMPOSITION_ORDER
     assert any(entry.get("_target_") == "tpen.callback.ModuleNorms" for entry in cfg.callbacks)
     assert cfg.loggers[0]._target_ == "tpen.logging.JSONL"
+
+
+def test_train_composition_changes_only_overlay_owned_leaves() -> None:
+    """A mapping-replace composition mutant must fail this structured diff."""
+
+    cfg = load_config(str(CONFIG_ROOT / "he" / "train.yaml"))
+    base = OmegaConf.to_container(cfg, resolve=False)
+    overlay = OmegaConf.to_container(OmegaConf.load(OVERLAY), resolve=False)
+    assert isinstance(base, Mapping)
+    assert isinstance(overlay, Mapping)
+    compose_train_overlay(cfg, overlay=str(OVERLAY), expected_sha256=overlay_sha256(OVERLAY))
+    composed = OmegaConf.to_container(cfg, resolve=False)
+
+    owned = {
+        path
+        for section in ("runtime", "sampler", "optimizer", "trainer")
+        for path in _mapping_leaf_paths(overlay[section], section)
+    }
+    owned.update({"callbacks", "loggers", "stage1_overlay"})
+    assert _structured_diff(base, composed) <= owned
+    assert composed["trainer"]["_target_"] == base["trainer"]["_target_"]
+    assert composed["runner"] == base["runner"]
 
 
 def test_overlay_hash_is_exact_file_bytes() -> None:
@@ -240,11 +293,25 @@ def test_real_overlay_train_eval_collect_chain(tmp_path: Path) -> None:
     assert resolved_train.stage1_overlay.path == protocol_module.OVERLAY_RELATIVE_PATH
     assert resolved_train.stage1_overlay.sha256 == overlay_sha256(OVERLAY)
     assert resolved_train.stage1_overlay.composition_order == protocol_module.OVERLAY_COMPOSITION_ORDER
+    status = json.loads((train_dir / "status.json").read_text(encoding="utf-8"))
+    assert status["status"] == "completed"
+    assert status["current_event"] == "run_end"
     metrics_path = train_dir / "metrics.jsonl"
     assert metrics_path.is_file()
     metric_records = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
     assert metric_records
     assert any("train/energy" in record["metrics"] for record in metric_records)
+    metric_keys = {
+        key for record in metric_records for key in record.get("metrics", {})
+    }
+    for namespace in (
+        "checks/data_integrity/",
+        "checks/gradient/",
+        "train/module_norms/",
+        "train/optimizer_state/",
+        "train/perf/",
+    ):
+        assert any(key.startswith(namespace) for key in metric_keys), namespace
     checkpoint_file = train_dir / "checkpoints" / "step_000001" / "model.pt"
     checkpoint_sha = hashlib.sha256(checkpoint_file.read_bytes()).hexdigest()
 

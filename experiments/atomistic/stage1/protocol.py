@@ -13,6 +13,7 @@ import base64
 import binascii
 import copy
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -143,6 +144,22 @@ def _overlay_binding(*, overlay: str | Path, expected_sha256: object) -> tuple[s
     return OVERLAY_RELATIVE_PATH, digest, path
 
 
+def _iter_mapping_leaves(value: Mapping[str, Any], prefix: str) -> Iterator[tuple[str, Any]]:
+    """Yield dotted paths for every scalar leaf in a mapping.
+
+    Overlay sections are applied one leaf at a time so a section cannot
+    replace a mapping owned by the base config.  Lists remain values at their
+    containing path and are handled explicitly by the append-only sections.
+    """
+
+    for key, nested in value.items():
+        dotted = f"{prefix}.{key}"
+        if isinstance(nested, Mapping):
+            yield from _iter_mapping_leaves(nested, dotted)
+        else:
+            yield dotted, nested
+
+
 def compose_train_overlay(cfg: Any, *, overlay: str | Path, expected_sha256: str) -> Any:
     """Compose the approved train overlay without touching physics sections.
 
@@ -164,28 +181,37 @@ def compose_train_overlay(cfg: Any, *, overlay: str | Path, expected_sha256: str
         raise ProtocolError("overlay contains unsupported or missing top-level sections")
     if any(key in payload for key in ("system", "atoms", "model", "hamiltonian_terms")):
         raise ProtocolError("overlay must not declare physics or model sections")
-    for key in ("runtime", "sampler", "optimizer", "trainer", "loggers"):
-        OmegaConf.update(cfg, key, copy.deepcopy(payload[key]), merge=False)
-    base_callbacks = OmegaConf.to_container(cfg.get("callbacks", []), resolve=False)
-    diagnostic_callbacks = copy.deepcopy(payload["callbacks"])
-    if not isinstance(base_callbacks, list) or not isinstance(diagnostic_callbacks, list):
-        raise ProtocolError("overlay callbacks must be lists")
-    OmegaConf.update(
-        cfg, "callbacks", base_callbacks + diagnostic_callbacks, merge=False,
-    )
-    OmegaConf.update(
-        cfg,
-        "stage1_overlay",
-        {
-            "schema": "stage1-overlay/v1",
-            "path": relative,
-            "sha256": digest,
-            "composition_order": OVERLAY_COMPOSITION_ORDER,
-            "stream": "train",
-        },
-        merge=False,
-        force_add=True,
-    )
+    for key in ("runtime", "sampler", "optimizer", "trainer"):
+        section = payload[key]
+        if not isinstance(section, Mapping):
+            raise ProtocolError(f"overlay section {key!r} must be a mapping")
+        for dotted, value in _iter_mapping_leaves(section, key):
+            OmegaConf.update(cfg, dotted, copy.deepcopy(value), merge=False)
+
+    for key in ("callbacks", "loggers"):
+        base_config = cfg.get(key)
+        base_entries = (
+            [] if base_config is None else OmegaConf.to_container(base_config, resolve=False)
+        )
+        overlay_entries = copy.deepcopy(payload[key])
+        if not isinstance(base_entries, list) or not isinstance(overlay_entries, list):
+            raise ProtocolError(f"overlay {key} must be lists")
+        # Both callback and logger entries are additive.  In particular, the
+        # diagnostics overlay must never discard base callbacks such as the
+        # resolved-config snapshot or checkpoint publisher.
+        OmegaConf.update(
+            cfg, key, base_entries + overlay_entries, merge=False, force_add=True,
+        )
+
+    provenance = {
+        "schema": "stage1-overlay/v1",
+        "path": relative,
+        "sha256": digest,
+        "composition_order": OVERLAY_COMPOSITION_ORDER,
+        "stream": "train",
+    }
+    for dotted, value in _iter_mapping_leaves(provenance, "stage1_overlay"):
+        OmegaConf.update(cfg, dotted, value, merge=False, force_add=True)
     return cfg
 
 
