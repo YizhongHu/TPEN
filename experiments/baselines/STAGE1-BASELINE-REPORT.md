@@ -4,39 +4,44 @@ Scope: the accepted BL-R2 baseline corpus only. Values below are copied from the
 
 ## He
 
-Reference: `systems.yaml` He id `He`, E0 = -2.903724377034119598 Ha. Source table: `he-canonical-f8.csv` (SHA256 `6a12daa399557075453f766b7c8d4380a70b93f3c2493d963d1b9cb205ae1f59`). The rows are historical corpus records; they are not TPEN runs. The Orbformer row is `inference`; all other rows here are `training_tail`.
+Reference: `systems.yaml` He id `he_atom`, E0 = -2.903724377034119598 Ha. Source table: `he-canonical-f8.csv` (SHA256 `6a12daa399557075453f766b7c8d4380a70b93f3c2493d963d1b9cb205ae1f59`); the joined JSON source is `canonical-f8.json` (SHA256 `27f089b04cb7bca4af02ab560bb132526d6896e2786d3fb729bcadefc1dc1601`). The rows are historical corpus records; they are not TPEN runs. The Orbformer row is `inference`; all other rows here are `training_tail`.
 
-| code / ansatz | run id | code commit | seed | N | W | E_W (Ha) | blocked SE | delta (uHa) | stage-1 |
-|---|---|---|---|---:|---:|---:|---:|---:|---|
-| DeepQMC / deeperwin | R01 | edf373e7 | unrecorded | 20000 | 10000 | -2.903722517562 | 4.779e-06 | +1.859 | record-only |
-| DeepQMC / default | R02 | edf373e7 | unrecorded | 20000 | 10000 | -2.903686363435 | 1.603e-05 | +38.014 | record-only |
-| DeepQMC / ferminet | R03 | edf373e7 | unrecorded | 20000 | 10000 | -2.903718433475 | 3.840e-06 | +5.944 | record-only |
-| DeepQMC / lapnet | R04 | edf373e7 | unrecorded | 20000 | 10000 | -2.903720249772 | 3.212e-06 | +4.127 | record-only |
-| DeepQMC / psiformer | R05 | edf373e7 | unrecorded | 20000 | 10000 | -2.903723219585 | 3.169e-06 | +1.157 | record-only |
-| DeepQMC / transpsiformer | R06 | edf373e7 | unrecorded | 20000 | 10000 | -2.903721802950 | 2.284e-06 | +2.574 | record-only |
-| Neural Pfaffian / neural_pfaffian | R13 | f711f08a | 813784688 | 100000 | 25000 | -2.903723855906 | 5.72e-07 | +0.521 | record-only |
-| OneQMC / orbformer-se | R14 | b7ed7223 | 42 | 40000 | 10000 | -2.903742715096 | 1.151e-05 | -18.338 | record-only; inference |
-| FermiNet / psiformer | R15 | c4312c31 | 23 | 200000 | 20000 | -2.903727148790 | 2.732e-06 | -2.772 | record-only |
-| FermiNet / ferminet | R16 | c4312c31 | 23 | 200000 | 20000 | -2.903717802725 | 2.737e-06 | +6.574 | record-only |
+| code / ansatz | run id | code commit | seed | N | W | E_W (Ha) | blocked SE | delta (uHa) | mean V +/- blocked SE | median V [95% CI] | stage-1 |
+|---|---|---|---|---:|---:|---:|---:|---:|---|---|---|
+| DeepQMC / deeperwin | R01 | edf373e7 | unrecorded | 20000 | 10000 | -2.903722517562 | 4.779e-06 | +1.859 | 8.785e-04 +/- 3.970e-05 | 3.343e-04 [3.272e-04,3.428e-04] | loss/finite/variance reduced |
+| DeepQMC / default | R02 | edf373e7 | unrecorded | 20000 | 10000 | -2.903686363435 | 1.603e-05 | +38.014 | 9.784e-03 +/- 9.909e-04 | 7.535e-04 [7.251e-04,7.841e-04] | loss/finite/variance reduced |
+| DeepQMC / ferminet | R03 | edf373e7 | unrecorded | 20000 | 10000 | -2.903718433475 | 3.840e-06 | +5.944 | 5.095e-04 +/- 4.682e-05 | 2.317e-04 [2.272e-04,2.363e-04] | loss/finite/variance reduced |
+| DeepQMC / lapnet | R04 | edf373e7 | unrecorded | 20000 | 10000 | -2.903720249772 | 3.212e-06 | +4.127 | 3.312e-04 +/- 2.208e-05 | 2.101e-04 [2.074e-04,2.134e-04] | loss/finite/variance reduced |
+| DeepQMC / psiformer | R05 | edf373e7 | unrecorded | 20000 | 10000 | -2.903723219585 | 3.169e-06 | +1.157 | 2.840e-04 +/- 7.888e-06 | 2.017e-04 [1.990e-04,2.044e-04] | loss/finite/variance reduced |
+| DeepQMC / transpsiformer | R06 | edf373e7 | unrecorded | 20000 | 10000 | -2.903721802950 | 2.284e-06 | +2.574 | 1.953e-04 +/- 4.067e-06 | 1.733e-04 [1.712e-04,1.753e-04] | loss/finite/variance reduced |
+| DeepQMC / deeperwin | R07 | edf373e7 | unrecorded | 188894 | 18889 | -2.903723506439 | 2.027e-06 | +0.871 | 3.168e-04 +/- 1.290e-05 | 1.010e-04 [9.911e-05,1.028e-04] | loss/finite/variance; mid->last not reduced |
+| DeepQMC / default | R08 | edf373e7 | unrecorded | 100000 | 50000 | -2.903709089837 | 7.201e-06 | +15.287 | 1.167e-02 +/- 1.340e-03 | 5.645e-04 [5.427e-04,5.901e-04] | loss/finite/variance reduced |
+| DeepQMC / default | R09 | edf373e7 | unrecorded | 200000 | 50000 | -2.903716541128 | 7.963e-06 | +7.836 | 1.628e-02 +/- 3.593e-03 | 5.205e-04 [5.049e-04,5.398e-04] | loss/finite/variance reduced |
+| DeepQMC / lapnet | R10 | edf373e7 | unrecorded | 100204 | 10020 | -2.903730758721 | 6.935e-06 | -6.382 | 1.760e-03 +/- 1.569e-03 | 1.159e-04 [1.145e-04,1.172e-04] | loss/finite/variance reduced |
+| DeepQMC / lapnet | R11 | edf373e7 | unrecorded | 200000 | 20000 | -2.903720270610 | 1.318e-06 | +4.106 | 1.403e-04 +/- 3.420e-06 | 8.694e-05 [8.609e-05,8.770e-05] | loss/finite/variance reduced |
+| Neural Pfaffian / neural_pfaffian | R13 | f711f08a | 813784688 | 100000 | 25000 | -2.903723855906 | 5.72e-07 | +0.521 | no walker variance | no walker variance | record-only |
+| OneQMC / orbformer-se | R14 | b7ed7223 | 42 | 40000 | 10000 | -2.903742715096 | 1.151e-05 | -18.338 | no walker variance | no walker variance | record-only; inference |
+| FermiNet / psiformer | R15 | c4312c31 | 23 | 200000 | 20000 | -2.903727148790 | 2.732e-06 | -2.772 | no walker variance | no walker variance | no V logged |
+| FermiNet / ferminet | R16 | c4312c31 | 23 | 200000 | 20000 | -2.903717802725 | 2.737e-06 | +6.574 | no walker variance | no walker variance | no V logged |
 
 The available He trajectory curves are descriptive only: `he-curve-series-table.csv` (SHA256 `6b4e26db5894705b9398333d599e00c7594e52fb3b8efc45955f0ebf6139a60e`). They do not establish a common optimizer-step criterion for every historical row, so the per-row Stage-1 field is `record-only`. Figure: ![He curves](stage1-report/he-deepqmc-20k-detail.png).
 
 ## H2
 
-Reference: `systems.yaml` H2 id `H2`, E0 = -1.17447 Ha; the source records the reference rounded to ±5 uHa. Source table: `h2-combined-table-r2.csv` (SHA256 `2f2f76041d5c41e0a48307ad531a77b4ed40c411a9a9f9c9154827d252436100`). These are historical baseline records, not TPEN values.
+Reference: `systems.yaml` H2 id `h2_molecule`, E0 = -1.17447 Ha; the source records the reference rounded to ±5 uHa. Source table: `h2-combined-table-r2.csv` (SHA256 `2f2f76041d5c41e0a48307ad531a77b4ed40c411a9a9f9c9154827d252436100`). These are historical baseline records, not TPEN values.
 
 | code / ansatz | run id | code commit | seed | N | W | E_W (Ha) | blocked SE | delta (uHa) | stage-1 |
 |---|---|---|---|---:|---:|---:|---:|---:|---|
-| DeepQMC / default (PauliNet-native) | dqmc-paulin2-h2-fix-39520283 | edf373e7 | unrecorded | 200000 | 20000 | -1.174469784546 | 4.665e-06 | +0.215 | record-only |
-| DeepQMC / default (secondary record window) | dqmc-paulin2-h2-fix-39520283 | edf373e7 | unrecorded | 200000 | 50000 | -1.174470104489 | 2.941e-06 | -0.104 | record-only |
-| FermiNet-codebase / ferminet | r2-h2-39068280 | c4312c31 | 23 | 200000 | 20000 | -1.174474339240 | 8.631e-07 | -4.339 | record-only |
-| FermiNet-codebase / psiformer | psi-2e-39195983__H2 | c4312c31 | 23 | 200000 | 20000 | -1.174469850475 | 1.495e-06 | +0.150 | record-only |
+| DeepQMC / default (PauliNet-native) | dqmc-paulin2-h2-fix-39520283 | edf373e7 | unrecorded | 200000 | 20000 | -1.174469784546 | 4.665e-06 | +0.215 | loss/finite/variance reduced |
+| DeepQMC / default (secondary record window) | dqmc-paulin2-h2-fix-39520283 | edf373e7 | unrecorded | 200000 | 50000 | -1.174470104489 | 2.941e-06 | -0.104 | loss/finite/variance reduced |
+| FermiNet-codebase / ferminet | r2-h2-39068280 | c4312c31 | 23 | 200000 | 20000 | -1.174474339240 | 8.631e-07 | -4.339 | no V logged |
+| FermiNet-codebase / psiformer | psi-2e-39195983__H2 | c4312c31 | 23 | 200000 | 20000 | -1.174469850475 | 1.495e-06 | +0.150 | no V logged |
 
 Figure: ![H2 DeepQMC W=20000](stage1-report/h2-rows-table-deepqmc-w20000.png). No TPEN overlay is present.
 
 ## H
 
-Reference: `systems.yaml` H id `H`, E0 = -0.5 Ha. Source table: `h-rows-table.csv` (SHA256 `db52af473f5a7b421e5dd85911d465bcbbfbf18c2f6eb14b037387cc22edfa4c`). The full runs are explicitly non-science (`SCIENCE=false`) and are training-batch trajectories, not fixed-parameter inference estimates and not comparable to a future fresh-sample preregistration verdict.
+Reference: `systems.yaml` H id `h_atom`, E0 = -0.5 Ha. Source table: `h-rows-table.csv` (SHA256 `db52af473f5a7b421e5dd85911d465bcbbfbf18c2f6eb14b037387cc22edfa4c`). The full runs are explicitly non-science (`SCIENCE=false`) and are training-batch trajectories, not fixed-parameter inference estimates and not comparable to a future fresh-sample preregistration verdict.
 
 | code | seed | N | W | E_W (Ha) | blocked SE | delta (uHa) | mean V | SE(mean V) | median V [95% CI] | rms/median sigma | max/median V | rebound | stage-1 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---|
@@ -57,7 +62,8 @@ Hooke is skipped: there is no native baseline support. F-sigma, P-sigma, F-abser
 
 | content | source |
 |---|---|
-| He energies, references, estimator, N/W, code/seed metadata | TO `19fcf084`, notes `sota-context-critical-analysis-20261117` and `-partB/-C/-D`; hash-bound `he-canonical-f8.csv` above |
+| He energies, references, estimator, N/W, code/seed metadata | TO `19fcf084`, notes `sota-context-critical-analysis-20261117` and `-partB/-C/-D`; hash-bound `he-canonical-f8.csv`/`canonical-f8.json` above |
+| He/H2 Stage-1 criteria | TO `19fcf084`, note `stage1-criteria-he-h2-20261119`; hash-bound `stage1-criteria-he-h2.csv` (SHA256 `65403385cde6390963e3393237bea42118159ffe96f7185ee78f794e057bf5c5`) |
 | H2 rows and ±5 uHa reference rounding | TO `19fcf084`, note `stage1-h2-rows-20261119-r2`; hash-bound `h2-combined-table-r2.csv` above |
 | H rows, VARERR/F11 fields, Stage-1 criteria | TO `19fcf084`, note `sota-context-critical-analysis-20261117-r2-H`; TO `dc036f76`, notes `run-conclusions-full-20261119`, `run-conclusions-full-20261119-partB`, and assessment; hash-bound `h-rows-table.csv` above |
 | late-rise argmin caveat | TO `19fcf084`, note `sota-context-critical-analysis-20261117-r2-H-addendum-argmin`, SHA256 `1f137bf189e185750a197c1296155101eb518d06f2386888d5b51709713fd645` |
