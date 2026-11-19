@@ -267,7 +267,8 @@ not rename or collapse those workstreams.
 
 `run_from_config` is the shared preconstruction restore admission boundary.
 Both an `OperationalRestoreRequest` (closed to `train_resume`) and a configured
-`runner.load.mode: train_resume` (including `runner.load: ${load}`) invoke the
+`runner.load.mode: train_resume` (including `runner.load: ${load}` and Train's
+sixth positional `_args_` load) invoke the
 core-owned `tpen.checkpoint.profiles.validate_native_recovery_profile` exactly
 once. The execution namespace re-exports that same validator and exception.
 There is no second allowlist and checkpoint does not import execution.
@@ -286,3 +287,9 @@ Fresh runs and `model_only` loads skip this gate. This policy covers direct
 unsupported train-resume configurations may now refuse. It does not certify
 launcher-supplied runtime observers or add validation to the lower-level
 checkpoint file loader, which has no complete run configuration.
+
+Restore-intent detection reads unresolved syntax and follows only plain dotted
+references. Indeterminate load syntax (including resolver expressions, missing
+references, cycles, or duplicate positional/named Train loads) refuses with
+`UnsupportedMutableStateError.code == "malformed-config"`. Native admission
+precedes HI validation, so native refusal cannot execute HI config resolvers.

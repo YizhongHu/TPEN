@@ -313,15 +313,8 @@ _PLAIN_REFERENCE = re.compile(
 _INVALID_SCALAR = object()
 
 
-def _resolve_plain_reference(config: Mapping[str, Any], value: str) -> Any:
-    """Follow only same-config dotted references to a literal scalar.
-
-    This is deliberately a syntax-only resolver.  It does not call OmegaConf,
-    import a target, or evaluate a resolver.  A reference chain is accepted
-    only when every hop is a plain dotted reference and its terminal value is a
-    literal scalar; cycles, missing paths, containers, targets, and callables
-    are all refused.
-    """
+def _resolve_plain_node(config: Mapping[str, Any], value: Any) -> Any:
+    """Follow plain dotted references without evaluating configuration syntax."""
 
     current: Any = value
     visited: set[str] = set()
@@ -342,6 +335,20 @@ def _resolve_plain_reference(config: Mapping[str, Any], value: str) -> Any:
                 return _INVALID_SCALAR
             node = node[segment]
         current = node
+    return current
+
+
+def _resolve_plain_reference(config: Mapping[str, Any], value: str) -> Any:
+    """Follow only same-config dotted references to a literal scalar.
+
+    This is deliberately a syntax-only resolver.  It does not call OmegaConf,
+    import a target, or evaluate a resolver.  A reference chain is accepted
+    only when every hop is a plain dotted reference and its terminal value is a
+    literal scalar; cycles, missing paths, containers, targets, and callables
+    are all refused.
+    """
+
+    current = _resolve_plain_node(config, value)
     if type(current) in (bool, int, float):
         return current
     if type(current) is str and "${" not in current:
@@ -819,6 +826,61 @@ class UnsupportedMutableStateError(ValueError):
     def __init__(self, message: str, *, code: str = "malformed-config") -> None:
         super().__init__(message)
         self.code = code
+
+
+def configured_load_mode(config: Any) -> str:
+    """Read restore intent before any resolving validation or construction.
+
+    Parameters
+    ----------
+    config : mapping
+        Unresolved configuration, including named loads or Train's sixth
+        positional argument. Only plain dotted references are followed.
+
+    Returns
+    -------
+    str
+        Literal load mode; absent loads and modes default to ``none``.
+
+    Raises
+    ------
+    UnsupportedMutableStateError
+        With ``malformed-config`` when load syntax is indeterminate or both
+        positional and named loads are supplied. No resolver or target runs.
+    """
+    from omegaconf import OmegaConf
+
+    if OmegaConf.is_config(config):
+        config = OmegaConf.to_container(config, resolve=False)
+    if not isinstance(config, Mapping):
+        raise UnsupportedMutableStateError("restore intent requires a mapping config")
+
+    def follow(value):
+        return _resolve_plain_node(config, value)
+
+    runner = follow(config.get("runner", {}))
+    if not isinstance(runner, Mapping):
+        raise UnsupportedMutableStateError("runner must be a syntactically known mapping")
+    load = runner.get("load")
+    target = follow(runner.get("_target_"))
+    if target in ("tpen.runner.Train", "tpen.runner.train.Train"):
+        args = follow(runner.get("_args_", []))
+        if not isinstance(args, (list, tuple)):
+            raise UnsupportedMutableStateError("Train _args_ must be a known sequence")
+        # Train.__init__: model, sampler, hamiltonian_terms, optimizer, trainer, load.
+        if len(args) >= 6:
+            if "load" in runner:
+                raise UnsupportedMutableStateError("Train load supplied twice")
+            load = args[5]
+    load = follow(load)
+    if load is None:
+        return "none"
+    if not isinstance(load, Mapping):
+        raise UnsupportedMutableStateError("load must be a syntactically known mapping")
+    mode = follow(load.get("mode", "none"))
+    if not isinstance(mode, str) or "${" in mode:
+        raise UnsupportedMutableStateError("load mode must be syntactically known")
+    return mode
 
 
 def _target(entry: Any, owner: str, index: int) -> str:

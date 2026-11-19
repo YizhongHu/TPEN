@@ -260,3 +260,113 @@ def test_stage1_diagnostics_composition_passes_restore_admission(source, monkeyp
     with pytest.raises(Admitted):
         run_module.run_from_config(cfg, **kwargs, raise_exceptions=True)
     assert reached == [True]
+
+
+def _positional_load(cfg):
+    cfg.runner = {
+        "_target_": "tpen.runner.Train",
+        "_args_": ["${model}", "${sampler}", "${hamiltonian_terms}",
+                    "${optimizer}", "${trainer}", "${load}"],
+    }
+
+
+def _rng_snapshot():
+    return deepcopy((random.getstate(), np.random.get_state(), torch.get_rng_state()))
+
+
+def _assert_early_refusal(cfg, kwargs, code, raise_exceptions, tmp_path, monkeypatch):
+    entered = []
+
+    def forbidden(*args, **kwargs):
+        entered.append(True)
+        raise AssertionError("refusal crossed the preconstruction boundary")
+
+    train = importlib.import_module("tpen.runner.train")
+    monkeypatch.setattr(run_module, "prepare_run_context", forbidden)
+    monkeypatch.setattr(run_module, "_instantiate_runner", forbidden)
+    monkeypatch.setattr(train, "restore_checkpoint_with_events", forbidden)
+    before, files = _rng_snapshot(), _files(tmp_path)
+    if raise_exceptions:
+        with pytest.raises(UnsupportedMutableStateError) as error:
+            run_module.run_from_config(cfg, **kwargs, raise_exceptions=True)
+        assert error.value.code == code
+    else:
+        assert run_module.run_from_config(cfg, **kwargs) == 1
+    assert entered == []
+    _equal(before, _rng_snapshot())
+    assert _files(tmp_path) == files
+    assert not (tmp_path / "successor").exists()
+
+
+@pytest.mark.parametrize("raise_exceptions", [True, False])
+def test_positional_resume_refuses_before_construction(tmp_path, monkeypatch, raise_exceptions):
+    cfg = OmegaConf.load(FIXTURE)
+    cfg.run.root = str(tmp_path / "successor")
+    cfg.load = {"mode": "train_resume", "path": str(tmp_path / "unused")}
+    _positional_load(cfg)
+    cfg.callbacks.append({"_target_": "tpen.callback.FailureLog"})
+    _assert_early_refusal(cfg, {}, "unsupported-callback", raise_exceptions, tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("positional", [False, True])
+def test_plain_load_reference_is_admitted(tmp_path, monkeypatch, positional):
+    cfg = OmegaConf.load(FIXTURE)
+    cfg.load = {"mode": "${resume_mode}"}
+    cfg.resume_mode = "train_resume"
+    cfg.runner.load = "${load}"
+    if positional:
+        _positional_load(cfg)
+    reached = []
+
+    class Admitted(Exception):
+        pass
+
+    def after_guard(*args, **kwargs):
+        reached.append(True)
+        raise Admitted
+
+    monkeypatch.setattr(run_module, "prepare_run_context", after_guard)
+    with pytest.raises(Admitted):
+        run_module.run_from_config(cfg, raise_exceptions=True)
+    assert reached == [True]
+
+
+@pytest.mark.parametrize("entry", ["request", "configured"])
+@pytest.mark.parametrize("raise_exceptions", [True, False])
+def test_native_refusal_precedes_hi_resolvers(source, tmp_path, monkeypatch, entry, raise_exceptions):
+    cfg, request, _, _ = source
+    kwargs = _entry(cfg, request, entry)
+    cfg.schema = "tpen.hi.train.v1"
+    cfg.callbacks.append({"_target_": "tpen.callback.FailureLog"})
+    calls = []
+    marker = tmp_path / "resolver-ran"
+
+    def side_effect():
+        calls.append(True)
+        marker.write_text("resolver executed")
+        random.random()
+        return 1
+
+    name = "cx09_r4_side_effect"
+    OmegaConf.register_new_resolver(name, side_effect)
+    try:
+        cfg.probe = "${cx09_r4_side_effect:}"
+        _assert_early_refusal(cfg, kwargs, "unsupported-callback", raise_exceptions, tmp_path, monkeypatch)
+        assert calls == []
+        assert not marker.exists()
+    finally:
+        OmegaConf.clear_resolver(name)
+
+
+@pytest.mark.parametrize("positional", [False, True])
+@pytest.mark.parametrize("load", ["${cx09_unregistered:}", {"mode": "${cx09_unregistered:}"},
+                                  "${missing}", "${load}"])
+@pytest.mark.parametrize("raise_exceptions", [True, False])
+def test_indeterminate_load_refuses_without_resolution(tmp_path, monkeypatch, positional, load, raise_exceptions):
+    cfg = OmegaConf.load(FIXTURE)
+    cfg.run.root = str(tmp_path / "successor")
+    cfg.load = load
+    cfg.runner.load = "${load}"
+    if positional:
+        _positional_load(cfg)
+    _assert_early_refusal(cfg, {}, "malformed-config", raise_exceptions, tmp_path, monkeypatch)
