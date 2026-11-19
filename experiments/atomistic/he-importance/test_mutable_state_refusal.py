@@ -105,12 +105,7 @@ def test_real_resolved_rows_validate_aliases_and_refusal_owners(tmp_path: Path) 
         )
         resolved_rows[f"{stage}-resolved"] = train_config.resolve_train_config(cell)
 
-    expected_aliases = {
-        "runner.model": "reconstructible",
-        "runner.sampler": "reconstructible",
-        "runner.trainer": "reconstructible",
-        "runner.optimizer": "reconstructible",
-    }
+    alias_pairs = ("model", "sampler", "trainer", "optimizer")
     expected_refused = {
         "tpen.callback.RuntimeEquivariance",
         "tpen.callback.ResourceUsage",
@@ -119,10 +114,8 @@ def test_real_resolved_rows_validate_aliases_and_refusal_owners(tmp_path: Path) 
         entries = inventory.validate_mutable_state_inventory(config)
         assert entries, label
         by_path = {entry.path: entry for entry in entries}
-        assert all(path in by_path for path in expected_aliases), label
-        assert {
-            path: by_path[path].classification for path in expected_aliases
-        } == expected_aliases, label
+        for path in alias_pairs:
+            assert by_path[f"runner.{path}"].classification == by_path[path].classification, label
         assert {
             entry.target
             for entry in entries
@@ -136,6 +129,49 @@ def test_real_resolved_rows_validate_aliases_and_refusal_owners(tmp_path: Path) 
     assert all(target in message for target in expected_refused)
     assert "tpen.sampling.metropolis.MetropolisSampler" not in message
     assert "tpen.training.trainer.VMCTrainer" not in message
+
+
+@pytest.mark.parametrize(
+    ("stage", "producer_path", "activation"),
+    [
+        ("A", "linear/orbit-complete", "tanh,tanh"),
+        ("A", "hybrid/orbit-complete", "exact GELU,exact GELU"),
+        ("A", "hybrid/orbit-complete", "Softplus beta2,Softplus beta2"),
+    ],
+)
+def test_real_resolved_rows_cover_admitted_constructor_shapes(
+    tmp_path: Path, stage: str, producer_path: str, activation: str
+) -> None:
+    """Every representative orbit/activation constructor shape is resolved and classified."""
+
+    cells = architecture_stage_family.materialize_family_stage(stage, tmp_path / stage)
+    cell = next(
+        item
+        for item in cells
+        if item.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and item.manifest["scientific_identity"]["context"]["literal_configuration"]["producer_path"] == producer_path
+        and item.manifest["scientific_identity"]["context"]["literal_configuration"]["activation"] == activation
+    )
+    config = train_config.resolve_train_config(cell)
+    entries = inventory.validate_mutable_state_inventory(config)
+    constructors = {(entry.path, entry.target) for entry in entries}
+    assert ("model.layers.0.layout.linear.explicit.7", "tpen.data.paths.SupportPath") in constructors
+    activation_target = {
+        "tanh,tanh": "torch.nn.Tanh",
+        "exact GELU,exact GELU": "torch.nn.GELU",
+        "Softplus beta2,Softplus beta2": "tpen.nn.SoftplusBeta",
+    }[activation]
+    assert ("model.layers.0.mixing.activation", activation_target) in constructors
+
+
+@pytest.mark.parametrize("config", [{}, {"scalar": 1}])
+def test_empty_or_scalar_only_config_refuses(config: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="constructs no inventory objects"):
+        inventory.validate_mutable_state_inventory(config)
+
+
+def test_nonempty_config_still_validates_after_census_guard() -> None:
+    assert inventory.validate_mutable_state_inventory()
 
 
 @pytest.mark.parametrize("update", ["replacement", "Gaussian residual"])

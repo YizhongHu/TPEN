@@ -22,7 +22,7 @@ _RECONSTRUCTIBLE = (
 )
 _TYPED_REFUSED = (
     "typed-refused",
-    "native recovery profile does not admit this mutable owner; with p=1 and max_calls=None cadence state is inert, otherwise HI continuation refuses before construction",
+    "HI study policy keeps this mutable owner typed-refused pending S5b qualification; core admits it after CX-07, but contract-repin-20261118 and S5b ddb2794a require HI continuation refusal before construction",
 )
 _ALLOCATION_LOCAL = (
     "allocation-local",
@@ -109,6 +109,7 @@ _REGISTRY.update(
             ("model.layers.0.layout.linear.explicit.0", "tpen.data.paths.SupportPath"),
             ("model.layers.0.layout.linear.explicit.1", "tpen.data.paths.SupportPath"),
             ("model.layers.0.layout.linear.explicit.2", "tpen.data.paths.SupportPath"),
+            *( (f"model.layers.0.layout.linear.explicit.{index}", "tpen.data.paths.SupportPath") for index in range(3, 8) ),
             ("model.layers.0.layout.tensor_product", "tpen.data.paths.PathMetadata.generate"),
             ("model.layers.0.layout.input_orders", "tpen.data.paths.NormalizedOrders"),
             ("model.layers.0.layout.output_orders", "tpen.data.paths.NormalizedOrders"),
@@ -118,6 +119,9 @@ _REGISTRY.update(
             ("model.layers.0.mixing.producers.0", "tpen.nn.LinearEquivariantMixing"),
             ("model.layers.0.mixing.producers.1", "tpen.nn.EquivariantMixing"),
             ("model.layers.0.mixing.activation", "tpen.nn.ChannelPreservingMLPActivation"),
+            ("model.layers.0.mixing.activation", "torch.nn.Tanh"),
+            ("model.layers.0.mixing.activation", "torch.nn.GELU"),
+            ("model.layers.0.mixing.activation", "tpen.nn.SoftplusBeta"),
             ("model.layers.0.mixing.activation.layout", "tpen.nn.OrderMLPLayout"),
             ("model.layers.0.mixing.activation.layout.axes", "tpen.nn.ChannelActivationAxes"),
             ("model.layers.0.mixing.activation.layout.specs.0", "tpen.nn.OrderMLPSpec"),
@@ -126,6 +130,9 @@ _REGISTRY.update(
             ("model.layers.0.mixing.activation.layout.specs.1.activation", "torch.nn.SiLU"),
             ("model.layers.0.mixing.activation.initializer", "tpen.nn.TorchInitializer"),
             ("model.layers.0.path_aggregation.activation", "tpen.nn.ChannelPreservingMLPActivation"),
+            ("model.layers.0.path_aggregation.activation", "torch.nn.Tanh"),
+            ("model.layers.0.path_aggregation.activation", "torch.nn.GELU"),
+            ("model.layers.0.path_aggregation.activation", "tpen.nn.SoftplusBeta"),
             ("model.layers.0.path_aggregation.activation.layout", "tpen.nn.OrderMLPLayout"),
             ("model.layers.0.path_aggregation.activation.layout.axes", "tpen.nn.ChannelActivationAxes"),
             ("model.layers.0.path_aggregation.activation.layout.specs.0", "tpen.nn.OrderMLPSpec"),
@@ -157,6 +164,7 @@ _REGISTRY.update(
             ("model.layers.0.mixing.layout.linear.explicit.0", "tpen.data.paths.SupportPath"),
             ("model.layers.0.mixing.layout.linear.explicit.1", "tpen.data.paths.SupportPath"),
             ("model.layers.0.mixing.layout.linear.explicit.2", "tpen.data.paths.SupportPath"),
+            *( (f"model.layers.0.mixing.layout.linear.explicit.{index}", "tpen.data.paths.SupportPath") for index in range(3, 8) ),
             ("model.layers.0.mixing.layout.tensor_product", "tpen.data.paths.PathMetadata.generate"),
             ("model.layers.0.mixing.layout.input_orders", "tpen.data.paths.NormalizedOrders"),
             ("model.layers.0.mixing.layout.output_orders", "tpen.data.paths.NormalizedOrders"),
@@ -167,6 +175,7 @@ _REGISTRY.update(
             ("model.layers.0.mixing.producers.0.metadata.explicit.0", "tpen.data.paths.SupportPath"),
             ("model.layers.0.mixing.producers.0.metadata.explicit.1", "tpen.data.paths.SupportPath"),
             ("model.layers.0.mixing.producers.0.metadata.explicit.2", "tpen.data.paths.SupportPath"),
+            *( (f"model.layers.0.mixing.producers.0.metadata.explicit.{index}", "tpen.data.paths.SupportPath") for index in range(3, 8) ),
             ("model.layers.0.mixing.producers.0.paths", "tpen.data.paths.PathMetadata.generate"),
             ("model.layers.0.mixing.producers.1.paths", "tpen.data.paths.PathMetadata.generate"),
             ("model.layers.0.path_aggregation.layout", "tpen.data.paths.compose_path_layout"),
@@ -174,6 +183,7 @@ _REGISTRY.update(
             ("model.layers.0.path_aggregation.layout.linear.explicit.0", "tpen.data.paths.SupportPath"),
             ("model.layers.0.path_aggregation.layout.linear.explicit.1", "tpen.data.paths.SupportPath"),
             ("model.layers.0.path_aggregation.layout.linear.explicit.2", "tpen.data.paths.SupportPath"),
+            *( (f"model.layers.0.path_aggregation.layout.linear.explicit.{index}", "tpen.data.paths.SupportPath") for index in range(3, 8) ),
             ("model.layers.0.path_aggregation.layout.tensor_product", "tpen.data.paths.PathMetadata.generate"),
             ("model.layers.0.path_aggregation.layout.input_orders", "tpen.data.paths.NormalizedOrders"),
             ("model.layers.0.path_aggregation.layout.output_orders", "tpen.data.paths.NormalizedOrders"),
@@ -330,6 +340,8 @@ def build_mutable_state_inventory(config: Any | None = None) -> tuple[MutableSta
                 source=_source_ref(path, target),
             )
         )
+    if not entries:
+        raise ValueError("HI train config constructs no inventory objects")
     entries.extend(
         MutableStateEntry(
             path=path,
@@ -350,8 +362,6 @@ def build_mutable_state_inventory(config: Any | None = None) -> tuple[MutableSta
         )
         for path, target, component in _ATTEMPT_LOCAL_STATE
     )
-    if not entries:
-        raise ValueError("HI train config constructs no inventory objects")
     return tuple(entries)
 
 
