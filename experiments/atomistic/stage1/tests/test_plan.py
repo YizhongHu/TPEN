@@ -70,6 +70,32 @@ def test_plan_main_uses_protocol_planned_physical_system_ids(
         plan_module.main()
 
 
+def test_plan_phase1_defaults_to_canonical_retention_checkpoints(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        plan_module,
+        "STAGE1_PROTOCOL",
+        replace(plan_module.STAGE1_PROTOCOL, lineage_updates=10, retention_cadence=5),
+    )
+    output = tmp_path / "manifest.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "plan.py", "--output", str(output), "--source-sha", "a" * 40,
+            "--results-root", "/external/stage1", "--phase", "1", "--systems", "he",
+            "--lineage-seeds", "11", "12", "13",
+        ],
+    )
+
+    assert plan_module.main() == 0
+    document = json.loads(output.read_text(encoding="utf-8"))
+    train_rows = [row for row in document["rows"] if row["kind"] == "train"]
+    assert train_rows
+    assert {tuple(row["checkpoint_steps"]) for row in train_rows} == {(0, 5, 10)}
+
+
 def test_two_phase_plan_compares_legacy_config_digest_to_checkout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
