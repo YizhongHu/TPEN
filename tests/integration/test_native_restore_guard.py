@@ -1,6 +1,8 @@
 """Preconstruction native-profile admission through both public restore entries."""
 
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
+from dataclasses import fields, is_dataclass
 import hashlib
 import importlib
 from pathlib import Path
@@ -32,21 +34,31 @@ def test_execution_exports_the_core_owned_validator():
     assert native_profile.UnsupportedMutableStateError is UnsupportedMutableStateError
 
 
-def _equal(left, right):
+def _equal(left, right, path="state"):
+    assert type(left) is type(right), f"{path}: types differ"
     if isinstance(left, torch.Tensor):
-        assert torch.equal(left, right)
+        assert left.dtype == right.dtype, f"{path}: tensor dtypes differ"
+        assert left.shape == right.shape, f"{path}: tensor shapes differ"
+        assert torch.equal(left, right), f"{path}: tensor values differ"
     elif isinstance(left, np.ndarray):
-        assert np.array_equal(left, right)
-    elif isinstance(left, dict):
-        assert left.keys() == right.keys()
+        assert left.dtype == right.dtype, f"{path}: array dtypes differ"
+        assert left.shape == right.shape, f"{path}: array shapes differ"
+        assert np.array_equal(left, right), f"{path}: array values differ"
+    elif is_dataclass(left) and not isinstance(left, type):
+        # Walkers' generated equality cannot reduce its tensor-valued fields.
+        for field in fields(left):
+            _equal(getattr(left, field.name), getattr(right, field.name),
+                   f"{path}.{field.name}")
+    elif isinstance(left, Mapping):
+        assert left.keys() == right.keys(), f"{path}: mapping keys differ"
         for key in left:
-            _equal(left[key], right[key])
-    elif isinstance(left, (tuple, list)):
-        assert len(left) == len(right)
-        for first, second in zip(left, right):
-            _equal(first, second)
+            _equal(left[key], right[key], f"{path}[{key!r}]")
+    elif isinstance(left, Sequence) and not isinstance(left, (str, bytes, bytearray)):
+        assert len(left) == len(right), f"{path}: sequence lengths differ"
+        for index, (first, second) in enumerate(zip(left, right)):
+            _equal(first, second, f"{path}[{index}]")
     else:
-        assert left == right
+        assert left == right, f"{path}: values differ"
 
 
 def _files(root):
@@ -180,7 +192,7 @@ def test_refusal_precedes_all_mutation(source, tmp_path, monkeypatch, entry, ref
 
 @pytest.mark.parametrize("mode", ["none", "model_only"])
 @pytest.mark.parametrize("unsupported", ["callback", "cadence"])
-def test_unsupported_profile_does_not_gate_non_resume(source, monkeypatch, mode, unsupported):
+def test_unsupported_profile_does_not_gate_non_resume(source, tmp_path, monkeypatch, mode, unsupported):
     cfg, _, checkpoint, _ = source
     callback = ({"_target_": "tpen.callback.FailureLog"} if unsupported == "callback"
                 else {"_target_": "tpen.callback.DataIntegrity", "max_calls": 1})
@@ -207,7 +219,8 @@ def test_unsupported_profile_does_not_gate_non_resume(source, monkeypatch, mode,
                 "_target_": "tpen.evaluation.Evaluator", "namespace": "eval",
                 "tasks": [{
                     "name": "null_task", "namespace": "eval/null_task",
-                    "output_dir": "${run.dir}/null_task",
+                    # Keep this fixture independent of run-populated science identity.
+                    "output_dir": str(tmp_path / "null_task"),
                     "generator": {"_target_": "tests.helpers.evaluation_components.NullGenerator"},
                     "calculators": [{"_target_": "tests.helpers.evaluation_components.IdentityCalculator"}],
                     "summaries": [{"_target_": "tests.helpers.evaluation_components.MetricSummary"}],
