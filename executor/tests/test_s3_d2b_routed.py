@@ -15,18 +15,21 @@ from tpen_executor.dispatch.transport import LeafRequest, LeafResult, LeafTeardo
 from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.placement import ChildPlacementObservation, WorkerBinding, read_child_placement
-from tpen_executor.runners import RUN_SHIM
+from tpen_executor.runners import ROUTED_STRICT_HOST_ENV, RUN_SHIM
 from tpen_executor.storage import DirectoryStore
 from tpen_executor.workers import SubprocessWorker
 
 from test_s3_transport_parsl import (
+    BINDING,
     _attach_routed_leaf_answers,
     _attach_routed_probe_answers,
     _group,
+    _lifecycle,
     _manifest_attempts,
     _routed_allocation,
     _routed_transport_payload,
     _runs,
+    _transport,
     _worker,
     fake_parsl,
 )
@@ -80,13 +83,20 @@ D2B_MUTANT_TABLE = (
         "killer": "test_routed_success_uses_finish_remote",
         "suite": "executor", "assertion": "routed normal completion persists through finish_remote and its teardown receipt",
     },
+    {
+        "id": "M7", "target": PARSL_MODULE,
+        "old": "                    strict_host=type(self.transport) is RoutedAttachedTransportSpec,\n",
+        "new": "                    strict_host=False,\n",
+        "killer": "test_routed_child_mismatch_is_launch_failed_without_segment",
+        "suite": "executor", "assertion": "routed leaf requests enable strict host admission before science",
+    },
 )
 
 
 def test_d2b_mutant_table_targets_unique_executable_anchors() -> None:
     root = Path(__file__).parents[2]
     module = Path(__file__).read_text(encoding="utf-8")
-    assert [row["id"] for row in D2B_MUTANT_TABLE] == ["M1", "M2", "M3", "M4", "M5", "M6"], (
+    assert [row["id"] for row in D2B_MUTANT_TABLE] == ["M1", "M2", "M3", "M4", "M5", "M6", "M7"], (
         f"anchor ids={tuple(row['id'] for row in D2B_MUTANT_TABLE)!r}; "
         "outcome/receipt details unavailable before execution"
     )
@@ -125,6 +135,29 @@ def test_routed_leaf_submission_uses_the_binding_node_label(tmp_path: Path, fake
     details = f"attempts={_manifest_attempts(manifest)!r}; segments={manifest.segments!r}"
     assert manifest.attempts, details
     assert [record["executors"] for record in fake_parsl.leaf_submissions()] == [["pool-b"], ["pool-a"]], details
+    for record in fake_parsl.leaf_submissions():
+        request = LeafRequest.decode(record["args"][0])
+        assert request.environment.env.get(ROUTED_STRICT_HOST_ENV) == "1", (
+            f"{details}; task_id={request.task_id!r}; environment={request.environment.env!r}"
+        )
+
+
+def test_attached_leaf_submission_does_not_enable_strict_host(tmp_path: Path, fake_parsl) -> None:
+    group = _group("s3d2b-attached-advisory", "member")
+    lifecycle = _lifecycle(tmp_path)
+    dispatcher = parsl_dispatch.ParslDispatcher(
+        _worker(tmp_path), binding=BINDING, transport=_transport(),
+    )
+
+    manifest = dispatcher.run(group, _runs(tmp_path, "member"), lifecycle, timeout=60)
+
+    details = f"attempts={_manifest_attempts(manifest)!r}; segments={manifest.segments!r}"
+    assert [attempt.outcome_receipt.status for attempt in manifest.attempts] == ["completed"], details
+    assert len(fake_parsl.leaf_submissions()) == 1, details
+    request = LeafRequest.decode(fake_parsl.leaf_submissions()[0]["args"][0])
+    assert ROUTED_STRICT_HOST_ENV not in request.environment.env, (
+        f"{details}; task_id={request.task_id!r}; environment={request.environment.env!r}"
+    )
 
 
 def test_missing_routed_binding_is_refused_before_begin(tmp_path: Path, fake_parsl, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -231,7 +264,10 @@ def test_routed_refusal_sidecar_and_teardown_are_json_serializable() -> None:
 
 
 def _attach_routed_mismatch_leaf_answers(fake_parsl, errors: list[str] | None = None) -> None:
-    """Return a valid remote refusal result with an identity-bound sidecar."""
+    """Mirror the shim's strict/advisory mismatch using the submitted flag."""
+
+    _attach_routed_leaf_answers(fake_parsl)
+    completed = fake_parsl.hooks["run_leaf"]
 
     def refused(_index, _function, args, _kwargs):
         try:
@@ -246,7 +282,15 @@ def _attach_routed_mismatch_leaf_answers(fake_parsl, errors: list[str] | None = 
         output_dir, _core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = request.paths()
         values = request.environment.env
         declared_cpus = tuple(int(item) for item in values["TPEN_SLOT_CPUS"].split(","))
-        refusal = {"code": "routed-child-node-mismatch", "reason": "synthetic wrong child host"}
+        strict_host = values.get(ROUTED_STRICT_HOST_ENV) == "1"
+        placement_abort = strict_host
+        refusal = {
+            "code": "routed-child-node-mismatch" if strict_host else "child-placement-mismatch",
+            "reason": "synthetic wrong child host",
+        }
+        # An advisory mismatch still runs core. Reuse the successful leaf's
+        # evidence, then replace its placement sidecar with the mismatch.
+        advisory_result = None if placement_abort else completed(0, None, args, {})
         sidecar = ChildPlacementObservation(
             request.task_id,
             request.attempt_id,
@@ -268,6 +312,8 @@ def _attach_routed_mismatch_leaf_answers(fake_parsl, errors: list[str] | None = 
         Path(values["TPEN_PLACEMENT_OUTPUT"]).write_text(
             json.dumps(sidecar.to_dict()) + "\n", encoding="utf-8",
         )
+        if not placement_abort:
+            return advisory_result
         return LeafResult(
             request.digest(),
             request.group_digest,
