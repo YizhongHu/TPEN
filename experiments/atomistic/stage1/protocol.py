@@ -623,6 +623,8 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
             raise ProtocolError("checkpoints must not exceed lineage_updates")
         if protocol.lineage_updates not in checkpoints:
             raise ProtocolError("checkpoints must retain the terminal lineage_updates checkpoint")
+        if 0 not in checkpoints:
+            raise ProtocolError("checkpoints must retain the initial zero checkpoint")
     if isinstance(config_sha256, Mapping):
         config_ids = {system: _require_sha(config_sha256.get(system), length=64,
                                            field=f"config_sha256[{system!r}]") for system in selected}

@@ -421,7 +421,7 @@ def _two_phase_document(tmp_path: Path) -> dict:
     config_sha256 = config_identities(config_root=_TWO_PHASE_CONFIG_ROOT, systems=("he",))
     phase1_rows = build_manifest(
         protocol=protocol, source_sha=_TWO_PHASE_SOURCE_SHA, config_sha256=config_sha256,
-        checkpoints=[7], lineage_seeds=[11, 12, 13], checkpoint_sha256={},
+        checkpoints=[0, 7], lineage_seeds=[11, 12, 13], checkpoint_sha256={},
         results_root=str(tmp_path), systems=("he",), phase=1,
     )
     phase1_hash = manifest_hash(phase1_rows)

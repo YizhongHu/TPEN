@@ -113,6 +113,20 @@ def test_zero_is_admitted_once_and_negative_or_duplicate_steps_are_rejected(
             _phase1_rows(tiny_protocol, checkpoints, tmp_path)
 
 
+def test_phase1_retention_requires_initial_and_terminal_boundaries(
+    tiny_protocol: Protocol, tmp_path: Path,
+) -> None:
+    """Phase-one training cannot omit either retained boundary checkpoint."""
+
+    for checkpoints, message in (
+        ([0, 1, 6], "terminal"),
+        ([1, 7], "initial zero"),
+        ([0, 7, 8], "exceed"),
+    ):
+        with pytest.raises(ProtocolError, match=message):
+            _phase1_rows(tiny_protocol, checkpoints, tmp_path)
+
+
 def test_phase2_binds_zero_digest_and_emits_four_streams(
     tiny_protocol: Protocol, tmp_path: Path,
 ) -> None:
