@@ -7,7 +7,13 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
 from tpen.run import load_config
-from experiments.atomistic.stage1.protocol import SYSTEMS, physical_system_id_from_config
+from experiments.atomistic.stage1.protocol import (
+    SYSTEMS,
+    STAGE1_PROTOCOL,
+    build_manifest,
+    config_identities,
+    physical_system_id_from_config,
+)
 from experiments.atomistic.stage1.launch import row_overrides
 
 
@@ -50,6 +56,41 @@ def test_train_config_declares_checkpoint_publication(system: str) -> None:
     else:
         assert list(checkpoints[0].schedule.updates) == [1000]
         assert list(cfg.checkpoint_steps) == [1000]
+
+
+def test_real_he_h2_phase1_rows_bind_protocol_horizon() -> None:
+    """The production phase-1 rows must carry the configured horizon."""
+
+    train_configs = {
+        system: load_config(str(ROOT / system / "train.yaml"))
+        for system in ("he", "h2")
+    }
+    checkpoints = list(train_configs["he"].checkpoint_steps)
+    assert checkpoints == list(train_configs["h2"].checkpoint_steps)
+    rows = build_manifest(
+        protocol=STAGE1_PROTOCOL,
+        source_sha="a" * 40,
+        config_sha256=config_identities(config_root=ROOT, systems=("he", "h2")),
+        checkpoints=checkpoints,
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root="/external/stage1",
+        systems=("he", "h2"),
+        phase=1,
+    )
+    train_rows = [row for row in rows if row["kind"] == "train"]
+    assert {row["system"] for row in train_rows} == {"he", "h2"}
+    assert all(row["updates"] == STAGE1_PROTOCOL.lineage_updates for row in train_rows)
+    assert all(row["checkpoint_steps"] == checkpoints for row in train_rows)
+
+
+@pytest.mark.parametrize("system", ["he", "h2"])
+def test_real_train_config_horizon_matches_protocol(system: str) -> None:
+    """The real train config and protocol must share one terminal update."""
+
+    cfg = load_config(str(ROOT / system / "train.yaml"))
+    assert cfg.trainer.max_steps == STAGE1_PROTOCOL.lineage_updates
+    assert max(cfg.checkpoint_steps) == STAGE1_PROTOCOL.lineage_updates
 
 
 @pytest.mark.parametrize("system", ["he", "h2"])
