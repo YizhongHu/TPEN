@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, ClassVar
 
-from ._codec import _freeze, canonical_bytes, decode_json, fields, thaw, text
-from .contracts import AllocationAttemptId, AllocationId, BackendJobId, GroupId
+from ._codec import _freeze, canonical_bytes, decode_json, fields, sha256_text, thaw, text
+from .contracts import AllocationAttemptId, AllocationId, AttemptId, BackendJobId, GroupId, InvocationId
 from ._records import frozen_record
 from .results import AllocationObservation
 
@@ -186,4 +186,57 @@ class AllocationAttemptV2:
         return cls.from_mapping(decode_json(data))
 
 
-__all__ = ["AllocationAttemptV2", "ConfiguredAllocation"]
+@frozen_record
+class MemberInvocationV2:
+    """Controller-issued invocation, echoed by the leaf with all identities.
+
+    A binding is an identity record, not proof that a process is quiescent or
+    that a successor has been admitted. Only the store may publish it.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/member-invocation-v2"
+    allocation_attempt: AllocationAttemptV2
+    group_digest: str
+    task_id: str
+    lineage_id: str
+    attempt_id: AttemptId
+    invocation_id: InvocationId
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.allocation_attempt, AllocationAttemptV2):
+            raise TypeError("allocation_attempt must be AllocationAttemptV2")
+        if not isinstance(self.attempt_id, AttemptId) or not isinstance(self.invocation_id, InvocationId):
+            raise TypeError("member attempt and invocation identities have invalid types")
+        object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
+        for name in ("task_id", "lineage_id"):
+            object.__setattr__(self, name, text(getattr(self, name), name))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "allocation_attempt": self.allocation_attempt.to_dict(),
+            "group_digest": self.group_digest,
+            "task_id": self.task_id,
+            "lineage_id": self.lineage_id,
+            "attempt_id": self.attempt_id.to_dict(),
+            "invocation_id": self.invocation_id.to_dict(),
+        }
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "MemberInvocationV2":
+        fields(data, {"schema", "allocation_attempt", "group_digest", "task_id", "lineage_id", "attempt_id", "invocation_id"}, cls.schema, cls.__name__)
+        return cls(
+            AllocationAttemptV2.from_mapping(data["allocation_attempt"]),
+            data["group_digest"], data["task_id"], data["lineage_id"],
+            AttemptId.from_mapping(data["attempt_id"]), InvocationId.from_mapping(data["invocation_id"]),
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "MemberInvocationV2":
+        return cls.from_mapping(decode_json(data))
+
+
+__all__ = ["AllocationAttemptV2", "ConfiguredAllocation", "MemberInvocationV2"]

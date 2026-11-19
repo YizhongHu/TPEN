@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from collections.abc import Mapping
 import fcntl
 import json
@@ -15,12 +15,12 @@ from typing import Any
 from uuid import uuid4
 
 from ._codec import canonical_bytes, decode_json, digest, fields, sha256_text, text, thaw
-from .allocations import ConfiguredAllocation
-from .contracts import AllocationId, AttemptId, BackendJobId, ReadyGroup
+from .allocations import AllocationAttemptV2, ConfiguredAllocation, MemberInvocationV2
+from .contracts import AllocationId, AttemptId, BackendJobId, InvocationId, ReadyGroup, ReadyGroupV2
 from .results import (
     AcceptedSegment, CoreOutcomeRecord, ManifestAttempt, OutcomeReceipt, PLACEMENT_RECEIPT_TYPES, RemoteTeardownReceipt, RunManifest,
     SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3, StartReceipt,
-    SuccessorAdmissionRecord, decode_placement_receipt,
+    SuccessorAdmissionRecord, MemberPublicationV2, ReconciliationPublicationV2, decode_placement_receipt,
 )
 from .runners import CoreRunEvidence
 from ._records import frozen_record
@@ -258,7 +258,7 @@ class DirectoryStore:
             _require_directory(root, "store root")
         object.__setattr__(self, "root", root)
 
-    def _group_dir(self, group: ReadyGroup) -> str:
+    def _group_dir(self, group: ReadyGroup | ReadyGroupV2) -> str:
         path = _lexical(os.path.join(self.root, "groups", group.identity))
         if not _inside(self.root, path):
             raise FenceRejected("group path escapes store root")
@@ -271,7 +271,7 @@ class DirectoryStore:
         if task_id in {".", ".."} or _SAFE_TASK_ID.fullmatch(task_id) is None:
             raise ValueError("task_id must match [A-Za-z0-9._:-]+ and must not be a traversal component")
 
-    def _prepare_task_dir(self, group: ReadyGroup, task_id: str) -> str:
+    def _prepare_task_dir(self, group: ReadyGroup | ReadyGroupV2, task_id: str) -> str:
         """Create and durably link the store ancestry for one task."""
         _ensure_directory(self.root)
         groups_dir = _lexical(os.path.join(self.root, "groups"))
@@ -306,11 +306,14 @@ class DirectoryStore:
 
     def begin_attempt(
         self,
-        group: ReadyGroup,
+        group: ReadyGroup | ReadyGroupV2,
         task_id: str,
         allocation: ConfiguredAllocation,
         started_at_utc: str = "",
         transport_kind: str | None = "local",
+        *,
+        allocation_attempt: AllocationAttemptV2 | None = None,
+        invocation_id: InvocationId | None = None,
     ) -> AttemptFence:
         """Create a fresh fenced output directory and durable start receipt.
 
@@ -327,6 +330,10 @@ class DirectoryStore:
         transport_kind : {"local", "remote"} or None, optional
             Durable transport identity for continuation admission. ``None`` is
             retained as unknown and therefore fails closed at the gate.
+        allocation_attempt : AllocationAttemptV2 or None, optional
+            Required for v2 groups; forbidden for legacy v1 groups.
+        invocation_id : InvocationId or None, optional
+            Controller-issued fresh process identity, required for v2 starts.
 
         Returns
         -------
@@ -344,7 +351,7 @@ class DirectoryStore:
             If a store-owned path is crossed by a symlink or an attempt ID is
             already present.
         """
-        if not isinstance(group, ReadyGroup) or not isinstance(allocation, ConfiguredAllocation):
+        if not isinstance(group, (ReadyGroup, ReadyGroupV2)) or not isinstance(allocation, ConfiguredAllocation):
             raise TypeError("group and allocation have invalid types")
         text(task_id, "task_id")
         self._validate_task_id(task_id)
@@ -354,6 +361,17 @@ class DirectoryStore:
             raise TypeError("started_at_utc must be a string")
         if transport_kind not in {None, "local", "remote"}:
             raise ValueError("transport_kind must be local, remote, or None")
+        if isinstance(group, ReadyGroupV2):
+            if not isinstance(allocation_attempt, AllocationAttemptV2):
+                raise TypeError("v2 start requires an allocation-attempt binding")
+            if (allocation_attempt.group_id != group.group_id
+                    or allocation_attempt.allocation_id != allocation.allocation_id
+                    or allocation_attempt.backend_job_id != allocation.backend_job_id):
+                raise FenceRejected("crossed allocation-attempt binding")
+            if not isinstance(invocation_id, InvocationId):
+                raise TypeError("v2 start requires a controller-issued InvocationId")
+        elif allocation_attempt is not None or invocation_id is not None:
+            raise ValueError("v1 start cannot carry v2 identities")
         stamp = started_at_utc or "unknown"
         task_dir = self._prepare_task_dir(group, task_id)
         lock_path = os.path.join(task_dir, _TASK_LOCK)
@@ -364,9 +382,188 @@ class DirectoryStore:
             _mkdir_new(output_dir)
             receipt = StartReceipt(task_id, attempt, allocation.allocation_id, allocation.backend_job_id, group.identity, stamp, output_dir, transport_kind)
             _write_new(os.path.join(output_dir, "start.json"), receipt.encode())
+            if allocation_attempt is not None:
+                task = next(member for member in group.members if member.task_id == task_id)
+                binding = MemberInvocationV2(allocation_attempt, group.identity, task_id, task.lineage_id, attempt, invocation_id)
+                _write_new(os.path.join(output_dir, "invocation.json"), binding.encode())
             pointer = os.path.join(task_dir, "current-attempt.json")
             _write_pointer(pointer, attempt.value)
             return AttemptFence(self.root, group.identity, task_id, allocation.allocation_id.value, attempt, output_dir)
+
+    @staticmethod
+    def _validate_invocation(start: StartReceipt, binding: MemberInvocationV2) -> None:
+        """Recheck the leaf echo against the controller's immutable binding."""
+        path = os.path.join(start.output_dir, "invocation.json")
+        _require_regular(path, "invocation binding")
+        encoded = Path(path).read_bytes()
+        stored = MemberInvocationV2.decode(encoded)
+        if encoded != stored.encode() or encoded != binding.encode():
+            raise FenceRejected("crossed-invocation")
+        if (binding.task_id != start.task_id or binding.attempt_id != start.attempt_id
+                or binding.group_digest != start.group_digest
+                or binding.allocation_attempt.allocation_id != start.allocation_id
+                or binding.allocation_attempt.backend_job_id != start.backend_job_id):
+            raise FenceRejected("crossed-invocation")
+
+    def _reconciliation_directory(self) -> str:
+        # One allocation attempt binds exactly one group/plan. Key records by
+        # allocation-attempt identity across the group store so changing even
+        # both caller-supplied group bindings cannot fork an existing record.
+        return os.path.join(self.root, "groups", ".reconciliation-publications")
+
+    def read_reconciliation(
+        self, group: ReadyGroupV2, allocation_attempt: AllocationAttemptV2,
+    ) -> ReconciliationPublicationV2 | None:
+        """Decode a canonical publication and recheck its exact plan binding."""
+        directory = self._reconciliation_directory()
+        path = os.path.join(directory, digest(allocation_attempt.allocation_attempt_id.to_dict()) + ".json")
+        if not os.path.lexists(path):
+            return None
+        _require_directory(self.root, "store root")
+        _require_directory(os.path.join(self.root, "groups"), "groups directory")
+        _require_directory(directory, "reconciliation directory")
+        _require_regular(path, "reconciliation publication")
+        encoded = Path(path).read_bytes()
+        record = ReconciliationPublicationV2.decode(encoded)
+        if (encoded != record.encode() or record.group.encode() != group.encode()
+                or record.allocation_attempt.encode() != allocation_attempt.encode()):
+            raise FenceRejected("crossed-reconciliation-publication")
+        return record
+
+    def publish_reconciliation(
+        self,
+        group: ReadyGroupV2,
+        allocation_attempt: AllocationAttemptV2,
+        inputs,
+        *,
+        bindings: Mapping[str, MemberInvocationV2],
+        successors: Mapping[str, tuple[Mapping[str, Any], str, MemberInvocationV2]] | None = None,
+    ):
+        """Publish one fake-core reconciliation, never launch or restore work.
+
+        ``bindings`` are the leaf echoes of controller-issued invocations.
+        ``successors`` contains the accepted CX-04 request, opaque core
+        acceptance digest, and proposed fresh binding for each successor.
+        Real-core compatibility remains unproven. Invalid/crossed evidence
+        returns a parked result without publishing or merging records.
+        Successful member admissions are independently durable; a crash before
+        the group record is recoverable by identical ledger replay.
+        """
+        from .recovery import GroupReconciliationV2, MemberReconciliationV2, reconcile_group
+
+        if not isinstance(group, ReadyGroupV2) or not isinstance(allocation_attempt, AllocationAttemptV2):
+            raise TypeError("publication requires v2 group and allocation attempt")
+        inputs = tuple(inputs)
+        result = reconcile_group(group, inputs)
+
+        def park(reason):
+            return GroupReconciliationV2(group.group_id, group.identity, tuple(
+                MemberReconciliationV2(member.task_id, "park", reason, member.attempt_id)
+                for member in result.members
+            ))
+
+        successors = {} if successors is None else dict(successors)
+        by_task = {item.task_id: item for item in inputs}
+        expected = {member.task_id for member in group.members}
+        if (allocation_attempt.group_id != group.group_id or set(by_task) != expected
+                or set(bindings) != {item.task_id for item in inputs if item.start_receipt is not None}
+                or set(successors) != {member.task_id for member in result.members if member.action == "admit_successor"}):
+            return park("crossed-reconciliation-input")
+        # Missing or untrusted core evidence cannot create even an admission
+        # intent. Unknown but well-formed core outcomes may be durably parked.
+        invalid_reasons = {
+            "missing-core-verdict", "crossed-lineage", "crossed-group-receipt",
+            "crossed-or-incomplete-receipt", "missing-attempt-identity",
+            "missing-settled-outcome", "unsupported-profile", "core-admission-refused",
+            "invalid-successor-evidence", "remote-quiescence-unconfirmed",
+        }
+        if any(member.reason_code in invalid_reasons for member in result.members):
+            return result
+        fences = {}
+        try:
+            for task in group.members:
+                self._validate_task_id(task.task_id)
+                item = by_task[task.task_id]
+                if item.start_receipt is None:
+                    task_dir = os.path.join(self._group_dir(group), task.task_id)
+                    if os.path.lexists(task_dir):
+                        _require_directory(task_dir, "fresh task directory")
+                        if set(os.listdir(task_dir)) - {_TASK_LOCK}:
+                            raise FenceRejected("fresh-member-has-durable-state")
+                    continue
+                binding = bindings[task.task_id]
+                if not isinstance(binding, MemberInvocationV2):
+                    raise TypeError("leaf echo must be MemberInvocationV2")
+                if (binding.allocation_attempt != allocation_attempt or binding.lineage_id != task.lineage_id
+                        or binding.group_digest != group.identity):
+                    raise FenceRejected("crossed-allocation-evidence")
+                start = item.start_receipt
+                if item.receipt_digest is not None and item.receipt_digest != digest({
+                    "start_receipt": start.to_dict(), "outcome_receipt": item.outcome_receipt.to_dict(),
+                }):
+                    raise FenceRejected("crossed-receipt-digest")
+                fence = AttemptFence(self.root, group.identity, task.task_id, allocation_attempt.allocation_id.value, item.attempt_id, start.output_dir)
+                task_dir = self._task_dir_for_fence(fence)
+                with _task_lock(os.path.join(task_dir, _TASK_LOCK)):
+                    durable = self._validate_fence(fence, task_dir)
+                    self._validate_invocation(durable, binding)
+                    outcome_path = os.path.join(start.output_dir, "outcome.json")
+                    _require_regular(outcome_path, "outcome receipt")
+                    if (Path(os.path.join(start.output_dir, "start.json")).read_bytes() != start.encode()
+                            or Path(outcome_path).read_bytes() != item.outcome_receipt.encode()):
+                        raise FenceRejected("crossed-durable-receipt")
+                fences[task.task_id] = fence
+            # Validate all proposed identity records before any ledger write.
+            proposed = []
+            for member in result.members:
+                admission = None
+                if member.action == "admit_successor":
+                    request, acceptance, successor = successors[member.task_id]
+                    request = self._successor_request_shape(request)
+                    admission = SuccessorAdmissionRecord(
+                        member.task_id, member.attempt_id,
+                        request["core_evidence"]["checkpoint_ref"]["content_id"],
+                        request["successor"]["task_id"], AttemptId(request["successor"]["attempt_id"]),
+                        digest(request), acceptance, successor,
+                    )
+                proposed.append(MemberPublicationV2(by_task[member.task_id], member, bindings.get(member.task_id), admission))
+            candidate = ReconciliationPublicationV2(group, allocation_attempt, tuple(proposed))
+            _ensure_directory(self.root)
+            _ensure_directory(os.path.join(self.root, "groups"))
+            directory = self._reconciliation_directory()
+            _ensure_directory(directory)
+            with _task_lock(os.path.join(directory, ".publication.lock")), ExitStack() as fresh_locks:
+                existing = self.read_reconciliation(group, allocation_attempt)
+                if existing is not None:
+                    if existing.encode() != candidate.encode():
+                        return park("reconciliation-publication-conflict")
+                    return existing.reconciliation
+                # A concurrent first start must not race a fresh_pending
+                # publication. Existing-member successor gates own their
+                # separate task-lock recheck below.
+                for member in candidate.members:
+                    if member.evidence.start_receipt is None:
+                        task_dir = self._prepare_task_dir(group, member.evidence.task_id)
+                        fresh_locks.enter_context(_task_lock(os.path.join(task_dir, _TASK_LOCK)))
+                        if set(os.listdir(task_dir)) - {_TASK_LOCK}:
+                            raise FenceRejected("fresh-member-has-durable-state")
+                for member in candidate.members:
+                    if member.admission is None:
+                        continue
+                    request, acceptance, successor = successors[member.evidence.task_id]
+                    actual = self.record_successor_admission(
+                        fences[member.evidence.task_id], request, acceptance,
+                        predecessor_binding=member.binding, successor_binding=successor,
+                    )
+                    if actual.encode() != member.admission.encode():
+                        raise FenceRejected("crossed-successor-admission")
+                path = os.path.join(directory, digest(allocation_attempt.allocation_attempt_id.to_dict()) + ".json")
+                _write_new(path, candidate.encode())
+                return candidate.reconciliation
+        except AdmissionFork:
+            return park("successor-fork")
+        except (FenceRejected, OSError, TypeError, ValueError, KeyError):
+            return park("invalid-durable-evidence")
 
     def finish_attempt(self, fence: AttemptFence, status: str, finished_at_utc: str, result_digest: str | None = None) -> OutcomeReceipt:
         """Write exactly one durable outcome after validating a complete fence.
@@ -877,6 +1074,9 @@ class DirectoryStore:
         fence: AttemptFence,
         request: Mapping[str, Any],
         core_acceptance_digest: str,
+        *,
+        predecessor_binding: MemberInvocationV2 | None = None,
+        successor_binding: MemberInvocationV2 | None = None,
     ) -> SuccessorAdmissionRecord:
         """Record a core-accepted successor request exactly once.
 
@@ -912,6 +1112,20 @@ class DirectoryStore:
             )
             if digest(rebuilt) != request_digest or rebuilt != request or digest(built) != request_digest:
                 raise FenceRejected("successor admission request does not match fenced core outcome")
+            if predecessor_binding is not None or successor_binding is not None:
+                if not isinstance(predecessor_binding, MemberInvocationV2) or not isinstance(successor_binding, MemberInvocationV2):
+                    raise FenceRejected("both invocation bindings are required")
+                self._validate_invocation(start, predecessor_binding)
+                if (successor_binding.task_id != start.task_id
+                        or successor_binding.attempt_id.value != request["successor"]["attempt_id"]
+                        or successor_binding.lineage_id != predecessor_binding.lineage_id
+                        or successor_binding.group_digest != predecessor_binding.group_digest
+                        or successor_binding.allocation_attempt.group_id != predecessor_binding.allocation_attempt.group_id
+                        or successor_binding.allocation_attempt.allocation_attempt_id == predecessor_binding.allocation_attempt.allocation_attempt_id
+                        or successor_binding.invocation_id == predecessor_binding.invocation_id):
+                    raise FenceRejected("successor binding is crossed or not fresh")
+            elif os.path.lexists(os.path.join(start.output_dir, "invocation.json")):
+                raise FenceRejected("v2 predecessor requires successor invocation binding")
             segment_path = os.path.join(_lexical(fence.output_dir), "segment.json")
             if os.path.lexists(segment_path):
                 raise FenceRejected("planned-yield admission cannot coexist with an accepted segment")
@@ -924,6 +1138,7 @@ class DirectoryStore:
                 AttemptId(successor["attempt_id"]),
                 request_digest,
                 core_acceptance_digest,
+                successor_binding,
             )
             ledger_dir = _lexical(os.path.join(task_dir, _SUCCESSOR_ADMISSIONS))
             _ensure_directory(ledger_dir)
@@ -968,7 +1183,10 @@ class DirectoryStore:
                     raise ValueError("successor admission predecessor directory has unexpected entries")
             path = os.path.join(predecessor_dir, _SUCCESSOR_ADMISSION_FILENAME)
             _require_regular(path, "successor admission record", ValueError)
-            record = SuccessorAdmissionRecord.decode(Path(path).read_bytes())
+            encoded = Path(path).read_bytes()
+            record = SuccessorAdmissionRecord.decode(encoded)
+            if encoded != record.encode():
+                raise ValueError("successor admission record is not canonical")
             if record.predecessor_task_id != task_id or record.predecessor_attempt_id.value != predecessor_attempt_id:
                 raise ValueError("foreign successor admission record in task store")
             if record.predecessor_attempt_id in seen:
