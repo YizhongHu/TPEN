@@ -763,6 +763,23 @@ def test_l2b_closes_its_seed_identity_vocabulary() -> None:
         stage_coordinate.validate_materialized_manifest(manifest)
 
 
+def test_materialized_manifest_closes_stage_authority_horizon() -> None:
+    manifest = _train_manifest()
+    manifest["seed_identity"] = {"stage": "O1", "label": 820_001, "namespace": "fresh-training"}
+    manifest["payload"] = {"updates": 49_999, "configuration": {"model": ("control",)}}
+    with pytest.raises(stage_coordinate.ManifestSchemaError, match="disagree with stage 'O1' horizon 50000"):
+        stage_coordinate.validate_materialized_manifest(manifest)
+
+
+@pytest.mark.parametrize("updates", [True, 50_000.0, "50000", None])
+def test_materialized_manifest_refuses_non_integer_or_missing_horizon(updates: object) -> None:
+    manifest = _train_manifest()
+    manifest["seed_identity"] = {"stage": "O1", "label": 820_001, "namespace": "fresh-training"}
+    manifest["payload"] = {"updates": updates, "configuration": {"model": ("control",)}}
+    with pytest.raises(stage_coordinate.ManifestSchemaError):
+        stage_coordinate.validate_materialized_manifest(manifest)
+
+
 def test_content_hash_is_canonical_and_rejects_nonfinite_values() -> None:
     assert stage_coordinate.content_hash({"a": 1, "b": [2, 3]}) == (
         "efbd0040190fb0871831e606c581f8a66db79d8e2bb836745a70051306956070"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -46,12 +47,24 @@ def _run(script: str, tmp_path: Path, **slurm: str) -> subprocess.CompletedProce
     return subprocess.run(["bash"], input=script, text=True, capture_output=True, env=env)
 
 
-def _fake_gpu_python(fake_bin: Path, device_count: str = "1") -> Path:
-    """Create the rendered interpreter seam used by the in-job CUDA probe."""
+def _fake_gpu_python(
+    fake_bin: Path, device_count: str = "1", driver_sentinel: Path | None = None,
+) -> Path:
+    """Create a fake interpreter that distinguishes probes from driver calls."""
 
     python = fake_bin / "python"
+    record_driver = (
+        f"  touch {shlex.quote(str(driver_sentinel))}\n"
+        if driver_sentinel is not None else "  :\n"
+    )
     python.write_text(
-        f"#!/bin/sh\nprintf '%s\\n' '{device_count}'\n", encoding="utf-8",
+        "#!/bin/sh\n"
+        "if [ \"$#\" -eq 2 ] && [ \"$1\" = \"-c\" ]; then\n"
+        f"  printf '%s\\n' '{device_count}'\n"
+        "else\n"
+        f"{record_driver}"
+        "fi\n",
+        encoding="utf-8",
     )
     python.chmod(0o750)
     return python
@@ -132,7 +145,8 @@ def test_gpu_partition_guard_accepts_one_requested_partition(
         encoding="utf-8",
     )
     nvidia.chmod(0o750)
-    python = _fake_gpu_python(fake_bin)
+    sentinel = tmp_path / "sentinel"
+    python = _fake_gpu_python(fake_bin, driver_sentinel=sentinel)
     script = render(
         row=gpu_row, driver="/bin/true", python=str(python), head_sha="c" * 40,
         results_root=ROW["results_root"], partition="seas_gpu,gpu",
@@ -142,6 +156,7 @@ def test_gpu_partition_guard_accepts_one_requested_partition(
                    SLURM_JOB_ID="123", SLURM_JOB_PARTITION="gpu")
     assert result.returncode == 0, result.stderr
     assert f"STAGE1_GUARD nvidia-smi={gpu_name}, 81920" in result.stdout
+    assert sentinel.exists()
 
 
 @pytest.mark.parametrize("gpu_output", [
@@ -161,6 +176,7 @@ def test_gpu_guard_rejects_mig_small_memory_and_multiple_gpus(
     )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
+    sentinel = tmp_path / "sentinel"
     nvidia = fake_bin / "nvidia-smi"
     nvidia.write_text(
         f"#!/bin/sh\ncase \"$*\" in *mig.mode.current*) printf 'Disabled\\n';; "
@@ -168,7 +184,7 @@ def test_gpu_guard_rejects_mig_small_memory_and_multiple_gpus(
         encoding="utf-8",
     )
     nvidia.chmod(0o750)
-    python = _fake_gpu_python(fake_bin)
+    python = _fake_gpu_python(fake_bin, driver_sentinel=sentinel)
     script = render(
         row=gpu_row, driver="/bin/true", python=str(python), head_sha="c" * 40,
         results_root=ROW["results_root"], partition="gpu",
@@ -178,6 +194,7 @@ def test_gpu_guard_rejects_mig_small_memory_and_multiple_gpus(
                    SLURM_JOB_ID="123", SLURM_JOB_PARTITION="gpu")
     assert result.returncode == 2
     assert "STAGE1_GUARD" in result.stderr
+    assert not sentinel.exists()
 
 
 def test_gpu_guard_rejects_delivered_partition_outside_requested_list_before_driver(
@@ -186,16 +203,13 @@ def test_gpu_guard_rejects_delivered_partition_outside_requested_list_before_dri
     gpu_row = {**ROW, "device": "cuda"}
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    python = _fake_gpu_python(fake_bin)
+    sentinel = tmp_path / "sentinel"
+    python = _fake_gpu_python(fake_bin, driver_sentinel=sentinel)
     nvidia = fake_bin / "nvidia-smi"
     nvidia.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
     nvidia.chmod(0o750)
-    sentinel = tmp_path / "sentinel"
-    driver = tmp_path / "driver"
-    driver.write_text(f"#!/bin/sh\ntouch '{sentinel}'\n", encoding="utf-8")
-    driver.chmod(0o750)
     script = render(
-        row=gpu_row, driver=str(driver), python=str(python), head_sha="c" * 40,
+        row=gpu_row, driver="/bin/true", python=str(python), head_sha="c" * 40,
         results_root=ROW["results_root"], partition="seas_gpu,gpu",
         cpus_per_task=8, mem="64G", time="08:00:00", scratch_base=str(tmp_path),
     )
@@ -213,7 +227,8 @@ def test_gpu_guard_rejects_cuda_device_count_before_driver(
     gpu_row = {**ROW, "device": "cuda"}
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    python = _fake_gpu_python(fake_bin, device_count)
+    sentinel = tmp_path / "sentinel"
+    python = _fake_gpu_python(fake_bin, device_count, driver_sentinel=sentinel)
     nvidia = fake_bin / "nvidia-smi"
     nvidia.write_text(
         "#!/bin/sh\ncase \"$*\" in *mig.mode.current*) printf 'Disabled\\n';; "
@@ -230,6 +245,7 @@ def test_gpu_guard_rejects_cuda_device_count_before_driver(
                   SLURM_JOB_ID="123", SLURM_JOB_PARTITION="gpu")
     assert result.returncode == 2
     assert "exactly one CUDA device" in result.stderr
+    assert not sentinel.exists()
 
 
 @pytest.mark.parametrize("mig_mode", ["Enabled", "[N/A]", "query-error"])
@@ -237,7 +253,8 @@ def test_gpu_guard_rejects_mig_mode_before_driver(tmp_path: Path, mig_mode: str)
     gpu_row = {**ROW, "device": "cuda"}
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    python = _fake_gpu_python(fake_bin)
+    sentinel = tmp_path / "sentinel"
+    python = _fake_gpu_python(fake_bin, driver_sentinel=sentinel)
     nvidia = fake_bin / "nvidia-smi"
     if mig_mode == "query-error":
         body = (
@@ -260,6 +277,7 @@ def test_gpu_guard_rejects_mig_mode_before_driver(tmp_path: Path, mig_mode: str)
                   SLURM_JOB_ID="123", SLURM_JOB_PARTITION="gpu")
     assert result.returncode == 2
     assert "MIG" in result.stderr
+    assert not sentinel.exists()
 
 
 @pytest.mark.parametrize("duration", ["99:59:59", "100:00:00", "168:00:00"])

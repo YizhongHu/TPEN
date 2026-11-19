@@ -51,7 +51,13 @@ from ..placement import (
     slots_from_allocation,
     validate_physical_device_entitlements,
 )
-from ..runners import CONTEXT_ENV_KEY_PATTERN, CHILD_CONTEXT_KEYS_ENV, CoreRunEvidence, EvidenceUnavailable
+from ..runners import (
+    CONTEXT_ENV_KEY_PATTERN,
+    CHILD_CONTEXT_KEYS_ENV,
+    ROUTED_STRICT_HOST_ENV,
+    CoreRunEvidence,
+    EvidenceUnavailable,
+)
 from ..storage import AttemptFence
 from ..tasks import ConfiguredRun
 
@@ -192,6 +198,8 @@ def _with_child_placement(
     configured: ConfiguredRun,
     *,
     check_controller_affinity: bool = True,
+    slot_resolver: Any = None,
+    strict_host: bool = False,
 ) -> Any:
     """Overlay the one concrete slot and fenced identities for the child.
 
@@ -205,6 +213,16 @@ def _with_child_placement(
     enforcement is enabled only by the explicit sidecar output path.
 
     CPU-only slots intentionally retain an empty declared-device field.
+
+    slot_resolver : callable, optional
+        Resolve allocation slots for a caller-specific placement path.  The
+        default retains the allocation-slots-v1 resolver and its legacy
+        refusal behavior.
+
+    strict_host : bool, optional
+        Turn the routed child-host mismatch sidecar into a pre-core refusal.
+        The default keeps the advisory behavior used by local, ThreadPool,
+        and v1 attached paths.
 
     A declared-GPU v2-placement slot also receives a worker-only GPU sampler
     evidence path and the slot's durable quarantine directory in the attempt
@@ -238,9 +256,10 @@ def _with_child_placement(
             "preset slot environment is missing declared device entitlement",
         )
     devices = values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "")
+    resolve_slots = slot_resolver or physical_slots_from_allocation
     if not (slot_id and host and cpus):
         try:
-            slots = physical_slots_from_allocation(allocation)
+            slots = resolve_slots(allocation)
         except PlacementRefusal:
             raise
         except (BindingError, TypeError, ValueError) as error:
@@ -252,6 +271,10 @@ def _with_child_placement(
             # is still a SCIENCE launch: stripping its worker-only keys never
             # makes it an inspection, so a carried TPEN_SLOT_ID is still
             # checked against the quarantine by the worker (delta-4 D4-1).
+            if not strict_host:
+                # Legacy/no-slot requests also carry only controller policy.
+                values.pop(ROUTED_STRICT_HOST_ENV, None)
+                environment = PreparedPythonEnvironment(environment.python, environment.setup, values)
             return _without_gpu_sampler(environment)
         slot = slots[0]
         slot_id, host, cpus = slot.slot_id, slot.node, ",".join(str(cpu) for cpu in slot.cpus)
@@ -261,7 +284,7 @@ def _with_child_placement(
         # A prepared logical slot is not a physical host map.  Resolve it by
         # slot_id from the immutable scheduler metadata captured at attach.
         try:
-            slots = physical_slots_from_allocation(allocation)
+            slots = resolve_slots(allocation)
         except PlacementRefusal:
             raise
         except (BindingError, TypeError, ValueError) as error:
@@ -274,7 +297,7 @@ def _with_child_placement(
         values.update(slot.env)
     if v2_requested:
         try:
-            slots = physical_slots_from_allocation(allocation)
+            slots = resolve_slots(allocation)
             validate_physical_device_entitlements(slots)
             devices = ",".join(canonical_device_uuid(device) for device in devices.split(",") if device)
         except PlacementRefusal:
@@ -322,6 +345,13 @@ def _with_child_placement(
             quarantine_dir = slot_quarantine_dir(fence.root, placement_values)
             if quarantine_dir is not None:
                 placement_values[SLOT_QUARANTINE_ENV] = quarantine_dir
+    if strict_host:
+        # Only routed attached dispatch turns a child host mismatch into a
+        # pre-core refusal; v1 and local paths remain advisory.
+        placement_values[ROUTED_STRICT_HOST_ENV] = "1"
+    else:
+        # Neither prepared nor slot values may enable this controller policy.
+        values.pop(ROUTED_STRICT_HOST_ENV, None)
     if controller_refusal is not None:
         placement_values[PLACEMENT_REFUSAL_ENV] = json.dumps(controller_refusal, sort_keys=True)
     values = placement_environment(values, **placement_values)
@@ -423,13 +453,18 @@ def _child_precore_refusal(environment: Any, outcome: Any) -> PlacementRefusal |
     except PlacementRefusal:
         return None
     refusal = observation.refusal
-    if not isinstance(refusal, Mapping) or refusal.get("code") != "child-placement-refused":
+    if not isinstance(refusal, Mapping):
+        return None
+    if refusal.get("code") == "routed-child-node-mismatch":
+        if environment.env.get(ROUTED_STRICT_HOST_ENV) != "1":
+            return None
+    elif refusal.get("code") != "child-placement-refused":
         return None
     reason = refusal.get("reason")
     if type(reason) is not str or not reason:
         return PlacementRefusal(
             "placement-receipt-invalid",
-            f"child-placement-refused reason must be a non-empty string, got {reason!r}",
+            f"{refusal.get('code')} reason must be a non-empty string, got {reason!r}",
         )
     return PlacementRefusal(refusal["code"], reason)
 

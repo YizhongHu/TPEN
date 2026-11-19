@@ -42,7 +42,7 @@ def _tiny_train_rows(tmp_path: Path) -> list[dict[str, object]]:
         eval_walkers=2,
         eval_draws=2,
     )
-    checkpoints = [7, 101]
+    checkpoints = [0, 7, 101]
     checkpoint_hashes = {
         (system, lineage, checkpoint): "d" * 64
         for system in SYSTEMS
@@ -78,7 +78,7 @@ def test_real_train_row_overrides_load_and_bind_checkpoint_schedule(
 
     config = CONFIG_ROOT / system / "train.yaml"
     resolved = load_config(str(config), overrides=overrides)
-    assert list(resolved.callbacks[4].schedule.updates) == [7, 101]
+    assert list(resolved.callbacks[4].schedule.updates) == [0, 7, 101]
 
     with pytest.raises(ProtocolError):
         validate_gateway_binding(
@@ -88,7 +88,7 @@ def test_real_train_row_overrides_load_and_bind_checkpoint_schedule(
             kind="train",
         )
     bad_overrides = [
-        "checkpoint_steps=[7,100]" if item.startswith(
+        "checkpoint_steps=[0,7,100]" if item.startswith(
             "checkpoint_steps="
         ) else item
         for item in overrides
@@ -119,13 +119,13 @@ def test_smoke_row_uses_train_config_and_loads_bounded_train_contract(
         ),
         source_sha="a" * 40,
         config_sha256="b" * 64,
-        checkpoints=[7, 101],
+        checkpoints=[0, 7, 101],
         lineage_seeds=[11, 22, 33],
         checkpoint_sha256={
             (name, lineage, checkpoint): "d" * 64
             for name in SYSTEMS
             for lineage in range(3)
-            for checkpoint in (7, 101)
+            for checkpoint in (0, 7, 101)
         },
         results_root=str(tmp_path / "results"),
     ) if row["kind"] == "smoke" and row["system"] == system)

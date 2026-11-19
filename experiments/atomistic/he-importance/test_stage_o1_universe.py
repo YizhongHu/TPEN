@@ -555,6 +555,29 @@ def test_c3_resolving_an_unavailable_o1_row_is_refused_not_rerouted(tmp_path: Pa
     assert "no declared intended-configuration universe" not in str(error.value)
 
 
+def test_c3_unavailable_roster_reasons_reach_refusals_verbatim(tmp_path: Path) -> None:
+    """Every unavailable materialized method preserves its row reason."""
+
+    expected_unavailable = {
+        method for method, optimizer_cell in _availability().items()
+        if optimizer_cell.status == "unavailable"
+    }
+    cells = _materialize_o1(tmp_path)
+    unavailable_by_method: dict[str, tuple[Any, Any]] = {}
+    for cell in cells:
+        optimizer_cell = cell.manifest["scientific_identity"]["optimizer_cell"]
+        if optimizer_cell["status"] == "unavailable":
+            unavailable_by_method.setdefault(optimizer_cell["method"], (cell, optimizer_cell))
+
+    assert set(unavailable_by_method) == expected_unavailable
+    for method, (cell, optimizer_cell) in unavailable_by_method.items():
+        reason = optimizer_cell["unavailable_reason"]
+        assert reason
+        with pytest.raises(train_config.UnavailableOptimizerError) as error:
+            train_config.resolve_train_config(cell)
+        assert reason in str(error.value)
+
+
 @pytest.mark.parametrize("stage_code", ["O2", "R", "F"])
 def test_c3_undeclared_stage_is_refused_with_its_named_reason(
     tmp_path: Path, stage_code: str

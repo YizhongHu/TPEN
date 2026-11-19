@@ -11,12 +11,16 @@ import json
 import re
 import base64
 import binascii
+import copy
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from omegaconf import OmegaConf
+from omegaconf._utils import split_key
+import yaml
 
 from experiments.baselines.systems import load_registry
 from experiments.toolkit.run_paths import resolve_run_dir
@@ -25,6 +29,9 @@ SYSTEMS = ("hooke1", "hooke2", "he", "h2")
 KINDS = ("smoke", "train", "eval")
 CONFIG_IDENTITY_RULE = "stage1-config-v1"
 LEGACY_CONFIG_IDENTITY_RULE = "legacy-config-sha256"
+OVERLAY_RELATIVE_PATH = "configs/overlays/diagnostics-v1.yaml"
+OVERLAY_SYSTEMS = frozenset({"he", "h2"})
+OVERLAY_COMPOSITION_ORDER = "base-config -> diagnostics-v1 overlay -> manifest overrides"
 CHECKPOINT_EVIDENCE_SCHEMA = "stage1-checkpoint-evidence/v1"
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -70,6 +77,7 @@ class Protocol:
     eval_streams: int
     eval_walkers: int
     eval_draws: int
+    retention_cadence: int | None = None
 
     def validate(self) -> None:
         """Reject non-positive dimensions and underspecified stream counts."""
@@ -81,9 +89,11 @@ class Protocol:
             raise ProtocolError(f"protocol dimensions must be positive: {values}")
         if self.lineages < 3 or self.eval_streams < 4:
             raise ProtocolError("Stage-1 requires at least 3 lineages and 4 eval streams")
+        if self.retention_cadence is not None and self.retention_cadence <= 0:
+            raise ProtocolError("retention_cadence must be positive when declared")
 
 
-STAGE1_PROTOCOL = Protocol(1000, 256, 50000, 4096, 3, 4, 4096, 256)
+STAGE1_PROTOCOL = Protocol(1000, 256, 100000, 4096, 3, 4, 4096, 256, 1000)
 SYSTEM_SPECS = tuple(SystemSpec(name, system_id) for name, system_id in (
     ("hooke1", "hooke_one_electron_omega0.5"),
     ("hooke2", "hooke_pair_singlet_omega0.5"),
@@ -104,6 +114,109 @@ def resolve_config_path(config: str | Path) -> Path:
     if path.is_absolute():
         return path
     return Path(__file__).resolve().parent / path
+
+
+def resolve_overlay_path(overlay: str | Path) -> Path:
+    """Resolve one Stage-1 overlay relative to the study directory."""
+
+    path = Path(overlay)
+    return path if path.is_absolute() else Path(__file__).resolve().parent / path
+
+
+def overlay_sha256(overlay: str | Path) -> str:
+    """Return the SHA-256 digest of one overlay file's exact bytes."""
+
+    path = resolve_overlay_path(overlay)
+    if not path.is_file():
+        raise ProtocolError(f"overlay file does not exist: {path}")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _overlay_binding(*, overlay: str | Path, expected_sha256: object) -> tuple[str, str, Path]:
+    """Validate the canonical overlay path and its exact content digest."""
+
+    path = resolve_overlay_path(overlay).resolve()
+    canonical = resolve_overlay_path(OVERLAY_RELATIVE_PATH).resolve()
+    if path != canonical:
+        raise ProtocolError(
+            f"overlay path must be the committed {OVERLAY_RELATIVE_PATH!r}"
+        )
+    digest = _require_sha(expected_sha256, length=64, field="overlay_sha256")
+    actual = overlay_sha256(path)
+    if actual != digest:
+        raise ProtocolError("overlay sha256 does not match the committed overlay bytes")
+    return OVERLAY_RELATIVE_PATH, digest, path
+
+
+def _iter_mapping_leaves(value: Mapping[str, Any], prefix: str) -> Iterator[tuple[str, Any]]:
+    """Yield dotted paths for every scalar leaf in a mapping.
+
+    Overlay sections are applied one leaf at a time so a section cannot
+    replace a mapping owned by the base config.  Lists remain values at their
+    containing path and are handled explicitly by the append-only sections.
+    """
+
+    for key, nested in value.items():
+        dotted = f"{prefix}.{key}"
+        if isinstance(nested, Mapping):
+            yield from _iter_mapping_leaves(nested, dotted)
+        else:
+            yield dotted, nested
+
+
+def compose_train_overlay(cfg: Any, *, overlay: str | Path, expected_sha256: str) -> Any:
+    """Compose the approved train overlay without touching physics sections.
+
+    The overlay owns train-side runtime/sampler/optimizer/trainer leaves plus
+    diagnostic callbacks and loggers.  Base callbacks are retained and the
+    diagnostics are appended explicitly; checkpoint retention therefore stays
+    manifest-owned.  A blind ``OmegaConf.merge`` is avoided so a future list
+    or nested model section cannot be silently replaced.
+    """
+
+    relative, digest, path = _overlay_binding(
+        overlay=overlay, expected_sha256=expected_sha256
+    )
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ProtocolError("overlay must contain a YAML mapping")
+    allowed = {"runtime", "sampler", "optimizer", "trainer", "callbacks", "loggers"}
+    if set(payload) != allowed:
+        raise ProtocolError("overlay contains unsupported or missing top-level sections")
+    if any(key in payload for key in ("system", "atoms", "model", "hamiltonian_terms")):
+        raise ProtocolError("overlay must not declare physics or model sections")
+    for key in ("runtime", "sampler", "optimizer", "trainer"):
+        section = payload[key]
+        if not isinstance(section, Mapping):
+            raise ProtocolError(f"overlay section {key!r} must be a mapping")
+        for dotted, value in _iter_mapping_leaves(section, key):
+            OmegaConf.update(cfg, dotted, copy.deepcopy(value), merge=False)
+
+    for key in ("callbacks", "loggers"):
+        base_config = cfg.get(key)
+        base_entries = (
+            [] if base_config is None else OmegaConf.to_container(base_config, resolve=False)
+        )
+        overlay_entries = copy.deepcopy(payload[key])
+        if not isinstance(base_entries, list) or not isinstance(overlay_entries, list):
+            raise ProtocolError(f"overlay {key} must be lists")
+        # Both callback and logger entries are additive.  In particular, the
+        # diagnostics overlay must never discard base callbacks such as the
+        # resolved-config snapshot or checkpoint publisher.
+        OmegaConf.update(
+            cfg, key, base_entries + overlay_entries, merge=False, force_add=True,
+        )
+
+    provenance = {
+        "schema": "stage1-overlay/v1",
+        "path": relative,
+        "sha256": digest,
+        "composition_order": OVERLAY_COMPOSITION_ORDER,
+        "stream": "train",
+    }
+    for dotted, value in _iter_mapping_leaves(provenance, "stage1_overlay"):
+        OmegaConf.update(cfg, dotted, value, merge=False, force_add=True)
+    return cfg
 
 
 def _config_files_for_system(system: str, config_root: str | Path) -> tuple[Path, ...]:
@@ -359,8 +472,40 @@ def decode_binding(token: str) -> dict[str, Any]:
     return value
 
 
+def _is_overlay_owned_override(key: str) -> bool:
+    """Identify override paths reserved by the declared train overlay."""
+
+    return (
+        key == "callbacks"
+        or key.startswith("callbacks.")
+        or key == "loggers"
+        or key.startswith("loggers.")
+        or key == "stage1_overlay"
+        or key.startswith("stage1_overlay.")
+    )
+
+
+def _canonical_override_key(key: str, *, reject_noncanonical: bool) -> str:
+    """Return the path spelling used by OmegaConf's update implementation.
+
+    ``OmegaConf.update`` resolves both dotted and getitem-style paths through
+    ``split_key``.  Admission must inspect that same path, while science rows
+    require the unambiguous dotted spelling at the gateway boundary.
+    """
+
+    try:
+        canonical = ".".join(split_key(key))
+    except Exception as exc:
+        raise ProtocolError(f"invalid gateway override key: {key!r}") from exc
+    if reject_noncanonical and ("[" in key or "]" in key or key.startswith(".")):
+        raise ProtocolError(f"non-canonical gateway override key: {key!r}")
+    return canonical
+
+
 def validate_gateway_binding(*, binding: str, config: str, overrides: list[str], kind: str,
-                             expected_checkpoint_sha256: str | None = None) -> dict[str, Any]:
+                             expected_checkpoint_sha256: str | None = None,
+                             overlay: str | None = None,
+                             overlay_sha256: str | None = None) -> dict[str, Any]:
     """Validate that gateway arguments still match the rendered row binding."""
 
     row = decode_binding(binding)
@@ -375,6 +520,19 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
         raise ProtocolError("binding config identity rule is unsupported")
     if resolve_config_path(config) != resolve_config_path(row_config):
         raise ProtocolError("gateway config does not match binding")
+    declared_overlay = row.get("overlay")
+    declared_overlay_sha = row.get("overlay_sha256")
+    if (declared_overlay is None) != (declared_overlay_sha is None):
+        raise ProtocolError("binding overlay declaration is incomplete")
+    if declared_overlay is None or declared_overlay_sha is None:
+        if overlay is not None or overlay_sha256 is not None:
+            raise ProtocolError("overlay was applied without being declared in the binding")
+    else:
+        if kind != "train":
+            raise ProtocolError("overlay is supported only on train rows")
+        if overlay != declared_overlay or overlay_sha256 != declared_overlay_sha:
+            raise ProtocolError("gateway overlay does not match binding")
+        _overlay_binding(overlay=overlay, expected_sha256=overlay_sha256)
     _validate_config_identity_for_row(row, resolve_config_path(config))
     _validate_run_identity(row)
     expected = {
@@ -418,9 +576,14 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
             raise ProtocolError("prefixed gateway overrides are not allowed")
         if not separator or not key:
             raise ProtocolError(f"invalid gateway override: {override!r}")
-        if key in override_map:
+        canonical_key = _canonical_override_key(
+            key, reject_noncanonical=kind in {"train", "eval"},
+        )
+        if declared_overlay is not None and _is_overlay_owned_override(canonical_key):
+            raise ProtocolError(f"gateway override targets overlay-owned path: {key}")
+        if canonical_key in override_map:
             raise ProtocolError(f"duplicate gateway override: {key}")
-        override_map[key] = value
+        override_map[canonical_key] = value
     expected_map = {entry.partition("=")[0]: entry.partition("=")[2] for entry in expected}
     missing = sorted(key for key in expected_map if key not in override_map)
     mismatched = sorted(
@@ -596,7 +759,9 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                    results_root: str,
                    expected_physical_system_id: Mapping[str, str] | None = None,
                    systems: tuple[str, ...] | list[str] | None = None,
-                   phase: int = 2, device: str | None = None) -> list[dict[str, Any]]:
+                   phase: int = 2, device: str | None = None,
+                   overlay: str | Path | None = None,
+                   overlay_sha256: str | None = None) -> list[dict[str, Any]]:
     """Expand systems into validated smoke, train, and eval rows.
 
     Parameters are explicit rather than defaulted so a missing identity or
@@ -614,10 +779,35 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         raise ProtocolError("systems must contain distinct known Stage-1 systems")
     if device is not None and device not in {"cpu", "cuda"}:
         raise ProtocolError("device must be 'cpu' or 'cuda'")
-    if not checkpoints or any(step <= 0 for step in checkpoints):
-        raise ProtocolError("checkpoints must be a non-empty list of positive updates")
+    if (overlay is None) != (overlay_sha256 is None):
+        raise ProtocolError("overlay and overlay_sha256 must be supplied together")
+    overlay_name: str | None = None
+    overlay_digest: str | None = None
+    if overlay is not None:
+        if not set(selected).issubset(OVERLAY_SYSTEMS):
+            raise ProtocolError("the diagnostics overlay is approved only for He/H2 rows")
+        overlay_name, overlay_digest, _ = _overlay_binding(
+            overlay=overlay, expected_sha256=overlay_sha256
+        )
+    if not checkpoints or any(type(step) is not int or step < 0 for step in checkpoints):
+        raise ProtocolError("checkpoints must be a non-empty list of non-negative updates")
     if len(set(checkpoints)) != len(checkpoints):
         raise ProtocolError("checkpoints must not contain duplicates")
+    if protocol.retention_cadence is not None:
+        expected_checkpoints = list(range(
+            0, protocol.lineage_updates + 1, protocol.retention_cadence
+        ))
+        if checkpoints != expected_checkpoints:
+            raise ProtocolError(
+                "train checkpoints must equal the declared retention cadence"
+            )
+    if phase in {1, 2}:
+        if any(step > protocol.lineage_updates for step in checkpoints):
+            raise ProtocolError("checkpoints must not exceed lineage_updates")
+        if protocol.lineage_updates not in checkpoints:
+            raise ProtocolError("checkpoints must retain the terminal lineage_updates checkpoint")
+        if 0 not in checkpoints:
+            raise ProtocolError("checkpoints must retain the initial zero checkpoint")
     if isinstance(config_sha256, Mapping):
         config_ids = {system: _require_sha(config_sha256.get(system), length=64,
                                            field=f"config_sha256[{system!r}]") for system in selected}
@@ -686,7 +876,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                 raise ProtocolError("seed collision across Stage-1 rows")
             seen_seeds.add(train_seed)
             train_id = stable_row_id(system=spec.name, kind="train", lineage=lineage)
-            rows.append({
+            row: dict[str, Any] = {
                 "row_id": train_id, "system": spec.name, "system_id": spec.system_id,
                 "kind": "train", "lineage": lineage, "seed": train_seed,
                 "source_sha": source_sha, "config_sha256": config_ids[spec.name],
@@ -697,7 +887,11 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                 "updates": protocol.lineage_updates,
                 "walkers": protocol.lineage_walkers,
                 "checkpoint_steps": list(checkpoints),
-            })
+            }
+            if overlay_name is not None:
+                row["overlay"] = overlay_name
+                row["overlay_sha256"] = overlay_digest
+            rows.append(row)
             train_row = rows[-1]
             if phase == 1:
                 continue
@@ -844,8 +1038,8 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         eval_streams, eval_walkers, eval_draws = protocol.eval_streams, protocol.eval_walkers, protocol.eval_draws
     if eval_streams <= 0 or eval_walkers <= 0 or eval_draws <= 0:
         raise ProtocolError("evaluation dimensions must be positive")
-    if not checkpoints or any(not isinstance(step, int) or step <= 0 for step in checkpoints):
-        raise ProtocolError("checkpoints must be a non-empty list of positive updates")
+    if not checkpoints or any(type(step) is not int or step < 0 for step in checkpoints):
+        raise ProtocolError("checkpoints must be a non-empty list of non-negative updates")
     if len(set(checkpoints)) != len(checkpoints):
         raise ProtocolError("checkpoints must not contain duplicates")
     phase1_checkpoint_steps = {

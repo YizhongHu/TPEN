@@ -25,6 +25,7 @@ from experiments.atomistic.stage1.protocol import (
     manifest_hash,
     validate_gateway_binding,
 )
+from experiments.atomistic.stage1.train import prepare_initial_checkpoint_config
 from experiments.baselines.systems import load_registry
 from experiments.toolkit.run_paths import resolve_run_dir
 from experiments.toolkit.trajectory_records import (
@@ -84,6 +85,8 @@ def _run_real_config(*, row: dict[str, object], config_path: Path,
         if row["kind"] == "train" else "experiments/atomistic/stage1/eval.py"
     )
     cfg = load_config(str(config_path), overrides)
+    if row["kind"] == "train":
+        prepare_initial_checkpoint_config(cfg)
     assert run_from_config(
         cfg, config_path=str(config_path), command=command, raise_exceptions=True
     ) == 0
@@ -118,15 +121,16 @@ def test_real_train_eval_inspect_collect_chain_for_all_stage1_systems(
     )
     placeholder_sha = "0" * 64
     bindings = {
-        (system, lineage, 1): placeholder_sha
+        (system, lineage, checkpoint): placeholder_sha
         for system in SYSTEMS
         for lineage in range(protocol.lineages)
+        for checkpoint in (0, 1)
     }
     planned = build_manifest(
         protocol=protocol,
         source_sha=source_sha,
         config_sha256=config_sha256,
-        checkpoints=[1],
+        checkpoints=[0, 1],
         lineage_seeds=[11, 12, 13],
         checkpoint_sha256=bindings,
         results_root=str(tmp_path),
@@ -139,7 +143,7 @@ def test_real_train_eval_inspect_collect_chain_for_all_stage1_systems(
     }
     eval_rows = [
         row for row in planned
-        if row["kind"] == "eval" and row["lineage"] == 0
+        if row["kind"] == "eval" and row["lineage"] == 0 and row["checkpoint"] == 1
     ]
     assert len(eval_rows) == len(SYSTEMS) * protocol.eval_streams
     assert all(Path(str(row["checkpoint_file"])).is_absolute() for row in eval_rows)

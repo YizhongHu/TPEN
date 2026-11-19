@@ -15,7 +15,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from tpen.checkpoint.profiles import (
+    CALLBACK_CONTRACT_REGISTRY,
+    NATIVE_PROFILE,
     check_resume_sensitive_callback_cadence,
+    check_profile_refusal,
     SUPPORTED_CALLBACK_TARGETS,
     SUPPORTED_LOGGER_TARGETS,
     SUPPORTED_STATE_OWNERS,
@@ -24,10 +27,6 @@ from tpen.checkpoint.profiles import (
 
 class UnsupportedMutableStateError(ValueError):
     """Raised when a configured state owner is outside the native profile."""
-
-
-# This allowlist defines the train_resume owners; callback/logger validation
-# below only covers additional user-configured mutable state.
 
 
 def _target(entry: Any, owner: str, index: int) -> str:
@@ -65,6 +64,8 @@ def validate_native_recovery_profile(config: Any) -> None:
         pass
     if not isinstance(config, Mapping):
         raise UnsupportedMutableStateError("native profile requires a mapping config")
+
+    new_contract_present = False
     for owner, allowed in (
         ("callbacks", SUPPORTED_CALLBACK_TARGETS),
         ("loggers", SUPPORTED_LOGGER_TARGETS),
@@ -74,10 +75,29 @@ def validate_native_recovery_profile(config: Any) -> None:
             raise UnsupportedMutableStateError(f"{owner} must be a sequence")
         for index, entry in enumerate(entries):
             target = _target(entry, owner, index)
+            if owner == "callbacks" and target in CALLBACK_CONTRACT_REGISTRY:
+                new_contract_present = True
             if target not in allowed:
                 raise UnsupportedMutableStateError(
                     f"{owner}[{index}] {target!r} is not in the native mutable-state profile"
                 )
+
+    if new_contract_present:
+        refusal = check_profile_refusal(config, NATIVE_PROFILE)
+        if refusal is not None:
+            code, reason = refusal
+            if code == "malformed-config":
+                message = reason
+            elif "is not in the declared profile" in reason:
+                message = reason.replace(
+                    "is not in the declared profile",
+                    "is not in the native mutable-state profile",
+                )
+            else:
+                message = f"{code}: {reason}"
+            raise UnsupportedMutableStateError(message)
+        return
+
     cadence_refusal = check_resume_sensitive_callback_cadence(config)
     if cadence_refusal is not None:
         code, reason = cadence_refusal

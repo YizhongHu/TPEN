@@ -829,10 +829,24 @@ def validate_materialized_manifest(manifest: Mapping[str, Any]) -> None:
 
     L2a's train validator owns structural sanity and reference-content screening
     at every depth. Scientific identity and payload configuration keys remain
-    caller-owned; L2b owns and closes only seed identity.
+    caller-owned; L2b owns seed identity and the stage-authority training
+    horizon.
+
+    Raises
+    ------
+    ManifestSchemaError
+        If the manifest payload horizon disagrees with the fixed horizon of
+        its stage. Confirmation stages with no fixed horizon are not checked
+        here.
     """
 
     validate_train_manifest(manifest)
+    definition = stage_definition(manifest["stage"])
+    if definition.updates is not None and manifest["payload"]["updates"] != definition.updates:
+        raise ManifestSchemaError(
+            f"payload updates {manifest['payload']['updates']!r} disagree with stage "
+            f"{manifest['stage']!r} horizon {definition.updates!r}"
+        )
     walker_count(manifest)
     _require_exact_keys(manifest["seed_identity"], _L2B_SEED_IDENTITY_KEYS, "seed_identity")
     if manifest["seed_identity"]["stage"] != manifest["stage"]:

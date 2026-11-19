@@ -41,6 +41,32 @@ Operational outcome receipts use the closed vocabulary `completed`, `failed`,
 `timed_out`, and `launch_failed`. These statuses describe execution only;
 scientific validity remains the responsibility of core evidence.
 
+## Allocation-group reconciliation (B1a)
+
+The executor exposes a fake-driven, pure Layer A contract for reconciling an
+immutable allocation group. `ExecutionPlanV2` binds opaque plan content to an
+ordered task list and explicit continuation/reconciliation protocol tokens;
+`ReadyGroupV2` binds that plan to an opaque `GroupId`. An
+`AllocationAttemptV2` separately identifies one controller/allocation
+generation. `GroupId`, `AllocationAttemptId`, and `InvocationId` are
+deliberately non-interchangeable with `AttemptId`, `AllocationId`, or
+`BackendJobId`.
+
+`reconcile_group()` consumes typed executor start/outcome receipt references
+and a typed `CoreAdmissionPort` verdict. It derives one of
+`preserve_completed`, `admit_successor`, `start_fresh`, `preserve_terminal`,
+or `park` for every member. Parked evidence dominates the group aggregate;
+otherwise a successor or fresh member yields `replacement_required`, and a
+fully preserved group is `settled` with completed/terminal counts. The
+reconciler publishes no ledger, starts no process, replaces no allocation,
+scans no checkpoint, and maps no result to a scheduler or Balsam status.
+
+The profile/admission port is intentionally a narrow typed fake seam. A
+missing or refused native profile parks a member before an optional restore
+callback can run. Real-core compatibility, durable publication, successor
+fencing, Balsam lifecycle, and facility integration are later layers and are
+not claimed by B1a.
+
 ## GPU placement qualification
 
 The L1a v2 placement receipt reports an explicit reason class: `not-sampled`,
@@ -180,8 +206,15 @@ python -m tpen_executor dispatch \
   --allocation <allocation.json> \
   --worker-config <worker.yaml> \
   --runs <configured-runs.json> \
-  [--dispatcher local|parsl] [--timeout SECONDS]
+  [--dispatcher local|parsl] [--transport <attached-transport.json>] \
+  [--timeout SECONDS]
 ```
+
+`--transport` is optional and is accepted only with `--dispatcher parsl`. Its
+file must be a strict `tpen-executor/attached-transport-v1` mapping accepted by
+`AttachedTransportSpec`; without it, Parsl uses the unchanged in-process
+ThreadPool route. The transport profile supplies only generic attached-route
+values; the executor does not provide facility defaults.
 
 The command writes a JSON manifest to stdout on dispatch and a typed
 `tpen-executor/cli-error-v1` envelope to stderr on refusal or failure. Exit
@@ -192,6 +225,10 @@ codes are:
 * `3`: dispatch completed with a failed, timed-out, or launch-failed member;
 * `4`: unexpected dispatch or publication failure after admission;
 * `130`: cancellation after an attempt began.
+
+Attached transport capacity and standard-worker shape refusals are reported as
+typed `dispatcher-admission` errors with exit code `2`, before the store is
+reserved. Shared-store reachability checks remain runtime dispatch failures.
 
 ## Remote-leaf wire (S3 Layer A)
 
@@ -316,6 +353,47 @@ Layer D: a node-to-executor-label map with one worker pool constrained to
 each named node by operator-supplied launcher data, each slot submitted only
 to its node's label, and observed node identity preflighted, which revises
 Layer B's one-executor validator.
+
+### Routed attached transport v2 (Layers D2a/D2b)
+
+The strict `tpen-executor/attached-routed-transport-v2` profile describes an
+ordered pool for each captured allocation node. Each pool carries its node,
+label, worker count, worker setup, interchange address, and opaque
+`MpiExecLauncher` bind/override values. The executor supplies no facility
+values and does not interpret those launcher strings. Its matching
+`tpen-executor/allocation-slots-v2` record may contain several slots per node;
+admission requires the exact node set from the captured scheduler host map and
+requires `pool.workers == slot_count` for every node. Host strings are compared
+exactly at this boundary; aliases and DNS normalization are not inferred.
+
+Admission constructs one fresh `HighThroughputExecutor` with a
+`LocalProvider(MpiExecLauncher(...))` for each pool. Every pool is a single
+initial block with its own label and worker count, and the route retains the
+no-retry, no-scaling, interpreter-module launch settings. Before any
+`lifecycle.begin`, the controller submits exactly the pool's worker count of
+shared-store probes through that pool's label. All probes join one aggregate
+barrier, and each returned hostname must equal the pool node exactly. A typed
+`RoutedTransportPreflightError` refuses wrong, missing, extra, or late facts.
+
+At each member launch, the controller resolves the binding's captured
+physical node to exactly one pool label and submits the leaf with only
+`executors=[that_label]`. An absent or ambiguous node-to-label mapping is an
+admission refusal before `begin`; the v1 attached profile remains the
+one-executor, single-label path described above.
+
+Routed children carry an internal strict-host flag. `RUN_SHIM` still writes
+the identity-bound placement sidecar, but a declared-host mismatch under that
+flag aborts before importing core. The controller recognizes only that
+routed sidecar case as `PlacementRefusal(code="routed-child-node-mismatch")`,
+publishes the refusal receipt, finishes the attempt as `launch_failed`, and
+accepts no segment. v1 and non-routed children retain the advisory
+`child-placement-mismatch` behavior and may complete.
+
+All routed normal and refusal replies continue through the CX-06 remote
+completion lifecycle. Cancellation or remote loss sweeps every active label
+under one bounded teardown deadline; missing or unacknowledged replies remain
+`remote-quiescence-unconfirmed` and close admission. D2b adds no retry,
+continuation, successor, or resubmission behavior.
 
 ## Local dispatch
 

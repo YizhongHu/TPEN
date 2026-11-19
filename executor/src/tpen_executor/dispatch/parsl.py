@@ -31,7 +31,14 @@ from typing import Any, ClassVar
 import uuid
 
 from ..environments import PreparedPythonEnvironment, SourceScript
-from ..placement import BindingError, PlacementRefusal, WorkerBinding, bindings_from_allocation, physical_slots_from_allocation, slots_from_allocation
+from ..placement import (
+    BindingError,
+    PlacementRefusal,
+    WorkerBinding,
+    bindings_from_allocation,
+    physical_slots_from_allocation,
+    routed_slots_from_allocation,
+)
 from ..programs import WorkerProgram
 from .._records import frozen_record
 from .._codec import canonical_bytes, digest
@@ -80,6 +87,10 @@ class SharedStorePreflightError(UnsupportedTransportError):
     """Raised when the attempt store is not one shared, lockable path."""
 
 
+class RoutedTransportPreflightError(SharedStorePreflightError):
+    """Raised when a routed pool does not prove its named physical host."""
+
+
 class RemoteLeafLaunchError(RuntimeError):
     """A remote leaf returned a launch error instead of a science outcome."""
 
@@ -89,9 +100,11 @@ class RemoteInspectionError(RuntimeError):
 
 
 ATTACHED_TRANSPORT_SCHEMA = "tpen-executor/attached-transport-v1"
+ROUTED_ATTACHED_TRANSPORT_SCHEMA = "tpen-executor/attached-routed-transport-v2"
 # The single reviewed attached form.  Anything else is refused at admission.
 _ATTACHED_FORM = {"executor": "htex", "provider": "local", "launcher": "mpiexec"}
 _LABEL_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"
+_HOST_LABEL_PATTERN = r"^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$"
 _PREFLIGHT_PREFIX = "store-preflight-"
 # HTEX starts its interchange and worker pool as console scripts found on
 # PATH by default.  The attached route runs both modules with the current
@@ -220,6 +233,135 @@ class AttachedTransportSpec:
         if unknown:
             raise ValueError(f"attached transport has unknown keys: {unknown!r}")
         return cls(**values)
+
+
+@frozen_record
+class RoutedTransportPool:
+    """One node-constrained HTEX pool in a routed attached transport."""
+
+    node: str
+    label: str
+    workers: int
+    worker_init: str
+    address: str | None
+    mpiexec_bind_cmd: str
+    mpiexec_overrides: str
+
+    def __post_init__(self) -> None:
+        if type(self.node) is not str or not self.node:
+            raise TypeError("pool node must be a non-empty string")
+        if any(char.isspace() for char in self.node) or any(re.fullmatch(_HOST_LABEL_PATTERN, part) is None for part in self.node.split(".")):
+            raise ValueError("pool node must be a canonical hostname")
+        if type(self.label) is not str or re.fullmatch(_LABEL_PATTERN, self.label) is None or self.label == "_parsl_internal":
+            raise ValueError("pool label must be a short executor label")
+        if type(self.workers) is not int or isinstance(self.workers, bool) or self.workers <= 0:
+            raise ValueError("pool workers must be a positive integer")
+        for name in ("worker_init", "mpiexec_bind_cmd", "mpiexec_overrides"):
+            if type(getattr(self, name)) is not str:
+                raise TypeError(f"pool {name} must be a string")
+        if self.address is not None and (type(self.address) is not str or not self.address):
+            raise TypeError("pool address must be a non-empty string or None")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the strict pool mapping."""
+
+        return {item.name: getattr(self, item.name) for item in fields(self)}
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "RoutedTransportPool":
+        """Decode one strict routed pool mapping."""
+
+        expected = {item.name for item in fields(cls)}
+        if not isinstance(data, Mapping) or set(data) != expected:
+            missing = expected - set(data) if isinstance(data, Mapping) else expected
+            extra = set(data) - expected if isinstance(data, Mapping) else set()
+            raise ValueError(f"routed transport pool keys differ (missing={sorted(missing)!r}, extra={sorted(extra)!r})")
+        return cls(**dict(data))
+
+
+@frozen_record
+class RoutedAttachedTransportSpec:
+    """Typed multi-pool attached HTEX transport for one captured allocation."""
+
+    schema: ClassVar[str] = ROUTED_ATTACHED_TRANSPORT_SCHEMA
+    executor: str
+    provider: str
+    launcher: str
+    pools: tuple[RoutedTransportPool, ...]
+    preflight_timeout: int | float
+    teardown_timeout: int | float
+
+    def __post_init__(self) -> None:
+        if any(type(getattr(self, name)) is not str for name in ("executor", "provider", "launcher")):
+            raise TypeError("routed transport form fields must be strings")
+        if (self.executor, self.provider, self.launcher) != ("htex", "local", "mpiexec"):
+            raise ValueError("only the attached htex/local/mpiexec form is admitted")
+        if isinstance(self.pools, (str, bytes, bytearray)) or not isinstance(self.pools, tuple) or not self.pools:
+            raise TypeError("routed transport pools must be a non-empty tuple")
+        if any(type(pool) is not RoutedTransportPool for pool in self.pools):
+            raise TypeError("routed transport pools must contain RoutedTransportPool values")
+        nodes = [pool.node for pool in self.pools]
+        labels = [pool.label for pool in self.pools]
+        if len(set(nodes)) != len(nodes):
+            raise ValueError("routed transport pool nodes must be unique")
+        if len(set(labels)) != len(labels):
+            raise ValueError("routed transport pool labels must be unique")
+        for name in ("preflight_timeout", "teardown_timeout"):
+            timeout = getattr(self, name)
+            if type(timeout) not in (int, float) or isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+
+    @property
+    def workers(self) -> int:
+        """Return the total number of workers across all routed pools."""
+
+        return sum(pool.workers for pool in self.pools)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the strict mapping form."""
+
+        return {
+            "schema": self.schema,
+            "executor": self.executor,
+            "provider": self.provider,
+            "launcher": self.launcher,
+            "pools": [pool.to_dict() for pool in self.pools],
+            "preflight_timeout": self.preflight_timeout,
+            "teardown_timeout": self.teardown_timeout,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "RoutedAttachedTransportSpec":
+        """Decode a strict routed v2 mapping."""
+
+        expected = {"schema", "executor", "provider", "launcher", "pools", "preflight_timeout", "teardown_timeout"}
+        if not isinstance(data, Mapping) or set(data) != expected:
+            missing = expected - set(data) if isinstance(data, Mapping) else expected
+            extra = set(data) - expected if isinstance(data, Mapping) else set()
+            raise ValueError(f"routed transport keys differ (missing={sorted(missing)!r}, extra={sorted(extra)!r})")
+        if data["schema"] != cls.schema:
+            raise ValueError(f"routed transport schema must be {cls.schema!r}")
+        pools = data["pools"]
+        if isinstance(pools, (str, bytes, bytearray)) or not isinstance(pools, (list, tuple)):
+            raise TypeError("routed transport pools must be a sequence")
+        return cls(
+            data["executor"], data["provider"], data["launcher"],
+            tuple(RoutedTransportPool.from_mapping(pool) for pool in pools),
+            data["preflight_timeout"], data["teardown_timeout"],
+        )
+
+
+def decode_attached_transport(data: Any) -> AttachedTransportSpec | RoutedAttachedTransportSpec:
+    """Decode attached transport v1 or v2 by its explicit schema discriminator."""
+
+    if not isinstance(data, Mapping):
+        raise TypeError("attached transport must be a mapping")
+    schema = data.get("schema")
+    if schema == ATTACHED_TRANSPORT_SCHEMA:
+        return AttachedTransportSpec.from_mapping(data)
+    if schema == ROUTED_ATTACHED_TRANSPORT_SCHEMA:
+        return RoutedAttachedTransportSpec.from_mapping(data)
+    raise ValueError("attached transport schema is not a supported version")
 
 
 def _require_standard_worker(materialized: Any) -> None:
@@ -664,7 +806,7 @@ class ParslDispatcher(DispatcherContract):
     worker: WorkerProgram
     executor_config: Any = None
     binding: WorkerBinding | Mapping[str, Any] | None = None
-    transport: AttachedTransportSpec | Mapping[str, Any] | None = None
+    transport: AttachedTransportSpec | RoutedAttachedTransportSpec | Mapping[str, Any] | None = None
     _config_type: Any = field(init=False, repr=False, compare=False)
     _dfk_type: Any = field(init=False, repr=False, compare=False)
     _thread_pool_type: Any = field(init=False, repr=False, compare=False)
@@ -702,10 +844,10 @@ class ParslDispatcher(DispatcherContract):
             # reaches run(), so it can never begin an attempt.
             if self.executor_config is not None:
                 raise UnsupportedTransportError("transport and executor_config are mutually exclusive")
-            if type(self.transport) is not AttachedTransportSpec:
-                if isinstance(self.transport, AttachedTransportSpec):
-                    raise TypeError("transport must be exactly AttachedTransportSpec")
-                object.__setattr__(self, "transport", AttachedTransportSpec.from_mapping(self.transport))
+            if type(self.transport) not in (AttachedTransportSpec, RoutedAttachedTransportSpec):
+                if isinstance(self.transport, (AttachedTransportSpec, RoutedAttachedTransportSpec)):
+                    raise TypeError("transport must be exactly its admitted transport spec")
+                object.__setattr__(self, "transport", decode_attached_transport(self.transport))
             # The remote route's Parsl types are imported only when selected,
             # so the default ThreadPool route imports exactly what it did.
             from parsl.executors import HighThroughputExecutor
@@ -773,8 +915,12 @@ class ParslDispatcher(DispatcherContract):
                 # A fresh executor/provider/launcher set for every run: none
                 # of them, nor the DFK below, outlives this allocation's run.
                 run_dir = str(Path(lifecycle.store.root) / "parsl")
-                config = self._attached_config(self.transport, run_dir)
-                labels = self._validate_attached_config(config, self.transport)
+                if type(self.transport) is RoutedAttachedTransportSpec:
+                    config = self._attached_routed_config(self.transport, run_dir)
+                    labels = self._validate_routed_config(config, self.transport)
+                else:
+                    config = self._attached_config(self.transport, run_dir)
+                    labels = self._validate_attached_config(config, self.transport)
             else:
                 if config is None:
                     run_dir = str(Path(lifecycle.store.root) / "parsl")
@@ -793,7 +939,10 @@ class ParslDispatcher(DispatcherContract):
                 if self.transport is not None:
                     # Every worker must see the same lockable store before
                     # the first begin; a refusal leaves no attempt.
-                    self._preflight_shared_store(lifecycle, self.transport)
+                    if type(self.transport) is RoutedAttachedTransportSpec:
+                        self._preflight_routed_store(lifecycle, self.transport)
+                    else:
+                        self._preflight_shared_store(lifecycle, self.transport)
                     return self._run_slot_pool(group, runs, lifecycle, env, timeout, bindings)
                 if len(bindings) == 1:
                     return super(ParslDispatcher, self).run(group, runs, lifecycle, env, timeout, _admitted=True)
@@ -836,27 +985,90 @@ class ParslDispatcher(DispatcherContract):
         """
 
         super(ParslDispatcher, self).validate(group, runs, lifecycle, env, timeout)
-        bindings = self._resolve_bindings(lifecycle)
+        self._resolve_bindings(lifecycle)
         if self.transport is not None:
-            self._admit_transport(lifecycle, env, len(bindings))
+            self._admit_transport(lifecycle, env)
 
-    def _admit_transport(self, lifecycle: AttachedAllocation, env: Mapping[str, Any] | None, slots: int) -> None:
-        """Refuse an attached remote run that cannot be dispatched faithfully."""
+    def admit_transport_shape(
+        self, allocation_or_lifecycle: Any, env: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Refuse an attached route with an invalid allocation or worker shape.
+
+        Parameters
+        ----------
+        allocation_or_lifecycle : object
+            A configured allocation, or an attached lifecycle carrying one.
+            Both paths use the runtime binding-resolution policy.
+        env : mapping, optional
+            Owner-process materialization environment for the worker handle.
+
+        Raises
+        ------
+        BindingError, PlacementRefusal, UnsupportedTransportError
+            If the transport, allocation capacity, or worker shape is refused.
+        """
 
         transport = self.transport
-        if type(transport) is not AttachedTransportSpec:
-            raise UnsupportedTransportError("transport must be an admitted AttachedTransportSpec")
-        if not isinstance(lifecycle, AttachedAllocation):
-            raise UnsupportedTransportError("the attached transport requires an AttachedAllocation lifecycle")
-        if slots > transport.workers:
-            raise UnsupportedTransportError("attached transport has fewer workers than admitted slots")
+        if type(transport) not in (AttachedTransportSpec, RoutedAttachedTransportSpec):
+            raise UnsupportedTransportError("transport must be an admitted attached transport spec")
+        allocation = allocation_or_lifecycle.allocation if isinstance(allocation_or_lifecycle, AttachedAllocation) else allocation_or_lifecycle
+        if type(transport) is RoutedAttachedTransportSpec:
+            slots = routed_slots_from_allocation(allocation)
+            counts: dict[str, int] = {}
+            for slot in slots:
+                counts[slot.node] = counts.get(slot.node, 0) + 1
+            pool_nodes = {pool.node for pool in transport.pools}
+            if pool_nodes != set(counts):
+                raise UnsupportedTransportError("routed transport pool nodes differ from the captured allocation nodes")
+            for pool in transport.pools:
+                if counts[pool.node] != pool.workers:
+                    raise UnsupportedTransportError(
+                        f"routed pool {pool.label!r} workers must equal its allocation slot count"
+                    )
+            # Resolve every declared physical node to exactly one controller-
+            # owned label before any lifecycle fence can be begun.
+            for slot in slots:
+                self._routed_label_for_node(slot.node)
+        else:
+            if isinstance(allocation_or_lifecycle, AttachedAllocation):
+                bindings = self._resolve_bindings(allocation_or_lifecycle)
+            else:
+                bindings = self._resolve_bindings_for_allocation(allocation_or_lifecycle)
+            if len(bindings) > transport.workers:
+                raise UnsupportedTransportError("attached transport has fewer workers than admitted slots")
         # The leaf always runs the standard worker; refuse any other program.
         _require_standard_worker(self.worker.materialize(env))
+
+    def _admit_transport(self, lifecycle: AttachedAllocation, env: Mapping[str, Any] | None) -> None:
+        """Refuse an attached remote run that cannot be dispatched faithfully."""
+
+        if not isinstance(lifecycle, AttachedAllocation):
+            raise UnsupportedTransportError("the attached transport requires an AttachedAllocation lifecycle")
+        self.admit_transport_shape(lifecycle, env)
+        if type(self.transport) is RoutedAttachedTransportSpec:
+            # Check the actual bindings used by this run as well as the raw
+            # slot topology.  This keeps a missing/ambiguous binding a
+            # pre-begin admission refusal rather than a member launch error.
+            for binding in self._resolve_bindings(lifecycle):
+                self._routed_label_for_node(binding.node)
         root = getattr(lifecycle.store, "root", None)
         if os.name != "posix" or type(root) is not str or not os.path.isabs(root):
             raise SharedStorePreflightError("attempt store root must be an absolute POSIX path")
         if not os.path.isdir(root):
             raise SharedStorePreflightError("attempt store root must already exist before an attached run")
+
+    def _routed_label_for_node(self, node: str | None) -> str:
+        """Return the one routed executor label owned by ``node``."""
+
+        transport = self.transport
+        if type(transport) is not RoutedAttachedTransportSpec:
+            raise UnsupportedTransportError("routed label lookup requires a routed attached transport")
+        labels = [pool.label for pool in transport.pools if pool.node == node]
+        if len(labels) != 1:
+            raise UnsupportedTransportError(
+                f"routed slot node {node!r} must resolve to exactly one executor label"
+            )
+        return labels[0]
 
     def _resolve_bindings(self, lifecycle: AttachedAllocation) -> tuple[WorkerBinding, ...]:
         """Resolve immutable per-slot bindings before any lifecycle write."""
@@ -865,8 +1077,16 @@ class ParslDispatcher(DispatcherContract):
             if self.binding is None:
                 raise BindingError("binding is required when lifecycle is not AttachedAllocation")
             return (WorkerBinding.from_mapping(self.binding),)
+        return self._resolve_bindings_for_allocation(lifecycle.allocation)
+
+    def _resolve_bindings_for_allocation(self, allocation: Any) -> tuple[WorkerBinding, ...]:
+        """Resolve immutable bindings from allocation facts for both gates."""
+
         try:
-            slots = physical_slots_from_allocation(lifecycle.allocation)
+            if type(self.transport) is RoutedAttachedTransportSpec:
+                slots = routed_slots_from_allocation(allocation)
+            else:
+                slots = physical_slots_from_allocation(allocation)
         except PlacementRefusal:
             # Keep the raw slot binding long enough for the shared completion
             # path to publish the typed prelaunch v2 refusal.
@@ -877,7 +1097,7 @@ class ParslDispatcher(DispatcherContract):
             return tuple(slot.binding() for slot in slots)
         if self.binding is not None:
             return (WorkerBinding.from_mapping(self.binding),)
-        return bindings_from_allocation(lifecycle.allocation)
+        return bindings_from_allocation(allocation)
 
     def _run_slot_pool(
         self,
@@ -933,6 +1153,12 @@ class ParslDispatcher(DispatcherContract):
                     # A remote slot's CPUs are not the controller's: the
                     # attached leaf checks them on its worker before science.
                     check_controller_affinity=self.transport is None,
+                    slot_resolver=(
+                        routed_slots_from_allocation
+                        if type(self.transport) is RoutedAttachedTransportSpec
+                        else None
+                    ),
+                    strict_host=type(self.transport) is RoutedAttachedTransportSpec,
                 )
                 placement_refusal = _placement_refusal_from_environment(environment)
                 if placement_refusal is not None:
@@ -963,7 +1189,9 @@ class ParslDispatcher(DispatcherContract):
                 output_dir, _core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = _member_paths(fence)
                 args = (*configured.command().args, f"run.root={output_dir}", "run.layout=flat", "run.run_id=core")
                 if self.transport is not None:
-                    future, handle = self._submit_leaf(materialized, environment, lifecycle, fence, configured, timeout)
+                    future, handle = self._submit_leaf(
+                        materialized, environment, lifecycle, fence, configured, timeout, binding,
+                    )
                 else:
                     future, handle = self._submit_process(
                         materialized,
@@ -1305,6 +1533,46 @@ class ParslDispatcher(DispatcherContract):
             usage_tracking=0,
         )
 
+    def _attached_routed_config(self, transport: RoutedAttachedTransportSpec, run_dir: str) -> Any:
+        """Build one single-node HTEX/LocalProvider per routed pool."""
+
+        assert self._htex_launch_commands is not None
+        interchange_launch_cmd, launch_cmd = self._htex_launch_commands
+        executors = []
+        for pool in transport.pools:
+            launcher = self._mpiexec_launcher_type(
+                bind_cmd=pool.mpiexec_bind_cmd,
+                overrides=pool.mpiexec_overrides,
+            )
+            provider = self._local_provider_type(
+                nodes_per_block=1,
+                launcher=launcher,
+                init_blocks=1,
+                min_blocks=1,
+                max_blocks=1,
+                worker_init=pool.worker_init,
+            )
+            executors.append(
+                self._htex_type(
+                    label=pool.label,
+                    provider=provider,
+                    address=pool.address,
+                    max_workers_per_node=pool.workers,
+                    cpu_affinity="none",
+                    available_accelerators=(),
+                    prefetch_capacity=0,
+                    interchange_launch_cmd=list(interchange_launch_cmd),
+                    launch_cmd=launch_cmd,
+                )
+            )
+        return self._config_type(
+            executors=executors,
+            run_dir=run_dir,
+            retries=0,
+            strategy="none",
+            usage_tracking=0,
+        )
+
     def _validate_attached_config(self, config: Any, transport: AttachedTransportSpec) -> tuple[str, ...]:
         """Refuse a run config that is not exactly the admitted attached form."""
 
@@ -1321,9 +1589,62 @@ class ParslDispatcher(DispatcherContract):
             raise UnsupportedTransportError("attached transport admits only HTEX with LocalProvider and MpiExecLauncher")
         if executor.label != transport.label:
             raise UnsupportedTransportError("attached executor label differs from the transport label")
-        if getattr(config, "retries", None) != 0 or getattr(config, "retry_handler", None) is not None:
+        if (
+            getattr(config, "retries", None) != 0
+            or getattr(config, "retry_handler", None) is not None
+            or getattr(config, "strategy", None) != "none"
+        ):
             raise UnsupportedTransportError("attached transport must not retry submissions")
         return (transport.label,)
+
+    def _validate_routed_config(self, config: Any, transport: RoutedAttachedTransportSpec) -> tuple[str, ...]:
+        """Refuse a routed config whose pools do not match the v2 spec."""
+
+        def setting(owner: Any, name: str) -> Any:
+            """Read a Parsl setting from either its attribute or test double."""
+
+            value = getattr(owner, name, None)
+            if value is not None:
+                return value
+            return getattr(owner, "options", {}).get(name)
+
+        executors = getattr(config, "executors", None)
+        if not isinstance(executors, (tuple, list)) or len(executors) != len(transport.pools):
+            raise UnsupportedTransportError("routed transport requires exactly one executor per pool")
+        if getattr(config, "retries", None) != 0 or getattr(config, "retry_handler", None) is not None:
+            raise UnsupportedTransportError("routed transport must not retry submissions")
+        labels: list[str] = []
+        for executor, pool in zip(executors, transport.pools, strict=True):
+            provider = getattr(executor, "provider", None)
+            launcher = getattr(provider, "launcher", None)
+            if (
+                type(executor) is not self._htex_type
+                or type(provider) is not self._local_provider_type
+                or type(launcher) is not self._mpiexec_launcher_type
+            ):
+                raise UnsupportedTransportError("routed transport admits only HTEX with LocalProvider and MpiExecLauncher")
+            if executor.label != pool.label:
+                raise UnsupportedTransportError("routed executor label differs from its pool label")
+            if any(setting(provider, name) != expected for name, expected in {
+                "nodes_per_block": 1, "init_blocks": 1, "min_blocks": 1,
+                "max_blocks": 1, "worker_init": pool.worker_init,
+            }.items()):
+                raise UnsupportedTransportError("routed pool provider options differ from the transport")
+            if (
+                getattr(launcher, "bind_cmd", None) != pool.mpiexec_bind_cmd
+                or getattr(launcher, "overrides", None) != pool.mpiexec_overrides
+            ):
+                raise UnsupportedTransportError("routed pool launcher options differ from the transport")
+            available_accelerators = setting(executor, "available_accelerators")
+            if not isinstance(available_accelerators, (list, tuple)) or available_accelerators:
+                raise UnsupportedTransportError("routed pools must not assign accelerators")
+            if any(setting(executor, name) != expected for name, expected in {
+                "address": pool.address, "max_workers_per_node": pool.workers,
+                "cpu_affinity": "none", "prefetch_capacity": 0,
+            }.items()):
+                raise UnsupportedTransportError("routed pool executor options differ from the transport")
+            labels.append(pool.label)
+        return tuple(labels)
 
     def _preflight_shared_store(self, lifecycle: AttachedAllocation, transport: AttachedTransportSpec) -> None:
         """Fail closed unless every worker sees the same lockable store.
@@ -1372,6 +1693,50 @@ class ParslDispatcher(DispatcherContract):
             if not isinstance(facts, dict) or facts.get("root") != real_root:
                 raise SharedStorePreflightError("a worker reported a different canonical attempt-store path")
 
+    def _preflight_routed_store(self, lifecycle: AttachedAllocation, transport: RoutedAttachedTransportSpec) -> None:
+        """Preflight every routed label and prove its exact physical host."""
+
+        root = lifecycle.store.root
+        real_root = os.path.realpath(root)
+        nonce = uuid.uuid4().hex
+        probe_dir = os.path.join(root, "parsl", _PREFLIGHT_PREFIX + nonce)
+        try:
+            os.makedirs(probe_dir)
+            token = os.path.join(probe_dir, "token")
+            with open(token, "x", encoding="utf-8") as handle:
+                handle.write(nonce)
+            _lockf_probe(token)
+        except OSError as error:
+            raise RoutedTransportPreflightError(f"attempt store is not a lockable POSIX directory: {error}") from error
+        deadline = time.monotonic() + transport.preflight_timeout
+        expected = transport.workers
+        futures: list[tuple[RoutedTransportPool, Any]] = []
+        for pool in transport.pools:
+            app = self._python_app_factory(
+                data_flow_kernel=self._active_dfk,
+                cache=False,
+                executors=[pool.label],
+            )(_shared_store_probe)
+            for _ in range(pool.workers):
+                futures.append((pool, app(root, real_root, nonce, expected, transport.preflight_timeout)))
+        for pool, future in futures:
+            try:
+                facts = future.result(timeout=max(deadline - time.monotonic(), 0))
+            except Exception as error:
+                raise RoutedTransportPreflightError(
+                    f"routed pool {pool.label!r} failed the shared-store preflight: {error!r}"
+                ) from error
+            if time.monotonic() > deadline:
+                raise RoutedTransportPreflightError(
+                    f"routed pool {pool.label!r} returned preflight facts after the acceptance deadline"
+                )
+            if not isinstance(facts, dict) or set(facts) != {"host", "pid", "root"}:
+                raise RoutedTransportPreflightError(f"routed pool {pool.label!r} returned malformed preflight facts")
+            if facts["root"] != real_root or facts["host"] != pool.node or type(facts["pid"]) is not int or facts["pid"] <= 0:
+                raise RoutedTransportPreflightError(
+                    f"routed pool {pool.label!r} did not prove hostname {pool.node!r}"
+                )
+
     def _submit_leaf(
         self,
         materialized: Any,
@@ -1380,6 +1745,7 @@ class ParslDispatcher(DispatcherContract):
         fence: Any,
         configured: ConfiguredRun,
         timeout: float | None,
+        binding: WorkerBinding,
     ) -> tuple[Any, _RemoteLeaf]:
         """Submit one begun member as a Layer A leaf on the attached HTEX.
 
@@ -1397,10 +1763,15 @@ class ParslDispatcher(DispatcherContract):
         dfk = self._active_dfk
         if dfk is None:
             raise RuntimeError("Parsl DFK is not active")
+        executors = (
+            [self._routed_label_for_node(binding.node)]
+            if type(self.transport) is RoutedAttachedTransportSpec
+            else list(self._active_executor_labels)
+        )
         app = self._python_app_factory(
             data_flow_kernel=dfk,
             cache=False,
-            executors=list(self._active_executor_labels),
+            executors=executors,
         )(run_leaf)
         handle = _RemoteLeaf(request)
         future = app(request.encode())
@@ -1552,12 +1923,17 @@ class ParslDispatcher(DispatcherContract):
 
 __all__ = [
     "ATTACHED_TRANSPORT_SCHEMA",
+    "ROUTED_ATTACHED_TRANSPORT_SCHEMA",
     "AttachedTransportSpec",
+    "RoutedAttachedTransportSpec",
+    "RoutedTransportPool",
     "ParslDispatcher",
     "ParslUnavailableError",
     "RemoteInspectionError",
     "RemoteLeafLaunchError",
     "SharedStorePreflightError",
+    "RoutedTransportPreflightError",
     "UnsupportedParslExecutorError",
     "UnsupportedTransportError",
+    "decode_attached_transport",
 ]

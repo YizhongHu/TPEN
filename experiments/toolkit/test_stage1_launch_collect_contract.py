@@ -52,12 +52,13 @@ def test_planned_launch_paths_bind_and_collect_contract_fixture(
     source_sha = "a" * 40
     model_payload = b"stage1-e2e-model"
     checkpoint_sha = hashlib.sha256(model_payload).hexdigest()
-    protocol = Protocol(1, 2, 1, 2, 3, 4, 2, 2)
-    bindings = {(system_name, lineage, 7): checkpoint_sha
-                for system_name in SYSTEMS for lineage in range(3)}
+    protocol = Protocol(1, 2, 7, 2, 3, 4, 2, 2)
+    bindings = {(system_name, lineage, checkpoint): checkpoint_sha
+                for system_name in SYSTEMS for lineage in range(3)
+                for checkpoint in (0, 7)}
     planned = build_manifest(
         protocol=protocol, source_sha=source_sha, config_sha256="b" * 64,
-        checkpoints=[7], lineage_seeds=[11, 12, 13], checkpoint_sha256=bindings,
+        checkpoints=[0, 7], lineage_seeds=[11, 12, 13], checkpoint_sha256=bindings,
         results_root=str(tmp_path),
     )
     rows = [row for row in planned if row["kind"] == "eval" and row["system"] == "hooke1"
