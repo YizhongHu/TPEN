@@ -351,28 +351,27 @@ def test_real_overlay_train_eval_collect_chain(tmp_path: Path) -> None:
         source_sha=source_sha,
         device="cpu",
     )
-    eval_row = next(row for row in eval_rows if row["lineage"] == 0 and row["stream"] == 0)
-    eval_overrides = row_overrides(eval_row) + [
-        "evaluation_sampler.burn_in=1", "evaluation_sampler.n_steps=1",
-    ]
-    validate_gateway_binding(
-        binding=_binding_token(eval_row),
-        config=str(eval_row["config"]),
-        overrides=eval_overrides,
-        kind="eval",
-        expected_checkpoint_sha256=str(eval_row["checkpoint_sha256"]),
-    )
-    eval_cfg = load_config(str(CONFIG_ROOT / "he" / "eval.yaml"), eval_overrides)
-    assert run_from_config(
-        eval_cfg, config_path=str(CONFIG_ROOT / "he" / "eval.yaml"),
-        command="stage1 overlay eval", raise_exceptions=True,
-    ) == 0
+    produced_eval_rows = [row for row in eval_rows if row["lineage"] == 0]
+    for eval_row in produced_eval_rows:
+        eval_overrides = row_overrides(eval_row) + [
+            "evaluation_sampler.burn_in=1", "evaluation_sampler.n_steps=1",
+        ]
+        validate_gateway_binding(
+            binding=_binding_token(eval_row),
+            config=str(eval_row["config"]),
+            overrides=eval_overrides,
+            kind="eval",
+            expected_checkpoint_sha256=str(eval_row["checkpoint_sha256"]),
+        )
+        eval_cfg = load_config(str(CONFIG_ROOT / "he" / "eval.yaml"), eval_overrides)
+        assert run_from_config(
+            eval_cfg, config_path=str(CONFIG_ROOT / "he" / "eval.yaml"),
+            command="stage1 overlay eval", raise_exceptions=True,
+        ) == 0
     # The tiny producer executes only lineage 0; the other lineages remain
     # bound above so phase-2 admission covers every planned train row, but
     # their unproduced eval rows must not be handed to the collector.
-    document_rows = phase1_rows + [
-        row for row in eval_rows if row["lineage"] == 0
-    ]
+    document_rows = phase1_rows + produced_eval_rows
     collected = collect({
         "schema": "stage1/v3",
         "manifest_hash": manifest_hash(document_rows),
