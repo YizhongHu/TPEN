@@ -305,16 +305,25 @@ def test_real_overlay_train_eval_collect_chain(tmp_path: Path) -> None:
         and "energy" in record.get("metrics", {})
         for record in metric_records
     )
+    observed_namespaces = {
+        record.get("namespace")
+        for record in metric_records
+        if isinstance(record.get("namespace"), str)
+    }
     for namespace in (
         "checks/data_integrity",
         "checks/gradient",
-        "train/module_norms",
-        "train/optimizer_state",
         "train/perf",
+        "train/factors",
+        "train/training_history",
     ):
-        assert any(
-            record.get("namespace") == namespace for record in metric_records
-        ), namespace
+        assert namespace in observed_namespaces, namespace
+    for prefix in ("train/module_norms/", "train/optimizer_state/"):
+        matching_namespaces = {
+            namespace for namespace in observed_namespaces if namespace.startswith(prefix)
+        }
+        assert matching_namespaces, prefix
+        assert all(namespace.removeprefix(prefix) for namespace in matching_namespaces)
     checkpoint_file = train_dir / "checkpoints" / "step_000001" / "model.pt"
     checkpoint_sha = hashlib.sha256(checkpoint_file.read_bytes()).hexdigest()
 
