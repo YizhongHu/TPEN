@@ -541,7 +541,6 @@ def test_plan_reports_small_cpu_layout_without_gpu_guard(tmp_path: Path) -> None
         PLAN_OUTPUT=str(output_path),
         PLAN_PHASE="1",
         SYSTEM="he",
-        CHECKPOINTS="50000",
         LINEAGE_SEEDS="1:2:3",
         TASKSET_ALLOWED="0-3",
     )
@@ -550,6 +549,30 @@ def test_plan_reports_small_cpu_layout_without_gpu_guard(tmp_path: Path) -> None
     assert result.returncode == 0, result.stderr
     assert "POLARIS_LAYOUT report-only=1 cores=4 cpus=0,1,2,3" in result.stdout
     assert output_path.is_file()
+
+
+def test_plan_rejects_noncanonical_phase1_checkpoints(tmp_path: Path) -> None:
+    prefix = tmp_path / "test-prefix"
+    results_root = prefix / "results"
+    plan_dir = results_root / "plan"
+    plan_dir.mkdir(parents=True)
+    env = _env(
+        tmp_path,
+        RESULTS_ROOT=str(results_root),
+        TPEN_POLARIS_TEST_RESULTS_PREFIX=str(prefix),
+        PBS_ENVIRONMENT="",
+        PBS_JOBID="",
+        PLAN_OUTPUT=str(plan_dir / "phase1.json"),
+        PLAN_PHASE="1",
+        SYSTEM="he",
+        CHECKPOINTS="50000",
+        LINEAGE_SEEDS="1:2:3",
+        TASKSET_ALLOWED="0-3",
+    )
+    env["MODE"] = "plan"
+    result = _run("plan", env)
+    assert result.returncode == 1
+    assert "train checkpoints must equal the declared retention cadence" in result.stderr
 
 
 def test_mutant_python_replacements_parse_and_killers_are_collected() -> None:
@@ -708,7 +731,7 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
     plan_path = results_root / "plan" / "phase1.json"
     env.update({
         "MODE": "plan", "PLAN_PHASE": "1", "SYSTEM": "he",
-        "PLAN_OUTPUT": str(plan_path), "CHECKPOINTS": "50000", "LINEAGE_SEEDS": "1:2:3",
+        "PLAN_OUTPUT": str(plan_path), "LINEAGE_SEEDS": "1:2:3",
     })
     planned = _run("plan", env)
     assert planned.returncode == 0, planned.stderr
@@ -769,7 +792,7 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
             for row in phase1["rows"] if row["kind"] == "train"
         },
         "checkpoints": {
-            f"{row['system']}:{row['lineage']}:50000": "0" * 64
+            f"{row['system']}:{row['lineage']}:100000": "0" * 64
             for row in phase1["rows"] if row["kind"] == "train"
         },
     }
@@ -780,7 +803,7 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
         sys.executable, "-m", "experiments.atomistic.stage1.plan", "--output", str(phase2_path),
         "--source-sha", source_sha, "--results-root", str(results_root), "--phase", "2",
         "--phase1-manifest", str(plan_path), "--checkpoint-bindings", str(evidence_path),
-        "--checkpoints", "50000", "--lineage-seeds", "1", "2", "3",
+        "--checkpoints", "100000", "--lineage-seeds", "1", "2", "3",
     ], cwd=checkout, check=True)
     env.update({"MODE": "eval", "PLAN_MANIFEST": str(phase2_path)})
     evaluated = _run("eval", env)

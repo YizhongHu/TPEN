@@ -594,18 +594,22 @@ run_plan() {
   local -a checkpoints lineage_seeds
   require_value PLAN_OUTPUT
   require_value PLAN_PHASE
-  require_value CHECKPOINTS
+  if [[ "$PLAN_PHASE" == 2 ]]; then
+    require_value CHECKPOINTS
+  fi
   require_value LINEAGE_SEEDS
   [[ "$PLAN_PHASE" == 1 || "$PLAN_PHASE" == 2 ]] || die "PLAN_PHASE must be 1 or 2"
-  CHECKPOINTS="${CHECKPOINTS//:/ }"
   LINEAGE_SEEDS="${LINEAGE_SEEDS//:/ }"
   assert_contained_path "$PLAN_OUTPUT" "$RESULTS_ROOT" PLAN_OUTPUT
-  read -r -a checkpoints <<< "$CHECKPOINTS"
   read -r -a lineage_seeds <<< "$LINEAGE_SEEDS"
   command+=(--phase "$PLAN_PHASE" --output "$PLAN_OUTPUT"
             --source-sha "$SOURCE_SHA" --results-root "$RESULTS_ROOT"
-            --checkpoints "${checkpoints[@]}"
             --lineage-seeds "${lineage_seeds[@]}")
+  if [[ -n "${CHECKPOINTS:-}" ]]; then
+    CHECKPOINTS="${CHECKPOINTS//:/ }"
+    read -r -a checkpoints <<< "$CHECKPOINTS"
+    command+=(--checkpoints "${checkpoints[@]}")
+  fi
   if [[ "$PLAN_PHASE" == 1 ]]; then
     require_value SYSTEM
     command+=(--systems "$SYSTEM" --device cuda)

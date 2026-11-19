@@ -1,0 +1,25 @@
+{
+  "mutants": [
+    {
+      "id": "lineage-50000",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "STAGE1_PROTOCOL = Protocol(1000, 256, 100000, 4096, 3, 4, 4096, 256)",
+      "new": "STAGE1_PROTOCOL = Protocol(1000, 256, 50000, 4096, 3, 4, 4096, 256)",
+      "killer": "experiments/atomistic/stage1/tests/test_system_configs.py::test_real_he_h2_phase1_rows_bind_protocol_horizon"
+    },
+    {
+      "id": "omit-terminal-boundary",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "if protocol.lineage_updates not in checkpoints:",
+      "new": "if False and protocol.lineage_updates not in checkpoints:",
+      "killer": "experiments/atomistic/stage1/tests/test_step_zero.py::test_phase1_retention_requires_initial_and_terminal_boundaries"
+    },
+    {
+      "id": "omit-zero-boundary",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "if 0 not in checkpoints:",
+      "new": "if False and 0 not in checkpoints:",
+      "killer": "experiments/atomistic/stage1/tests/test_step_zero.py::test_phase1_retention_requires_initial_and_terminal_boundaries"
+    }
+  ]
+}

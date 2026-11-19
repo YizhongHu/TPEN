@@ -32,29 +32,22 @@ from tpen.run import load_config
 
 
 CONFIG_ROOT = Path(__file__).parents[1] / "configs"
-NO_ZERO_FIXTURE = Path(__file__).with_name("fixtures") / "no-zero-manifest-v3.json"
+CANONICAL_FIXTURE = Path(__file__).with_name("fixtures") / "canonical-manifest-v3.json"
 
 
-def _no_zero_manifest_bytes() -> bytes:
-    """Render the fixed no-zero manifest using the current protocol code."""
+def _canonical_manifest_bytes() -> bytes:
+    """Render the fixed canonical manifest using the current protocol code."""
 
-    fixture = json.loads(NO_ZERO_FIXTURE.read_text(encoding="utf-8"))
+    fixture = json.loads(CANONICAL_FIXTURE.read_text(encoding="utf-8"))
     systems = tuple(fixture["systems"])
-    checkpoint = int(fixture["checkpoints"][0])
-    checkpoint_sha256 = {
-        (system, lineage, checkpoint): fixture["checkpoint_sha256"]
-        for system in systems
-        for lineage in range(len(fixture["lineage_seeds"]))
-    }
     rows = build_manifest(
         protocol=STAGE1_PROTOCOL,
         source_sha=fixture["source_sha"],
         config_sha256=fixture["config_sha256"],
         checkpoints=fixture["checkpoints"],
         lineage_seeds=fixture["lineage_seeds"],
-        checkpoint_sha256=checkpoint_sha256,
+        checkpoint_sha256={},
         results_root=fixture["results_root"],
-        expected_physical_system_id=fixture["physical_system_id"],
         systems=systems,
         phase=int(fixture["phase"]),
     )
@@ -113,6 +106,20 @@ def test_zero_is_admitted_once_and_negative_or_duplicate_steps_are_rejected(
             _phase1_rows(tiny_protocol, checkpoints, tmp_path)
 
 
+def test_phase1_retention_requires_initial_and_terminal_boundaries(
+    tiny_protocol: Protocol, tmp_path: Path,
+) -> None:
+    """Phase-one training cannot omit either retained boundary checkpoint."""
+
+    for checkpoints, message in (
+        ([0, 1, 6], "terminal"),
+        ([1, 7], "initial zero"),
+        ([0, 7, 8], "exceed"),
+    ):
+        with pytest.raises(ProtocolError, match=message):
+            _phase1_rows(tiny_protocol, checkpoints, tmp_path)
+
+
 def test_phase2_binds_zero_digest_and_emits_four_streams(
     tiny_protocol: Protocol, tmp_path: Path,
 ) -> None:
@@ -150,26 +157,98 @@ def test_phase2_binds_zero_digest_and_emits_four_streams(
     assert train_rows
 
 
+@pytest.mark.parametrize(
+    ("phase", "checkpoints", "should_raise"),
+    (
+        (1, [0, 7], False),
+        (1, [7], True),
+        (1, [0, 8], True),
+        (2, [0, 7], False),
+        (2, [7], True),
+        (2, [0, 8], True),
+    ),
+)
+def test_one_shot_phase2_emits_train_rows_and_rejects_invalid_retention(
+    tiny_protocol: Protocol,
+    tmp_path: Path,
+    phase: int,
+    checkpoints: list[int],
+    should_raise: bool,
+) -> None:
+    """Both manifest modes must enforce the training retention boundaries."""
+
+    kwargs = dict(
+        protocol=tiny_protocol,
+        source_sha="a" * 40,
+        config_sha256={"he": "b" * 64},
+        checkpoints=checkpoints,
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={
+            ("he", lineage, checkpoint): "c" * 64
+            for lineage in range(tiny_protocol.lineages)
+            for checkpoint in checkpoints
+        },
+        results_root=str(tmp_path / "results"),
+        systems=("he",),
+        phase=phase,
+        expected_physical_system_id={"he": "d" * 64},
+    )
+    if should_raise:
+        with pytest.raises(ProtocolError, match="terminal|initial zero|exceed"):
+            build_manifest(**kwargs)
+        return
+
+    rows = build_manifest(**kwargs)
+    train_rows = [row for row in rows if row["kind"] == "train"]
+    assert len(train_rows) == tiny_protocol.lineages
+    assert all(row["checkpoint_steps"] == checkpoints for row in train_rows)
+    if phase == 2:
+        eval_rows = [row for row in rows if row["kind"] == "eval"]
+        assert eval_rows
+        assert {row["checkpoint"] for row in eval_rows} == set(checkpoints)
+
+
 def test_positive_row_identity_does_not_depend_on_zero_prefix(
     tiny_protocol: Protocol, tmp_path: Path,
 ) -> None:
     """Adding zero does not shift positive checkpoint coordinates or seeds."""
 
-    def planned(checkpoints: list[int]) -> list[dict]:
-        return build_manifest(
+    phase1 = build_manifest(
             protocol=tiny_protocol,
             source_sha="a" * 40,
             config_sha256={system: "b" * 64 for system in SYSTEMS},
-            checkpoints=checkpoints,
+            checkpoints=[0, 7],
             lineage_seeds=[11, 12, 13],
-            checkpoint_sha256={
-                (system, lineage, checkpoint): "c" * 64
-                for system in SYSTEMS
-                for lineage in range(tiny_protocol.lineages)
-                for checkpoint in checkpoints
-            },
+            checkpoint_sha256={},
             results_root=str(tmp_path / "results"),
-            phase=2,
+            phase=1,
+        )
+    phase1_hash = manifest_hash(phase1)
+    train_rows = [row for row in phase1 if row["kind"] == "train"]
+
+    def planned(checkpoints: list[int]) -> list[dict]:
+        return bind_evaluation_manifest(
+            phase1_rows=phase1,
+            checkpoints=checkpoints,
+            checkpoint_evidence={
+                "schema": "stage1-checkpoint-evidence/v1",
+                "phase1_manifest_hash": phase1_hash,
+                "phase1_train_row_hashes": {
+                    f"{row['system']}:{row['lineage']}": manifest_hash([row])
+                    for row in train_rows
+                },
+                "checkpoints": {
+                    f"{system}:{lineage}:{checkpoint}": "c" * 64
+                    for system in SYSTEMS
+                    for lineage in range(tiny_protocol.lineages)
+                    for checkpoint in checkpoints
+                },
+            },
+            source_sha="a" * 40,
+            config_sha256={system: "b" * 64 for system in SYSTEMS},
+            protocol=tiny_protocol,
+            phase1_manifest_hash=phase1_hash,
+            expected_physical_system_id={system: "d" * 64 for system in SYSTEMS},
         )
 
     without_zero = planned([7])
@@ -194,11 +273,11 @@ def test_positive_row_identity_does_not_depend_on_zero_prefix(
     assert evaluation_seed(system="he", lineage=0, checkpoint=7, stream=2) == expected_he_seed
 
 
-def test_no_zero_manifest_matches_pre_change_golden_and_detects_non_id_change() -> None:
-    """The no-zero full manifest stays byte-stable and compares every field."""
+def test_canonical_manifest_matches_golden_and_detects_non_id_change() -> None:
+    """The canonical full manifest stays byte-stable and compares every field."""
 
-    fixture = json.loads(NO_ZERO_FIXTURE.read_text(encoding="utf-8"))
-    rendered = _no_zero_manifest_bytes()
+    fixture = json.loads(CANONICAL_FIXTURE.read_text(encoding="utf-8"))
+    rendered = _canonical_manifest_bytes()
     assert len(rendered) == fixture["manifest_bytes"]
     assert hashlib.sha256(rendered).hexdigest() == fixture["manifest_sha256"]
 

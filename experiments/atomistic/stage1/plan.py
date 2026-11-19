@@ -36,9 +36,18 @@ def main() -> int:
     parser.add_argument("--systems", nargs="+", choices=SYSTEMS)
     parser.add_argument("--phase1-manifest", type=Path,
                         help="phase-1 manifest to bind during phase 2")
-    parser.add_argument("--checkpoints", type=int, nargs="+", required=True)
+    parser.add_argument("--checkpoints", type=int, nargs="+")
     parser.add_argument("--lineage-seeds", type=int, nargs="+", required=True)
     args = parser.parse_args()
+    if args.checkpoints is None:
+        if args.phase != 1 or STAGE1_PROTOCOL.retention_cadence is None:
+            parser.error(
+                "--checkpoints is required for phase 2 or protocols without retention_cadence"
+            )
+        args.checkpoints = list(range(
+            0, STAGE1_PROTOCOL.lineage_updates + 1,
+            STAGE1_PROTOCOL.retention_cadence,
+        ))
     systems = tuple(args.systems) if args.systems else None
     if args.overlay_sha256 is not None and args.overlay is None:
         raise ValueError("--overlay-sha256 requires --overlay")

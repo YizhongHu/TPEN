@@ -144,14 +144,14 @@ sha256sum "$RESULTS_ROOT/inputs/pbs_stage1.sh" > "$RESULTS_ROOT/inputs/pbs_stage
 qsub -A HetRxnEnergy -q debug \
   -l select=1:system=polaris:ngpus=4:ncpus=64,walltime=00:55:00,filesystems=home:eagle,place=scatter \
   -o "$RESULTS_ROOT/logs/plan.pbs.out" -e "$RESULTS_ROOT/logs/plan.pbs.err" \
-  -v MODE=plan,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",PLAN_PHASE=1,SYSTEM="$SYSTEM",PLAN_OUTPUT="$RESULTS_ROOT/plan/phase1-manifest.json",CHECKPOINTS=50000,LINEAGE_SEEDS=1:2:3 \
+  -v MODE=plan,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",PLAN_PHASE=1,SYSTEM="$SYSTEM",PLAN_OUTPUT="$RESULTS_ROOT/plan/phase1-manifest.json",LINEAGE_SEEDS=1:2:3 \
   "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 ```
 
 Require `qstat -xf` to show the delivered queue `debug`, `Exit_status=0`,
 and `run_count=1` before reading the phase-1 manifest.  The plan must contain
 one smoke row and three train rows for the selected system, with lineages
-`0,1,2`, walkers `4096`, updates `50000`, terminal checkpoint `50000`,
+`0,1,2`, walkers `4096`, updates `100000`, terminal checkpoint `100000`,
 `device=cuda`, and the exact `SOURCE_SHA`.
 
 ### 2. Three train rows in one `capacity` allocation
@@ -183,14 +183,17 @@ captures the exact argv returned by `launch.command_for_row`.
 
 After training, build `plan/checkpoint-evidence.json` from the three named run
 directories only.  Require `status.json` to say `completed`, require the
-complete `checkpoints/step_050000` directory, and record each `model.pt`
+complete `checkpoints/step_100000` directory, and record each `model.pt`
 SHA-256.  Do not search the Eagle tree recursively.  Then submit:
+
+This phase-2 selection follows the S0-B evaluation-cadence decision; the
+full roster B and evaluation cadence remain specified there.
 
 ```bash
 qsub -A HetRxnEnergy -q debug \
   -l select=1:system=polaris:ngpus=4:ncpus=64,walltime=00:55:00,filesystems=home:eagle,place=scatter \
   -o "$RESULTS_ROOT/logs/phase2.pbs.out" -e "$RESULTS_ROOT/logs/phase2.pbs.err" \
-  -v MODE=plan,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",PLAN_PHASE=2,PLAN_OUTPUT="$RESULTS_ROOT/plan/phase2-manifest.json",PHASE1_MANIFEST="$RESULTS_ROOT/plan/phase1-manifest.json",CHECKPOINT_BINDINGS="$RESULTS_ROOT/plan/checkpoint-evidence.json",CHECKPOINTS=50000,LINEAGE_SEEDS=1:2:3 \
+  -v MODE=plan,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",PLAN_PHASE=2,PLAN_OUTPUT="$RESULTS_ROOT/plan/phase2-manifest.json",PHASE1_MANIFEST="$RESULTS_ROOT/plan/phase1-manifest.json",CHECKPOINT_BINDINGS="$RESULTS_ROOT/plan/checkpoint-evidence.json",CHECKPOINTS=100000,LINEAGE_SEEDS=1:2:3 \
   "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 ```
 
