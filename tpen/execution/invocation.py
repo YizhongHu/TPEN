@@ -466,8 +466,38 @@ def classify_core_outcome(
     return InvocationOutcome.PARKED, facts.reason or "core outcome is ambiguous; park for reconciliation"
 
 
-def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    """Fsync JSON and exclusively publish it without replacing a prior receipt."""
+class ReceiptExistsError(FileExistsError):
+    """Raised when exclusive receipt publication finds an occupied path."""
+
+
+def create_json_receipt(path: str | Path, payload: Mapping[str, Any]) -> None:
+    """Atomically create a JSON receipt without replacing an existing path.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Destination in an existing directory on a filesystem supporting hard
+        links. Parent directories are not created.
+    payload : Mapping[str, Any]
+        JSON-shaped receipt, encoded as canonical UTF-8 JSON plus one newline.
+
+    Raises
+    ------
+    ReceiptExistsError
+        The destination already exists, including a concurrent winner.
+    OSError
+        Writing, linking, or syncing fails. A directory-sync failure after
+        publication can leave the complete receipt present.
+
+    Notes
+    -----
+    A uniquely named temporary file is exclusively created, written and
+    fsynced before linking to the destination. The link is the atomic
+    no-overwrite publication point; the parent directory is then fsynced.
+    This primitive supplies no lease expiry or takeover policy.
+    """
+
+    path = Path(path)
 
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -480,7 +510,10 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
             handle.write(b"\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.link(temporary, path)
+        try:
+            os.link(temporary, path)
+        except FileExistsError as exc:
+            raise ReceiptExistsError(exc.errno, exc.strerror, str(path)) from exc
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -493,6 +526,12 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    """Publish internal receipts through the public exclusive-create primitive."""
+
+    create_json_receipt(path, payload)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -682,6 +721,47 @@ def _leaf_relative_checkpoint_location(checkpoint_root: Path, checkpoint_dir: Pa
         return str(resolved_dir)
 
 
+def discover_published_checkpoint(checkpoint_root: str | Path) -> CheckpointRef | None:
+    """Discover the latest published train-resume checkpoint without writes.
+
+    Parameters
+    ----------
+    checkpoint_root : str or pathlib.Path
+        Directory containing checkpoint step directories and publication indexes.
+
+    Returns
+    -------
+    CheckpointRef or None
+        Validated published reference, or ``None`` when no checkpoint exists.
+        A newer complete but unpublished directory is ignored.
+
+    Raises
+    ------
+    PredecessorDiscoveryRefusal
+        Publication indexes are missing for complete checkpoints or the latest
+        pointer and catalog disagree.
+    ValueError
+        Checkpoint bytes, manifest, or publication catalog are invalid.
+    OSError
+        Checkpoint artifacts cannot be read.
+
+    Notes
+    -----
+    Only checkpoint publication records authorize selection. Logger JSONL/CSV,
+    metrics, status and run-outcome files are never consulted. This operation
+    neither repairs indexes nor changes restore or takeover policy.
+    """
+
+    checkpoint_root = Path(checkpoint_root)
+    if not checkpoint_root.is_dir():
+        return None
+    ref = _discover_published_checkpoint(checkpoint_root)
+    if ref is not None:
+        read_manifest(ref.checkpoint_dir / "manifest.json", mode="train_resume")
+        ref.validate()
+    return ref
+
+
 def _committed_checkpoint(run_dir: Path, *, allow_reconcile: bool = False) -> CheckpointRef | None:
     """Read the latest committed full-state checkpoint through checkpoint APIs.
 
@@ -699,11 +779,9 @@ def _committed_checkpoint(run_dir: Path, *, allow_reconcile: bool = False) -> Ch
     if not checkpoint_root.is_dir():
         return None
 
-    ref = (
-        _owner_committed_checkpoint(checkpoint_root)
-        if allow_reconcile
-        else _discover_published_checkpoint(checkpoint_root)
-    )
+    if not allow_reconcile:
+        return discover_published_checkpoint(checkpoint_root)
+    ref = _owner_committed_checkpoint(checkpoint_root)
 
     if ref is None:
         return None

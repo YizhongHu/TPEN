@@ -1,5 +1,12 @@
 # Release Notes
 
+## Unreleased
+
+- **Core restart primitives (CX-08)**: expose read-only published checkpoint
+  discovery and atomic exclusive JSON receipt creation through `tpen.execution`.
+  Discovery uses checkpoint publication records only; receipts never overwrite
+  an existing path. Restore and takeover policies are unchanged.
+
 ## v0.5.4 - Stage 1 production GPU launch, reconciled collector statistics, two-phase manifest identity
 
 5 commits since `v0.5.3` (`0cc1de6d`), merged into `dev` through PRs #744,
