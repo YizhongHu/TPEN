@@ -367,7 +367,12 @@ def test_real_overlay_train_eval_collect_chain(tmp_path: Path) -> None:
         eval_cfg, config_path=str(CONFIG_ROOT / "he" / "eval.yaml"),
         command="stage1 overlay eval", raise_exceptions=True,
     ) == 0
-    document_rows = phase1_rows + eval_rows
+    # The tiny producer executes only lineage 0; the other lineages remain
+    # bound above so phase-2 admission covers every planned train row, but
+    # their unproduced eval rows must not be handed to the collector.
+    document_rows = phase1_rows + [
+        row for row in eval_rows if row["lineage"] == 0
+    ]
     collected = collect({
         "schema": "stage1/v3",
         "manifest_hash": manifest_hash(document_rows),
