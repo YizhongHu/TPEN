@@ -10,7 +10,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from tpen.checkpoint import CheckpointRef, TrainResume, save_checkpoint
+from tpen.checkpoint import CheckpointRef, ModelOnly, TrainResume, save_checkpoint
 from tpen.execution import (
     PredecessorDiscoveryRefusal,
     ReceiptExistsError,
@@ -20,8 +20,8 @@ from tpen.execution import (
 from tpen.execution import invocation
 
 
-def _save(root: Path, step: int) -> CheckpointRef:
-    """Produce real full-state checkpoints without a training run."""
+def _save(root: Path, step: int, *, payload: ModelOnly | TrainResume | None = None) -> CheckpointRef:
+    """Produce real published checkpoints without a training run."""
     model = torch.nn.Linear(1, 1, bias=False)
     context = SimpleNamespace(
         cfg=OmegaConf.create({"trainer": {"max_steps": 10}}),
@@ -36,7 +36,7 @@ def _save(root: Path, step: int) -> CheckpointRef:
         optimizer=torch.optim.SGD(model.parameters(), lr=0.1),
         trainer=SimpleNamespace(state_dict=lambda: {"next_iteration": step, "completed_updates": step}),
         sampler=SimpleNamespace(mcmc_state_dict=lambda: {"walker": step}),
-        payload=TrainResume(),
+        payload=TrainResume() if payload is None else payload,
         context=context,
     )
     return CheckpointRef.from_directory(directory)
@@ -80,6 +80,20 @@ def test_discovery_ignores_newer_unpublished_directory(tmp_path: Path) -> None:
     before = _snapshot(tmp_path)
     assert discover_published_checkpoint(root) == expected
     assert newer.checkpoint_dir.is_dir()
+    assert _snapshot(tmp_path) == before
+
+
+def test_discovery_refuses_published_model_only_without_writes(tmp_path: Path) -> None:
+    root = tmp_path / "checkpoints"
+    expected = _save(root, 1, payload=ModelOnly())
+    before = _snapshot(tmp_path)
+    # Publication is consistent: only the public train-resume check must refuse.
+    assert invocation._discover_published_checkpoint(root) == expected
+    with pytest.raises(
+        ValueError,
+        match="checkpoint payload profile 'model_only' cannot satisfy restore mode 'train_resume'",
+    ):
+        discover_published_checkpoint(root)
     assert _snapshot(tmp_path) == before
 
 
