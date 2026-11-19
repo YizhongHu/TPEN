@@ -481,38 +481,6 @@ class DirectoryStore:
             return result
         fences = {}
         try:
-            for task in group.members:
-                self._validate_task_id(task.task_id)
-                item = by_task[task.task_id]
-                if item.start_receipt is None:
-                    task_dir = os.path.join(self._group_dir(group), task.task_id)
-                    if os.path.lexists(task_dir):
-                        _require_directory(task_dir, "fresh task directory")
-                        if set(os.listdir(task_dir)) - {_TASK_LOCK}:
-                            raise FenceRejected("fresh-member-has-durable-state")
-                    continue
-                binding = bindings[task.task_id]
-                if not isinstance(binding, MemberInvocationV2):
-                    raise TypeError("leaf echo must be MemberInvocationV2")
-                if (binding.allocation_attempt != allocation_attempt or binding.lineage_id != task.lineage_id
-                        or binding.group_digest != group.identity):
-                    raise FenceRejected("crossed-allocation-evidence")
-                start = item.start_receipt
-                if item.receipt_digest is not None and item.receipt_digest != digest({
-                    "start_receipt": start.to_dict(), "outcome_receipt": item.outcome_receipt.to_dict(),
-                }):
-                    raise FenceRejected("crossed-receipt-digest")
-                fence = AttemptFence(self.root, group.identity, task.task_id, allocation_attempt.allocation_id.value, item.attempt_id, start.output_dir)
-                task_dir = self._task_dir_for_fence(fence)
-                with _task_lock(os.path.join(task_dir, _TASK_LOCK)):
-                    durable = self._validate_fence(fence, task_dir)
-                    self._validate_invocation(durable, binding)
-                    outcome_path = os.path.join(start.output_dir, "outcome.json")
-                    _require_regular(outcome_path, "outcome receipt")
-                    if (Path(os.path.join(start.output_dir, "start.json")).read_bytes() != start.encode()
-                            or Path(outcome_path).read_bytes() != item.outcome_receipt.encode()):
-                        raise FenceRejected("crossed-durable-receipt")
-                fences[task.task_id] = fence
             # Validate all proposed identity records before any ledger write.
             proposed = []
             for member in result.members:
@@ -538,6 +506,39 @@ class DirectoryStore:
                     if existing.encode() != candidate.encode():
                         return park("reconciliation-publication-conflict")
                     return existing.reconciliation
+                # Mutable state gates apply only to first publication.
+                for task in group.members:
+                    self._validate_task_id(task.task_id)
+                    item = by_task[task.task_id]
+                    if item.start_receipt is None:
+                        task_dir = os.path.join(self._group_dir(group), task.task_id)
+                        if os.path.lexists(task_dir):
+                            _require_directory(task_dir, "fresh task directory")
+                            if set(os.listdir(task_dir)) - {_TASK_LOCK}:
+                                raise FenceRejected("fresh-member-has-durable-state")
+                        continue
+                    binding = bindings[task.task_id]
+                    if not isinstance(binding, MemberInvocationV2):
+                        raise TypeError("leaf echo must be MemberInvocationV2")
+                    if (binding.allocation_attempt != allocation_attempt or binding.lineage_id != task.lineage_id
+                            or binding.group_digest != group.identity):
+                        raise FenceRejected("crossed-allocation-evidence")
+                    start = item.start_receipt
+                    if item.receipt_digest is not None and item.receipt_digest != digest({
+                        "start_receipt": start.to_dict(), "outcome_receipt": item.outcome_receipt.to_dict(),
+                    }):
+                        raise FenceRejected("crossed-receipt-digest")
+                    fence = AttemptFence(self.root, group.identity, task.task_id, allocation_attempt.allocation_id.value, item.attempt_id, start.output_dir)
+                    task_dir = self._task_dir_for_fence(fence)
+                    with _task_lock(os.path.join(task_dir, _TASK_LOCK)):
+                        durable = self._validate_fence(fence, task_dir)
+                        self._validate_invocation(durable, binding)
+                        outcome_path = os.path.join(start.output_dir, "outcome.json")
+                        _require_regular(outcome_path, "outcome receipt")
+                        if (Path(os.path.join(start.output_dir, "start.json")).read_bytes() != start.encode()
+                                or Path(outcome_path).read_bytes() != item.outcome_receipt.encode()):
+                            raise FenceRejected("crossed-durable-receipt")
+                    fences[task.task_id] = fence
                 # A concurrent first start must not race a fresh_pending
                 # publication. Existing-member successor gates own their
                 # separate task-lock recheck below.

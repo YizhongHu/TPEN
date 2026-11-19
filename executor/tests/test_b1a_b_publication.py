@@ -52,12 +52,13 @@ def _fixture(tmp_path, names=("successor",), remote=True):
             }, "c" * 64, status, "utc-2")
         else:
             outcome = store.finish_attempt(fence, status, "utc-2")
-        if name == "successor":
+        if name.startswith("successor"):
             store.record_core_outcome(fence, _planned_evidence(core_dir))
             verdict = _core("successor", profile=_profile(), admission="admitted", checkpoint="valid", quiescence="valid")
-            request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+            next_attempt = AttemptId("successor-1" if name == "successor" else "next-" + name)
+            request = store.build_successor_admission_request(fence, next_attempt, "a" * 64, 10)
             next_lease = replace(lease, allocation_attempt_id=AllocationAttemptId("lease-2"), allocation_id=AllocationId("allocation-2"), backend_job_id=BackendJobId("job-2"))
-            successor = MemberInvocationV2(next_lease, group.identity, name, binding.lineage_id, AttemptId("successor-1"), InvocationId("invocation-next"))
+            successor = MemberInvocationV2(next_lease, group.identity, name, binding.lineage_id, next_attempt, InvocationId("invocation-next" if name == "successor" else "invocation-next-" + name))
             successors[name] = (request, "b" * 64, successor)
         else:
             verdict = _core("unknown" if name == "ambiguous" else name)
@@ -263,6 +264,102 @@ def test_changed_evidence_cannot_merge_into_publication(tmp_path):
     assert _files(Path(fixture[0].root)) == snapshot
 
 
+@pytest.mark.parametrize("name", ["fresh", "terminal"])
+def test_replay_after_real_member_start_preserves_publication(tmp_path, name):
+    fixture = _fixture(tmp_path, (name,))
+    store, group, lease, inputs, bindings, successors, _ = fixture
+    result = _publish(fixture)
+    assert result.aggregate == ("replacement_required" if name == "fresh" else "settled")
+    original = store.read_reconciliation(group, lease).encode()
+    next_lease = replace(lease, allocation_attempt_id=AllocationAttemptId("consumed-lease"),
+                         allocation_id=AllocationId("consumed-allocation"), backend_job_id=BackendJobId("consumed-job"))
+    allocation = ConfiguredAllocation(next_lease.allocation_id, next_lease.backend_job_id, {})
+    # Exercise the public writer, including its real current-attempt pointer.
+    fence = store.begin_attempt(group, name, allocation, allocation_attempt=next_lease,
+                                invocation_id=InvocationId("consumed-invocation"))
+    assert Path(fence.output_dir, "start.json").is_file()
+    snapshot = _files(Path(store.root))
+    reopened = DirectoryStore(store.root)
+    assert reopened.publish_reconciliation(group, lease, inputs, bindings=bindings, successors=successors) == result
+    stored = reopened.read_reconciliation(group, lease)
+    assert stored.reconciliation == result
+    assert stored.encode() == original
+    assert _files(Path(store.root)) == snapshot
+    # A changed candidate must still conflict after the mutable state advances.
+    if name == "terminal":
+        changed = (replace(inputs[0], core_verdict=replace(inputs[0].core_verdict, reason="changed-after-start")),)
+        refused = reopened.publish_reconciliation(group, lease, changed, bindings=bindings, successors=successors)
+        assert refused.aggregate == "parked"
+        assert refused.members[0].reason_code == "reconciliation-publication-conflict"
+        assert reopened.read_reconciliation(group, lease).encode() == original
+        assert _files(Path(store.root)) == snapshot
+
+
+@pytest.mark.parametrize("field", ["allocation_id", "backend_job_id", "controller_generation", "observed_at_utc"])
+def test_conflicting_successor_allocation_attempt_parks_before_ledgers(tmp_path, field):
+    fixture = _fixture(tmp_path, ("successor", "successor-two"))
+    store, group, lease, _, _, successors, _ = fixture
+    request, acceptance, binding = successors["successor-two"]
+    changes = {
+        "allocation_id": AllocationId("crossed-allocation"),
+        "backend_job_id": BackendJobId("crossed-job"),
+        "controller_generation": "crossed-generation", "observed_at_utc": "crossed-observation",
+    }
+    crossed = replace(binding.allocation_attempt, **{field: changes[field]})
+    successors["successor-two"] = (request, acceptance, replace(binding, allocation_attempt=crossed))
+    snapshot = _files(Path(store.root))
+    assert _publish(fixture).aggregate == "parked"
+    assert not list(Path(store.root).rglob("successor-admission.json"))
+    assert store.read_reconciliation(group, lease) is None
+    assert _files(Path(store.root)) == snapshot
+
+
+def test_shared_successor_allocation_record_admits_and_replays(tmp_path):
+    fixture = _fixture(tmp_path, ("successor", "successor-two"))
+    store, group, lease, inputs, bindings, successors, _ = fixture
+    result = _publish(fixture)
+    assert result.aggregate == "replacement_required"
+    record = store.read_reconciliation(group, lease)
+    assert [member.outcome for member in record.members] == ["successor_admitted"] * 2
+    admitted = [member.admission.successor_binding for member in record.members]
+    assert admitted[0].allocation_attempt == admitted[1].allocation_attempt
+    assert admitted[0].attempt_id != admitted[1].attempt_id
+    assert admitted[0].invocation_id != admitted[1].invocation_id
+    assert len(list(Path(store.root).rglob("successor-admission.json"))) == 2
+    encoded = record.encode()
+    assert ReconciliationPublicationV2.decode(encoded).encode() == encoded
+    snapshot = _files(Path(store.root))
+    reopened = DirectoryStore(store.root)
+    assert reopened.publish_reconciliation(group, lease, inputs, bindings=bindings, successors=successors) == result
+    assert reopened.read_reconciliation(group, lease).encode() == encoded
+    assert _files(Path(store.root)) == snapshot
+
+
+@pytest.mark.parametrize("field", ["allocation_id", "backend_job_id", "controller_generation", "observed_at_utc"])
+def test_publication_constructor_and_decoder_reject_conflicting_allocations(tmp_path, field):
+    fixture = _fixture(tmp_path, ("successor", "successor-two"))
+    assert _publish(fixture).aggregate == "replacement_required"
+    record = fixture[0].read_reconciliation(fixture[1], fixture[2])
+    member = record.members[1]
+    binding = member.admission.successor_binding
+    changes = {
+        "allocation_id": AllocationId("crossed-allocation"),
+        "backend_job_id": BackendJobId("crossed-job"),
+        "controller_generation": "crossed-generation", "observed_at_utc": "crossed-observation",
+    }
+    crossed = replace(binding, allocation_attempt=replace(binding.allocation_attempt, **{field: changes[field]}))
+    changed = replace(member, admission=replace(member.admission, successor_binding=crossed))
+    with pytest.raises(ValueError, match="conflicting successor allocation-attempt"):
+        replace(record, members=(record.members[0], changed))
+    # Start from the real producer's record and recompute the altered digest,
+    # so rejection must come from identity consistency, not digest corruption.
+    data = record.to_dict()
+    data["members"][1] = changed.to_dict()
+    data["member_digests"][1] = digest(changed.to_dict())
+    with pytest.raises(ValueError, match="conflicting successor allocation-attempt"):
+        ReconciliationPublicationV2.decode(canonical_bytes(data))
+
+
 # Executable mutation specification for the independent cluster verifier.
 # Each edit is exact and unique; tests below validate the table's source anchors.
 # Runtime kills are intentionally UNMEASURED in this implementation receipt.
@@ -281,6 +378,9 @@ MUTANTS = (
     ("v1-attached-api-drift", "lifecycle/attached.py", "        begin_kwargs = {} if transport_kind == \"local\" else {\"transport_kind\": transport_kind}", "        begin_kwargs = {'transport_kind': None}", "test_v1_attached_api_and_start_bytes_unchanged"),
     ("crossed-invocation-echo", "storage.py", "        if encoded != stored.encode() or encoded != binding.encode():", "        if False:", "test_crossed_or_missing_evidence_parks_without_writes"),
     ("discard-member-digests", "results.py", "            \"member_digests\": [digest(member.to_dict()) for member in self.members],", "            \"member_digests\": [],", "test_publication_replay_and_exact_member_digests"),
+    ('replay-after-mutable-precondition', 'storage.py', '                existing = self.read_reconciliation(group, allocation_attempt)', '                for task in group.members:\n                    if by_task[task.task_id].start_receipt is None:\n                        task_dir = os.path.join(self._group_dir(group), task.task_id)\n                        if os.path.lexists(task_dir) and set(os.listdir(task_dir)) - {_TASK_LOCK}:\n                            raise FenceRejected("fresh-member-has-durable-state")\n                existing = self.read_reconciliation(group, allocation_attempt)', 'test_replay_after_real_member_start_preserves_publication'),
+    ('allow-conflicting-allocation-attempt', 'results.py', '            if previous != allocation:', '            if False:', 'test_conflicting_successor_allocation_attempt_parks_before_ledgers'),
+    ('decode-conflicting-allocation-attempt', 'results.py', '            if previous != allocation:', '            if False:', 'test_publication_constructor_and_decoder_reject_conflicting_allocations'),
 )
 
 

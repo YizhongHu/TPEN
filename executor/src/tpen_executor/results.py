@@ -1717,6 +1717,17 @@ class ReconciliationPublicationV2:
                         or successor.allocation_attempt.allocation_attempt_id == self.allocation_attempt.allocation_attempt_id
                         or successor.invocation_id == binding.invocation_id):
                     raise ValueError("successor binding is crossed or not fresh")
+        # One allocation-attempt identity denotes one complete immutable record.
+        # Storage constructs this candidate before writing any admission ledger;
+        # decoding follows the same constructor validation.
+        successor_allocations = {}
+        for member in members:
+            if member.admission is None:
+                continue
+            allocation = member.admission.successor_binding.allocation_attempt
+            previous = successor_allocations.setdefault(allocation.allocation_attempt_id, allocation)
+            if previous != allocation:
+                raise ValueError("conflicting successor allocation-attempt binding")
         successor_invocations = [member.admission.successor_binding.invocation_id for member in members if member.admission is not None]
         if len(set(successor_invocations)) != len(successor_invocations) or set(successor_invocations) & invocations:
             raise ValueError("successor invocation identity is reused")
