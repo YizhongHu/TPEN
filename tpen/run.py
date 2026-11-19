@@ -437,6 +437,15 @@ def run_from_config(
         :func:`prepare_run_context`; see its docstring for the routing
         contract. ``cfg`` and the recorded ``run.dir`` are unaffected.
 
+    Raises
+    ------
+    tpen.checkpoint.profiles.UnsupportedMutableStateError
+        With ``raise_exceptions=True``, a train-resume configuration outside
+        the native recovery profile is refused before context construction,
+        callback execution or mutable state initialization. Both configured
+        ``runner.load`` and ``restore_request`` use this admission boundary.
+        Fresh and model-only runs do not undergo profile admission.
+
     Returns
     -------
     int
@@ -476,6 +485,17 @@ def run_from_config(
         # exception event, logger teardown, `return 1`) rather than escaping as
         # a bare exception from a helper.
         validate_hi_train_config(cfg)
+        # Both operational requests and configured loads meet here, before
+        # context construction, callbacks, RNG seeding or runner construction.
+        # OperationalRestoreRequest is closed to train_resume; the configured
+        # mode lookup also handles runner.load: ${load} without resolving the
+        # callback profile (whose unresolved syntax is the admission contract).
+        if restore_request is not None or OmegaConf.select(
+            cfg, "runner.load.mode", default="none"
+        ) == "train_resume":
+            from tpen.checkpoint.profiles import validate_native_recovery_profile
+
+            validate_native_recovery_profile(cfg)
         if topology is not None:
             topology = execution_topology_from_facts(topology)
         if topology is None:

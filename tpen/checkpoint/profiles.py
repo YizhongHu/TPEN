@@ -490,6 +490,84 @@ def check_profile(config: Any, profile_name: str) -> ProfileCheck:
     )
 
 
+class UnsupportedMutableStateError(ValueError):
+    """A native recovery profile refusal with its stable capability code.
+
+    Parameters
+    ----------
+    message : str
+        Human-readable refusal explanation.
+    code : str, optional
+        Existing profile-check refusal code.
+    """
+
+    def __init__(self, message: str, *, code: str = "malformed-config") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _target(entry: Any, owner: str, index: int) -> str:
+    """Read a constructor name without resolving or importing it."""
+
+    if not isinstance(entry, Mapping):
+        raise UnsupportedMutableStateError(f"{owner}[{index}] must be a mapping")
+    value = entry.get("_target_")
+    if not isinstance(value, str) or not value:
+        raise UnsupportedMutableStateError(f"{owner}[{index}] has no explicit _target_")
+    return value
+
+
+def validate_native_recovery_profile(config: Any) -> None:
+    """Validate the allowlisted mutable-state owners in a config.
+
+    Parameters
+    ----------
+    config : mapping
+        Unresolved OmegaConf-compatible configuration.  Only syntax is read;
+        no ``_target_`` is imported or instantiated.
+
+    Raises
+    ------
+    UnsupportedMutableStateError
+        If a callback, logger or cadence is not certified by this profile.
+        ``code`` carries the existing profile-check refusal code.
+
+    Notes
+    -----
+    This is the existing execution validator, owned here so core restore
+    admission does not import executor adapters. Its legacy syntax behavior
+    and exception messages are preserved.
+    """
+
+    try:
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(config):
+            config = OmegaConf.to_container(config, resolve=False)
+    except ImportError:  # pragma: no cover - OmegaConf is a project dependency
+        pass
+    if not isinstance(config, Mapping):
+        raise UnsupportedMutableStateError("native profile requires a mapping config")
+    for owner, allowed in (
+        ("callbacks", SUPPORTED_CALLBACK_TARGETS),
+        ("loggers", SUPPORTED_LOGGER_TARGETS),
+    ):
+        entries = config.get(owner, ()) or ()
+        if not isinstance(entries, (list, tuple)):
+            raise UnsupportedMutableStateError(f"{owner} must be a sequence")
+        for index, entry in enumerate(entries):
+            target = _target(entry, owner, index)
+            if target not in allowed:
+                raise UnsupportedMutableStateError(
+                    f"{owner}[{index}] {target!r} is not in the native mutable-state profile",
+                    code="unsupported-callback" if owner == "callbacks" else "unsupported-logger",
+                )
+    cadence_refusal = check_resume_sensitive_callback_cadence(config)
+    if cadence_refusal is not None:
+        code, reason = cadence_refusal
+        raise UnsupportedMutableStateError(f"{code}: {reason}", code=code)
+
+
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)

@@ -1,5 +1,13 @@
 # Release Notes
 
+## Unreleased
+
+- **Native restore guard [CX-09]**: all `run_from_config` train-resume loads,
+  including operational requests and direct configured loads, check the existing
+  native recovery profile before construction or state mutation. Unsupported
+  callbacks/loggers/cadence now refuse with `UnsupportedMutableStateError` and
+  the existing profile code. Fresh and model-only runs are unchanged.
+
 ## v0.5.4 - Stage 1 production GPU launch, reconciled collector statistics, two-phase manifest identity
 
 5 commits since `v0.5.3` (`0cc1de6d`), merged into `dev` through PRs #744,
