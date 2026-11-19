@@ -164,6 +164,57 @@ def test_phase2_binds_zero_digest_and_emits_four_streams(
     assert train_rows
 
 
+@pytest.mark.parametrize(
+    ("phase", "checkpoints", "should_raise"),
+    (
+        (1, [0, 7], False),
+        (1, [7], True),
+        (1, [0, 8], True),
+        (2, [0, 7], False),
+        (2, [7], True),
+        (2, [0, 8], True),
+    ),
+)
+def test_one_shot_phase2_emits_train_rows_and_rejects_invalid_retention(
+    tiny_protocol: Protocol,
+    tmp_path: Path,
+    phase: int,
+    checkpoints: list[int],
+    should_raise: bool,
+) -> None:
+    """Both manifest modes must enforce the training retention boundaries."""
+
+    kwargs = dict(
+        protocol=tiny_protocol,
+        source_sha="a" * 40,
+        config_sha256={"he": "b" * 64},
+        checkpoints=checkpoints,
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={
+            ("he", lineage, checkpoint): "c" * 64
+            for lineage in range(tiny_protocol.lineages)
+            for checkpoint in checkpoints
+        },
+        results_root=str(tmp_path / "results"),
+        systems=("he",),
+        phase=phase,
+        expected_physical_system_id={"he": "d" * 64},
+    )
+    if should_raise:
+        with pytest.raises(ProtocolError, match="terminal|initial zero|exceed"):
+            build_manifest(**kwargs)
+        return
+
+    rows = build_manifest(**kwargs)
+    train_rows = [row for row in rows if row["kind"] == "train"]
+    assert len(train_rows) == tiny_protocol.lineages
+    assert all(row["checkpoint_steps"] == checkpoints for row in train_rows)
+    if phase == 2:
+        eval_rows = [row for row in rows if row["kind"] == "eval"]
+        assert eval_rows
+        assert {row["checkpoint"] for row in eval_rows} == set(checkpoints)
+
+
 def test_positive_row_identity_does_not_depend_on_zero_prefix(
     tiny_protocol: Protocol, tmp_path: Path,
 ) -> None:

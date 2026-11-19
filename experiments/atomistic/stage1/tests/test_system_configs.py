@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+import sys
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
@@ -15,6 +16,9 @@ from experiments.atomistic.stage1.protocol import (
     physical_system_id_from_config,
 )
 from experiments.atomistic.stage1.launch import row_overrides
+from experiments.atomistic.stage1 import train as stage1_train
+from experiments.atomistic.stage1.launch import _binding_token
+from experiments.atomistic.stage1.protocol import validate_gateway_binding
 
 
 ROOT = Path(__file__).parents[1] / "configs"
@@ -91,6 +95,59 @@ def test_real_train_config_horizon_matches_protocol(system: str) -> None:
     cfg = load_config(str(ROOT / system / "train.yaml"))
     assert cfg.trainer.max_steps == STAGE1_PROTOCOL.lineage_updates
     assert max(cfg.checkpoint_steps) == STAGE1_PROTOCOL.lineage_updates
+
+
+@pytest.mark.parametrize("system", ["he", "h2"])
+def test_real_train_row_reaches_gateway_zero_preparation(
+    system: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real He/H2 rows reach the gateway with zero routed separately."""
+
+    checkpoints = list(load_config(str(ROOT / system / "train.yaml")).checkpoint_steps)
+    rows = build_manifest(
+        protocol=STAGE1_PROTOCOL,
+        source_sha="a" * 40,
+        config_sha256=config_identities(config_root=ROOT, systems=(system,)),
+        checkpoints=checkpoints,
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root=str(tmp_path / "results"),
+        systems=(system,),
+        phase=1,
+        device="cpu",
+    )
+    row = next(row for row in rows if row["kind"] == "train" and row["lineage"] == 0)
+    overrides = row_overrides(row)
+    assert validate_gateway_binding(
+        binding=_binding_token(row),
+        config=str(row["config"]),
+        overrides=overrides,
+        kind="train",
+    ) == row
+
+    observed = {}
+    monkeypatch.setattr(
+        stage1_train,
+        "run_from_config",
+        lambda cfg, **_: observed.update(cfg=cfg) or 0,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage1-train",
+            "--config", str(ROOT / system / "train.yaml"),
+            "--kind", "train",
+            *overrides,
+            "--binding", _binding_token(row),
+        ],
+    )
+    assert stage1_train.main() == 0
+    cfg = observed["cfg"]
+    assert cfg.trainer.max_steps == STAGE1_PROTOCOL.lineage_updates
+    assert list(cfg.checkpoint_steps) == checkpoints[1:]
+    assert list(cfg.callbacks[4].schedule.updates) == checkpoints[1:]
+    assert cfg.callbacks[-1]._target_ == "tpen.callback.InitialCheckpoint"
 
 
 @pytest.mark.parametrize("system", ["he", "h2"])
