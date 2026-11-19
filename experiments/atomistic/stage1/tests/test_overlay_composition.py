@@ -396,7 +396,9 @@ def test_overlay_hash_is_exact_file_bytes() -> None:
 
 @pytest.mark.integration
 @pytest.mark.stage1_real_producer
-def test_real_overlay_train_eval_collect_chain(tmp_path: Path) -> None:
+def test_real_overlay_train_eval_collect_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The producer chain writes overlay diagnostics and collects eval rows."""
 
     source_sha = subprocess.check_output(
@@ -435,15 +437,20 @@ def test_real_overlay_train_eval_collect_chain(tmp_path: Path) -> None:
     )
     assert f"--overlay {train_row['overlay']}" in rendered_command
     assert f"--overlay-sha256 {train_row['overlay_sha256']}" in rendered_command
-    cfg = load_config(str(CONFIG_ROOT / "he" / "train.yaml"))
-    compose_train_overlay(
-        cfg, overlay=str(OVERLAY), expected_sha256=overlay_sha256(OVERLAY),
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage1-train",
+            "--config", str(CONFIG_ROOT / "he" / "train.yaml"),
+            "--kind", "train",
+            *train_overrides,
+            "--binding", _binding_token(train_row),
+            "--overlay", str(train_row["overlay"]),
+            "--overlay-sha256", str(train_row["overlay_sha256"]),
+        ],
     )
-    cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(train_overrides))
-    assert run_from_config(
-        cfg, config_path=str(CONFIG_ROOT / "he" / "train.yaml"),
-        command="stage1 overlay train", raise_exceptions=True,
-    ) == 0
+    assert stage1_train.main() == 0
     train_dir = resolve_run_dir(train_row)
     resolved_train = OmegaConf.load(train_dir / "resolved_config.yaml")
     assert resolved_train.stage1_overlay.path == protocol_module.OVERLAY_RELATIVE_PATH
