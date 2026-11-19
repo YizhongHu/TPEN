@@ -224,6 +224,52 @@ def test_manifest_rejects_placeholder_identity(field: str, value: str) -> None:
                        results_root="/external/stage1", **kwargs)
 
 
+def _complete_checkpoint_bindings(
+    checkpoints: list[int],
+) -> dict[tuple[str, int, int], str]:
+    """Provide a digest for every requested system/lineage/checkpoint tuple."""
+
+    return {
+        (system, lineage, checkpoint): SHA256
+        for system in SYSTEMS
+        for lineage in range(3)
+        for checkpoint in checkpoints
+    }
+
+
+def test_manifest_accepts_complete_identity_bindings() -> None:
+    """A valid identity and complete checkpoint packet is admitted."""
+
+    rows = build_manifest(
+        protocol=TEST_PROTOCOL,
+        source_sha=SHA1,
+        config_sha256=SHA256,
+        checkpoints=[0, 7, 101],
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256=_complete_checkpoint_bindings([0, 7, 101]),
+        results_root="/external/stage1",
+    )
+    assert len([row for row in rows if row["kind"] == "eval"]) == 3 * 3 * 3 * 4
+
+
+@pytest.mark.parametrize("field,value", [("source_sha", "tiny"), ("config_sha256", "tiny")])
+def test_manifest_rejects_placeholder_identity_with_complete_bindings(
+    field: str, value: str,
+) -> None:
+    """Placeholder identity fails before any checkpoint binding can mask it."""
+
+    kwargs = {"source_sha": SHA1, "config_sha256": SHA256, field: value}
+    with pytest.raises(ProtocolError, match=field):
+        build_manifest(
+            protocol=TEST_PROTOCOL,
+            checkpoints=[0, 7, 101],
+            lineage_seeds=[11, 12, 13],
+            checkpoint_sha256=_complete_checkpoint_bindings([0, 7, 101]),
+            results_root="/external/stage1",
+            **kwargs,
+        )
+
+
 def test_manifest_rejects_placeholder_config_sha256() -> None:
     with pytest.raises(ProtocolError, match="config_sha256"):
         build_manifest(protocol=TEST_PROTOCOL, source_sha=SHA1, config_sha256="tiny",
