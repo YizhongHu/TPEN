@@ -15,7 +15,7 @@ if _REPO_ROOT not in sys.path:
 
 from experiments.atomistic.stage1.protocol import (
     SYSTEMS, STAGE1_PROTOCOL, bind_evaluation_manifest, build_manifest,
-    config_identities, manifest_hash,
+    config_identities, manifest_hash, overlay_sha256,
 )
 
 
@@ -31,6 +31,8 @@ def main() -> int:
                         help="phase-2 evidence envelope, or one-shot digest map")
     parser.add_argument("--phase", type=int, choices=(1, 2), default=2)
     parser.add_argument("--device", choices=("cpu", "cuda"))
+    parser.add_argument("--overlay", help="canonical train-side diagnostics overlay")
+    parser.add_argument("--overlay-sha256", help="expected exact overlay digest")
     parser.add_argument("--systems", nargs="+", choices=SYSTEMS)
     parser.add_argument("--phase1-manifest", type=Path,
                         help="phase-1 manifest to bind during phase 2")
@@ -38,6 +40,11 @@ def main() -> int:
     parser.add_argument("--lineage-seeds", type=int, nargs="+", required=True)
     args = parser.parse_args()
     systems = tuple(args.systems) if args.systems else None
+    if args.overlay_sha256 is not None and args.overlay is None:
+        raise ValueError("--overlay-sha256 requires --overlay")
+    effective_overlay_sha = (
+        None if args.overlay is None else args.overlay_sha256 or overlay_sha256(args.overlay)
+    )
     config_root = Path(__file__).resolve().parent / "configs"
     config_sha256: str | dict[str, str]
     if args.phase == 1:
@@ -47,7 +54,8 @@ def main() -> int:
                               config_sha256=config_sha256, checkpoints=args.checkpoints,
                               lineage_seeds=args.lineage_seeds, checkpoint_sha256={},
                               results_root=args.results_root, systems=systems, phase=1,
-                              device=args.device)
+                              device=args.device, overlay=args.overlay,
+                              overlay_sha256=effective_overlay_sha)
     else:
         if args.phase1_manifest is not None:
             phase1_doc = json.loads(args.phase1_manifest.read_text(encoding="utf-8"))
@@ -84,7 +92,8 @@ def main() -> int:
                                   lineage_seeds=args.lineage_seeds,
                                   checkpoint_sha256=_read_bindings(args.checkpoint_bindings),
                                   results_root=args.results_root, systems=systems, phase=2,
-                                  device=args.device)
+                                  device=args.device, overlay=args.overlay,
+                                  overlay_sha256=effective_overlay_sha)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     identity_rules = {row.get("config_identity_rule") for row in rows}
     if len(identity_rules) != 1:
