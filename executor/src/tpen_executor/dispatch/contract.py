@@ -271,6 +271,10 @@ def _with_child_placement(
             # is still a SCIENCE launch: stripping its worker-only keys never
             # makes it an inspection, so a carried TPEN_SLOT_ID is still
             # checked against the quarantine by the worker (delta-4 D4-1).
+            if not strict_host:
+                # Legacy/no-slot requests also carry only controller policy.
+                values.pop(ROUTED_STRICT_HOST_ENV, None)
+                environment = PreparedPythonEnvironment(environment.python, environment.setup, values)
             return _without_gpu_sampler(environment)
         slot = slots[0]
         slot_id, host, cpus = slot.slot_id, slot.node, ",".join(str(cpu) for cpu in slot.cpus)
@@ -345,6 +349,9 @@ def _with_child_placement(
         # Only routed attached dispatch turns a child host mismatch into a
         # pre-core refusal; v1 and local paths remain advisory.
         placement_values[ROUTED_STRICT_HOST_ENV] = "1"
+    else:
+        # Neither prepared nor slot values may enable this controller policy.
+        values.pop(ROUTED_STRICT_HOST_ENV, None)
     if controller_refusal is not None:
         placement_values[PLACEMENT_REFUSAL_ENV] = json.dumps(controller_refusal, sort_keys=True)
     values = placement_environment(values, **placement_values)

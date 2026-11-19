@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -20,11 +21,11 @@ from tpen_executor.storage import DirectoryStore
 from tpen_executor.workers import SubprocessWorker
 
 from test_s3_transport_parsl import (
-    BINDING,
     _attach_routed_leaf_answers,
     _attach_routed_probe_answers,
     _group,
     _lifecycle,
+    _placed_lifecycle,
     _manifest_attempts,
     _routed_allocation,
     _routed_transport_payload,
@@ -90,13 +91,34 @@ D2B_MUTANT_TABLE = (
         "killer": "test_routed_child_mismatch_is_launch_failed_without_segment",
         "suite": "executor", "assertion": "routed leaf requests enable strict host admission before science",
     },
+    {
+        "id": "M8", "target": CONTRACT_MODULE,
+        "old": "    else:\n        # Neither prepared nor slot values may enable this controller policy.\n        values.pop(ROUTED_STRICT_HOST_ENV, None)\n",
+        "new": "    else:\n        pass  # mutant: preserve carried strict flag\n",
+        "killer": "test_v1_child_host_mismatch_remains_advisory",
+        "suite": "executor", "assertion": "prepared strict flag is cleared for advisory placement",
+    },
+    {
+        "id": "M9", "target": "executor/src/tpen_executor/workers.py",
+        "old": "        child_env.pop(ROUTED_STRICT_HOST_ENV, None)\n",
+        "new": "        pass  # mutant: inherit owner strict flag\n",
+        "killer": "test_v1_child_host_mismatch_remains_advisory",
+        "suite": "executor", "assertion": "ambient owner strict flag cannot change advisory child policy",
+    },
+    {
+        "id": "M10", "target": CONTRACT_MODULE,
+        "old": "                environment = PreparedPythonEnvironment(environment.python, environment.setup, values)\n",
+        "new": "                pass  # mutant: retain unsanitized early-return descriptor\n",
+        "killer": "test_advisory_no_slot_clears_carried_strict_host",
+        "suite": "executor", "assertion": "legacy no-slot return also clears the prepared strict flag",
+    },
 )
 
 
 def test_d2b_mutant_table_targets_unique_executable_anchors() -> None:
     root = Path(__file__).parents[2]
     module = Path(__file__).read_text(encoding="utf-8")
-    assert [row["id"] for row in D2B_MUTANT_TABLE] == ["M1", "M2", "M3", "M4", "M5", "M6", "M7"], (
+    assert [row["id"] for row in D2B_MUTANT_TABLE] == ["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10"], (
         f"anchor ids={tuple(row['id'] for row in D2B_MUTANT_TABLE)!r}; "
         "outcome/receipt details unavailable before execution"
     )
@@ -144,9 +166,9 @@ def test_routed_leaf_submission_uses_the_binding_node_label(tmp_path: Path, fake
 
 def test_attached_leaf_submission_does_not_enable_strict_host(tmp_path: Path, fake_parsl) -> None:
     group = _group("s3d2b-attached-advisory", "member")
-    lifecycle = _lifecycle(tmp_path)
+    lifecycle = _placed_lifecycle(tmp_path, min(os.sched_getaffinity(0)))
     dispatcher = parsl_dispatch.ParslDispatcher(
-        _worker(tmp_path), binding=BINDING, transport=_transport(),
+        _worker(tmp_path), transport=_transport(),
     )
 
     manifest = dispatcher.run(group, _runs(tmp_path, "member"), lifecycle, timeout=60)
@@ -155,9 +177,27 @@ def test_attached_leaf_submission_does_not_enable_strict_host(tmp_path: Path, fa
     assert [attempt.outcome_receipt.status for attempt in manifest.attempts] == ["completed"], details
     assert len(fake_parsl.leaf_submissions()) == 1, details
     request = LeafRequest.decode(fake_parsl.leaf_submissions()[0]["args"][0])
+    for key in ("TPEN_PLACEMENT_TASK_ID", "TPEN_PLACEMENT_ATTEMPT_ID",
+                "TPEN_PLACEMENT_SLOT_ID", "TPEN_PLACEMENT_DECLARED_HOST"):
+        assert request.environment.env.get(key), f"{details}; missing placement identity: {key}"
     assert ROUTED_STRICT_HOST_ENV not in request.environment.env, (
         f"{details}; task_id={request.task_id!r}; environment={request.environment.env!r}"
     )
+
+
+def test_advisory_no_slot_clears_carried_strict_host(tmp_path: Path) -> None:
+    """Legacy placement returns must serialize no controller-owned flag."""
+
+    group = _group("s3d2b-no-slot", "member")
+    lifecycle = _lifecycle(tmp_path)
+    fence = lifecycle.begin(group, "member", "2026-11-18T00:00:00+00:00")
+    environment = _with_child_placement(
+        PreparedPythonEnvironment(sys.executable, None, {ROUTED_STRICT_HOST_ENV: "1"}),
+        lifecycle.allocation, fence, group, group.members[0], _runs(tmp_path, "member")["member"],
+        strict_host=False,
+    )
+    assert "TPEN_PLACEMENT_TASK_ID" not in environment.env
+    assert ROUTED_STRICT_HOST_ENV not in environment.env, environment.env
 
 
 def test_missing_routed_binding_is_refused_before_begin(tmp_path: Path, fake_parsl, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -185,7 +225,7 @@ def test_missing_routed_binding_is_refused_before_begin(tmp_path: Path, fake_par
     assert fake_parsl.submissions == [], details
 
 
-def _placement_environment(tmp_path: Path, *, strict: bool) -> PreparedPythonEnvironment:
+def _placement_environment(tmp_path: Path, *, strict: bool, carried_flag: bool = False) -> PreparedPythonEnvironment:
     package = tmp_path / "core" / "tpen"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
@@ -207,7 +247,7 @@ def _placement_environment(tmp_path: Path, *, strict: bool) -> PreparedPythonEnv
         PreparedPythonEnvironment(
             sys.executable,
             None,
-            {"PYTHONPATH": str(tmp_path / "core")},
+            {"PYTHONPATH": str(tmp_path / "core"), **({ROUTED_STRICT_HOST_ENV: "1"} if carried_flag else {})},
         ),
         allocation,
         fence,
@@ -224,7 +264,7 @@ def test_routed_child_host_mismatch_aborts_before_core(tmp_path: Path) -> None:
     environment = _placement_environment(tmp_path, strict=True)
     outcome = SubprocessWorker().run(
         environment,
-        ("-c", RUN_SHIM, f"run.root={tmp_path}"),
+        ("-c", RUN_SHIM, str(tmp_path / "core-ran.txt"), f"run.root={tmp_path}"),
         cwd=tmp_path,
         stdout_path=tmp_path / "stdout.log",
         stderr_path=tmp_path / "stderr.log",
@@ -388,8 +428,16 @@ def test_routed_child_mismatch_is_launch_failed_without_segment(
     assert list(store_root.rglob("remote-teardown.json")), details
 
 
-def test_v1_child_host_mismatch_remains_advisory(tmp_path: Path) -> None:
-    environment = _placement_environment(tmp_path, strict=False)
+@pytest.mark.parametrize("flag_source", ["none", "prepared", "owner"])
+def test_v1_child_host_mismatch_remains_advisory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag_source: str,
+) -> None:
+    # Isolate prepared contamination from ambient owner contamination.
+    monkeypatch.delenv(ROUTED_STRICT_HOST_ENV, raising=False)
+    environment = _placement_environment(tmp_path, strict=False, carried_flag=flag_source == "prepared")
+    if flag_source == "owner":
+        monkeypatch.setenv(ROUTED_STRICT_HOST_ENV, "1")
+    assert ROUTED_STRICT_HOST_ENV not in environment.env
     # The shim passes the first argument to the fake core, which proves that
     # advisory v1 mismatch handling still reaches core.
     outcome = SubprocessWorker().run(
