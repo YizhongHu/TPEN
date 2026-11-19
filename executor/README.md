@@ -41,6 +41,32 @@ Operational outcome receipts use the closed vocabulary `completed`, `failed`,
 `timed_out`, and `launch_failed`. These statuses describe execution only;
 scientific validity remains the responsibility of core evidence.
 
+## Allocation-group reconciliation (B1a)
+
+The executor exposes a fake-driven, pure Layer A contract for reconciling an
+immutable allocation group. `ExecutionPlanV2` binds opaque plan content to an
+ordered task list and explicit continuation/reconciliation protocol tokens;
+`ReadyGroupV2` binds that plan to an opaque `GroupId`. An
+`AllocationAttemptV2` separately identifies one controller/allocation
+generation. `GroupId`, `AllocationAttemptId`, and `InvocationId` are
+deliberately non-interchangeable with `AttemptId`, `AllocationId`, or
+`BackendJobId`.
+
+`reconcile_group()` consumes typed executor start/outcome receipt references
+and a typed `CoreAdmissionPort` verdict. It derives one of
+`preserve_completed`, `admit_successor`, `start_fresh`, `preserve_terminal`,
+or `park` for every member. Parked evidence dominates the group aggregate;
+otherwise a successor or fresh member yields `replacement_required`, and a
+fully preserved group is `settled` with completed/terminal counts. The
+reconciler publishes no ledger, starts no process, replaces no allocation,
+scans no checkpoint, and maps no result to a scheduler or Balsam status.
+
+The profile/admission port is intentionally a narrow typed fake seam. A
+missing or refused native profile parks a member before an optional restore
+callback can run. Real-core compatibility, durable publication, successor
+fencing, Balsam lifecycle, and facility integration are later layers and are
+not claimed by B1a.
+
 ## GPU placement qualification
 
 The L1a v2 placement receipt reports an explicit reason class: `not-sampled`,

@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any, ClassVar
 
 from ._codec import _freeze, canonical_bytes, decode_json, fields, thaw, text
-from .contracts import AllocationId, BackendJobId
+from .contracts import AllocationAttemptId, AllocationId, BackendJobId, GroupId
 from ._records import frozen_record
 from .results import AllocationObservation
 
@@ -116,4 +116,74 @@ class ConfiguredAllocation:
         return AllocationObservation(self.allocation_id, at_utc, state, self.facts)
 
 
-__all__ = ["ConfiguredAllocation"]
+@frozen_record
+class AllocationAttemptV2:
+    """Typed binding for one controller generation on one allocation.
+
+    This record deliberately carries no member lineage or member attempt.  A
+    controller may use it to scope a group reconciliation, but it cannot be
+    substituted for ``AttemptId`` or for the backend allocation identity.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/allocation-attempt-v2"
+    group_id: GroupId
+    allocation_attempt_id: AllocationAttemptId
+    allocation_id: AllocationId
+    backend_job_id: BackendJobId
+    controller_generation: str
+    observed_at_utc: str
+
+    def __post_init__(self) -> None:
+        for value, name, cls in (
+            (self.group_id, "group_id", GroupId),
+            (self.allocation_attempt_id, "allocation_attempt_id", AllocationAttemptId),
+            (self.allocation_id, "allocation_id", AllocationId),
+            (self.backend_job_id, "backend_job_id", BackendJobId),
+        ):
+            if not isinstance(value, cls):
+                raise TypeError(f"{name} must be {cls.__name__}")
+        object.__setattr__(self, "controller_generation", text(self.controller_generation, "controller_generation"))
+        object.__setattr__(self, "observed_at_utc", text(self.observed_at_utc, "observed_at_utc"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "group_id": self.group_id.to_dict(),
+            "allocation_attempt_id": self.allocation_attempt_id.to_dict(),
+            "allocation_id": self.allocation_id.to_dict(),
+            "backend_job_id": self.backend_job_id.to_dict(),
+            "controller_generation": self.controller_generation,
+            "observed_at_utc": self.observed_at_utc,
+        }
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "AllocationAttemptV2":
+        fields(
+            data,
+            {
+                "schema", "group_id", "allocation_attempt_id", "allocation_id",
+                "backend_job_id", "controller_generation", "observed_at_utc",
+            },
+            cls.schema,
+            cls.__name__,
+        )
+        if type(data["controller_generation"]) is not str or type(data["observed_at_utc"]) is not str:
+            raise TypeError("AllocationAttemptV2 observation fields must be strings")
+        return cls(
+            GroupId.from_mapping(data["group_id"]),
+            AllocationAttemptId.from_mapping(data["allocation_attempt_id"]),
+            AllocationId.from_mapping(data["allocation_id"]),
+            BackendJobId.from_mapping(data["backend_job_id"]),
+            data["controller_generation"],
+            data["observed_at_utc"],
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "AllocationAttemptV2":
+        return cls.from_mapping(decode_json(data))
+
+
+__all__ = ["AllocationAttemptV2", "ConfiguredAllocation"]
