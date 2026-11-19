@@ -1,0 +1,18 @@
+{
+  "mutants": [
+    {
+      "id": "cadence-check-removed",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "if protocol.retention_cadence is not None:",
+      "new": "if False and protocol.retention_cadence is not None:",
+      "killer": "experiments/atomistic/stage1/tests/test_step_zero.py::test_one_shot_phase2_emits_train_rows_and_rejects_invalid_retention[2-7-True]"
+    },
+    {
+      "id": "phase2-retention-gate-restored",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "if phase in {1, 2}:",
+      "new": "if phase == 1:",
+      "killer": "experiments/atomistic/stage1/tests/test_step_zero.py::test_one_shot_phase2_emits_train_rows_and_rejects_invalid_retention[2-7-True]"
+    }
+  ]
+}
