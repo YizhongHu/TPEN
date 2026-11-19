@@ -15,16 +15,18 @@ Reference: `systems.yaml` He id `he_atom`, E0 = -2.903724377034119598 Ha. Source
 | DeepQMC / psiformer | R05 | edf373e7 | unrecorded | 20000 | 10000 | -2.903723219585 | 3.169e-06 | +1.157 | 2.840e-04 +/- 7.888e-06 | 2.017e-04 [1.990e-04,2.044e-04] | loss/finite/variance reduced |
 | DeepQMC / transpsiformer | R06 | edf373e7 | unrecorded | 20000 | 10000 | -2.903721802950 | 2.284e-06 | +2.574 | 1.953e-04 +/- 4.067e-06 | 1.733e-04 [1.712e-04,1.753e-04] | loss/finite/variance reduced |
 | DeepQMC / deeperwin | R07 | edf373e7 | unrecorded | 188894 | 18889 | -2.903723506439 | 2.027e-06 | +0.871 | 3.168e-04 +/- 1.290e-05 | 1.010e-04 [9.911e-05,1.028e-04] | loss/finite/variance; mid->last not reduced |
-| DeepQMC / default | R08 | edf373e7 | unrecorded | 100000 | 50000 | -2.903709089837 | 7.201e-06 | +15.287 | 1.167e-02 +/- 1.340e-03 | 5.645e-04 [5.427e-04,5.901e-04] | loss/finite/variance reduced |
-| DeepQMC / default | R09 | edf373e7 | unrecorded | 200000 | 50000 | -2.903716541128 | 7.963e-06 | +7.836 | 1.628e-02 +/- 3.593e-03 | 5.205e-04 [5.049e-04,5.398e-04] | loss/finite/variance reduced |
+| DeepQMC / default | R08 | edf373e7 | unrecorded | 100000 | 50000† | -2.903709089837 | 7.201e-06 | +15.287 | 1.167e-02 +/- 1.340e-03 | 5.645e-04 [5.427e-04,5.901e-04] | loss/finite/variance reduced |
+| DeepQMC / default | R09 | edf373e7 | unrecorded | 200000 | 50000‡ | -2.903716541128 | 7.963e-06 | +7.836 | 1.628e-02 +/- 3.593e-03 | 5.205e-04 [5.049e-04,5.398e-04] | loss/finite/variance reduced |
 | DeepQMC / lapnet | R10 | edf373e7 | unrecorded | 100204 | 10020 | -2.903730758721 | 6.935e-06 | -6.382 | 1.760e-03 +/- 1.569e-03 | 1.159e-04 [1.145e-04,1.172e-04] | loss/finite/variance reduced |
 | DeepQMC / lapnet | R11 | edf373e7 | unrecorded | 200000 | 20000 | -2.903720270610 | 1.318e-06 | +4.106 | 1.403e-04 +/- 3.420e-06 | 8.694e-05 [8.609e-05,8.770e-05] | loss/finite/variance reduced |
 | Neural Pfaffian / neural_pfaffian | R13 | f711f08a | 813784688 | 100000 | 25000 | -2.903723855906 | 5.72e-07 | +0.521 | no walker variance | no walker variance | record-only |
 | OneQMC / orbformer-se | R14 | b7ed7223 | 42 | 40000 | 10000 | -2.903742715096 | 1.151e-05 | -18.338 | no walker variance | no walker variance | record-only; inference |
-| FermiNet / psiformer | R15 | c4312c31 | 23 | 200000 | 20000 | -2.903727148790 | 2.732e-06 | -2.772 | no walker variance | no walker variance | no V logged |
-| FermiNet / ferminet | R16 | c4312c31 | 23 | 200000 | 20000 | -2.903717802725 | 2.737e-06 | +6.574 | no walker variance | no walker variance | no V logged |
+| FermiNet / psiformer | R15 | c4312c31 | 23 | 200000 | 20000 | -2.903727148790 | 2.732e-06 | -2.772 | no walker variance | no walker variance | loss reduced, finite; no V logged |
+| FermiNet / ferminet | R16 | c4312c31 | 23 | 200000 | 20000 | -2.903717802725 | 2.737e-06 | +6.574 | no walker variance | no walker variance | loss reduced, finite; no V logged |
 
-The available He trajectory curves are descriptive only: `he-curve-series-table.csv` (SHA256 `6b4e26db5894705b9398333d599e00c7594e52fb3b8efc45955f0ebf6139a60e`). They do not establish a common optimizer-step criterion for every historical row, so the per-row Stage-1 field is `record-only`. Figure: ![He curves](stage1-report/he-deepqmc-20k-detail.png).
+The Stage-1 fields are computed from `stage1-criteria-he-h2.csv` (SHA256 `65403385cde6390963e3393237bea42118159ffe96f7185ee78f794e057bf5c5`). The available He trajectory curves are descriptive only: `he-curve-series-table.csv` (SHA256 `6b4e26db5894705b9398333d599e00c7594e52fb3b8efc45955f0ebf6139a60e`). Figure: ![He curves](stage1-report/he-deepqmc-20k-detail.png).
+
+† R08 energy columns use the record window W=50000; its variance columns use the spec window W=max(10000,round(0.1N))=10000. ‡ R09 energy columns use the record window W=50000; its variance columns use the spec window W=max(10000,round(0.1N))=20000. No other He row has an energy/variance window mismatch.
 
 ## H2
 
@@ -34,8 +36,8 @@ Reference: `systems.yaml` H2 id `h2_molecule`, E0 = -1.17447 Ha; the source reco
 |---|---|---|---|---:|---:|---:|---:|---:|---|
 | DeepQMC / default (PauliNet-native) | dqmc-paulin2-h2-fix-39520283 | edf373e7 | unrecorded | 200000 | 20000 | -1.174469784546 | 4.665e-06 | +0.215 | loss/finite/variance reduced |
 | DeepQMC / default (secondary record window) | dqmc-paulin2-h2-fix-39520283 | edf373e7 | unrecorded | 200000 | 50000 | -1.174470104489 | 2.941e-06 | -0.104 | loss/finite/variance reduced |
-| FermiNet-codebase / ferminet | r2-h2-39068280 | c4312c31 | 23 | 200000 | 20000 | -1.174474339240 | 8.631e-07 | -4.339 | no V logged |
-| FermiNet-codebase / psiformer | psi-2e-39195983__H2 | c4312c31 | 23 | 200000 | 20000 | -1.174469850475 | 1.495e-06 | +0.150 | no V logged |
+| FermiNet-codebase / ferminet | r2-h2-39068280 | c4312c31 | 23 | 200000 | 20000 | -1.174474339240 | 8.631e-07 | -4.339 | loss reduced, finite; no V logged |
+| FermiNet-codebase / psiformer | psi-2e-39195983__H2 | c4312c31 | 23 | 200000 | 20000 | -1.174469850475 | 1.495e-06 | +0.150 | loss reduced, finite; no V logged |
 
 Figure: ![H2 DeepQMC W=20000](stage1-report/h2-rows-table-deepqmc-w20000.png). No TPEN overlay is present.
 
