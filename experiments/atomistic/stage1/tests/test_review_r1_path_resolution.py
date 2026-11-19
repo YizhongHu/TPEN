@@ -34,6 +34,25 @@ BASE_ROW = {
 }
 
 
+@pytest.mark.parametrize("script", ["plan.py", "launch.py"])
+def test_stage1_planning_scripts_import_by_path_outside_checkout(
+    script: str, tmp_path: Path,
+) -> None:
+    """Both planning entrypoints bootstrap imports before loading protocol."""
+
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "experiments/atomistic/stage1" / script), "--help"],
+        cwd=unrelated,
+        env={"PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "usage:" in result.stdout
+
+
 def _row(kind: str) -> dict[str, object]:
     """Return one small manifest row for a real rendered driver command."""
 

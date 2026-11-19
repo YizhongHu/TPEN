@@ -7,8 +7,15 @@ import base64
 import json
 import re
 import shlex
+import sys
 from pathlib import Path
 from typing import Any, Mapping
+
+# Direct script execution puts only this directory on sys.path.  Add the
+# checkout root before importing the source-owned experiments package.
+_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from experiments.atomistic.stage1.protocol import (
     _require_path_component,
