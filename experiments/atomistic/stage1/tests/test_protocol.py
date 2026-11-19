@@ -370,12 +370,12 @@ def test_phase2_rejects_evidence_with_a_forged_manifest_hash() -> None:
 def test_phase2_rejects_checkpoint_outside_phase1_steps() -> None:
     evidence = _phase2_evidence()
     evidence["checkpoints"] = {
-        **evidence["checkpoints"], "he:0:101": SHA256,
-        "he:1:101": SHA256, "he:2:101": SHA256,
+        **evidence["checkpoints"], "he:0:99": SHA256,
+        "he:1:99": SHA256, "he:2:99": SHA256,
     }
     with pytest.raises(ProtocolError, match="checkpoint_steps"):
         bind_evaluation_manifest(
-            phase1_rows=_phase1_rows(), checkpoints=[101], checkpoint_evidence=evidence,
+            phase1_rows=_phase1_rows(), checkpoints=[99], checkpoint_evidence=evidence,
             expected_physical_system_id={"he": "c" * 64},
         )
 

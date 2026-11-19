@@ -42,7 +42,7 @@ def _tiny_train_rows(tmp_path: Path) -> list[dict[str, object]]:
         eval_walkers=2,
         eval_draws=2,
     )
-    checkpoints = [7, 101]
+    checkpoints = [0, 7, 101]
     checkpoint_hashes = {
         (system, lineage, checkpoint): "d" * 64
         for system in SYSTEMS
@@ -78,7 +78,7 @@ def test_real_train_row_overrides_load_and_bind_checkpoint_schedule(
 
     config = CONFIG_ROOT / system / "train.yaml"
     resolved = load_config(str(config), overrides=overrides)
-    assert list(resolved.callbacks[4].schedule.updates) == [7, 101]
+    assert list(resolved.callbacks[4].schedule.updates) == [0, 7, 101]
 
     with pytest.raises(ProtocolError):
         validate_gateway_binding(
@@ -88,7 +88,7 @@ def test_real_train_row_overrides_load_and_bind_checkpoint_schedule(
             kind="train",
         )
     bad_overrides = [
-        "checkpoint_steps=[7,100]" if item.startswith(
+        "checkpoint_steps=[0,7,100]" if item.startswith(
             "checkpoint_steps="
         ) else item
         for item in overrides

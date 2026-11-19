@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,12 @@ def test_planned_physical_system_ids_rejects_train_electron_electron_swap(
 def test_plan_main_uses_protocol_planned_physical_system_ids(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
+    # This probe exercises the physical-ID lookup, not production retention.
+    monkeypatch.setattr(
+        plan_module, "STAGE1_PROTOCOL",
+        replace(plan_module.STAGE1_PROTOCOL, retention_cadence=None),
+    )
+
     def refuse_planning_ids() -> dict[str, str]:
         raise ProtocolError("planned IDs were not requested")
 
@@ -105,6 +112,13 @@ def test_plan_main_phase1_then_phase2_round_trip(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     """(a)-(d): the authentic two-phase round trip through `plan.main`."""
+
+    # Keep the round-trip coordinates intentionally small; retention is not
+    # the contract under test here.
+    monkeypatch.setattr(
+        plan_module, "STAGE1_PROTOCOL",
+        replace(plan_module.STAGE1_PROTOCOL, retention_cadence=None),
+    )
 
     phase1_path = tmp_path / "phase1.json"
     monkeypatch.setattr(
