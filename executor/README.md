@@ -354,6 +354,31 @@ each named node by operator-supplied launcher data, each slot submitted only
 to its node's label, and observed node identity preflighted, which revises
 Layer B's one-executor validator.
 
+### Routed attached transport v2 (Layer D2a)
+
+The strict `tpen-executor/attached-routed-transport-v2` profile describes an
+ordered pool for each captured allocation node. Each pool carries its node,
+label, worker count, worker setup, interchange address, and opaque
+`MpiExecLauncher` bind/override values. The executor supplies no facility
+values and does not interpret those launcher strings. Its matching
+`tpen-executor/allocation-slots-v2` record may contain several slots per node;
+admission requires the exact node set from the captured scheduler host map and
+requires `pool.workers == slot_count` for every node. Host strings are compared
+exactly at this boundary; aliases and DNS normalization are not inferred.
+
+Admission constructs one fresh `HighThroughputExecutor` with a
+`LocalProvider(MpiExecLauncher(...))` for each pool. Every pool is a single
+initial block with its own label and worker count, and the route retains the
+no-retry, no-scaling, interpreter-module launch settings. Before any
+`lifecycle.begin`, the controller submits exactly the pool's worker count of
+shared-store probes through that pool's label. All probes join one aggregate
+barrier, and each returned hostname must equal the pool node exactly. A typed
+`RoutedTransportPreflightError` refuses wrong, missing, extra, or late facts.
+
+Task-to-label selection and strict child placement mismatch handling are
+deferred to D2b. The v1 attached profile remains the one-executor,
+single-label path described above.
+
 ## Local dispatch
 
 `LocalDispatcher` is the attached-allocation baseline. It admits an exact

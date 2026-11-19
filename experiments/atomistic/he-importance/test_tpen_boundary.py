@@ -1188,6 +1188,8 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
             ("manifest has passed the structural validator and the namespace is module-owned", 1),
         ("stage_coordinate.py", "validate_materialized_manifest", 'manifest["seed_identity"]["namespace"] != "fresh-training"'):
             ("manifest has passed the structural validator and the expected namespace is a module literal", 1),
+        ("stage_coordinate.py", "validate_materialized_manifest", 'manifest["payload"]["updates"] != definition.updates'):
+            ("manifest payload updates is an exact integer and definition is the module-owned stage authority", 1),
         ("stage_coordinate.py", "_require_exact_keys", "frozenset(value) != expected"):
             ("value is a validated mapping at each caller and expected is a module-owned schema set", 1),
         ("stage_coordinate.py", "_validate_delegated_subtree", "key in _FORBIDDEN_TRAIN_CONTENT_KEYS"):

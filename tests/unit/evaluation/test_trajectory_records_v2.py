@@ -479,6 +479,18 @@ def test_v2_reader_propagates_mixed_nonfinite_rows_from_real_writer(tmp_path: Pa
     assert math.isnan(v1_inspection.variance)
 
 
+def test_v2_roundtrip_preserves_equal_mean_with_infinite_variance(tmp_path: Path) -> None:
+    """Finite rows whose square sum overflows remain readable as v2 records."""
+
+    artifact = _v2_artifact(
+        tmp_path,
+        torch.tensor([[1.0e200, -1.0e200]], dtype=torch.float64),
+    )
+    inspected = inspect_trajectory_record(artifact.metadata_path)
+    assert inspected.mean == 0.0
+    assert inspected.variance == float("inf")
+
+
 def test_v2_public_reader_rejects_a_tampered_finite_count(tmp_path: Path) -> None:
     artifact = _v2_artifact(tmp_path, FINITE)
     metadata = _read_metadata(artifact)

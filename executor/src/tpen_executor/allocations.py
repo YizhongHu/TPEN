@@ -46,6 +46,8 @@ class ConfiguredAllocation:
         scheduler = facts.get("scheduler", facts.get("scheduler_host_map"))
         if isinstance(scheduler, Mapping):
             scheduler = dict(scheduler)
+            slots = facts.get("slots")
+            routed_slots = isinstance(slots, Mapping) and slots.get("schema") == "tpen-executor/allocation-slots-v2"
             path_keys = {"pbs_nodefile_path", "PBS_NODEFILE_PATH"}
             scalar_pbs = scheduler.get("pbs_nodefile", scheduler.get("PBS_NODEFILE"))
             has_path = any(scheduler.get(key) is not None for key in path_keys) or (
@@ -55,10 +57,14 @@ class ConfiguredAllocation:
                 # Scheduler paths are an input-time concern. Capture their
                 # contents before this allocation is frozen so later binding
                 # resolution cannot change an immutable allocation's host map.
-                from .placement import PlacementRefusal, scheduler_host_map
+                from .placement import PlacementRefusal, captured_scheduler_host_map, scheduler_host_map
 
                 try:
-                    hosts = scheduler_host_map(scheduler, environ={})
+                    hosts = (
+                        captured_scheduler_host_map(scheduler)
+                        if routed_slots
+                        else scheduler_host_map(scheduler, environ={})
+                    )
                 except PlacementRefusal as error:
                     # Preserve a typed capture failure so dispatch can publish
                     # launch_failed/rc=3 placement evidence instead of turning

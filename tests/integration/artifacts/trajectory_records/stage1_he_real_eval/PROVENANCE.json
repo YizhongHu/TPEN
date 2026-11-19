@@ -1,0 +1,15 @@
+{
+  "fixture": "stage1_he_real_eval",
+  "source": "FASRC Cannon Stage 1 He round-2 full-collect evaluation",
+  "source_task_orchestrator_note": "he-h2-review-packet-r2-20261118",
+  "source_job_id": "61836721",
+  "source_commit": "4ec84737b3a1a792b3d6f7604ff007d97039f35b",
+  "csv_filename": "sampled_eval_table.csv",
+  "csv_sha256": "0b44ce4d1cb3ee97b8528ecee1c8e955fcae23387b18004a0de75eb62a984721",
+  "metadata_filename": "sampled_eval_table.metadata.json",
+  "metadata_sha256": "1b1fdf9d3332c1e091983944cee589aafe38f8420fea79b0bdcd5c98218bbedb",
+  "draw_count": 4,
+  "walker_count": 64,
+  "row_count": 256,
+  "fixture_kind": "copied_real_stage1_eval_sidecar_csv_pair"
+}
