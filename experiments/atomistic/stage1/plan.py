@@ -38,6 +38,8 @@ def main() -> int:
                         help="phase-1 manifest to bind during phase 2")
     parser.add_argument("--checkpoints", type=int, nargs="+")
     parser.add_argument("--lineage-seeds", type=int, nargs="+", required=True)
+    parser.add_argument("--science-profile")
+    parser.add_argument("--evaluation-selection")
     args = parser.parse_args()
     if args.checkpoints is None:
         if args.phase != 1 or STAGE1_PROTOCOL.retention_cadence is None:
@@ -49,6 +51,10 @@ def main() -> int:
             STAGE1_PROTOCOL.retention_cadence,
         ))
     systems = tuple(args.systems) if args.systems else None
+    selected_for_profile = set(systems or SYSTEMS)
+    if (args.phase == 1 and selected_for_profile & {"hooke1", "hooke2"}
+            and args.science_profile != "hooke-hv2-v1"):
+        parser.error("Hooke production phase 1 requires --science-profile hooke-hv2-v1")
     if args.overlay_sha256 is not None and args.overlay is None:
         raise ValueError("--overlay-sha256 requires --overlay")
     effective_overlay_sha = (
@@ -64,7 +70,9 @@ def main() -> int:
                               lineage_seeds=args.lineage_seeds, checkpoint_sha256={},
                               results_root=args.results_root, systems=systems, phase=1,
                               device=args.device, overlay=args.overlay,
-                              overlay_sha256=effective_overlay_sha)
+                              overlay_sha256=effective_overlay_sha,
+                              science_profile=args.science_profile,
+                              evaluation_selection=args.evaluation_selection)
     else:
         if args.phase1_manifest is not None:
             phase1_doc = json.loads(args.phase1_manifest.read_text(encoding="utf-8"))
@@ -102,7 +110,9 @@ def main() -> int:
                                   checkpoint_sha256=_read_bindings(args.checkpoint_bindings),
                                   results_root=args.results_root, systems=systems, phase=2,
                                   device=args.device, overlay=args.overlay,
-                                  overlay_sha256=effective_overlay_sha)
+                                  overlay_sha256=effective_overlay_sha,
+                                  science_profile=args.science_profile,
+                                  evaluation_selection=args.evaluation_selection)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     identity_rules = {row.get("config_identity_rule") for row in rows}
     if len(identity_rules) != 1:

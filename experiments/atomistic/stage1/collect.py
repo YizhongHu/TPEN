@@ -21,6 +21,7 @@ from experiments.atomistic.stage1.protocol import (
     ProtocolError,
     resolve_config_path,
     resolve_run_dir,
+    validate_hooke_eval_grid,
 )
 
 
@@ -105,6 +106,10 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
         raise CollectionError("manifest contains a malformed eval row")
     eval_rows = [row for row in rows if row.get("kind") == "eval"]
     phase1_rows = [row for row in rows if row.get("kind") != "eval"]
+    try:
+        validate_hooke_eval_grid(eval_rows)
+    except ProtocolError as exc:
+        raise CollectionError(f"Hooke evaluation grid is incomplete: {exc}") from exc
     phase1_hashes = {row.get("phase1_manifest_hash") for row in eval_rows
                      if row.get("phase1_manifest_hash") is not None}
     if phase1_hashes:

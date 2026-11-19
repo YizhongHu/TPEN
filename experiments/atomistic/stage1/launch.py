@@ -81,6 +81,8 @@ def row_overrides(row: Mapping[str, Any]) -> list[str]:
             f"sampler.n_walkers={row['walkers']}",
             f"trainer.max_steps={row['updates']}",
         ])
+        if "sampler_seed" in row:
+            overrides.append(f"sampler.seed={row['sampler_seed']}")
         if row.get("checkpoint_steps"):
             steps = ",".join(str(step) for step in row["checkpoint_steps"])
             overrides.append(f"checkpoint_steps=[{steps}]")
