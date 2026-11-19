@@ -101,6 +101,27 @@ def test_hooke_phase1_rows_bind_distinct_sampler_seeds_and_gateway() -> None:
         )
 
 
+def test_legacy_he_h2_rows_do_not_inherit_hooke_profile_fields() -> None:
+    rows = build_manifest(
+        protocol=STAGE1_PROTOCOL,
+        source_sha="a" * 40,
+        config_sha256=config_identities(
+            config_root=ROOT / "configs", systems=("he", "h2"),
+        ),
+        checkpoints=[0, 1000],
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root="/external/stage1",
+        systems=("he", "h2"),
+        phase=1,
+    )
+    profile_fields = {
+        "science_profile", "training_seed_rule", "lineage_seed", "sampler_seed",
+        "evaluation_selection", "evaluation_selection_id", "selection_id",
+    }
+    assert all(profile_fields.isdisjoint(row) for row in rows)
+
+
 def test_hooke_grid_rejects_count_preserving_replacement() -> None:
     rows = [
         {"kind": "eval", "system": "hooke1", "lineage": lineage,
