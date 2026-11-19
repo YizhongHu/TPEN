@@ -181,6 +181,15 @@ def command_for_row(row: Mapping[str, Any], *, python: str, driver: str) -> str:
         _require_safe_value(override, field="override")
         args.append(override)
     args.extend(["--binding", _binding_token(row)])
+    if row.get("overlay") is not None or row.get("overlay_sha256") is not None:
+        if row.get("kind") != "train":
+            raise ValueError("only train rows may declare an overlay")
+        if not isinstance(row.get("overlay"), str) or not isinstance(row.get("overlay_sha256"), str):
+            raise ValueError("overlay rows require overlay and overlay_sha256")
+        args.extend([
+            "--overlay", str(row["overlay"]),
+            "--overlay-sha256", str(row["overlay_sha256"]),
+        ])
     if row.get("kind") == "eval":
         args.extend([
             "--expected-checkpoint-sha256", str(row["checkpoint_sha256"]),
