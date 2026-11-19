@@ -300,18 +300,21 @@ def test_real_overlay_train_eval_collect_chain(tmp_path: Path) -> None:
     assert metrics_path.is_file()
     metric_records = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
     assert metric_records
-    assert any("train/energy" in record["metrics"] for record in metric_records)
-    metric_keys = {
-        key for record in metric_records for key in record.get("metrics", {})
-    }
+    assert any(
+        record.get("namespace") == "train"
+        and "energy" in record.get("metrics", {})
+        for record in metric_records
+    )
     for namespace in (
-        "checks/data_integrity/",
-        "checks/gradient/",
-        "train/module_norms/",
-        "train/optimizer_state/",
-        "train/perf/",
+        "checks/data_integrity",
+        "checks/gradient",
+        "train/module_norms",
+        "train/optimizer_state",
+        "train/perf",
     ):
-        assert any(key.startswith(namespace) for key in metric_keys), namespace
+        assert any(
+            record.get("namespace") == namespace for record in metric_records
+        ), namespace
     checkpoint_file = train_dir / "checkpoints" / "step_000001" / "model.pt"
     checkpoint_sha = hashlib.sha256(checkpoint_file.read_bytes()).hexdigest()
 
