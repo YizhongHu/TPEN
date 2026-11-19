@@ -56,7 +56,7 @@ def main() -> int:
     parser.add_argument("--overlay-sha256")
     args = parser.parse_args()
     config_path = resolve_config_path(args.config)
-    validate_gateway_binding(
+    row = validate_gateway_binding(
         binding=args.binding, config=str(config_path), overrides=args.overrides,
         kind=args.kind, overlay=args.overlay, overlay_sha256=args.overlay_sha256,
     )
@@ -74,6 +74,14 @@ def main() -> int:
         )
     if args.overrides:
         cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(args.overrides)))
+    if row.get("science_profile") == "hooke-hv2-v1":
+        # Recheck the resolved producer boundary after OmegaConf composition;
+        # checking only the textual override list would allow a later merge to
+        # alias the initialization and sampler streams.
+        if cfg.runtime.seed != row["seed"] or cfg.sampler.seed != row["sampler_seed"]:
+            raise ValueError("Hooke science runtime and sampler seeds are not bound")
+        if cfg.runtime.seed == cfg.sampler.seed:
+            raise ValueError("Hooke science runtime and sampler seeds must be distinct")
     prepare_initial_checkpoint_config(cfg)
     return run_from_config(cfg, config_path=str(config_path), command="stage1 train")
 
