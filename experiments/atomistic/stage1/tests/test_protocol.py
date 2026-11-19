@@ -249,7 +249,7 @@ def test_manifest_accepts_complete_identity_bindings() -> None:
         checkpoint_sha256=_complete_checkpoint_bindings([0, 7, 101]),
         results_root="/external/stage1",
     )
-    assert len([row for row in rows if row["kind"] == "eval"]) == 3 * 3 * 3 * 4
+    assert len([row for row in rows if row["kind"] == "eval"]) == len(SYSTEMS) * 3 * 3 * 4
 
 
 @pytest.mark.parametrize("field,value", [("source_sha", "tiny"), ("config_sha256", "tiny")])
