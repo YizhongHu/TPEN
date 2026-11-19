@@ -415,7 +415,9 @@ def _run_real_resource_attempt(
     random.seed(19)
     np.random.seed(19)
     torch.manual_seed(19)
-    config = recovery._config(root, "resource")
+    # Keep the logical config identical while each context writes to its own
+    # attempt directory; resolved_config.yaml is part of the checkpoint too.
+    config = recovery._config(root.parent / "logical-run", "resource")
     context = recovery._context(root, "resource", config)
     context.monotonic_clock = lambda: 42.0
     model = recovery._ProbeModel(non_equivariant=False)
@@ -533,7 +535,12 @@ def _assert_real_resource_attempts_equal(first, second) -> None:
     assert first["records"] == second["records"]
     first_manifest = first["manifest"]
     second_manifest = second["manifest"]
-    assert first_manifest["files"] == second_manifest["files"]
+    expected_components = {"resolved_config", "model", "optimizer", "trainer", "sampler", "rng"}
+    for attempt, manifest in (("first", first_manifest), ("second", second_manifest)):
+        assert set(manifest["files"]) == expected_components, (
+            f"{attempt} checkpoint component set differs: {set(manifest['files'])}"
+        )
+    assert first_manifest["files"] == second_manifest["files"], "checkpoint filenames differ"
     assert first_manifest["next_iteration"] == second_manifest["next_iteration"]
     assert first_manifest["completed_updates"] == second_manifest["completed_updates"]
     assert first_manifest["payload"] == second_manifest["payload"]
@@ -548,8 +555,17 @@ def _assert_real_resource_attempts_equal(first, second) -> None:
         for key, value in second_manifest["provenance"].items()
         if key != "run_dir"
     }
-    for component in ("model", "optimizer", "trainer", "sampler", "rng"):
-        assert first_manifest["hashes"][component] == second_manifest["hashes"][component]
+    # Fixed basenames and identical state in one process produce identical
+    # torch.save archives (no ZIP timestamps); include JSON/YAML files as well.
+    for component in first_manifest["files"]:
+        digest_key = f"{component}_sha256"
+        for attempt, manifest in (("first", first_manifest), ("second", second_manifest)):
+            assert digest_key in manifest["hashes"], (
+                f"{attempt} checkpoint is missing the {component} file digest ({digest_key})"
+            )
+        assert first_manifest["hashes"][digest_key] == second_manifest["hashes"][digest_key], (
+            f"resource probe changed checkpoint component {component} ({digest_key})"
+        )
 
 
 def test_resource_usage_probe_variation_cannot_change_real_checkpoint_or_science(
