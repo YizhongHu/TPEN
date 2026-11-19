@@ -13,7 +13,7 @@ from .storage import AttemptFence, DirectoryStore, FenceRejected
 from .tasks import ConfiguredRun
 from .lifecycle import AttachedAllocation
 from .workers import ProcessOutcome, SubprocessWorker
-from .placement import AllocationSlot, BindingError, ChildPlacementObservation, PlacementRefusal, WorkerBinding, binding_from_allocation, bindings_from_allocation, parse_cpu_set, parse_proc_start_ticks, read_child_placement, slots_from_allocation
+from .placement import AllocationSlot, ALLOCATION_SLOTS_V2_SCHEMA, BindingError, ChildPlacementObservation, PlacementRefusal, WorkerBinding, binding_from_allocation, bindings_from_allocation, captured_scheduler_host_map, parse_cpu_set, parse_proc_start_ticks, read_child_placement, routed_slots_from_allocation, slots_from_allocation
 
 __version__ = "0.1.0"
 
@@ -26,6 +26,10 @@ _LAZY_EXPORTS = {
     "LocalDispatcher": (".dispatch", "LocalDispatcher"),
     "ParslDispatcher": (".dispatch", "ParslDispatcher"),
     "ParslUnavailableError": (".dispatch", "ParslUnavailableError"),
+    "AttachedTransportSpec": (".dispatch.parsl", "AttachedTransportSpec"),
+    "RoutedAttachedTransportSpec": (".dispatch.parsl", "RoutedAttachedTransportSpec"),
+    "RoutedTransportPool": (".dispatch.parsl", "RoutedTransportPool"),
+    "decode_attached_transport": (".dispatch.parsl", "decode_attached_transport"),
 }
 
 
@@ -46,6 +50,6 @@ __all__ = [
     "ProgramSpecRef", "ProfileCheck", "ProfileUnavailable", "ReadyGroup", "RunManifest", "SciencePlacementReceipt", "SciencePlacementReceiptV2", "SciencePlacementReceiptV3", "StagedConfig", "StagedHydra", "LocalDispatcher", "ParslDispatcher", "ParslUnavailableError",
     "PreparedInputBundle", "PreparedPythonEnvironment", "SourceScript", "StartReceipt",
     "TaskSpec", "TPENCommand", "TPENEvidence", "SubprocessWorker", "WorkerProgram", "CoreProfileReference",
-    "AllocationSlot", "BindingError", "ChildPlacementObservation", "PlacementRefusal", "WorkerBinding", "binding_from_allocation", "bindings_from_allocation", "parse_cpu_set", "parse_proc_start_ticks", "read_child_placement", "slots_from_allocation",
+    "AllocationSlot", "ALLOCATION_SLOTS_V2_SCHEMA", "AttachedTransportSpec", "BindingError", "captured_scheduler_host_map", "ChildPlacementObservation", "PlacementRefusal", "RoutedAttachedTransportSpec", "RoutedTransportPool", "WorkerBinding", "binding_from_allocation", "bindings_from_allocation", "decode_attached_transport", "parse_cpu_set", "parse_proc_start_ticks", "read_child_placement", "routed_slots_from_allocation", "slots_from_allocation",
     "decode_manifest", "encode_manifest",
 ]

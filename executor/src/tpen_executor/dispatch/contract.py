@@ -192,6 +192,7 @@ def _with_child_placement(
     configured: ConfiguredRun,
     *,
     check_controller_affinity: bool = True,
+    slot_resolver: Any = None,
 ) -> Any:
     """Overlay the one concrete slot and fenced identities for the child.
 
@@ -205,6 +206,11 @@ def _with_child_placement(
     enforcement is enabled only by the explicit sidecar output path.
 
     CPU-only slots intentionally retain an empty declared-device field.
+
+    slot_resolver : callable, optional
+        Resolve allocation slots for a caller-specific placement path.  The
+        default retains the allocation-slots-v1 resolver and its legacy
+        refusal behavior.
 
     A declared-GPU v2-placement slot also receives a worker-only GPU sampler
     evidence path and the slot's durable quarantine directory in the attempt
@@ -238,9 +244,10 @@ def _with_child_placement(
             "preset slot environment is missing declared device entitlement",
         )
     devices = values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "")
+    resolve_slots = slot_resolver or physical_slots_from_allocation
     if not (slot_id and host and cpus):
         try:
-            slots = physical_slots_from_allocation(allocation)
+            slots = resolve_slots(allocation)
         except PlacementRefusal:
             raise
         except (BindingError, TypeError, ValueError) as error:
@@ -261,7 +268,7 @@ def _with_child_placement(
         # A prepared logical slot is not a physical host map.  Resolve it by
         # slot_id from the immutable scheduler metadata captured at attach.
         try:
-            slots = physical_slots_from_allocation(allocation)
+            slots = resolve_slots(allocation)
         except PlacementRefusal:
             raise
         except (BindingError, TypeError, ValueError) as error:
@@ -274,7 +281,7 @@ def _with_child_placement(
         values.update(slot.env)
     if v2_requested:
         try:
-            slots = physical_slots_from_allocation(allocation)
+            slots = resolve_slots(allocation)
             validate_physical_device_entitlements(slots)
             devices = ",".join(canonical_device_uuid(device) for device in devices.split(",") if device)
         except PlacementRefusal:

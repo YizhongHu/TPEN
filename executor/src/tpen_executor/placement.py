@@ -85,7 +85,7 @@ def canonical_device_uuid(value: str) -> str:
     return result
 
 
-def _host_tokens(text: str, source: str) -> tuple[str, ...]:
+def _host_tokens(text: str, source: str, *, canonicalize: bool = True) -> tuple[str, ...]:
     """Parse one scheduler host text into canonical, unique host names."""
 
     if type(text) is not str:
@@ -98,7 +98,13 @@ def _host_tokens(text: str, source: str) -> tuple[str, ...]:
         if any(char.isspace() for char in line):
             raise PlacementRefusal("host-map-ambiguous", f"{source} contains a host line with whitespace")
         try:
-            host = canonical_host(line)
+            if canonicalize:
+                host = canonical_host(line)
+            else:
+                labels = line.split(".")
+                if any(_HOST_LABEL.fullmatch(label) is None for label in labels):
+                    raise PlacementRefusal("invalid-host", "host contains an invalid hostname label")
+                host = line
         except PlacementRefusal as error:
             raise PlacementRefusal("host-map-ambiguous", f"{source} contains an invalid hostname") from error
         hosts.append(host)
@@ -107,7 +113,7 @@ def _host_tokens(text: str, source: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(hosts))
 
 
-def expand_slurm_nodelist(value: str) -> tuple[str, ...]:
+def expand_slurm_nodelist(value: str, *, canonicalize: bool = True) -> tuple[str, ...]:
     """Expand a bounded Slurm nodelist without importing a scheduler client."""
 
     if type(value) is not str or not value.strip():
@@ -189,7 +195,13 @@ def expand_slurm_nodelist(value: str) -> tuple[str, ...]:
     normalized = []
     for host in hosts:
         try:
-            normalized.append(canonical_host(host))
+            if canonicalize:
+                normalized.append(canonical_host(host))
+            else:
+                labels = host.split(".")
+                if any(_HOST_LABEL.fullmatch(label) is None for label in labels):
+                    raise PlacementRefusal("invalid-host", "host contains an invalid hostname label")
+                normalized.append(host)
         except PlacementRefusal as error:
             raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains an invalid hostname") from error
     return tuple(dict.fromkeys(normalized))
@@ -235,6 +247,37 @@ def scheduler_host_map(
         return _host_tokens(pbs, "PBS_NODEFILE")
     if slurm is not None:
         return expand_slurm_nodelist(slurm)
+    raise PlacementRefusal("host-map-unavailable", "scheduler physical host mapping is absent")
+
+
+def captured_scheduler_host_map(scheduler: Mapping[str, Any] | None = None) -> tuple[str, ...]:
+    """Return the captured scheduler hosts without alias normalization.
+
+    This is the v2 admission view.  The legacy :func:`scheduler_host_map`
+    remains canonicalizing for v1 placement compatibility; routed admission
+    compares these captured spellings exactly with pool and slot nodes.
+    """
+
+    values: Mapping[str, Any] = scheduler if isinstance(scheduler, Mapping) else {}
+    pbs = next((values.get(key) for key in ("pbs_nodefile_text", "PBS_NODEFILE_TEXT") if values.get(key) is not None), None)
+    pbs_path = next((values.get(key) for key in ("pbs_nodefile_path", "PBS_NODEFILE_PATH") if values.get(key) is not None), None)
+    if pbs is None and pbs_path is None:
+        captured = next((values.get(key) for key in ("pbs_nodefile", "PBS_NODEFILE") if values.get(key) is not None), None)
+        if captured is not None:
+            if isinstance(captured, str) and "\n" in captured:
+                pbs = captured
+            else:
+                pbs_path = captured
+    slurm = next((values.get(key) for key in ("slurm_nodelist", "SLURM_NODELIST") if values.get(key) is not None), None)
+    if pbs_path is not None:
+        try:
+            pbs = Path(pbs_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise PlacementRefusal("host-map-unavailable", "PBS_NODEFILE could not be read") from error
+    if pbs is not None:
+        return _host_tokens(pbs, "PBS_NODEFILE", canonicalize=False)
+    if slurm is not None:
+        return expand_slurm_nodelist(slurm, canonicalize=False)
     raise PlacementRefusal("host-map-unavailable", "scheduler physical host mapping is absent")
 
 
@@ -569,6 +612,7 @@ class WorkerBinding:
 
 
 _SLOT_SCHEMA = "tpen-executor/allocation-slots-v1"
+ALLOCATION_SLOTS_V2_SCHEMA = "tpen-executor/allocation-slots-v2"
 _THREAD_NAMES = frozenset({"OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"})
 
 
@@ -792,6 +836,70 @@ def slots_from_allocation(allocation: ConfiguredAllocation) -> tuple[AllocationS
     return decoded
 
 
+def routed_slots_from_allocation(allocation: ConfiguredAllocation) -> tuple[AllocationSlot, ...]:
+    """Decode routed v2 slots and bind them to the captured allocation nodes.
+
+    The v1 resolver above deliberately retains its one-node restriction.  This
+    resolver is the separate v2 path: several slots may name the same node,
+    but the set of slot nodes must equal the exact host set captured in the
+    allocation's scheduler metadata.  No hostname normalization is performed
+    at this comparison boundary.
+
+    Parameters
+    ----------
+    allocation : ConfiguredAllocation
+        Allocation facts containing an ``allocation-slots-v2`` record and its
+        captured scheduler host map.
+
+    Returns
+    -------
+    tuple of AllocationSlot
+        Immutable routed slot entitlements in declared order.
+
+    Raises
+    ------
+    BindingError
+        If the v2 slot record is malformed or entitlements overlap.
+    PlacementRefusal
+        If the captured scheduler host map is absent, ambiguous, or differs
+        from the slot-node set.
+    """
+
+    if not isinstance(allocation, ConfiguredAllocation):
+        raise BindingError("routed slot resolution requires ConfiguredAllocation")
+    raw = allocation.facts.get("slots")
+    if not isinstance(raw, Mapping) or set(raw) != {"schema", "slots"} or raw.get("schema") != ALLOCATION_SLOTS_V2_SCHEMA:
+        raise BindingError(f"routed allocation slots must use schema {ALLOCATION_SLOTS_V2_SCHEMA!r}")
+    entries = raw["slots"]
+    if isinstance(entries, (str, bytes, bytearray)) or not isinstance(entries, Sequence) or not entries:
+        raise BindingError("routed allocation slots must be a non-empty sequence")
+    decoded = tuple(AllocationSlot.from_mapping(entry) for entry in entries)
+    slot_ids = [slot.slot_id for slot in decoded]
+    if len(set(slot_ids)) != len(slot_ids):
+        raise BindingError("routed allocation slots must have unique slot_id values")
+    devices = [device for slot in decoded for device in slot.devices]
+    if len(set(devices)) != len(devices):
+        raise BindingError("routed allocation slots must have disjoint device entitlements")
+    cpu_entitlements = [(slot.node, cpu) for slot in decoded for cpu in slot.cpus]
+    if len(set(cpu_entitlements)) != len(cpu_entitlements):
+        raise BindingError("routed allocation slots must have disjoint CPU entitlements")
+    scheduler = allocation.facts.get("scheduler", allocation.facts.get("scheduler_host_map"))
+    if scheduler is None:
+        raise PlacementRefusal("host-map-unavailable", "routed allocation has no captured scheduler host map")
+    if isinstance(scheduler, Mapping) and isinstance(scheduler.get("pbs_nodefile_error"), Mapping):
+        error = scheduler["pbs_nodefile_error"]
+        if set(error) == {"code", "reason"}:
+            raise PlacementRefusal(error["code"], error["reason"])
+    hosts = captured_scheduler_host_map(scheduler if isinstance(scheduler, Mapping) else None)
+    slot_nodes = {slot.node for slot in decoded}
+    if slot_nodes != set(hosts):
+        raise PlacementRefusal(
+            "routed-node-set-mismatch",
+            f"routed slot nodes {sorted(slot_nodes)!r} differ from captured allocation nodes {sorted(set(hosts))!r}",
+        )
+    return decoded
+
+
 def validate_physical_device_entitlements(slots: Sequence[AllocationSlot]) -> tuple[AllocationSlot, ...]:
     """Canonicalize and validate GPU UUID entitlements for a v2 request."""
 
@@ -897,6 +1005,7 @@ def binding_from_allocation(allocation: ConfiguredAllocation) -> WorkerBinding:
 
 __all__ = [
     "AllocationSlot",
+    "ALLOCATION_SLOTS_V2_SCHEMA",
     "BindingError",
     "CHILD_PLACEMENT_SCHEMA",
     "ChildPlacementObservation",
@@ -906,6 +1015,7 @@ __all__ = [
     "WorkerBinding",
     "binding_from_allocation",
     "bindings_from_allocation",
+    "captured_scheduler_host_map",
     "parse_cpu_set",
     "parse_proc_start_ticks",
     "canonical_device_uuid",
@@ -915,6 +1025,7 @@ __all__ = [
     "read_child_placement",
     "scheduler_host_map",
     "slots_from_allocation",
+    "routed_slots_from_allocation",
     "validate_physical_device_entitlements",
     "utc_timestamp",
 ]
