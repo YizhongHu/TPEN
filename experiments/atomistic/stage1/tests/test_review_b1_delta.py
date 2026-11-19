@@ -119,13 +119,13 @@ def test_smoke_row_uses_train_config_and_loads_bounded_train_contract(
         ),
         source_sha="a" * 40,
         config_sha256="b" * 64,
-        checkpoints=[7, 101],
+        checkpoints=[0, 7, 101],
         lineage_seeds=[11, 22, 33],
         checkpoint_sha256={
             (name, lineage, checkpoint): "d" * 64
             for name in SYSTEMS
             for lineage in range(3)
-            for checkpoint in (7, 101)
+            for checkpoint in (0, 7, 101)
         },
         results_root=str(tmp_path / "results"),
     ) if row["kind"] == "smoke" and row["system"] == system)
