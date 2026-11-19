@@ -165,8 +165,14 @@ def test_real_train_row_reaches_gateway_zero_preparation(
     cfg = observed["cfg"]
     assert cfg.trainer.max_steps == STAGE1_PROTOCOL.lineage_updates
     assert list(cfg.checkpoint_steps) == checkpoints[1:]
-    assert list(cfg.callbacks[4].schedule.updates) == checkpoints[1:]
-    assert cfg.callbacks[-1]._target_ == "tpen.callback.InitialCheckpoint"
+    targets = [str(callback.get("_target_")) for callback in cfg.callbacks]
+    assert targets.count("tpen.callback.Checkpoint") == 1
+    assert targets.count("tpen.callback.InitialCheckpoint") == 1
+    checkpoint = next(
+        callback for callback in cfg.callbacks
+        if callback.get("_target_") == "tpen.callback.Checkpoint"
+    )
+    assert list(checkpoint.schedule.updates) == checkpoints[1:]
 
 
 @pytest.mark.parametrize("system", ["he", "h2"])
