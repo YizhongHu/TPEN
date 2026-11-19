@@ -153,14 +153,27 @@ _REGISTRY.update(
     _registry_entries(
         [
             ("model.layers.0.mixing.layout", "tpen.data.paths.compose_path_layout"),
+            ("model.layers.0.mixing.layout.linear", "tpen.data.paths.LinearPathMetadata.generate"),
+            ("model.layers.0.mixing.layout.linear.explicit.0", "tpen.data.paths.SupportPath"),
+            ("model.layers.0.mixing.layout.linear.explicit.1", "tpen.data.paths.SupportPath"),
+            ("model.layers.0.mixing.layout.linear.explicit.2", "tpen.data.paths.SupportPath"),
             ("model.layers.0.mixing.layout.tensor_product", "tpen.data.paths.PathMetadata.generate"),
             ("model.layers.0.mixing.layout.input_orders", "tpen.data.paths.NormalizedOrders"),
             ("model.layers.0.mixing.layout.output_orders", "tpen.data.paths.NormalizedOrders"),
             ("model.layers.0.mixing.layout.input_channels", "tpen.data.paths.NormalizedChannels"),
             ("model.layers.0.mixing.layout.output_channels", "tpen.data.paths.NormalizedChannels"),
             ("model.layers.0.mixing.producers.0", "tpen.nn.EquivariantMixing"),
+            ("model.layers.0.mixing.producers.0.metadata", "tpen.data.paths.LinearPathMetadata.generate"),
+            ("model.layers.0.mixing.producers.0.metadata.explicit.0", "tpen.data.paths.SupportPath"),
+            ("model.layers.0.mixing.producers.0.metadata.explicit.1", "tpen.data.paths.SupportPath"),
+            ("model.layers.0.mixing.producers.0.metadata.explicit.2", "tpen.data.paths.SupportPath"),
             ("model.layers.0.mixing.producers.0.paths", "tpen.data.paths.PathMetadata.generate"),
+            ("model.layers.0.mixing.producers.1.paths", "tpen.data.paths.PathMetadata.generate"),
             ("model.layers.0.path_aggregation.layout", "tpen.data.paths.compose_path_layout"),
+            ("model.layers.0.path_aggregation.layout.linear", "tpen.data.paths.LinearPathMetadata.generate"),
+            ("model.layers.0.path_aggregation.layout.linear.explicit.0", "tpen.data.paths.SupportPath"),
+            ("model.layers.0.path_aggregation.layout.linear.explicit.1", "tpen.data.paths.SupportPath"),
+            ("model.layers.0.path_aggregation.layout.linear.explicit.2", "tpen.data.paths.SupportPath"),
             ("model.layers.0.path_aggregation.layout.tensor_product", "tpen.data.paths.PathMetadata.generate"),
             ("model.layers.0.path_aggregation.layout.input_orders", "tpen.data.paths.NormalizedOrders"),
             ("model.layers.0.path_aggregation.layout.output_orders", "tpen.data.paths.NormalizedOrders"),
@@ -302,7 +315,8 @@ def build_mutable_state_inventory(config: Any | None = None) -> tuple[MutableSta
             classification, reason = _classification(path, target)
         except ValueError:
             # ``runner.*`` is a producer alias emitted by resolve_train_config;
-            # accept only an exact registered target at its canonical path.
+            # accept only an exact registered target at its canonical path,
+            # including nested model/sampler constructors.
             if path.startswith("runner."):
                 classification, reason = _classification(path[7:], target)
             else:

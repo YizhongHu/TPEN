@@ -22,6 +22,12 @@ context_mapping = importlib.import_module("experiments.atomistic.he-importance.c
 architecture_stage_family = importlib.import_module(
     "experiments.atomistic.he-importance.architecture_stage_family"
 )
+stage_coordinate = importlib.import_module(
+    "experiments.atomistic.he-importance.stage_coordinate"
+)
+optimizer_grid = importlib.import_module(
+    "experiments.atomistic.he-importance.optimizer_grid"
+)
 
 
 def test_real_hi_train_config_is_fully_classified() -> None:
@@ -71,29 +77,65 @@ def test_o_composite_hi_config_is_fully_classified() -> None:
     assert any(entry.target == "tpen.nn.CompositeMixing" for entry in entries)
 
 
-def test_real_o_and_ab_rows_are_closed_inventory_inputs(tmp_path: Path) -> None:
-    """Run real O/A/B resolver outputs through the closed inventory checker."""
+def test_real_resolved_rows_validate_aliases_and_refusal_owners(tmp_path: Path) -> None:
+    """Validate resolver-produced O/A/B rows, including their runner aliases."""
 
-    raw = train_config._compose_base_config()
-    composite = train_config._compose_base_config()
-    composite.model = context_mapping.compose_package(composite.model, "B11")
-    family_configs = []
-    for stage in ("A", "B"):
-        cells = architecture_stage_family.materialize_family_stage(
-            stage, tmp_path / stage
+    q_cells = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "q",
+        availability=optimizer_grid.roster_availability(),
+        stages=("Q",),
+    )
+    resolved_rows = {
+        f"{context}-resolved": train_config.resolve_train_config(
+            next(
+                cell
+                for cell in q_cells
+                if cell.manifest["scientific_identity"]["context"]["name"] == context
+                and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+            )
         )
-        family_configs.append(train_config.resolve_train_config(cells[0]))
+        for context in ("O-raw", "O-composite")
+    }
+    for stage in ("A", "B"):
+        cells = architecture_stage_family.materialize_family_stage(stage, tmp_path / stage)
+        cell = next(
+            item
+            for item in cells
+            if item.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        )
+        resolved_rows[f"{stage}-resolved"] = train_config.resolve_train_config(cell)
 
-    failures = []
-    for label, config in (("O-raw", raw), ("O-composite", composite),
-                          ("A", family_configs[0]), ("B", family_configs[1])):
-        try:
-            entries = inventory.validate_mutable_state_inventory(config)
-            assert entries
-            assert all(entry.source for entry in entries)
-        except Exception as error:
-            failures.append(f"{label}: {error}")
-    assert not failures, "valid admitted rows failed inventory: " + "; ".join(failures)
+    expected_aliases = {
+        "runner.model": "reconstructible",
+        "runner.sampler": "reconstructible",
+        "runner.trainer": "reconstructible",
+        "runner.optimizer": "reconstructible",
+    }
+    expected_refused = {
+        "tpen.callback.RuntimeEquivariance",
+        "tpen.callback.ResourceUsage",
+    }
+    for label, config in resolved_rows.items():
+        entries = inventory.validate_mutable_state_inventory(config)
+        assert entries, label
+        by_path = {entry.path: entry for entry in entries}
+        assert all(path in by_path for path in expected_aliases), label
+        assert {
+            path: by_path[path].classification for path in expected_aliases
+        } == expected_aliases, label
+        assert {
+            entry.target
+            for entry in entries
+            if entry.classification == "typed-refused"
+        } == expected_refused, label
+
+    with pytest.raises(launch.HIContinuationRefusal) as refusal:
+        launch.refuse_hi_continuation(object())
+    message = str(refusal.value)
+    assert "typed-refused mutable owners" in message
+    assert all(target in message for target in expected_refused)
+    assert "tpen.sampling.metropolis.MetropolisSampler" not in message
+    assert "tpen.training.trainer.VMCTrainer" not in message
 
 
 @pytest.mark.parametrize("update", ["replacement", "Gaussian residual"])
