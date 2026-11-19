@@ -334,7 +334,11 @@ def test_real_overlay_train_eval_collect_chain(tmp_path: Path) -> None:
             f"{row['system']}:{row['lineage']}": manifest_hash([row])
             for row in phase1_rows if row["kind"] == "train"
         },
-        "checkpoints": {"he:0:1": checkpoint_sha},
+        "checkpoints": {
+            f"{row['system']}:{row['lineage']}:1": checkpoint_sha
+            for row in phase1_rows
+            if row["kind"] == "train"
+        },
     }
     eval_rows = bind_evaluation_manifest(
         phase1_rows=phase1_rows,
