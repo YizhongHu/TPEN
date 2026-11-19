@@ -741,7 +741,8 @@ def discover_published_checkpoint(checkpoint_root: str | Path) -> CheckpointRef 
         Publication indexes are missing for complete checkpoints or the latest
         pointer and catalog disagree.
     ValueError
-        Checkpoint bytes, manifest, or publication catalog are invalid.
+        The train-resume manifest, reference manifest/model digests, or
+        publication catalog are invalid.
     OSError
         Checkpoint artifacts cannot be read.
 
@@ -750,6 +751,9 @@ def discover_published_checkpoint(checkpoint_root: str | Path) -> CheckpointRef 
     Only checkpoint publication records authorize selection. Logger JSONL/CSV,
     metrics, status and run-outcome files are never consulted. This operation
     neither repairs indexes nor changes restore or takeover policy.
+    Discovery validates the train-resume manifest and the reference's manifest
+    and model digests. Per-component ``<component>_sha256`` integrity is checked
+    by ``restore_checkpoint`` before it mutates state.
     """
 
     checkpoint_root = Path(checkpoint_root)
