@@ -618,10 +618,11 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         raise ProtocolError("checkpoints must be a non-empty list of non-negative updates")
     if len(set(checkpoints)) != len(checkpoints):
         raise ProtocolError("checkpoints must not contain duplicates")
-    if any(step > protocol.lineage_updates for step in checkpoints):
-        raise ProtocolError("checkpoints must not exceed lineage_updates")
-    if protocol.lineage_updates not in checkpoints:
-        raise ProtocolError("checkpoints must retain the terminal lineage_updates checkpoint")
+    if phase == 1:
+        if any(step > protocol.lineage_updates for step in checkpoints):
+            raise ProtocolError("checkpoints must not exceed lineage_updates")
+        if protocol.lineage_updates not in checkpoints:
+            raise ProtocolError("checkpoints must retain the terminal lineage_updates checkpoint")
     if isinstance(config_sha256, Mapping):
         config_ids = {system: _require_sha(config_sha256.get(system), length=64,
                                            field=f"config_sha256[{system!r}]") for system in selected}

@@ -244,7 +244,7 @@ def _phase1_rows() -> list[dict[str, object]]:
     return build_manifest(
         protocol=STAGE1_PROTOCOL, source_sha=SHA1,
         config_sha256={system: SHA256 for system in SYSTEMS},
-        checkpoints=[7], lineage_seeds=[11, 12, 13], checkpoint_sha256={},
+        checkpoints=[7, STAGE1_PROTOCOL.lineage_updates], lineage_seeds=[11, 12, 13], checkpoint_sha256={},
         results_root="/external/stage1", systems=("he",), phase=1,
     )
 
@@ -339,7 +339,7 @@ def test_phase2_rejects_checkpoint_evidence_from_a_foreign_phase1_manifest() -> 
     phase1_b = build_manifest(
         protocol=STAGE1_PROTOCOL, source_sha=SHA1,
         config_sha256={system: SHA256 for system in SYSTEMS},
-        checkpoints=[7], lineage_seeds=[21, 22, 23], checkpoint_sha256={},
+        checkpoints=[7, STAGE1_PROTOCOL.lineage_updates], lineage_seeds=[21, 22, 23], checkpoint_sha256={},
         results_root="/external/stage1", systems=("he",), phase=1,
     )
     with pytest.raises(ProtocolError, match="checkpoint evidence"):

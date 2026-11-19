@@ -54,7 +54,7 @@ def test_plan_main_uses_protocol_planned_physical_system_ids(
             "--config-sha256", "b" * 64,
             "--results-root", "/external/stage1",
             "--checkpoint-bindings", str(bindings),
-            "--checkpoints", "7",
+            "--checkpoints", "7", "100000",
             "--lineage-seeds", "11", "12", "13",
         ],
     )
@@ -77,7 +77,7 @@ def test_two_phase_plan_compares_legacy_config_digest_to_checkout(
             "--results-root", "/external/stage1",
             "--phase", "1",
             "--systems", "he",
-            "--checkpoints", "7",
+            "--checkpoints", "7", "100000",
             "--lineage-seeds", "11", "12", "13",
         ],
     )
@@ -111,7 +111,7 @@ def test_plan_main_phase1_then_phase2_round_trip(
         sys, "argv",
         ["plan.py", "--output", str(phase1_path), "--source-sha", "a" * 40,
          "--results-root", "/external/stage1", "--phase", "1", "--systems", "he",
-         "--checkpoints", "7", "--lineage-seeds", "11", "12", "13"],
+         "--checkpoints", "7", "100000", "--lineage-seeds", "11", "12", "13"],
     )
     assert plan_module.main() == 0
     phase1_doc = json.loads(phase1_path.read_text(encoding="utf-8"))
@@ -170,7 +170,7 @@ def test_plan_main_phase1_then_phase2_round_trip(
         sys, "argv",
         ["plan.py", "--output", str(phase1_b_path), "--source-sha", "a" * 40,
          "--results-root", "/external/stage1", "--phase", "1", "--systems", "he",
-         "--checkpoints", "7", "--lineage-seeds", "21", "22", "23"],
+         "--checkpoints", "7", "100000", "--lineage-seeds", "21", "22", "23"],
     )
     assert plan_module.main() == 0
     phase2_d_path = tmp_path / "phase2_d.json"
