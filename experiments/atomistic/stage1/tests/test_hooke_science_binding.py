@@ -108,7 +108,7 @@ def test_legacy_he_h2_rows_do_not_inherit_hooke_profile_fields() -> None:
         config_sha256=config_identities(
             config_root=ROOT / "configs", systems=("he", "h2"),
         ),
-        checkpoints=[0, 1000],
+        checkpoints=list(range(0, STAGE1_PROTOCOL.lineage_updates + 1, 1000)),
         lineage_seeds=[11, 12, 13],
         checkpoint_sha256={},
         results_root="/external/stage1",
