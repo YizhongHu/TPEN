@@ -141,7 +141,7 @@ def test_refusal_precedes_all_mutation(source, tmp_path, monkeypatch, entry, ref
     cfg, request, _, live = source
     kwargs = _entry(cfg, request, entry)
     if refusal == "unsupported-callback":
-        cfg.callbacks.append({"_target_": "tpen.callback.ResourceUsage"})
+        cfg.callbacks.append({"_target_": "tpen.callback.FailureLog"})
     else:
         cfg.callbacks.append({"_target_": "tpen.callback.DataIntegrity", "max_calls": 1})
 
@@ -182,7 +182,7 @@ def test_refusal_precedes_all_mutation(source, tmp_path, monkeypatch, entry, ref
 @pytest.mark.parametrize("unsupported", ["callback", "cadence"])
 def test_unsupported_profile_does_not_gate_non_resume(source, monkeypatch, mode, unsupported):
     cfg, _, checkpoint, _ = source
-    callback = ({"_target_": "tpen.callback.ResourceUsage"} if unsupported == "callback"
+    callback = ({"_target_": "tpen.callback.FailureLog"} if unsupported == "callback"
                 else {"_target_": "tpen.callback.DataIntegrity", "max_calls": 1})
     cfg.callbacks.append(callback)
     cfg.runner.load = {"mode": mode, "path": str(checkpoint)}

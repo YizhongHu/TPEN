@@ -161,6 +161,26 @@ identity (`executor/src/tpen_executor/storage.py:454-485`). A consumer must
 not infer a full checkpoint reference, publication receipt, or resumability
 from this summary alone.
 
+### Public restart primitives (CX-08)
+
+`tpen.execution.discover_published_checkpoint(checkpoint_root)` exposes the
+existing read-only discovery and train-resume validation path. It returns a
+`CheckpointRef` or `None`, ignores newer complete-but-unpublished directories,
+and refuses inconsistent publication indexes without reconciling or writing.
+Checkpoint publication records alone authorize selection: logger JSONL/CSV,
+metrics, `status.json`, and `run-outcome.json` never determine the selected ref.
+`PredecessorDiscoveryRefusal` is exported for missing or inconsistent indexes;
+malformed catalog or checkpoint data retain their existing validation errors.
+
+`tpen.execution.create_json_receipt(path, payload)` creates canonical UTF-8
+JSON with a trailing newline in an existing parent directory. It fsyncs an
+exclusively created temporary file before atomically linking it to the final
+path, then fsyncs the directory. An occupied destination raises the exported
+`ReceiptExistsError` (`FileExistsError` subtype), including concurrent losers;
+no existing receipt is replaced. A sync failure after linking may leave the
+complete receipt present. These primitives add no restore, lease-expiry,
+takeover, launch, or executor policy.
+
 ## 6. Segment continuation (PROPOSED)
 
 Current `AcceptedSegment` is a fresh-start operational record. It requires
