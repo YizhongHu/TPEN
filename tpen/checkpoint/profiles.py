@@ -325,7 +325,10 @@ def _resolve_plain_reference(config: Mapping[str, Any], value: str) -> Any:
 
     current: Any = value
     visited: set[str] = set()
-    while isinstance(current, str) and current.startswith("${"):
+    # Any interpolation marker is executable/configuration syntax.  A marker
+    # embedded in a larger string is not a literal scalar and must not be
+    # laundered through the same-config reference path.
+    while isinstance(current, str) and "${" in current:
         match = _PLAIN_REFERENCE.fullmatch(current)
         if match is None:
             return _INVALID_SCALAR
@@ -339,7 +342,9 @@ def _resolve_plain_reference(config: Mapping[str, Any], value: str) -> Any:
                 return _INVALID_SCALAR
             node = node[segment]
         current = node
-    if type(current) in (bool, int, float, str):
+    if type(current) in (bool, int, float):
+        return current
+    if type(current) is str and "${" not in current:
         return current
     return _INVALID_SCALAR
 
@@ -350,7 +355,7 @@ def _scalar_value(value: Any, config: Mapping[str, Any]) -> Any:
     if type(value) in (bool, int, float):
         return value
     if type(value) is str:
-        if not value.startswith("${"):
+        if "${" not in value:
             return value
         return _resolve_plain_reference(config, value)
     return _INVALID_SCALAR

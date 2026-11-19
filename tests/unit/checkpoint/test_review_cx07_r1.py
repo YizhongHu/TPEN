@@ -33,6 +33,13 @@ def _runtime(config):
     )
 
 
+def _resource_usage(config):
+    return next(
+        entry for entry in config["callbacks"]
+        if entry["_target_"] == "tpen.callback.ResourceUsage"
+    )
+
+
 def _assert_refused(config, validator):
     if validator == "profile":
         assert check_profile(config, NATIVE_RECOVERY_PROFILE).verdict == "refused"
@@ -64,6 +71,38 @@ def test_checker_seed_rejects_attempt_dependent_resolver(validator):
     config = _hi_config()
     _runtime(config)["checkers"][0]["seed"] = "${oc.env:CX07_CHECKER_SEED,19}"
     _assert_refused(config, validator)
+
+
+@pytest.mark.parametrize("validator", ["profile", "native"])
+@pytest.mark.parametrize("form", ["direct", "aliased"])
+def test_allocator_device_rejects_embedded_interpolation(validator, form):
+    """An interpolation anywhere in an audited device scalar is refused."""
+    config = _hi_config()
+    embedded = "cuda:${oc.env:CX07_DEVICE_INDEX,0}"
+    if form == "direct":
+        _resource_usage(config)["allocator_probe"]["device"] = embedded
+    else:
+        config["runtime"]["device"] = embedded
+    _assert_refused(config, validator)
+
+
+@pytest.mark.parametrize("validator", ["profile", "native"])
+def test_allocator_device_literal_and_hi_reference_are_admitted(validator):
+    """Literal devices and HI's full same-config device reference remain valid."""
+    config = _hi_config()
+    resource = _resource_usage(config)
+    assert resource["allocator_probe"]["device"] == "${runtime.device}"
+
+    if validator == "profile":
+        assert check_profile(config, NATIVE_RECOVERY_PROFILE).verdict == "supported"
+    else:
+        validate_native_recovery_profile(config)
+
+    resource["allocator_probe"]["device"] = "cuda:0"
+    if validator == "profile":
+        assert check_profile(config, NATIVE_RECOVERY_PROFILE).verdict == "supported"
+    else:
+        validate_native_recovery_profile(config)
 
 
 def test_real_hi_scalar_references_remain_admitted():
