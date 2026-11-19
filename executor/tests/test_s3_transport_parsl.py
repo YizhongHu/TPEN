@@ -87,8 +87,8 @@ S3B_MUTANT_TABLE = (
     },
     {
         "id": "M3", "target": WORKERS_MODULE,
-        "old": "        child_env = os.environ.copy()\n        child_env.update(environment.env)\n",
-        "new": "        child_env = dict(environment.env)\n        child_env.update(os.environ)\n",
+        "old": "        child_env.pop(ROUTED_STRICT_HOST_ENV, None)\n        child_env.update(environment.env)\n",
+        "new": "        child_env.pop(ROUTED_STRICT_HOST_ENV, None)\n        child_env = {**environment.env, **child_env}\n",
         "killer": "test_slot_binding_survives_controller_ambient_at_the_remote_boundary",
         "suite": "executor", "assertion": "controller/worker ambient CUDA and CPU values never override the slot binding in the leaf child",
     },

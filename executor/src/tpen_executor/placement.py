@@ -416,7 +416,7 @@ class ChildPlacementObservation:
             "thread_settings": dict(self.thread_settings),
             "cuda_visible_devices": self.cuda_visible_devices,
             "observed_at_utc": self.observed_at_utc,
-            "refusal": self.refusal,
+            "refusal": None if self.refusal is None else dict(self.refusal),
         }
 
     @classmethod
