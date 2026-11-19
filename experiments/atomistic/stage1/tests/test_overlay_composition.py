@@ -121,12 +121,12 @@ def test_no_overlay_manifest_matches_pre_overlay_golden_bytes() -> None:
     """The overlay feature leaves the pre-change no-overlay manifest untouched."""
 
     from experiments.atomistic.stage1.tests.test_step_zero import (
-        NO_ZERO_FIXTURE,
-        _no_zero_manifest_bytes,
+        CANONICAL_FIXTURE,
+        _canonical_manifest_bytes,
     )
 
-    fixture = json.loads(NO_ZERO_FIXTURE.read_text(encoding="utf-8"))
-    rendered = _no_zero_manifest_bytes()
+    fixture = json.loads(CANONICAL_FIXTURE.read_text(encoding="utf-8"))
+    rendered = _canonical_manifest_bytes()
     assert len(rendered) == fixture["manifest_bytes"]
     assert hashlib.sha256(rendered).hexdigest() == fixture["manifest_sha256"]
 
