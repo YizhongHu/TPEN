@@ -468,6 +468,19 @@ def decode_binding(token: str) -> dict[str, Any]:
     return value
 
 
+def _is_overlay_owned_override(key: str) -> bool:
+    """Identify override paths reserved by the declared train overlay."""
+
+    return (
+        key == "callbacks"
+        or key.startswith("callbacks.")
+        or key == "loggers"
+        or key.startswith("loggers.")
+        or key == "stage1_overlay"
+        or key.startswith("stage1_overlay.")
+    )
+
+
 def validate_gateway_binding(*, binding: str, config: str, overrides: list[str], kind: str,
                              expected_checkpoint_sha256: str | None = None,
                              overlay: str | None = None,
@@ -542,6 +555,8 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
             raise ProtocolError("prefixed gateway overrides are not allowed")
         if not separator or not key:
             raise ProtocolError(f"invalid gateway override: {override!r}")
+        if declared_overlay is not None and _is_overlay_owned_override(key):
+            raise ProtocolError(f"gateway override targets overlay-owned path: {key}")
         if key in override_map:
             raise ProtocolError(f"duplicate gateway override: {key}")
         override_map[key] = value

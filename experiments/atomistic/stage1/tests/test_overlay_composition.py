@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from experiments.atomistic.stage1 import protocol as protocol_module
+from experiments.atomistic.stage1 import train as stage1_train
 from experiments.atomistic.stage1.launch import _binding_token, row_overrides
 from experiments.atomistic.stage1.protocol import (
     CONFIG_IDENTITY_RULE,
@@ -115,6 +117,20 @@ def test_no_overlay_manifest_keeps_existing_identity_shape() -> None:
     assert {row["config_identity_rule"] for row in rows} == {CONFIG_IDENTITY_RULE}
 
 
+def test_no_overlay_manifest_matches_pre_overlay_golden_bytes() -> None:
+    """The overlay feature leaves the pre-change no-overlay manifest untouched."""
+
+    from experiments.atomistic.stage1.tests.test_step_zero import (
+        NO_ZERO_FIXTURE,
+        _no_zero_manifest_bytes,
+    )
+
+    fixture = json.loads(NO_ZERO_FIXTURE.read_text(encoding="utf-8"))
+    rendered = _no_zero_manifest_bytes()
+    assert len(rendered) == fixture["manifest_bytes"]
+    assert hashlib.sha256(rendered).hexdigest() == fixture["manifest_sha256"]
+
+
 def test_declared_overlay_is_hash_bound_to_train_rows() -> None:
     """A declared overlay appears only on train rows and carries its digest."""
 
@@ -185,6 +201,127 @@ def test_gateway_accepts_declared_overlay_and_rejects_hash_or_undeclared_use() -
             overlay=protocol_module.OVERLAY_RELATIVE_PATH,
             overlay_sha256=overlay_sha256(OVERLAY),
         )
+
+
+@pytest.mark.parametrize(
+    "owned_override",
+    (
+        "loggers=[]",
+        "callbacks=[{_target_:tpen.callback.Status}]",
+        "stage1_overlay.sha256=" + "d" * 64,
+    ),
+)
+def test_actual_train_gateway_refuses_overlay_owned_overrides(
+    owned_override: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public train gateway refuses unbound overlay-owned overrides."""
+
+    row = _overlay_row()
+    overrides = row_overrides(row) + [owned_override]
+    monkeypatch.setattr(
+        "tpen.run.load_config",
+        lambda *_args, **_kwargs: pytest.fail("rejected gateway loaded a config"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage1-train",
+            "--config",
+            str(CONFIG_ROOT / "he" / "train.yaml"),
+            "--kind",
+            "train",
+            *overrides,
+            "--binding",
+            _binding_token(row),
+            "--overlay",
+            str(row["overlay"]),
+            "--overlay-sha256",
+            str(row["overlay_sha256"]),
+        ],
+    )
+    with pytest.raises(ProtocolError, match="overlay-owned path"):
+        stage1_train.main()
+
+
+def test_actual_train_gateway_accepts_bound_overlay_without_owned_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public train gateway keeps the manifest-bound overlay path green."""
+
+    row = _overlay_row()
+    cfg = load_config(str(CONFIG_ROOT / "he" / "train.yaml"))
+    observed: dict[str, object] = {}
+    monkeypatch.setattr("tpen.run.load_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        stage1_train,
+        "run_from_config",
+        lambda resolved, **_kwargs: observed.setdefault("cfg", resolved) and 0,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage1-train",
+            "--config",
+            str(CONFIG_ROOT / "he" / "train.yaml"),
+            "--kind",
+            "train",
+            *row_overrides(row),
+            "--binding",
+            _binding_token(row),
+            "--overlay",
+            str(row["overlay"]),
+            "--overlay-sha256",
+            str(row["overlay_sha256"]),
+        ],
+    )
+    assert stage1_train.main() == 0
+    resolved = observed["cfg"]
+    assert resolved.stage1_overlay.sha256 == row["overlay_sha256"]
+
+
+def test_overlay_gateway_zero_checkpoint_preserves_base_checkpoint_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overlay composition and zero routing preserve manifest checkpointing."""
+
+    row = _overlay_row()
+    row["checkpoint_steps"] = [0, 7]
+    cfg = load_config(str(CONFIG_ROOT / "he" / "train.yaml"))
+    observed: dict[str, object] = {}
+    monkeypatch.setattr("tpen.run.load_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        stage1_train,
+        "run_from_config",
+        lambda resolved, **_kwargs: observed.setdefault("cfg", resolved) and 0,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage1-train",
+            "--config",
+            str(CONFIG_ROOT / "he" / "train.yaml"),
+            "--kind",
+            "train",
+            *row_overrides(row),
+            "--binding",
+            _binding_token(row),
+            "--overlay",
+            str(row["overlay"]),
+            "--overlay-sha256",
+            str(row["overlay_sha256"]),
+        ],
+    )
+    assert stage1_train.main() == 0
+    resolved = observed["cfg"]
+    assert list(resolved.checkpoint_steps) == [7]
+    callback_targets = [entry["_target_"] for entry in resolved.callbacks]
+    assert callback_targets.count("tpen.callback.Checkpoint") == 1
+    assert callback_targets.count("tpen.callback.InitialCheckpoint") == 1
+    assert resolved.stage1_overlay.path == protocol_module.OVERLAY_RELATIVE_PATH
+    assert resolved.loggers[0]._target_ == "tpen.logging.JSONL"
 
 
 def test_train_composition_appends_diagnostics_and_preserves_base_callbacks() -> None:
