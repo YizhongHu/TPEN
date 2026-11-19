@@ -42,8 +42,27 @@ def test_train_config_declares_checkpoint_publication(system: str) -> None:
                           if entry.get("_target_") == "tpen.callback.Checkpoint")
     assert raw_checkpoint["output_dir"] == "${run.dir}/checkpoints"
     assert checkpoints[0].schedule._target_ == "tpen.checkpoint.ExplicitUpdates"
-    assert list(checkpoints[0].schedule.updates) == [1000]
-    assert list(cfg.checkpoint_steps) == [1000]
+    if system in {"he", "h2"}:
+        expected_steps = [0, *range(1000, 100001, 1000)]
+        assert list(checkpoints[0].schedule.updates) == expected_steps
+        assert list(cfg.checkpoint_steps) == expected_steps
+        assert cfg.trainer.max_steps == 100000
+    else:
+        assert list(checkpoints[0].schedule.updates) == [1000]
+        assert list(cfg.checkpoint_steps) == [1000]
+
+
+@pytest.mark.parametrize("system", ["he", "h2"])
+def test_width32_model_is_identical_between_train_and_eval(system: str) -> None:
+    train = load_config(str(ROOT / system / "train.yaml"))
+    eval_cfg = load_config(str(ROOT / system / "eval.yaml"))
+    eval_model = eval_cfg.stage1_he_model if system == "he" else eval_cfg.stage1_h2_model
+    for model in (train.model, eval_model):
+        assert model.embedding.out_channels == 32
+        assert model.embedding.hidden_channels == 128
+        assert model.layers[0].mixing.channels == 32
+        assert model.layers[0].path_aggregation.channels == 32
+        assert model.readout.channels == 32
 
 
 @pytest.mark.parametrize("system", ["hooke1", "hooke2", "he"])

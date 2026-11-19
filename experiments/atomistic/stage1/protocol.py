@@ -83,7 +83,7 @@ class Protocol:
             raise ProtocolError("Stage-1 requires at least 3 lineages and 4 eval streams")
 
 
-STAGE1_PROTOCOL = Protocol(1000, 256, 50000, 4096, 3, 4, 4096, 256)
+STAGE1_PROTOCOL = Protocol(1000, 256, 100000, 4096, 3, 4, 4096, 256)
 SYSTEM_SPECS = tuple(SystemSpec(name, system_id) for name, system_id in (
     ("hooke1", "hooke_one_electron_omega0.5"),
     ("hooke2", "hooke_pair_singlet_omega0.5"),
@@ -618,6 +618,10 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         raise ProtocolError("checkpoints must be a non-empty list of non-negative updates")
     if len(set(checkpoints)) != len(checkpoints):
         raise ProtocolError("checkpoints must not contain duplicates")
+    if any(step > protocol.lineage_updates for step in checkpoints):
+        raise ProtocolError("checkpoints must not exceed lineage_updates")
+    if protocol.lineage_updates not in checkpoints:
+        raise ProtocolError("checkpoints must retain the terminal lineage_updates checkpoint")
     if isinstance(config_sha256, Mapping):
         config_ids = {system: _require_sha(config_sha256.get(system), length=64,
                                            field=f"config_sha256[{system!r}]") for system in selected}
