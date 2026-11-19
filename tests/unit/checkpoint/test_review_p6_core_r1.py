@@ -114,6 +114,8 @@ def test_core_t2_constants_facade_and_chain_resume_remain_exact():
         "tpen.callback.OptimizerState",
         "tpen.callback.RawTrainingBatchRecorder",
         "tpen.callback.TrainingBatchRecorder",
+        "tpen.callback.RuntimeEquivariance",
+        "tpen.callback.ResourceUsage",
     })
     assert profiles.SUPPORTED_LOGGER_TARGETS == frozenset({
         "tpen.logging.CSV", "tpen.logging.JSONL",
