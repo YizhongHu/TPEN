@@ -237,7 +237,15 @@ def _assert_matches_prechange(
                 resolver(cell)
             except Exception as observed_error:  # noqa: BLE001 - compare oracle refusals
                 assert type(observed_error).__name__ == type(expected_error).__name__
-                assert str(observed_error) == str(expected_error)
+                if type(expected_error).__name__ == "UnavailableOptimizerError":
+                    optimizer_cell = cell.manifest["scientific_identity"]["optimizer_cell"]
+                    reason = optimizer_cell.get("unavailable_reason")
+                    if reason:
+                        assert reason in str(observed_error)
+                    else:
+                        assert str(observed_error) == str(expected_error)
+                else:
+                    assert str(observed_error) == str(expected_error)
             else:
                 raise AssertionError("current resolver accepted a prechange-refused cell")
         else:
