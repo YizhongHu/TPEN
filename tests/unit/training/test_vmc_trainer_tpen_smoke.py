@@ -268,6 +268,30 @@ def test_one_vmc_step_is_finite_and_vmc_native() -> None:
         assert key in state.metrics
 
 
+def test_vmc_optimizer_update_does_not_leave_stale_sampler_cache() -> None:
+    """The next trainer collection refreshes retained walkers after an update."""
+
+    model = build_tiny_spenn()
+    sampler = build_tiny_sampler()
+    terms = [KineticEnergy(), HarmonicTrap(omega=0.5), ElectronElectronInteraction()]
+    trainer = VMCTrainer(max_steps=2, log_every_n_steps=1)
+    trainer.fit(
+        model=model,
+        sampler=sampler,
+        hamiltonian_terms=terms,
+        optimizer=torch.optim.Adam(model.parameters(), lr=0.01),
+        context=_StubContext(),
+        emit=lambda name, *, state=None, payload=None, step=None: None,
+    )
+
+    assert trainer.completed_updates == 2
+    assert sampler.walkers is not None
+    with torch.no_grad():
+        output = model(sampler.walkers.make_batch())
+    assert torch.equal(sampler.walkers.logabs, output.logabs)
+    assert torch.equal(sampler.walkers.sign, output.sign)
+
+
 def _fit_one_step(*, return_terms: bool, terms) -> object:
     model = build_tiny_spenn()
     sampler = build_tiny_sampler()

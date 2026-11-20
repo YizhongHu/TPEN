@@ -226,14 +226,36 @@ def test_collect_samples_refreshes_retained_cache_before_changed_model_decision(
     shifted = ShiftedQuadraticLogAbsModel(-5.0)
 
     for sampler in (stale, fresh):
-        walkers = sampler.reset(device="cpu")
-        sampler._walkers = walkers.update_cache(base)
-        sampler._has_burned_in = True
-    expected, _ = fresh.collect_samples(shifted)
+        sampler.collect_samples(base, reset=True)
+    # The expected branch refreshes through the public walker operation and
+    # calls step directly, so it remains independent of collect_samples' fix.
+    assert fresh.walkers is not None
+    expected = fresh.step(shifted, fresh.walkers.update_cache(shifted))
     actual, _ = stale.collect_samples(shifted)
 
     assert torch.equal(actual.positions, expected.positions)
     assert torch.equal(actual.aux["accepted"], expected.aux["accepted"])
+
+
+def test_retained_cache_refresh_matches_fresh_unchanged_model_and_preserves_rng() -> None:
+    cached = MetropolisSampler(n_walkers=8, burn_in=0, n_steps=1, seed=123, dtype=torch.float64)
+    fresh = MetropolisSampler(n_walkers=8, burn_in=0, n_steps=1, seed=123, dtype=torch.float64)
+    model = QuadraticLogAbsModel()
+    cached.collect_samples(model, reset=True)
+    fresh.collect_samples(model, reset=True)
+
+    expected_rng_before = fresh.mcmc_state_dict()["generator_state"]
+    assert fresh.walkers is not None
+    refreshed = fresh.walkers.update_cache(model)
+    assert torch.equal(expected_rng_before, fresh.mcmc_state_dict()["generator_state"])
+    expected = fresh.step(model, refreshed)
+    actual = cached.collect_samples(model)[0]
+
+    assert torch.equal(actual.positions, expected.positions)
+    assert torch.equal(actual.aux["accepted"], expected.aux["accepted"])
+    assert torch.equal(actual.logabs, expected.logabs)
+    assert torch.equal(actual.sign, expected.sign)
+    assert torch.equal(cached.mcmc_state_dict()["generator_state"], fresh.mcmc_state_dict()["generator_state"])
 
 
 def test_retained_cache_refresh_is_one_boundary_evaluation_not_per_step() -> None:
@@ -261,6 +283,27 @@ def test_sampler_state_dict_roundtrip_continues_same_chain() -> None:
 
     assert resumed.has_burned_in is True
     assert torch.equal(expected.positions, actual.positions)
+
+
+def test_restored_walkers_refresh_against_changed_model_on_next_collect() -> None:
+    base = QuadraticLogAbsModel()
+    shifted = ShiftedQuadraticLogAbsModel(-5.0)
+    source = _tiny_sampler()
+    source.collect_samples(base)
+    state = source.mcmc_state_dict()
+
+    actual_sampler = _tiny_sampler()
+    expected_sampler = _tiny_sampler()
+    actual_sampler.load_mcmc_state_dict(state)
+    expected_sampler.load_mcmc_state_dict(state)
+    assert expected_sampler.walkers is not None
+    expected = expected_sampler.step(shifted, expected_sampler.walkers.update_cache(shifted))
+    actual, _ = actual_sampler.collect_samples(shifted)
+
+    assert torch.equal(actual.positions, expected.positions)
+    assert torch.equal(actual.aux["accepted"], expected.aux["accepted"])
+    assert torch.equal(actual.logabs, expected.logabs)
+    assert torch.equal(actual.sign, expected.sign)
 
 
 def test_sampler_state_load_maps_checkpoint_device_to_runtime_device() -> None:
