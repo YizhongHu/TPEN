@@ -146,7 +146,8 @@ def test_default_mapping_dispatch_preserves_hybrid_l3a_behavior() -> None:
 
 @pytest.mark.parametrize("key", [b"benign", Path("benign")])
 def test_default_normalizes_non_string_mapping_keys(key: object) -> None:
-    assert _screen({key: "benign"}) == [str(key), "benign"]
+    normalized = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+    assert _screen({key: "benign"}) == [normalized, "benign"]
 
 
 def test_opt_in_walker_policies_refuse_original_keys_and_prioritize_dataclass_fields() -> None:
