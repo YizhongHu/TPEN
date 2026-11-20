@@ -18,8 +18,22 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
+import importlib.util
 import math
+from pathlib import Path
+import sys
 from typing import Any
+
+
+_WALKER_NAME = "he_importance_blinding_traversal"
+_WALKER_PATH = Path(__file__).with_name("blinding_traversal.py")
+_WALKER_SPEC = importlib.util.spec_from_file_location(_WALKER_NAME, _WALKER_PATH)
+assert _WALKER_SPEC is not None and _WALKER_SPEC.loader is not None
+_WALKER = sys.modules.get(_WALKER_NAME)
+if _WALKER is None:
+    _WALKER = importlib.util.module_from_spec(_WALKER_SPEC)
+    sys.modules[_WALKER_NAME] = _WALKER
+    _WALKER_SPEC.loader.exec_module(_WALKER)
 
 
 class EvaluatorQualificationError(ValueError):
@@ -213,18 +227,27 @@ def require_complete_rank_artifact(states: Sequence[InferenceState], *, expected
 def _refuse_blinding_content(value: Any, label: str) -> None:
     """Reject reference-bearing fields recursively before they reach the evaluator."""
 
-    if isinstance(value, str):
-        normalized = value.lower().replace("-", "_")
-        if normalized in _FORBIDDEN_BLINDING_TOKENS or "reference" in normalized:
-            raise EvaluatorQualificationError(f"{label} contains forbidden blinding value {value!r}")
-    elif isinstance(value, Mapping):
-        for key, nested in value.items():
-            if not isinstance(key, str):
-                raise EvaluatorQualificationError(f"{label} keys must be strings")
-            normalized = key.lower().replace("-", "_")
-            if normalized in _FORBIDDEN_BLINDING_TOKENS or "reference" in normalized:
-                raise EvaluatorQualificationError(f"{label} contains forbidden blinding field {key!r}")
-            _refuse_blinding_content(nested, f"{label}.{key}")
-    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        for index, nested in enumerate(value):
-            _refuse_blinding_content(nested, f"{label}[{index}]")
+    def is_forbidden(text: str) -> bool:
+        normalized = text.lower().replace("-", "_")
+        return normalized in _FORBIDDEN_BLINDING_TOKENS or "reference" in normalized
+
+    def error_factory(path: str, content: Any, reason: str) -> Exception:
+        if reason == "key-type":
+            return EvaluatorQualificationError(f"{label} keys must be strings")
+        if reason == "key":
+            parent = path.rsplit(".", 1)[0]
+            return EvaluatorQualificationError(
+                f"{parent} contains forbidden blinding field {content!r}"
+            )
+        if reason == "decode":
+            return EvaluatorQualificationError(f"{path} contains undecodable blinding content")
+        if reason == "cycle":
+            return EvaluatorQualificationError(f"{path} contains a cyclic blinding value")
+        return EvaluatorQualificationError(f"{path} contains forbidden blinding value {content!r}")
+
+    _WALKER.walk_blinding_content(
+        value,
+        label,
+        is_forbidden=is_forbidden,
+        error_factory=error_factory,
+    )

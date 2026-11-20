@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+from dataclasses import dataclass
 from pathlib import Path
 import re
 import sys
@@ -560,3 +561,36 @@ def test_r2_a_non_string_mapping_key_is_refused_with_declared_error() -> None:
 def test_r2_a_non_string_key_is_refused_at_nested_node() -> None:
     with pytest.raises(evaluator.EvaluatorQualificationError):
         evaluator._refuse_blinding_content({"outer": [{2: "y"}]}, "probe")
+
+
+@dataclass(frozen=True)
+class _DataclassWitness:
+    payload: object
+
+
+class _ObjectWitness:
+    def __init__(self, payload: object) -> None:
+        self.payload = payload
+
+
+@pytest.mark.parametrize(
+    ("payload", "label"),
+    [
+        (_DataclassWitness("reference_energy"), "factor input.payload"),
+        (_ObjectWitness("reference_energy"), "factor input.payload"),
+        ({"payload": b"reference_energy"}, "factor input.payload"),
+        ({"payload": Path("reference_energy")}, "factor input.payload"),
+    ],
+)
+def test_blinding_reaches_new_structural_and_normalized_leaves(payload: object, label: str) -> None:
+    with pytest.raises(
+        evaluator.EvaluatorQualificationError,
+        match=rf"{re.escape(label)} contains forbidden blinding value",
+    ) as exc:
+        evaluator.qualify_factor(
+            "cusp",
+            payload,
+            lambda value: value,
+            analytic_oracle=lambda value: value,
+        )
+    assert exc.type is evaluator.EvaluatorQualificationError
