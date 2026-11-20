@@ -932,10 +932,20 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
         raise ProtocolError("unresolved train config is not a mapping")
     expected_callbacks = _expected_overlay_callbacks(relative)
     callbacks = unresolved.get("callbacks")
-    if (
-        not isinstance(callbacks, list)
-        or len(callbacks) < len(expected_callbacks)
-        or callbacks[-len(expected_callbacks):] != expected_callbacks
+    overlay_start = None
+    if isinstance(callbacks, list):
+        for index in range(len(callbacks) - len(expected_callbacks) + 1):
+            if callbacks[index:index + len(expected_callbacks)] == expected_callbacks:
+                overlay_start = index
+                break
+    if overlay_start is None:
+        raise ProtocolError("resolved diagnostics callback profile drifted")
+    trailing_callbacks = callbacks[overlay_start + len(expected_callbacks):]
+    if any(
+        not isinstance(entry, Mapping)
+        or entry.get("_target_") != "tpen.callback.InitialCheckpoint"
+        or set(entry) != {"_target_", "output_dir"}
+        for entry in trailing_callbacks
     ):
         raise ProtocolError("resolved diagnostics callback profile drifted")
 
@@ -1201,18 +1211,6 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
     if science_profile == HOOKE_SCIENCE_PROFILE:
         if not set(selected).issubset({"hooke1", "hooke2"}):
             raise ProtocolError("Hooke science profile cannot mix in He/H2 systems")
-        if (
-            protocol.lineage_updates != STAGE1_PROTOCOL.lineage_updates
-            or protocol.lineage_walkers != STAGE1_PROTOCOL.lineage_walkers
-            or protocol.lineages != STAGE1_PROTOCOL.lineages
-            or protocol.eval_streams != STAGE1_PROTOCOL.eval_streams
-            or protocol.eval_walkers != STAGE1_PROTOCOL.eval_walkers
-            or protocol.eval_draws != STAGE1_PROTOCOL.eval_draws
-            or protocol.retention_cadence != STAGE1_PROTOCOL.retention_cadence
-        ):
-            raise ProtocolError(
-                "Hooke science profile requires the exact production protocol dimensions"
-            )
         if evaluation_selection not in {None, HOOKE_EVAL_SELECTION}:
             raise ProtocolError("unknown Hooke evaluation selection")
         evaluation_selection = HOOKE_EVAL_SELECTION
@@ -1236,6 +1234,18 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         )
     elif science_profile == HOOKE_SCIENCE_PROFILE:
         raise ProtocolError("Hooke science train rows require the Hooke diagnostics overlay")
+    if science_profile == HOOKE_SCIENCE_PROFILE and (
+        protocol.lineage_updates != STAGE1_PROTOCOL.lineage_updates
+        or protocol.lineage_walkers != STAGE1_PROTOCOL.lineage_walkers
+        or protocol.lineages != STAGE1_PROTOCOL.lineages
+        or protocol.eval_streams != STAGE1_PROTOCOL.eval_streams
+        or protocol.eval_walkers != STAGE1_PROTOCOL.eval_walkers
+        or protocol.eval_draws != STAGE1_PROTOCOL.eval_draws
+        or protocol.retention_cadence != STAGE1_PROTOCOL.retention_cadence
+    ):
+        raise ProtocolError(
+            "Hooke science profile requires the exact production protocol dimensions"
+        )
     if not checkpoints or any(type(step) is not int or step < 0 for step in checkpoints):
         raise ProtocolError("checkpoints must be a non-empty list of non-negative updates")
     if len(set(checkpoints)) != len(checkpoints):

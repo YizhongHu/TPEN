@@ -562,7 +562,7 @@ def test_overlay_hash_is_exact_file_bytes() -> None:
 
 @pytest.mark.parametrize(
     ("needle", "replacement"),
-    [("fail_fast: true", "fail_fast: false"), ("every_n_steps: 1", "every_n_steps: 1000")],
+        [("fail_fast: true", "fail_fast: false"), ("    every_n_steps: 1", "    every_n_steps: 1000")],
 )
 def test_recomputed_health_callback_drift_is_rejected(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, needle: str, replacement: str,
