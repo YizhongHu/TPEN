@@ -595,9 +595,12 @@ def test_recomputed_health_callback_drift_is_rejected(
         variant_path.unlink(missing_ok=True)
 
 
-def test_final_guard_rejects_post_composition_health_drift() -> None:
+def test_final_guard_rejects_post_composition_health_drift(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
     """The final resolved-config guard independently checks callback settings."""
 
+    monkeypatch.setenv("TPEN_STAGE1_RESULTS_ROOT", str(tmp_path))
     row = _overlay_row()
     cfg = load_config(str(CONFIG_ROOT / "he" / "train.yaml"))
     compose_train_overlay(cfg, overlay=str(OVERLAY), expected_sha256=overlay_sha256(OVERLAY))
