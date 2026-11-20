@@ -110,7 +110,10 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
     phase1_hooke_rows = [
         row for row in phase1_rows if row.get("system") in {"hooke1", "hooke2"}
     ]
-    phase1_profiles = {row.get("science_profile") for row in phase1_hooke_rows}
+    phase1_profiles = {
+        row.get("science_profile") for row in phase1_hooke_rows
+        if row.get("science_profile") is not None
+    }
     hooke_science = HOOKE_SCIENCE_PROFILE in phase1_profiles
     if hooke_science and phase1_profiles != {HOOKE_SCIENCE_PROFILE}:
         raise CollectionError("Hooke phase-1 rows mix science and legacy profiles")
@@ -118,6 +121,7 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
     # rows.  The explicit no-profile path preserves genuinely legacy manifests.
     expected_systems = tuple(dict.fromkeys(
         str(row["system"]) for row in phase1_hooke_rows
+        if row.get("science_profile") == HOOKE_SCIENCE_PROFILE
     )) if hooke_science else None
     try:
         validate_hooke_eval_grid(

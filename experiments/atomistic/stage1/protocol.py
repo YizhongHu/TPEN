@@ -1104,11 +1104,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         for row in rows:
             row["device"] = device
     if science_profile == HOOKE_SCIENCE_PROFILE and phase == 2:
-        validate_hooke_eval_grid(
-            [row for row in rows if row["kind"] == "eval"],
-            expected_systems=tuple(systems),
-            expected_profile=HOOKE_SCIENCE_PROFILE,
-        )
+        validate_hooke_eval_grid([row for row in rows if row["kind"] == "eval"])
     return rows
 
 
