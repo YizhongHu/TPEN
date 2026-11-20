@@ -349,6 +349,15 @@ def test_local_energy_chain_completeness_has_a_discriminating_witness(
         evaluator.evaluate_local_energy_rows("checkpoint-a", rows, expected_chain_ids=expected)
 
 
+def test_local_energy_rejects_duplicate_expected_chain_ids() -> None:
+    with pytest.raises(evaluator.EvaluatorQualificationError) as exc:
+        evaluator.evaluate_local_energy_rows(
+            "checkpoint-a", _rows(1.0), expected_chain_ids=("chain-0", "chain-0")
+        )
+    assert exc.type is evaluator.EvaluatorQualificationError
+    assert "chain-0" in str(exc.value)
+
+
 def test_rank_artifact_rejects_nonfinite_state_instead_of_silently_dropping_it() -> None:
     ready = evaluator.evaluate_local_energy_rows("checkpoint-a", _rows(1.0), expected_chain_ids=("chain-0",))
     bad_rows = tuple(
@@ -373,6 +382,16 @@ def test_rank_artifact_rejects_duplicate_checkpoint_ids() -> None:
         evaluator.require_complete_rank_artifact(
             (ready, ready), expected_checkpoint_ids=("checkpoint-a",)
         )
+
+
+def test_rank_artifact_rejects_duplicate_expected_checkpoint_ids() -> None:
+    ready = evaluator.InferenceState("checkpoint-a", evaluator.InferenceStatus.READY, ())
+    with pytest.raises(evaluator.EvaluatorQualificationError) as exc:
+        evaluator.require_complete_rank_artifact(
+            (ready,), expected_checkpoint_ids=("checkpoint-a", "checkpoint-a")
+        )
+    assert exc.type is evaluator.EvaluatorQualificationError
+    assert "checkpoint-a" in str(exc.value)
 
 
 @pytest.mark.parametrize(

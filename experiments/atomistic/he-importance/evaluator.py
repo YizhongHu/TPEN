@@ -118,12 +118,28 @@ def evaluate_local_energy_rows(
     make the checkpoint unusable to a rank artifact.  It intentionally does
     not inherit trainer ruling 377f6b0f's raise-always policy, because this is
     an evaluator state boundary rather than the trainer seam.
+
+    Raises
+    ------
+    EvaluatorQualificationError
+        If ``expected_chain_ids`` contains duplicated IDs, if a row has
+        mismatched checkpoint provenance, or if topology provenance is
+        blinding-bearing or empty.
+    IncompleteRankArtifactError
+        If the rows contain missing, extra, or duplicated actual chain IDs.
     """
 
     if not rows:
         raise EvaluatorQualificationError("local-energy evaluation requires at least one row")
     actual = tuple(row.chain_id for row in rows)
     required = tuple(expected_chain_ids)
+    duplicate_expected = tuple(
+        dict.fromkeys(chain_id for chain_id in required if required.count(chain_id) > 1)
+    )
+    if duplicate_expected:
+        raise EvaluatorQualificationError(
+            f"expected chain ids must be unique; duplicated ids: {duplicate_expected!r}"
+        )
     if len(actual) != len(set(actual)) or set(actual) != set(required):
         raise IncompleteRankArtifactError("local-energy rows must contain each expected chain exactly once")
     if any(row.checkpoint_id != checkpoint_id for row in rows):
@@ -141,10 +157,26 @@ def evaluate_local_energy_rows(
 
 
 def require_complete_rank_artifact(states: Sequence[InferenceState], *, expected_checkpoint_ids: Sequence[str]) -> None:
-    """Refuse partial or nonfinite checkpoint artifacts before any ranking step."""
+    """Refuse partial or nonfinite checkpoint artifacts before any ranking step.
+
+    Raises
+    ------
+    EvaluatorQualificationError
+        If ``expected_checkpoint_ids`` contains duplicated IDs.
+    IncompleteRankArtifactError
+        If the artifact contains missing, extra, or duplicated actual
+        checkpoint IDs, or contains a nonfinite local-energy state.
+    """
 
     actual = tuple(state.checkpoint_id for state in states)
     expected = tuple(expected_checkpoint_ids)
+    duplicate_expected = tuple(
+        dict.fromkeys(checkpoint_id for checkpoint_id in expected if expected.count(checkpoint_id) > 1)
+    )
+    if duplicate_expected:
+        raise EvaluatorQualificationError(
+            f"expected checkpoint ids must be unique; duplicated ids: {duplicate_expected!r}"
+        )
     if len(actual) != len(set(actual)) or set(actual) != set(expected):
         raise IncompleteRankArtifactError("rank artifact must contain each expected checkpoint exactly once")
     nonfinite = [state.checkpoint_id for state in states if state.status is not InferenceStatus.READY]
