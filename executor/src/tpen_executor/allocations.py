@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, ClassVar
 
-from ._codec import _freeze, canonical_bytes, decode_json, fields, sha256_text, thaw, text
+from ._codec import _freeze, canonical_bytes, decode_json, digest, fields, sha256_text, thaw, text
 from .contracts import AllocationAttemptId, AllocationId, AttemptId, BackendJobId, GroupId, InvocationId
 from ._records import frozen_record
 from .results import AllocationObservation
@@ -239,4 +239,112 @@ class MemberInvocationV2:
         return cls.from_mapping(decode_json(data))
 
 
-__all__ = ["AllocationAttemptV2", "ConfiguredAllocation", "MemberInvocationV2"]
+@frozen_record
+class ControllerGenerationV1:
+    """Store-owned, strictly ordered authority for one allocation group.
+
+    ``claimant_nonce`` must be freshly generated and unique for every
+    controller incarnation; it is not a retry counter or a reusable name.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/controller-generation-v1"
+    group_id: GroupId
+    generation: int
+    allocation_id: AllocationId
+    backend_job_id: BackendJobId
+    registration_receipt_digest: str
+    claimant_nonce: str
+    predecessor_record_digest: str | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.group_id, GroupId):
+            raise TypeError("group_id must be GroupId")
+        if type(self.generation) is not int or self.generation < 1:
+            raise TypeError("generation must be a positive integer")
+        for value, name, cls in ((self.allocation_id, "allocation_id", AllocationId), (self.backend_job_id, "backend_job_id", BackendJobId)):
+            if not isinstance(value, cls):
+                raise TypeError(f"{name} must be {cls.__name__}")
+        object.__setattr__(self, "registration_receipt_digest", sha256_text(self.registration_receipt_digest, "registration_receipt_digest"))
+        object.__setattr__(self, "claimant_nonce", text(self.claimant_nonce, "claimant_nonce"))
+        if self.predecessor_record_digest is not None:
+            object.__setattr__(self, "predecessor_record_digest", sha256_text(self.predecessor_record_digest, "predecessor_record_digest"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"schema": self.schema, "group_id": self.group_id.to_dict(), "generation": self.generation,
+                "allocation_id": self.allocation_id.to_dict(), "backend_job_id": self.backend_job_id.to_dict(),
+                "registration_receipt_digest": self.registration_receipt_digest, "claimant_nonce": self.claimant_nonce,
+                "predecessor_record_digest": self.predecessor_record_digest}
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @property
+    def record_digest(self) -> str:
+        """Digest used to link the next generation to this record."""
+        return digest(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "ControllerGenerationV1":
+        fields(data, {"schema", "group_id", "generation", "allocation_id", "backend_job_id",
+                      "registration_receipt_digest", "claimant_nonce", "predecessor_record_digest"}, cls.schema, cls.__name__)
+        if type(data["generation"]) is not int:
+            raise TypeError("generation must be an integer")
+        allocation_id = AllocationId.from_mapping(data["allocation_id"])
+        backend_job_id = BackendJobId.from_mapping(data["backend_job_id"])
+        return cls(GroupId.from_mapping(data["group_id"]), data["generation"], allocation_id, backend_job_id,
+                   data["registration_receipt_digest"], data["claimant_nonce"], data["predecessor_record_digest"])
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "ControllerGenerationV1":
+        return cls.from_mapping(decode_json(data))
+
+
+@frozen_record
+class LaunchIntentV1:
+    """Write-once proof that one member launch was claimed by one controller."""
+
+    schema: ClassVar[str] = "tpen-executor/launch-intent-v1"
+    group_id: GroupId
+    task_id: str
+    attempt_id: AttemptId
+    invocation_id: InvocationId
+    controller_generation: int
+    claimant_nonce: str
+    allocation_id: AllocationId
+    backend_job_id: BackendJobId
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.group_id, GroupId) or not isinstance(self.attempt_id, AttemptId) or not isinstance(self.invocation_id, InvocationId):
+            raise TypeError("launch intent identities have invalid types")
+        object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
+        if type(self.controller_generation) is not int or self.controller_generation < 1:
+            raise TypeError("controller_generation must be a positive integer")
+        object.__setattr__(self, "claimant_nonce", text(self.claimant_nonce, "claimant_nonce"))
+        if not isinstance(self.allocation_id, AllocationId) or not isinstance(self.backend_job_id, BackendJobId):
+            raise TypeError("launch intent allocation identities have invalid types")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"schema": self.schema, "group_id": self.group_id.to_dict(), "task_id": self.task_id,
+                "attempt_id": self.attempt_id.to_dict(), "invocation_id": self.invocation_id.to_dict(),
+                "controller_generation": self.controller_generation, "claimant_nonce": self.claimant_nonce,
+                "allocation_id": self.allocation_id.to_dict(), "backend_job_id": self.backend_job_id.to_dict()}
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "LaunchIntentV1":
+        fields(data, {"schema", "group_id", "task_id", "attempt_id", "invocation_id", "controller_generation",
+                      "claimant_nonce", "allocation_id", "backend_job_id"}, cls.schema, cls.__name__)
+        allocation_id = AllocationId.from_mapping(data["allocation_id"])
+        backend_job_id = BackendJobId.from_mapping(data["backend_job_id"])
+        return cls(GroupId.from_mapping(data["group_id"]), data["task_id"], AttemptId.from_mapping(data["attempt_id"]),
+                   InvocationId.from_mapping(data["invocation_id"]), data["controller_generation"], data["claimant_nonce"],
+                   allocation_id, backend_job_id)
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "LaunchIntentV1":
+        return cls.from_mapping(decode_json(data))
+
+
+__all__ = ["AllocationAttemptV2", "ConfiguredAllocation", "ControllerGenerationV1", "LaunchIntentV1", "MemberInvocationV2"]
