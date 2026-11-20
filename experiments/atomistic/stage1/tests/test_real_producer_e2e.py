@@ -16,9 +16,12 @@ from pathlib import Path
 
 import pytest
 
+from experiments.atomistic.stage1 import train as stage1_train
 from experiments.atomistic.stage1.collect import CollectionError, collect
 from experiments.atomistic.stage1.launch import command_for_row, row_overrides
 from experiments.atomistic.stage1.protocol import (
+    HOOKE_EVAL_SELECTION,
+    HOOKE_SCIENCE_PROFILE,
     Protocol,
     SYSTEMS,
     build_manifest,
@@ -103,7 +106,7 @@ def _binding_token(row: dict[str, object]) -> str:
 @pytest.mark.integration
 @pytest.mark.stage1_real_producer
 def test_real_train_eval_inspect_collect_chain_for_all_stage1_systems(
-    tmp_path: Path, record_property,
+    tmp_path: Path, record_property, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Produce and collect tiny real runs for Hooke-1e, Hooke-2e, He, and H2."""
 
@@ -141,6 +144,64 @@ def test_real_train_eval_inspect_collect_chain_for_all_stage1_systems(
                      and row["lineage"] == 0)
         for system in SYSTEMS
     }
+
+    # Exercise the real public Hooke producer gateway with science-profile
+    # rows.  The legacy all-system chain below intentionally remains a control
+    # packet, while these two tiny rows pin the distinct sampler namespace.
+    hooke_science_rows = build_manifest(
+        protocol=protocol,
+        source_sha=source_sha,
+        config_sha256=config_sha256,
+        checkpoints=[0, 1],
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root=str(tmp_path / "hooke-science-gateway"),
+        systems=("hooke1", "hooke2"),
+        phase=1,
+        science_profile=HOOKE_SCIENCE_PROFILE,
+        evaluation_selection=HOOKE_EVAL_SELECTION,
+    )
+    for row in hooke_science_rows:
+        if row["kind"] != "train" or row["lineage"] != 0:
+            continue
+        argv = [
+            "stage1-train", "--config", str(row["config"]), "--kind", "train",
+            *row_overrides(row), "sampler.burn_in=1", "sampler.n_steps=1",
+            "--binding", _binding_token(row),
+        ]
+        with monkeypatch.context() as isolated:
+            isolated.setattr(sys, "argv", argv)
+            assert stage1_train.main() == 0
+
+    # The resolved-config check must also refuse a runtime-seed tamper after
+    # gateway admission; otherwise the bypass mutant reaches execution.
+    hooke_row = next(
+        row for row in hooke_science_rows
+        if row["kind"] == "train" and row["system"] == "hooke1" and row["lineage"] == 0
+    )
+    tampered_overrides = [
+        f"runtime.seed={int(hooke_row['seed']) + 1}"
+        if override.startswith("runtime.seed=") else override
+        for override in row_overrides(hooke_row)
+    ]
+    with monkeypatch.context() as isolated:
+        isolated.setattr(stage1_train, "validate_gateway_binding", lambda **_: hooke_row)
+        isolated.setattr(
+            stage1_train,
+            "run_from_config",
+            lambda **_: pytest.fail("seed-tampered config reached execution"),
+        )
+        isolated.setattr(
+            sys,
+            "argv",
+            [
+                "stage1-train", "--config", str(hooke_row["config"]), "--kind", "train",
+                *tampered_overrides, "--binding", _binding_token(hooke_row),
+            ],
+        )
+        with pytest.raises(ValueError, match="runtime and sampler seeds are not bound"):
+            stage1_train.main()
+
     eval_rows = [
         row for row in planned
         if row["kind"] == "eval" and row["lineage"] == 0 and row["checkpoint"] == 1
