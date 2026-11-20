@@ -96,6 +96,11 @@ def _attempt(group: ReadyGroupV2, allocation: Any, controller: ControllerGenerat
     )
 
 
+def _require_current_controller(store: DirectoryStore, group: ReadyGroupV2, controller: ControllerGenerationV1) -> None:
+    """Apply one durable authority check at a controller boundary."""
+    store.require_current_controller(group, generation=controller.generation, nonce=controller.claimant_nonce)
+
+
 def run_group_controller(
     binding: Any,
     observed_job_id: BackendJobId,
@@ -139,7 +144,7 @@ def run_group_controller(
     except Exception:
         return _park(group, "admission-port-failed")
     try:
-        store.require_current_controller(group, controller.generation, controller.claimant_nonce)
+        _require_current_controller(store, group, controller)
         bindings = {}
         for item in frozen_inputs:
             if item.start_receipt is not None:

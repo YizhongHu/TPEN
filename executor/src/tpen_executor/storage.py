@@ -331,6 +331,17 @@ class DirectoryStore:
             _require_directory(root, "store root")
         object.__setattr__(self, "root", root)
 
+    def record_pre_start_receipt(self, reason: str) -> None:
+        """Durably record a controller refusal before member work begins."""
+        ensure_durable_directory(self.root)
+        path = os.path.join(self.root, "pre-start.json")
+        payload = canonical_bytes({"schema": "tpen-executor/pre-start-v1", "reason": str(reason)})
+        if os.path.lexists(path):
+            if Path(path).read_bytes() != payload:
+                raise FenceRejected("pre-start receipt conflicts")
+            return
+        _write_new(path, payload)
+
     def _group_dir(self, group: ReadyGroup | ReadyGroupV2) -> str:
         path = _lexical(os.path.join(self.root, "groups", group.identity))
         if not _inside(self.root, path):
