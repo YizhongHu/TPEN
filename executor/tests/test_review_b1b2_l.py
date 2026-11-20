@@ -13,13 +13,15 @@ from tpen_executor.storage import ControllerGenerationRejected, DirectoryStore, 
 MUTANTS = (
     ("monotonic-check-off", "executor/src/tpen_executor/storage.py", "record.generation != expected", "False", "test_generation_rejects_skipped_or_stale"),
     ("predecessor-check-off", "executor/src/tpen_executor/storage.py", "record.predecessor_record_digest != predecessor", "False", "test_generation_rejects_forked_predecessor"),
-    ("nonce-check-off", "executor/src/tpen_executor/storage.py", "records[-1].claimant_nonce != nonce", "False", "test_require_current_controller_rejects_wrong_nonce"),
+    ("nonce-check-off", "executor/src/tpen_executor/storage.py", "current.claimant_nonce != nonce", "False", "test_require_current_controller_rejects_wrong_nonce"),
     ("replay-byte-compare-off", "executor/src/tpen_executor/storage.py", "record.encode() == current.encode()", "True", "test_generation_rejects_differing_replay"),
     ("recovery-directory-fsync-off", "executor/src/tpen_executor/storage.py", "_fsync_directory(directory)  # replay barrier", "pass  # replay barrier", "test_visible_generation_recovery_requires_directory_barrier"),
     ("chain-group-check-off", "executor/src/tpen_executor/storage.py", "record.group_id != group_id", "False", "test_invalid_ledger_never_grants_authority"),
     ("chain-predecessor-check-off", "executor/src/tpen_executor/storage.py", "record.predecessor_record_digest != expected", "False", "test_invalid_ledger_never_grants_authority"),
-    ("full-controller-compare-off", "executor/src/tpen_executor/storage.py", "records[-1].encode() != controller_record.encode()", "False", "test_intent_rechecks_durable_fence_and_binding"),
+    ("full-controller-compare-off", "executor/src/tpen_executor/storage.py", "current = self._current_controller_locked(directory, controller_record.group_id, controller_record)", "current = self._current_controller_locked(directory, controller_record.group_id)", "test_intent_rechecks_durable_fence_and_binding"),
     ("intent-validation-off", "executor/src/tpen_executor/storage.py", "self._validate_invocation(start, invocation)  # durable intent gate", "pass  # durable intent gate", "test_intent_rechecks_durable_fence_and_binding"),
+    ("intent-gate-sync-off", "executor/src/tpen_executor/storage.py", "_fsync_directory(directory)  # authority gate barrier", "pass  # authority gate barrier", "test_intent_gate_syncs_recovered_controller_before_publication"),
+    ("historical-read-current-pointer", "executor/src/tpen_executor/storage.py", "start = self._validate_fence_immutable(fence, task_dir)", "start = self._validate_fence(fence, task_dir)", "test_historical_intent_survives_controller_and_attempt_supersession"),
 )
 
 # No intent-exclusivity row: _write_new refuses an existing destination and create_launch_intent maps FileExistsError to the same LaunchIntentRejected.
@@ -121,6 +123,8 @@ def test_mutant_anchors_are_unique_compile_and_name_real_killers():
     names = {name for name, value in globals().items() if name.startswith("test_") and callable(value)}
     import test_review_b1b2_l_r1 as review_r1
     names.update(name for name, value in vars(review_r1).items() if name.startswith("test_") and callable(value))
+    import test_review_b1b2_l_delta as review_delta
+    names.update(name for name, value in vars(review_delta).items() if name.startswith("test_") and callable(value))
     anchors = [row[2] for row in MUTANTS]
     assert len(anchors) == len(set(anchors)) >= 5
     for _, filename, before, after, killer in MUTANTS:

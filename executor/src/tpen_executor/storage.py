@@ -389,6 +389,18 @@ class DirectoryStore:
         ensure_durable_directory(directory)
         return directory
 
+    def _current_controller_locked(self, directory: str, group_id: GroupId,
+                                   expected: ControllerGenerationV1 | None = None) -> ControllerGenerationV1:
+        """Load, sync, and optionally compare authority with the lock held."""
+        records = self._controller_records(directory, group_id)
+        _fsync_directory(directory)  # authority gate barrier
+        if not records:
+            raise ControllerGenerationRejected("controller ledger is empty")
+        current = records[-1]
+        if expected is not None and current.encode() != expected.encode():
+            raise ControllerGenerationRejected("controller record is not current")
+        return current
+
     def acquire_controller_generation(self, group: ReadyGroupV2, record: ControllerGenerationV1) -> ControllerGenerationV1:
         """Durably acquire the next controller generation for ``group``.
 
@@ -422,13 +434,12 @@ class DirectoryStore:
         directory = self._controller_dir(group)
         try:
             with _task_lock(os.path.join(directory, _CONTROLLER_LOCK)):
-                records = self._controller_records(directory, group.group_id if isinstance(group, ReadyGroupV2) else group)
-                _fsync_directory(directory)
+                current = self._current_controller_locked(directory, group.group_id if isinstance(group, ReadyGroupV2) else group)
         except (FileNotFoundError, OSError, FenceRejected, ValueError, TypeError) as error:
             raise ControllerGenerationRejected("controller ledger is unavailable") from error
-        if not records or records[-1].generation != generation or records[-1].claimant_nonce != nonce:
+        if current.generation != generation or current.claimant_nonce != nonce:
             raise ControllerGenerationRejected("controller is not current")
-        return records[-1]
+        return current
 
     def create_launch_intent(self, fence: AttemptFence, controller_record: ControllerGenerationV1,
                              invocation: MemberInvocationV2) -> LaunchIntentV1:
@@ -437,9 +448,7 @@ class DirectoryStore:
             raise TypeError("launch intent requires typed controller and invocation records")
         directory = self._controller_dir(controller_record.group_id)
         with _task_lock(os.path.join(directory, _CONTROLLER_LOCK)):
-            records = self._controller_records(directory, controller_record.group_id)
-            if not records or records[-1].encode() != controller_record.encode():
-                raise ControllerGenerationRejected("controller record is not current")
+            current = self._current_controller_locked(directory, controller_record.group_id, controller_record)
             task_dir = self._task_dir_for_fence(fence)
             with _task_lock(os.path.join(task_dir, _TASK_LOCK)):
                 start = self._validate_fence(fence, task_dir)
@@ -450,9 +459,9 @@ class DirectoryStore:
                         or invocation.allocation_attempt.allocation_id != controller_record.allocation_id
                         or invocation.allocation_attempt.backend_job_id != controller_record.backend_job_id):
                     raise LaunchIntentRejected("launch intent binding crosses its fence")
-                intent = LaunchIntentV1(controller_record.group_id, fence.task_id, fence.attempt_id, invocation.invocation_id,
-                                        records[-1].generation, records[-1].claimant_nonce,
-                                        records[-1].allocation_id, records[-1].backend_job_id)
+                intent = LaunchIntentV1(current.group_id, fence.task_id, fence.attempt_id, invocation.invocation_id,
+                                        current.generation, current.claimant_nonce,
+                                        current.allocation_id, current.backend_job_id)
                 intent_path = os.path.join(fence.output_dir, _LAUNCH_INTENT_FILENAME)
                 if os.path.lexists(intent_path):
                     raise LaunchIntentRejected("launch intent already exists")
@@ -473,7 +482,7 @@ class DirectoryStore:
         path = os.path.join(fence.output_dir, _LAUNCH_INTENT_FILENAME)
         with _task_lock(os.path.join(task_dir, _TASK_LOCK)):
             try:
-                start = self._validate_fence(fence, task_dir)
+                start = self._validate_fence_immutable(fence, task_dir)
                 invocation_path = os.path.join(fence.output_dir, "invocation.json")
                 _require_regular(invocation_path, "invocation binding")
                 invocation_bytes = Path(invocation_path).read_bytes()
@@ -1657,17 +1666,8 @@ class DirectoryStore:
                 raise FenceRejected("accepted segment progress coordinate is not strictly increasing")
         return tuple(ordered)
 
-    def _validate_fence(self, fence: AttemptFence, task_dir: str) -> StartReceipt:
-        """Validate pointer, path, and every start-receipt fence binding."""
-        pointer = os.path.join(task_dir, "current-attempt.json")
-        _require_regular(pointer, "current attempt pointer")
-        try:
-            current = decode_json(Path(pointer).read_bytes())
-            fields(current, {"schema", "attempt_id"}, "tpen-executor/current-attempt-v1", "current attempt")
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
-            raise FenceRejected("current attempt pointer is unavailable") from error
-        if current["attempt_id"] != fence.attempt_id.value:
-            raise FenceRejected("stale attempt fence")
+    def _validate_fence_immutable(self, fence: AttemptFence, task_dir: str) -> StartReceipt:
+        """Validate the immutable attempt path and start receipt binding."""
         expected = _lexical(os.path.join(task_dir, fence.attempt_id.value))
         if expected != _lexical(fence.output_dir):
             raise FenceRejected("crossed attempt fence")
@@ -1687,6 +1687,19 @@ class DirectoryStore:
         ):
             raise FenceRejected("crossed attempt fence")
         return start
+
+    def _validate_fence(self, fence: AttemptFence, task_dir: str) -> StartReceipt:
+        """Validate current pointer plus immutable attempt fence binding."""
+        pointer = os.path.join(task_dir, "current-attempt.json")
+        _require_regular(pointer, "current attempt pointer")
+        try:
+            current = decode_json(Path(pointer).read_bytes())
+            fields(current, {"schema", "attempt_id"}, "tpen-executor/current-attempt-v1", "current attempt")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+            raise FenceRejected("current attempt pointer is unavailable") from error
+        if current["attempt_id"] != fence.attempt_id.value:
+            raise FenceRejected("stale attempt fence")
+        return self._validate_fence_immutable(fence, task_dir)
 
     def manifest(self, group: ReadyGroup) -> RunManifest:
         """Rebuild a strict manifest only from durable receipts on disk.
