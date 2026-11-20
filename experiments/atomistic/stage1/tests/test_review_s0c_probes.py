@@ -137,6 +137,10 @@ def test_public_production_hooke_rows_reach_execution_stub(
         ("runner.sampler.seed", "123"),
         ("runner.sampler.n_walkers", "2"),
         ("runner.sampler.burn_in", "1"),
+        ("runner.sampler.n_steps", "1"),
+        ("runner.sampler.proposal_scale", "0.25"),
+        ("runner.trainer.log_every_n_steps", "7"),
+        ("runner.trainer.return_terms", "false"),
     ],
 )
 def test_public_production_hooke_rows_refuse_independent_runner_overrides(
