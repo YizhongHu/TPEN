@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from omegaconf import OmegaConf
@@ -90,3 +91,153 @@ def test_takeover_requires_terminal_quiescent_budget_and_identity() -> None:
             quiescent=False, adopted_budget="budget", lineage_id="lineage",
             config_identity="config", overlay_identity="overlay", target_iterations=100000,
         ).validate(expected={"predecessor_content_id": "content"})
+
+
+def test_execute_calls_profile_gate_before_driver_and_uses_durable_outcome(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from experiments.atomistic.stage1 import restart
+
+    cfg = _cfg()
+    row = _row(tmp_path)
+    run_dir = tmp_path / "run"
+    calls: list[object] = []
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        restart, "validate_native_recovery_profile", lambda _cfg: calls.append("profile")
+    )
+    monkeypatch.setattr(
+        restart,
+        "select_restart",
+        lambda **_kwargs: restart.RestartSelection(
+            StartDecision.FRESH, run_dir, None, None, None
+        ),
+    )
+
+    def fake_run(run_cfg, **_kwargs):
+        calls.append("driver")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "status.json").write_text('{"status":"completed"}', encoding="utf-8")
+        return 99
+
+    terminal = SimpleNamespace(next_iteration=100000, content_id="terminal-content")
+    discoveries = iter([terminal])
+    monkeypatch.setattr(restart, "discover_published_checkpoint", lambda _path: next(discoveries))
+    result = restart.execute_restart(
+        cfg=cfg, row=row, config_path="train.yaml", run=fake_run,
+        run_dir=run_dir, profile_validator=restart.validate_native_recovery_profile,
+    )
+    assert calls == ["profile", "driver"]
+    assert result.outcome == "completed"
+    assert result.exit_code == 99
+    assert result.receipt["published_content_id"] == "terminal-content"
+
+
+def test_occupied_lease_refuses_without_overwrite_or_driver(tmp_path: Path, monkeypatch) -> None:
+    from experiments.atomistic.stage1 import restart
+
+    cfg = _cfg()
+    row = _row(tmp_path)
+    run_dir = tmp_path / "run"
+    lease_dir = run_dir / "attempts"
+    lease_dir.mkdir(parents=True)
+    lease = lease_dir / "initial.json"
+    lease.write_text('{"owner":"first"}\n', encoding="utf-8")
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(restart, "validate_native_recovery_profile", lambda _cfg: None)
+    monkeypatch.setattr(
+        restart,
+        "select_restart",
+        lambda **_kwargs: restart.RestartSelection(
+            StartDecision.FRESH, run_dir, None, None, None
+        ),
+    )
+    with pytest.raises(RestartRefusal, match="occupied"):
+        restart.execute_restart(
+            cfg=cfg, row=row, config_path="train.yaml", run=lambda *_a, **_k: pytest.fail("driver"),
+            run_dir=run_dir,
+        )
+    assert lease.read_text(encoding="utf-8") == '{"owner":"first"}\n'
+
+
+def test_restore_passes_typed_request_and_drops_initial_checkpoint(tmp_path: Path, monkeypatch) -> None:
+    from experiments.atomistic.stage1 import restart
+
+    cfg = _cfg()
+    row = _row(tmp_path)
+    run_dir = tmp_path / "run"
+    request = object()
+    predecessor = SimpleNamespace(content_id="published-content")
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(restart, "validate_native_recovery_profile", lambda _cfg: None)
+    monkeypatch.setattr(
+        restart,
+        "select_restart",
+        lambda **_kwargs: restart.RestartSelection(
+            StartDecision.RESTORE, run_dir, predecessor, None, request
+        ),
+    )
+    observed: dict[str, object] = {}
+
+    def fake_run(run_cfg, **kwargs):
+        observed["request"] = kwargs["restore_request"]
+        observed["initial_callbacks"] = [
+            item.get("_target_") for item in run_cfg.callbacks
+        ]
+        return 0
+
+    monkeypatch.setattr(restart, "discover_published_checkpoint", lambda _path: None)
+    restart.execute_restart(
+        cfg=cfg, row=row, config_path="train.yaml", run=fake_run,
+        run_dir=run_dir,
+    )
+    assert observed == {"request": request, "initial_callbacks": [
+        "tpen.callback.RawTrainingBatchRecorder", "tpen.callback.ParameterActivity",
+    ]}
+
+
+def test_newer_complete_checkpoint_is_parked_before_start(tmp_path: Path, monkeypatch) -> None:
+    from experiments.atomistic.stage1 import restart
+
+    run_dir = tmp_path / "run"
+    monkeypatch.setattr(restart, "discover_published_checkpoint", lambda _path: None)
+    monkeypatch.setattr(
+        restart,
+        "_check_newer_complete",
+        lambda **_kwargs: (_ for _ in ()).throw(restart.RestartPark("newer complete")),
+    )
+    selected = select_restart(cfg=_cfg(), row=_row(tmp_path), run_dir=run_dir)
+    assert selected.decision is StartDecision.PARK
+    assert "newer complete" in selected.reason
+
+
+def test_terminal_publication_cannot_hide_a_failed_durable_status(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from experiments.atomistic.stage1 import restart
+
+    cfg = _cfg()
+    row = _row(tmp_path)
+    run_dir = tmp_path / "run"
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+    monkeypatch.setattr(restart, "validate_native_recovery_profile", lambda _cfg: None)
+    monkeypatch.setattr(
+        restart,
+        "select_restart",
+        lambda **_kwargs: restart.RestartSelection(
+            StartDecision.FRESH, run_dir, None, None, None
+        ),
+    )
+
+    def failed_run(run_cfg, **_kwargs):
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "status.json").write_text('{"status":"failed"}', encoding="utf-8")
+        return 0
+
+    terminal = SimpleNamespace(next_iteration=100000, content_id="terminal-content")
+    monkeypatch.setattr(restart, "discover_published_checkpoint", lambda _path: terminal)
+    result = restart.execute_restart(
+        cfg=cfg, row=row, config_path="train.yaml", run=failed_run, run_dir=run_dir,
+    )
+    assert result.outcome == "failed"
+    assert result.receipt["exit_code"] == 0
