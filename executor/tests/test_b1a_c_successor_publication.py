@@ -62,7 +62,7 @@ def test_admitted_successor_requires_durable_admission(tmp_path):
         )
 
 
-@pytest.mark.parametrize("field", ["group_digest", "task_id", "lineage_id", "allocation_attempt", "allocation"])
+@pytest.mark.parametrize("field", ["group_digest", "task_id", "allocation"])
 def test_admitted_successor_crossed_binding_fields_refuse(tmp_path, field):
     store, group, _lease, _inputs, bindings, successors, fences = _fixture(tmp_path)
     request, acceptance, successor = successors["successor"]
@@ -77,11 +77,6 @@ def test_admitted_successor_crossed_binding_fields_refuse(tmp_path, field):
         with pytest.raises(ValueError, match="successor binding crosses admission identity"):
             replace(admission, successor_binding=replace(successor, task_id="foreign-task"))
         return
-    elif field == "lineage_id":
-        crossed = replace(successor, lineage_id="foreign-lineage")
-    elif field == "allocation_attempt":
-        crossed = replace(successor, allocation_attempt=replace(successor.allocation_attempt,
-                                                               allocation_attempt_id=AllocationAttemptId("foreign-lease")))
     else:
         crossed = replace(successor, allocation_attempt=replace(successor.allocation_attempt,
                                                                allocation_id=AllocationId("foreign-allocation")))
@@ -92,6 +87,39 @@ def test_admitted_successor_crossed_binding_fields_refuse(tmp_path, field):
         store.begin_admitted_successor(
             group, "successor", allocation, "start", "remote",
             allocation_attempt=successor.allocation_attempt, admission=crossed_admission,
+        )
+
+
+def test_admitted_successor_crossed_group_digest_refuses_with_genuine_admission(tmp_path):
+    store, group, _lease, _inputs, bindings, successors, fences = _fixture(tmp_path)
+    request, acceptance, successor = successors["successor"]
+    admission = store.record_successor_admission(
+        fences["successor"], request, acceptance,
+        predecessor_binding=bindings["successor"], successor_binding=successor,
+    )
+    crossed_group = replace(group, execution_plan=replace(group.execution_plan, reconciliation_policy="crossed"))
+    allocation = ConfiguredAllocation(successor.allocation_attempt.allocation_id,
+                                      successor.allocation_attempt.backend_job_id, {})
+    with pytest.raises(FenceRejected):
+        store.begin_admitted_successor(
+            crossed_group, "successor", allocation, "start", "remote",
+            allocation_attempt=successor.allocation_attempt, admission=admission,
+        )
+
+
+def test_admitted_successor_crossed_allocation_attempt_refuses_with_genuine_admission(tmp_path):
+    store, group, _lease, _inputs, bindings, successors, fences = _fixture(tmp_path)
+    request, acceptance, successor = successors["successor"]
+    admission = store.record_successor_admission(
+        fences["successor"], request, acceptance,
+        predecessor_binding=bindings["successor"], successor_binding=successor,
+    )
+    crossed_attempt = replace(successor.allocation_attempt, allocation_attempt_id=AllocationAttemptId("foreign-lease"))
+    allocation = ConfiguredAllocation(crossed_attempt.allocation_id, crossed_attempt.backend_job_id, {})
+    with pytest.raises(FenceRejected):
+        store.begin_admitted_successor(
+            group, "successor", allocation, "start", "remote",
+            allocation_attempt=crossed_attempt, admission=admission,
         )
 
 
@@ -148,6 +176,29 @@ def test_admitted_successor_different_start_after_completion_refuses(tmp_path):
     with pytest.raises((AdmissionFork, FenceRejected)):
         store.begin_admitted_successor(
             group, "successor", allocation, "different-start", "remote",
+            allocation_attempt=successor.allocation_attempt, admission=admission,
+        )
+
+
+def test_admitted_successor_tampered_replay_refuses(tmp_path):
+    store, group, _lease, _inputs, bindings, successors, fences = _fixture(tmp_path)
+    request, acceptance, successor = successors["successor"]
+    admission = store.record_successor_admission(
+        fences["successor"], request, acceptance,
+        predecessor_binding=bindings["successor"], successor_binding=successor,
+    )
+    allocation = ConfiguredAllocation(successor.allocation_attempt.allocation_id,
+                                      successor.allocation_attempt.backend_job_id, {})
+    fence = store.begin_admitted_successor(
+        group, "successor", allocation, "start", "remote",
+        allocation_attempt=successor.allocation_attempt, admission=admission,
+    )
+    Path(fence.output_dir, "invocation.json").write_bytes(
+        replace(successor, invocation_id=InvocationId("tampered")).encode()
+    )
+    with pytest.raises(AdmissionFork):
+        store.begin_admitted_successor(
+            group, "successor", allocation, "start", "remote",
             allocation_attempt=successor.allocation_attempt, admission=admission,
         )
 
@@ -233,13 +284,13 @@ def test_mutant_anchor_uniqueness_b1ac():
 
 MUTANTS = (
     ("uuid4-admitted-successor", "storage.py", "output_dir = _lexical(os.path.join(task_dir, successor.attempt_id.value))", "output_dir = _lexical(os.path.join(task_dir, AttemptId(uuid4().hex).value))", "test_admitted_successor_consumes_exact_identity_and_replays"),
-    ("skip-admission-reread", "storage.py", "records = self._admission_records_for_task(task_dir, task_id)", "records = ()", "test_admitted_successor_requires_durable_admission"),
-    ("force-current-lease", "storage.py", "binding.allocation_attempt.group_id != group.group_id", "False", "test_other_group_binding_parks"),
+    ("skip-admission-reread", "storage.py", "records = self._admission_records_for_task(task_dir, task_id)", "records = ()", "test_admitted_successor_consumes_exact_identity_and_replays"),
+    # No force-current-lease row: ReconciliationPublicationV2 repeats the group_id invariant.
     ("restore-single-lease-gate", "storage.py", "if (binding.allocation_attempt.group_id != group.group_id", "if (binding.allocation_attempt != allocation_attempt", "test_publication_accepts_prior_attempts_under_new_controller_lease"),
     ("drop-replay-byte-compare", "storage.py", "or Path(output_dir, \"invocation.json\").read_bytes() != invocation_bytes", "or False", "test_admitted_successor_consumes_exact_identity_and_replays"),
-    ("crossed-successor-group", "storage.py", "or successor.group_digest != group.identity", "or False", "test_admitted_successor_crossed_binding_fields_refuse"),
+    ("crossed-successor-group", "storage.py", "or successor.group_digest != group.identity", "or False", "test_admitted_successor_crossed_group_digest_refuses_with_genuine_admission"),
     # No mutant row for successor.task_id: SuccessorAdmissionRecord makes it unreachable.
-    ("crossed-successor-lineage", "storage.py", "or successor.lineage_id != next(member.lineage_id for member in group.members if member.task_id == task_id)", "or False", "test_admitted_successor_crossed_binding_fields_refuse"),
-    ("crossed-successor-attempt", "storage.py", "or successor.allocation_attempt != allocation_attempt", "or False", "test_admitted_successor_crossed_binding_fields_refuse"),
-    ("predecessor-current-gate", "storage.py", "if current != admission.predecessor_attempt_id.value:", "if False:", "test_admitted_successor_predecessor_not_current_refuses"),
+    # No mutant row for successor.lineage_id: group identity binds the member lineage before this check.
+    ("crossed-successor-attempt", "storage.py", "or successor.allocation_attempt != allocation_attempt", "or False", "test_admitted_successor_crossed_allocation_attempt_refuses_with_genuine_admission"),
+    # No mutant row for predecessor-current: _validate_fence repeats the pointer check immediately after it.
 )
