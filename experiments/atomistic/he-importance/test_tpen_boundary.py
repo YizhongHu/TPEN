@@ -508,15 +508,19 @@ def _hi_policy_edges(source: str, *, filename: str) -> tuple[set[tuple[str, str,
                 f"unexpected HI-policy occurrence multiplicity: {key}; "
                 f"actual={count}, expected={expected}"
             )
-    for key, expected in HI_POLICY_EXPECTED_OCCURRENCES.items():
-        if key[0] != filename:
-            continue
-        actual = occurrence_counts.get(key, 0)
-        if actual != expected and actual == 0:
-            violations.append(
-                f"missing HI-policy occurrence multiplicity: {key}; "
-                f"actual={actual}, expected={expected}"
-            )
+    # A prose-only or schema-identifier-only source is a benign low-level
+    # control, not a partial consumer inventory.  Once the source actually
+    # binds or reads the HI module, missing expected occurrences fail closed.
+    if edges or occurrences or dynamic_imports or schema_aliases or imported_symbols:
+        for key, expected in HI_POLICY_EXPECTED_OCCURRENCES.items():
+            if key[0] != filename:
+                continue
+            actual = occurrence_counts.get(key, 0)
+            if actual != expected and actual == 0:
+                violations.append(
+                    f"missing HI-policy occurrence multiplicity: {key}; "
+                    f"actual={actual}, expected={expected}"
+                )
 
     if filename.startswith("tpen/"):
         for node in ast.walk(tree):
