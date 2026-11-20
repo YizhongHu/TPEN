@@ -39,7 +39,7 @@ ROOT = Path(__file__).parents[1]
 CONFIG_ROOT = ROOT / "configs"
 OVERLAY = CONFIG_ROOT / "overlays" / "diagnostics-v1.yaml"
 APPROVED_PROPOSAL_SHA256 = "8bbaf291e90ec6c90b5a8afbe664bded96dcb9743ad0c24cda1f66ddcb4634c1"
-COMMITTED_OVERLAY_SHA256 = "fd80c4d7beb0a2c075e3ac85015ea975c0a505352e7dca58be951350b21fed7c"
+COMMITTED_OVERLAY_SHA256 = "bf7a78f5b3721f0486053301a0ed8165de58366bdd6ea4748e05b1f742161096"
 
 
 def _structured_diff(before: object, after: object, prefix: str = "") -> set[str]:
@@ -107,6 +107,132 @@ def test_repository_overlay_is_versioned_and_checkpoint_free() -> None:
     targets = [entry["_target_"] for entry in overlay_cfg.callbacks]
     assert "tpen.callback.InitialCheckpoint" not in targets
     assert "tpen.callback.Checkpoint" not in targets
+
+
+def test_hooke_overlay_is_system_qualified_and_has_amplitude_risk() -> None:
+    """Hooke uses the separate canonical overlay and exact risk settings."""
+
+    overlay = CONFIG_ROOT / "overlays" / "hooke-diagnostics-v1.yaml"
+    cfg = OmegaConf.load(overlay)
+    assert protocol_module.overlay_path_for_system("hooke1") == (
+        "configs/overlays/hooke-diagnostics-v1.yaml"
+    )
+    assert protocol_module.overlay_path_for_system("hooke2") == (
+        "configs/overlays/hooke-diagnostics-v1.yaml"
+    )
+    amplitude = [entry for entry in cfg.callbacks
+                 if entry.get("_target_") == "tpen.callback.AmplitudeRiskFraction"]
+    assert len(amplitude) == 1
+    assert list(amplitude[0].thresholds) == [-3, -4, -5, -7, -10]
+    assert amplitude[0].every_n_steps == 100
+    assert amplitude[0].start_step == 0
+
+
+def test_hooke_manifest_requires_its_overlay_and_rejects_he_overlay() -> None:
+    """Planner admission is finite and system-qualified."""
+
+    kwargs = dict(
+        protocol=Protocol(1, 2, 100000, 2, 3, 4, 2, 2, 1000),
+        source_sha="a" * 40,
+        config_sha256=config_identities(config_root=CONFIG_ROOT, systems=("hooke1",)),
+        checkpoints=list(range(0, 100001, 1000)),
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root="/n/netscratch/kozinsky_lab/Lab/rhu/stage1-overlay-test",
+        systems=("hooke1",),
+        phase=1,
+        science_profile="hooke-hv2-v1",
+        evaluation_selection="A37",
+    )
+    with pytest.raises(ProtocolError, match="require the Hooke diagnostics overlay"):
+        build_manifest(**kwargs)
+    with pytest.raises(ProtocolError, match="system-qualified"):
+        build_manifest(
+            **kwargs,
+            overlay=str(OVERLAY),
+            overlay_sha256=overlay_sha256(OVERLAY),
+        )
+
+
+def _hundred_k_he_phase1() -> list[dict[str, object]]:
+    """Build one public He overlay plan at the production horizon."""
+
+    return build_manifest(
+        protocol=Protocol(1, 2, 100000, 2, 3, 4, 2, 2, 1000),
+        source_sha="a" * 40,
+        config_sha256=config_identities(config_root=CONFIG_ROOT, systems=("he",)),
+        checkpoints=list(range(0, 100001, 1000)),
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root="/external/stage1-he-100k",
+        systems=("he",),
+        phase=1,
+        device="cpu",
+        overlay=str(OVERLAY),
+        overlay_sha256=overlay_sha256(OVERLAY),
+    )
+
+
+def test_public_he_overlay_path_binds_the_100k_horizon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The He/H2 diagnostics overlay is checked through the train gateway."""
+
+    row = next(row for row in _hundred_k_he_phase1() if row["kind"] == "train")
+    observed: dict[str, object] = {}
+    cfg = load_config(str(CONFIG_ROOT / "he" / "train.yaml"))
+    monkeypatch.setattr("tpen.run.load_config", lambda *_args, **_kwargs: cfg)
+    monkeypatch.setattr(
+        stage1_train,
+        "run_from_config",
+        lambda resolved, **_kwargs: observed.setdefault("cfg", resolved) and 0,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage1-train", "--config", str(row["config"]), "--kind", "train",
+            *row_overrides(row), "--binding", _binding_token(row),
+            "--overlay", str(row["overlay"]),
+            "--overlay-sha256", str(row["overlay_sha256"]),
+        ],
+    )
+    assert stage1_train.main() == 0
+    resolved = observed["cfg"]
+    assert resolved.trainer.max_steps == 100000
+    assert resolved.trainer.log_every_n_steps == 1
+    assert resolved.trainer.return_terms is True
+
+
+def test_stale_overlay_horizon_is_rejected_before_a_100k_row_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A stale 50k overlay cannot hide behind the manifest's 100k override."""
+
+    relative = f"configs/overlays/.s0c-stale-{tmp_path.name}.yaml"
+    stale_path = ROOT / relative
+    stale_path.write_bytes(
+        OVERLAY.read_bytes().replace(b"max_steps: 100000", b"max_steps: 50000", 1)
+    )
+    monkeypatch.setitem(protocol_module.OVERLAY_PATH_BY_SYSTEM, "he", relative)
+    try:
+        with pytest.raises(ProtocolError, match="trainer profile drifted"):
+            build_manifest(
+                protocol=Protocol(1, 2, 100000, 2, 3, 4, 2, 2, 1000),
+                source_sha="a" * 40,
+                config_sha256=config_identities(config_root=CONFIG_ROOT, systems=("he",)),
+                checkpoints=list(range(0, 100001, 1000)),
+                lineage_seeds=[11, 12, 13],
+                checkpoint_sha256={},
+                results_root="/external/stage1-stale-overlay",
+                systems=("he",),
+                phase=1,
+                device="cpu",
+                overlay=relative,
+                overlay_sha256=overlay_sha256(relative),
+            )
+    finally:
+        stale_path.unlink(missing_ok=True)
 
 
 def test_no_overlay_manifest_keeps_existing_identity_shape() -> None:
@@ -190,6 +316,46 @@ def test_gateway_accepts_declared_overlay_and_rejects_hash_or_undeclared_use() -
             overlay=str(row["overlay"]),
             overlay_sha256="d" * 64,
         )
+
+
+def test_stale_canonical_overlay_digest_is_rejected_at_every_binding_boundary() -> None:
+    """A stale digest cannot authenticate committed overlay bytes anywhere."""
+
+    stale_digest = "0" * 64
+    with pytest.raises(ProtocolError, match="overlay sha256 does not match"):
+        build_manifest(
+            protocol=Protocol(1, 2, 100000, 2, 3, 4, 2, 2, 1000),
+            source_sha="a" * 40,
+            config_sha256=config_identities(config_root=CONFIG_ROOT, systems=("he",)),
+            checkpoints=list(range(0, 100001, 1000)),
+            lineage_seeds=[11, 12, 13],
+            checkpoint_sha256={},
+            results_root="/external/stage1-stale-digest",
+            systems=("he",),
+            phase=1,
+            device="cpu",
+            overlay=str(OVERLAY),
+            overlay_sha256=stale_digest,
+        )
+
+    row = _overlay_row()
+    row["overlay_sha256"] = stale_digest
+    with pytest.raises(ProtocolError, match="overlay sha256 does not match"):
+        validate_gateway_binding(
+            binding=_binding_token(row),
+            config=str(row["config"]),
+            overrides=row_overrides(row),
+            kind="train",
+            overlay=str(row["overlay"]),
+            overlay_sha256=stale_digest,
+        )
+
+    cfg = load_config(str(CONFIG_ROOT / "he" / "train.yaml"))
+    with pytest.raises(ProtocolError, match="overlay sha256 does not match"):
+        compose_train_overlay(cfg, overlay=str(OVERLAY), expected_sha256=stale_digest)
+
+    with pytest.raises(ProtocolError, match="overlay sha256 does not match"):
+        protocol_module.validate_resolved_train_config(cfg, row, base_config=cfg)
 
     undeclared = {key: value for key, value in row.items() if key not in {"overlay", "overlay_sha256"}}
     with pytest.raises(ProtocolError, match="without being declared"):
@@ -392,6 +558,144 @@ def test_overlay_hash_is_exact_file_bytes() -> None:
     """The identity helper hashes bytes, not parsed YAML semantics."""
 
     assert overlay_sha256(OVERLAY) == hashlib.sha256(OVERLAY.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("needle", "replacement"),
+        [("fail_fast: true", "fail_fast: false"), ("    every_n_steps: 1", "    every_n_steps: 1000")],
+)
+def test_recomputed_health_callback_drift_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, needle: str, replacement: str,
+) -> None:
+    """A fresh digest cannot authorize a weakened callback health contract."""
+
+    relative = f"configs/overlays/.s0c-health-{tmp_path.name}.yaml"
+    variant_path = ROOT / relative
+    variant_path.write_bytes(OVERLAY.read_bytes().replace(
+        needle.encode(), replacement.encode(), 1,
+    ))
+    monkeypatch.setitem(protocol_module.OVERLAY_PATH_BY_SYSTEM, "he", relative)
+    try:
+        with pytest.raises(ProtocolError, match="callback set drifted"):
+            build_manifest(
+                protocol=_protocol(),
+                source_sha="a" * 40,
+                config_sha256=config_identities(config_root=CONFIG_ROOT, systems=("he",)),
+                checkpoints=[0, 1],
+                lineage_seeds=[11, 12, 13],
+                checkpoint_sha256={},
+                results_root="/external/stage1-health-drift",
+                systems=("he",),
+                phase=1,
+                device="cpu",
+                overlay=relative,
+                overlay_sha256=overlay_sha256(relative),
+            )
+    finally:
+        variant_path.unlink(missing_ok=True)
+
+
+def test_final_guard_rejects_post_composition_health_drift(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The final resolved-config guard independently checks callback settings."""
+
+    monkeypatch.setenv("TPEN_STAGE1_RESULTS_ROOT", str(tmp_path))
+    row = _overlay_row()
+    cfg = load_config(str(CONFIG_ROOT / "he" / "train.yaml"))
+    compose_train_overlay(cfg, overlay=str(OVERLAY), expected_sha256=overlay_sha256(OVERLAY))
+    cfg.callbacks[-len(protocol_module._expected_overlay_callbacks(protocol_module.OVERLAY_RELATIVE_PATH))]["fail_fast"] = False
+    with pytest.raises(ProtocolError, match="resolved diagnostics callback profile drifted"):
+        protocol_module.validate_resolved_train_config(cfg, row, base_config=cfg)
+
+
+def test_overlay_identity_has_separate_base_and_overlay_sides(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A byte-only overlay change preserves base identity but invalidates ancestry."""
+
+    original = _phase1(overlay=True)
+    original_base = config_identities(config_root=CONFIG_ROOT, systems=("he",))
+    relative = f"configs/overlays/.s0c-identity-{tmp_path.name}.yaml"
+    variant_path = ROOT / relative
+    variant_path.write_bytes(OVERLAY.read_bytes() + b"\n# byte-only identity variant\n")
+    monkeypatch.setitem(protocol_module.OVERLAY_PATH_BY_SYSTEM, "he", relative)
+    try:
+        variant = build_manifest(
+            protocol=_protocol(),
+            source_sha="a" * 40,
+            config_sha256=config_identities(config_root=CONFIG_ROOT, systems=("he",)),
+            checkpoints=[0, 1],
+            lineage_seeds=[11, 12, 13],
+            checkpoint_sha256={},
+            results_root="/n/netscratch/kozinsky_lab/Lab/rhu/stage1-overlay-test",
+            systems=("he",),
+            phase=1,
+            device="cpu",
+            overlay=relative,
+            overlay_sha256=overlay_sha256(relative),
+        )
+    finally:
+        variant_path.unlink(missing_ok=True)
+
+    assert original_base == config_identities(config_root=CONFIG_ROOT, systems=("he",))
+    original_train = next(row for row in original if row["kind"] == "train")
+    variant_train = next(row for row in variant if row["kind"] == "train")
+    assert original_train["config_sha256"] == variant_train["config_sha256"]
+    assert original_train["overlay_sha256"] != variant_train["overlay_sha256"]
+    assert manifest_hash([original_train]) != manifest_hash([variant_train])
+    assert manifest_hash(original) != manifest_hash(variant)
+
+    def evidence_for(rows: list[dict[str, object]], phase_hash: str) -> dict[str, object]:
+        return {
+            "schema": protocol_module.CHECKPOINT_EVIDENCE_SCHEMA,
+            "phase1_manifest_hash": phase_hash,
+            "phase1_train_row_hashes": {
+                f"{row['system']}:{row['lineage']}": manifest_hash([row])
+                for row in rows if row["kind"] == "train"
+            },
+            "checkpoints": {
+                f"he:{lineage}:1": "c" * 64 for lineage in range(3)
+            },
+        }
+
+    original_hash = manifest_hash(original)
+    variant_hash = manifest_hash(variant)
+    with pytest.raises(ProtocolError, match="phase-1 manifest_hash"):
+        bind_evaluation_manifest(
+            phase1_rows=variant, checkpoints=[1],
+            checkpoint_evidence=evidence_for(original, original_hash),
+            protocol=_protocol(), phase1_manifest_hash=original_hash,
+        )
+    assert bind_evaluation_manifest(
+        phase1_rows=variant, checkpoints=[1],
+        checkpoint_evidence=evidence_for(variant, variant_hash),
+        protocol=_protocol(), phase1_manifest_hash=variant_hash,
+    )
+
+
+def test_eval_rows_refuse_overlay_application() -> None:
+    """Eval execution keeps authenticated ancestry and never applies a train overlay."""
+
+    row = _overlay_row()
+    row.update({
+        "kind": "eval",
+        "config": "configs/he/eval.yaml",
+        "checkpoint": 1,
+        "stream": 0,
+        "draws": 2,
+        "checkpoint_dir": "/external/checkpoints/step_000001",
+        "checkpoint_file": "/external/checkpoints/step_000001/model.pt",
+        "checkpoint_sha256": "e" * 64,
+    })
+    with pytest.raises(ProtocolError, match="only on train rows"):
+        validate_gateway_binding(
+            binding=_binding_token(row), config=str(row["config"]),
+            overrides=row_overrides(row), kind="eval",
+            expected_checkpoint_sha256=str(row["checkpoint_sha256"]),
+            overlay=str(row["overlay"]),
+            overlay_sha256=str(row["overlay_sha256"]),
+        )
 
 
 @pytest.mark.integration

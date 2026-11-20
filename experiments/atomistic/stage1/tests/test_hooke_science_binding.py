@@ -29,10 +29,12 @@ from experiments.atomistic.stage1.protocol import (
     training_seed,
     validate_gateway_binding,
     validate_hooke_eval_grid,
+    overlay_sha256,
 )
 
 
 ROOT = Path(__file__).parents[1]
+HOOKE_OVERLAY = ROOT / "configs" / "overlays" / "hooke-diagnostics-v1.yaml"
 
 
 @pytest.mark.parametrize("system", ["hooke1", "hooke2"])
@@ -82,6 +84,8 @@ def _hooke_phase1() -> list[dict[str, object]]:
         phase=1,
         science_profile=HOOKE_SCIENCE_PROFILE,
         evaluation_selection=HOOKE_EVAL_SELECTION,
+        overlay=str(HOOKE_OVERLAY),
+        overlay_sha256=overlay_sha256(HOOKE_OVERLAY),
     )
 
 
@@ -90,19 +94,22 @@ def test_hooke_phase1_rows_bind_distinct_sampler_seeds_and_gateway() -> None:
     train = next(row for row in rows if row["kind"] == "train")
     assert train["training_seed_rule"] == HOOKE_TRAINING_SEED_RULE
     assert train["evaluation_selection_id"] == HOOKE_EVAL_SELECTION_ID
+    assert train["overlay"] == "configs/overlays/hooke-diagnostics-v1.yaml"
     assert train["seed"] != train["sampler_seed"]
     overrides = row_overrides(train)
     assert f"runtime.seed={train['seed']}" in overrides
     assert f"sampler.seed={train['sampler_seed']}" in overrides
     assert validate_gateway_binding(
         binding=_binding_token(train), config=str(train["config"]),
-        overrides=overrides, kind="train",
+        overrides=overrides, kind="train", overlay=str(train["overlay"]),
+        overlay_sha256=str(train["overlay_sha256"]),
     ) == train
     with pytest.raises(ProtocolError, match="sampler.seed"):
         validate_gateway_binding(
             binding=_binding_token(train), config=str(train["config"]),
             overrides=[item for item in overrides if not item.startswith("sampler.seed=")],
-            kind="train",
+            kind="train", overlay=str(train["overlay"]),
+            overlay_sha256=str(train["overlay_sha256"]),
         )
     tampered = dict(train)
     tampered["sampler_seed"] = tampered["seed"]
@@ -110,6 +117,8 @@ def test_hooke_phase1_rows_bind_distinct_sampler_seeds_and_gateway() -> None:
         validate_gateway_binding(
             binding=_binding_token(tampered), config=str(tampered["config"]),
             overrides=row_overrides(tampered), kind="train",
+            overlay=str(tampered["overlay"]),
+            overlay_sha256=str(tampered["overlay_sha256"]),
         )
 
     tampered = dict(train)
@@ -120,6 +129,8 @@ def test_hooke_phase1_rows_bind_distinct_sampler_seeds_and_gateway() -> None:
         validate_gateway_binding(
             binding=_binding_token(tampered), config=str(tampered["config"]),
             overrides=row_overrides(tampered), kind="train",
+            overlay=str(tampered["overlay"]),
+            overlay_sha256=str(tampered["overlay_sha256"]),
         )
 
 
@@ -150,9 +161,39 @@ def test_hooke_train_gateway_rechecks_resolved_seed_binding(
             [
                 "stage1-train", "--config", str(train["config"]), "--kind", "train",
                 *tampered_overrides, "--binding", _binding_token(train),
+                "--overlay", str(train["overlay"]),
+                "--overlay-sha256", str(train["overlay_sha256"]),
             ],
         )
         with pytest.raises(ValueError, match="runtime and sampler seeds are not bound"):
+            stage1_train.main()
+
+
+def test_hooke_train_gateway_rechecks_resolved_model_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public gateway refuses a post-validation base-model tamper."""
+
+    train = next(row for row in _hooke_phase1() if row["kind"] == "train")
+    overrides = row_overrides(train) + ["model.readout.trainable=false"]
+    with monkeypatch.context() as isolated:
+        isolated.setenv("TPEN_STAGE1_RESULTS_ROOT", "/external/stage1")
+        isolated.setattr(
+            stage1_train,
+            "run_from_config",
+            lambda **_: pytest.fail("model-tampered config reached execution"),
+        )
+        isolated.setattr(
+            sys,
+            "argv",
+            [
+                "stage1-train", "--config", str(train["config"]), "--kind", "train",
+                *overrides, "--binding", _binding_token(train),
+                "--overlay", str(train["overlay"]),
+                "--overlay-sha256", str(train["overlay_sha256"]),
+            ],
+        )
+        with pytest.raises(ProtocolError, match="base-owned section model"):
             stage1_train.main()
 
 
@@ -207,7 +248,7 @@ def test_hooke_grid_rejects_count_preserving_replacement(
         for lineage in range(3)
         for checkpoint in HOOKE_A37
     }
-    with pytest.raises(ProtocolError, match="A37 grid mismatch"):
+    with pytest.raises(ProtocolError, match="exact production protocol dimensions"):
         build_manifest(
             # A37 is a phase-2 selection, not the phase-1 retention cadence.
             protocol=replace(STAGE1_PROTOCOL, retention_cadence=None),
@@ -221,6 +262,8 @@ def test_hooke_grid_rejects_count_preserving_replacement(
             phase=2,
             science_profile=HOOKE_SCIENCE_PROFILE,
             evaluation_selection=HOOKE_EVAL_SELECTION,
+            overlay=str(HOOKE_OVERLAY),
+            overlay_sha256=overlay_sha256(HOOKE_OVERLAY),
             expected_physical_system_id={"hooke1": "d" * 64},
         )
 
@@ -228,7 +271,7 @@ def test_hooke_grid_rejects_count_preserving_replacement(
 def _two_hooke_phase2_document(tmp_path: Path) -> tuple[dict[str, object], object]:
     """Build a complete, planner-shaped two-Hooke A37 document for collection tests."""
 
-    protocol = replace(STAGE1_PROTOCOL, eval_walkers=2, eval_draws=2)
+    protocol = STAGE1_PROTOCOL
     systems = ("hooke1", "hooke2")
     config_sha256 = config_identities(config_root=ROOT / "configs", systems=systems)
     physical_ids = {"hooke1": "a" * 64, "hooke2": "b" * 64}
@@ -244,6 +287,8 @@ def _two_hooke_phase2_document(tmp_path: Path) -> tuple[dict[str, object], objec
         phase=1,
         science_profile=HOOKE_SCIENCE_PROFILE,
         evaluation_selection=HOOKE_EVAL_SELECTION,
+        overlay=str(HOOKE_OVERLAY),
+        overlay_sha256=overlay_sha256(HOOKE_OVERLAY),
         expected_physical_system_id=physical_ids,
     )
     phase1_hash = protocol_module.manifest_hash(phase1_rows)
@@ -291,10 +336,10 @@ def _install_two_hooke_collection_fakes(monkeypatch: pytest.MonkeyPatch) -> None
         physical_id = "b" * 64 if "hooke2" in str(path) else "a" * 64
         return type("Record", (), {
             "record_schema": "trajectory_records/v2",
-            "draw_count": 2,
-            "walker_count": 2,
-            "row_count": 4,
-            "finite_count": 4,
+            "draw_count": 256,
+            "walker_count": 4096,
+            "row_count": 256 * 4096,
+            "finite_count": 256 * 4096,
             "mean": 2.5,
             "variance": 1.25,
             "csv_sha256": "e" * 64,
@@ -384,3 +429,47 @@ def test_phase2_rejects_evaluation_seed_collision_with_train_sampler_seed(
             protocol=protocol,
             phase1_manifest_hash=evidence["phase1_manifest_hash"],
         )
+
+
+def test_phase2_rejects_full_row_tamper_even_with_recomputed_phase1_hash(
+    tmp_path: Path,
+) -> None:
+    """Recomputing a phase-1 hash cannot rewrite the authenticated train row."""
+
+    document, protocol = _two_hooke_phase2_document(tmp_path)
+    phase1_rows = [dict(row) for row in document["rows"] if row["kind"] != "eval"]
+    original_hash = protocol_module.manifest_hash(phase1_rows)
+    evidence = {
+        "schema": protocol_module.CHECKPOINT_EVIDENCE_SCHEMA,
+        # The tampered caller may recompute this outer hash, but not the
+        # independently recorded train-row identities.
+        "phase1_manifest_hash": "d" * 64,
+        "phase1_train_row_hashes": {
+            f"{row['system']}:{row['lineage']}": protocol_module.manifest_hash([row])
+            for row in phase1_rows if row["kind"] == "train"
+        },
+        "checkpoints": {
+            f"{system}:{lineage}:{checkpoint}": "c" * 64
+            for system in ("hooke1", "hooke2")
+            for lineage in range(protocol.lineages)
+            for checkpoint in HOOKE_A37
+        },
+    }
+    tampered = [dict(row) for row in phase1_rows]
+    tampered_train = next(row for row in tampered if row["kind"] == "train")
+    tampered_train["overlay_sha256"] = "0" * 64
+    tampered_hash = protocol_module.manifest_hash(tampered)
+    evidence["phase1_manifest_hash"] = tampered_hash
+    with pytest.raises(ProtocolError, match="train identity"):
+        protocol_module.bind_evaluation_manifest(
+            phase1_rows=tampered,
+            checkpoints=list(HOOKE_A37),
+            checkpoint_evidence=evidence,
+            expected_physical_system_id={"hooke1": "a" * 64, "hooke2": "b" * 64},
+            config_sha256=config_identities(
+                config_root=ROOT / "configs", systems=("hooke1", "hooke2")
+            ),
+            protocol=protocol,
+            phase1_manifest_hash=tampered_hash,
+        )
+    assert original_hash != tampered_hash
