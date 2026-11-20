@@ -336,6 +336,62 @@ def _run_real_child(payload: dict[str, object]) -> tuple[dict[str, object], Proc
     return result, evidence
 
 
+def _real_outcome_diagnostic(
+    result: dict[str, object], *, run_dir: Path, expected: str,
+) -> str:
+    """Render bounded durable evidence when a real child parks unexpectedly."""
+
+    receipt = result.get("receipt")
+    lease_json: object = None
+    if isinstance(receipt, dict):
+        lease = receipt.get("lease")
+        if isinstance(lease, str):
+            lease_path = Path(lease)
+            try:
+                lease_json = json.loads(lease_path.read_text(encoding="utf-8"))
+            except Exception as exc:  # pragma: no cover - diagnostic fallback
+                lease_json = {"read_error": str(exc), "path": lease}
+
+    checkpoint_root = run_dir / "checkpoints"
+    layout: list[dict[str, object]] = []
+    if checkpoint_root.is_dir():
+        for path in sorted(checkpoint_root.iterdir(), key=lambda item: item.name):
+            if path.is_dir() and path.name.startswith("step_"):
+                marker = path / "COMPLETE"
+                layout.append({
+                    "name": path.name,
+                    "complete": marker.is_file(),
+                    "complete_contents": (
+                        marker.read_text(encoding="utf-8")[:64]
+                        if marker.is_file() else None
+                    ),
+                })
+            elif path.name in {"latest.json", "publications.jsonl", "publication_receipts.jsonl"}:
+                layout.append({
+                    "name": path.name,
+                    "contents": path.read_text(encoding="utf-8")[:512]
+                    if path.is_file() else None,
+                })
+    diagnostic = {
+        "expected": expected,
+        "run_dir": str(run_dir),
+        "outcome_receipt": receipt,
+        "lease_json": lease_json,
+        "checkpoint_layout": layout,
+    }
+    rendered = json.dumps(diagnostic, sort_keys=True)
+    return rendered if len(rendered) <= 3900 else rendered[:3900] + "...<layout-truncated>"
+
+
+def _assert_real_outcome(
+    result: dict[str, object], *, run_dir: Path, expected: str,
+) -> None:
+    """Fail with receipt, lease, and publication layout for an unexpected outcome."""
+
+    if result.get("outcome") != expected:
+        pytest.fail(_real_outcome_diagnostic(result, run_dir=run_dir, expected=expected))
+
+
 def _publish(run_dir: Path, step: int) -> None:
     """Publish a real full-state checkpoint with the core checkpoint writer."""
 
@@ -465,7 +521,7 @@ def test_real_cannon_cpu_restartable_multi_attempt_chain(
         "trace_path": str(tmp_path / f"{system}-fresh-trace.json"),
     }
     first_result, _first_evidence = _run_real_child(first_payload)
-    assert first_result["outcome"] == "planned_yield", json.dumps(first_result, sort_keys=True)
+    _assert_real_outcome(first_result, run_dir=run_dir, expected="planned_yield")
     assert first_result["exit_code"] == 2
     first_receipt = first_result["receipt"]
     assert isinstance(first_receipt, dict)
@@ -474,7 +530,7 @@ def test_real_cannon_cpu_restartable_multi_attempt_chain(
 
     resumed_payload = {**first_payload, "phase": "resumed", "trace_path": str(tmp_path / f"{system}-resumed-trace.json")}
     resumed_result, resumed_evidence = _run_real_child(resumed_payload)
-    assert resumed_result["outcome"] == "completed"
+    _assert_real_outcome(resumed_result, run_dir=run_dir, expected="completed")
     assert resumed_result["exit_code"] == 0
 
     reference_row = _row(system, tmp_path / "reference", protocol=protocol)
@@ -489,7 +545,9 @@ def test_real_cannon_cpu_restartable_multi_attempt_chain(
         "trace_path": str(tmp_path / f"{system}-reference-trace.json"),
     }
     reference_result, reference_evidence = _run_real_child(reference_payload)
-    assert reference_result["outcome"] == "completed"
+    _assert_real_outcome(
+        reference_result, run_dir=Path(str(reference_payload["run_dir"])), expected="completed",
+    )
     assert reference_result["exit_code"] == 0
 
     assert_fresh_processes(reference_evidence, resumed_evidence)
@@ -515,7 +573,9 @@ def test_real_cannon_cpu_restartable_multi_attempt_chain(
         "trace_path": str(tmp_path / f"{system}-control-trace.json"),
     }
     control_result, control_evidence = _run_real_child(control_payload)
-    assert control_result["outcome"] == "completed"
+    _assert_real_outcome(
+        control_result, run_dir=Path(str(control_payload["run_dir"])), expected="completed",
+    )
     assert control_result["exit_code"] == 0
     resumed_cursor = next(
         event.step for event in resumed_evidence.events if event.channel == "trainer_cursor"
