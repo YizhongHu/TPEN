@@ -95,6 +95,29 @@ def _walk(
     dataclass_fields_first: bool,
     active: set[int],
 ) -> None:
+    if dataclass_fields_first and isinstance(value, str):
+        _check(value, label, "value", is_forbidden, error_factory)
+        return
+
+    if dataclass_fields_first and is_dataclass(value) and not isinstance(value, type):
+        identity = id(value)
+        if identity in active:
+            return
+        active.add(identity)
+        try:
+            _walk_members(
+                value,
+                label,
+                is_forbidden=is_forbidden,
+                error_factory=error_factory,
+                reject_non_string_mapping_keys=reject_non_string_mapping_keys,
+                dataclass_fields_first=dataclass_fields_first,
+                active=active,
+            )
+            return
+        finally:
+            active.remove(identity)
+
     normalized = _normalize(value, label, error_factory=error_factory)
     if normalized is not None:
         _check(normalized, label, "value", is_forbidden, error_factory)
@@ -108,18 +131,6 @@ def _walk(
         return
     active.add(identity)
     try:
-        if dataclass_fields_first and is_dataclass(value) and not isinstance(value, type):
-            _walk_members(
-                value,
-                label,
-                is_forbidden=is_forbidden,
-                error_factory=error_factory,
-                reject_non_string_mapping_keys=reject_non_string_mapping_keys,
-                dataclass_fields_first=dataclass_fields_first,
-                active=active,
-            )
-            return
-
         if isinstance(value, Mapping):
             for key, nested in value.items():
                 if reject_non_string_mapping_keys and not isinstance(key, str):

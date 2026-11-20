@@ -146,6 +146,22 @@ class _DataclassSequenceHybrid(list):
         list.__init__(self, ["benign"])
 
 
+@dataclass
+class _BytearrayDataclass(bytearray):
+    payload: str
+
+    def __new__(cls, payload: str) -> "_BytearrayDataclass":
+        return bytearray.__new__(cls)
+
+
+@dataclass
+class _IntDataclass(int):
+    payload: str
+
+    def __new__(cls, payload: str) -> "_IntDataclass":
+        return int.__new__(cls, 0)
+
+
 class _PrivateSlotWitness:
     __slots__ = ("__payload",)
 
@@ -219,6 +235,43 @@ def test_l3b_refuses_non_string_mapping_keys_before_normalization(
 @pytest.mark.parametrize("route", ["request", "output"])
 def test_l3b_dataclass_fields_precede_hybrid_container_dispatch(
     hybrid: Callable[[object], object], payload: str, route: str, tmp_path: Path
+) -> None:
+    value = hybrid(payload)
+    if payload == "benign":
+        if route == "request":
+            ranking_evaluator.evaluate_checkpoint(
+                replace(_request(tmp_path), rng_provenance={"payload": value})
+            )
+        else:
+            ranking_evaluator.validate_ranking_output(
+                {"checkpoint_id": value, "disposition": "keep", "ordinal": 0}
+            )
+        return
+
+    if route == "request":
+        label = "ranking request.rng_provenance.payload.payload"
+        with pytest.raises(ranking_evaluator.RankingEvaluationError, match=re.escape(
+            f"{label} contains forbidden value 'reference_energy'"
+        )) as exc:
+            ranking_evaluator.evaluate_checkpoint(
+                replace(_request(tmp_path), rng_provenance={"payload": value})
+            )
+    else:
+        label = "ranking output.checkpoint_id.payload"
+        with pytest.raises(ranking_evaluator.RankingEvaluationError, match=re.escape(
+            f"{label} contains forbidden value 'reference_energy'"
+        )) as exc:
+            ranking_evaluator.validate_ranking_output(
+                {"checkpoint_id": value, "disposition": "keep", "ordinal": 0}
+            )
+    assert exc.type is ranking_evaluator.RankingEvaluationError
+
+
+@pytest.mark.parametrize("hybrid", [_BytearrayDataclass, _IntDataclass])
+@pytest.mark.parametrize("payload", ["reference_energy", "benign"])
+@pytest.mark.parametrize("route", ["request", "output"])
+def test_l3b_dataclass_fields_precede_leaf_normalization_and_numeric_shortcuts(
+    hybrid: Callable[[str], object], payload: str, route: str, tmp_path: Path
 ) -> None:
     value = hybrid(payload)
     if payload == "benign":
