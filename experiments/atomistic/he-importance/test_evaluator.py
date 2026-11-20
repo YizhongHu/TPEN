@@ -603,7 +603,7 @@ class _PrivateSlotWitness:
     __slots__ = ("__payload",)
 
     def __init__(self, payload: object) -> None:
-        self.__payload = payload
+        _PrivateSlotWitness.__dict__["_PrivateSlotWitness__payload"].__set__(self, payload)
 
 
 class _InheritedPrivateSlotWitness(_PrivateSlotWitness):
