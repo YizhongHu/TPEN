@@ -423,3 +423,60 @@ their fences are finished. After processing, the first `begin` exception is
 raised as the primary error. A later `finish` exception is retained as a note
 on that same exception; when there was no `begin` failure, a `finish` exception
 is raised normally.
+
+## Balsam group registration and application boundary (B1b)
+
+`tpen_executor.lifecycle.balsam` provides an optional, group-keyed registration
+port and application factory. It does not import Balsam until
+`make_group_application(api=None, ...)` is called. Tests inject a fake API;
+no SDK dependency or installation is added by this slice.
+
+`register_group(intent, store, client)` binds one persistent `BackendJobId` to
+one `GroupId` in the configured `DirectoryStore`. The intent includes the
+ready-group digest and the digest of the complete backend request (including
+application identity and deployment options). The client owns constructing
+that request and must honor those digests. Registration uses the store's POSIX
+durable no-replace publication primitives: an exclusive intent is persisted
+before the sole backend call. Identical acknowledged intent reuses its receipt;
+changed intent raises `BalsamGroupRefusal`. A missing/ambiguous acknowledgement,
+including failure to persist it, raises `BalsamGroupParked`. Reopening an intent
+without acknowledgement never calls registration again, even if the original
+process died before making the call. Permanent client refusal is retained.
+Do not remove these records to request a retry. The one-Job guarantee is scoped
+to this shared store; independent stores are not coordinated.
+
+`GroupExitContract(backend_retry_codes=...)` requires an explicit deployed retry
+set and rejects overlap with exit 2 (or success 0). Its version-one no-retry
+code is fixed at 2. The historical set `(-11, 1, 255, 12345)` is test input,
+not an installed-version assertion or automatic default. `group_exit_code`
+accepts typed B1a reconciliation or a `GroupFailure`:
+
+| Authoritative outcome | Process exit |
+| --- | --- |
+| Every member `preserve_completed` | 0 |
+| Settled with any terminal member | 2 |
+| Parked | 2 |
+| Pre-start failure | 2 |
+| Uncaught exception | 2 |
+| Voluntary exit with replacement required | 2 |
+
+Backend observations, `JOB_FINISHED`, and integer return values cannot establish
+completion. `make_group_application(api, controller=..., contract=...,
+record_failure=...)` builds an `ApplicationDefinition` at call time. Its
+`run()` passes the Job to the injected controller exactly once. Non-success
+raises `SystemExit(2)` instead of returning an integer that a backend Python
+runner might serialize while exiting zero. Exceptions (including an injected
+`SystemExit(1)`) go through the failure recorder and also exit 2. If recording
+itself fails, the original exception retains that fact and the process still
+exits 2; storage failure cannot guarantee a durable receipt.
+
+The shell preamble is empty and `environment_variables` is empty, so this
+boundary preserves inherited environment. The injected controller owns
+prepending configured paths, recording the effective environment, durable
+start/pre-start receipts before work, allocation and invocation identities,
+reconciliation, successor admission and dispatch. Those controller mechanics
+are **not implemented or qualified by B1b**. Per the scope split, B1a-C supplies
+the storage seams and B1b2 supplies `run_group_controller`. No scheduler,
+reaper, retry loop, allocation replacement, walltime/signal behavior, or real
+core admission is supplied here. Deployment exit behavior and durability need
+independent B1c qualification; fake tests are not facility evidence.

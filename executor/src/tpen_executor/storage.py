@@ -165,6 +165,68 @@ def _ensure_directory(path: str) -> None:
         raise FenceRejected(f"store component is not a directory: {path}")
 
 
+def ensure_durable_directory(path: str) -> None:
+    """Create or validate one directory and durably publish its parent link.
+
+    Parameters
+    ----------
+    path : str
+        Directory component to publish. Its parent must already be durable;
+        callers publish an ancestor chain in parent-to-child order.
+
+    Notes
+    -----
+    Existing entries are validated as directories, never symlinks, and their
+    parent is synced too: another creator may have stopped after mkdir. This
+    POSIX publication contract assumes no concurrent removal or replacement of
+    validated directories. Sync failures propagate before publication succeeds.
+    Existing private storage callers retain their original contract.
+    """
+    path = _lexical(path)
+    try:
+        os.mkdir(path)
+    except FileExistsError:
+        _require_directory(path, "publication directory")
+        # Visibility does not prove that another creator synced this link.
+        _fsync_directory(os.path.dirname(path))  # durable existing publication
+        return
+    _require_directory(path, "publication directory")
+    _fsync_directory(os.path.dirname(path))
+
+
+def require_regular_file(path: str, name: str) -> None:
+    """Require a non-symlink regular file, raising ``FenceRejected`` otherwise.
+
+    Parameters
+    ----------
+    path : str
+        File to validate before reading a published record.
+    name : str
+        Human-readable record name used in validation errors.
+    """
+    _require_regular(path, name)
+
+
+def publish_json_exclusive(path: str, payload: bytes) -> None:
+    """Publish encoded JSON bytes durably without replacing an existing entry.
+
+    Parameters
+    ----------
+    path : str
+        Destination under an already durable directory chain.
+    payload : bytes
+        Complete JSON record encoded and validated by its owning codec.
+
+    Notes
+    -----
+    Syncs the payload before exclusive linking, then syncs the destination
+    directory. Raises ``FileExistsError`` on collision; other storage failures
+    propagate. A failed call can leave a published record, so callers must
+    treat failure as uncertain rather than permission to repeat a side effect.
+    """
+    _write_new(path, payload)
+
+
 def _mkdir_new(path: str) -> None:
     """Create one fresh directory and persist its parent link."""
     try:
