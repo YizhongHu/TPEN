@@ -379,6 +379,44 @@ def _durable_status(run_dir: Path) -> tuple[str | None, dict[str, Any]]:
     return status if isinstance(status, str) else None, payload
 
 
+def _active_attempt_lease_paths(attempts: Path) -> list[Path]:
+    """Return lease receipts whose owners have not published an outcome.
+
+    A successor checkpoint changes the lease key, so checking only the
+    selected predecessor key would allow an in-flight initial attempt to race
+    its successor.  The outcome sibling is the CX-08-backed relinquishment
+    record for every earlier attempt; absent that sibling, the lease remains
+    active and a successor must be refused or explicitly taken over.
+    """
+
+    if not attempts.is_dir():
+        return []
+    active: list[Path] = []
+    for lease_path in sorted(attempts.glob("*.json")):
+        if lease_path.name.endswith(".outcome.json"):
+            continue
+        if not (attempts / f"{lease_path.stem}.outcome.json").is_file():
+            active.append(lease_path)
+    return active
+
+
+def _reject_configured_restore_on_fresh(cfg: Any) -> None:
+    """Reject concrete raw restore input before acquiring a restart lease."""
+
+    configured_load = OmegaConf.select(cfg, "runner.load", default=None)
+    if configured_load is None:
+        return
+    try:
+        load_payload = OmegaConf.to_container(configured_load, resolve=False)
+    except (TypeError, ValueError) as exc:
+        raise RestartRefusal("configured runner.load is not an admitted typed restore") from exc
+    if load_payload not in (None, {}, []):
+        raise RestartRefusal(
+            "fresh restart refuses concrete runner.load; use the selected "
+            "OperationalRestoreRequest"
+        )
+
+
 def execute_restart(
     *, cfg: Any, row: Mapping[str, Any], config_path: str | Path,
     binding: str | None = None, overrides: list[str] | None = None,
@@ -401,12 +439,26 @@ def execute_restart(
     profile_validator(cfg)
     selection = select_restart(cfg=cfg, row=row, run_dir=run_dir)
     identity = _identity(row, cfg, target)
-    if selection.predecessor is not None and takeover is not None:
-        takeover.validate(expected={**identity, "predecessor_content_id": selection.predecessor.content_id})
-    elif selection.predecessor is not None and (selection.run_dir / "attempts" / f"{selection.content_id}.json").exists():
-        raise RestartRefusal("occupied predecessor lease requires orchestrator takeover approval")
-
     attempts = selection.run_dir / "attempts"
+    if selection.decision is StartDecision.FRESH:
+        _reject_configured_restore_on_fresh(cfg)
+
+    # Every takeover, including replacement of an initial owner, consumes the
+    # same complete approval contract.  The initial marker is a real owner
+    # identity for this purpose, not an exception to the gate.
+    expected_approval = {
+        **identity,
+        "predecessor_content_id": selection.content_id,
+    }
+    active_leases = _active_attempt_lease_paths(attempts)
+    if takeover is not None:
+        takeover.validate(expected=expected_approval)
+    elif active_leases:
+        raise RestartRefusal(
+            "occupied predecessor lease requires orchestrator takeover approval: "
+            + ", ".join(str(path) for path in active_leases)
+        )
+
     attempts.mkdir(parents=True, exist_ok=True)
     # A takeover never overwrites the predecessor lease.  Its approval is an
     # explicit new attempt namespace, while the original content identity is
@@ -454,7 +506,7 @@ def execute_restart(
             cause = cause or RestartCause.INVOCATION_ERROR
             reason = reason or cause.value
         elif selection.decision is StartDecision.COMPLETED:
-            outcome = "completed"
+            outcome = "completed" if status in {None, "completed"} else status
         elif published_after is not None and published_after.next_iteration == target:
             outcome = "completed" if status in {None, "completed"} else status
         elif status in {"failed", "planned_yield"}:
