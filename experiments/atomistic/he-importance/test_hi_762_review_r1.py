@@ -92,6 +92,7 @@ def _assert_exact(error_type: type[BaseException], message: str, call: Any) -> N
 
     with pytest.raises(error_type) as raised:
         call()
+    assert type(raised.value) is error_type
     assert str(raised.value) == message
 
 
