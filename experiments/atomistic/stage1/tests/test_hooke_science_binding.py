@@ -11,7 +11,6 @@ from omegaconf import OmegaConf
 
 from experiments.atomistic.stage1.launch import _binding_token, row_overrides
 from experiments.atomistic.stage1.protocol import (
-    HOOKE_A37,
     HOOKE_EVAL_SELECTION,
     HOOKE_EVAL_SELECTION_ID,
     HOOKE_SCIENCE_PROFILE,
@@ -130,15 +129,16 @@ def test_legacy_he_h2_rows_do_not_inherit_hooke_profile_fields() -> None:
 
 
 def test_hooke_grid_rejects_count_preserving_replacement() -> None:
+    expected_a37 = list(range(0, 20001, 1000)) + list(range(25000, 100001, 5000))
     assert HOOKE_EVAL_SELECTION == "A37"
     rows = [
         {"kind": "eval", "system": "hooke1", "lineage": lineage,
          "checkpoint": checkpoint, "stream": stream,
          "science_profile": HOOKE_SCIENCE_PROFILE,
          "evaluation_selection": HOOKE_EVAL_SELECTION}
-        for lineage in range(3) for checkpoint in HOOKE_A37 for stream in range(4)
+        for lineage in range(3) for checkpoint in expected_a37 for stream in range(4)
     ]
     validate_hooke_eval_grid(rows)
-    rows[-1]["checkpoint"] = HOOKE_A37[0]
+    rows[-1]["checkpoint"] = expected_a37[0]
     with pytest.raises(ProtocolError, match="A37 grid mismatch"):
         validate_hooke_eval_grid(rows)
