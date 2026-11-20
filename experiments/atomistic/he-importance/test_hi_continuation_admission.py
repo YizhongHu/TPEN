@@ -25,17 +25,21 @@ train_config = importlib.import_module(
 context_mapping = importlib.import_module(
     "experiments.atomistic.he-importance.context_mapping"
 )
+_ROWS: dict[str, tuple[object, object]] | None = None
 
 
 def _resolved_rows(tmp_path: Path) -> dict[str, tuple[object, object]]:
     """Return one resolved O1 Adam row for each sealed O context."""
 
+    global _ROWS
+    if _ROWS is not None:
+        return _ROWS
     cells = stage_coordinate.materialize_intended_configurations(
         tmp_path / "o1",
         availability=optimizer_grid.roster_availability(),
         stages=("O1",),
     )
-    rows = {}
+    rows: dict[str, tuple[object, object]] = {}
     for context in ("O-raw", "O-composite"):
         cell = next(
             candidate
@@ -44,6 +48,7 @@ def _resolved_rows(tmp_path: Path) -> dict[str, tuple[object, object]]:
             and candidate.manifest["scientific_identity"]["context"]["name"] == context
         )
         rows[context] = (cell, train_config.resolve_train_config(cell))
+    _ROWS = rows
     return rows
 
 
