@@ -417,13 +417,13 @@ class DirectoryStore:
         intent = LaunchIntentV1(controller_record.group_id, fence.task_id, fence.attempt_id, invocation.invocation_id,
                                 controller_record.generation, controller_record.claimant_nonce,
                                 controller_record.allocation_id, controller_record.backend_job_id)
-        path = os.path.join(fence.output_dir, _LAUNCH_INTENT_FILENAME)
+        intent_path = os.path.join(fence.output_dir, _LAUNCH_INTENT_FILENAME)
         with _task_lock(os.path.join(task_dir, _TASK_LOCK)):
             self.require_current_controller(controller_record.group_id, controller_record.generation, controller_record.claimant_nonce)
-            if os.path.lexists(path):
+            if os.path.lexists(intent_path):
                 raise LaunchIntentRejected("launch intent already exists")
             try:
-                _write_new(path, intent.encode())
+                _write_new(intent_path, intent.encode())
             except FileExistsError as error:
                 raise LaunchIntentRejected("launch intent already exists") from error
         return intent
