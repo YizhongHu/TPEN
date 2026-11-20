@@ -1180,7 +1180,16 @@ def test_hi_policy_rejects_unlisted_import_and_redefinition() -> None:
     )
     edges, violations = _hi_policy_edges(low_level_source, filename="optimizer_grid.py")
     assert ("optimizer_grid.py", "from-import", "validate_hi_train_config") in edges
-    assert violations == ("redefinition/mutation of HI_METHOD_ROSTER",)
+    assert violations == (
+        "redefinition/mutation of HI_METHOD_ROSTER",
+        "unapproved HI-policy occurrence: "
+        "('optimizer_grid.py', '<module>', 'from-import', 'HI_METHOD_ROSTER')",
+        "unapproved HI-policy occurrence: "
+        "('optimizer_grid.py', '<module>', 'from-import', 'validate_hi_train_config')",
+        "missing HI-policy occurrence multiplicity: "
+        "('optimizer_grid.py', 'roster_availability', 'dynamic-import', "
+        "'HI_METHOD_ROSTER'); actual=0, expected=1",
+    )
     assert any(edge not in HI_POLICY_ALLOWLIST for edge in edges)
 
     with_source = _valid_hi_policy_fixture()
