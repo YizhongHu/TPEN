@@ -465,7 +465,7 @@ def test_real_cannon_cpu_restartable_multi_attempt_chain(
         "trace_path": str(tmp_path / f"{system}-fresh-trace.json"),
     }
     first_result, _first_evidence = _run_real_child(first_payload)
-    assert first_result["outcome"] == "planned_yield", first_result
+    assert first_result["outcome"] == "planned_yield", json.dumps(first_result, sort_keys=True)
     assert first_result["exit_code"] == 2
     first_receipt = first_result["receipt"]
     assert isinstance(first_receipt, dict)
