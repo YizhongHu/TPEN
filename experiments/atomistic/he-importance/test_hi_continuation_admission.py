@@ -99,9 +99,7 @@ def test_noncanonical_runner_alias_refuses(tmp_path: Path) -> None:
         inventory.validate_hi_continuation_admission(cell, mutated)
 
 
-def test_deleted_registry_classification_refuses(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_deleted_registry_classification_refuses(tmp_path: Path) -> None:
     cell, config = _resolved_rows(tmp_path)["O-raw"]
     key = ("model", "tpen.nn.TPENWaveFunction")
     disposition = inventory._REGISTRY.pop(key)
@@ -112,7 +110,9 @@ def test_deleted_registry_classification_refuses(
         ):
             inventory.validate_hi_continuation_admission(cell, config)
     finally:
-        monkeypatch.setitem(inventory._REGISTRY, key, disposition)
+        # Restore the manually removed key directly; monkeypatch would undo
+        # this restoration during teardown and poison later admission cases.
+        inventory._REGISTRY[key] = disposition
 
 
 def test_o_composite_injection_under_o_raw_identity_refuses(tmp_path: Path) -> None:
