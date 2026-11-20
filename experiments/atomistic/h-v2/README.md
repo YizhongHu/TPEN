@@ -575,8 +575,12 @@ All 101 checkpoints per lineage are retained (update 0 and every 1,000 through
 are now **decided**, not proposed.
 
 Storage lifecycle: the working location is Cannon netscratch, not scratch,
-which is purged after 90 days, so the HPSS archive must be made inside that
-window. The Holystore set is chosen retroactively, after the analysis; about
+which is temporary and not backed up. FASRC announced that Netscratch retention
+changes from 90 to 60 days at the 2026-12-07 maintenance; this run's HPSS
+archive must be made before the applicable cutoff, and the live policy should be
+rechecked after the maintenance. Sources: the [FASRC announcement](https://www.rc.fas.harvard.edu/blog/netscratch-retention-change/)
+and [scratch policy](https://docs.rc.fas.harvard.edu/kb/policy-scratch/).
+The Holystore set is chosen retroactively, after the analysis; about
 26 to 28 GiB is acceptable for now, and excludes the checkpoints themselves
 (operator: "archive everything leading up to the conclusion except the
 checkpoints themselves into holystore"). The HPSS scope is the whole run,
