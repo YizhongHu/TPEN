@@ -175,7 +175,7 @@ def test_stale_inspection_is_not_admitted_from_request_bytes(tmp_path: Path) -> 
         "checkpoint": "invalid",
         "quiescence": "unknown",
         "profile": None,
-        "reason": "corrupt-publication-catalog",
+        "reason": "unpublished-checkpoint-ref",
     }
 
 
