@@ -67,6 +67,23 @@ callback can run. Real-core compatibility, durable publication, successor
 fencing, Balsam lifecycle, and facility integration are later layers and are
 not claimed by B1a.
 
+### B1a-C durable successor and multi-generation publication
+
+`DirectoryStore.begin_admitted_successor()` is the only executor start path
+for a CX-04 admitted successor. It locks the task, rereads the canonical
+successor-admission ledger, requires the predecessor to remain current, and
+consumes the recorded `AttemptId` and `InvocationId` exactly. The start and
+invocation files are write-once; an identical replay returns the same fence,
+while a missing, crossed, symlinked, or differing record is refused.
+
+`publish_reconciliation()` is keyed by the new controller's
+`AllocationAttemptV2`, but each existing member is validated against the
+allocation attempt recorded in that member's durable `invocation.json`. This
+allows recovered groups to combine evidence from several prior allocation
+generations. Evidence from another group, from the new controller lease, or
+whose durable invocation was tampered with parks the publication. Existing
+single-generation `ReconciliationPublicationV2` bytes remain unchanged.
+
 ## GPU placement qualification
 
 The L1a v2 placement receipt reports an explicit reason class: `not-sampled`,

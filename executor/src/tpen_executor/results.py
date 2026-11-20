@@ -1701,10 +1701,10 @@ class ReconciliationPublicationV2:
                 continue
             start = member.evidence.start_receipt
             if (binding.group_digest != self.group.identity
-                    or binding.allocation_attempt != self.allocation_attempt
+                    or binding.allocation_attempt.group_id != self.group.group_id
                     or start.group_digest != self.group.identity
-                    or start.allocation_id != self.allocation_attempt.allocation_id
-                    or start.backend_job_id != self.allocation_attempt.backend_job_id):
+                    or start.allocation_id != binding.allocation_attempt.allocation_id
+                    or start.backend_job_id != binding.allocation_attempt.backend_job_id):
                 raise ValueError("publication crosses allocation or group")
             if binding.invocation_id in invocations:
                 raise ValueError("publication repeats invocation identity")

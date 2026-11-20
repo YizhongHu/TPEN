@@ -452,6 +452,97 @@ class DirectoryStore:
             _write_pointer(pointer, attempt.value)
             return AttemptFence(self.root, group.identity, task_id, allocation.allocation_id.value, attempt, output_dir)
 
+    def begin_admitted_successor(
+        self,
+        group: ReadyGroupV2,
+        task_id: str,
+        allocation: ConfiguredAllocation,
+        started_at_utc: str,
+        transport_kind: str | None,
+        *,
+        allocation_attempt: AllocationAttemptV2,
+        admission: SuccessorAdmissionRecord,
+    ) -> AttemptFence:
+        """Start the exact successor recorded by the durable CX-04 admission.
+
+        The predecessor task lock serializes admission revalidation, exact
+        successor identity consumption, and the current-attempt pointer.  A
+        replay of the same canonical start returns its original fence; any
+        fork, crossed binding, legacy group, or foreign path is refused.
+        """
+        if not isinstance(group, ReadyGroupV2):
+            raise TypeError("admitted successor requires a v2 group")
+        if not isinstance(allocation, ConfiguredAllocation) or not isinstance(allocation_attempt, AllocationAttemptV2):
+            raise TypeError("admitted successor requires typed allocation records")
+        if not isinstance(admission, SuccessorAdmissionRecord) or admission.successor_binding is None:
+            raise TypeError("admitted successor requires a bound admission record")
+        self._validate_task_id(task_id)
+        if task_id not in {member.task_id for member in group.members}:
+            raise ValueError("task_id is not a member of group")
+        if type(started_at_utc) is not str or transport_kind not in {None, "local", "remote"}:
+            raise TypeError("invalid successor start metadata")
+        successor = admission.successor_binding
+        if (admission.predecessor_task_id != task_id
+                or admission.successor_task_id != task_id):
+            raise FenceRejected("crossed-successor-admission")
+        if (allocation_attempt.group_id != group.group_id
+                or allocation_attempt.allocation_id != allocation.allocation_id
+                or allocation_attempt.backend_job_id != allocation.backend_job_id
+                or successor.group_digest != group.identity
+                or successor.task_id != task_id
+                or successor.lineage_id != next(member.lineage_id for member in group.members if member.task_id == task_id)
+                or successor.allocation_attempt != allocation_attempt):
+            raise FenceRejected("crossed-successor-binding")
+        task_dir = self._prepare_task_dir(group, task_id)
+        lock_path = os.path.join(task_dir, _TASK_LOCK)
+        with _task_lock(lock_path):
+            records = self._admission_records_for_task(task_dir, task_id)
+            matches = [record for record in records if record.predecessor_attempt_id == admission.predecessor_attempt_id]
+            if len(matches) != 1 or matches[0].encode() != admission.encode():
+                raise AdmissionFork("admission record is missing or differs")
+            predecessor_dir = _lexical(os.path.join(task_dir, admission.predecessor_attempt_id.value))
+            predecessor_start_path = os.path.join(predecessor_dir, "start.json")
+            _require_regular(predecessor_start_path, "predecessor start receipt")
+            predecessor_start = StartReceipt.decode(Path(predecessor_start_path).read_bytes())
+            predecessor_fence = AttemptFence(
+                self.root, group.identity, task_id,
+                predecessor_start.allocation_id.value,
+                admission.predecessor_attempt_id, predecessor_dir,
+            )
+            pointer = os.path.join(task_dir, "current-attempt.json")
+            current = None
+            if os.path.lexists(pointer):
+                _require_regular(pointer, "current attempt pointer")
+                current = decode_json(Path(pointer).read_bytes()).get("attempt_id")
+            output_dir = _lexical(os.path.join(task_dir, successor.attempt_id.value))
+            start = StartReceipt(task_id, successor.attempt_id, allocation.allocation_id,
+                                 allocation.backend_job_id, group.identity,
+                                 started_at_utc or "unknown", output_dir, transport_kind)
+            binding = successor
+            start_bytes = start.encode()
+            invocation_bytes = binding.encode()
+            if os.path.lexists(output_dir):
+                _require_directory(output_dir, "admitted successor attempt")
+                if current != successor.attempt_id.value:
+                    raise FenceRejected("admitted successor attempt is not current")
+                _require_regular(os.path.join(output_dir, "start.json"), "start receipt")
+                _require_regular(os.path.join(output_dir, "invocation.json"), "invocation binding")
+                if (Path(output_dir, "start.json").read_bytes() != start_bytes
+                        or Path(output_dir, "invocation.json").read_bytes() != invocation_bytes):
+                    raise AdmissionFork("admitted successor start differs")
+                return AttemptFence(self.root, group.identity, task_id, allocation.allocation_id.value,
+                                    successor.attempt_id, output_dir)
+            if current != admission.predecessor_attempt_id.value:
+                raise FenceRejected("admission predecessor is not current")
+            # Validate the predecessor fence while its task lock is held.
+            self._validate_fence(predecessor_fence, task_dir)
+            _mkdir_new(output_dir)
+            _write_new(os.path.join(output_dir, "start.json"), start_bytes)
+            _write_new(os.path.join(output_dir, "invocation.json"), invocation_bytes)
+            _write_pointer(pointer, successor.attempt_id.value)
+            return AttemptFence(self.root, group.identity, task_id, allocation.allocation_id.value,
+                                successor.attempt_id, output_dir)
+
     @staticmethod
     def _validate_invocation(start: StartReceipt, binding: MemberInvocationV2) -> None:
         """Recheck the leaf echo against the controller's immutable binding."""
@@ -582,7 +673,9 @@ class DirectoryStore:
                     binding = bindings[task.task_id]
                     if not isinstance(binding, MemberInvocationV2):
                         raise TypeError("leaf echo must be MemberInvocationV2")
-                    if (binding.allocation_attempt != allocation_attempt or binding.lineage_id != task.lineage_id
+                    if (binding.allocation_attempt.group_id != group.group_id
+                            or binding.allocation_attempt.allocation_attempt_id == allocation_attempt.allocation_attempt_id
+                            or binding.lineage_id != task.lineage_id
                             or binding.group_digest != group.identity):
                         raise FenceRejected("crossed-allocation-evidence")
                     start = item.start_receipt
@@ -590,7 +683,12 @@ class DirectoryStore:
                         "start_receipt": start.to_dict(), "outcome_receipt": item.outcome_receipt.to_dict(),
                     }):
                         raise FenceRejected("crossed-receipt-digest")
-                    fence = AttemptFence(self.root, group.identity, task.task_id, allocation_attempt.allocation_id.value, item.attempt_id, start.output_dir)
+                    if (start.allocation_id != binding.allocation_attempt.allocation_id
+                            or start.backend_job_id != binding.allocation_attempt.backend_job_id):
+                        raise FenceRejected("crossed-allocation-evidence")
+                    fence = AttemptFence(self.root, group.identity, task.task_id,
+                                         binding.allocation_attempt.allocation_id.value,
+                                         item.attempt_id, start.output_dir)
                     task_dir = self._task_dir_for_fence(fence)
                     with _task_lock(os.path.join(task_dir, _TASK_LOCK)):
                         durable = self._validate_fence(fence, task_dir)
