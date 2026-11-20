@@ -847,7 +847,7 @@ def test_intended_configurations_loader_rejects_a_smuggled_status_key(
     broken_path = tmp_path / "intended_configurations.json"
     broken_path.write_text(json.dumps(entries), encoding="utf-8")
     monkeypatch.setattr(stage_coordinate, "_INTENDED_CONFIGURATIONS_PATH", broken_path)
-    with pytest.raises(stage_coordinate.MaterializationError, match="exactly method and levels"):
+    with pytest.raises(stage_coordinate.MaterializationError, match=r"unexpected=\['status'\]"):
         stage_coordinate.intended_configurations()
 
 
@@ -871,6 +871,124 @@ def test_intended_configurations_loader_rejects_a_configuration_optimizer_mismat
         stage_coordinate.MaterializationError, match="entry optimizer and scientific_identity optimizer must be identical"
     ):
         stage_coordinate.intended_configurations()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda entry: entry.__setitem__("stage", None), ".stage must be a non-empty string"),
+        (lambda entry: entry.pop("stage"), r"missing=\['stage'\]"),
+        (lambda entry: entry.__setitem__("unexpected", True), r"unexpected=\['unexpected'\]"),
+        (lambda entry: entry.__setitem__("configurations", "not-a-sequence"), ".configurations must be a list or tuple"),
+        (lambda entry: entry.__setitem__("configurations", 42), ".configurations must be a list or tuple"),
+        (lambda entry: entry.__setitem__("configurations", None), ".configurations must be a list or tuple"),
+        (lambda entry: entry.__setitem__("configurations", [None]), r"configurations\[0\] is missing scientific_identity"),
+        (lambda entry: entry["optimizer"].pop("method"), "optimizer has invalid keys"),
+        (lambda entry: entry["optimizer"].__setitem__("unexpected", True), r"unexpected=\['unexpected'\]"),
+        (lambda entry: entry["optimizer"].__setitem__("method", None), "optimizer method must be a non-empty string"),
+        (lambda entry: entry["optimizer"].__setitem__("levels", None), "optimizer levels must be a mapping"),
+    ],
+)
+def test_intended_configuration_loader_rejects_malformed_typed_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: object, message: str
+) -> None:
+    entries = json.loads(Path(__file__).with_name("intended_configurations.json").read_text())
+    mutation(entries[0])
+    broken_path = tmp_path / "intended_configurations.json"
+    broken_path.write_text(json.dumps(entries), encoding="utf-8")
+    monkeypatch.setattr(stage_coordinate, "_INTENDED_CONFIGURATIONS_PATH", broken_path)
+    with pytest.raises(stage_coordinate.MaterializationError) as error:
+        stage_coordinate.intended_configurations()
+    assert error.type is stage_coordinate.MaterializationError
+    assert re.search(message, str(error.value))
+
+
+def test_materializer_rejects_malformed_availability_and_stage_selection_types(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="availability must be a mapping") as error:
+        stage_coordinate.materialize_intended_configurations(tmp_path, availability=None)  # type: ignore[arg-type]
+    assert error.type is stage_coordinate.MaterializationError
+    with pytest.raises(stage_coordinate.MaterializationError, match="must be an OptimizerCell") as error:
+        stage_coordinate.materialize_intended_configurations(
+            tmp_path, availability={"adam": object()}  # type: ignore[dict-item]
+        )
+    assert error.type is stage_coordinate.MaterializationError
+    with pytest.raises(stage_coordinate.MaterializationError, match="availability keys must be strings") as error:
+        stage_coordinate.materialize_intended_configurations(
+            tmp_path, availability={1: _complete_available_roster()["adam"]}  # type: ignore[dict-item]
+        )
+    assert error.type is stage_coordinate.MaterializationError
+    with pytest.raises(stage_coordinate.MaterializationError, match="stage selection values must be strings") as error:
+        stage_coordinate.materialize_intended_configurations(
+            tmp_path, availability=_complete_available_roster(), stages=(None,)  # type: ignore[tuple-item]
+        )
+    assert error.type is stage_coordinate.MaterializationError
+    with pytest.raises(stage_coordinate.MaterializationError, match="stages must be an iterable") as error:
+        stage_coordinate.materialize_intended_configurations(
+            tmp_path, availability=_complete_available_roster(), stages=42  # type: ignore[arg-type]
+        )
+    assert error.type is stage_coordinate.MaterializationError
+
+
+def test_materializer_rejects_optimizer_cell_missing_reason_with_typed_error(
+    tmp_path: Path,
+) -> None:
+    """A same-named foreign cell still needs the complete cell contract."""
+
+    foreign_cell = type("OptimizerCell", (), {"method": "adam", "status": "available"})()
+    with pytest.raises(
+        stage_coordinate.MaterializationError,
+        match=r"^availability\['adam'\] must be an OptimizerCell$",
+    ) as error:
+        stage_coordinate.materialize_intended_configurations(
+            tmp_path, availability={"adam": foreign_cell}  # type: ignore[dict-item]
+        )
+    assert error.type is stage_coordinate.MaterializationError
+
+
+def test_materializer_accepts_equivalent_optimizer_cells_from_isolated_modules(
+    tmp_path: Path,
+) -> None:
+    """Cross-module cells with equal values preserve materialized identities."""
+
+    spec = importlib.util.spec_from_file_location(
+        "he_importance_optimizer_grid_for_stage_test", Path(__file__).with_name("optimizer_grid.py")
+    )
+    assert spec is not None and spec.loader is not None
+    optimizer_grid = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = optimizer_grid
+    spec.loader.exec_module(optimizer_grid)
+
+    foreign_stage_coordinate = optimizer_grid.stage_coordinate
+    assert foreign_stage_coordinate.OptimizerCell is not stage_coordinate.OptimizerCell
+    owned = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "owned", availability=_complete_available_roster(), stages=("Q",)
+    )
+    foreign = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "foreign",
+        availability={
+            method: foreign_stage_coordinate.OptimizerCell(method, "available")
+            for method in ("adam", "sr", "kfac", "spring", "linear_method")
+        },
+        stages=("Q",),
+    )
+    assert _identity_pairs(owned, tmp_path / "owned") == _identity_pairs(
+        foreign, tmp_path / "foreign"
+    )
+
+
+def test_materializer_does_not_translate_non_typeerror_stage_iterators(
+    tmp_path: Path,
+) -> None:
+    class BrokenStages:
+        def __iter__(self) -> object:
+            raise ValueError("sentinel iterator failure")
+
+    with pytest.raises(ValueError, match="sentinel iterator failure"):
+        stage_coordinate.materialize_intended_configurations(
+            tmp_path, availability=_complete_available_roster(), stages=BrokenStages()  # type: ignore[arg-type]
+        )
 def test_q_mechanics_walker_identity_rebuilds_hash_path_and_preserves_committed_cells(
     tmp_path: Path,
 ) -> None:
