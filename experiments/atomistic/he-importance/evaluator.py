@@ -233,16 +233,15 @@ def _refuse_blinding_content(value: Any, label: str) -> None:
 
     def error_factory(path: str, content: Any, reason: str) -> Exception:
         if reason == "key-type":
-            return EvaluatorQualificationError(f"{label} keys must be strings")
+            parent = getattr(path, "parent", label)
+            return EvaluatorQualificationError(f"{parent} keys must be strings")
         if reason == "key":
-            parent = path.rsplit(".", 1)[0]
+            parent = getattr(path, "parent", path.rsplit(".", 1)[0])
             return EvaluatorQualificationError(
                 f"{parent} contains forbidden blinding field {content!r}"
             )
         if reason == "decode":
             return EvaluatorQualificationError(f"{path} contains undecodable blinding content")
-        if reason == "cycle":
-            return EvaluatorQualificationError(f"{path} contains a cyclic blinding value")
         return EvaluatorQualificationError(f"{path} contains forbidden blinding value {content!r}")
 
     _WALKER.walk_blinding_content(

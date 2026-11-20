@@ -8,7 +8,7 @@ L4b declaration freezer is intentionally not a consumer of this module.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import fields, is_dataclass
 from pathlib import PurePath
 from typing import Any
@@ -16,6 +16,15 @@ from typing import Any
 
 Predicate = Callable[[str], bool]
 ErrorFactory = Callable[[str, Any, str], Exception]
+
+
+class _Path(str):
+    """A string path carrying its explicit parent for error attribution."""
+
+    def __new__(cls, value: str, parent: str) -> "_Path":
+        instance = str.__new__(cls, value)
+        instance.parent = parent
+        return instance
 
 
 def walk_blinding_content(
@@ -39,15 +48,14 @@ def walk_blinding_content(
         ``True`` refuses that content.
     error_factory
         Caller-owned exception constructor receiving ``(path, content,
-        reason)``.  Reasons are ``"key"``, ``"value"``, ``"key-type"``,
-        ``"decode"``, and ``"cycle"``.
+        reason)``.  Reasons are ``"key"``, ``"value"``, ``"key-type"``, and
+        ``"decode"``.
 
     Raises
     ------
     Exception
         The exception returned by ``error_factory`` when a predicate refuses
-        content, a key/leaf cannot be normalized, or an ancestor cycle is
-        encountered.
+        content or a key/leaf cannot be normalized.
 
     Notes
     -----
@@ -78,13 +86,19 @@ def _walk(
 
     identity = id(value)
     if identity in active:
-        raise error_factory(label, value, "cycle")
+        return
     active.add(identity)
     try:
         if isinstance(value, Mapping):
             for key, nested in value.items():
                 key_text = _normalize_key(key, label, error_factory=error_factory)
-                _check(key_text, f"{label}.{key_text}", "key", is_forbidden, error_factory)
+                _check(
+                    key_text,
+                    _Path(f"{label}.{key_text}", label),
+                    "key",
+                    is_forbidden,
+                    error_factory,
+                )
                 _walk(
                     nested,
                     f"{label}.{key_text}",
@@ -94,7 +108,7 @@ def _walk(
                 )
             return
 
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
             for index, nested in enumerate(value):
                 _walk(
                     nested,
@@ -121,7 +135,13 @@ def _walk(
         if members is None:
             return
         for name, nested in members:
-            _check(name, f"{label}.{name}", "key", is_forbidden, error_factory)
+            _check(
+                name,
+                _Path(f"{label}.{name}", label),
+                "key",
+                is_forbidden,
+                error_factory,
+            )
             _walk(
                 nested,
                 f"{label}.{name}",
@@ -147,9 +167,9 @@ def _normalize(value: Any, label: str, *, error_factory: ErrorFactory) -> str | 
 
 
 def _normalize_key(key: Any, label: str, *, error_factory: ErrorFactory) -> str:
-    normalized = _normalize(key, f"{label} key", error_factory=error_factory)
+    normalized = _normalize(key, _Path(f"{label} key", label), error_factory=error_factory)
     if normalized is None:
-        raise error_factory(f"{label} key", key, "key-type")
+        raise error_factory(_Path(f"{label} key", label), key, "key-type")
     return normalized
 
 
@@ -167,23 +187,42 @@ def _check(
 def _members(value: Any) -> tuple[tuple[str, Any], ...] | None:
     if is_dataclass(value) and not isinstance(value, type):
         return tuple((field.name, getattr(value, field.name)) for field in fields(value))
-    members: dict[str, Any] = {}
+    members: list[tuple[str, Any]] = []
+    seen_storage: set[str] = set()
     if hasattr(value, "__dict__"):
-        members.update(vars(value))
-    slots: set[str] = set()
+        members.extend(vars(value).items())
+        seen_storage.update(vars(value))
     for owner in type(value).__mro__:
-        declared = getattr(owner, "__slots__", ())
+        declared = owner.__dict__.get("__slots__", ())
         if isinstance(declared, str):
-            slots.add(declared)
+            declared_names = (declared,)
         else:
-            slots.update(declared)
-    slots.difference_update({"__dict__", "__weakref__"})
-    for name in sorted(slots):
-        try:
-            members.setdefault(name, getattr(value, name))
-        except AttributeError:
-            continue
-    return tuple(sorted(members.items())) or None
+            declared_names = declared
+        for name in declared_names:
+            if name in {"__dict__", "__weakref__"}:
+                continue
+            storage_name = _mangled_slot_name(owner, name)
+            if storage_name in seen_storage:
+                continue
+            descriptor = owner.__dict__.get(storage_name)
+            if descriptor is None or not hasattr(descriptor, "__get__"):
+                continue
+            seen_storage.add(storage_name)
+            try:
+                nested = descriptor.__get__(value, type(value))
+            except AttributeError:
+                continue
+            members.append((name, nested))
+    return tuple(sorted(members, key=lambda member: member[0])) or None
+
+
+def _mangled_slot_name(owner: type[Any], name: str) -> str:
+    """Return the defining class's storage name for a slot declaration."""
+
+    if name.startswith("__") and not name.endswith("__"):
+        class_name = owner.__name__.lstrip("_")
+        return f"_{class_name}{name}"
+    return name
 
 
 __all__ = ["ErrorFactory", "Predicate", "walk_blinding_content"]

@@ -93,13 +93,16 @@ def test_walks_set_and_plain_object_attributes_with_stable_paths() -> None:
     assert caught.value.content == "reference_energy"
 
 
-def test_cycle_is_refused_instead_of_recursing_forever() -> None:
+def test_cycle_back_edge_is_skipped_and_later_sibling_is_screened() -> None:
     value: dict[str, object] = {}
     value["self"] = value
+    assert _screen(value) == ["self"]
+
+    value["sibling"] = "reference_energy"
     with pytest.raises(ProbeError) as caught:
         _screen(value)
-    assert caught.value.path == "probe.self"
-    assert caught.value.reason == "cycle"
+    assert caught.value.path == "probe.sibling"
+    assert caught.value.reason == "value"
 
 
 def test_undecodable_bytes_are_refused() -> None:

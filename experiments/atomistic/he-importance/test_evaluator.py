@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 import re
 import sys
@@ -559,8 +561,117 @@ def test_r2_a_non_string_mapping_key_is_refused_with_declared_error() -> None:
 
 
 def test_r2_a_non_string_key_is_refused_at_nested_node() -> None:
-    with pytest.raises(evaluator.EvaluatorQualificationError):
+    with pytest.raises(
+        evaluator.EvaluatorQualificationError,
+        match=re.escape("probe.outer[0] keys must be strings"),
+    ) as exc:
         evaluator._refuse_blinding_content({"outer": [{2: "y"}]}, "probe")
+    assert str(exc.value) == "probe.outer[0] keys must be strings"
+
+
+def test_r2_a_dotted_forbidden_key_keeps_root_parent_label() -> None:
+    with pytest.raises(
+        evaluator.EvaluatorQualificationError,
+        match=re.escape("probe contains forbidden blinding field 'reference.foo'"),
+    ) as exc:
+        evaluator._refuse_blinding_content({"reference.foo": 0}, "probe")
+    assert str(exc.value) == "probe contains forbidden blinding field 'reference.foo'"
+
+
+def test_factor_qualification_restores_non_text_sequence_screening() -> None:
+    with pytest.raises(
+        evaluator.EvaluatorQualificationError,
+        match=rf"{re.escape('factor input[0]')} contains forbidden blinding value 'reference_energy'",
+    ) as exc:
+        evaluator.qualify_factor(
+            "cusp",
+            deque(["reference_energy"]),
+            lambda value: value,
+            analytic_oracle=lambda value: value,
+        )
+    assert exc.type is evaluator.EvaluatorQualificationError
+
+    evaluator.qualify_factor(
+        "cusp",
+        deque(["benign"]),
+        lambda value: value,
+        analytic_oracle=lambda value: value,
+    )
+
+
+class _PrivateSlotWitness:
+    __slots__ = ("__payload",)
+
+    def __init__(self, payload: object) -> None:
+        self.__payload = payload
+
+
+class _InheritedPrivateSlotWitness(_PrivateSlotWitness):
+    @property
+    def _PrivateSlotWitness__payload(self) -> str:
+        return "benign property shadow"
+
+
+@pytest.mark.parametrize("payload", [_PrivateSlotWitness("reference_energy"), _InheritedPrivateSlotWitness("reference_energy")])
+def test_factor_qualification_reads_private_slots_from_defining_storage(payload: object) -> None:
+    with pytest.raises(
+        evaluator.EvaluatorQualificationError,
+        match=rf"{re.escape('factor input.__payload')} contains forbidden blinding value 'reference_energy'",
+    ) as exc:
+        evaluator.qualify_factor(
+            "cusp",
+            payload,
+            lambda value: value,
+            analytic_oracle=lambda value: value,
+        )
+    assert exc.type is evaluator.EvaluatorQualificationError
+
+
+@pytest.mark.parametrize("payload", [_PrivateSlotWitness("benign"), _InheritedPrivateSlotWitness("benign")])
+def test_factor_qualification_admits_benign_private_slots(payload: object) -> None:
+    evaluator.qualify_factor(
+        "cusp",
+        payload,
+        lambda value: value,
+        analytic_oracle=lambda value: value,
+    )
+
+
+class _SelfReferentialWitness:
+    def __init__(self, sibling: object = "benign") -> None:
+        self.self = self
+        self.sibling = sibling
+
+
+class _BenignEnum(Enum):
+    ITEM = "benign"
+
+
+def test_factor_qualification_skips_benign_cycles_but_continues_siblings() -> None:
+    evaluator.qualify_factor(
+        "cusp",
+        _SelfReferentialWitness(),
+        lambda value: value,
+        analytic_oracle=lambda value: value,
+    )
+    with pytest.raises(evaluator.EvaluatorQualificationError) as exc:
+        evaluator.qualify_factor(
+            "cusp",
+            _SelfReferentialWitness("reference_energy"),
+            lambda value: value,
+            analytic_oracle=lambda value: value,
+        )
+    assert exc.type is evaluator.EvaluatorQualificationError
+    assert "factor input.sibling" in str(exc.value)
+
+
+def test_factor_qualification_admits_benign_enum_member() -> None:
+    evaluator.qualify_factor(
+        "cusp",
+        _BenignEnum.ITEM,
+        lambda value: value,
+        analytic_oracle=lambda value: value,
+    )
 
 
 @dataclass(frozen=True)
