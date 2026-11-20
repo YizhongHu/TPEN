@@ -9,11 +9,12 @@ import pytest
 
 import tpen_executor.lifecycle.controller as controller_module
 from tpen_executor._codec import digest
-from tpen_executor.allocations import ConfiguredAllocation, ControllerGenerationV1, MemberInvocationV2
-from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId
+from tpen_executor.allocations import AllocationAttemptV2, ConfiguredAllocation, ControllerGenerationV1, MemberInvocationV2
+from tpen_executor.contracts import AllocationAttemptId, AllocationId, AttemptId, BackendJobId, InvocationId
 from tpen_executor.lifecycle.balsam import BalsamGroupRegistrationIntent, BalsamGroupRegistrationReceipt, GroupFailure
 from tpen_executor.recovery import GroupReconciliationV2, MemberReconciliationV2, MemberRecoveryInputV2
 from tpen_executor.storage import DirectoryStore, LaunchIntentRejected
+from tpen_executor.results import SuccessorAdmissionRecord
 from test_b1a_reconciliation import _group
 from test_b1a_b_publication import _fixture
 
@@ -24,10 +25,13 @@ MUTANTS = (
     ("drop-acquire-refusal-park", MODULE_NAME, "controller = store.acquire_controller_generation(group, controller_request)", "controller = controller_request", "test_stale_controller_parks_before_publish"),
     ("drop-pre-launch-authority-check", MODULE_NAME, "store.require_current_controller(group, controller.generation, controller.claimant_nonce)", "pass", "test_superseded_after_intent_does_not_launch"),
     ("begin-attempt-for-successor", MODULE_NAME, "store.begin_admitted_successor(", "store.begin_attempt(", "test_real_store_admitted_successor_uses_durable_admission_once"),
-    ("relaunch-existing-intent", MODULE_NAME, "existing = store.read_launch_intent(fence)", "existing = None", "test_real_store_recovery_after_executor_exception_parks_without_relaunch"),
+    ("intent-probe-inverted", MODULE_NAME, "existing = store.read_launch_intent(fence)", "existing = None", "test_real_store_fresh_start_writes_intent_and_launches_once"),
     ("park-is-not-success", MODULE_NAME, "else 2)", "else 0)", "test_terminal_and_park_exit_two"),
     ("publish-equality-off", MODULE_NAME, "if published.encode() != checked.encode():", "if False:", "test_publication_conflict_parks"),
 )
+# Relaunch prevention is deliberately double-fenced: this controller probe
+# parks an existing intent, while DirectoryStore.create_launch_intent also
+# enforces exclusive creation in the B1b2-L storage seam.
 
 
 class FakeAdmission:
@@ -63,6 +67,14 @@ class FakeStore:
         return self.controller
     def publish_reconciliation(self, group, attempt, inputs, *, bindings, successors):
         self.calls.append("publish"); return self.published
+    def read_reconciliation(self, group, allocation_attempt):
+        self.calls.append("read_reconciliation")
+        binding = MemberInvocationV2(
+            allocation_attempt, group.identity, "task-0", group.members[0].lineage_id,
+            AttemptId("successor-task-0"), InvocationId("successor-invocation-0"),
+        )
+        admission = SuccessorAdmissionRecord("task-0", AttemptId("predecessor-task-0"), "c" * 64, "task-0", binding.attempt_id, "d" * 64, "e" * 64, binding)
+        return SimpleNamespace(members=(SimpleNamespace(evidence=SimpleNamespace(task_id="task-0"), admission=admission),))
     def begin_attempt(self, group, task_id, allocation, *args, **kwargs):
         self.calls.append("begin_attempt:" + task_id)
         return SimpleNamespace(task_id=task_id, attempt_id=AttemptId("attempt-" + task_id), output_dir=str(self.real.root))
@@ -122,7 +134,8 @@ def test_stale_controller_parks_before_publish(tmp_path):
 
 def test_superseded_after_intent_does_not_launch(tmp_path):
     result, store, executor = _run(tmp_path, supersede=True)
-    assert result.reconciliation.aggregate == "replacement_required" and not executor.calls
+    assert result.member_outcomes[0][1] == "parked"
+    assert result.reconciliation.members[0].action == "park" and not executor.calls
 
 def test_recovered_intent_never_relaunches(tmp_path):
     result, store, executor = _run(tmp_path, recovered=True)
