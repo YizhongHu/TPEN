@@ -317,6 +317,46 @@ def test_gateway_accepts_declared_overlay_and_rejects_hash_or_undeclared_use() -
             overlay_sha256="d" * 64,
         )
 
+
+def test_stale_canonical_overlay_digest_is_rejected_at_every_binding_boundary() -> None:
+    """A stale digest cannot authenticate committed overlay bytes anywhere."""
+
+    stale_digest = "0" * 64
+    with pytest.raises(ProtocolError, match="overlay sha256 does not match"):
+        build_manifest(
+            protocol=Protocol(1, 2, 100000, 2, 3, 4, 2, 2, 1000),
+            source_sha="a" * 40,
+            config_sha256=config_identities(config_root=CONFIG_ROOT, systems=("he",)),
+            checkpoints=list(range(0, 100001, 1000)),
+            lineage_seeds=[11, 12, 13],
+            checkpoint_sha256={},
+            results_root="/external/stage1-stale-digest",
+            systems=("he",),
+            phase=1,
+            device="cpu",
+            overlay=str(OVERLAY),
+            overlay_sha256=stale_digest,
+        )
+
+    row = _overlay_row()
+    row["overlay_sha256"] = stale_digest
+    with pytest.raises(ProtocolError, match="overlay sha256 does not match"):
+        validate_gateway_binding(
+            binding=_binding_token(row),
+            config=str(row["config"]),
+            overrides=row_overrides(row),
+            kind="train",
+            overlay=str(OVERLAY),
+            overlay_sha256=stale_digest,
+        )
+
+    cfg = load_config(str(CONFIG_ROOT / "he" / "train.yaml"))
+    with pytest.raises(ProtocolError, match="overlay sha256 does not match"):
+        compose_train_overlay(cfg, overlay=str(OVERLAY), expected_sha256=stale_digest)
+
+    with pytest.raises(ProtocolError, match="overlay sha256 does not match"):
+        protocol_module.validate_resolved_train_config(cfg, row, base_config=cfg)
+
     undeclared = {key: value for key, value in row.items() if key not in {"overlay", "overlay_sha256"}}
     with pytest.raises(ProtocolError, match="without being declared"):
         validate_gateway_binding(

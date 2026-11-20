@@ -169,6 +169,33 @@ def test_hooke_train_gateway_rechecks_resolved_seed_binding(
             stage1_train.main()
 
 
+def test_hooke_train_gateway_rechecks_resolved_model_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public gateway refuses a post-validation base-model tamper."""
+
+    train = next(row for row in _hooke_phase1() if row["kind"] == "train")
+    overrides = row_overrides(train) + ["model.readout.trainable=false"]
+    with monkeypatch.context() as isolated:
+        isolated.setattr(
+            stage1_train,
+            "run_from_config",
+            lambda **_: pytest.fail("model-tampered config reached execution"),
+        )
+        isolated.setattr(
+            sys,
+            "argv",
+            [
+                "stage1-train", "--config", str(train["config"]), "--kind", "train",
+                *overrides, "--binding", _binding_token(train),
+                "--overlay", str(train["overlay"]),
+                "--overlay-sha256", str(train["overlay_sha256"]),
+            ],
+        )
+        with pytest.raises(ProtocolError, match="base-owned section model"):
+            stage1_train.main()
+
+
 def test_legacy_he_h2_rows_do_not_inherit_hooke_profile_fields() -> None:
     rows = build_manifest(
         protocol=STAGE1_PROTOCOL,
