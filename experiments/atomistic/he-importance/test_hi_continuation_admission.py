@@ -47,10 +47,21 @@ def _resolved_rows(tmp_path: Path) -> dict[str, dict[str, tuple[object, object]]
             if candidate.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
             and candidate.manifest["scientific_identity"]["context"]["name"] == context
         ]
-        assert len(context_cells) >= 2
+        selected = []
+        seen_optimizer_coordinates: set[tuple[tuple[str, object], ...]] = set()
+        for candidate in context_cells:
+            levels = candidate.manifest["scientific_identity"]["optimizer"]["levels"]
+            coordinate = tuple(sorted(levels.items()))
+            if coordinate in seen_optimizer_coordinates:
+                continue
+            selected.append(candidate)
+            seen_optimizer_coordinates.add(coordinate)
+            if len(selected) == 2:
+                break
+        assert len(selected) == 2
         rows[context] = {
             label: (cell, train_config.resolve_train_config(cell))
-            for label, cell in zip(("A", "B"), context_cells[:2], strict=True)
+            for label, cell in zip(("A", "B"), selected, strict=True)
         }
         assert rows[context]["A"][1]["optimizer"] != rows[context]["B"][1]["optimizer"]
     _ROWS = rows
