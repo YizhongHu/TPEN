@@ -25,8 +25,10 @@ from experiments.atomistic.stage1.protocol import (
     Protocol,
     SYSTEMS,
     build_manifest,
+    config_identities,
     manifest_hash,
     overlay_sha256,
+    physical_system_id_from_config,
     validate_gateway_binding,
 )
 from experiments.atomistic.stage1.train import prepare_initial_checkpoint_config
@@ -334,3 +336,125 @@ def test_real_train_eval_inspect_collect_chain_for_all_stage1_systems(
     wrong_checkpoint["manifest_hash"] = manifest_hash(wrong_checkpoint["rows"])
     with pytest.raises(CollectionError, match="checkpoint"):
         collect(wrong_checkpoint)
+
+
+@pytest.mark.integration
+@pytest.mark.stage1_real_producer
+@pytest.mark.parametrize("system", ["hooke1", "hooke2"])
+def test_bounded_real_hooke_overlay_chain_preserves_diagnostics_and_readout(
+    system: str, tmp_path: Path, record_property, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run a labeled, bounded Hooke qualification train/eval/collect chain.
+
+    This is deliberately not a science-profile row: the one-update protocol
+    owns a separate bounded identity and never masquerades as the 100k row.
+    """
+
+    started = time.perf_counter()
+    source_sha = _source_sha()
+    protocol = Protocol(
+        smoke_updates=1,
+        smoke_walkers=2,
+        lineage_updates=1,
+        lineage_walkers=2,
+        lineages=3,
+        eval_streams=4,
+        eval_walkers=2,
+        eval_draws=2,
+    )
+    phase1_rows = build_manifest(
+        protocol=protocol,
+        source_sha=source_sha,
+        config_sha256=config_identities(config_root=CONFIG_ROOT, systems=(system,)),
+        checkpoints=[0, 1],
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root=str(tmp_path / "hooke-bounded-qualification"),
+        systems=(system,),
+        phase=1,
+        device="cpu",
+        overlay=str(HOOKE_OVERLAY),
+        overlay_sha256=overlay_sha256(HOOKE_OVERLAY),
+    )
+    train_row = next(
+        row for row in phase1_rows
+        if row["kind"] == "train" and row["lineage"] == 0
+    )
+    train_argv = [
+        "stage1-train", "--config", str(train_row["config"]), "--kind", "train",
+        *row_overrides(train_row), "sampler.burn_in=1", "sampler.n_steps=1",
+        "--binding", _binding_token(train_row),
+        "--overlay", str(train_row["overlay"]),
+        "--overlay-sha256", str(train_row["overlay_sha256"]),
+    ]
+    with monkeypatch.context() as isolated:
+        isolated.setattr(sys, "argv", train_argv)
+        assert stage1_train.main() == 0
+
+    train_dir = resolve_run_dir(train_row)
+    train_records = [
+        json.loads(line)
+        for line in (train_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    namespaces = {record.get("namespace") for record in train_records}
+    assert "train/amplitude_risk" in namespaces
+    assert "train/module_norms/readout" in namespaces
+    checkpoint_file = train_dir / "checkpoints" / "step_000001" / "model.pt"
+    assert checkpoint_file.is_file()
+    checkpoint_sha = hashlib.sha256(checkpoint_file.read_bytes()).hexdigest()
+
+    evidence = {
+        "schema": "stage1-checkpoint-evidence/v1",
+        "phase1_manifest_hash": manifest_hash(phase1_rows),
+        "phase1_train_row_hashes": {
+            f"{row['system']}:{row['lineage']}": manifest_hash([row])
+            for row in phase1_rows if row["kind"] == "train"
+        },
+        "checkpoints": {
+            f"{system}:{lineage}:1": (
+                checkpoint_sha if lineage == 0 else "0" * 64
+            )
+            for lineage in range(protocol.lineages)
+        },
+    }
+    eval_rows = bind_evaluation_manifest(
+        phase1_rows=phase1_rows,
+        checkpoints=[1],
+        checkpoint_evidence=evidence,
+        expected_physical_system_id={
+            system: physical_system_id_from_config(CONFIG_ROOT / system / "eval.yaml")
+        },
+        protocol=protocol,
+        source_sha=source_sha,
+        device="cpu",
+    )
+    produced_eval_rows = [row for row in eval_rows if row["lineage"] == 0]
+    for eval_row in produced_eval_rows:
+        overrides = row_overrides(eval_row) + [
+            "evaluation_sampler.burn_in=1", "evaluation_sampler.n_steps=1",
+        ]
+        validate_gateway_binding(
+            binding=_binding_token(eval_row), config=str(eval_row["config"]),
+            overrides=overrides, kind="eval",
+            expected_checkpoint_sha256=checkpoint_sha,
+        )
+        eval_cfg = load_config(str(CONFIG_ROOT / system / "eval.yaml"), overrides)
+        assert run_from_config(
+            eval_cfg, config_path=str(CONFIG_ROOT / system / "eval.yaml"),
+            command=f"stage1 bounded Hooke qualification eval {system}",
+            raise_exceptions=True,
+        ) == 0
+        run_dir = resolve_run_dir(eval_row)
+        assert inspect_eval_run(run_dir)["verdict"] == "completed"
+
+    collected = collect({
+        "schema": "stage1/v3",
+        "manifest_hash": manifest_hash(phase1_rows + produced_eval_rows),
+        "rows": phase1_rows + produced_eval_rows,
+    })
+    assert len(collected["records"]) == protocol.eval_streams
+    assert len(collected["aggregates"]) == 1
+    record_property(
+        f"{system}_bounded_qualification_runtime_seconds",
+        round(time.perf_counter() - started, 3),
+    )

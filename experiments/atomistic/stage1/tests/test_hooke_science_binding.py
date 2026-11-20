@@ -9,6 +9,8 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import torch
+from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
 import experiments.atomistic.stage1.collect as collect_module
@@ -31,6 +33,10 @@ from experiments.atomistic.stage1.protocol import (
     validate_hooke_eval_grid,
     overlay_sha256,
 )
+from tpen.data.batch import WavefunctionOutput
+from tpen.training.events import TrainingIteration, TrainingIterationCompleted
+from tests.helpers.run_context import RecordingLogger, make_run_context
+from tests.unit.callback.support import training_state
 
 
 ROOT = Path(__file__).parents[1]
@@ -167,6 +173,40 @@ def test_hooke_train_gateway_rechecks_resolved_seed_binding(
         )
         with pytest.raises(ValueError, match="runtime and sampler seeds are not bound"):
             stage1_train.main()
+
+
+def test_hooke_overlay_amplitude_callback_uses_0_99_100_pre_update_events(
+    tmp_path: Path,
+) -> None:
+    """The composed Hooke callback fires at 0 and 100, using each batch once."""
+
+    overlay = OmegaConf.load(HOOKE_OVERLAY)
+    amplitude_cfg = next(
+        entry for entry in overlay.callbacks
+        if entry.get("_target_") == "tpen.callback.AmplitudeRiskFraction"
+    )
+    callback = instantiate(amplitude_cfg)
+    logger = RecordingLogger()
+    context = make_run_context(tmp_path, callbacks=[callback], loggers=[logger])
+    state = training_state(model=lambda *_args, **_kwargs: pytest.fail("unexpected forward"))
+    for step, values in (
+        (0, [0.0, 0.0, -10.0]),
+        (99, [100.0, 100.0, -10.0]),
+        (100, [0.0, 0.0, 0.0]),
+    ):
+        state.wavefunction_output = WavefunctionOutput(
+            logabs=torch.tensor(values, dtype=torch.float64),
+            sign=torch.ones(3, dtype=torch.float64),
+        )
+        context.emit(
+            TrainingIterationCompleted(iteration=TrainingIteration(step=step)),
+            state=state,
+        )
+
+    records = logger.by_namespace("train/amplitude_risk")
+    assert [record.step for record in records] == [0, 100]
+    assert [record.metrics["total_count"] for record in records] == [3, 3]
+    assert [record.metrics["low_amplitude_count.-3.0"] for record in records] == [1, 0]
 
 
 def test_legacy_he_h2_rows_do_not_inherit_hooke_profile_fields() -> None:
@@ -401,3 +441,47 @@ def test_phase2_rejects_evaluation_seed_collision_with_train_sampler_seed(
             protocol=protocol,
             phase1_manifest_hash=evidence["phase1_manifest_hash"],
         )
+
+
+def test_phase2_rejects_full_row_tamper_even_with_recomputed_phase1_hash(
+    tmp_path: Path,
+) -> None:
+    """Recomputing a phase-1 hash cannot rewrite the authenticated train row."""
+
+    document, protocol = _two_hooke_phase2_document(tmp_path)
+    phase1_rows = [dict(row) for row in document["rows"] if row["kind"] != "eval"]
+    original_hash = protocol_module.manifest_hash(phase1_rows)
+    evidence = {
+        "schema": protocol_module.CHECKPOINT_EVIDENCE_SCHEMA,
+        # The tampered caller may recompute this outer hash, but not the
+        # independently recorded train-row identities.
+        "phase1_manifest_hash": "d" * 64,
+        "phase1_train_row_hashes": {
+            f"{row['system']}:{row['lineage']}": protocol_module.manifest_hash([row])
+            for row in phase1_rows if row["kind"] == "train"
+        },
+        "checkpoints": {
+            f"{system}:{lineage}:{checkpoint}": "c" * 64
+            for system in ("hooke1", "hooke2")
+            for lineage in range(protocol.lineages)
+            for checkpoint in HOOKE_A37
+        },
+    }
+    tampered = [dict(row) for row in phase1_rows]
+    tampered_train = next(row for row in tampered if row["kind"] == "train")
+    tampered_train["overlay_sha256"] = "0" * 64
+    tampered_hash = protocol_module.manifest_hash(tampered)
+    evidence["phase1_manifest_hash"] = tampered_hash
+    with pytest.raises(ProtocolError, match="train identity"):
+        protocol_module.bind_evaluation_manifest(
+            phase1_rows=tampered,
+            checkpoints=list(HOOKE_A37),
+            checkpoint_evidence=evidence,
+            expected_physical_system_id={"hooke1": "a" * 64, "hooke2": "b" * 64},
+            config_sha256=config_identities(
+                config_root=ROOT / "configs", systems=("hooke1", "hooke2")
+            ),
+            protocol=protocol,
+            phase1_manifest_hash=tampered_hash,
+        )
+    assert original_hash != tampered_hash
