@@ -313,15 +313,8 @@ _PLAIN_REFERENCE = re.compile(
 _INVALID_SCALAR = object()
 
 
-def _resolve_plain_reference(config: Mapping[str, Any], value: str) -> Any:
-    """Follow only same-config dotted references to a literal scalar.
-
-    This is deliberately a syntax-only resolver.  It does not call OmegaConf,
-    import a target, or evaluate a resolver.  A reference chain is accepted
-    only when every hop is a plain dotted reference and its terminal value is a
-    literal scalar; cycles, missing paths, containers, targets, and callables
-    are all refused.
-    """
+def _resolve_plain_node(config: Mapping[str, Any], value: Any) -> Any:
+    """Follow plain dotted references without evaluating configuration syntax."""
 
     current: Any = value
     visited: set[str] = set()
@@ -342,6 +335,20 @@ def _resolve_plain_reference(config: Mapping[str, Any], value: str) -> Any:
                 return _INVALID_SCALAR
             node = node[segment]
         current = node
+    return current
+
+
+def _resolve_plain_reference(config: Mapping[str, Any], value: str) -> Any:
+    """Follow only same-config dotted references to a literal scalar.
+
+    This is deliberately a syntax-only resolver.  It does not call OmegaConf,
+    import a target, or evaluate a resolver.  A reference chain is accepted
+    only when every hop is a plain dotted reference and its terminal value is a
+    literal scalar; cycles, missing paths, containers, targets, and callables
+    are all refused.
+    """
+
+    current = _resolve_plain_node(config, value)
     if type(current) in (bool, int, float):
         return current
     if type(current) is str and "${" not in current:
@@ -803,6 +810,165 @@ def check_profile(config: Any, profile_name: str) -> ProfileCheck:
         profile.state_owners,
         None if refusal is None else {"code": refusal[0], "reason": refusal[1]},
     )
+
+
+class UnsupportedMutableStateError(ValueError):
+    """A native recovery profile refusal with its stable capability code.
+
+    Parameters
+    ----------
+    message : str
+        Human-readable refusal explanation.
+    code : str, optional
+        Existing profile-check refusal code.
+    """
+
+    def __init__(self, message: str, *, code: str = "malformed-config") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def configured_load_mode(config: Any) -> str:
+    """Read restore intent before any resolving validation or construction.
+
+    Parameters
+    ----------
+    config : mapping
+        Unresolved configuration, including named loads or Train's sixth
+        positional argument. Only plain dotted references are followed.
+
+    Returns
+    -------
+    str
+        Literal load mode; absent loads and modes default to ``none``.
+
+    Raises
+    ------
+    UnsupportedMutableStateError
+        With ``malformed-config`` when load syntax is indeterminate or both
+        positional and named loads are supplied. No resolver or target runs.
+    """
+    from omegaconf import OmegaConf
+
+    if OmegaConf.is_config(config):
+        config = OmegaConf.to_container(config, resolve=False)
+    if not isinstance(config, Mapping):
+        raise UnsupportedMutableStateError("restore intent requires a mapping config")
+
+    def follow(value):
+        return _resolve_plain_node(config, value)
+
+    runner = follow(config.get("runner", {}))
+    if not isinstance(runner, Mapping):
+        raise UnsupportedMutableStateError("runner must be a syntactically known mapping")
+    load = runner.get("load")
+    target = follow(runner.get("_target_"))
+    if target is _INVALID_SCALAR:
+        args = follow(runner.get("_args_", []))
+        # An unknown target may be Train; do not hide a possible positional load.
+        if args is _INVALID_SCALAR or isinstance(args, (list, tuple)) and len(args) >= 6:
+            raise UnsupportedMutableStateError("runner target leaves positional load indeterminate")
+    if target in ("tpen.runner.Train", "tpen.runner.train.Train"):
+        args = follow(runner.get("_args_", []))
+        if not isinstance(args, (list, tuple)):
+            raise UnsupportedMutableStateError("Train _args_ must be a known sequence")
+        # Train.__init__: model, sampler, hamiltonian_terms, optimizer, trainer, load.
+        if len(args) >= 6:
+            if "load" in runner:
+                raise UnsupportedMutableStateError("Train load supplied twice")
+            load = args[5]
+    load = follow(load)
+    if load is None:
+        return "none"
+    if not isinstance(load, Mapping):
+        raise UnsupportedMutableStateError("load must be a syntactically known mapping")
+    mode = follow(load.get("mode", "none"))
+    if not isinstance(mode, str) or "${" in mode:
+        raise UnsupportedMutableStateError("load mode must be syntactically known")
+    return mode
+
+
+def _target(entry: Any, owner: str, index: int) -> str:
+    """Read a constructor name without resolving or importing it."""
+
+    if not isinstance(entry, Mapping):
+        raise UnsupportedMutableStateError(f"{owner}[{index}] must be a mapping")
+    value = entry.get("_target_")
+    if not isinstance(value, str) or not value:
+        raise UnsupportedMutableStateError(f"{owner}[{index}] has no explicit _target_")
+    return value
+
+
+def validate_native_recovery_profile(config: Any) -> None:
+    """Validate the allowlisted mutable-state owners in a config.
+
+    Parameters
+    ----------
+    config : mapping
+        Unresolved OmegaConf-compatible configuration.  Only syntax is read;
+        no ``_target_`` is imported or instantiated.
+
+    Raises
+    ------
+    UnsupportedMutableStateError
+        If a callback, logger or cadence is not certified by this profile.
+        ``code`` carries the existing profile-check refusal code.
+
+    Notes
+    -----
+    This is the existing execution validator, owned here so core restore
+    admission does not import executor adapters. Its legacy syntax behavior
+    and exception messages are preserved.
+    """
+
+    try:
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(config):
+            config = OmegaConf.to_container(config, resolve=False)
+    except ImportError:  # pragma: no cover - OmegaConf is a project dependency
+        pass
+    if not isinstance(config, Mapping):
+        raise UnsupportedMutableStateError("native profile requires a mapping config")
+
+    new_contract_present = False
+    for owner, allowed in (
+        ("callbacks", SUPPORTED_CALLBACK_TARGETS),
+        ("loggers", SUPPORTED_LOGGER_TARGETS),
+    ):
+        entries = config.get(owner, ()) or ()
+        if not isinstance(entries, (list, tuple)):
+            raise UnsupportedMutableStateError(f"{owner} must be a sequence")
+        for index, entry in enumerate(entries):
+            target = _target(entry, owner, index)
+            if owner == "callbacks" and target in CALLBACK_CONTRACT_REGISTRY:
+                new_contract_present = True
+            if target not in allowed:
+                raise UnsupportedMutableStateError(
+                    f"{owner}[{index}] {target!r} is not in the native mutable-state profile",
+                    code="unsupported-callback" if owner == "callbacks" else "unsupported-logger",
+                )
+
+    if new_contract_present:
+        refusal = check_profile_refusal(config, NATIVE_PROFILE)
+        if refusal is not None:
+            code, reason = refusal
+            if code == "malformed-config":
+                message = reason
+            elif "is not in the declared profile" in reason:
+                message = reason.replace(
+                    "is not in the declared profile",
+                    "is not in the native mutable-state profile",
+                )
+            else:
+                message = f"{code}: {reason}"
+            raise UnsupportedMutableStateError(message, code=code)
+        return
+
+    cadence_refusal = check_resume_sensitive_callback_cadence(config)
+    if cadence_refusal is not None:
+        code, reason = cadence_refusal
+        raise UnsupportedMutableStateError(f"{code}: {reason}", code=code)
 
 
 def _main(argv: list[str] | None = None) -> int:

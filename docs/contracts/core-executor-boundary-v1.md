@@ -262,3 +262,38 @@ Naming is reserved as follows: `HI-S<n>` identifies the HI-resume execution
 lane, `EX-S3.<letter>` identifies executor transport layers, and `CX-nn`
 identifies cross-boundary contract slices. This document is `CX-00` and does
 not rename or collapse those workstreams.
+
+## Native train-resume admission (CX-09)
+
+`run_from_config` is the shared preconstruction restore admission boundary.
+Both an `OperationalRestoreRequest` (closed to `train_resume`) and a configured
+`runner.load.mode: train_resume` (including `runner.load: ${load}` and Train's
+sixth positional `_args_` load) invoke the
+core-owned `tpen.checkpoint.profiles.validate_native_recovery_profile` exactly
+once. The execution namespace re-exports that same validator and exception.
+There is no second allowlist and checkpoint does not import execution.
+
+Admission reads unresolved callback/logger syntax using the existing native
+profile validator. It precedes `prepare_run_context`, run-directory creation,
+callback/logger construction or delivery, runtime RNG seeding, runner/model/
+trainer/sampler/optimizer construction, and checkpoint restoration. Unsupported
+callbacks, loggers and cadence retain the existing profile refusal codes on
+`UnsupportedMutableStateError.code`. With `raise_exceptions=True`, the typed
+error escapes `run_from_config`; otherwise the existing failure handler returns
+1. No checkpoint or catalog is written on refusal.
+
+Fresh runs and `model_only` loads skip this gate. This policy covers direct
+`run_from_config` callers as well as executor-launched runs; previously accepted
+unsupported train-resume configurations may now refuse. It does not certify
+launcher-supplied runtime observers or add validation to the lower-level
+checkpoint file loader, which has no complete run configuration.
+
+Restore-intent detection reads unresolved syntax and follows only plain dotted
+references. Indeterminate load syntax (including resolver expressions, missing
+references, cycles, or duplicate positional/named Train loads) refuses with
+`UnsupportedMutableStateError.code == "malformed-config"`. Native admission
+precedes HI validation, so native refusal cannot execute HI config resolvers.
+An indeterminate runner target also refuses when `_args_` is indeterminate or
+contains a sixth argument that could be Train's load, even for a fresh load.
+An indeterminate target without positional arguments retains named-load handling;
+known literal non-Train targets retain their existing handling.

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Native restore guard [CX-09]**: all `run_from_config` train-resume loads,
+  including operational requests and direct configured loads, check the existing
+  native recovery profile before construction or state mutation. Unsupported
+  callbacks/loggers/cadence now refuse with `UnsupportedMutableStateError` and
+  the existing profile code. Positional Train loads are covered; admission
+  precedes HI resolver evaluation. Indeterminate load syntax refuses with
+  `malformed-config`, including indeterminate runner targets with a possible
+  positional load (sixth argument or indeterminate `_args_`). Syntactically
+  determined fresh and model-only loads skip profile admission.
 - **Core restart primitives (CX-08)**: expose read-only published checkpoint
   discovery and atomic exclusive JSON receipt creation through `tpen.execution`.
   Discovery uses checkpoint publication records only; receipts never overwrite
