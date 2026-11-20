@@ -23,8 +23,8 @@ MUTANTS = (
     ("drop-job-id-check", MODULE_NAME, "if observed_job_id != bound_job_id or allocation.backend_job_id != observed_job_id:", "if False:", "test_job_id_mismatch_is_pre_start"),
     ("drop-acquire-refusal-park", MODULE_NAME, "controller = store.acquire_controller_generation(group, controller_request)", "controller = controller_request", "test_stale_controller_parks_before_publish"),
     ("drop-pre-launch-authority-check", MODULE_NAME, "store.require_current_controller(group, controller.generation, controller.claimant_nonce)", "pass", "test_superseded_after_intent_does_not_launch"),
-    ("begin-attempt-for-successor", MODULE_NAME, "store.begin_admitted_successor(", "store.begin_attempt(", "test_successor_uses_admitted_start_only"),
-    ("relaunch-existing-intent", MODULE_NAME, "existing = store.read_launch_intent(fence)", "existing = None", "test_recovered_intent_never_relaunches"),
+    ("begin-attempt-for-successor", MODULE_NAME, "store.begin_admitted_successor(", "store.begin_attempt(", "test_real_store_admitted_successor_uses_durable_admission_once"),
+    ("relaunch-existing-intent", MODULE_NAME, "existing = store.read_launch_intent(fence)", "existing = None", "test_real_store_recovery_after_executor_exception_parks_without_relaunch"),
     ("park-is-not-success", MODULE_NAME, "else 2)", "else 0)", "test_terminal_and_park_exit_two"),
     ("publish-equality-off", MODULE_NAME, "if published.encode() != checked.encode():", "if False:", "test_publication_conflict_parks"),
 )
@@ -79,11 +79,11 @@ class FakeStore:
 def _setup(tmp_path, actions=("start_fresh",), **kwargs):
     group = _group(tuple("task-" + str(i) for i in range(len(actions))))
     allocation = ConfiguredAllocation(AllocationId("allocation"), BackendJobId("job"), {})
-    controller = ControllerGenerationV1(group.group_id, 1, allocation.allocation_id, allocation.backend_job_id, "r" * 64, "nonce", None)
+    controller = ControllerGenerationV1(group.group_id, 1, allocation.allocation_id, allocation.backend_job_id, "b" * 64, "nonce", None)
     published = GroupReconciliationV2(group.group_id, group.identity, tuple(MemberReconciliationV2(task.task_id, action, "fake", None) for task, action in zip(group.members, actions)))
     real = DirectoryStore(tmp_path / "store")
     store = FakeStore(real, controller, published, **kwargs)
-    facts = controller_module.GroupControllerFactsV1(group, allocation, "r" * 64, "nonce", "utc", tuple(MemberRecoveryInputV2(task.task_id, task.lineage_id) for task in group.members))
+    facts = controller_module.GroupControllerFactsV1(group, allocation, "b" * 64, "nonce", "utc", tuple(MemberRecoveryInputV2(task.task_id, task.lineage_id) for task in group.members))
     binding = BalsamGroupRegistrationReceipt(BalsamGroupRegistrationIntent(group.group_id, group.identity, digest({"backend": "fake"})), BackendJobId("job"))
     return facts, binding, store
 
