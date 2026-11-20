@@ -48,6 +48,26 @@ class QuadraticLogAbsModel(nn.Module):
         return WavefunctionOutput(logabs=logabs, sign=torch.ones_like(logabs))
 
 
+class ShiftedQuadraticLogAbsModel(QuadraticLogAbsModel):
+    def __init__(self, shift: float) -> None:
+        super().__init__()
+        self.shift = shift
+
+    def forward(self, batch: ElectronBatch) -> WavefunctionOutput:
+        output = super().forward(batch)
+        return WavefunctionOutput(logabs=output.logabs + self.shift, sign=output.sign)
+
+
+class CountingLinearModel(NoGradLinearModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, batch: ElectronBatch) -> WavefunctionOutput:
+        self.calls += 1
+        return super().forward(batch)
+
+
 def test_metropolis_sampler_uses_logabs_ratio_and_caches_values() -> None:
     sampler = MetropolisSampler(move=ShiftMove(), n_walkers=3, n_electrons=2, spatial_dim=1, dtype=torch.float64)
     walkers = sampler.initialize(n_walkers=3, device="cpu")
@@ -197,6 +217,34 @@ def test_collect_samples_reset_restarts_the_chain() -> None:
 
     # reset=True re-seeds, so it matches a fresh sampler's first draw.
     assert torch.equal(reset_draw.positions, fresh_draw.positions)
+
+
+def test_collect_samples_refreshes_retained_cache_before_changed_model_decision() -> None:
+    stale = MetropolisSampler(n_walkers=8, burn_in=0, n_steps=1, seed=123, dtype=torch.float64)
+    fresh = MetropolisSampler(n_walkers=8, burn_in=0, n_steps=1, seed=123, dtype=torch.float64)
+    base = QuadraticLogAbsModel()
+    shifted = ShiftedQuadraticLogAbsModel(-5.0)
+
+    for sampler in (stale, fresh):
+        walkers = sampler.reset(device="cpu")
+        sampler._walkers = walkers.update_cache(base)
+        sampler._has_burned_in = True
+    expected, _ = fresh.collect_samples(shifted)
+    actual, _ = stale.collect_samples(shifted)
+
+    assert torch.equal(actual.positions, expected.positions)
+    assert torch.equal(actual.aux["accepted"], expected.aux["accepted"])
+
+
+def test_retained_cache_refresh_is_one_boundary_evaluation_not_per_step() -> None:
+    sampler = MetropolisSampler(n_walkers=4, burn_in=0, n_steps=2, seed=123, dtype=torch.float64)
+    model = CountingLinearModel()
+    sampler.collect_samples(model, reset=True)
+    assert model.calls == 2
+
+    model.calls = 0
+    sampler.collect_samples(model)
+    assert model.calls == 3  # one retained-cache refresh plus two proposals
 
 
 def test_sampler_state_dict_roundtrip_continues_same_chain() -> None:

@@ -389,6 +389,11 @@ class MetropolisSampler(nn.Module):
             self.reset(device=device)
         else:
             self._require_device(device)
+            # Persistent walkers may outlive a model/parameter update.  Refresh
+            # their current values once at this public boundary so acceptance
+            # compares values from one model version without consuming RNG.
+            with torch.no_grad():
+                self._walkers = self._walkers.update_cache(model)
         if not self._has_burned_in and self.burn_in:
             self._walkers = self.sample(model, self._walkers, self.burn_in)
             self._has_burned_in = True
