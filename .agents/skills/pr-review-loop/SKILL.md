@@ -10,7 +10,7 @@ Review one implementation-slice PR with relevant stack context. **Improve behavi
 ## Purpose of each decision
 
 - **Reviewer — What could go wrong?** Identify plausible defects, regressions, or invalid assumptions, keeping the slice's design intention in mind.
-- **Reviewer — What would a test establish?** Test behavior, not implementation details; include useful passing tests.
+- **Reviewer — What would a test establish?** Name the plausible defect and independent expectation. Reuse an existing test when it already distinguishes that defect; explain the coverage gap before proposing another. Include useful passing tests, and choose each run's scope and stopping condition with [test-execution](../test-execution/SKILL.md).
 - **Orchestrator — Does it matter to this slice?** Accept, decline, or defer **each finding and test**, with a reason based on the slice's purpose and cost/benefit. For spikes, prioritize issues that inform the proof of concept or design. A deferral counts as declined *for this slice* and must identify a follow-up; it does not keep the loop open.
 - **Termination — Mechanical.** Stop if the reviewer proposes nothing or the orchestrator accepts nothing. Otherwise integrate and verify accepted fixes and tests, then review again. Revisit declined findings only when new evidence changes their relevance.
 
