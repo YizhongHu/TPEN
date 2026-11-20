@@ -41,8 +41,8 @@ MUTANTS = (
     (
         "ignore-stale-or-missing-reference",
         "tpen/execution/core_admission.py",
-        'if evidence.verdict == "refused" or not evidence.continuation_eligible:',
-        'if False:',
+        '"unpublished-checkpoint-ref",',
+        '"not-unpublished-checkpoint-ref",',
         "test_stale_inspection_is_not_admitted_from_request_bytes",
     ),
     (
@@ -53,11 +53,39 @@ MUTANTS = (
         "test_inspection_exception_is_unknown",
     ),
     (
-        "failed-to-completed",
+        "failed-to-unknown",
         "tpen/execution/core_admission.py",
         'if evidence.outcome in {"failed", "refused"}:',
         'if evidence.outcome == "refused":',
         "test_failed_maps_to_terminal_refused",
+    ),
+    (
+        "request-binding-bypass",
+        "tpen/execution/core_admission.py",
+        "if not _request_binds_to_inspection(context, evidence, request):",
+        "if True:",
+        "test_review_request_for_another_leaf_is_unknown",
+    ),
+    (
+        "inspection-validity-bypass",
+        "tpen/execution/core_admission.py",
+        'if evidence.verdict == "refused" or evidence.refusal is not None:',
+        "if False:",
+        "test_review_contradictory_terminal_outcome_is_unknown",
+    ),
+    (
+        "typed-v3-only-bypass",
+        "tpen/execution/core_admission.py",
+        'if evidence.schema != RUN_EVIDENCE_SCHEMA_V3:',
+        "if False:",
+        "test_review_untyped_terminal_evidence_is_unknown",
+    ),
+    (
+        "unavailable-to-refusal",
+        "tpen/execution/core_admission.py",
+        "if evidence.inspection_unavailable:",
+        "if False:",
+        "test_review_catalog_io_failure_is_unknown",
     ),
     (
         "quiescence-not-unknown",
@@ -247,9 +275,11 @@ def test_canonical_mapping_has_executor_unknown_quiescence(tmp_path: Path) -> No
 
 def test_mutant_table_has_unique_compile_valid_anchors_and_existing_killers() -> None:
     source = inspect.getsource(core_admission)
+    review_source = Path(__file__).with_name("test_review_b1d_core_admission.py").read_text()
+    test_sources = source + review_source
     for name, target, before, after, killer in MUTANTS:
         assert target == "tpen/execution/core_admission.py"
         assert source.count(before) == 1, name
         compile(source.replace(before, after), target, "exec")
-        assert killer in globals(), killer
+        assert killer in test_sources, killer
 

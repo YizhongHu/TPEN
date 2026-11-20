@@ -22,6 +22,7 @@ from tpen.inspection import RUN_EVIDENCE_SCHEMA_V3, RunEvidence, inspect_run
 
 from .recovery import (
     ScienceIntent,
+    SuccessorAdmissionDecodeRefusal,
     SuccessorAdmissionRequest,
     decode_successor_admission_request,
     select_successor_admission,
@@ -86,6 +87,13 @@ class CoreAdmissionContextV1:
         Unresolved configuration syntax checked by the native profile gate.
     profile_name : str
         Declared native recovery profile name.
+
+    Notes
+    -----
+    The composition root guarantees the task/lineage-to-leaf binding before
+    constructing this context.  Core evidence does not carry lineage, so this
+    evaluator binds the leaf, request evidence, and science digest but does
+    not claim to verify that outer task/lineage guarantee.
     """
 
     task_id: str
@@ -158,6 +166,43 @@ def _intent_for(context: CoreAdmissionContextV1, request: SuccessorAdmissionRequ
     return intent
 
 
+def _same_path(left: str, right: str) -> bool:
+    """Compare two leaf references after resolving their filesystem spelling."""
+
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except (OSError, RuntimeError, TypeError):
+        return False
+
+
+def _request_binds_to_inspection(
+    context: CoreAdmissionContextV1,
+    evidence: Any,
+    request: SuccessorAdmissionRequest,
+) -> bool:
+    """Require one request to name the exact freshly inspected core facts."""
+
+    request_evidence = request.core_evidence
+    if not _same_path(context.core_run_dir or "", evidence.run_dir):
+        return False
+    if not _same_path(request_evidence.run_dir, evidence.run_dir):
+        return False
+    if request_evidence.resolved_config_identity != evidence.resolved_config_identity:
+        return False
+    if request.predecessor.resolved_config_identity != evidence.resolved_config_identity:
+        return False
+    if request_evidence.checkpoint_ref != evidence.checkpoint_ref:
+        return False
+    if request_evidence.checkpoint != evidence.checkpoint:
+        # A missing/stale publication is itself the typed core refusal.  The
+        # inspection cannot retain a selected summary after that refusal, but
+        # the bound ref and identity above still prevent cross-leaf reuse.
+        refusal_code = None if evidence.refusal is None else evidence.refusal.get("code")
+        if refusal_code not in _CHECKPOINT_ADMISSION_REFUSALS:
+            return False
+    return request.science_input_digest == context.science_input_digest
+
+
 def evaluate_core_admission(context: CoreAdmissionContextV1) -> dict[str, Any] | None:
     """Evaluate core evidence into a canonical ``tpen-core-admission-v1`` map.
 
@@ -181,24 +226,39 @@ def evaluate_core_admission(context: CoreAdmissionContextV1) -> dict[str, Any] |
     request: SuccessorAdmissionRequest | None = None
     if context.successor_request is not None:
         try:
-            request = (
+            decoded = (
                 context.successor_request
                 if isinstance(context.successor_request, SuccessorAdmissionRequest)
                 else decode_successor_admission_request(context.successor_request)
             )
         except Exception as exc:
             return _unknown(f"malformed-successor-request:{type(exc).__name__}")
+        if isinstance(decoded, SuccessorAdmissionDecodeRefusal):
+            return _unknown(decoded.code.value)
+        request = decoded
         if request.predecessor.task_id != context.task_id or request.successor.task_id != context.task_id:
             return _unknown("identity-mismatch")
-        if request.science_input_digest != context.science_input_digest:
+        if not _request_binds_to_inspection(context, evidence, request):
             return _unknown("identity-mismatch")
 
+    if evidence.inspection_unavailable:
+        return _unknown("inspection-unavailable")
     if evidence.schema != RUN_EVIDENCE_SCHEMA_V3:
-        if evidence.verdict == "completed":
-            return _mapping("completed", "unknown", "unknown", None, "completed")
-        if evidence.verdict == "failed":
-            return _mapping("terminal", "refused", "absent", None, "failed")
         return _unknown("untyped-core-evidence")
+    if evidence.verdict == "refused" or evidence.refusal is not None:
+        reason = None if evidence.refusal is None else evidence.refusal.get("code")
+        if reason in _CHECKPOINT_ADMISSION_REFUSALS and request is not None:
+            return _mapping("successor", "refused", "invalid", None, reason)
+        return _unknown(reason or "invalid-core-evidence")
+    expected_verdict = {
+        "completed": "completed",
+        "failed": "failed",
+        "unknown": "incomplete",
+        "refused": "incomplete",
+        "planned_yield": "incomplete",
+    }
+    if evidence.outcome not in expected_verdict or evidence.verdict != expected_verdict[evidence.outcome]:
+        return _unknown("invalid-core-evidence")
 
     if evidence.outcome == "completed":
         return _mapping("completed", "unknown", "unknown", None, "completed")
@@ -212,12 +272,8 @@ def evaluate_core_admission(context: CoreAdmissionContextV1) -> dict[str, Any] |
     if evidence.outcome != "planned_yield":
         return _unknown("unsupported-outcome")
 
-    # A typed inspection refusal is already a core-owned admission refusal.
-    if evidence.verdict == "refused" or not evidence.continuation_eligible:
-        reason = None if evidence.refusal is None else evidence.refusal["code"]
-        if reason not in _CHECKPOINT_ADMISSION_REFUSALS:
-            return _unknown(reason or "non-eligible-outcome")
-        return _mapping("successor", "refused", "invalid", None, reason)
+    if not evidence.continuation_eligible:
+        return _unknown("non-eligible-outcome")
     if request is None:
         return _unknown("missing-successor-request")
 

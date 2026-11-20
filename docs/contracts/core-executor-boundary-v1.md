@@ -28,12 +28,21 @@ port.  The closed mapping is canonical JSON with these fields:
 ```
 
 The mapping is read-only and deterministic.  A missing core leaf returns
-`null`, allowing the executor's existing `start_fresh` rule.  Untyped,
-malformed, unreadable, identity-mismatched, or exceptional evidence maps to
-all-unknown.  Typed `completed` maps to `completed`; typed `failed` or
+`null`, allowing the executor's existing `start_fresh` rule.  Before any
+authoritative mapping, the evaluator binds the context to the freshly
+inspected normalized leaf, run/config identity, checkpoint facts, and request
+science digest.  The composition root guarantees the context's task/lineage
+to leaf mapping; `RunEvidence` carries no lineage and the evaluator does not
+claim to verify that outer binding.  A binding failure, malformed request,
+decoder refusal, unavailable read, inspection refusal/contradiction, or
+non-v3 evidence maps to all-unknown.  Only a valid typed v3 decision may map
+to a terminal result: `completed` maps to `completed`; typed `failed` or
 `refused` maps to `terminal/refused/absent`; typed `unknown` maps to all
-unknown.  A typed planned yield is checked by the native profile gate and
-then by `select_successor_admission`: accepted evidence maps to
+unknown.  A genuine typed missing/stale publication refusal retains its
+stable refusal code and maps to `successor/refused/invalid`; an unavailable
+catalog/ref read is all-unknown even when the inspection code is otherwise
+the same.  A valid typed planned yield is checked by the native profile gate
+and then by `select_successor_admission`: accepted evidence maps to
 `successor/admitted/valid`, while a typed profile or admission refusal maps to
 `successor/refused/invalid` with its stable refusal code.  Core never infers
 operational quiescence, so `quiescence` is always `unknown`.
