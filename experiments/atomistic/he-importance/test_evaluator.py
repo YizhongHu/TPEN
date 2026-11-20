@@ -612,6 +612,16 @@ class _InheritedPrivateSlotWitness(_PrivateSlotWitness):
         return "benign property shadow"
 
 
+class _CollidingPrivateSlotWitness:
+    __slots__ = ("__payload", "__dict__")
+
+    def __init__(self, slot_payload: object, dict_payload: object) -> None:
+        type(self).__dict__["_CollidingPrivateSlotWitness__payload"].__set__(
+            self, slot_payload
+        )
+        vars(self)["_CollidingPrivateSlotWitness__payload"] = dict_payload
+
+
 @pytest.mark.parametrize("payload", [_PrivateSlotWitness("reference_energy"), _InheritedPrivateSlotWitness("reference_energy")])
 def test_factor_qualification_reads_private_slots_from_defining_storage(payload: object) -> None:
     with pytest.raises(
@@ -625,6 +635,27 @@ def test_factor_qualification_reads_private_slots_from_defining_storage(payload:
             analytic_oracle=lambda value: value,
         )
     assert exc.type is evaluator.EvaluatorQualificationError
+
+
+def test_factor_qualification_visits_private_slot_despite_dict_collision() -> None:
+    with pytest.raises(
+        evaluator.EvaluatorQualificationError,
+        match=rf"{re.escape('factor input.__payload')} contains forbidden blinding value 'reference_energy'",
+    ) as exc:
+        evaluator.qualify_factor(
+            "cusp",
+            _CollidingPrivateSlotWitness("reference_energy", "benign"),
+            lambda value: value,
+            analytic_oracle=lambda value: value,
+        )
+    assert exc.type is evaluator.EvaluatorQualificationError
+
+    evaluator.qualify_factor(
+        "cusp",
+        _CollidingPrivateSlotWitness("benign", "benign"),
+        lambda value: value,
+        analytic_oracle=lambda value: value,
+    )
 
 
 @pytest.mark.parametrize("payload", [_PrivateSlotWitness("benign"), _InheritedPrivateSlotWitness("benign")])

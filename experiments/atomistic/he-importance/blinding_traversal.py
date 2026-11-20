@@ -188,10 +188,9 @@ def _members(value: Any) -> tuple[tuple[str, Any], ...] | None:
     if is_dataclass(value) and not isinstance(value, type):
         return tuple((field.name, getattr(value, field.name)) for field in fields(value))
     members: list[tuple[str, Any]] = []
-    seen_storage: set[str] = set()
     if hasattr(value, "__dict__"):
         members.extend(vars(value).items())
-        seen_storage.update(vars(value))
+    seen_descriptors: set[int] = set()
     for owner in type(value).__mro__:
         declared = owner.__dict__.get("__slots__", ())
         if isinstance(declared, str):
@@ -202,12 +201,13 @@ def _members(value: Any) -> tuple[tuple[str, Any], ...] | None:
             if name in {"__dict__", "__weakref__"}:
                 continue
             storage_name = _mangled_slot_name(owner, name)
-            if storage_name in seen_storage:
-                continue
             descriptor = owner.__dict__.get(storage_name)
             if descriptor is None or not hasattr(descriptor, "__get__"):
                 continue
-            seen_storage.add(storage_name)
+            descriptor_identity = id(descriptor)
+            if descriptor_identity in seen_descriptors:
+                continue
+            seen_descriptors.add(descriptor_identity)
             try:
                 nested = descriptor.__get__(value, type(value))
             except AttributeError:
