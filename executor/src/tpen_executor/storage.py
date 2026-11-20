@@ -331,16 +331,23 @@ class DirectoryStore:
             _require_directory(root, "store root")
         object.__setattr__(self, "root", root)
 
-    def record_pre_start_receipt(self, group, backend_job_id, observed_job_id, reason: str) -> None:
+    def record_pre_start_receipt(self, group: ReadyGroupV2 | GroupId, backend_job_id: BackendJobId, observed_job_id: BackendJobId, reason: str) -> None:
         """Durably record one refusal keyed by group and backend observations."""
         ensure_durable_directory(self.root)
-        group_key = getattr(group, "identity", digest(getattr(group, "to_dict", lambda: {"group": str(group)})()))
-        key = digest({"group": group_key, "backend_job_id": str(backend_job_id), "observed_job_id": str(observed_job_id)})
+        if isinstance(group, ReadyGroupV2):
+            group_key = group.identity
+        elif isinstance(group, GroupId):
+            group_key = digest(group.to_dict())
+        else:
+            raise TypeError("pre-start receipt requires ReadyGroupV2 or GroupId")
+        if not isinstance(backend_job_id, BackendJobId) or not isinstance(observed_job_id, BackendJobId):
+            raise TypeError("pre-start receipt requires typed backend job identities")
+        key = digest({"group": group_key, "backend_job_id": backend_job_id.value, "observed_job_id": observed_job_id.value})
         directory = os.path.join(self.root, "groups", group_key)
         ensure_durable_directory(os.path.join(self.root, "groups"))
         ensure_durable_directory(directory)
         path = os.path.join(directory, f"pre-start-{key}.json")
-        payload = canonical_bytes({"schema": "tpen-executor/pre-start-v1", "group": group_key, "backend_job_id": str(backend_job_id), "observed_job_id": str(observed_job_id), "reason": str(reason)})
+        payload = canonical_bytes({"schema": "tpen-executor/pre-start-v1", "group": group_key, "backend_job_id": backend_job_id.value, "observed_job_id": observed_job_id.value, "reason": str(reason)})
         if os.path.lexists(path):
             if Path(path).read_bytes() != payload:
                 raise FenceRejected("pre-start receipt conflicts")
