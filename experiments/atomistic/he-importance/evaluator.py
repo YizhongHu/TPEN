@@ -118,6 +118,15 @@ def evaluate_local_energy_rows(
     make the checkpoint unusable to a rank artifact.  It intentionally does
     not inherit trainer ruling 377f6b0f's raise-always policy, because this is
     an evaluator state boundary rather than the trainer seam.
+
+    Raises
+    ------
+    EvaluatorQualificationError
+        If ``expected_chain_ids`` contains duplicated IDs, if a row has
+        mismatched checkpoint provenance, or if topology provenance is
+        blinding-bearing or empty.
+    IncompleteRankArtifactError
+        If the rows contain missing, extra, or duplicated actual chain IDs.
     """
 
     if not rows:
@@ -148,7 +157,16 @@ def evaluate_local_energy_rows(
 
 
 def require_complete_rank_artifact(states: Sequence[InferenceState], *, expected_checkpoint_ids: Sequence[str]) -> None:
-    """Refuse partial or nonfinite checkpoint artifacts before any ranking step."""
+    """Refuse partial or nonfinite checkpoint artifacts before any ranking step.
+
+    Raises
+    ------
+    EvaluatorQualificationError
+        If ``expected_checkpoint_ids`` contains duplicated IDs.
+    IncompleteRankArtifactError
+        If the artifact contains missing, extra, or duplicated actual
+        checkpoint IDs, or contains a nonfinite local-energy state.
+    """
 
     actual = tuple(state.checkpoint_id for state in states)
     expected = tuple(expected_checkpoint_ids)
