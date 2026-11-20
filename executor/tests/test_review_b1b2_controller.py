@@ -30,7 +30,7 @@ MUTANTS = (
     ("park-is-not-success", MODULE_NAME, "else 2, reasons)", "else 0, reasons)", "test_terminal_and_park_exit_two"),
     ("publish-equality-off", MODULE_NAME, "if published.encode() != checked.encode():", "if False:", "test_publication_conflict_parks"),
     ("critical-section-off", "executor/src/tpen_executor/storage.py", "self._current_controller_locked(directory, group.group_id, controller_record)\n            return self.begin_attempt", "pass\n            return self.begin_attempt", "test_t2_supersession_after_publication_preserves_newer_start"),
-    ("outcome-receipt-off", MODULE_NAME, "store.record_controller_outcome(fence, controller, invocation, \"launched\", launched.detail)", "pass", "test_real_store_launch_writes_controller_outcome"),
+    ("outcome-receipt-off", MODULE_NAME, "store.record_controller_outcome(fence, controller, invocation, \"launched\", launched.detail or \"acknowledged\")", "pass", "test_real_store_launch_writes_controller_outcome"),
 )
 # Relaunch prevention is deliberately double-fenced: this controller probe
 # parks an existing intent, while DirectoryStore.create_launch_intent also

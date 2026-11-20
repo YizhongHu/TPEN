@@ -102,6 +102,14 @@ def _attempt(group: ReadyGroupV2, allocation: Any, controller: ControllerGenerat
     )
 
 
+def _reason(phase: str, error: BaseException | None = None) -> str:
+    """Return a compact typed diagnostic for one member transition."""
+    if error is None:
+        return phase
+    detail = str(error).strip() or "no-message"
+    return f"{phase}:{type(error).__name__}:{detail}"
+
+
 def _require_current_controller(store: DirectoryStore, group: ReadyGroupV2, controller: ControllerGenerationV1) -> None:
     """Apply one durable authority check at a controller boundary."""
     store.require_current_controller(group, generation=controller.generation, nonce=controller.claimant_nonce)
@@ -186,6 +194,7 @@ def run_group_controller(
     except Exception:
         return _park(group, "publication-failed")
     outcomes = []
+    reasons = {}
     for member in published.members:
         if member.action == "preserve_completed" or member.action == "preserve_terminal":
             outcomes.append((member.task_id, member.action))
@@ -217,27 +226,31 @@ def run_group_controller(
                 invocation = record.successor_binding
             else:
                 outcomes.append((member.task_id, "parked"))
+                reasons[member.task_id] = _reason("reconcile-action")
                 continue
             try:
                 existing = store.read_launch_intent(fence)
             except LaunchIntentAbsent:
                 existing = None
-            except Exception:
+            except Exception as error:
                 outcomes.append((member.task_id, "parked"))
+                reasons[member.task_id] = _reason("intent-read", error)
                 continue
             if existing is not None:
                 outcomes.append((member.task_id, "parked"))
+                reasons[member.task_id] = _reason("intent-recovered")
                 continue
             store.create_launch_intent(fence, controller, invocation)
             store.require_current_controller(group, controller.generation, controller.claimant_nonce)
             try:
                 launched = executor.launch(fence, invocation)
-            except Exception:
+            except Exception as error:
                 try:
                     store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "executor-failed")
                 except (OSError, FenceRejected):
                     pass
                 outcomes.append((member.task_id, "parked"))
+                reasons[member.task_id] = _reason("executor-launch", error)
                 continue
             if not isinstance(launched, MemberLaunchResult) or not launched.acknowledged:
                 try:
@@ -245,26 +258,29 @@ def run_group_controller(
                 except (OSError, FenceRejected):
                     pass
                 outcomes.append((member.task_id, "parked"))
+                reasons[member.task_id] = _reason("launch-ack", None if isinstance(launched, MemberLaunchResult) else TypeError("invalid MemberLaunchResult"))
                 continue
             try:
-                store.record_controller_outcome(fence, controller, invocation, "launched", launched.detail)
-            except Exception:
+                store.record_controller_outcome(fence, controller, invocation, "launched", launched.detail or "acknowledged")
+            except Exception as error:
                 outcomes.append((member.task_id, "launched-outcome-unrecorded"))
+                reasons[member.task_id] = _reason("outcome-receipt", error)
                 continue
             outcomes.append((member.task_id, "launched"))
-        except Exception:
+        except Exception as error:
             outcomes.append((member.task_id, "parked"))
+            reasons[member.task_id] = _reason("member-transition", error)
     parked = {task_id for task_id, status in outcomes if status == "parked"}
     final = published if not parked else replace(
         published,
         members=tuple(
-            replace(member, action="park", reason_code="controller-uncertainty") if member.task_id in parked else member
+            replace(member, action="park", reason_code=reasons.get(member.task_id, "controller-uncertainty")) if member.task_id in parked else member
             for member in published.members
         ),
     )
-    reasons = tuple((task_id, "launch-acknowledged" if status == "launched" else "controller-uncertainty")
-                    for task_id, status in outcomes)
-    return GroupControllerOutcome(final, tuple(outcomes), 0 if all(member.action == "preserve_completed" for member in final.members) else 2, reasons)
+    reason_records = tuple((task_id, reasons.get(task_id, "launch-acknowledged" if status == "launched" else "controller-uncertainty"))
+                           for task_id, status in outcomes)
+    return GroupControllerOutcome(final, tuple(outcomes), 0 if all(member.action == "preserve_completed" for member in final.members) else 2, reason_records)
 
 
 __all__ = ["AllocationLocalExecutor", "GroupControllerFactsV1", "GroupControllerOutcome", "MemberLaunchResult", "run_group_controller"]
