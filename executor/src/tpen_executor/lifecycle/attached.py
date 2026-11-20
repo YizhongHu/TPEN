@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from ..allocations import ConfiguredAllocation
-from ..contracts import ReadyGroup
+from ..allocations import AllocationAttemptV2, ConfiguredAllocation
+from ..contracts import InvocationId, ReadyGroup, ReadyGroupV2
 from ..results import AllocationObservation, OutcomeReceipt
 from ..storage import AttemptFence, DirectoryStore, FenceRejected
 from .._records import frozen_record
@@ -22,6 +22,8 @@ class AttachedAllocation:
         Allocation identity that owns every delegated attempt.
     store : DirectoryStore
         Durable store used for fenced start and outcome receipts.
+    allocation_attempt : AllocationAttemptV2 or None, optional
+        Explicit v2 controller lease binding. Omission preserves the v1 API.
 
     Notes
     -----
@@ -31,6 +33,15 @@ class AttachedAllocation:
 
     allocation: ConfiguredAllocation
     store: DirectoryStore
+    allocation_attempt: AllocationAttemptV2 | None = None
+
+    def __post_init__(self) -> None:
+        if self.allocation_attempt is not None:
+            if not isinstance(self.allocation_attempt, AllocationAttemptV2):
+                raise TypeError("allocation_attempt must be AllocationAttemptV2")
+            if (self.allocation_attempt.allocation_id != self.allocation.allocation_id
+                    or self.allocation_attempt.backend_job_id != self.allocation.backend_job_id):
+                raise FenceRejected("allocation-attempt binding crosses attached allocation")
 
     def observe(self, state: str, at_utc: str) -> AllocationObservation:
         """Create a backend-neutral observation of the attached allocation.
@@ -49,10 +60,12 @@ class AttachedAllocation:
 
     def begin(
         self,
-        group: ReadyGroup,
+        group: ReadyGroup | ReadyGroupV2,
         task_id: str,
         started_at_utc: str = "",
         transport_kind: str | None = "local",
+        *,
+        invocation_id: InvocationId | None = None,
     ) -> AttemptFence:
         """Begin one task attempt in the attached allocation.
 
@@ -66,6 +79,8 @@ class AttachedAllocation:
             UTC start timestamp; ``""`` selects the documented placeholder.
         transport_kind : {"local", "remote"} or None, optional
             Durable transport identity retained in the start receipt.
+        invocation_id : InvocationId or None, optional
+            Controller-issued identity required for a bound v2 start.
 
         Returns
         -------
@@ -73,6 +88,8 @@ class AttachedAllocation:
             Fence bound to this allocation and store.
         """
         begin_kwargs = {} if transport_kind == "local" else {"transport_kind": transport_kind}
+        if self.allocation_attempt is not None or invocation_id is not None:
+            begin_kwargs.update(allocation_attempt=self.allocation_attempt, invocation_id=invocation_id)
         return self.store.begin_attempt(group, task_id, self.allocation, started_at_utc, **begin_kwargs)
 
     def finish(self, fence: AttemptFence, status: str, finished_at_utc: str, result_digest: str | None = None) -> OutcomeReceipt:
