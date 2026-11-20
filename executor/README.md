@@ -85,6 +85,12 @@ whose durable invocation was tampered with parks the publication. The current
 controller lease is valid when it is also the member's recorded lease; prior
 and mixed leases are valid when each matches its own durable invocation.
 Existing single-generation `ReconciliationPublicationV2` bytes remain unchanged.
+If a crash leaves an admitted successor directory visible while the predecessor
+pointer is still current, the next start validates existing canonical files,
+writes only missing files, and advances the pointer to the admitted attempt.
+Allocation-attempt IDs are also one-to-one with complete attempt facts across
+the controller, member bindings, and proposed successors; conflicting facts
+park before any admission ledger write.
 
 ## GPU placement qualification
 

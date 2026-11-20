@@ -1692,6 +1692,7 @@ class ReconciliationPublicationV2:
         expected = reconcile_group(self.group, tuple(member.evidence for member in members))
         if tuple(member.reconciliation for member in members) != expected.members:
             raise ValueError("publication outcomes differ from evidence")
+        allocation_attempts = {self.allocation_attempt.allocation_attempt_id: self.allocation_attempt}
         invocations = set()
         for member, task in zip(members, self.group.members):
             if member.evidence.lineage_id != task.lineage_id:
@@ -1706,6 +1707,10 @@ class ReconciliationPublicationV2:
                     or start.allocation_id != binding.allocation_attempt.allocation_id
                     or start.backend_job_id != binding.allocation_attempt.backend_job_id):
                 raise ValueError("publication crosses allocation or group")
+            previous = allocation_attempts.get(binding.allocation_attempt.allocation_attempt_id)
+            if previous is not None and previous != binding.allocation_attempt:
+                raise ValueError("conflicting allocation-attempt facts")
+            allocation_attempts[binding.allocation_attempt.allocation_attempt_id] = binding.allocation_attempt
             if binding.invocation_id in invocations:
                 raise ValueError("publication repeats invocation identity")
             invocations.add(binding.invocation_id)
@@ -1717,6 +1722,10 @@ class ReconciliationPublicationV2:
                         or successor.allocation_attempt.allocation_attempt_id == self.allocation_attempt.allocation_attempt_id
                         or successor.invocation_id == binding.invocation_id):
                     raise ValueError("successor binding is crossed or not fresh")
+                previous = allocation_attempts.get(successor.allocation_attempt.allocation_attempt_id)
+                if previous is not None and previous != successor.allocation_attempt:
+                    raise ValueError("conflicting allocation-attempt facts")
+                allocation_attempts[successor.allocation_attempt.allocation_attempt_id] = successor.allocation_attempt
         # One allocation-attempt identity denotes one complete immutable record.
         # Storage constructs this candidate before writing any admission ledger;
         # decoding follows the same constructor validation.

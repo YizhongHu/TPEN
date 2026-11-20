@@ -287,10 +287,12 @@ MUTANTS = (
     ("skip-admission-reread", "storage.py", "records = self._admission_records_for_task(task_dir, task_id)", "records = ()", "test_admitted_successor_consumes_exact_identity_and_replays"),
     # No force-current-lease row: ReconciliationPublicationV2 repeats the group_id invariant.
     ("restore-single-lease-gate", "storage.py", "if (binding.allocation_attempt.group_id != group.group_id", "if (binding.allocation_attempt != allocation_attempt", "test_publication_accepts_prior_attempts_under_new_controller_lease"),
-    ("drop-replay-byte-compare", "storage.py", "or Path(output_dir, \"invocation.json\").read_bytes() != invocation_bytes", "or False", "test_admitted_successor_tampered_replay_refuses"),
+    ("drop-replay-byte-compare", "storage.py", "if Path(path).read_bytes() != expected:", "if False:", "test_admitted_successor_tampered_replay_refuses"),
     # No mutant row for successor.group_digest: _group_dir keys the task directory by group.identity, so a crossed group finds no admission ledger first.
     # No mutant row for successor.task_id: SuccessorAdmissionRecord makes it unreachable.
     # No mutant row for successor.lineage_id: group identity binds the member lineage before this check.
     ("crossed-successor-attempt", "storage.py", "or successor.allocation_attempt != allocation_attempt", "or False", "test_admitted_successor_crossed_allocation_attempt_refuses_with_genuine_admission"),
     # No mutant row for predecessor-current: _validate_fence repeats the pointer check immediately after it.
+    ("partial-start-recovery", "storage.py", "if current not in {successor.attempt_id.value, admission.predecessor_attempt_id.value}:", "if current != successor.attempt_id.value:", "test_admitted_start_recovers_after_durable_boundary"),
+    ("lease-facts-consistency", "results.py", "if previous is not None and previous != binding.allocation_attempt:", "if False:", "test_conflicting_lease_facts_park_before_publication"),
 )

@@ -523,13 +523,20 @@ class DirectoryStore:
             invocation_bytes = binding.encode()
             if os.path.lexists(output_dir):
                 _require_directory(output_dir, "admitted successor attempt")
-                if current != successor.attempt_id.value:
+                if current not in {successor.attempt_id.value, admission.predecessor_attempt_id.value}:
                     raise FenceRejected("admitted successor attempt is not current")
-                _require_regular(os.path.join(output_dir, "start.json"), "start receipt")
-                _require_regular(os.path.join(output_dir, "invocation.json"), "invocation binding")
-                if (Path(output_dir, "start.json").read_bytes() != start_bytes
-                        or Path(output_dir, "invocation.json").read_bytes() != invocation_bytes):
-                    raise AdmissionFork("admitted successor start differs")
+                for name, expected in (("start.json", start_bytes), ("invocation.json", invocation_bytes)):
+                    path = os.path.join(output_dir, name)
+                    if os.path.lexists(path):
+                        _require_regular(path, name)
+                        if Path(path).read_bytes() != expected:
+                            raise AdmissionFork("admitted successor start differs")
+                    elif current == admission.predecessor_attempt_id.value:
+                        _write_new(path, expected)
+                    else:
+                        raise FenceRejected("admitted successor receipt is missing")
+                if current == admission.predecessor_attempt_id.value:
+                    _write_pointer(pointer, successor.attempt_id.value)
                 return AttemptFence(self.root, group.identity, task_id, allocation.allocation_id.value,
                                     successor.attempt_id, output_dir)
             if current != admission.predecessor_attempt_id.value:
