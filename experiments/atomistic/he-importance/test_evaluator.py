@@ -468,7 +468,7 @@ def test_rank_artifact_rejects_duplicate_expected_checkpoint_ids() -> None:
         ),
         (
             (evaluator.InferenceState("reference_energy", evaluator.InferenceStatus.READY, ()),),
-            ("reference_energy",),
+            ("checkpoint-a",),
             "rank-artifact state[0] checkpoint id",
         ),
         (
