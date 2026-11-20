@@ -200,6 +200,21 @@ class OptimizerCell:
             raise MaterializationError("available optimizer cells cannot carry an unavailable reason")
 
 
+def _is_optimizer_cell(value: Any) -> bool:
+    """Recognize an optimizer cell across intentionally isolated module loads."""
+
+    return (
+        type(value).__name__ == "OptimizerCell"
+        and type(getattr(value, "method", None)) is str
+        and bool(value.method)
+        and type(getattr(value, "status", None)) is str
+        and value.status in {"available", "unavailable"}
+        and (getattr(value, "reason", None) is None or type(value.reason) is str)
+        and (value.status == "available" or bool(value.reason))
+        and (value.status == "unavailable" or value.reason is None)
+    )
+
+
 @dataclass(frozen=True)
 class MaterializedCell:
     """One content-addressed train row without an attempt identity."""
@@ -874,11 +889,19 @@ def intended_configurations() -> tuple[Mapping[str, Any], ...]:
     raw = json.loads(_INTENDED_CONFIGURATIONS_PATH.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
         raise MaterializationError("intended configuration inventory must be a list")
-    for entry in raw:
-        if not isinstance(entry, Mapping) or frozenset(entry) != frozenset(
-            {"stage", "optimizer", "configurations"}
-        ):
-            raise MaterializationError("intended configuration entry has an invalid schema")
+    for entry_index, entry in enumerate(raw):
+        if not isinstance(entry, Mapping):
+            raise MaterializationError(
+                f"intended configuration entry[{entry_index}] must be a mapping"
+            )
+        if frozenset(entry) != frozenset({"stage", "optimizer", "configurations"}):
+            raise MaterializationError(
+                f"intended configuration entry[{entry_index}] has an invalid schema"
+            )
+        if not isinstance(entry["stage"], str) or not entry["stage"]:
+            raise MaterializationError(
+                f"intended configuration entry[{entry_index}].stage must be a non-empty string"
+            )
         optimizer_data = entry["optimizer"]
         if not isinstance(optimizer_data, Mapping) or frozenset(optimizer_data) != frozenset({"method", "levels"}):
             raise MaterializationError("intended optimizer must declare exactly method and levels")
@@ -886,9 +909,17 @@ def intended_configurations() -> tuple[Mapping[str, Any], ...]:
             raise MaterializationError("intended optimizer method must be a non-empty string")
         if not isinstance(optimizer_data["levels"], Mapping):
             raise MaterializationError("intended optimizer levels must be a mapping")
-        for configuration in entry["configurations"]:
+        configurations = entry["configurations"]
+        if not isinstance(configurations, (list, tuple)):
+            raise MaterializationError(
+                f"intended configuration entry[{entry_index}].configurations must be a list or tuple"
+            )
+        for configuration_index, configuration in enumerate(configurations):
             if not isinstance(configuration, Mapping) or "scientific_identity" not in configuration:
-                raise MaterializationError("intended configuration is missing scientific_identity")
+                raise MaterializationError(
+                    f"intended configuration entry[{entry_index}].configurations[{configuration_index}] "
+                    "is missing scientific_identity"
+                )
             identity = configuration["scientific_identity"]
             if not isinstance(identity, Mapping) or "optimizer" not in identity:
                 raise MaterializationError("scientific_identity is missing optimizer")
@@ -936,14 +967,29 @@ def materialize_intended_configurations(
         ``availability``.
     """
 
+    if not isinstance(availability, Mapping):
+        raise MaterializationError("availability must be a mapping")
+    for method, optimizer in availability.items():
+        if not isinstance(method, str):
+            raise MaterializationError("availability keys must be strings")
+        if not _is_optimizer_cell(optimizer):
+            raise MaterializationError(
+                f"availability[{method!r}] must be an OptimizerCell"
+            )
+
     entries = intended_configurations()
     if stages is not None:
         if isinstance(stages, (str, bytes)):
             raise MaterializationError("stages must be an iterable of stage codes, not a string")
-        requested = tuple(stages)
+        try:
+            requested = tuple(stages)
+        except TypeError as error:
+            raise MaterializationError("stages must be an iterable of stage codes") from error
         if not requested:
             raise MaterializationError("an explicit stage selection must name at least one stage")
         for stage in requested:
+            if not isinstance(stage, str):
+                raise MaterializationError("stage selection values must be strings")
             stage_definition(stage)
         present = {entry["stage"] for entry in entries}
         missing = [stage for stage in requested if stage not in present]

@@ -871,6 +871,58 @@ def test_intended_configurations_loader_rejects_a_configuration_optimizer_mismat
         stage_coordinate.MaterializationError, match="entry optimizer and scientific_identity optimizer must be identical"
     ):
         stage_coordinate.intended_configurations()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda entry: entry.__setitem__("stage", None), ".stage must be a non-empty string"),
+        (lambda entry: entry.__setitem__("configurations", "not-a-sequence"), ".configurations must be a list or tuple"),
+        (lambda entry: entry.__setitem__("configurations", [None]), r"configurations\[0\] is missing scientific_identity"),
+    ],
+)
+def test_intended_configuration_loader_rejects_malformed_typed_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: object, message: str
+) -> None:
+    entries = json.loads(Path(__file__).with_name("intended_configurations.json").read_text())
+    mutation(entries[0])
+    broken_path = tmp_path / "intended_configurations.json"
+    broken_path.write_text(json.dumps(entries), encoding="utf-8")
+    monkeypatch.setattr(stage_coordinate, "_INTENDED_CONFIGURATIONS_PATH", broken_path)
+    with pytest.raises(stage_coordinate.MaterializationError, match=message):
+        stage_coordinate.intended_configurations()
+
+
+def test_materializer_rejects_malformed_availability_and_stage_selection_types(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="availability must be a mapping"):
+        stage_coordinate.materialize_intended_configurations(tmp_path, availability=None)  # type: ignore[arg-type]
+    with pytest.raises(stage_coordinate.MaterializationError, match="must be an OptimizerCell"):
+        stage_coordinate.materialize_intended_configurations(
+            tmp_path, availability={"adam": object()}  # type: ignore[dict-item]
+        )
+    with pytest.raises(stage_coordinate.MaterializationError, match="stage selection values must be strings"):
+        stage_coordinate.materialize_intended_configurations(
+            tmp_path, availability=_complete_available_roster(), stages=(None,)  # type: ignore[tuple-item]
+        )
+    with pytest.raises(stage_coordinate.MaterializationError, match="stages must be an iterable"):
+        stage_coordinate.materialize_intended_configurations(
+            tmp_path, availability=_complete_available_roster(), stages=42  # type: ignore[arg-type]
+        )
+
+
+def test_materializer_does_not_translate_non_typeerror_stage_iterators(
+    tmp_path: Path,
+) -> None:
+    class BrokenStages:
+        def __iter__(self) -> object:
+            raise ValueError("sentinel iterator failure")
+
+    with pytest.raises(ValueError, match="sentinel iterator failure"):
+        stage_coordinate.materialize_intended_configurations(
+            tmp_path, availability=_complete_available_roster(), stages=BrokenStages()  # type: ignore[arg-type]
+        )
 def test_q_mechanics_walker_identity_rebuilds_hash_path_and_preserves_committed_cells(
     tmp_path: Path,
 ) -> None:
