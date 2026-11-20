@@ -109,6 +109,15 @@ relaunches it. Every controller incarnation must supply a freshly generated,
 unique claimant nonce; retries reuse the same canonical record rather than
 minting a second nonce.
 
+### Group controller run loop
+
+`lifecycle.controller.run_group_controller()` composes registration binding,
+the durable controller-generation ledger, one-shot core admission verdicts,
+reconciliation publication, and the B1a-C fresh/admitted start seams. It
+requires a current generation immediately before each injected local launch.
+An existing or uncertain launch intent is permanently parked; the controller
+never retries an executor call after a lost acknowledgement.
+
 ## GPU placement qualification
 
 The L1a v2 placement receipt reports an explicit reason class: `not-sampled`,
