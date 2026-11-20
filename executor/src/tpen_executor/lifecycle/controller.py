@@ -161,15 +161,12 @@ def run_group_controller(
         return _park(group, "controller-authority-refused")
     try:
         frozen_inputs = []
-        admission_failures = set()
         for item in facts.member_inputs:
             try:
                 verdict = admission_port.admit(item)
                 if verdict is not None and not isinstance(verdict, CoreAdmissionVerdictV2):
-                    admission_failures.add(item.task_id)
                     verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "malformed-core-admission")
             except Exception:
-                admission_failures.add(item.task_id)
                 verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "core-admission-unavailable")
             frozen_inputs.append(replace(item, core_verdict=verdict))
         checked = reconcile_group(group, tuple(frozen_inputs))
@@ -184,6 +181,8 @@ def run_group_controller(
                 bindings[item.task_id] = MemberInvocationV2.decode(invocation_path.read_bytes())
         successor_requests = {}
         for task_id, (request, acceptance, proposed) in facts.successor_requests.items():
+            if next(member.action for member in checked.members if member.task_id == task_id) != "admit_successor":
+                continue
             successor_requests[task_id] = (request, acceptance, MemberInvocationV2(
                 launch_attempt, group.identity, task_id,
                 next(task.lineage_id for task in group.members if task.task_id == task_id),
@@ -195,6 +194,9 @@ def run_group_controller(
         )
         if published.encode() != checked.encode():
             return _park(group, "reconciliation-publication-conflict")
+        durable_publication = store.read_reconciliation(group, attempt)
+        if durable_publication is None or durable_publication.reconciliation.encode() != checked.encode():
+            return _park(group, "reconciliation-publication-unavailable")
     except Exception:
         return _park(group, "publication-failed")
     outcomes = []
@@ -216,10 +218,7 @@ def run_group_controller(
                     fence.attempt_id, invocation_id,
                 )
             elif member.action == "admit_successor":
-                publication = store.read_reconciliation(group, attempt)
-                if publication is None:
-                    raise LaunchIntentRejected("successor admission unavailable")
-                record = next((item.admission for item in publication.members if item.evidence.task_id == member.task_id), None)
+                record = next((item.admission for item in durable_publication.members if item.evidence.task_id == member.task_id), None)
                 if not isinstance(record, SuccessorAdmissionRecord) or record.successor_binding is None:
                     raise LaunchIntentRejected("successor admission unavailable")
                 fence = store.begin_admitted_successor_current_controller(
@@ -249,20 +248,28 @@ def run_group_controller(
             try:
                 launched = executor.launch(fence, invocation)
             except Exception as error:
+                receipt_error = None
                 try:
                     store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "executor-failed")
-                except (OSError, FenceRejected):
-                    pass
+                except Exception as record_error:
+                    receipt_error = record_error
                 outcomes.append((member.task_id, "parked"))
-                reasons[member.task_id] = _reason("executor-launch", error)
+                reason = _reason("executor-launch", error)
+                if receipt_error is not None:
+                    reason += ";" + _reason("outcome-receipt", receipt_error)
+                reasons[member.task_id] = reason
                 continue
             if not isinstance(launched, MemberLaunchResult) or not launched.acknowledged:
+                receipt_error = None
                 try:
                     store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "invalid-launch-ack")
-                except (OSError, FenceRejected):
-                    pass
+                except Exception as record_error:
+                    receipt_error = record_error
                 outcomes.append((member.task_id, "parked"))
-                reasons[member.task_id] = _reason("launch-ack", None if isinstance(launched, MemberLaunchResult) else TypeError("invalid MemberLaunchResult"))
+                reason = _reason("launch-ack", None if isinstance(launched, MemberLaunchResult) else TypeError("invalid MemberLaunchResult"))
+                if receipt_error is not None:
+                    reason += ";" + _reason("outcome-receipt", receipt_error)
+                reasons[member.task_id] = reason
                 continue
             try:
                 store.record_controller_outcome(fence, controller, invocation, "launched", launched.detail or "acknowledged")

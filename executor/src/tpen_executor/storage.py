@@ -515,8 +515,12 @@ class DirectoryStore:
                 invocation_bytes = Path(invocation_path).read_bytes()
                 invocation = MemberInvocationV2.decode(invocation_bytes)
                 self._validate_invocation(start, invocation)
-                if not os.path.lexists(path):
-                    raise LaunchIntentAbsent("launch intent is absent")
+                try:
+                    os.lstat(path)
+                except FileNotFoundError as error:
+                    raise LaunchIntentAbsent("launch intent is absent") from error
+                except OSError as error:
+                    raise LaunchIntentRejected("launch intent is unreadable") from error
                 _require_regular(path, "launch intent", LaunchIntentRejected)
                 encoded = Path(path).read_bytes()
                 intent = LaunchIntentV1.decode(encoded)
