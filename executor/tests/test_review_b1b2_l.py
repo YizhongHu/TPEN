@@ -15,9 +15,10 @@ MUTANTS = (
     ("predecessor-check-off", "executor/src/tpen_executor/storage.py", "record.predecessor_record_digest != predecessor", "False", "test_generation_rejects_forked_predecessor"),
     ("nonce-check-off", "executor/src/tpen_executor/storage.py", "records[-1].claimant_nonce != nonce", "False", "test_require_current_controller_rejects_wrong_nonce"),
     ("replay-byte-compare-off", "executor/src/tpen_executor/storage.py", "record.encode() == current.encode()", "True", "test_generation_rejects_differing_replay"),
-    ("intent-exclusivity-off", "executor/src/tpen_executor/storage.py", "if os.path.lexists(intent_path):", "if False:", "test_launch_intent_second_create_refuses"),
     ("intent-stale-check-off", "executor/src/tpen_executor/storage.py", "self.require_current_controller(controller_record.group_id, controller_record.generation, controller_record.claimant_nonce)", "None", "test_launch_intent_stale_controller_refuses"),
 )
+
+# No intent-exclusivity row: _write_new refuses an existing destination and create_launch_intent maps FileExistsError to the same LaunchIntentRejected.
 
 
 def _group():
@@ -115,7 +116,7 @@ def test_mutant_anchors_are_unique_compile_and_name_real_killers():
     source = Path(__file__).parents[1].joinpath("src/tpen_executor/storage.py").read_text()
     names = {name for name, value in globals().items() if name.startswith("test_") and callable(value)}
     anchors = [row[2] for row in MUTANTS]
-    assert len(anchors) == len(set(anchors)) >= 6
+    assert len(anchors) == len(set(anchors)) >= 5
     for _, filename, before, after, killer in MUTANTS:
         assert filename.endswith("storage.py") and source.count(before) == 1 and killer in names
         compile(source.replace(before, after, 1), filename, "exec")
