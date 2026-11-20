@@ -107,21 +107,29 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
         raise CollectionError("manifest contains a malformed eval row")
     eval_rows = [row for row in rows if row.get("kind") == "eval"]
     phase1_rows = [row for row in rows if row.get("kind") != "eval"]
-    phase1_hooke_rows = [
-        row for row in phase1_rows if row.get("system") in {"hooke1", "hooke2"}
+    phase1_hooke_train_rows = [
+        row for row in phase1_rows
+        if row.get("kind") == "train" and row.get("system") in {"hooke1", "hooke2"}
     ]
-    phase1_profiles = {
-        row.get("science_profile") for row in phase1_hooke_rows
+    phase1_train_profiles = {
+        row.get("science_profile") for row in phase1_hooke_train_rows
         if row.get("science_profile") is not None
     }
-    hooke_science = HOOKE_SCIENCE_PROFILE in phase1_profiles
-    if hooke_science and phase1_profiles != {HOOKE_SCIENCE_PROFILE}:
-        raise CollectionError("Hooke phase-1 rows mix science and legacy profiles")
+    hooke_science = HOOKE_SCIENCE_PROFILE in phase1_train_profiles
+    if hooke_science:
+        # Train rows are the science authority.  A missing/null profile on a
+        # train row is mixed science/legacy input; smoke rows are deliberately
+        # excluded so legacy smoke fixtures remain readable.
+        if (phase1_train_profiles != {HOOKE_SCIENCE_PROFILE}
+                or any(row.get("science_profile") != HOOKE_SCIENCE_PROFILE
+                       for row in phase1_hooke_train_rows)):
+            raise CollectionError("Hooke phase-1 rows mix science and legacy profiles")
+    elif phase1_train_profiles:
+        raise CollectionError("Hooke phase-1 rows use an unsupported science profile")
     # Science collection derives its required systems from the frozen phase-1
-    # rows.  The explicit no-profile path preserves genuinely legacy manifests.
+    # train rows.  The explicit no-profile path preserves genuinely legacy manifests.
     expected_systems = tuple(dict.fromkeys(
-        str(row["system"]) for row in phase1_hooke_rows
-        if row.get("science_profile") == HOOKE_SCIENCE_PROFILE
+        str(row["system"]) for row in phase1_hooke_train_rows
     )) if hooke_science else None
     try:
         validate_hooke_eval_grid(
