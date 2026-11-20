@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -207,7 +208,8 @@ def test_hooke_grid_rejects_count_preserving_replacement(
     }
     with pytest.raises(ProtocolError, match="A37 grid mismatch"):
         build_manifest(
-            protocol=STAGE1_PROTOCOL,
+            # A37 is a phase-2 selection, not the phase-1 retention cadence.
+            protocol=replace(STAGE1_PROTOCOL, retention_cadence=None),
             source_sha="a" * 40,
             config_sha256={"hooke1": "c" * 64},
             checkpoints=list(HOOKE_A37),
