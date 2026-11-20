@@ -8,7 +8,9 @@
   callbacks/loggers/cadence now refuse with `UnsupportedMutableStateError` and
   the existing profile code. Positional Train loads are covered; admission
   precedes HI resolver evaluation. Indeterminate load syntax refuses with
-  `malformed-config`. Literal fresh and model-only loads skip profile admission.
+  `malformed-config`, including indeterminate runner targets with a possible
+  positional load (sixth argument or indeterminate `_args_`). Syntactically
+  determined fresh and model-only loads skip profile admission.
 - **Core restart primitives (CX-08)**: expose read-only published checkpoint
   discovery and atomic exclusive JSON receipt creation through `tpen.execution`.
   Discovery uses checkpoint publication records only; receipts never overwrite

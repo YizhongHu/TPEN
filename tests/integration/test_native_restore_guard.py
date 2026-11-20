@@ -299,13 +299,32 @@ def _assert_early_refusal(cfg, kwargs, code, raise_exceptions, tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("raise_exceptions", [True, False])
-def test_positional_resume_refuses_before_construction(tmp_path, monkeypatch, raise_exceptions):
+@pytest.mark.parametrize("target", ["literal", "embedded", "resolver"])
+def test_positional_resume_refuses_before_construction(tmp_path, monkeypatch, raise_exceptions, target):
     cfg = OmegaConf.load(FIXTURE)
     cfg.run.root = str(tmp_path / "successor")
     cfg.load = {"mode": "train_resume", "path": str(tmp_path / "unused")}
     _positional_load(cfg)
     cfg.callbacks.append({"_target_": "tpen.callback.FailureLog"})
-    _assert_early_refusal(cfg, {}, "unsupported-callback", raise_exceptions, tmp_path, monkeypatch)
+    calls = []
+
+    def resolve_target():
+        calls.append(True)
+        return "tpen.runner.Train"
+
+    name = "cx09_r5_target"
+    OmegaConf.register_new_resolver(name, resolve_target)
+    try:
+        if target == "embedded":
+            cfg.runner_kind = "Train"
+            cfg.runner._target_ = "tpen.runner.${runner_kind}"
+        elif target == "resolver":
+            cfg.runner._target_ = "${cx09_r5_target:}"
+        code = "unsupported-callback" if target == "literal" else "malformed-config"
+        _assert_early_refusal(cfg, {}, code, raise_exceptions, tmp_path, monkeypatch)
+        assert calls == []
+    finally:
+        OmegaConf.clear_resolver(name)
 
 
 @pytest.mark.parametrize("positional", [False, True])

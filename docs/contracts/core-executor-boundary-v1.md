@@ -293,3 +293,7 @@ references. Indeterminate load syntax (including resolver expressions, missing
 references, cycles, or duplicate positional/named Train loads) refuses with
 `UnsupportedMutableStateError.code == "malformed-config"`. Native admission
 precedes HI validation, so native refusal cannot execute HI config resolvers.
+An indeterminate runner target also refuses when `_args_` is indeterminate or
+contains a sixth argument that could be Train's load, even for a fresh load.
+An indeterminate target without positional arguments retains named-load handling;
+known literal non-Train targets retain their existing handling.

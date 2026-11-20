@@ -863,6 +863,11 @@ def configured_load_mode(config: Any) -> str:
         raise UnsupportedMutableStateError("runner must be a syntactically known mapping")
     load = runner.get("load")
     target = follow(runner.get("_target_"))
+    if target is _INVALID_SCALAR:
+        args = follow(runner.get("_args_", []))
+        # An unknown target may be Train; do not hide a possible positional load.
+        if args is _INVALID_SCALAR or isinstance(args, (list, tuple)) and len(args) >= 6:
+            raise UnsupportedMutableStateError("runner target leaves positional load indeterminate")
     if target in ("tpen.runner.Train", "tpen.runner.train.Train"):
         args = follow(runner.get("_args_", []))
         if not isinstance(args, (list, tuple)):
