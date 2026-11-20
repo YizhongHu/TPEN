@@ -15,7 +15,7 @@ from .._codec import canonical_bytes, decode_json, digest, fields, sha256_text
 from .._records import frozen_record
 from ..contracts import BackendJobId, GroupId
 from ..recovery import GroupReconciliationV2
-from ..storage import DirectoryStore, _ensure_directory, _require_regular, _write_new
+from ..storage import DirectoryStore, ensure_durable_directory, require_regular_file, publish_json_exclusive
 
 
 class BalsamGroupRefusal(RuntimeError):
@@ -111,7 +111,7 @@ class GroupBalsamClient(Protocol):
 
 
 def _read_record(path: Path, record_type: Any) -> Any:
-    _require_regular(str(path), "Balsam group record")
+    require_regular_file(str(path), "Balsam group record")
     payload = path.read_bytes()
     record = record_type.decode(payload)
     if payload != record.encode():
@@ -143,9 +143,9 @@ def register_group(
         raise TypeError("registration requires a typed intent and DirectoryStore")
     directory = Path(store.root, "balsam-groups", digest(intent.group_id.to_dict()))
     try:
-        _ensure_directory(store.root)
-        _ensure_directory(str(directory.parent))
-        _ensure_directory(str(directory))
+        ensure_durable_directory(store.root)
+        ensure_durable_directory(str(directory.parent))
+        ensure_durable_directory(str(directory))
         intent_path, receipt_path = directory / "intent.json", directory / "receipt.json"
         refusal_path = directory / "refusal.json"
         owns_intent = False
@@ -153,7 +153,7 @@ def register_group(
             if os.path.lexists(receipt_path) or os.path.lexists(refusal_path):
                 raise BalsamGroupRefusal("acknowledgement/refusal without intent")
             try:
-                _write_new(str(intent_path), intent.encode())
+                publish_json_exclusive(str(intent_path), intent.encode())
                 owns_intent = True
             except FileExistsError:
                 pass  # A competing controller owns the one possible call.
@@ -172,7 +172,7 @@ def register_group(
         try:
             job_id = client.register_group(intent)
         except BalsamGroupRefusal as error:
-            _write_new(str(refusal_path), canonical_bytes({
+            publish_json_exclusive(str(refusal_path), canonical_bytes({
                 "schema": "tpen-executor/balsam-group-refusal-v1",
                 "intent": intent.to_dict(), "reason": str(error),
             }))
@@ -182,7 +182,7 @@ def register_group(
         if not isinstance(job_id, BackendJobId):
             raise BalsamGroupParked("missing typed Job acknowledgement")
         receipt = BalsamGroupRegistrationReceipt(intent, job_id)
-        _write_new(str(receipt_path), receipt.encode())
+        publish_json_exclusive(str(receipt_path), receipt.encode())
         return receipt
     except (BalsamGroupRefusal, BalsamGroupParked):
         raise

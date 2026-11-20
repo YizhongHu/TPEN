@@ -5,6 +5,8 @@ import ast
 import builtins
 from dataclasses import replace
 import importlib
+import os
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +21,7 @@ from tpen_executor.lifecycle.balsam import (
     group_exit_code, make_group_application, register_group,
 )
 from tpen_executor.recovery import GroupReconciliationV2, MemberReconciliationV2
+from tpen_executor import storage
 from tpen_executor.storage import DirectoryStore
 
 
@@ -71,6 +74,128 @@ def test_registration_reuses_durable_job_and_never_observes_completion(tmp_path)
     assert client.observations == []
 
 
+class DirectoryCrashModel:
+    """POSIX fault model: file sync saves data, parent sync saves names.
+
+    The root (and its external ancestry) starts durable. Descendant names
+    survive a crash only if their parent was synced after they appeared.
+    This intentionally does not infer ancestor durability from a leaf sync.
+    """
+
+    def __init__(self, root, monkeypatch):
+        self.root = Path(root)
+        self.links = {self.root, *self.root.rglob("*")}
+        self.data = {self.inode(path.stat()) for path in self.links if path.is_file()}
+        monkeypatch.setattr(os, "fsync", self.fsync)
+
+    @staticmethod
+    def inode(info):
+        return info.st_dev, info.st_ino
+
+    def fsync(self, fd):
+        info = os.fstat(fd)
+        if stat.S_ISDIR(info.st_mode):
+            # Match the actual opened directory, not a helper call or path label.
+            for path in (self.root.parent, self.root, *self.root.rglob("*")):
+                if path.is_dir() and self.inode(path.stat()) == self.inode(info):
+                    self.links.update(path.iterdir())
+                    return
+        else:
+            self.data.add(self.inode(info))
+
+    def intent_is_durable(self):
+        leaf = self.root / "balsam-groups" / digest(_intent().group_id.to_dict())
+        intent = leaf / "intent.json"
+        return (all(path in self.links for path in
+                    (self.root, leaf.parent, leaf, intent))
+                and intent.is_file() and self.inode(intent.stat()) in self.data)
+
+    def crash(self):
+        # Only this test's tmp_path descendants are removed by the fault model.
+        def discard(path):
+            if path.is_dir():
+                for child in path.iterdir():
+                    discard(child)
+                path.rmdir()
+            else:
+                path.unlink()
+
+        def reopen(directory):
+            for path in list(directory.iterdir()):
+                if path not in self.links:
+                    discard(path)
+                elif path.is_dir():
+                    reopen(path)
+                elif self.inode(path.stat()) not in self.data:
+                    discard(path)
+        reopen(self.root)
+
+
+@pytest.mark.parametrize("tree", ["interrupted-creator", "fresh", "durable-existing"])
+def test_registration_directory_chain_survives_crash(tmp_path, monkeypatch, tree):
+    root = tmp_path / "store"
+    root.mkdir()
+    groups = root / "balsam-groups"
+    if tree == "durable-existing":
+        (groups / digest(_intent().group_id.to_dict())).mkdir(parents=True)
+    model = DirectoryCrashModel(root, monkeypatch)
+    store = DirectoryStore(root)
+    boundaries = []
+
+    class BoundaryClient(Client):
+        def register_group(self, intent):
+            # Record before acknowledging; assert outside adapter exception handling.
+            boundaries.append(model.intent_is_durable())
+            self.calls.append(intent)
+            return BackendJobId("job")
+
+    client = BoundaryClient(store)
+    receipts = []
+    if tree == "interrupted-creator":
+        mkdir = os.mkdir
+        suspended = []
+
+        class CreatorStopped(BaseException):
+            pass
+
+        def interrupt_creator(path, *args, **kwargs):
+            mkdir(path, *args, **kwargs)
+            if Path(path) == groups and not suspended:
+                suspended.append(True)
+                # Creator A is suspended after mkdir, before its parent fsync.
+                # B must establish durability even though the entry is visible.
+                receipts.append(register_group(_intent(), DirectoryStore(root), client))
+                raise CreatorStopped
+
+        with monkeypatch.context() as interruption:
+            interruption.setattr(os, "mkdir", interrupt_creator)
+            with pytest.raises(CreatorStopped):
+                register_group(_intent(), store, client)
+        assert suspended == [True]
+    else:
+        receipts.append(register_group(_intent(), store, client))
+
+    # Capture the pre-crash backend boundary independently of the reopen result.
+    before_crash = list(boundaries)
+    model.crash()
+    reopened = register_group(_intent(), DirectoryStore(root), client)
+    assert before_crash == [True], "backend called without durable ancestor chain and intent"
+    assert reopened == receipts[0]
+    assert boundaries == [True]
+    assert len(client.calls) == 1, "crash/reopen registered a second backend Job"
+
+
+@pytest.mark.parametrize("entry", ["file", "symlink"])
+def test_public_directory_publication_rejects_non_directory(tmp_path, entry):
+    target = tmp_path / "entry"
+    if entry == "file":
+        target.write_text("not a directory")
+    else:
+        target.symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(storage.FenceRejected):
+        storage.ensure_durable_directory(str(target))
+
+
 @pytest.mark.parametrize("field", ["group_digest", "backend_options_digest"])
 def test_changed_intent_is_typed_refusal(tmp_path, field):
     store = DirectoryStore(tmp_path / "store")
@@ -118,17 +243,17 @@ def test_intent_without_ack_parks_before_backend_call(tmp_path):
 def test_ack_publication_failure_cannot_resubmit(tmp_path, monkeypatch):
     store = DirectoryStore(tmp_path / "store")
     client = Client(store)
-    original = balsam._write_new
+    original = balsam.publish_json_exclusive
 
     def fail_ack(path, payload):
         if path.endswith("receipt.json"):
             raise OSError("write failed")
         return original(path, payload)
 
-    monkeypatch.setattr(balsam, "_write_new", fail_ack)
+    monkeypatch.setattr(balsam, "publish_json_exclusive", fail_ack)
     with pytest.raises(BalsamGroupParked):
         register_group(_intent(), store, client)
-    monkeypatch.setattr(balsam, "_write_new", original)
+    monkeypatch.setattr(balsam, "publish_json_exclusive", original)
     with pytest.raises(BalsamGroupParked):
         register_group(_intent(), store, client)
     assert len(client.calls) == 1
@@ -316,10 +441,12 @@ def test_absent_sdk_import_and_factory_refusal(monkeypatch):
 # Exact single-edit mutants for independent cluster verification; kills are
 # predictions until the verifier records call-phase assertions for each arm.
 MUTANTS = (
+    ("existing-directory-unsynced", "storage.py", '        _fsync_directory(os.path.dirname(path))  # durable existing publication', '        pass  # fault: visible link mistaken for durable link', "test_registration_directory_chain_survives_crash"),
+    ("backend-before-directory-chain", "lifecycle/balsam.py", '        ensure_durable_directory(store.root)', '        client.register_group(intent)\n        ensure_durable_directory(store.root)', "test_registration_directory_chain_survives_crash"),
     ("blind-resubmit", "lifecycle/balsam.py", '        if not owns_intent:\n', '        if False:\n', "test_lost_ack_never_registers_twice"),
     ("discard-intent", "lifecycle/balsam.py", '        if stored != intent:\n', '        if False:\n', "test_changed_intent_is_typed_refusal"),
     ("discard-receipt-binding", "lifecycle/balsam.py", '            if receipt.intent != intent:\n', '            if False:\n', "test_crossed_receipt_refuses_reuse"),
-    ("late-intent", "lifecycle/balsam.py", '                _write_new(str(intent_path), intent.encode())', '                client.register_group(intent)\n                _write_new(str(intent_path), intent.encode())', "test_registration_reuses_durable_job_and_never_observes_completion"),
+    ("late-intent", "lifecycle/balsam.py", '                publish_json_exclusive(str(intent_path), intent.encode())', '                client.register_group(intent)\n                publish_json_exclusive(str(intent_path), intent.encode())', "test_registration_reuses_durable_job_and_never_observes_completion"),
     ("job-allocation-confusion", "lifecycle/balsam.py", 'BackendJobId.from_mapping(data["backend_job_id"])', 'BackendJobId(data["backend_job_id"]["value"])', "test_registration_identity_types_and_strict_schema"),
     ("terminal-success", "lifecycle/balsam.py", '        if all(member.action == "preserve_completed" for member in outcome.members):', '        if outcome.aggregate == "settled":', "test_exit_table"),
     ("parked-success", "lifecycle/balsam.py", '    if isinstance(outcome, GroupFailure):\n        return contract.no_retry_code', '    if isinstance(outcome, GroupFailure):\n        return 0', "test_failure_exit_table"),
@@ -334,10 +461,10 @@ MUTANTS = (
 
 
 def test_mutant_anchor_uniqueness():
-    source = Path(balsam.__file__).read_text()
     names = set()
     for name, filename, before, after, killer in MUTANTS:
-        assert filename == "lifecycle/balsam.py"
+        assert filename in {"lifecycle/balsam.py", "storage.py"}
+        source = (Path(storage.__file__).parent / filename).read_text()
         assert name not in names
         names.add(name)
         assert source.count(before) == 1, name
