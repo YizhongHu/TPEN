@@ -1724,7 +1724,7 @@ class ReconciliationPublicationV2:
                     raise ValueError("successor binding is crossed or not fresh")
                 previous = allocation_attempts.get(successor.allocation_attempt.allocation_attempt_id)
                 if previous is not None and previous != successor.allocation_attempt:
-                    raise ValueError("conflicting allocation-attempt facts")
+                    raise ValueError("conflicting successor allocation-attempt facts")
                 allocation_attempts[successor.allocation_attempt.allocation_attempt_id] = successor.allocation_attempt
         # One allocation-attempt identity denotes one complete immutable record.
         # Storage constructs this candidate before writing any admission ledger;
