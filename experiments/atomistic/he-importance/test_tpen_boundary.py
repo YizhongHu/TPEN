@@ -191,7 +191,6 @@ class _HIPolicyOccurrence:
 
     filename: str
     consumer: str
-    source_module: str
     source_member: str
     import_kind: str
     line: int
@@ -209,11 +208,11 @@ def _dynamic_import_aliases(tree: ast.AST) -> _DynamicImportAliases:
                 if alias.name == "importlib":
                     importlib_modules.add(alias.asname or "importlib")
         elif isinstance(node, ast.ImportFrom):
-            if node.module == "importlib":
+            if node.level == 0 and node.module == "importlib":
                 for alias in node.names:
                     if alias.name == "import_module":
                         import_module_callables.add(alias.asname or alias.name)
-            elif node.module == "builtins":
+            elif node.level == 0 and node.module == "builtins":
                 for alias in node.names:
                     if alias.name == "__import__":
                         builtin_import_callables.add(alias.asname or alias.name)
@@ -224,17 +223,9 @@ def _dynamic_import_aliases(tree: ast.AST) -> _DynamicImportAliases:
     )
 
 
-def _dynamic_import_name(
-    node: ast.Call, aliases: _DynamicImportAliases | None = None
-) -> str | None:
+def _dynamic_import_name(node: ast.Call, aliases: _DynamicImportAliases) -> str | None:
     """Return the resolved dynamic-import spelling, if *node* uses one."""
 
-    if aliases is None:
-        aliases = _DynamicImportAliases(
-            frozenset({"importlib"}),
-            frozenset({"import_module"}),
-            frozenset({"__import__"}),
-        )
     if isinstance(node.func, ast.Name):
         if node.func.id in aliases.import_module_callables:
             return "import_module"
@@ -380,17 +371,22 @@ def _hi_policy_edges(source: str, *, filename: str) -> tuple[set[tuple[str, str,
     edges: set[tuple[str, str, str]] = set()
     occurrences: list[_HIPolicyOccurrence] = []
     violations: list[str] = []
-    schema_aliases: set[str] = set()
-    imported_symbols: dict[str, str] = {}
-    dynamic_imports: list[ast.Call] = []
-    dynamic_binding_names: set[str] = set()
+    schema_aliases: dict[str, set[str]] = {}
+    imported_symbols: dict[tuple[str, str], str] = {}
+    dynamic_imports: list[tuple[ast.Call, str]] = []
+    dynamic_binding_names: set[tuple[str, str]] = set()
+
+    def consumer_for(node: ast.AST) -> str:
+        return _enclosing_consumer(node, parents)
+
+    def aliases_for(consumer: str) -> set[str]:
+        return schema_aliases.setdefault(consumer, set())
 
     def add_occurrence(node: ast.AST, import_kind: str, source_member: str) -> None:
         occurrences.append(
             _HIPolicyOccurrence(
                 filename,
                 _enclosing_consumer(node, parents),
-                "tpen.hi_schema",
                 source_member,
                 import_kind,
                 getattr(node, "lineno", 0),
@@ -399,17 +395,18 @@ def _hi_policy_edges(source: str, *, filename: str) -> tuple[set[tuple[str, str,
 
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "tpen.hi_schema":
+            consumer = consumer_for(node)
             for alias in node.names:
                 local_name = alias.asname or alias.name
-                imported_symbols[local_name] = alias.name
+                imported_symbols[(consumer, local_name)] = alias.name
                 add_occurrence(node, "from-import", alias.name)
                 edges.add((filename, "from-import", alias.name))
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name == "tpen.hi_schema":
-                    schema_aliases.add(alias.asname or alias.name.split(".")[0])
+                    aliases_for(consumer_for(node)).add(alias.asname or alias.name.split(".")[0])
         elif isinstance(node, ast.Call) and _literal_dynamic_target(node, aliases) == "tpen.hi_schema":
-            dynamic_imports.append(node)
+            dynamic_imports.append((node, consumer_for(node)))
 
     # AST nodes do not retain parents; infer module bindings from assignments.
     for node in ast.walk(tree):
@@ -425,37 +422,46 @@ def _hi_policy_edges(source: str, *, filename: str) -> tuple[set[tuple[str, str,
             continue
         if _literal_dynamic_target(value, aliases) != "tpen.hi_schema":
             continue
+        consumer = consumer_for(node)
         names = [target.id for target in targets if isinstance(target, ast.Name)]
-        schema_aliases.update(names)
-        dynamic_binding_names.update(names)
+        aliases_for(consumer).update(names)
+        dynamic_binding_names.update((consumer, name) for name in names)
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name):
             continue
-        if node.value.id not in schema_aliases:
+        consumer = consumer_for(node)
+        if node.value.id not in schema_aliases.get(consumer, set()):
             continue
         if isinstance(node.ctx, ast.Load):
             add_occurrence(node, "dynamic-import", node.attr)
             edges.add((filename, "dynamic-import", node.attr))
 
-    def bound_member(expression: ast.AST) -> str | None:
+    def bound_member(expression: ast.AST, consumer: str) -> str | None:
         if isinstance(expression, ast.Name):
-            return imported_symbols.get(expression.id)
+            return imported_symbols.get((consumer, expression.id))
         if isinstance(expression, ast.Attribute) and isinstance(expression.value, ast.Name):
-            if expression.value.id in schema_aliases:
+            if expression.value.id in schema_aliases.get(consumer, set()):
                 return expression.attr
         return None
 
     for node in ast.walk(tree):
         assigned_name: str | None = None
+        consumer = consumer_for(node)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             assigned_name = node.name
         elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            assigned_name = imported_symbols.get(node.id, node.id)
-            if node.id in schema_aliases and node.id not in dynamic_binding_names:
+            assigned_name = imported_symbols.get((consumer, node.id), node.id)
+            if (
+                node.id in schema_aliases.get(consumer, set())
+                and (consumer, node.id) not in dynamic_binding_names
+            ):
                 violations.append("mutation of resolved tpen.hi_schema binding")
         elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            if isinstance(node.value, ast.Name) and node.value.id in schema_aliases:
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id in schema_aliases.get(consumer, set())
+            ):
                 assigned_name = node.attr
         if assigned_name in HI_POLICY_NAMES:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) or isinstance(
@@ -465,25 +471,24 @@ def _hi_policy_edges(source: str, *, filename: str) -> tuple[set[tuple[str, str,
 
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if node.func.attr in {"append", "extend", "clear", "pop", "remove", "update"}:
-                name = bound_member(node.func.value)
+                name = bound_member(node.func.value, consumer)
                 if name is not None:
                     violations.append(f"mutation of {name}")
-            if node.func.attr in {"setattr", "delattr"}:
-                continue
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in {"setattr", "delattr"} and len(node.args) >= 2:
                 target, member = node.args[:2]
                 if (
                     isinstance(target, ast.Name)
-                    and target.id in schema_aliases
+                    and target.id in schema_aliases.get(consumer, set())
                     and isinstance(member, ast.Constant)
                     and isinstance(member.value, str)
                 ):
                     violations.append(f"mutation of {member.value}")
 
-    for node in dynamic_imports:
+    for node, consumer in dynamic_imports:
         has_consumer = any(
             occurrence.import_kind == "dynamic-import"
+            and occurrence.consumer == consumer
             and occurrence.line > node.lineno
             for occurrence in occurrences
         )
@@ -550,7 +555,8 @@ def _assert_hi_policy_inventory(source_by_file: dict[str, str]) -> None:
         violations.extend(f"{filename}: {violation}" for violation in source_violations)
     violations.extend(f"unapproved HI-policy edge: {edge}" for edge in sorted(measured - HI_POLICY_ALLOWLIST))
     violations.extend(f"missing HI-policy edge: {edge}" for edge in sorted(HI_POLICY_ALLOWLIST - measured))
-    assert not violations, "HI policy boundary violations: " + "; ".join(violations)
+    if violations:
+        raise AssertionError("HI policy boundary violations: " + repr(violations))
 
 
 def _validate_inventory_admission(
@@ -1128,10 +1134,14 @@ def _valid_hi_policy_fixture() -> dict[str, str]:
             "def resolve_train_config():\n"
             '    schema = import_module("tpen.hi_schema")\n'
             "    return schema.validate_hi_train_config\n"
+            "def describe(schema):\n"
+            "    return schema.title\n"
         ),
         "run_stage_q.py": (
             "def _roster():\n"
             "    from tpen.hi_schema import HI_METHOD_ROSTER\n"
+            "    from .importlib import import_module as load\n"
+            '    load("tpen.hi_schema")\n'
             "    return tuple(HI_METHOD_ROSTER)\n"
         ),
         "optimizer_grid.py": (
@@ -1144,7 +1154,7 @@ def _valid_hi_policy_fixture() -> dict[str, str]:
 
 
 def _assert_hi_fixture_rejects(
-    source_by_file: dict[str, str], diagnostic: str
+    source_by_file: dict[str, str], diagnostics: tuple[str, ...]
 ) -> None:
     """Route one injected fault through the public enforcement entry point."""
 
@@ -1153,8 +1163,10 @@ def _assert_hi_fixture_rejects(
     except AssertionError as error:
         message = str(error)
     else:
-        raise AssertionError(f"injected HI-policy fault was admitted: {diagnostic}")
-    assert diagnostic in message, message
+        raise AssertionError(f"injected HI-policy fault was admitted: {diagnostics}")
+    prefix = "HI policy boundary violations: "
+    assert message.startswith(prefix), message
+    assert tuple(ast.literal_eval(message[len(prefix) :])) == diagnostics, message
 
 
 def test_hi_policy_complete_fixture_passes_enforcement_entry_point() -> None:
@@ -1168,12 +1180,15 @@ def test_hi_policy_rejects_unlisted_import_and_redefinition() -> None:
     )
     edges, violations = _hi_policy_edges(low_level_source, filename="optimizer_grid.py")
     assert ("optimizer_grid.py", "from-import", "validate_hi_train_config") in edges
-    assert any("redefinition/mutation" in violation for violation in violations)
+    assert violations == ("redefinition/mutation of HI_METHOD_ROSTER",)
     assert any(edge not in HI_POLICY_ALLOWLIST for edge in edges)
 
     with_source = _valid_hi_policy_fixture()
     with_source["optimizer_grid.py"] += "\n    HI_METHOD_ROSTER = ()\n"
-    _assert_hi_fixture_rejects(with_source, "redefinition/mutation of HI_METHOD_ROSTER")
+    _assert_hi_fixture_rejects(
+        with_source,
+        ("optimizer_grid.py: redefinition/mutation of HI_METHOD_ROSTER",),
+    )
 
 
 def test_hi_policy_rejects_dynamic_import_aliases_at_enforcement_boundary() -> None:
@@ -1205,7 +1220,8 @@ def test_hi_policy_rejects_dynamic_import_aliases_at_enforcement_boundary() -> N
             "    return roster\n"
         )
         _assert_hi_fixture_rejects(
-            source_by_file, "unrecognized tpen.hi_schema dynamic import"
+            source_by_file,
+            ("optimizer_grid.py: unrecognized tpen.hi_schema dynamic import",),
         )
 
 
@@ -1215,7 +1231,18 @@ def test_hi_policy_rejects_wrong_symbol_alias_at_enforcement_boundary() -> None:
         "from tpen.hi_schema import HI_METHOD_ROSTER",
         "from tpen.hi_schema import HI_TRAIN_SCHEMA as HI_METHOD_ROSTER",
     )
-    _assert_hi_fixture_rejects(source_by_file, "HI_TRAIN_SCHEMA")
+    _assert_hi_fixture_rejects(
+        source_by_file,
+        (
+            "run_stage_q.py: unapproved HI-policy occurrence: "
+            "('run_stage_q.py', '_roster', 'from-import', 'HI_TRAIN_SCHEMA')",
+            "run_stage_q.py: missing HI-policy occurrence multiplicity: "
+            "('run_stage_q.py', '_roster', 'from-import', 'HI_METHOD_ROSTER'); "
+            "actual=0, expected=1",
+            "unapproved HI-policy edge: ('run_stage_q.py', 'from-import', 'HI_TRAIN_SCHEMA')",
+            "missing HI-policy edge: ('run_stage_q.py', 'from-import', 'HI_METHOD_ROSTER')",
+        ),
+    )
 
 
 def test_hi_policy_rejects_duplicate_or_other_member_consumption() -> None:
@@ -1224,14 +1251,28 @@ def test_hi_policy_rejects_duplicate_or_other_member_consumption() -> None:
         "return schema.HI_METHOD_ROSTER",
         "return (schema.HI_METHOD_ROSTER, schema.HI_METHOD_ROSTER)[0]",
     )
-    _assert_hi_fixture_rejects(duplicate, "actual=2, expected=1")
+    _assert_hi_fixture_rejects(
+        duplicate,
+        (
+            "optimizer_grid.py: unexpected HI-policy occurrence multiplicity: "
+            "('optimizer_grid.py', 'roster_availability', 'dynamic-import', "
+            "'HI_METHOD_ROSTER'); actual=2, expected=1",
+        ),
+    )
 
     other_member = _valid_hi_policy_fixture()
     other_member["optimizer_grid.py"] = other_member["optimizer_grid.py"].replace(
         "return schema.HI_METHOD_ROSTER",
         "policy = schema.HI_TRAIN_SCHEMA\n    return schema.HI_METHOD_ROSTER",
     )
-    _assert_hi_fixture_rejects(other_member, "HI_TRAIN_SCHEMA")
+    _assert_hi_fixture_rejects(
+        other_member,
+        (
+            "optimizer_grid.py: unapproved HI-policy occurrence: "
+            "('optimizer_grid.py', 'roster_availability', 'dynamic-import', 'HI_TRAIN_SCHEMA')",
+            "unapproved HI-policy edge: ('optimizer_grid.py', 'dynamic-import', 'HI_TRAIN_SCHEMA')",
+        ),
+    )
 
 
 def test_hi_policy_whitespace_shift_preserves_structural_inventory() -> None:
@@ -1242,18 +1283,21 @@ def test_hi_policy_whitespace_shift_preserves_structural_inventory() -> None:
 
 def test_hi_policy_rejects_assignment_deletion_and_literal_mutation() -> None:
     mutations = (
-        "    schema.HI_METHOD_ROSTER = ()\n",
-        "    del schema.HI_METHOD_ROSTER\n",
-        '    setattr(schema, "HI_METHOD_ROSTER", ())\n',
-        '    delattr(schema, "HI_METHOD_ROSTER")\n',
+        ("    schema.HI_METHOD_ROSTER = ()\n", "redefinition/mutation"),
+        ("    del schema.HI_METHOD_ROSTER\n", "redefinition/mutation"),
+        ('    setattr(schema, "HI_METHOD_ROSTER", ())\n', "mutation"),
+        ('    delattr(schema, "HI_METHOD_ROSTER")\n', "mutation"),
     )
-    for mutation in mutations:
+    for mutation, kind in mutations:
         source_by_file = _valid_hi_policy_fixture()
         source_by_file["optimizer_grid.py"] = source_by_file["optimizer_grid.py"].replace(
             "    return schema.HI_METHOD_ROSTER\n",
             "    return schema.HI_METHOD_ROSTER\n" + mutation,
         )
-        _assert_hi_fixture_rejects(source_by_file, "HI_METHOD_ROSTER")
+        _assert_hi_fixture_rejects(
+            source_by_file,
+            (f"optimizer_grid.py: {kind} of HI_METHOD_ROSTER",),
+        )
 
 
 def test_hi_policy_rejects_dynamic_import_aliases_in_crossing_census() -> None:
@@ -1265,6 +1309,15 @@ def test_hi_policy_rejects_dynamic_import_aliases_in_crossing_census() -> None:
         assert _detect_crossings(source) == (
             Crossing(2, "tpen.anything", sanctioned=False),
         )
+
+
+def test_hi_policy_ignores_relative_import_helpers_in_both_scanners() -> None:
+    source = (
+        "from .importlib import import_module as load\n"
+        'load("tpen.hi_schema")\n'
+    )
+    assert _detect_crossings(source) == ()
+    _assert_hi_policy_inventory(_valid_hi_policy_fixture())
 
 
 def test_hi_policy_rejects_literal_core_to_experiments_import() -> None:
