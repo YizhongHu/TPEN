@@ -259,14 +259,19 @@ def test_retained_cache_refresh_matches_fresh_unchanged_model_and_preserves_rng(
 
 
 def test_retained_cache_refresh_is_one_boundary_evaluation_not_per_step() -> None:
-    sampler = MetropolisSampler(n_walkers=4, burn_in=0, n_steps=2, seed=123, dtype=torch.float64)
+    n_steps = 4
+    sampler = MetropolisSampler(n_walkers=4, burn_in=0, n_steps=n_steps, seed=123, dtype=torch.float64)
     model = CountingLinearModel()
     sampler.collect_samples(model, reset=True)
-    assert model.calls == 2
+    # A reset starts with uncached walkers: one current-value evaluation plus
+    # one proposal evaluation per production step.
+    assert model.calls == 1 + n_steps
 
     model.calls = 0
     sampler.collect_samples(model)
-    assert model.calls == 3  # one retained-cache refresh plus two proposals
+    # A retained collect refreshes current values once at the boundary, then
+    # evaluates one proposal per step (never re-evaluating current walkers).
+    assert model.calls == 1 + n_steps
 
 
 def test_sampler_state_dict_roundtrip_continues_same_chain() -> None:
@@ -297,7 +302,11 @@ def test_restored_walkers_refresh_against_changed_model_on_next_collect() -> Non
     actual_sampler.load_mcmc_state_dict(state)
     expected_sampler.load_mcmc_state_dict(state)
     assert expected_sampler.walkers is not None
-    expected = expected_sampler.step(shifted, expected_sampler.walkers.update_cache(shifted))
+    refreshed = expected_sampler.walkers.update_cache(shifted)
+    # The restored state has already burned in, so the public collect performs
+    # exactly the production steps below; keep this oracle independent of its
+    # refresh implementation and match that step count explicitly.
+    expected = expected_sampler.sample(shifted, refreshed, expected_sampler.n_steps)
     actual, _ = actual_sampler.collect_samples(shifted)
 
     assert torch.equal(actual.positions, expected.positions)
