@@ -94,6 +94,21 @@ Allocation-attempt IDs are also one-to-one with complete attempt facts across
 the controller, member bindings, and proposed successors; conflicting facts
 park before any admission ledger write.
 
+### Controller authority ledger
+
+`ControllerGenerationV1` is the store-owned, canonical authority record for a
+`GroupId`. `DirectoryStore.acquire_controller_generation()` writes only the
+next generation under a per-group lock, linked to the exact digest of its
+predecessor; an identical retry is idempotent and stale, skipped, or forked
+records are refused. `require_current_controller()` rereads that ledger before
+publication or launch work. A `LaunchIntentV1` is created exactly once in the
+member attempt directory while the task lock is held. Recovery may read an
+intent, but an existing intent without an executor acknowledgement is a
+permanent park decision for the controller layer; this storage slice never
+relaunches it. Every controller incarnation must supply a freshly generated,
+unique claimant nonce; retries reuse the same canonical record rather than
+minting a second nonce.
+
 ## GPU placement qualification
 
 The L1a v2 placement receipt reports an explicit reason class: `not-sampled`,

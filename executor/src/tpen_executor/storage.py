@@ -15,8 +15,8 @@ from typing import Any
 from uuid import uuid4
 
 from ._codec import canonical_bytes, decode_json, digest, fields, sha256_text, text, thaw
-from .allocations import AllocationAttemptV2, ConfiguredAllocation, MemberInvocationV2
-from .contracts import AllocationId, AttemptId, BackendJobId, InvocationId, ReadyGroup, ReadyGroupV2
+from .allocations import AllocationAttemptV2, ConfiguredAllocation, ControllerGenerationV1, LaunchIntentV1, MemberInvocationV2
+from .contracts import AllocationId, AttemptId, BackendJobId, GroupId, InvocationId, ReadyGroup, ReadyGroupV2
 from .results import (
     AcceptedSegment, CoreOutcomeRecord, ManifestAttempt, OutcomeReceipt, PLACEMENT_RECEIPT_TYPES, RemoteTeardownReceipt, RunManifest,
     SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3, StartReceipt,
@@ -34,6 +34,14 @@ class AdmissionFork(FenceRejected):
     """Raised when one predecessor is presented with a different successor."""
 
     code = "fork"
+
+
+class ControllerGenerationRejected(FenceRejected):
+    """Raised when a controller generation is stale, crossed, or forked."""
+
+
+class LaunchIntentRejected(FenceRejected):
+    """Raised when a member launch intent cannot be created or read safely."""
 
 
 @frozen_record
@@ -120,6 +128,9 @@ _SUCCESSOR_ADMISSION_SCHEMA = "tpen.execution/successor-admission-request-v1"
 _REMOTE_TEARDOWN_FILENAME = "remote-teardown.json"
 _TEARDOWN_UNCONFIRMED_REASON = "teardown-unconfirmed"
 _LEAF_TEARDOWN_SCHEMA = "tpen-executor/leaf-teardown-v1"
+_CONTROLLER_LEDGER_DIR = "controller-generations"
+_CONTROLLER_LOCK = "controller.lock"
+_LAUNCH_INTENT_FILENAME = "launch-intent.json"
 
 
 def _fsync_directory(path: str) -> None:
@@ -325,6 +336,172 @@ class DirectoryStore:
         if not _inside(self.root, path):
             raise FenceRejected("group path escapes store root")
         return path
+
+    def _controller_dir(self, group: ReadyGroupV2 | GroupId) -> str:
+        """Return the durable controller ledger directory for a GroupId."""
+        if not isinstance(group, (ReadyGroupV2, GroupId)):
+            raise TypeError("controller authority requires a ReadyGroupV2")
+        # Hashing the opaque identity keeps arbitrary GroupId text out of paths.
+        group_id = group.group_id if isinstance(group, ReadyGroupV2) else group
+        group_key = digest(group_id.to_dict())
+        path = _lexical(os.path.join(self.root, "groups", group_key, _CONTROLLER_LEDGER_DIR))
+        if not _inside(self.root, path):
+            raise ControllerGenerationRejected("controller ledger escapes store root")
+        return path
+
+    def _controller_records(self, directory: str, group_id: GroupId) -> list[ControllerGenerationV1]:
+        """Load and validate the complete canonical generation chain."""
+        records: list[tuple[int, ControllerGenerationV1]] = []
+        for name in os.listdir(directory):
+            if name == _CONTROLLER_LOCK or name.startswith(".tmp-"):
+                continue
+            match = re.fullmatch(r"generation-(\d+)\.json", name)
+            if match is None:
+                raise ControllerGenerationRejected("unexpected controller ledger entry")
+            path = os.path.join(directory, name)
+            _require_regular(path, "controller generation", ControllerGenerationRejected)
+            encoded = Path(path).read_bytes()
+            try:
+                record = ControllerGenerationV1.decode(encoded)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+                raise ControllerGenerationRejected("controller generation is malformed") from error
+            if encoded != record.encode() or int(match.group(1)) != record.generation or record.group_id != group_id:
+                raise ControllerGenerationRejected("controller generation identity is crossed")
+            records.append((record.generation, record))
+        records.sort(key=lambda item: item[0])
+        if records and records[0][0] != 1 or any(number != index for index, (number, _) in enumerate(records, 1)):
+            raise ControllerGenerationRejected("controller generation chain is not contiguous")
+        previous = None
+        for _, record in records:
+            expected = None if previous is None else previous.record_digest
+            if record.predecessor_record_digest != expected:
+                raise ControllerGenerationRejected("controller generation predecessor is crossed")
+            previous = record
+        return [record for _, record in records]
+
+    def _prepare_controller_dir(self, group: ReadyGroupV2) -> str:
+        """Create and durably publish the controller ledger ancestry."""
+        directory = self._controller_dir(group)
+        group_dir = os.path.dirname(directory)
+        ensure_durable_directory(self.root)
+        ensure_durable_directory(os.path.join(self.root, "groups"))
+        ensure_durable_directory(group_dir)
+        ensure_durable_directory(directory)
+        return directory
+
+    def _current_controller_locked(self, directory: str, group_id: GroupId,
+                                   expected: ControllerGenerationV1 | None = None) -> ControllerGenerationV1:
+        """Load, sync, and optionally compare authority with the lock held."""
+        records = self._controller_records(directory, group_id)
+        _fsync_directory(directory)  # authority gate barrier
+        if not records:
+            raise ControllerGenerationRejected("controller ledger is empty")
+        current = records[-1]
+        if expected is not None and current.encode() != expected.encode():
+            raise ControllerGenerationRejected("controller record is not current")
+        return current
+
+    def acquire_controller_generation(self, group: ReadyGroupV2, record: ControllerGenerationV1) -> ControllerGenerationV1:
+        """Durably acquire the next controller generation for ``group``.
+
+        Identical retries return the existing canonical record.  A skipped,
+        stale, or forked generation is refused before any replacement write.
+        """
+        if not isinstance(record, ControllerGenerationV1) or record.group_id != group.group_id:
+            raise ControllerGenerationRejected("controller generation is crossed")
+        directory = self._prepare_controller_dir(group)
+        with _task_lock(os.path.join(directory, _CONTROLLER_LOCK)):
+            records = self._controller_records(directory, group.group_id)
+            _fsync_directory(directory)  # replay barrier
+            current = records[-1] if records else None
+            if current is not None and record.generation == current.generation and record.encode() == current.encode():
+                return current
+            expected = 1 if current is None else current.generation + 1
+            predecessor = None if current is None else current.record_digest
+            if record.generation != expected or record.predecessor_record_digest != predecessor:
+                raise ControllerGenerationRejected("controller generation is stale, skipped, or forked")
+            path = os.path.join(directory, f"generation-{record.generation}.json")
+            try:
+                _write_new(path, record.encode())
+            except FileExistsError as error:
+                raise ControllerGenerationRejected("controller generation write is ambiguous") from error
+            return record
+
+    def require_current_controller(self, group: ReadyGroupV2 | GroupId, generation: int, nonce: str) -> ControllerGenerationV1:
+        """Re-read and require the highest generation and exact claimant nonce."""
+        if type(generation) is not int or generation < 1 or type(nonce) is not str:
+            raise ControllerGenerationRejected("invalid controller authority")
+        directory = self._controller_dir(group)
+        try:
+            with _task_lock(os.path.join(directory, _CONTROLLER_LOCK)):
+                current = self._current_controller_locked(directory, group.group_id if isinstance(group, ReadyGroupV2) else group)
+        except (FileNotFoundError, OSError, FenceRejected, ValueError, TypeError) as error:
+            raise ControllerGenerationRejected("controller ledger is unavailable") from error
+        if current.generation != generation or current.claimant_nonce != nonce:
+            raise ControllerGenerationRejected("controller is not current")
+        return current
+
+    def create_launch_intent(self, fence: AttemptFence, controller_record: ControllerGenerationV1,
+                             invocation: MemberInvocationV2) -> LaunchIntentV1:
+        """Exclusively create one launch intent after a current-controller check."""
+        if not isinstance(controller_record, ControllerGenerationV1) or not isinstance(invocation, MemberInvocationV2):
+            raise TypeError("launch intent requires typed controller and invocation records")
+        directory = self._controller_dir(controller_record.group_id)
+        with _task_lock(os.path.join(directory, _CONTROLLER_LOCK)):
+            current = self._current_controller_locked(directory, controller_record.group_id, controller_record)
+            task_dir = self._task_dir_for_fence(fence)
+            with _task_lock(os.path.join(task_dir, _TASK_LOCK)):
+                start = self._validate_fence(fence, task_dir)
+                self._validate_invocation(start, invocation)  # durable intent gate
+                if (invocation.attempt_id != fence.attempt_id
+                        or invocation.group_digest != fence.group_digest
+                        or invocation.allocation_attempt.group_id != controller_record.group_id
+                        or invocation.allocation_attempt.allocation_id != controller_record.allocation_id
+                        or invocation.allocation_attempt.backend_job_id != controller_record.backend_job_id):
+                    raise LaunchIntentRejected("launch intent binding crosses its fence")
+                intent = LaunchIntentV1(current.group_id, fence.task_id, fence.attempt_id, invocation.invocation_id,
+                                        current.generation, current.claimant_nonce,
+                                        current.allocation_id, current.backend_job_id)
+                intent_path = os.path.join(fence.output_dir, _LAUNCH_INTENT_FILENAME)
+                if os.path.lexists(intent_path):
+                    raise LaunchIntentRejected("launch intent already exists")
+                try:
+                    _write_new(intent_path, intent.encode())
+                except FileExistsError as error:
+                    raise LaunchIntentRejected("launch intent already exists") from error
+                return intent
+
+    def read_launch_intent(self, fence: AttemptFence) -> LaunchIntentV1:
+        """Read a canonical historical launch intent for recovery.
+
+        The attempt start and invocation binding are revalidated, but current
+        controller authority is deliberately not required: an old intent is
+        evidence for permanent parking, never permission to relaunch.
+        """
+        task_dir = self._task_dir_for_fence(fence)
+        path = os.path.join(fence.output_dir, _LAUNCH_INTENT_FILENAME)
+        with _task_lock(os.path.join(task_dir, _TASK_LOCK)):
+            try:
+                start = self._validate_fence_immutable(fence, task_dir)
+                invocation_path = os.path.join(fence.output_dir, "invocation.json")
+                _require_regular(invocation_path, "invocation binding")
+                invocation_bytes = Path(invocation_path).read_bytes()
+                invocation = MemberInvocationV2.decode(invocation_bytes)
+                self._validate_invocation(start, invocation)
+                _require_regular(path, "launch intent", LaunchIntentRejected)
+                encoded = Path(path).read_bytes()
+                intent = LaunchIntentV1.decode(encoded)
+                if encoded != intent.encode():
+                    raise LaunchIntentRejected("launch intent is not canonical")
+            except (OSError, ValueError, TypeError) as error:
+                raise LaunchIntentRejected("launch intent is unreadable") from error
+        if (intent.attempt_id != fence.attempt_id or intent.task_id != fence.task_id
+                or intent.group_id != invocation.allocation_attempt.group_id
+                or intent.invocation_id != invocation.invocation_id
+                or intent.allocation_id != invocation.allocation_attempt.allocation_id
+                or intent.backend_job_id != invocation.allocation_attempt.backend_job_id):
+            raise LaunchIntentRejected("launch intent is crossed")
+        return intent
 
     @staticmethod
     def _validate_task_id(task_id: str) -> None:
@@ -1489,17 +1666,8 @@ class DirectoryStore:
                 raise FenceRejected("accepted segment progress coordinate is not strictly increasing")
         return tuple(ordered)
 
-    def _validate_fence(self, fence: AttemptFence, task_dir: str) -> StartReceipt:
-        """Validate pointer, path, and every start-receipt fence binding."""
-        pointer = os.path.join(task_dir, "current-attempt.json")
-        _require_regular(pointer, "current attempt pointer")
-        try:
-            current = decode_json(Path(pointer).read_bytes())
-            fields(current, {"schema", "attempt_id"}, "tpen-executor/current-attempt-v1", "current attempt")
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
-            raise FenceRejected("current attempt pointer is unavailable") from error
-        if current["attempt_id"] != fence.attempt_id.value:
-            raise FenceRejected("stale attempt fence")
+    def _validate_fence_immutable(self, fence: AttemptFence, task_dir: str) -> StartReceipt:
+        """Validate the immutable attempt path and start receipt binding."""
         expected = _lexical(os.path.join(task_dir, fence.attempt_id.value))
         if expected != _lexical(fence.output_dir):
             raise FenceRejected("crossed attempt fence")
@@ -1519,6 +1687,19 @@ class DirectoryStore:
         ):
             raise FenceRejected("crossed attempt fence")
         return start
+
+    def _validate_fence(self, fence: AttemptFence, task_dir: str) -> StartReceipt:
+        """Validate current pointer plus immutable attempt fence binding."""
+        pointer = os.path.join(task_dir, "current-attempt.json")
+        _require_regular(pointer, "current attempt pointer")
+        try:
+            current = decode_json(Path(pointer).read_bytes())
+            fields(current, {"schema", "attempt_id"}, "tpen-executor/current-attempt-v1", "current attempt")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+            raise FenceRejected("current attempt pointer is unavailable") from error
+        if current["attempt_id"] != fence.attempt_id.value:
+            raise FenceRejected("stale attempt fence")
+        return self._validate_fence_immutable(fence, task_dir)
 
     def manifest(self, group: ReadyGroup) -> RunManifest:
         """Rebuild a strict manifest only from durable receipts on disk.
@@ -1690,4 +1871,4 @@ def _write_pointer(path: str, attempt_id: str) -> None:
             except FileNotFoundError: pass
 
 
-__all__ = ["AdmissionFork", "AttemptFence", "DirectoryStore", "FenceRejected"]
+__all__ = ["AdmissionFork", "AttemptFence", "ControllerGenerationRejected", "DirectoryStore", "FenceRejected", "LaunchIntentRejected"]
