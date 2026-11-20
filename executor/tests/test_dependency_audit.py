@@ -9,6 +9,23 @@ SOURCE_ROOT = Path(__file__).parents[1] / "src" / "tpen_executor"
 FORBIDDEN_ROOTS = {"tpen", "experiments", "torch", "parsl", "balsam"}
 CONFIGURATION_ROOTS = {"hydra", "omegaconf"}
 OPTIONAL_IMPORT_PATH = Path("dispatch/parsl.py")
+BALSAM_IMPORT_PATH = Path("lifecycle/balsam.py")
+
+
+def _allowed_balsam_import(path: Path, node: ast.AST, tree: ast.Module) -> bool:
+    """Allow exactly one static SDK import in the named top-level factory."""
+    imports = [candidate for candidate in ast.walk(tree)
+               if isinstance(candidate, (ast.Import, ast.ImportFrom))
+               and "balsam" in _import_roots(candidate)]
+    factories = [candidate for candidate in tree.body
+                 if isinstance(candidate, ast.FunctionDef) and candidate.name == "make_group_application"]
+    return (
+        path == BALSAM_IMPORT_PATH and len(imports) == len(factories) == 1
+        and node is imports[0] and node in list(ast.walk(factories[0]))
+        and isinstance(node, ast.ImportFrom) and node.level == 0
+        and node.module == "balsam" and len(node.names) == 1
+        and node.names[0].name == "api" and node.names[0].asname == "loaded_api"
+    )
 
 
 def _constructor_lines(tree: ast.AST) -> set[int]:
@@ -68,6 +85,8 @@ def test_source_imports_only_stdlib_or_executor() -> None:
                     relative = path.relative_to(SOURCE_ROOT)
                     if root == "parsl" and _allowed_parsl_import(relative, node, constructor_lines):
                         continue
+                    if root == "balsam" and _allowed_balsam_import(relative, node, tree):
+                        continue
                     if root in FORBIDDEN_ROOTS or (root in CONFIGURATION_ROOTS and relative not in {Path("configuration.py"), Path("programs.py")}):
                         violations.append(f"{path}: {root}")
                     elif root not in {"tpen_executor", *CONFIGURATION_ROOTS} and root not in sys.stdlib_module_names:
@@ -98,3 +117,20 @@ def test_source_has_no_dynamic_forbidden_imports() -> None:
             elif root is not None and root not in {"tpen_executor", *CONFIGURATION_ROOTS} and root not in sys.stdlib_module_names:
                 violations.append(f"{path}:{node.lineno}: non-stdlib {root}")
     assert not violations, "forbidden dynamic executor imports: " + ", ".join(violations)
+
+
+def test_balsam_allowlist_is_exact() -> None:
+    tree = ast.parse((SOURCE_ROOT / BALSAM_IMPORT_PATH).read_text())
+    imports = [node for node in ast.walk(tree)
+               if isinstance(node, (ast.Import, ast.ImportFrom)) and "balsam" in _import_roots(node)]
+    assert len(imports) == 1
+    assert _allowed_balsam_import(BALSAM_IMPORT_PATH, imports[0], tree)
+    assert not _allowed_balsam_import(Path("other.py"), imports[0], tree)
+    for source in (
+        "from balsam import api as loaded_api",
+        "def other():\n    from balsam import api as loaded_api",
+        "def make_group_application():\n    import balsam",
+        "def make_group_application():\n    from balsam import api as loaded_api\n    from balsam import api as loaded_api",
+    ):
+        invalid = ast.parse(source)
+        assert not any(_allowed_balsam_import(BALSAM_IMPORT_PATH, node, invalid) for node in ast.walk(invalid))
