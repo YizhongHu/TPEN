@@ -200,11 +200,12 @@ def test_newer_complete_checkpoint_is_parked_before_start(tmp_path: Path, monkey
     from experiments.atomistic.stage1 import restart
 
     run_dir = tmp_path / "run"
+    (run_dir / "checkpoints").mkdir(parents=True)
     monkeypatch.setattr(restart, "discover_published_checkpoint", lambda _path: None)
     monkeypatch.setattr(
         restart,
-        "_check_newer_complete",
-        lambda **_kwargs: (_ for _ in ()).throw(restart.RestartPark("newer complete")),
+        "_complete_refs",
+        lambda _root: [SimpleNamespace(next_iteration=1000, checkpoint_dir=run_dir / "checkpoints" / "step_001000")],
     )
     selected = select_restart(cfg=_cfg(), row=_row(tmp_path), run_dir=run_dir)
     assert selected.decision is StartDecision.PARK
