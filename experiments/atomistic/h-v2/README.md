@@ -580,6 +580,9 @@ changes from 90 to 60 days at the 2026-12-07 maintenance; this run's HPSS
 archive must be made before the applicable cutoff, and the live policy should be
 rechecked after the maintenance. Sources: the [FASRC announcement](https://www.rc.fas.harvard.edu/blog/netscratch-retention-change/)
 and [scratch policy](https://docs.rc.fas.harvard.edu/kb/policy-scratch/).
+The scratch-policy page still contains older 90-day body/table passages below
+its new notice; those passages describe the pre-cutover policy and are not a
+post-maintenance retention guarantee.
 The Holystore set is chosen retroactively, after the analysis; about
 26 to 28 GiB is acceptable for now, and excludes the checkpoints themselves
 (operator: "archive everything leading up to the conclusion except the
