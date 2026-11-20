@@ -9,6 +9,8 @@ The non-finite policy is declared independently at each evaluator seam. L3a
 retains rows with provenance and rejects the resulting artifact, while the
 adjacent L3b ranking evaluator declares ``defer``. This declaration is
 deliberate; L3a does not inherit trainer ruling 377f6b0f's raise-always policy.
+Artifact checkpoint and chain identifiers are screened at the rank-artifact
+guard before duplicate, completeness, or non-finite checks.
 """
 
 from __future__ import annotations
@@ -163,19 +165,37 @@ def evaluate_local_energy_rows(
 
 
 def require_complete_rank_artifact(states: Sequence[InferenceState], *, expected_checkpoint_ids: Sequence[str]) -> None:
-    """Refuse partial or nonfinite checkpoint artifacts before any ranking step.
+    """Refuse blinded, partial, or nonfinite checkpoint artifacts before ranking.
+
+    Checkpoint and row identifiers are screened shallowly at this boundary;
+    payload traversal remains owned by the producer seams.
 
     Raises
     ------
     EvaluatorQualificationError
-        If ``expected_checkpoint_ids`` contains duplicated IDs.
+        If an expected, state, or row checkpoint/chain identifier contains
+        blinding-bearing content, or if ``expected_checkpoint_ids`` contains
+        duplicated IDs.
     IncompleteRankArtifactError
         If the artifact contains missing, extra, or duplicated actual
         checkpoint IDs, or contains a nonfinite local-energy state.
     """
 
-    actual = tuple(state.checkpoint_id for state in states)
     expected = tuple(expected_checkpoint_ids)
+    for index, checkpoint_id in enumerate(expected):
+        _refuse_blinding_content(checkpoint_id, f"rank-artifact expected checkpoint id[{index}]")
+    for state_index, state in enumerate(states):
+        _refuse_blinding_content(state.checkpoint_id, f"rank-artifact state[{state_index}] checkpoint id")
+        for row_index, row in enumerate(state.rows):
+            _refuse_blinding_content(
+                row.checkpoint_id,
+                f"rank-artifact state[{state_index}] row[{row_index}] checkpoint id",
+            )
+            _refuse_blinding_content(
+                row.chain_id,
+                f"rank-artifact state[{state_index}] row[{row_index}] chain id",
+            )
+    actual = tuple(state.checkpoint_id for state in states)
     duplicate_expected = tuple(
         dict.fromkeys(checkpoint_id for checkpoint_id in expected if expected.count(checkpoint_id) > 1)
     )
