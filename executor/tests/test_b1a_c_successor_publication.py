@@ -235,7 +235,7 @@ MUTANTS = (
     ("uuid4-admitted-successor", "storage.py", "output_dir = _lexical(os.path.join(task_dir, successor.attempt_id.value))", "output_dir = _lexical(os.path.join(task_dir, AttemptId(uuid4().hex).value))", "test_admitted_successor_consumes_exact_identity_and_replays"),
     ("skip-admission-reread", "storage.py", "records = self._admission_records_for_task(task_dir, task_id)", "records = ()", "test_admitted_successor_requires_durable_admission"),
     ("force-current-lease", "storage.py", "binding.allocation_attempt.group_id != group.group_id", "False", "test_other_group_binding_parks"),
-    ("restore-single-lease-gate", "storage.py", "if (binding.allocation_attempt.group_id != group.group_id\n                            or binding.lineage_id != task.lineage_id", "if binding.allocation_attempt != allocation_attempt:", "test_publication_accepts_prior_attempts_under_new_controller_lease"),
+    ("restore-single-lease-gate", "storage.py", "if (binding.allocation_attempt.group_id != group.group_id", "if (binding.allocation_attempt != allocation_attempt", "test_publication_accepts_prior_attempts_under_new_controller_lease"),
     ("drop-replay-byte-compare", "storage.py", "or Path(output_dir, \"invocation.json\").read_bytes() != invocation_bytes", "or False", "test_admitted_successor_consumes_exact_identity_and_replays"),
     ("crossed-successor-group", "storage.py", "or successor.group_digest != group.identity", "or False", "test_admitted_successor_crossed_binding_fields_refuse"),
     # No mutant row for successor.task_id: SuccessorAdmissionRecord makes it unreachable.
