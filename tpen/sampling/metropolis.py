@@ -274,6 +274,15 @@ class MetropolisSampler(nn.Module):
         Walkers
             Updated walker state with cached wavefunction values and sampler
             diagnostics in ``aux``.
+
+        Notes
+        -----
+        This method trusts any populated ``walkers.logabs``/``sign`` cache and
+        does not re-evaluate it. ``collect_samples`` is the entry point that
+        refreshes retained walkers against the supplied model once per call.
+        Callers that reuse walkers after a parameter or model change must call
+        ``Walkers.update_cache(model)`` or invalidate the cache first, for
+        example with ``with_positions(..., invalidate_cache=True)``.
         """
 
         self._require_device(walkers.device)
@@ -340,6 +349,15 @@ class MetropolisSampler(nn.Module):
         Walkers
             Walker state after sampling. ``self.acceptance_rate`` is the mean
             acceptance rate over all steps in this call.
+
+        Notes
+        -----
+        This method trusts any populated ``walkers.logabs``/``sign`` cache and
+        does not re-evaluate it. ``collect_samples`` is the entry point that
+        refreshes retained walkers against the supplied model once per call.
+        Callers that reuse walkers after a parameter or model change must call
+        ``Walkers.update_cache(model)`` or invalidate the cache first, for
+        example with ``with_positions(..., invalidate_cache=True)``.
         """
 
         total_steps = self.n_steps if n_steps is None else n_steps

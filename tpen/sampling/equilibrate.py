@@ -37,6 +37,7 @@ def equilibrate(
 
     if n_steps < 0:
         raise ValueError("n_steps must be non-negative")
+    # ``sample`` trusts populated caches; refresh or invalidate before reuse.
     walkers = sampler.sample(model, walkers, n_steps)
     if target_acceptance is not None and hasattr(getattr(sampler, "move", None), "step_size"):
         low, high = target_acceptance
