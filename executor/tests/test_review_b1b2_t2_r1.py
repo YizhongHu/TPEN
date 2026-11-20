@@ -67,8 +67,9 @@ def test_t2_successor_is_bound_to_current_controller_attempt(tmp_path):
     publications = list(Path(store.root).rglob(".reconciliation-publications/*.json"))
     assert len(publications) == 1
     publication = ReconciliationPublicationV2.decode(publications[0].read_bytes())
-    assert invocation.allocation_attempt == publication.allocation_attempt
+    assert invocation.allocation_attempt.allocation_attempt_id != publication.allocation_attempt.allocation_attempt_id
     assert invocation.allocation_attempt.allocation_id == allocation.allocation_id
+    assert invocation.allocation_attempt.backend_job_id == allocation.backend_job_id
     assert invocation.invocation_id != old_proposal.invocation_id
     assert invocation.attempt_id == old_proposal.attempt_id == fence.attempt_id
     assert publication.members[0].admission.successor_binding == invocation

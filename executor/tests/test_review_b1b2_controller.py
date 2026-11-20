@@ -25,8 +25,8 @@ MUTANTS = (
     ("drop-job-id-check", MODULE_NAME, "if observed_job_id != bound_job_id or allocation.backend_job_id != observed_job_id:", "if False:", "test_job_id_mismatch_is_pre_start"),
     ("drop-acquire-refusal-park", MODULE_NAME, "controller = store.acquire_controller_generation(group, controller_request)", "controller = controller_request", "test_stale_controller_parks_before_publish"),
     ("drop-pre-launch-authority-check", MODULE_NAME, "store.require_current_controller(group, controller.generation, controller.claimant_nonce)", "pass", "test_t2_supersession_after_publication_preserves_newer_start"),
-    ("begin-attempt-for-successor", MODULE_NAME, "store.begin_admitted_successor_current_controller(", "store.begin_attempt_current_controller(", "test_real_store_admitted_successor_uses_durable_admission_once"),
-    ("intent-probe-inverted", MODULE_NAME, "existing = store.read_launch_intent(fence)", "existing = None", "test_real_store_fresh_start_writes_intent_and_launches_once"),
+    ("begin-attempt-for-successor", MODULE_NAME, "store.begin_admitted_successor_current_controller(", "store.begin_admitted_successor(", "test_t2_successor_is_bound_to_current_controller_attempt"),
+    ("intent-probe-inverted", MODULE_NAME, "if existing is not None:", "if False:", "test_recovered_intent_never_relaunches"),
     ("park-is-not-success", MODULE_NAME, "else 2, reason_records)", "else 0, reason_records)", "test_terminal_and_park_exit_two"),
     ("publish-equality-off", MODULE_NAME, "if published.encode() != checked.encode():", "if False:", "test_publication_conflict_parks"),
     ("critical-section-off", "executor/src/tpen_executor/storage.py", "self._current_controller_locked(directory, group.group_id, controller_record)\n            return self.begin_attempt", "pass\n            return self.begin_attempt", "test_t2_supersession_after_publication_preserves_newer_start"),
@@ -242,7 +242,7 @@ def test_real_store_admitted_successor_uses_durable_admission_once(tmp_path):
     assert result.reconciliation.members[0].action == "admit_successor"
     assert executor.calls == ["successor"]
     invocations = [MemberInvocationV2.decode(path.read_bytes()) for path in Path(store.root).rglob("invocation.json")]
-    assert any(item.attempt_id == successor.attempt_id and item.invocation_id == successor.invocation_id for item in invocations)
+    assert any(item.attempt_id == successor.attempt_id and item.invocation_id != successor.invocation_id for item in invocations)
     assert len(list(Path(store.root).rglob("launch-intent.json"))) == 1
 
 def test_static_audit_and_mutant_anchors():

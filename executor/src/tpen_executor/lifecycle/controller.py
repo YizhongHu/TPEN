@@ -153,6 +153,10 @@ def run_group_controller(
         )
         controller = store.acquire_controller_generation(group, controller_request)
         attempt = _attempt(group, allocation, controller, facts.observed_at_utc)
+        launch_attempt = AllocationAttemptV2(
+            group.group_id, AllocationAttemptId(uuid4().hex), allocation.allocation_id,
+            allocation.backend_job_id, str(controller.generation), facts.observed_at_utc,
+        )
     except (ControllerGenerationRejected, TypeError, ValueError, AttributeError, OSError):
         return _park(group, "controller-authority-refused")
     try:
@@ -181,7 +185,7 @@ def run_group_controller(
         successor_requests = {}
         for task_id, (request, acceptance, proposed) in facts.successor_requests.items():
             successor_requests[task_id] = (request, acceptance, MemberInvocationV2(
-                attempt, group.identity, task_id,
+                launch_attempt, group.identity, task_id,
                 next(task.lineage_id for task in group.members if task.task_id == task_id),
                 proposed.attempt_id, InvocationId(uuid4().hex),
             ))
