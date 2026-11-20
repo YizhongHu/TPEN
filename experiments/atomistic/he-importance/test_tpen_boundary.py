@@ -4,6 +4,11 @@ This test reads study files from disk and parses them with :mod:`ast`.  It does
 not import the study: ``he-importance`` is not an importable package name, and
 the study's imports would pull in its training dependencies.
 
+The HI-policy guard below is a tripwire against accidental coupling, not a
+security boundary.  Computed-string ``getattr``/import names, ``exec``/``eval``,
+non-literal monkeypatching, and ``importlib.util`` spec loading are explicitly
+out of scope; this test does not chase those forms.
+
 The inventory is pinned to ``dev`` at 3143e43ac170df33f61f2002b1011cd85c9cfc37
 on 2026-10-07.  The two inventories are intentionally explicit: every measured
 crossing must be declared, and every declared entry for a file already present
@@ -126,6 +131,16 @@ HI_POLICY_ALLOWLIST = frozenset(
 )
 HI_POLICY_NAMES = frozenset({"HI_METHOD_ROSTER", "validate_hi_train_config"})
 
+# Consumer identity and source member are structural authority coordinates;
+# source line numbers remain diagnostics only.  A duplicate read therefore
+# cannot hide behind the set-valued edge projection below.
+HI_POLICY_EXPECTED_OCCURRENCES = {
+    ("train_config.py", "_optimizer_entry", "dynamic-import", "HI_METHOD_ROSTER"): 1,
+    ("train_config.py", "resolve_train_config", "dynamic-import", "validate_hi_train_config"): 1,
+    ("run_stage_q.py", "_roster", "from-import", "HI_METHOD_ROSTER"): 1,
+    ("optimizer_grid.py", "roster_availability", "dynamic-import", "HI_METHOD_ROSTER"): 1,
+}
+
 EXPECTED_PUBLIC_INVENTORY_CALLERS = frozenset(
     {
         "test_production_inventory_obeys_admission_rule",
@@ -161,19 +176,98 @@ def _is_sanctioned_import(node: ast.ImportFrom) -> bool:
     )
 
 
-def _dynamic_import_name(node: ast.Call) -> str | None:
-    """Return the supported dynamic-import spelling, if *node* uses one."""
+@dataclass(frozen=True)
+class _DynamicImportAliases:
+    """Resolved spellings for literal dynamic import callables."""
 
-    if isinstance(node.func, ast.Name) and node.func.id in {"import_module", "__import__"}:
-        return node.func.id
+    importlib_modules: frozenset[str]
+    import_module_callables: frozenset[str]
+    builtin_import_callables: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _HIPolicyOccurrence:
+    """One source-member read, retaining line only for diagnostics."""
+
+    filename: str
+    consumer: str
+    source_module: str
+    source_member: str
+    import_kind: str
+    line: int
+
+
+def _dynamic_import_aliases(tree: ast.AST) -> _DynamicImportAliases:
+    """Resolve direct and aliased spellings of the supported import helpers."""
+
+    importlib_modules = {"importlib"}
+    import_module_callables = {"import_module"}
+    builtin_import_callables = {"__import__"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "importlib":
+                    importlib_modules.add(alias.asname or "importlib")
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "importlib":
+                for alias in node.names:
+                    if alias.name == "import_module":
+                        import_module_callables.add(alias.asname or alias.name)
+            elif node.module == "builtins":
+                for alias in node.names:
+                    if alias.name == "__import__":
+                        builtin_import_callables.add(alias.asname or alias.name)
+    return _DynamicImportAliases(
+        frozenset(importlib_modules),
+        frozenset(import_module_callables),
+        frozenset(builtin_import_callables),
+    )
+
+
+def _dynamic_import_name(
+    node: ast.Call, aliases: _DynamicImportAliases | None = None
+) -> str | None:
+    """Return the resolved dynamic-import spelling, if *node* uses one."""
+
+    if aliases is None:
+        aliases = _DynamicImportAliases(
+            frozenset({"importlib"}),
+            frozenset({"import_module"}),
+            frozenset({"__import__"}),
+        )
+    if isinstance(node.func, ast.Name):
+        if node.func.id in aliases.import_module_callables:
+            return "import_module"
+        if node.func.id in aliases.builtin_import_callables:
+            return "__import__"
     if (
         isinstance(node.func, ast.Attribute)
         and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "importlib"
+        and node.func.value.id in aliases.importlib_modules
         and node.func.attr == "import_module"
     ):
         return "importlib.import_module"
     return None
+
+
+def _dynamic_import_targets(
+    node: ast.Call, aliases: _DynamicImportAliases
+) -> tuple[str, ...]:
+    """Return literal import targets, preserving relative-import semantics."""
+
+    if _dynamic_import_name(node, aliases) is None:
+        return ()
+    arguments = [*node.args]
+    arguments.extend(
+        keyword.value
+        for keyword in node.keywords
+        if keyword.arg in {"name", "package"}
+    )
+    return tuple(
+        argument.value
+        for argument in arguments
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+    )
 
 
 def _detect_crossings(source: str, *, filename: str = "<unknown>") -> tuple[Crossing, ...]:
@@ -181,6 +275,7 @@ def _detect_crossings(source: str, *, filename: str = "<unknown>") -> tuple[Cros
 
     crossings: list[Crossing] = []
     tree = ast.parse(source, filename=filename)
+    aliases = _dynamic_import_aliases(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -199,19 +294,12 @@ def _detect_crossings(source: str, *, filename: str = "<unknown>") -> tuple[Cros
                 )
             continue
 
-        if not isinstance(node, ast.Call) or _dynamic_import_name(node) is None:
+        if not isinstance(node, ast.Call) or _dynamic_import_name(node, aliases) is None:
             continue
-        arguments = [*node.args]
-        arguments.extend(
-            keyword.value
-            for keyword in node.keywords
-            if keyword.arg in {"name", "package"}
-        )
-        for argument in arguments:
-            if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
-                if _is_tpen_name(argument.value):
-                    crossings.append(Crossing(node.lineno, argument.value))
-                    break
+        for target in _dynamic_import_targets(node, aliases):
+            if _is_tpen_name(target):
+                crossings.append(Crossing(node.lineno, target))
+                break
 
     return tuple(sorted(crossings, key=lambda crossing: (crossing.line, crossing.target)))
 
@@ -262,93 +350,173 @@ def _scan_study() -> tuple[tuple[Path, ...], tuple[tuple[str, Crossing], ...]]:
     return paths, violations
 
 
+def _enclosing_consumer(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str:
+    """Return the nearest stable function/class consumer identity."""
+
+    parts: list[str] = []
+    current: ast.AST | None = node
+    while current in parents:
+        current = parents[current]
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            parts.append(current.name)
+    return ".".join(reversed(parts)) or "<module>"
+
+
+def _literal_dynamic_target(
+    node: ast.Call, aliases: _DynamicImportAliases
+) -> str | None:
+    """Return the first literal target, with a package keyword preserved."""
+
+    targets = _dynamic_import_targets(node, aliases)
+    return targets[0] if targets else None
+
+
 def _hi_policy_edges(source: str, *, filename: str) -> tuple[set[tuple[str, str, str]], tuple[str, ...]]:
     """Inventory HI-policy reads and fail-closed structural violations."""
 
     tree = ast.parse(source, filename=filename)
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    aliases = _dynamic_import_aliases(tree)
     edges: set[tuple[str, str, str]] = set()
+    occurrences: list[_HIPolicyOccurrence] = []
     violations: list[str] = []
     schema_aliases: set[str] = set()
+    imported_symbols: dict[str, str] = {}
     dynamic_imports: list[ast.Call] = []
+    dynamic_binding_names: set[str] = set()
 
-    def import_target(node: ast.Call) -> str | None:
-        if _dynamic_import_name(node) is None or not node.args:
-            return None
-        argument = node.args[0]
-        return argument.value if isinstance(argument, ast.Constant) and isinstance(argument.value, str) else None
+    def add_occurrence(node: ast.AST, import_kind: str, source_member: str) -> None:
+        occurrences.append(
+            _HIPolicyOccurrence(
+                filename,
+                _enclosing_consumer(node, parents),
+                "tpen.hi_schema",
+                source_member,
+                import_kind,
+                getattr(node, "lineno", 0),
+            )
+        )
 
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "tpen.hi_schema":
             for alias in node.names:
-                edges.add((filename, "from-import", alias.asname or alias.name))
+                local_name = alias.asname or alias.name
+                imported_symbols[local_name] = alias.name
+                add_occurrence(node, "from-import", alias.name)
+                edges.add((filename, "from-import", alias.name))
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name == "tpen.hi_schema":
-                    schema_aliases.add(alias.asname or "hi_schema")
-        elif isinstance(node, ast.Call):
-            target = import_target(node)
-            if target == "tpen.hi_schema":
-                dynamic_imports.append(node)
+                    schema_aliases.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.Call) and _literal_dynamic_target(node, aliases) == "tpen.hi_schema":
+            dynamic_imports.append(node)
 
-    # AST nodes do not retain parents; infer aliases from assignments directly.
+    # AST nodes do not retain parents; infer module bindings from assignments.
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+        value: ast.AST | None = None
+        targets: list[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            value = node.value
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            value = node.value
+            targets = [node.target]
+        if not isinstance(value, ast.Call):
             continue
-        if import_target(node.value) != "tpen.hi_schema":
+        if _literal_dynamic_target(value, aliases) != "tpen.hi_schema":
             continue
-        schema_aliases.update(
-            target.id for target in node.targets if isinstance(target, ast.Name)
-        )
+        names = [target.id for target in targets if isinstance(target, ast.Name)]
+        schema_aliases.update(names)
+        dynamic_binding_names.update(names)
 
-    dynamic_lines = sorted(node.lineno for node in dynamic_imports)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name):
             continue
-        if node.value.id not in schema_aliases or node.attr not in HI_POLICY_NAMES:
+        if node.value.id not in schema_aliases:
             continue
-        preceding = [line for line in dynamic_lines if line < node.lineno]
-        following = [line for line in dynamic_lines if line > node.lineno]
-        if preceding and (not following or node.lineno < min(following)):
+        if isinstance(node.ctx, ast.Load):
+            add_occurrence(node, "dynamic-import", node.attr)
             edges.add((filename, "dynamic-import", node.attr))
+
+    def bound_member(expression: ast.AST) -> str | None:
+        if isinstance(expression, ast.Name):
+            return imported_symbols.get(expression.id)
+        if isinstance(expression, ast.Attribute) and isinstance(expression.value, ast.Name):
+            if expression.value.id in schema_aliases:
+                return expression.attr
+        return None
 
     for node in ast.walk(tree):
         assigned_name: str | None = None
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             assigned_name = node.name
-        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            assigned_name = node.id
-        elif isinstance(node, ast.Attribute) and node.attr in HI_POLICY_NAMES:
-            assigned_name = node.attr
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            assigned_name = imported_symbols.get(node.id, node.id)
+            if node.id in schema_aliases and node.id not in dynamic_binding_names:
+                violations.append("mutation of resolved tpen.hi_schema binding")
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            if isinstance(node.value, ast.Name) and node.value.id in schema_aliases:
+                assigned_name = node.attr
         if assigned_name in HI_POLICY_NAMES:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) or isinstance(
-                getattr(node, "ctx", None), ast.Store
+                getattr(node, "ctx", None), (ast.Store, ast.Del)
             ):
                 violations.append(f"redefinition/mutation of {assigned_name}")
 
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if node.func.attr in {"append", "extend", "clear", "pop", "remove", "update"}:
-                value = node.func.value
-                if isinstance(value, (ast.Attribute, ast.Name)):
-                    name = value.attr if isinstance(value, ast.Attribute) else value.id
-                    if name in HI_POLICY_NAMES:
-                        violations.append(f"mutation of {name}")
+                name = bound_member(node.func.value)
+                if name is not None:
+                    violations.append(f"mutation of {name}")
+            if node.func.attr in {"setattr", "delattr"}:
+                continue
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in {"setattr", "delattr"} and len(node.args) >= 2:
+                target, member = node.args[:2]
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id in schema_aliases
+                    and isinstance(member, ast.Constant)
+                    and isinstance(member.value, str)
+                ):
+                    violations.append(f"mutation of {member.value}")
 
     for node in dynamic_imports:
-        next_line = min(
-            (line for line in dynamic_lines if line > node.lineno),
-            default=None,
-        )
         has_consumer = any(
-            isinstance(candidate, ast.Attribute)
-            and isinstance(candidate.value, ast.Name)
-            and candidate.value.id in schema_aliases
-            and candidate.attr in HI_POLICY_NAMES
-            and candidate.lineno > node.lineno
-            and (next_line is None or candidate.lineno < next_line)
-            for candidate in ast.walk(tree)
+            occurrence.import_kind == "dynamic-import"
+            and occurrence.line > node.lineno
+            for occurrence in occurrences
         )
         if not has_consumer:
             violations.append("unrecognized tpen.hi_schema dynamic import")
+
+    occurrence_counts: dict[tuple[str, str, str, str], int] = {}
+    for occurrence in occurrences:
+        key = (
+            occurrence.filename,
+            occurrence.consumer,
+            occurrence.import_kind,
+            occurrence.source_member,
+        )
+        occurrence_counts[key] = occurrence_counts.get(key, 0) + 1
+    for key, count in occurrence_counts.items():
+        expected = HI_POLICY_EXPECTED_OCCURRENCES.get(key)
+        if expected is None:
+            violations.append(f"unapproved HI-policy occurrence: {key}")
+        elif count != expected:
+            violations.append(
+                f"unexpected HI-policy occurrence multiplicity: {key}; "
+                f"actual={count}, expected={expected}"
+            )
+    for key, expected in HI_POLICY_EXPECTED_OCCURRENCES.items():
+        if key[0] != filename:
+            continue
+        actual = occurrence_counts.get(key, 0)
+        if actual != expected and actual == 0:
+            violations.append(
+                f"missing HI-policy occurrence multiplicity: {key}; "
+                f"actual={actual}, expected={expected}"
+            )
 
     if filename.startswith("tpen/"):
         for node in ast.walk(tree):
@@ -358,7 +526,7 @@ def _hi_policy_edges(source: str, *, filename: str) -> tuple[set[tuple[str, str,
             elif isinstance(node, ast.ImportFrom):
                 target = node.module
             elif isinstance(node, ast.Call):
-                target = import_target(node)
+                target = _literal_dynamic_target(node, aliases)
             if target and (target == "experiments" or target.startswith("experiments.")):
                 violations.append("core-to-experiments import")
 
@@ -944,19 +1112,155 @@ def test_hi_policy_exact_allowlist_is_structural() -> None:
     assert measured == HI_POLICY_ALLOWLIST
 
 
-def test_hi_policy_rejects_unlisted_import_and_redefinition() -> None:
-    with_source = {
+def _valid_hi_policy_fixture() -> dict[str, str]:
+    """Return the complete four-edge fixture used by every rejection control."""
+
+    return {
+        "train_config.py": (
+            "from importlib import import_module\n"
+            "def _optimizer_entry():\n"
+            '    schema = import_module("tpen.hi_schema")\n'
+            "    return schema.HI_METHOD_ROSTER\n"
+            "def resolve_train_config():\n"
+            '    schema = import_module("tpen.hi_schema")\n'
+            "    return schema.validate_hi_train_config\n"
+        ),
+        "run_stage_q.py": (
+            "def _roster():\n"
+            "    from tpen.hi_schema import HI_METHOD_ROSTER\n"
+            "    return tuple(HI_METHOD_ROSTER)\n"
+        ),
         "optimizer_grid.py": (
-            'from tpen.hi_schema import HI_METHOD_ROSTER, validate_hi_train_config\n'
-            "HI_METHOD_ROSTER = ()\n"
-        )
+            "def roster_availability():\n"
+            "    from importlib import import_module as load\n"
+            '    schema = load("tpen.hi_schema")\n'
+            "    return schema.HI_METHOD_ROSTER\n"
+        ),
     }
-    edges, violations = _hi_policy_edges(
-        with_source["optimizer_grid.py"], filename="optimizer_grid.py"
+
+
+def _assert_hi_fixture_rejects(
+    source_by_file: dict[str, str], diagnostic: str
+) -> None:
+    """Route one injected fault through the public enforcement entry point."""
+
+    try:
+        _assert_hi_policy_inventory(source_by_file)
+    except AssertionError as error:
+        message = str(error)
+    else:
+        raise AssertionError(f"injected HI-policy fault was admitted: {diagnostic}")
+    assert diagnostic in message, message
+
+
+def test_hi_policy_complete_fixture_passes_enforcement_entry_point() -> None:
+    _assert_hi_policy_inventory(_valid_hi_policy_fixture())
+
+
+def test_hi_policy_rejects_unlisted_import_and_redefinition() -> None:
+    low_level_source = (
+        "from tpen.hi_schema import HI_METHOD_ROSTER, validate_hi_train_config\n"
+        "HI_METHOD_ROSTER = ()\n"
     )
+    edges, violations = _hi_policy_edges(low_level_source, filename="optimizer_grid.py")
     assert ("optimizer_grid.py", "from-import", "validate_hi_train_config") in edges
     assert any("redefinition/mutation" in violation for violation in violations)
     assert any(edge not in HI_POLICY_ALLOWLIST for edge in edges)
+
+    with_source = _valid_hi_policy_fixture()
+    with_source["optimizer_grid.py"] += "\n    HI_METHOD_ROSTER = ()\n"
+    _assert_hi_fixture_rejects(with_source, "redefinition/mutation of HI_METHOD_ROSTER")
+
+
+def test_hi_policy_rejects_dynamic_import_aliases_at_enforcement_boundary() -> None:
+    cases = (
+        (
+            "from importlib import import_module as load",
+            'schema = load("tpen.hi_schema")',
+            'orphan = load("tpen.hi_schema")',
+        ),
+        (
+            "import importlib as il",
+            'schema = il.import_module("tpen.hi_schema")',
+            'orphan = il.import_module("tpen.hi_schema")',
+        ),
+        (
+            "from builtins import __import__ as imp",
+            'schema = imp("tpen.hi_schema", fromlist=("HI_METHOD_ROSTER",))',
+            'orphan = imp("tpen.hi_schema", fromlist=("HI_METHOD_ROSTER",))',
+        ),
+    )
+    for import_statement, binding, orphan in cases:
+        source_by_file = _valid_hi_policy_fixture()
+        source_by_file["optimizer_grid.py"] = (
+            "def roster_availability():\n"
+            f"    {import_statement}\n"
+            f"    {binding}\n"
+            "    roster = schema.HI_METHOD_ROSTER\n"
+            f"    {orphan}\n"
+            "    return roster\n"
+        )
+        _assert_hi_fixture_rejects(
+            source_by_file, "unrecognized tpen.hi_schema dynamic import"
+        )
+
+
+def test_hi_policy_rejects_wrong_symbol_alias_at_enforcement_boundary() -> None:
+    source_by_file = _valid_hi_policy_fixture()
+    source_by_file["run_stage_q.py"] = source_by_file["run_stage_q.py"].replace(
+        "from tpen.hi_schema import HI_METHOD_ROSTER",
+        "from tpen.hi_schema import HI_TRAIN_SCHEMA as HI_METHOD_ROSTER",
+    )
+    _assert_hi_fixture_rejects(source_by_file, "HI_TRAIN_SCHEMA")
+
+
+def test_hi_policy_rejects_duplicate_or_other_member_consumption() -> None:
+    duplicate = _valid_hi_policy_fixture()
+    duplicate["optimizer_grid.py"] = duplicate["optimizer_grid.py"].replace(
+        "return schema.HI_METHOD_ROSTER",
+        "return (schema.HI_METHOD_ROSTER, schema.HI_METHOD_ROSTER)[0]",
+    )
+    _assert_hi_fixture_rejects(duplicate, "actual=2, expected=1")
+
+    other_member = _valid_hi_policy_fixture()
+    other_member["optimizer_grid.py"] = other_member["optimizer_grid.py"].replace(
+        "return schema.HI_METHOD_ROSTER",
+        "policy = schema.HI_TRAIN_SCHEMA\n    return schema.HI_METHOD_ROSTER",
+    )
+    _assert_hi_fixture_rejects(other_member, "HI_TRAIN_SCHEMA")
+
+
+def test_hi_policy_whitespace_shift_preserves_structural_inventory() -> None:
+    shifted = _valid_hi_policy_fixture()
+    shifted = {filename: "\n\n" + source for filename, source in shifted.items()}
+    _assert_hi_policy_inventory(shifted)
+
+
+def test_hi_policy_rejects_assignment_deletion_and_literal_mutation() -> None:
+    mutations = (
+        "    schema.HI_METHOD_ROSTER = ()\n",
+        "    del schema.HI_METHOD_ROSTER\n",
+        '    setattr(schema, "HI_METHOD_ROSTER", ())\n',
+        '    delattr(schema, "HI_METHOD_ROSTER")\n',
+    )
+    for mutation in mutations:
+        source_by_file = _valid_hi_policy_fixture()
+        source_by_file["optimizer_grid.py"] = source_by_file["optimizer_grid.py"].replace(
+            "    return schema.HI_METHOD_ROSTER\n",
+            "    return schema.HI_METHOD_ROSTER\n" + mutation,
+        )
+        _assert_hi_fixture_rejects(source_by_file, "HI_METHOD_ROSTER")
+
+
+def test_hi_policy_rejects_dynamic_import_aliases_in_crossing_census() -> None:
+    for source in (
+        'import importlib as il\nil.import_module("tpen.anything")\n',
+        'from importlib import import_module as load\nload("tpen.anything")\n',
+        'from builtins import __import__ as imp\nimp("tpen.anything")\n',
+    ):
+        assert _detect_crossings(source) == (
+            Crossing(2, "tpen.anything", sanctioned=False),
+        )
 
 
 def test_hi_policy_rejects_literal_core_to_experiments_import() -> None:
