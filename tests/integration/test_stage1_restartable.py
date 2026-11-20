@@ -250,6 +250,20 @@ def _real_chain_child() -> None:
     trace = _Stage1Trace(phase=phase, seed=int(row["seed"]))
     trace_path = Path(str(payload["trace_path"]))
     protocol = _bounded_protocol()
+    # The parent pytest process cannot instrument modules imported by this
+    # fresh interpreter.  The launcher installs the same package hook as
+    # ``pyproject.toml`` before importing TPEN; this assertion keeps the
+    # real-chain evidence honest about runtime type checking.
+    from typeguard import TypeCheckError
+    from tpen.naming import camel_to_snake
+
+    try:
+        camel_to_snake(123)  # type: ignore[arg-type]
+    except TypeCheckError:
+        pass
+    else:  # pragma: no cover - proves the child hook was not active
+        raise AssertionError("child Typeguard hook did not reject a wrong-typed TPEN call")
+
     import experiments.atomistic.stage1.restart as restart_module
 
     # This replacement is process-local test configuration only; no committed
@@ -312,7 +326,12 @@ def _run_real_child(payload: dict[str, object]) -> tuple[dict[str, object], Proc
     completed = subprocess.run(
         [
             sys.executable, "-c",
-            "from tests.integration.test_stage1_restartable import _real_chain_child; _real_chain_child()",
+            (
+                "from typeguard.importhook import install_import_hook; "
+                "install_import_hook('tpen'); "
+                "from tests.integration.test_stage1_restartable import _real_chain_child; "
+                "_real_chain_child()"
+            ),
             str(argument_path),
         ],
         cwd=str(Path(__file__).parents[2]),
