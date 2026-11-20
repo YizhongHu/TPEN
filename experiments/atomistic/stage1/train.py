@@ -15,7 +15,6 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from tpen.run import run_from_config
-from tpen.checkpoint.profiles import validate_native_recovery_profile
 from experiments.atomistic.stage1.protocol import (
     compose_train_overlay,
     resolve_config_path,
@@ -93,10 +92,6 @@ def main() -> int:
             raise ValueError("Hooke science runtime and sampler seeds must be distinct")
     prepare_initial_checkpoint_config(cfg)
     validate_resolved_train_config(cfg, row, base_config=base_cfg)
-    # Native recovery admission is a core-owned policy.  Stage 1 records the
-    # same preflight on every gateway start; run_from_config repeats the guard
-    # at its direct restore boundary for callers that bypass this wrapper.
-    validate_native_recovery_profile(cfg)
     if args.restart:
         from experiments.atomistic.stage1.restart import execute_restart
 

@@ -24,25 +24,17 @@ from experiments.atomistic.stage1.protocol import (
 )
 from experiments.atomistic.stage1.train import prepare_initial_checkpoint_config
 from experiments.toolkit.run_paths import resolve_run_dir
-from tpen.checkpoint.artifact import list_complete_checkpoints
-from tpen.checkpoint.reference import CheckpointRef
-from tpen.execution.invocation import (
-    PredecessorDiscoveryRefusal,
-    ReceiptExistsError,
-    create_json_receipt,
-    discover_published_checkpoint,
-)
-from tpen.execution.recovery import (
+from tpen.checkpoint import CheckpointRef, list_complete_checkpoints
+from tpen.execution import (
     CheckpointEvidence,
     OperationalRestoreRequest,
-    RecoveryDecision,
-    RecoveryOutcome,
-    RecoveryPhase,
+    ReceiptExistsError,
     ScienceIntent,
-    capture_science_intent,
+    create_json_receipt,
+    discover_published_checkpoint,
     select_recovery,
+    validate_native_recovery_profile,
 )
-from tpen.checkpoint.profiles import validate_native_recovery_profile
 from tpen.run import load_config, run_from_config
 
 
@@ -208,7 +200,9 @@ def _science_intent(cfg: Any, row: Mapping[str, Any], target: int) -> ScienceInt
         "overlay_sha256": row.get("overlay_sha256"),
     }
     source = OmegaConf.to_container(cfg, resolve=False)
-    return capture_science_intent(science_input, target_iterations=target, source_config=source)
+    return ScienceIntent(
+        science_input=science_input, target_iterations=target, source_config=source,
+    )
 
 
 def _remove_initial_checkpoint(cfg: Any) -> None:
@@ -255,7 +249,7 @@ def select_restart(
     checkpoint_root = resolved_run_dir / "checkpoints"
     try:
         published = discover_published_checkpoint(checkpoint_root)
-    except (PredecessorDiscoveryRefusal, FileNotFoundError, OSError, TypeError, ValueError) as exc:
+    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
         return RestartSelection(
             StartDecision.PARK, resolved_run_dir, None, None, None, str(exc)
         )
@@ -278,7 +272,7 @@ def select_restart(
     evidence = CheckpointEvidence.from_ref(
         published, science_input=intent.science_input, target_iterations=target
     )
-    recovery = select_recovery(intent, phase=RecoveryPhase.RECOVERY, evidence=evidence)
+    recovery = select_recovery(intent, phase="recovery", evidence=evidence)
     if recovery.refusal is not None:
         return RestartSelection(
             StartDecision.PARK, resolved_run_dir, published, recovery, None,

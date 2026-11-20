@@ -8,20 +8,54 @@ from pathlib import Path
 HERE = Path(__file__).parents[1]
 
 
+_PUBLIC_IMPORTS = {
+    "tpen.run": {"run_from_config", "load_config"},
+}
+_RESTART_IMPORTS = {
+    "tpen.execution": {
+        "create_json_receipt", "discover_published_checkpoint", "ReceiptExistsError",
+        "OperationalRestoreRequest", "ScienceIntent", "CheckpointEvidence",
+        "select_recovery", "validate_native_recovery_profile",
+    },
+    "tpen.checkpoint": {"list_complete_checkpoints", "CheckpointRef"},
+    "tpen.run": {"run_from_config", "load_config"},
+}
+
+
+def _violations(path: Path, source: str) -> list[str]:
+    """Return public-boundary violations for one study source file."""
+
+    tree = ast.parse(source, filename=str(path))
+    allowed = _RESTART_IMPORTS if path.name == "restart.py" else _PUBLIC_IMPORTS
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("tpen"):
+                    violations.append(f"{path}: import {alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if not module.startswith("tpen"):
+                continue
+            names = allowed.get(module)
+            if names is None:
+                violations.append(f"{path}: from {module}")
+                continue
+            for alias in node.names:
+                if alias.name not in names:
+                    violations.append(f"{path}: from {module} import {alias.name}")
+    return violations
+
+
 def test_only_train_and_eval_use_the_public_tpen_gateway() -> None:
     violations: list[str] = []
     for path in sorted(HERE.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.name.startswith("tpen") and alias.name != "tpen.run":
-                        violations.append(f"{path}: import {alias.name}")
-            elif isinstance(node, ast.ImportFrom):
-                module = node.module or ""
-                if module.startswith("tpen") and module != "tpen.run":
-                    violations.append(f"{path}: from {module}")
-                if module == "tpen.run" and any(alias.name not in {"run_from_config", "load_config"}
-                                                for alias in node.names):
-                    violations.append(f"{path}: non-gateway import")
+        violations.extend(_violations(path, path.read_text(encoding="utf-8")))
     assert not violations, "import boundary violated:\n" + "\n".join(violations)
+
+
+def test_restart_deep_submodule_import_is_rejected() -> None:
+    restart = HERE / "restart.py"
+    source = "from tpen.execution.invocation import create_json_receipt\n"
+    violations = _violations(restart, source)
+    assert violations == [f"{restart}: from tpen.execution.invocation"]

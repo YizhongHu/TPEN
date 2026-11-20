@@ -209,7 +209,7 @@ def test_newer_complete_checkpoint_is_parked_before_start(tmp_path: Path, monkey
     )
     selected = select_restart(cfg=_cfg(), row=_row(tmp_path), run_dir=run_dir)
     assert selected.decision is StartDecision.PARK
-    assert "newer complete" in selected.reason
+    assert "complete checkpoint is newer" in selected.reason
 
 
 def test_terminal_publication_cannot_hide_a_failed_durable_status(
