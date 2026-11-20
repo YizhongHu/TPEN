@@ -48,6 +48,26 @@ class QuadraticLogAbsModel(nn.Module):
         return WavefunctionOutput(logabs=logabs, sign=torch.ones_like(logabs))
 
 
+class ShiftedQuadraticLogAbsModel(QuadraticLogAbsModel):
+    def __init__(self, shift: float) -> None:
+        super().__init__()
+        self.shift = shift
+
+    def forward(self, batch: ElectronBatch) -> WavefunctionOutput:
+        output = super().forward(batch)
+        return WavefunctionOutput(logabs=output.logabs + self.shift, sign=output.sign)
+
+
+class CountingLinearModel(NoGradLinearModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, batch: ElectronBatch) -> WavefunctionOutput:
+        self.calls += 1
+        return super().forward(batch)
+
+
 def test_metropolis_sampler_uses_logabs_ratio_and_caches_values() -> None:
     sampler = MetropolisSampler(move=ShiftMove(), n_walkers=3, n_electrons=2, spatial_dim=1, dtype=torch.float64)
     walkers = sampler.initialize(n_walkers=3, device="cpu")
@@ -199,6 +219,61 @@ def test_collect_samples_reset_restarts_the_chain() -> None:
     assert torch.equal(reset_draw.positions, fresh_draw.positions)
 
 
+def test_collect_samples_refreshes_retained_cache_before_changed_model_decision() -> None:
+    stale = MetropolisSampler(n_walkers=8, burn_in=0, n_steps=1, seed=123, dtype=torch.float64)
+    fresh = MetropolisSampler(n_walkers=8, burn_in=0, n_steps=1, seed=123, dtype=torch.float64)
+    base = QuadraticLogAbsModel()
+    shifted = ShiftedQuadraticLogAbsModel(-5.0)
+
+    for sampler in (stale, fresh):
+        sampler.collect_samples(base, reset=True)
+    # The expected branch refreshes through the public walker operation and
+    # calls step directly, so it remains independent of collect_samples' fix.
+    assert fresh.walkers is not None
+    expected = fresh.step(shifted, fresh.walkers.update_cache(shifted))
+    actual, _ = stale.collect_samples(shifted)
+
+    assert torch.equal(actual.positions, expected.positions)
+    assert torch.equal(actual.aux["accepted"], expected.aux["accepted"])
+
+
+def test_retained_cache_refresh_matches_fresh_unchanged_model_and_preserves_rng() -> None:
+    cached = MetropolisSampler(n_walkers=8, burn_in=0, n_steps=1, seed=123, dtype=torch.float64)
+    fresh = MetropolisSampler(n_walkers=8, burn_in=0, n_steps=1, seed=123, dtype=torch.float64)
+    model = QuadraticLogAbsModel()
+    cached.collect_samples(model, reset=True)
+    fresh.collect_samples(model, reset=True)
+
+    expected_rng_before = fresh.mcmc_state_dict()["generator_state"]
+    assert fresh.walkers is not None
+    refreshed = fresh.walkers.update_cache(model)
+    assert torch.equal(expected_rng_before, fresh.mcmc_state_dict()["generator_state"])
+    expected = fresh.step(model, refreshed)
+    actual = cached.collect_samples(model)[0]
+
+    assert torch.equal(actual.positions, expected.positions)
+    assert torch.equal(actual.aux["accepted"], expected.aux["accepted"])
+    assert torch.equal(actual.logabs, expected.logabs)
+    assert torch.equal(actual.sign, expected.sign)
+    assert torch.equal(cached.mcmc_state_dict()["generator_state"], fresh.mcmc_state_dict()["generator_state"])
+
+
+def test_retained_cache_refresh_is_one_boundary_evaluation_not_per_step() -> None:
+    n_steps = 4
+    sampler = MetropolisSampler(n_walkers=4, burn_in=0, n_steps=n_steps, seed=123, dtype=torch.float64)
+    model = CountingLinearModel()
+    sampler.collect_samples(model, reset=True)
+    # A reset starts with uncached walkers: one current-value evaluation plus
+    # one proposal evaluation per production step.
+    assert model.calls == 1 + n_steps
+
+    model.calls = 0
+    sampler.collect_samples(model)
+    # A retained collect refreshes current values once at the boundary, then
+    # evaluates one proposal per step (never re-evaluating current walkers).
+    assert model.calls == 1 + n_steps
+
+
 def test_sampler_state_dict_roundtrip_continues_same_chain() -> None:
     model = NoGradLinearModel()
     sampler = _tiny_sampler()
@@ -213,6 +288,31 @@ def test_sampler_state_dict_roundtrip_continues_same_chain() -> None:
 
     assert resumed.has_burned_in is True
     assert torch.equal(expected.positions, actual.positions)
+
+
+def test_restored_walkers_refresh_against_changed_model_on_next_collect() -> None:
+    base = QuadraticLogAbsModel()
+    shifted = ShiftedQuadraticLogAbsModel(-5.0)
+    source = _tiny_sampler()
+    source.collect_samples(base)
+    state = source.mcmc_state_dict()
+
+    actual_sampler = _tiny_sampler()
+    expected_sampler = _tiny_sampler()
+    actual_sampler.load_mcmc_state_dict(state)
+    expected_sampler.load_mcmc_state_dict(state)
+    assert expected_sampler.walkers is not None
+    refreshed = expected_sampler.walkers.update_cache(shifted)
+    # The restored state has already burned in, so the public collect performs
+    # exactly the production steps below; keep this oracle independent of its
+    # refresh implementation and match that step count explicitly.
+    expected = expected_sampler.sample(shifted, refreshed, expected_sampler.n_steps)
+    actual, _ = actual_sampler.collect_samples(shifted)
+
+    assert torch.equal(actual.positions, expected.positions)
+    assert torch.equal(actual.aux["accepted"], expected.aux["accepted"])
+    assert torch.equal(actual.logabs, expected.logabs)
+    assert torch.equal(actual.sign, expected.sign)
 
 
 def test_sampler_state_load_maps_checkpoint_device_to_runtime_device() -> None:
