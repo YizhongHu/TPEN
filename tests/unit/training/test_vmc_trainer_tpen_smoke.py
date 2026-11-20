@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from types import SimpleNamespace
+from types import MethodType
 from typing import Any
 
 import pytest
@@ -273,6 +274,31 @@ def test_vmc_optimizer_update_does_not_leave_stale_sampler_cache() -> None:
 
     model = build_tiny_spenn()
     sampler = build_tiny_sampler()
+    observed: list[tuple[torch.Tensor, torch.Tensor]] = []
+    first_cache: torch.Tensor | None = None
+    collection_number = 0
+    original_step = sampler.step
+    original_collect = sampler.collect_samples
+
+    def step(self, current_model, walkers):
+        if collection_number == 2 and not observed:
+            assert walkers.logabs is not None
+            with torch.no_grad():
+                output = current_model(walkers.make_batch())
+            observed.append((walkers.logabs.clone(), output.logabs.clone()))
+        return original_step(current_model, walkers)
+
+    def collect(self, current_model, *, reset=False, device=None):
+        nonlocal collection_number, first_cache
+        collection_number += 1
+        result = original_collect(current_model, reset=reset, device=device)
+        if collection_number == 1:
+            assert result[0].logabs is not None
+            first_cache = result[0].logabs.clone()
+        return result
+
+    sampler.step = MethodType(step, sampler)
+    sampler.collect_samples = MethodType(collect, sampler)
     terms = [KineticEnergy(), HarmonicTrap(omega=0.5), ElectronElectronInteraction()]
     trainer = VMCTrainer(max_steps=2, log_every_n_steps=1)
     trainer.fit(
@@ -285,11 +311,11 @@ def test_vmc_optimizer_update_does_not_leave_stale_sampler_cache() -> None:
     )
 
     assert trainer.completed_updates == 2
-    assert sampler.walkers is not None
-    with torch.no_grad():
-        output = model(sampler.walkers.make_batch())
-    assert torch.equal(sampler.walkers.logabs, output.logabs)
-    assert torch.equal(sampler.walkers.sign, output.sign)
+    assert first_cache is not None
+    assert observed
+    refreshed_cache, model_values = observed[0]
+    assert torch.equal(refreshed_cache, model_values)
+    assert not torch.equal(first_cache, refreshed_cache)
 
 
 def _fit_one_step(*, return_terms: bool, terms) -> object:
