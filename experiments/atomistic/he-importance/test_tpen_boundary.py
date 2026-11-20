@@ -114,6 +114,18 @@ EXPECTED_TEST_INVENTORY = {
     ),
 }
 
+# HI policy is core-owned.  These are the only read-only experiment consumers;
+# the key deliberately omits line numbers so formatting cannot alter policy.
+HI_POLICY_ALLOWLIST = frozenset(
+    {
+        ("train_config.py", "dynamic-import", "HI_METHOD_ROSTER"),
+        ("train_config.py", "dynamic-import", "validate_hi_train_config"),
+        ("run_stage_q.py", "from-import", "HI_METHOD_ROSTER"),
+        ("optimizer_grid.py", "dynamic-import", "HI_METHOD_ROSTER"),
+    }
+)
+HI_POLICY_NAMES = frozenset({"HI_METHOD_ROSTER", "validate_hi_train_config"})
+
 EXPECTED_PUBLIC_INVENTORY_CALLERS = frozenset(
     {
         "test_production_inventory_obeys_admission_rule",
@@ -248,6 +260,125 @@ def _scan_study() -> tuple[tuple[Path, ...], tuple[tuple[str, Crossing], ...]]:
             "entry under rule (b), then rerun the boundary control"
         )
     return paths, violations
+
+
+def _hi_policy_edges(source: str, *, filename: str) -> tuple[set[tuple[str, str, str]], tuple[str, ...]]:
+    """Inventory HI-policy reads and fail-closed structural violations."""
+
+    tree = ast.parse(source, filename=filename)
+    edges: set[tuple[str, str, str]] = set()
+    violations: list[str] = []
+    schema_aliases: set[str] = set()
+    dynamic_imports: list[ast.Call] = []
+
+    def import_target(node: ast.Call) -> str | None:
+        if _dynamic_import_name(node) is None or not node.args:
+            return None
+        argument = node.args[0]
+        return argument.value if isinstance(argument, ast.Constant) and isinstance(argument.value, str) else None
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "tpen.hi_schema":
+            for alias in node.names:
+                edges.add((filename, "from-import", alias.asname or alias.name))
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "tpen.hi_schema":
+                    schema_aliases.add(alias.asname or "hi_schema")
+        elif isinstance(node, ast.Call):
+            target = import_target(node)
+            if target == "tpen.hi_schema":
+                dynamic_imports.append(node)
+
+    # AST nodes do not retain parents; infer aliases from assignments directly.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        if import_target(node.value) != "tpen.hi_schema":
+            continue
+        schema_aliases.update(
+            target.id for target in node.targets if isinstance(target, ast.Name)
+        )
+
+    dynamic_lines = sorted(node.lineno for node in dynamic_imports)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name):
+            continue
+        if node.value.id not in schema_aliases or node.attr not in HI_POLICY_NAMES:
+            continue
+        preceding = [line for line in dynamic_lines if line < node.lineno]
+        following = [line for line in dynamic_lines if line > node.lineno]
+        if preceding and (not following or node.lineno < min(following)):
+            edges.add((filename, "dynamic-import", node.attr))
+
+    for node in ast.walk(tree):
+        assigned_name: str | None = None
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            assigned_name = node.name
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            assigned_name = node.id
+        elif isinstance(node, ast.Attribute) and node.attr in HI_POLICY_NAMES:
+            assigned_name = node.attr
+        if assigned_name in HI_POLICY_NAMES:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) or isinstance(
+                getattr(node, "ctx", None), ast.Store
+            ):
+                violations.append(f"redefinition/mutation of {assigned_name}")
+
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in {"append", "extend", "clear", "pop", "remove", "update"}:
+                value = node.func.value
+                if isinstance(value, (ast.Attribute, ast.Name)):
+                    name = value.attr if isinstance(value, ast.Attribute) else value.id
+                    if name in HI_POLICY_NAMES:
+                        violations.append(f"mutation of {name}")
+
+    for node in dynamic_imports:
+        next_line = min(
+            (line for line in dynamic_lines if line > node.lineno),
+            default=None,
+        )
+        has_consumer = any(
+            isinstance(candidate, ast.Attribute)
+            and isinstance(candidate.value, ast.Name)
+            and candidate.value.id in schema_aliases
+            and candidate.attr in HI_POLICY_NAMES
+            and candidate.lineno > node.lineno
+            and (next_line is None or candidate.lineno < next_line)
+            for candidate in ast.walk(tree)
+        )
+        if not has_consumer:
+            violations.append("unrecognized tpen.hi_schema dynamic import")
+
+    if filename.startswith("tpen/"):
+        for node in ast.walk(tree):
+            target: str | None = None
+            if isinstance(node, ast.Import):
+                target = node.names[0].name if node.names else None
+            elif isinstance(node, ast.ImportFrom):
+                target = node.module
+            elif isinstance(node, ast.Call):
+                target = import_target(node)
+            if target and (target == "experiments" or target.startswith("experiments.")):
+                violations.append("core-to-experiments import")
+
+    return edges, tuple(violations)
+
+
+def _assert_hi_policy_inventory(source_by_file: dict[str, str]) -> None:
+    """Require exactly the sanctioned production HI-policy edges."""
+
+    measured: set[tuple[str, str, str]] = set()
+    violations: list[str] = []
+    for filename, source in source_by_file.items():
+        if Path(filename).name.startswith("test_"):
+            continue
+        edges, source_violations = _hi_policy_edges(source, filename=filename)
+        measured.update(edges)
+        violations.extend(f"{filename}: {violation}" for violation in source_violations)
+    violations.extend(f"unapproved HI-policy edge: {edge}" for edge in sorted(measured - HI_POLICY_ALLOWLIST))
+    violations.extend(f"missing HI-policy edge: {edge}" for edge in sorted(HI_POLICY_ALLOWLIST - measured))
+    assert not violations, "HI policy boundary violations: " + "; ".join(violations)
 
 
 def _validate_inventory_admission(
@@ -791,6 +922,59 @@ def test_production_inventory_obeys_admission_rule() -> None:
         measured, EXPECTED_PRODUCTION_INVENTORY, pending
     )
     assert pending_count + measured_count == 0
+    _assert_hi_policy_inventory(
+        {
+            path.relative_to(STUDY_DIR).as_posix(): path.read_text(encoding="utf-8")
+            for path in STUDY_DIR.rglob("*.py")
+        }
+    )
+
+
+def test_hi_policy_exact_allowlist_is_structural() -> None:
+    source_by_file = {
+        path.relative_to(STUDY_DIR).as_posix(): path.read_text(encoding="utf-8")
+        for path in STUDY_DIR.rglob("*.py")
+    }
+    measured = set()
+    for filename, source in source_by_file.items():
+        if not Path(filename).name.startswith("test_"):
+            edges, violations = _hi_policy_edges(source, filename=filename)
+            assert not violations, (filename, violations)
+            measured.update(edges)
+    assert measured == HI_POLICY_ALLOWLIST
+
+
+def test_hi_policy_rejects_unlisted_import_and_redefinition() -> None:
+    with_source = {
+        "optimizer_grid.py": (
+            'from tpen.hi_schema import HI_METHOD_ROSTER, validate_hi_train_config\n'
+            "HI_METHOD_ROSTER = ()\n"
+        )
+    }
+    edges, violations = _hi_policy_edges(
+        with_source["optimizer_grid.py"], filename="optimizer_grid.py"
+    )
+    assert ("optimizer_grid.py", "from-import", "validate_hi_train_config") in edges
+    assert any("redefinition/mutation" in violation for violation in violations)
+    assert any(edge not in HI_POLICY_ALLOWLIST for edge in edges)
+
+
+def test_hi_policy_rejects_literal_core_to_experiments_import() -> None:
+    _, violations = _hi_policy_edges(
+        'import_module("experiments.atomistic.he_importance.stage_coordinate")\n',
+        filename="tpen/hi_schema.py",
+    )
+    assert "core-to-experiments import" in violations
+
+
+def test_hi_policy_ignores_prose_and_schema_identifier_strings() -> None:
+    edges, violations = _hi_policy_edges(
+        'message = "tpen.hi_schema.HI_METHOD_ROSTER"\n'
+        'schema = "tpen.hi.train.v1"\n',
+        filename="train_config.py",
+    )
+    assert edges == set()
+    assert violations == ()
 
 
 def test_test_file_inventory_obeys_admission_rule() -> None:
