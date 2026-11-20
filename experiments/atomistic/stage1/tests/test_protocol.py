@@ -125,7 +125,46 @@ def test_seed_known_vectors_are_cross_process_stable_across_hash_seeds() -> None
 
 
 def test_manifest_refuses_forced_seed_collision(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(protocol_module, "_encode_seed", lambda **_: 123)
+    original_training_seed = protocol_module.training_seed
+    training_calls = 0
+
+    def collide_across_training_lineages(*, system: str, lineage: int,
+                                          lineage_seed: int) -> int:
+        nonlocal training_calls
+        training_calls += 1
+        # The first 12 calls are the complete-plan audit.  Collide only when
+        # the row loop reaches hooke1 lineage 1, proving its own guard is live.
+        if training_calls == 14:
+            return original_training_seed(
+                system="hooke1", lineage=0, lineage_seed=11,
+            )
+        return original_training_seed(
+            system=system, lineage=lineage, lineage_seed=lineage_seed,
+        )
+
+    monkeypatch.setattr(protocol_module, "training_seed", collide_across_training_lineages)
+    with pytest.raises(ProtocolError, match="seed collision"):
+        _manifest(checkpoints=[0, 7, 101])
+    monkeypatch.setattr(protocol_module, "training_seed", original_training_seed)
+
+    original_evaluation_seed = protocol_module.evaluation_seed
+    evaluation_calls = 0
+
+    def collide_across_evaluation_lineages(*, system: str, lineage: int,
+                                            checkpoint: int, stream: int) -> int:
+        nonlocal evaluation_calls
+        evaluation_calls += 1
+        # The complete-plan audit emits 144 eval seeds first.  The row loop
+        # reaches hooke1 lineage 1 after 12 rows for lineage 0.
+        if evaluation_calls == 157:
+            return original_evaluation_seed(
+                system="hooke1", lineage=0, checkpoint=0, stream=0,
+            )
+        return original_evaluation_seed(
+            system=system, lineage=lineage, checkpoint=checkpoint, stream=stream,
+        )
+
+    monkeypatch.setattr(protocol_module, "evaluation_seed", collide_across_evaluation_lineages)
     with pytest.raises(ProtocolError, match="seed collision"):
         _manifest(checkpoints=[0, 7, 101])
 
