@@ -295,4 +295,6 @@ MUTANTS = (
     # No mutant row for predecessor-current: _validate_fence repeats the pointer check immediately after it.
     ("partial-start-recovery", "storage.py", "if current not in {successor.attempt_id.value, admission.predecessor_attempt_id.value}:", "if current != successor.attempt_id.value:", "test_admitted_start_recovers_after_durable_boundary"),
     ("lease-facts-consistency", "results.py", "if previous is not None and previous != binding.allocation_attempt:", "if False:", "test_conflicting_lease_facts_park_before_publication"),
+    ("drop-recovery-predecessor-fence", "storage.py", "if current == admission.predecessor_attempt_id.value:\n                    self._validate_fence(predecessor_fence, task_dir)", "if False:\n                    pass", "test_partial_start_rechecks_predecessor_before_writes"),
+    ("drop-recovery-directory-fsync", "storage.py", "_fsync_directory(output_dir)", "pass", "test_recovery_syncs_visible_receipts_before_pointer_commit"),
 )

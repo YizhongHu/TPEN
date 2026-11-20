@@ -88,6 +88,8 @@ Existing single-generation `ReconciliationPublicationV2` bytes remain unchanged.
 If a crash leaves an admitted successor directory visible while the predecessor
 pointer is still current, the next start validates existing canonical files,
 writes only missing files, and advances the pointer to the admitted attempt.
+Recovery revalidates the predecessor fence, verifies or completes both receipt
+files, fsyncs the successor directory, and only then advances the pointer.
 Allocation-attempt IDs are also one-to-one with complete attempt facts across
 the controller, member bindings, and proposed successors; conflicting facts
 park before any admission ledger write.

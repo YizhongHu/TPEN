@@ -525,6 +525,8 @@ class DirectoryStore:
                 _require_directory(output_dir, "admitted successor attempt")
                 if current not in {successor.attempt_id.value, admission.predecessor_attempt_id.value}:
                     raise FenceRejected("admitted successor attempt is not current")
+                if current == admission.predecessor_attempt_id.value:
+                    self._validate_fence(predecessor_fence, task_dir)
                 for name, expected in (("start.json", start_bytes), ("invocation.json", invocation_bytes)):
                     path = os.path.join(output_dir, name)
                     if os.path.lexists(path):
@@ -536,6 +538,7 @@ class DirectoryStore:
                     else:
                         raise FenceRejected("admitted successor receipt is missing")
                 if current == admission.predecessor_attempt_id.value:
+                    _fsync_directory(output_dir)
                     _write_pointer(pointer, successor.attempt_id.value)
                 return AttemptFence(self.root, group.identity, task_id, allocation.allocation_id.value,
                                     successor.attempt_id, output_dir)
