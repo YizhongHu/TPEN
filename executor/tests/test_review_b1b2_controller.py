@@ -27,7 +27,7 @@ MUTANTS = (
     ("drop-pre-launch-authority-check", MODULE_NAME, "store.require_current_controller(group, controller.generation, controller.claimant_nonce)", "pass", "test_t2_supersession_after_publication_preserves_newer_start"),
     ("begin-attempt-for-successor", MODULE_NAME, "store.begin_admitted_successor_current_controller(", "store.begin_attempt_current_controller(", "test_real_store_admitted_successor_uses_durable_admission_once"),
     ("intent-probe-inverted", MODULE_NAME, "existing = store.read_launch_intent(fence)", "existing = None", "test_real_store_fresh_start_writes_intent_and_launches_once"),
-    ("park-is-not-success", MODULE_NAME, "else 2, reasons)", "else 0, reasons)", "test_terminal_and_park_exit_two"),
+    ("park-is-not-success", MODULE_NAME, "else 2, reason_records)", "else 0, reason_records)", "test_terminal_and_park_exit_two"),
     ("publish-equality-off", MODULE_NAME, "if published.encode() != checked.encode():", "if False:", "test_publication_conflict_parks"),
     ("critical-section-off", "executor/src/tpen_executor/storage.py", "self._current_controller_locked(directory, group.group_id, controller_record)\n            return self.begin_attempt", "pass\n            return self.begin_attempt", "test_t2_supersession_after_publication_preserves_newer_start"),
     ("outcome-receipt-off", MODULE_NAME, "store.record_controller_outcome(fence, controller, invocation, \"launched\", launched.detail or \"acknowledged\")", "pass", "test_real_store_launch_writes_controller_outcome"),
