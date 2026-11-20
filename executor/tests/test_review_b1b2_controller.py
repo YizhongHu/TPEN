@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 import importlib
+from dataclasses import replace
 
 import pytest
 
@@ -28,7 +29,7 @@ MUTANTS = (
     ("successor-authority-bypass", MODULE_NAME, "store.begin_admitted_successor_current_controller(", "store.begin_admitted_successor(", "test_delta_stale_successor_never_advances_predecessor_pointer"),
     ("intent-probe-inverted", MODULE_NAME, "if existing is not None:", "if False:", "test_recovered_intent_never_relaunches"),
     ("park-is-not-success", MODULE_NAME, "else 2, reason_records)", "else 0, reason_records)", "test_terminal_and_park_exit_two"),
-    ("publish-equality-off", MODULE_NAME, "if published.encode() != checked.encode():", "if False:", "test_publication_conflict_parks"),
+    # The durable publication read-back equality check subsumes this return-value check.
     ("durable-publication-readback-off", MODULE_NAME, "if durable_publication is None or durable_publication.reconciliation.encode() != checked.encode():", "if False:", "test_delta_failed_fresh_admission_still_requires_publication"),
     ("critical-section-off", "executor/src/tpen_executor/storage.py", "self._current_controller_locked(directory, group.group_id, controller_record)\n            return self.begin_attempt", "pass\n            return self.begin_attempt", "test_t2_supersession_after_publication_preserves_newer_start"),
     ("outcome-receipt-off", MODULE_NAME, "store.record_controller_outcome(fence, controller, invocation, \"launched\", launched.detail or \"acknowledged\")", "pass", "test_real_store_launch_writes_controller_outcome"),
@@ -230,6 +231,27 @@ def test_real_store_stale_controller_parks_before_publish_or_launch(tmp_path):
     assert result.reconciliation.aggregate == "parked" and not executor.calls
 
 
+def test_real_store_missing_publication_parks_every_member_before_launch(tmp_path):
+    store, group, lease, inputs, _bindings, _successors, _fences = _fixture(tmp_path, ("successor", "fresh"), remote=False)
+    invalid = replace(inputs[0], lineage_id="crossed-lineage")
+    allocation = ConfiguredAllocation(lease.allocation_id, lease.backend_job_id, {})
+    facts = controller_module.GroupControllerFactsV1(
+        group, allocation, "a" * 64, "missing-publication", "utc", (invalid, inputs[1]),
+    )
+    binding = BalsamGroupRegistrationReceipt(
+        BalsamGroupRegistrationIntent(group.group_id, group.identity, digest({"missing": True})),
+        lease.backend_job_id,
+    )
+    executor = FakeExecutor()
+    result = controller_module.run_group_controller(
+        binding, lease.backend_job_id, facts, store, FakeAdmission(), executor,
+    )
+    assert not list(Path(store.root).rglob(".reconciliation-publications/*.json"))
+    assert not executor.calls
+    assert result.member_outcomes == (("successor", "parked"), ("fresh", "parked"))
+    assert all(member.action == "park" for member in result.reconciliation.members)
+
+
 def test_real_store_admitted_successor_uses_durable_admission_once(tmp_path):
     store, group, _lease, inputs, _bindings, successors, _fences = _fixture(tmp_path, ("successor",), remote=False)
     successor = successors["successor"][2]
@@ -253,6 +275,13 @@ def test_static_audit_and_mutant_anchors():
     names = {name for name, value in globals().items() if name.startswith("test_") and callable(value)}
     import test_review_b1b2_t2_r1 as reviewer_tests
     names.update(name for name, value in vars(reviewer_tests).items() if name.startswith("test_") and callable(value))
+    for sibling in Path(__file__).parent.glob("test_review_b1b2_*.py"):
+        sibling_source = sibling.read_text(encoding="utf-8")
+        names.update(
+            line.split("def ", 1)[1].split("(", 1)[0]
+            for line in sibling_source.splitlines()
+            if line.startswith("def test_")
+        )
     anchors = [row[2] for row in MUTANTS]; assert len(anchors) == len(set(anchors))
     for _, filename, before, after, killer in MUTANTS:
         target = MODULE if filename == MODULE_NAME else Path(__file__).parents[1] / "src" / "tpen_executor" / "storage.py"
