@@ -300,24 +300,21 @@ def test_blinding_refuses_reference_name_in_local_energy_topology() -> None:
 
 
 @pytest.mark.parametrize(
-    ("channel", "checkpoint_id", "expected_chain_ids", "rows", "label"),
+    ("checkpoint_id", "expected_chain_ids", "rows", "label"),
     [
         (
-            "checkpoint id",
             "reference_energy",
             ("chain-0",),
             (evaluator.LocalEnergyRow("checkpoint-a", "chain-0", {"rank": 0}, 1.0),),
             "local-energy checkpoint id",
         ),
         (
-            "expected chain id",
             "checkpoint-a",
             ("reference_energy",),
             (evaluator.LocalEnergyRow("checkpoint-a", "chain-0", {"rank": 0}, 1.0),),
             "local-energy expected chain id[0]",
         ),
         (
-            "row chain id",
             "checkpoint-a",
             ("chain-0",),
             (evaluator.LocalEnergyRow("checkpoint-a", "reference_energy", {"rank": 0}, 1.0),),
@@ -326,7 +323,6 @@ def test_blinding_refuses_reference_name_in_local_energy_topology() -> None:
     ],
 )
 def test_blinding_refuses_reference_name_on_each_identifier_route(
-    channel: str,
     checkpoint_id: str,
     expected_chain_ids: tuple[str, ...],
     rows: tuple[object, ...],
