@@ -67,6 +67,33 @@ callback can run. Real-core compatibility, durable publication, successor
 fencing, Balsam lifecycle, and facility integration are later layers and are
 not claimed by B1a.
 
+### B1a-C durable successor and multi-generation publication
+
+`DirectoryStore.begin_admitted_successor()` is the only executor start path
+for a CX-04 admitted successor. It locks the task, rereads the canonical
+successor-admission ledger, requires the predecessor to remain current, and
+consumes the recorded `AttemptId` and `InvocationId` exactly. The start and
+invocation files are write-once; an identical replay returns the same fence,
+while a missing, crossed, symlinked, or differing record is refused.
+
+`publish_reconciliation()` is keyed by the new controller's
+`AllocationAttemptV2`, but each existing member is validated against the
+allocation attempt recorded in that member's durable `invocation.json`. This
+allows recovered groups to combine evidence from several prior allocation
+generations. Evidence from another group, with mismatched allocation facts, or
+whose durable invocation was tampered with parks the publication. The current
+controller lease is valid when it is also the member's recorded lease; prior
+and mixed leases are valid when each matches its own durable invocation.
+Existing single-generation `ReconciliationPublicationV2` bytes remain unchanged.
+If a crash leaves an admitted successor directory visible while the predecessor
+pointer is still current, the next start validates existing canonical files,
+writes only missing files, and advances the pointer to the admitted attempt.
+Recovery revalidates the predecessor fence, verifies or completes both receipt
+files, fsyncs the successor directory, and only then advances the pointer.
+Allocation-attempt IDs are also one-to-one with complete attempt facts across
+the controller, member bindings, and proposed successors; conflicting facts
+park before any admission ledger write.
+
 ## GPU placement qualification
 
 The L1a v2 placement receipt reports an explicit reason class: `not-sampled`,
