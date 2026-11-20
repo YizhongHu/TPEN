@@ -30,7 +30,7 @@ MUTANTS = (
     ("intent-probe-inverted", MODULE_NAME, "if existing is not None:", "if False:", "test_recovered_intent_never_relaunches"),
     ("park-is-not-success", MODULE_NAME, "else 2, reason_records)", "else 0, reason_records)", "test_terminal_and_park_exit_two"),
     # The durable publication read-back equality check subsumes this return-value check.
-    ("durable-publication-readback-off", MODULE_NAME, "if durable_publication is None or durable_publication.reconciliation.encode() != checked.encode():", "if False:", "test_delta_failed_fresh_admission_still_requires_publication"),
+    ("durable-publication-readback-off", MODULE_NAME, "if durable_publication is None or durable_publication.reconciliation.encode() != checked.encode():", "if False:", "test_real_store_missing_publication_parks_every_member_before_launch"),
     ("critical-section-off", "executor/src/tpen_executor/storage.py", "self._current_controller_locked(directory, group.group_id, controller_record)\n            return self.begin_attempt", "pass\n            return self.begin_attempt", "test_t2_supersession_after_publication_preserves_newer_start"),
     ("outcome-receipt-off", MODULE_NAME, "store.record_controller_outcome(fence, controller, invocation, \"launched\", launched.detail or \"acknowledged\")", "pass", "test_real_store_launch_writes_controller_outcome"),
 )
