@@ -73,7 +73,10 @@ def test_admitted_successor_crossed_binding_fields_refuse(tmp_path, field):
     if field == "group_digest":
         crossed = replace(successor, group_digest="0" * 64)
     elif field == "task_id":
-        crossed = replace(successor, task_id="foreign-task")
+        # SuccessorAdmissionRecord rejects this crossing before storage sees it.
+        with pytest.raises(ValueError, match="successor binding crosses admission identity"):
+            replace(admission, successor_binding=replace(successor, task_id="foreign-task"))
+        return
     elif field == "lineage_id":
         crossed = replace(successor, lineage_id="foreign-lineage")
     elif field == "allocation_attempt":
@@ -174,7 +177,8 @@ def test_publication_accepts_prior_attempts_under_new_controller_lease(tmp_path)
     record = store.read_reconciliation(group, controller)
     assert record is not None
     encoded = record.encode()
-    assert store.publish_reconciliation(group, controller, tuple(inputs), bindings=bindings).encode() == encoded
+    assert store.publish_reconciliation(group, controller, tuple(inputs), bindings=bindings) == result
+    assert store.read_reconciliation(group, controller).encode() == encoded
     assert [member.binding.allocation_attempt for member in record.members] == [bindings["a"].allocation_attempt, bindings["b"].allocation_attempt]
 
 
@@ -234,7 +238,7 @@ MUTANTS = (
     ("restore-single-lease-gate", "storage.py", "if (binding.allocation_attempt.group_id != group.group_id\n                            or binding.lineage_id != task.lineage_id", "if binding.allocation_attempt != allocation_attempt:", "test_publication_accepts_prior_attempts_under_new_controller_lease"),
     ("drop-replay-byte-compare", "storage.py", "or Path(output_dir, \"invocation.json\").read_bytes() != invocation_bytes", "or False", "test_admitted_successor_consumes_exact_identity_and_replays"),
     ("crossed-successor-group", "storage.py", "or successor.group_digest != group.identity", "or False", "test_admitted_successor_crossed_binding_fields_refuse"),
-    ("crossed-successor-task", "storage.py", "or successor.task_id != task_id", "or False", "test_admitted_successor_crossed_binding_fields_refuse"),
+    # No mutant row for successor.task_id: SuccessorAdmissionRecord makes it unreachable.
     ("crossed-successor-lineage", "storage.py", "or successor.lineage_id != next(member.lineage_id for member in group.members if member.task_id == task_id)", "or False", "test_admitted_successor_crossed_binding_fields_refuse"),
     ("crossed-successor-attempt", "storage.py", "or successor.allocation_attempt != allocation_attempt", "or False", "test_admitted_successor_crossed_binding_fields_refuse"),
     ("predecessor-current-gate", "storage.py", "if current != admission.predecessor_attempt_id.value:", "if False:", "test_admitted_successor_predecessor_not_current_refuses"),
