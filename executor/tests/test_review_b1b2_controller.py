@@ -9,17 +9,18 @@ import pytest
 
 import tpen_executor.lifecycle.controller as controller_module
 from tpen_executor._codec import digest
-from tpen_executor.allocations import ConfiguredAllocation, ControllerGenerationV1
+from tpen_executor.allocations import ConfiguredAllocation, ControllerGenerationV1, MemberInvocationV2
 from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId
 from tpen_executor.lifecycle.balsam import BalsamGroupRegistrationIntent, BalsamGroupRegistrationReceipt, GroupFailure
 from tpen_executor.recovery import GroupReconciliationV2, MemberReconciliationV2, MemberRecoveryInputV2
 from tpen_executor.storage import DirectoryStore, LaunchIntentRejected
 from test_b1a_reconciliation import _group
+from test_b1a_b_publication import _fixture
 
 MODULE = Path(__file__).parents[1] / "src" / "tpen_executor" / "lifecycle" / "controller.py"
 MODULE_NAME = "executor/src/tpen_executor/lifecycle/controller.py"
 MUTANTS = (
-    ("drop-job-id-check", MODULE_NAME, "if observed_job_id != binding.backend_job_id", "if False", "test_job_id_mismatch_is_pre_start"),
+    ("drop-job-id-check", MODULE_NAME, "if observed_job_id != bound_job_id or allocation.backend_job_id != observed_job_id:", "if False:", "test_job_id_mismatch_is_pre_start"),
     ("drop-acquire-refusal-park", MODULE_NAME, "controller = store.acquire_controller_generation(group, controller_request)", "controller = controller_request", "test_stale_controller_parks_before_publish"),
     ("drop-pre-launch-authority-check", MODULE_NAME, "store.require_current_controller(group, controller.generation, controller.claimant_nonce)", "pass", "test_superseded_after_intent_does_not_launch"),
     ("begin-attempt-for-successor", MODULE_NAME, "store.begin_admitted_successor(", "store.begin_attempt(", "test_successor_uses_admitted_start_only"),
@@ -49,7 +50,7 @@ class FakeStore:
     def __init__(self, real, controller, published, *, recovered=False, supersede=False, reject=False):
         self.real, self.controller, self.published = real, controller, published
         self.recovered, self.supersede, self.reject, self.calls = recovered, supersede, reject, []
-    def record_pre_start_receipt(self, reason): self.real.record_pre_start_receipt(reason)
+    def record_pre_start_receipt(self, group, backend_job_id, observed_job_id, reason): self.real.record_pre_start_receipt(group, backend_job_id, observed_job_id, reason)
     def acquire_controller_generation(self, group, record):
         self.calls.append("acquire")
         if self.reject:
@@ -106,6 +107,14 @@ def test_job_id_mismatch_is_pre_start(tmp_path):
     facts, binding, store = _setup(tmp_path)
     result = controller_module.run_group_controller(binding, BackendJobId("other"), facts, store, FakeAdmission(), FakeExecutor())
     assert result == GroupFailure.PRE_START and list(Path(store.real.root).rglob("pre-start-*.json")) and not store.calls
+
+def test_pre_start_receipts_are_keyed_and_replay_idempotent(tmp_path):
+    store = DirectoryStore(tmp_path / "receipts")
+    group_a = _group(("a",)); group_b = _group(("b",))
+    store.record_pre_start_receipt(group_a, BackendJobId("job-a"), BackendJobId("seen-a"), "mismatch")
+    store.record_pre_start_receipt(group_b, BackendJobId("job-b"), BackendJobId("seen-b"), "mismatch")
+    store.record_pre_start_receipt(group_a, BackendJobId("job-a"), BackendJobId("seen-a"), "mismatch")
+    assert len(list(Path(store.root).rglob("pre-start-*.json"))) == 2
 
 def test_stale_controller_parks_before_publish(tmp_path):
     result, store, executor = _run(tmp_path, reject=True)
@@ -186,6 +195,23 @@ def test_real_store_stale_controller_parks_before_publish_or_launch(tmp_path):
     executor = FakeExecutor()
     result = controller_module.run_group_controller(binding, BackendJobId("real-job"), facts, store, FakeAdmission(), executor)
     assert result.reconciliation.aggregate == "parked" and not executor.calls
+
+
+def test_real_store_admitted_successor_uses_durable_admission_once(tmp_path):
+    store, group, _lease, inputs, _bindings, successors, _fences = _fixture(tmp_path, ("successor",), remote=False)
+    successor = successors["successor"][2]
+    allocation = ConfiguredAllocation(successor.allocation_attempt.allocation_id, successor.allocation_attempt.backend_job_id, {})
+    facts = controller_module.GroupControllerFactsV1(group, allocation, "a" * 64, "successor-controller", "utc", inputs, successors)
+    binding = BalsamGroupRegistrationReceipt(BalsamGroupRegistrationIntent(group.group_id, group.identity, digest({"successor": True})), successor.allocation_attempt.backend_job_id)
+    class EchoAdmission:
+        def admit(self, member): return member.core_verdict
+    executor = FakeExecutor()
+    result = controller_module.run_group_controller(binding, successor.allocation_attempt.backend_job_id, facts, store, EchoAdmission(), executor)
+    assert result.reconciliation.members[0].action == "admit_successor"
+    assert executor.calls == ["successor"]
+    invocations = [MemberInvocationV2.decode(path.read_bytes()) for path in Path(store.root).rglob("invocation.json")]
+    assert any(item.attempt_id == successor.attempt_id and item.invocation_id == successor.invocation_id for item in invocations)
+    assert len(list(Path(store.root).rglob("launch-intent.json"))) == 1
 
 def test_static_audit_and_mutant_anchors():
     source = MODULE.read_text(encoding="utf-8")

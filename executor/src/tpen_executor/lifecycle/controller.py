@@ -1,22 +1,23 @@
 """Backend-neutral allocation-group controller loop.
 
 The controller owns ordering and fencing only.  It does not import an optional
-backend SDK, infer completion from backend observations, or retry an uncertain
+backend SDK, infer completion from backend observations, or repeat an uncertain
 launch.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 from uuid import uuid4
 
 from .._records import frozen_record
 from ..allocations import AllocationAttemptV2, ControllerGenerationV1, MemberInvocationV2
-from ..contracts import AllocationAttemptId, BackendJobId, InvocationId, ReadyGroupV2
+from ..contracts import AllocationAttemptId, BackendJobId, GroupId, InvocationId, ReadyGroupV2
 from ..recovery import CoreAdmissionPort, GroupReconciliationV2, MemberRecoveryInputV2, reconcile_group
 from ..results import SuccessorAdmissionRecord
-from ..storage import AttemptFence, ControllerGenerationRejected, DirectoryStore, LaunchIntentRejected
+from ..storage import AttemptFence, ControllerGenerationRejected, DirectoryStore, FenceRejected, LaunchIntentRejected
 
 
 @frozen_record
@@ -67,17 +68,12 @@ class GroupControllerOutcome:
     exit_code: int
 
 
-def _pre_start(store: DirectoryStore, reason: str, *, group: Any = None, backend_job_id: Any = None, observed_job_id: Any = None) -> Any:
-    """Best-effort durable pre-start receipt; ambiguity remains non-success."""
-    writer = getattr(store, "record_pre_start_receipt", None)
-    if writer is not None:
-        try:
-            try:
-                writer(group, backend_job_id, observed_job_id, reason)
-            except TypeError:
-                writer(reason)
-        except Exception:
-            pass
+def _pre_start(store: DirectoryStore, reason: str, *, group: ReadyGroupV2 | GroupId, backend_job_id: BackendJobId, observed_job_id: BackendJobId) -> Any:
+    """Persist a refusal when possible; storage uncertainty remains PRE_START."""
+    try:
+        store.record_pre_start_receipt(group, backend_job_id, observed_job_id, reason)
+    except (OSError, FenceRejected):
+        pass
     from .balsam import GroupFailure
 
     return GroupFailure.PRE_START
@@ -123,12 +119,18 @@ def run_group_controller(
     facts = allocation_facts
     group = facts.group
     allocation = facts.allocation
-    if not isinstance(observed_job_id, BackendJobId) or not hasattr(binding, "backend_job_id"):
-        return _pre_start(store, "malformed-registration", group=getattr(binding, "intent", None), backend_job_id=getattr(binding, "backend_job_id", None), observed_job_id=observed_job_id)
-    if observed_job_id != binding.backend_job_id or allocation.backend_job_id != observed_job_id:
-        return _pre_start(store, "backend-job-mismatch", group=group, backend_job_id=binding.backend_job_id, observed_job_id=observed_job_id)
-    if binding.intent.group_id != group.group_id or binding.intent.group_digest != group.identity:
-        return _pre_start(store, "registration-group-mismatch", group=group, backend_job_id=binding.backend_job_id, observed_job_id=observed_job_id)
+    if not isinstance(observed_job_id, BackendJobId):
+        return _pre_start(store, "malformed-registration", group=group, backend_job_id=allocation.backend_job_id, observed_job_id=observed_job_id)
+    try:
+        bound_job_id = binding.backend_job_id
+        bound_group_id = binding.intent.group_id
+        bound_group_digest = binding.intent.group_digest
+    except AttributeError:
+        return _pre_start(store, "malformed-registration", group=group, backend_job_id=allocation.backend_job_id, observed_job_id=observed_job_id)
+    if observed_job_id != bound_job_id or allocation.backend_job_id != observed_job_id:
+        return _pre_start(store, "backend-job-mismatch", group=group, backend_job_id=bound_job_id, observed_job_id=observed_job_id)
+    if bound_group_id != group.group_id or bound_group_digest != group.identity:
+        return _pre_start(store, "registration-group-mismatch", group=group, backend_job_id=bound_job_id, observed_job_id=observed_job_id)
     try:
         controller_request = ControllerGenerationV1(
             group.group_id, facts.controller_generation, allocation.allocation_id, observed_job_id,
@@ -151,11 +153,8 @@ def run_group_controller(
         bindings = {}
         for item in frozen_inputs:
             if item.start_receipt is not None:
-                bindings[item.task_id] = MemberInvocationV2(
-                    attempt, group.identity, item.task_id,
-                    next(member.lineage_id for member in group.members if member.task_id == item.task_id),
-                    item.attempt_id, InvocationId(uuid4().hex),
-                )
+                invocation_path = Path(item.start_receipt.output_dir) / "invocation.json"
+                bindings[item.task_id] = MemberInvocationV2.decode(invocation_path.read_bytes())
         published = store.publish_reconciliation(
             group, attempt, tuple(frozen_inputs), bindings=bindings,
             successors=facts.successor_requests,
@@ -182,28 +181,17 @@ def run_group_controller(
                     fence.attempt_id, invocation_id,
                 )
             elif member.action == "admit_successor":
-                request = facts.successor_requests[member.task_id]
-                admission = request[2]
-                if not isinstance(admission, MemberInvocationV2):
-                    raise TypeError("successor request lacks binding")
-                # The durable publication contains the admission; callers may
-                # pass the typed record in the request tuple for this seam.
-                record = getattr(published, "admissions", {}).get(member.task_id)
-                if record is None:
-                    record = getattr(store, "read_successor_admission", lambda *_: None)(member.task_id)
-                if record is None:
-                    publication = getattr(store, "read_reconciliation", lambda *_: None)(group, attempt)
-                    if publication is not None:
-                        record = next((item.admission for item in publication.members if item.evidence.task_id == member.task_id), None)
-                if not isinstance(record, SuccessorAdmissionRecord):
-                    record = request[0] if isinstance(request[0], SuccessorAdmissionRecord) else None
-                if record is None:
+                publication = store.read_reconciliation(group, attempt)
+                if publication is None:
+                    raise LaunchIntentRejected("successor admission unavailable")
+                record = next((item.admission for item in publication.members if item.evidence.task_id == member.task_id), None)
+                if not isinstance(record, SuccessorAdmissionRecord) or record.successor_binding is None:
                     raise LaunchIntentRejected("successor admission unavailable")
                 fence = store.begin_admitted_successor(
                     group, member.task_id, allocation, facts.observed_at_utc, "local",
-                    allocation_attempt=attempt, admission=record,
+                    allocation_attempt=record.successor_binding.allocation_attempt, admission=record,
                 )
-                invocation = admission
+                invocation = record.successor_binding
             else:
                 outcomes.append((member.task_id, "parked"))
                 continue
