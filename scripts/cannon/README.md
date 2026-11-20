@@ -4,6 +4,16 @@ verify.sh is the versioned, facility-neutral entry point for exact-head CPU
 verification. The Cannon submission wrapper supplies facility paths and
 resources; the repository receives only CLI and environment inputs.
 
+Use the [test-execution contract](../../.agents/skills/test-execution/SKILL.md)
+to name each stage's question, selection and stopping condition in the runbook.
+Purpose names are note labels; this runner has no `--purpose` option. Quick mode
+can support diagnosis or affected verification when its selected scope fits.
+Adding `--mutants` adds fault checks; it is not a routine verification requirement.
+The current mutation path evaluates baseline failure after executing mutant arms,
+so it does not yet enforce the contract's early-stop intent. A failed baseline
+cannot support a killed-mutant claim. The current 3-6-row mutant input restriction
+is a tool limitation, not a reason to invent additional faults.
+
 Quick mode requires a Slurm allocation, clones the exact SHA with tags,
 resolves and validates a pre-built, reuse-only shared dependency environment
 under `SHARED_ENV_PREFIX` (see "Shared environment: reuse-only" below), creates
@@ -72,8 +82,8 @@ manual-validation fallback (e.g.
 and are marked `@pytest.mark.requires_typeguard`. `tests/conftest.py` skips
 these whenever typeguard is not instrumenting `tpen` — which is always true in
 quick mode's `--typecheck off` — so they are never silently reported as a
-baseline failure or a false SURVIVED/HARNESS_ERROR. **Quick mode does not
-exercise these tests; only the full suite (type checking on) does.** The
+baseline failure or a false SURVIVED/HARNESS_ERROR. **A selected quick-mode run
+with Typeguard on exercises them; a run with it off does not.** The
 one-line summary reports the skip count explicitly as
 `typeguard_skipped=N`; a nonzero count is the documented gap, not a defect.
 
@@ -100,9 +110,14 @@ resolved root looks like a real `tpen` checkout (`pyproject.toml` with
 `name = "tpen"`) and fails loudly instead of silently reporting an empty,
 vacuously-passing F3 section.
 
-Use --mode measure --full-suite to record targeted type-checking/parallelism
-combinations plus one full-suite timing in the evidence root. All evidence is
-written live below RUN_ROOT; throwaway checkout, cache, temporary files,
+Use `--mode measure` only for an explicit benchmark question: it runs all four
+type-checking/parallelism combinations. Always supply the intended `--test`
+selection; an empty selection currently falls through to broad collection.
+Adding `--full-suite` appends a full-suite timing after that matrix. It is not
+a standalone batch-regression switch; use a bounded batch runbook when only the
+batch suite is needed. This documentation does not change runner dispatch.
+
+All evidence is written live below RUN_ROOT; throwaway checkout, cache, temporary files,
 overlays, and mutant backups are removed from the exact job scratch directory
 by the exit trap.
 
