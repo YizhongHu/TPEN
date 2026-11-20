@@ -628,6 +628,7 @@ class DirectoryStore:
         *,
         allocation_attempt: AllocationAttemptV2 | None = None,
         invocation_id: InvocationId | None = None,
+        controller_record: ControllerGenerationV1 | None = None,
     ) -> AttemptFence:
         """Create a fresh fenced output directory and durable start receipt.
 
@@ -714,6 +715,7 @@ class DirectoryStore:
         *,
         allocation_attempt: AllocationAttemptV2,
         admission: SuccessorAdmissionRecord,
+        controller_record: ControllerGenerationV1 | None = None,
     ) -> AttemptFence:
         """Start the exact successor recorded by the durable CX-04 admission.
 

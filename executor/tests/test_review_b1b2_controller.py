@@ -27,10 +27,10 @@ MUTANTS = (
     ("drop-pre-launch-authority-check", MODULE_NAME, "store.require_current_controller(group, controller.generation, controller.claimant_nonce)", "pass", "test_t2_supersession_after_publication_preserves_newer_start"),
     ("begin-attempt-for-successor", MODULE_NAME, "store.begin_admitted_successor_current_controller(", "store.begin_attempt_current_controller(", "test_real_store_admitted_successor_uses_durable_admission_once"),
     ("intent-probe-inverted", MODULE_NAME, "existing = store.read_launch_intent(fence)", "existing = None", "test_real_store_fresh_start_writes_intent_and_launches_once"),
-    ("park-is-not-success", MODULE_NAME, "else 2)", "else 0)", "test_terminal_and_park_exit_two"),
+    ("park-is-not-success", MODULE_NAME, "else 2, reasons)", "else 0, reasons)", "test_terminal_and_park_exit_two"),
     ("publish-equality-off", MODULE_NAME, "if published.encode() != checked.encode():", "if False:", "test_publication_conflict_parks"),
-    ("critical-section-off", "executor/src/tpen_executor/storage.py", "self._current_controller_locked(directory, group.group_id, controller_record)\n            return self.begin_attempt", "self._current_controller_locked(directory, group.group_id, controller_record)\n            raise ControllerGenerationRejected(\"start authority lost\")", "test_t2_supersession_after_publication_preserves_newer_start"),
-    ("outcome-receipt-off", MODULE_NAME, "store.record_controller_outcome(fence, controller, invocation, \"launched\", launched.detail)", "pass", "test_t2_typed_ack_launches_with_durable_intent"),
+    ("critical-section-off", "executor/src/tpen_executor/storage.py", "self._current_controller_locked(directory, group.group_id, controller_record)\n            return self.begin_attempt", "pass\n            return self.begin_attempt", "test_t2_supersession_after_publication_preserves_newer_start"),
+    ("outcome-receipt-off", MODULE_NAME, "store.record_controller_outcome(fence, controller, invocation, \"launched\", launched.detail)", "pass", "test_real_store_launch_writes_controller_outcome"),
 )
 # Relaunch prevention is deliberately double-fenced: this controller probe
 # parks an existing intent, while DirectoryStore.create_launch_intent also
@@ -197,6 +197,12 @@ def test_real_store_fresh_start_writes_intent_and_launches_once(tmp_path):
     result = controller_module.run_group_controller(binding, BackendJobId("real-job"), facts, store, FakeAdmission(), executor)
     assert result.exit_code == 2 and executor.calls == ["real-task"]
     assert list(Path(store.root).rglob("launch-intent.json"))
+
+def test_real_store_launch_writes_controller_outcome(tmp_path):
+    group, allocation, facts, binding, store = _real_fresh(tmp_path)
+    result = controller_module.run_group_controller(binding, BackendJobId("real-job"), facts, store, FakeAdmission(), FakeExecutor())
+    assert result.member_outcomes == (("real-task", "launched"),)
+    assert len(list(Path(store.root).rglob("controller-outcome.json"))) == 1
 
 
 def test_real_store_recovery_after_executor_exception_parks_without_relaunch(tmp_path):

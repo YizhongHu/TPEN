@@ -72,6 +72,7 @@ class GroupControllerOutcome:
     reconciliation: GroupReconciliationV2
     member_outcomes: tuple[tuple[str, str], ...]
     exit_code: int
+    member_reasons: tuple[tuple[str, str], ...] = ()
 
 
 def _pre_start(store: DirectoryStore, reason: str, *, group: ReadyGroupV2 | GroupId, backend_job_id: BackendJobId, observed_job_id: BackendJobId) -> Any:
@@ -160,11 +161,6 @@ def run_group_controller(
                 verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "core-admission-unavailable")
             frozen_inputs.append(replace(item, core_verdict=verdict))
         checked = reconcile_group(group, tuple(frozen_inputs))
-        if admission_failures:
-            checked = replace(checked, members=tuple(
-                replace(member, action="park", reason_code="core-admission-unavailable")
-                if member.task_id in admission_failures else member for member in checked.members
-            ))
     except Exception:
         return _park(group, "admission-port-failed")
     try:
@@ -224,29 +220,38 @@ def run_group_controller(
                 continue
             try:
                 existing = store.read_launch_intent(fence)
+            except LaunchIntentAbsent:
+                existing = None
+            except Exception:
                 outcomes.append((member.task_id, "parked"))
                 continue
-            except LaunchIntentAbsent:
-                pass
-            except Exception:
+            if existing is not None:
                 outcomes.append((member.task_id, "parked"))
                 continue
             store.create_launch_intent(fence, controller, invocation)
             store.require_current_controller(group, controller.generation, controller.claimant_nonce)
             try:
                 launched = executor.launch(fence, invocation)
-                if not isinstance(launched, MemberLaunchResult) or not launched.acknowledged:
-                    store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "invalid-launch-ack")
-                    outcomes.append((member.task_id, "parked"))
-                else:
-                    store.record_controller_outcome(fence, controller, invocation, "launched", launched.detail)
-                    outcomes.append((member.task_id, "launched"))
             except Exception:
                 try:
                     store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "executor-failed")
                 except (OSError, FenceRejected):
                     pass
                 outcomes.append((member.task_id, "parked"))
+                continue
+            if not isinstance(launched, MemberLaunchResult) or not launched.acknowledged:
+                try:
+                    store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "invalid-launch-ack")
+                except (OSError, FenceRejected):
+                    pass
+                outcomes.append((member.task_id, "parked"))
+                continue
+            try:
+                store.record_controller_outcome(fence, controller, invocation, "launched", launched.detail)
+            except Exception:
+                outcomes.append((member.task_id, "launched-outcome-unrecorded"))
+                continue
+            outcomes.append((member.task_id, "launched"))
         except Exception:
             outcomes.append((member.task_id, "parked"))
     parked = {task_id for task_id, status in outcomes if status == "parked"}
@@ -257,7 +262,9 @@ def run_group_controller(
             for member in published.members
         ),
     )
-    return GroupControllerOutcome(final, tuple(outcomes), 0 if all(member.action == "preserve_completed" for member in final.members) else 2)
+    reasons = tuple((task_id, "launch-acknowledged" if status == "launched" else "controller-uncertainty")
+                    for task_id, status in outcomes)
+    return GroupControllerOutcome(final, tuple(outcomes), 0 if all(member.action == "preserve_completed" for member in final.members) else 2, reasons)
 
 
 __all__ = ["AllocationLocalExecutor", "GroupControllerFactsV1", "GroupControllerOutcome", "MemberLaunchResult", "run_group_controller"]
