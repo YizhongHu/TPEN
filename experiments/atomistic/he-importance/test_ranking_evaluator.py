@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections import deque
+from dataclasses import dataclass, replace
+from enum import Enum
 import importlib.util
-from dataclasses import replace
 from pathlib import Path
+import re
 import sys
 from types import MappingProxyType
 
@@ -16,6 +19,14 @@ assert _SPEC is not None and _SPEC.loader is not None
 ranking_evaluator = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = ranking_evaluator
 _SPEC.loader.exec_module(ranking_evaluator)
+
+_EVALUATOR_SPEC = importlib.util.spec_from_file_location(
+    "he_importance_l3a_evaluator", Path(__file__).with_name("evaluator.py")
+)
+assert _EVALUATOR_SPEC is not None and _EVALUATOR_SPEC.loader is not None
+l3a_evaluator = importlib.util.module_from_spec(_EVALUATOR_SPEC)
+sys.modules[_EVALUATOR_SPEC.name] = l3a_evaluator
+_EVALUATOR_SPEC.loader.exec_module(l3a_evaluator)
 
 
 def _request(tmp_path: Path, observations: tuple[float, ...] = (0.1, 0.2)) -> object:
@@ -111,6 +122,89 @@ def test_blinding_refuses_forbidden_string_values() -> None:
         ranking_evaluator.validate_ranking_output(
             {"checkpoint_id": "reference_energy=-2.903724", "disposition": "keep", "ordinal": 0}
         )
+
+
+@dataclass
+class _PlainObjectWitness:
+    payload: object
+
+
+class _PrivateSlotWitness:
+    __slots__ = ("__payload",)
+
+    def __init__(self, payload: object) -> None:
+        type(self).__dict__["_PrivateSlotWitness__payload"].__set__(self, payload)
+
+
+class _SelfReferentialWitness:
+    def __init__(self, sibling: object = "benign") -> None:
+        self.self = self
+        self.sibling = sibling
+
+
+class _BenignEnum(Enum):
+    ITEM = "benign"
+
+
+@pytest.mark.parametrize(
+    ("payload", "request_suffix", "output_suffix"),
+    [
+        (_PlainObjectWitness("reference_energy"), "payload.payload", "checkpoint_id.payload"),
+        (b"reference_energy", "payload", "checkpoint_id"),
+        (Path("reference_energy"), "payload", "checkpoint_id"),
+        (deque(["reference_energy"]), "payload[0]", "checkpoint_id[0]"),
+        (_PrivateSlotWitness("reference_energy"), "payload.__payload", "checkpoint_id.__payload"),
+    ],
+    ids=["plain-object", "bytes", "path", "deque", "private-slot"],
+)
+@pytest.mark.parametrize("route", ["request", "output"])
+def test_l3b_shared_walker_reaches_new_structural_and_normalized_leaves(
+    payload: object, request_suffix: str, output_suffix: str, route: str, tmp_path: Path
+) -> None:
+    if route == "request":
+        label = f"ranking request.rng_provenance.{request_suffix}"
+    else:
+        label = f"ranking output.{output_suffix}"
+    expected = f"{label} contains forbidden value 'reference_energy'"
+    with pytest.raises(ranking_evaluator.RankingEvaluationError, match=re.escape(expected)) as exc:
+        if route == "request":
+            request = replace(_request(tmp_path), rng_provenance={"payload": payload})
+            ranking_evaluator.evaluate_checkpoint(request)
+        else:
+            ranking_evaluator.validate_ranking_output(
+                {"checkpoint_id": payload, "disposition": "keep", "ordinal": 0}
+            )
+    assert exc.type is ranking_evaluator.RankingEvaluationError
+
+
+def test_l3b_shared_walker_preserves_benign_cycles_enum_and_deque(tmp_path: Path) -> None:
+    ranking_evaluator.evaluate_checkpoint(
+        replace(_request(tmp_path), rng_provenance={"payload": _SelfReferentialWitness()})
+    )
+    ranking_evaluator.evaluate_checkpoint(
+        replace(_request(tmp_path), rng_provenance={"payload": _BenignEnum.ITEM})
+    )
+    ranking_evaluator.evaluate_checkpoint(
+        replace(_request(tmp_path), rng_provenance={"payload": deque(["benign"])})
+    )
+
+    with pytest.raises(
+        ranking_evaluator.RankingEvaluationError,
+        match=re.escape("ranking request.rng_provenance.payload.sibling contains forbidden value 'reference_energy'"),
+    ):
+        ranking_evaluator.evaluate_checkpoint(
+            replace(
+                _request(tmp_path),
+                rng_provenance={"payload": _SelfReferentialWitness("reference_energy")},
+            )
+        )
+
+
+def test_l3b_energy_floor_remains_stricter_than_l3a() -> None:
+    with pytest.raises(ranking_evaluator.RankingEvaluationError):
+        ranking_evaluator._refuse_blinded_content({"energy": 1}, "ranking request")
+    l3a_evaluator._refuse_blinding_content({"energy": 1}, "evaluator input")
+    l3a_evaluator._refuse_blinding_content({"local_energy": 1}, "evaluator input")
 
 
 def test_selector_side_energy_peek_mutant_is_rejected() -> None:

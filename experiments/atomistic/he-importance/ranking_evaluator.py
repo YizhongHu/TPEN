@@ -3,19 +3,34 @@
 This module is deliberately a separate arm from independent-sampler
 evaluation.  It accepts a fixed, finite sequence of mechanical observations
 and emits only an ordinal keep/defer signal; it has no sampler inputs and no
-analysis-result representation.
+analysis-result representation.  Its blinding screen delegates structural
+reachability and leaf normalization to the study-owned shared walker while
+retaining this evaluator's stricter token policy and error labels.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
+import importlib.util
 from pathlib import Path
+import sys
 from typing import Any
 
 
 class RankingEvaluationError(ValueError):
     """A cheap-ranking request or signal violates its mechanics-only contract."""
+
+
+_WALKER_NAME = "he_importance_blinding_traversal"
+_WALKER_PATH = Path(__file__).with_name("blinding_traversal.py")
+_WALKER_SPEC = importlib.util.spec_from_file_location(_WALKER_NAME, _WALKER_PATH)
+assert _WALKER_SPEC is not None and _WALKER_SPEC.loader is not None
+_WALKER = sys.modules.get(_WALKER_NAME)
+if _WALKER is None:
+    _WALKER = importlib.util.module_from_spec(_WALKER_SPEC)
+    sys.modules[_WALKER_NAME] = _WALKER
+    _WALKER_SPEC.loader.exec_module(_WALKER)
 
 
 @dataclass(frozen=True)
@@ -105,25 +120,34 @@ def _validate_request(request: CheckpointRankingRequest) -> None:
 
 
 def _refuse_blinded_content(value: Any, path: str) -> None:
-    """Traverse mappings, frozen containers, and dataclasses by structure."""
+    """Traverse structural and normalized content with L3b's frozen policy.
 
-    if isinstance(value, str):
-        normalized = value.lower().replace("-", "_")
-        if _is_forbidden_token(normalized):
-            raise RankingEvaluationError(f"{path} contains forbidden value {value!r}")
-    elif is_dataclass(value):
-        _refuse_blinded_content(_dataclass_members(value), path)
-    elif isinstance(value, Mapping):
-        for key, nested in value.items():
-            if not isinstance(key, str):
-                raise RankingEvaluationError(f"{path} keys must be strings")
-            normalized = key.lower().replace("-", "_")
-            if _is_forbidden_token(normalized):
-                raise RankingEvaluationError(f"{path} contains forbidden field {key!r}")
-            _refuse_blinded_content(nested, f"{path}.{key}")
-    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        for index, nested in enumerate(value):
-            _refuse_blinded_content(nested, f"{path}[{index}]")
+    The shared walker owns reachability, normalization, and cycle handling.  It
+    does not own a token set or an exception policy: those remain local to L3b
+    so its stricter ``energy`` token floor and established labels are unchanged.
+    """
+
+    def is_forbidden(text: str) -> bool:
+        normalized = text.lower().replace("-", "_")
+        return _is_forbidden_token(normalized)
+
+    def error_factory(path: str, content: Any, reason: str) -> Exception:
+        if reason == "key-type":
+            parent = getattr(path, "parent", path)
+            return RankingEvaluationError(f"{parent} keys must be strings")
+        if reason == "key":
+            parent = getattr(path, "parent", path.rsplit(".", 1)[0])
+            return RankingEvaluationError(f"{parent} contains forbidden field {content!r}")
+        if reason == "decode":
+            return RankingEvaluationError(f"{path} contains undecodable blinding content")
+        return RankingEvaluationError(f"{path} contains forbidden value {content!r}")
+
+    _WALKER.walk_blinding_content(
+        value,
+        path,
+        is_forbidden=is_forbidden,
+        error_factory=error_factory,
+    )
 
 
 def _is_forbidden_token(normalized: str) -> bool:
