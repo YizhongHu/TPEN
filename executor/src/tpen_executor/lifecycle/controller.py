@@ -67,12 +67,15 @@ class GroupControllerOutcome:
     exit_code: int
 
 
-def _pre_start(store: DirectoryStore, reason: str) -> Any:
+def _pre_start(store: DirectoryStore, reason: str, *, group: Any = None, backend_job_id: Any = None, observed_job_id: Any = None) -> Any:
     """Best-effort durable pre-start receipt; ambiguity remains non-success."""
     writer = getattr(store, "record_pre_start_receipt", None)
     if writer is not None:
         try:
-            writer(reason)
+            try:
+                writer(group, backend_job_id, observed_job_id, reason)
+            except TypeError:
+                writer(reason)
         except Exception:
             pass
     from .balsam import GroupFailure
@@ -121,11 +124,11 @@ def run_group_controller(
     group = facts.group
     allocation = facts.allocation
     if not isinstance(observed_job_id, BackendJobId) or not hasattr(binding, "backend_job_id"):
-        return _pre_start(store, "malformed-registration")
+        return _pre_start(store, "malformed-registration", group=getattr(binding, "intent", None), backend_job_id=getattr(binding, "backend_job_id", None), observed_job_id=observed_job_id)
     if observed_job_id != binding.backend_job_id or allocation.backend_job_id != observed_job_id:
-        return _pre_start(store, "backend-job-mismatch")
+        return _pre_start(store, "backend-job-mismatch", group=group, backend_job_id=binding.backend_job_id, observed_job_id=observed_job_id)
     if binding.intent.group_id != group.group_id or binding.intent.group_digest != group.identity:
-        return _pre_start(store, "registration-group-mismatch")
+        return _pre_start(store, "registration-group-mismatch", group=group, backend_job_id=binding.backend_job_id, observed_job_id=observed_job_id)
     try:
         controller_request = ControllerGenerationV1(
             group.group_id, facts.controller_generation, allocation.allocation_id, observed_job_id,
@@ -188,6 +191,10 @@ def run_group_controller(
                 record = getattr(published, "admissions", {}).get(member.task_id)
                 if record is None:
                     record = getattr(store, "read_successor_admission", lambda *_: None)(member.task_id)
+                if record is None:
+                    publication = getattr(store, "read_reconciliation", lambda *_: None)(group, attempt)
+                    if publication is not None:
+                        record = next((item.admission for item in publication.members if item.evidence.task_id == member.task_id), None)
                 if not isinstance(record, SuccessorAdmissionRecord):
                     record = request[0] if isinstance(request[0], SuccessorAdmissionRecord) else None
                 if record is None:
@@ -213,7 +220,15 @@ def run_group_controller(
             outcomes.append((member.task_id, "launched" if acknowledged else "parked"))
         except Exception:
             outcomes.append((member.task_id, "parked"))
-    return GroupControllerOutcome(published, tuple(outcomes), 0 if all(member.action == "preserve_completed" for member in published.members) else 2)
+    parked = {task_id for task_id, status in outcomes if status == "parked"}
+    final = published if not parked else replace(
+        published,
+        members=tuple(
+            replace(member, action="park", reason_code="controller-uncertainty") if member.task_id in parked else member
+            for member in published.members
+        ),
+    )
+    return GroupControllerOutcome(final, tuple(outcomes), 0 if all(member.action == "preserve_completed" for member in final.members) else 2)
 
 
 __all__ = ["AllocationLocalExecutor", "GroupControllerFactsV1", "GroupControllerOutcome", "MemberLaunchResult", "run_group_controller"]

@@ -100,12 +100,12 @@ def _run(tmp_path, actions=("start_fresh",), **kwargs):
 def test_ordered_happy_mixed_group_and_exit_contract(tmp_path):
     result, store, executor = _run(tmp_path, ("preserve_completed", "preserve_terminal", "start_fresh", "park"))
     assert result.exit_code == 2 and result.reconciliation.aggregate == "parked"
-    assert store.calls[:3] == ["acquire", "require", "publish"] and not executor.calls
+    assert store.calls[:3] == ["acquire", "require", "publish"] and executor.calls == ["task-2"]
 
 def test_job_id_mismatch_is_pre_start(tmp_path):
     facts, binding, store = _setup(tmp_path)
     result = controller_module.run_group_controller(binding, BackendJobId("other"), facts, store, FakeAdmission(), FakeExecutor())
-    assert result == GroupFailure.PRE_START and (Path(store.real.root) / "pre-start.json").exists() and not store.calls
+    assert result == GroupFailure.PRE_START and list(Path(store.real.root).rglob("pre-start-*.json")) and not store.calls
 
 def test_stale_controller_parks_before_publish(tmp_path):
     result, store, executor = _run(tmp_path, reject=True)
@@ -145,6 +145,47 @@ def test_publication_conflict_parks(tmp_path):
 
 def test_terminal_and_park_exit_two(tmp_path):
     result, _, _ = _run(tmp_path, ("preserve_terminal",)); assert result.exit_code == 2
+
+
+def _real_fresh(tmp_path):
+    group = _group(("real-task",))
+    allocation = ConfiguredAllocation(AllocationId("real-allocation"), BackendJobId("real-job"), {})
+    store = DirectoryStore(tmp_path / "real-store")
+    facts = controller_module.GroupControllerFactsV1(group, allocation, "a" * 64, "real-nonce", "utc", (MemberRecoveryInputV2("real-task", "lineage-real-task"),))
+    binding = BalsamGroupRegistrationReceipt(BalsamGroupRegistrationIntent(group.group_id, group.identity, digest({"real": True})), BackendJobId("real-job"))
+    return group, allocation, facts, binding, store
+
+
+def test_real_store_fresh_start_writes_intent_and_launches_once(tmp_path):
+    group, allocation, facts, binding, store = _real_fresh(tmp_path)
+    executor = FakeExecutor()
+    result = controller_module.run_group_controller(binding, BackendJobId("real-job"), facts, store, FakeAdmission(), executor)
+    assert result.exit_code == 2 and executor.calls == ["real-task"]
+    assert list(Path(store.root).rglob("launch-intent.json"))
+
+
+def test_real_store_recovery_after_executor_exception_parks_without_relaunch(tmp_path):
+    group, allocation, facts, binding, store = _real_fresh(tmp_path)
+    first = FakeExecutor(error=RuntimeError("lost acknowledgement"))
+    controller_module.run_group_controller(binding, BackendJobId("real-job"), facts, store, FakeAdmission(), first)
+    start_path = next(Path(store.root).rglob("start.json"))
+    from tpen_executor.results import StartReceipt
+    start = StartReceipt.decode(start_path.read_bytes())
+    recovered = controller_module.GroupControllerFactsV1(group, allocation, facts.registration_receipt_digest, facts.claimant_nonce, facts.observed_at_utc, (MemberRecoveryInputV2("real-task", "lineage-real-task", start.attempt_id, start, None, None),))
+    second = FakeExecutor()
+    result = controller_module.run_group_controller(binding, BackendJobId("real-job"), recovered, store, FakeAdmission(), second)
+    assert result.reconciliation.aggregate == "parked" and not second.calls
+
+
+def test_real_store_stale_controller_parks_before_publish_or_launch(tmp_path):
+    group, allocation, facts, binding, store = _real_fresh(tmp_path)
+    first = controller_module.run_group_controller(binding, BackendJobId("real-job"), facts, store, FakeAdmission(), FakeExecutor())
+    current = store.require_current_controller(group, 1, facts.claimant_nonce)
+    newer = ControllerGenerationV1(group.group_id, 2, allocation.allocation_id, allocation.backend_job_id, facts.registration_receipt_digest, "newer-nonce", current.record_digest)
+    store.acquire_controller_generation(group, newer)
+    executor = FakeExecutor()
+    result = controller_module.run_group_controller(binding, BackendJobId("real-job"), facts, store, FakeAdmission(), executor)
+    assert result.reconciliation.aggregate == "parked" and not executor.calls
 
 def test_static_audit_and_mutant_anchors():
     source = MODULE.read_text(encoding="utf-8")
