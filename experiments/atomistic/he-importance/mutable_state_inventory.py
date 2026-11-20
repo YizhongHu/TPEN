@@ -496,8 +496,31 @@ def _canonical_inventory(entries: Sequence[MutableStateEntry]) -> tuple[dict[str
     )
 
 
-def _canonical_scientific_context_tree(config: Any) -> bytes:
-    """Serialize the complete resolved scientific/context config tree.
+_ROW_IDENTITY_REFUSAL = (
+    "resolved-row context identity does not match the sealed O1 row"
+)
+
+
+def _contains_residual_interpolation(value: Any) -> bool:
+    """Return whether a detached config tree still contains interpolation syntax."""
+
+    if isinstance(value, str):
+        return "${" in value
+    if isinstance(value, Mapping):
+        return any(
+            _contains_residual_interpolation(key)
+            or _contains_residual_interpolation(nested)
+            for key, nested in value.items()
+        )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return any(_contains_residual_interpolation(nested) for nested in value)
+    return False
+
+
+def _canonical_scientific_context_tree(
+    config: Any, *, resolve: bool = True, refuse_residual_interpolation: bool = False
+) -> bytes:
+    """Serialize the complete scientific/context config tree.
 
     The overlay allowlist is intentionally empty for S5b-A, so every value in
     the producer-resolved tree is identity-significant.  JSON encoding keeps
@@ -505,9 +528,13 @@ def _canonical_scientific_context_tree(config: Any) -> bytes:
     """
 
     if isinstance(config, DictConfig) or OmegaConf.is_config(config):
-        config = OmegaConf.to_container(config, resolve=True)
+        config = OmegaConf.to_container(config, resolve=resolve)
     if not isinstance(config, Mapping):
         raise TypeError("HI continuation config must be a mapping")
+    if refuse_residual_interpolation and _contains_residual_interpolation(config):
+        raise HIContinuationRowIdentityRefusal(
+            _ROW_IDENTITY_REFUSAL
+        )
     tree = dict(config)
     for path in _SCIENTIFIC_CONTEXT_OVERLAY_ALLOWLIST:
         cursor: Any = tree
@@ -605,14 +632,18 @@ def validate_hi_continuation_admission(
 
     try:
         expected_tree = _canonical_scientific_context_tree(expected_config)
-        observed_tree = _canonical_scientific_context_tree(config)
+        observed_tree = _canonical_scientific_context_tree(
+            config, resolve=False, refuse_residual_interpolation=True
+        )
     except Exception as error:
+        if isinstance(error, HIContinuationRowIdentityRefusal):
+            raise
         raise HIContinuationAdmissionRefusal(
             f"resolved-row config tree cannot be canonicalized: {error}"
         ) from error
     if observed_tree != expected_tree:
         raise HIContinuationRowIdentityRefusal(
-            "resolved-row context identity does not match the sealed O1 row"
+            _ROW_IDENTITY_REFUSAL
         )
 
     try:
@@ -627,7 +658,7 @@ def validate_hi_continuation_admission(
     observed_signature = _canonical_inventory(observed_entries)
     if observed_signature != expected_signature:
         raise HIContinuationAdmissionRefusal(
-            "resolved-row context identity does not match the sealed O1 row"
+            _ROW_IDENTITY_REFUSAL
         )
 
     identity = SealedHIContinuationIdentity(

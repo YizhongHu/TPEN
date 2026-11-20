@@ -121,6 +121,37 @@ def test_same_target_runner_optimizer_value_refuses(tmp_path: Path) -> None:
         inventory.validate_hi_continuation_admission(cell, mutated)
 
 
+def test_uncached_observed_resolver_refuses_without_execution(tmp_path: Path) -> None:
+    cell, config = _resolved_rows(tmp_path)["O-raw"]["A"]
+    expected_lr = config["runner"]["optimizer"]["lr"]
+    calls = 0
+    resolver_name = "hi_s5b_a_uncached_row_value"
+
+    def uncached_row_value() -> object:
+        nonlocal calls
+        calls += 1
+        return expected_lr
+
+    mutated = OmegaConf.create(_plain(config))
+    OmegaConf.register_new_resolver(resolver_name, uncached_row_value, use_cache=False)
+    try:
+        OmegaConf.update(
+            mutated,
+            "runner.optimizer.lr",
+            f"${{{resolver_name}:}}",
+            merge=False,
+        )
+        with pytest.raises(inventory.HIContinuationRowIdentityRefusal) as refused:
+            inventory.validate_hi_continuation_admission(cell, mutated)
+        assert str(refused.value) == (
+            "hi-continuation-admission-refused: "
+            "resolved-row context identity does not match the sealed O1 row"
+        )
+        assert calls == 0
+    finally:
+        OmegaConf.clear_resolver(resolver_name)
+
+
 def test_noncanonical_runner_alias_refuses(tmp_path: Path) -> None:
     cell, config = _resolved_rows(tmp_path)["O-raw"]["A"]
     mutated = _plain(config)
