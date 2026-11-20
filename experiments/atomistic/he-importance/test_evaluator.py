@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import re
 import sys
 from types import MappingProxyType
 
@@ -330,7 +331,7 @@ def test_blinding_refuses_reference_name_on_each_identifier_route(
 ) -> None:
     with pytest.raises(
         evaluator.EvaluatorQualificationError,
-        match=rf"{label} contains forbidden blinding value 'reference_energy'",
+        match=rf"{re.escape(label)} contains forbidden blinding value 'reference_energy'",
     ) as exc:
         evaluator.evaluate_local_energy_rows(
             checkpoint_id, rows, expected_chain_ids=expected_chain_ids
