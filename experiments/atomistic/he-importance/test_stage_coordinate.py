@@ -847,7 +847,7 @@ def test_intended_configurations_loader_rejects_a_smuggled_status_key(
     broken_path = tmp_path / "intended_configurations.json"
     broken_path.write_text(json.dumps(entries), encoding="utf-8")
     monkeypatch.setattr(stage_coordinate, "_INTENDED_CONFIGURATIONS_PATH", broken_path)
-    with pytest.raises(stage_coordinate.MaterializationError, match="exactly method and levels"):
+    with pytest.raises(stage_coordinate.MaterializationError, match=r"unexpected=\['status'\]"):
         stage_coordinate.intended_configurations()
 
 
@@ -877,14 +877,14 @@ def test_intended_configurations_loader_rejects_a_configuration_optimizer_mismat
     ("mutation", "message"),
     [
         (lambda entry: entry.__setitem__("stage", None), ".stage must be a non-empty string"),
-        (lambda entry: entry.pop("stage"), "missing=\['stage'\]"),
-        (lambda entry: entry.__setitem__("unexpected", True), "unexpected=\['unexpected'\]"),
+        (lambda entry: entry.pop("stage"), r"missing=\['stage'\]"),
+        (lambda entry: entry.__setitem__("unexpected", True), r"unexpected=\['unexpected'\]"),
         (lambda entry: entry.__setitem__("configurations", "not-a-sequence"), ".configurations must be a list or tuple"),
         (lambda entry: entry.__setitem__("configurations", 42), ".configurations must be a list or tuple"),
         (lambda entry: entry.__setitem__("configurations", None), ".configurations must be a list or tuple"),
         (lambda entry: entry.__setitem__("configurations", [None]), r"configurations\[0\] is missing scientific_identity"),
         (lambda entry: entry["optimizer"].pop("method"), "optimizer has invalid keys"),
-        (lambda entry: entry["optimizer"].__setitem__("unexpected", True), "unexpected=\['unexpected'\]"),
+        (lambda entry: entry["optimizer"].__setitem__("unexpected", True), r"unexpected=\['unexpected'\]"),
         (lambda entry: entry["optimizer"].__setitem__("method", None), "optimizer method must be a non-empty string"),
         (lambda entry: entry["optimizer"].__setitem__("levels", None), "optimizer levels must be a mapping"),
     ],
