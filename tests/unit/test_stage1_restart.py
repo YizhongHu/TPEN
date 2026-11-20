@@ -9,17 +9,22 @@ import pytest
 from omegaconf import OmegaConf
 
 from experiments.atomistic.stage1.restart import (
+    RestartCause,
     RestartApproval,
     RestartRefusal,
     StartDecision,
     configure_attempt_local_diagnostics,
     select_restart,
 )
+from experiments.toolkit.run_paths import resolve_run_dir
 
 
-def _cfg() -> object:
+def _cfg(tmp_path: Path | None = None) -> object:
+    root = str(tmp_path or Path.cwd())
     return OmegaConf.create(
         {
+            "experiment": {"name": "stage1_he", "sector": "atomistic"},
+            "run": {"root": root, "run_id": "run-0", "layout": "nested"},
             "trainer": {"max_steps": 100000},
             "callbacks": [
                 {"_target_": "tpen.callback.InitialCheckpoint", "output_dir": "old"},
@@ -51,14 +56,51 @@ def test_fresh_selection_is_read_only_and_has_initial_marker(tmp_path: Path, mon
     from experiments.atomistic.stage1 import restart
 
     monkeypatch.setattr(restart, "discover_published_checkpoint", lambda _: None)
-    selected = select_restart(cfg=_cfg(), row=_row(tmp_path), run_dir=tmp_path / "run")
+    selected = select_restart(cfg=_cfg(tmp_path), row=_row(tmp_path))
     assert selected.decision is StartDecision.FRESH
     assert selected.content_id == "initial"
-    assert not (tmp_path / "run").exists()
+    assert not resolve_run_dir(_row(tmp_path)).exists()
+
+
+def test_config_run_dir_mismatch_refuses_before_lease_or_driver(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from experiments.atomistic.stage1 import restart
+
+    row = _row(tmp_path)
+    cfg = _cfg(tmp_path)
+    cfg.run.root = str(tmp_path / "wrong-root")
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+    monkeypatch.setattr(restart, "validate_native_recovery_profile", lambda _cfg: None)
+    with pytest.raises(RestartRefusal, match="config-derived run directory differs") as refused:
+        restart.execute_restart(
+            cfg=cfg, row=row, config_path="train.yaml",
+            run=lambda *_a, **_k: pytest.fail("driver"),
+        )
+    assert refused.value.cause is RestartCause.RUN_DIRECTORY_MISMATCH
+    assert not (resolve_run_dir(row) / "attempts").exists()
+
+
+def test_empty_post_run_publication_has_typed_nonempty_park_cause(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from experiments.atomistic.stage1 import restart
+
+    row = _row(tmp_path)
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+    monkeypatch.setattr(restart, "validate_native_recovery_profile", lambda _cfg: None)
+    monkeypatch.setattr(restart, "discover_published_checkpoint", lambda _path: None)
+    result = restart.execute_restart(
+        cfg=cfg, row=row, config_path="train.yaml", run=lambda *_a, **_k: 2,
+    )
+    assert result.outcome == "parked"
+    assert result.receipt["cause"] == RestartCause.NO_PUBLICATION.value
+    assert result.receipt["reason"]
 
 
 def test_attempt_diagnostics_are_never_shared_with_previous_attempt(tmp_path: Path) -> None:
-    cfg = _cfg()
+    cfg = _cfg(tmp_path)
     configure_attempt_local_diagnostics(cfg, tmp_path / "attempt-2")
     assert cfg.callbacks[1].path == str(tmp_path / "attempt-2" / "training_history")
     assert cfg.callbacks[2].output_path == str(tmp_path / "attempt-2" / "parameter_activity.json")
@@ -98,9 +140,9 @@ def test_execute_calls_profile_gate_before_driver_and_uses_durable_outcome(
 ) -> None:
     from experiments.atomistic.stage1 import restart
 
-    cfg = _cfg()
+    cfg = _cfg(tmp_path)
     row = _row(tmp_path)
-    run_dir = tmp_path / "run"
+    run_dir = resolve_run_dir(row)
     calls: list[object] = []
     monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -136,9 +178,9 @@ def test_execute_calls_profile_gate_before_driver_and_uses_durable_outcome(
 def test_occupied_lease_refuses_without_overwrite_or_driver(tmp_path: Path, monkeypatch) -> None:
     from experiments.atomistic.stage1 import restart
 
-    cfg = _cfg()
+    cfg = _cfg(tmp_path)
     row = _row(tmp_path)
-    run_dir = tmp_path / "run"
+    run_dir = resolve_run_dir(row)
     lease_dir = run_dir / "attempts"
     lease_dir.mkdir(parents=True)
     lease = lease_dir / "initial.json"
@@ -163,9 +205,9 @@ def test_occupied_lease_refuses_without_overwrite_or_driver(tmp_path: Path, monk
 def test_restore_passes_typed_request_and_drops_initial_checkpoint(tmp_path: Path, monkeypatch) -> None:
     from experiments.atomistic.stage1 import restart
 
-    cfg = _cfg()
+    cfg = _cfg(tmp_path)
     row = _row(tmp_path)
-    run_dir = tmp_path / "run"
+    run_dir = resolve_run_dir(row)
     request = object()
     predecessor = SimpleNamespace(content_id="published-content")
     monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_args, **_kwargs: None)
@@ -199,7 +241,8 @@ def test_restore_passes_typed_request_and_drops_initial_checkpoint(tmp_path: Pat
 def test_newer_complete_checkpoint_is_parked_before_start(tmp_path: Path, monkeypatch) -> None:
     from experiments.atomistic.stage1 import restart
 
-    run_dir = tmp_path / "run"
+    row = _row(tmp_path)
+    run_dir = resolve_run_dir(row)
     (run_dir / "checkpoints").mkdir(parents=True)
     monkeypatch.setattr(restart, "discover_published_checkpoint", lambda _path: None)
     monkeypatch.setattr(
@@ -207,7 +250,7 @@ def test_newer_complete_checkpoint_is_parked_before_start(tmp_path: Path, monkey
         "_complete_refs",
         lambda _root: [SimpleNamespace(next_iteration=1000, checkpoint_dir=run_dir / "checkpoints" / "step_001000")],
     )
-    selected = select_restart(cfg=_cfg(), row=_row(tmp_path), run_dir=run_dir)
+    selected = select_restart(cfg=_cfg(tmp_path), row=row, run_dir=run_dir)
     assert selected.decision is StartDecision.PARK
     assert "complete checkpoint is newer" in selected.reason
 
@@ -217,9 +260,9 @@ def test_terminal_publication_cannot_hide_a_failed_durable_status(
 ) -> None:
     from experiments.atomistic.stage1 import restart
 
-    cfg = _cfg()
+    cfg = _cfg(tmp_path)
     row = _row(tmp_path)
-    run_dir = tmp_path / "run"
+    run_dir = resolve_run_dir(row)
     monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
     monkeypatch.setattr(restart, "validate_native_recovery_profile", lambda _cfg: None)
     monkeypatch.setattr(

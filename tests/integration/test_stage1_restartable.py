@@ -19,7 +19,10 @@ from experiments.atomistic.stage1.protocol import (
     STAGE1_PROTOCOL,
     build_manifest,
     config_identities,
+    validate_gateway_binding,
+    validate_resolved_train_config,
 )
+from experiments.atomistic.stage1.launch import _binding_token, row_overrides
 from experiments.atomistic.stage1.restart import execute_restart
 from experiments.atomistic.stage1.train import prepare_initial_checkpoint_config
 from experiments.toolkit.run_paths import resolve_run_dir
@@ -76,6 +79,20 @@ def _bounded_protocol() -> Protocol:
         eval_draws=2,
         retention_cadence=2,
     )
+
+
+def _production_cfg(row: dict[str, object], config_path: Path) -> Any:
+    """Build one attempt config through the production train gateway path."""
+
+    overrides = row_overrides(row)
+    admitted_row = validate_gateway_binding(
+        binding=_binding_token(row), config=str(config_path),
+        overrides=overrides, kind="train",
+    )
+    cfg = load_config(str(config_path), overrides)
+    prepare_initial_checkpoint_config(cfg)
+    validate_resolved_train_config(cfg, admitted_row)
+    return cfg
 
 
 class _Stage1Trace:
@@ -240,15 +257,7 @@ def _real_chain_child() -> None:
     original_protocol = restart_module.STAGE1_PROTOCOL
     restart_module.STAGE1_PROTOCOL = protocol
     try:
-        cfg = load_config(str(config_path))
-        cfg.run.root = str(row["results_root"])
-        cfg.run.run_id = str(row["run_id"])
-        cfg.sampler.n_walkers = protocol.lineage_walkers
-        cfg.sampler.burn_in = 1
-        cfg.sampler.n_steps = 1
-        cfg.trainer.max_steps = protocol.lineage_updates
-        cfg.checkpoint_steps = [0, 2, 4, 6, 8]
-        prepare_initial_checkpoint_config(cfg)
+        cfg = _production_cfg(row, config_path)
         with _install_stage1_trace(trace):
             if phase in {"fresh", "resumed", "control"}:
                 planned = phase == "fresh"
@@ -275,7 +284,6 @@ def _real_chain_child() -> None:
                     config_path=config_path,
                     command=f"stage1 real restart {system} {phase}",
                     run=real_run,
-                    run_dir=Path(str(payload["run_dir"])),
                 )
                 result_payload = {
                     "outcome": result.outcome,
@@ -433,9 +441,8 @@ def test_restart_admission_lease_receipt_chain_with_stub_driver(
 
     row = _row(system, tmp_path)
     config_path = CONFIG_ROOT / system / "train.yaml"
-    run_dir = tmp_path / system / "lineage-0"
-    first_cfg = load_config(str(config_path))
-    prepare_initial_checkpoint_config(first_cfg)
+    run_dir = resolve_run_dir(row)
+    first_cfg = _production_cfg(row, config_path)
     first_calls: list[dict[str, object]] = []
 
     def first_driver(_cfg, **kwargs):
@@ -457,8 +464,7 @@ def test_restart_admission_lease_receipt_chain_with_stub_driver(
     assert first.exit_code == 7
     assert first_calls == [{"config_path": str(config_path), "command": "stage1 restart"}]
 
-    second_cfg = load_config(str(config_path))
-    prepare_initial_checkpoint_config(second_cfg)
+    second_cfg = _production_cfg(row, config_path)
     second_calls: list[dict[str, object]] = []
 
     def second_driver(_cfg, **kwargs):

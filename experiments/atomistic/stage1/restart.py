@@ -43,8 +43,27 @@ ATTEMPT_RECEIPT_SCHEMA = "stage1/restart-attempt/v1"
 OUTCOME_RECEIPT_SCHEMA = "stage1/restart-outcome/v1"
 
 
+class RestartCause(str, Enum):
+    """Typed causes for every parked or refused restart decision."""
+
+    DISCOVERY_ERROR = "checkpoint_discovery_error"
+    NEWER_COMPLETE_CHECKPOINT = "newer_complete_checkpoint"
+    RECOVERY_REFUSAL = "recovery_refusal"
+    RESTORE_REQUEST_INVALID = "restore_request_invalid"
+    NO_PUBLICATION = "no_publication_at_admitted_run_dir"
+    POST_RUN_DISCOVERY_ERROR = "post_run_checkpoint_discovery_error"
+    INVOCATION_ERROR = "restart_invocation_error"
+    RUN_DIRECTORY_MISMATCH = "run_directory_mismatch"
+
+
 class RestartRefusal(ValueError):
     """A deterministic refusal that must not start model or driver work."""
+
+    def __init__(
+        self, message: str, *, cause: RestartCause = RestartCause.INVOCATION_ERROR,
+    ) -> None:
+        self.cause = cause
+        super().__init__(message)
 
 
 class RestartPark(ValueError):
@@ -109,6 +128,7 @@ class RestartSelection:
     recovery: RecoveryDecision | None
     restore_request: OperationalRestoreRequest | None
     reason: str = ""
+    cause: RestartCause | None = None
 
     @property
     def content_id(self) -> str:
@@ -205,6 +225,48 @@ def _science_intent(cfg: Any, row: Mapping[str, Any], target: int) -> ScienceInt
     )
 
 
+def _config_run_dir(cfg: Any) -> Path:
+    """Resolve the run directory that the un-routed core gateway will write."""
+
+    fields = {
+        "results_root": OmegaConf.select(cfg, "run.root", default=None),
+        "experiment_name": OmegaConf.select(cfg, "experiment.name", default=None),
+        "sector": OmegaConf.select(cfg, "experiment.sector", default=None),
+        "run_id": OmegaConf.select(cfg, "run.run_id", default=None),
+    }
+    if any(value is None or not str(value).strip() for value in fields.values()):
+        raise RestartRefusal("resolved config lacks a complete run identity")
+    try:
+        return resolve_run_dir(fields)
+    except Exception as exc:
+        raise RestartRefusal("resolved config run identity is not admissible") from exc
+
+
+def _admitted_run_dir(
+    *, cfg: Any, row: Mapping[str, Any], run_dir: str | Path | None,
+) -> Path:
+    """Require the row, config, and optional compatibility argument to agree."""
+
+    try:
+        row_dir = resolve_run_dir(row)
+    except Exception as exc:
+        raise RestartRefusal("manifest row run identity is not admissible") from exc
+    config_dir = _config_run_dir(cfg)
+    if config_dir.resolve() != row_dir.resolve():
+        raise RestartRefusal(
+            "config-derived run directory differs from manifest run directory: "
+            f"config={config_dir} manifest={row_dir}",
+            cause=RestartCause.RUN_DIRECTORY_MISMATCH,
+        )
+    if run_dir is not None and Path(run_dir).resolve() != config_dir.resolve():
+        raise RestartRefusal(
+            "explicit run_dir differs from the admitted config-derived run directory: "
+            f"explicit={run_dir} admitted={config_dir}",
+            cause=RestartCause.RUN_DIRECTORY_MISMATCH,
+        )
+    return config_dir
+
+
 def _remove_initial_checkpoint(cfg: Any) -> None:
     """Ensure a restored zero boundary is observed, never rewritten."""
 
@@ -245,18 +307,22 @@ def select_restart(
     """Select fresh, typed restore, completed, or parked without invoking core."""
 
     target = _target_iterations(cfg, row)
-    resolved_run_dir = Path(run_dir) if run_dir is not None else resolve_run_dir(row)
+    resolved_run_dir = _admitted_run_dir(cfg=cfg, row=row, run_dir=run_dir)
     checkpoint_root = resolved_run_dir / "checkpoints"
     try:
         published = discover_published_checkpoint(checkpoint_root)
     except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
         return RestartSelection(
-            StartDecision.PARK, resolved_run_dir, None, None, None, str(exc)
+            StartDecision.PARK, resolved_run_dir, None, None, None,
+            reason=str(exc), cause=RestartCause.DISCOVERY_ERROR,
         )
     try:
         _check_newer_complete(checkpoint_root=checkpoint_root, published=published)
     except RestartPark as exc:
-        return RestartSelection(StartDecision.PARK, resolved_run_dir, published, None, None, str(exc))
+        return RestartSelection(
+            StartDecision.PARK, resolved_run_dir, published, None, None,
+            reason=str(exc), cause=RestartCause.NEWER_COMPLETE_CHECKPOINT,
+        )
     if published is None:
         return RestartSelection(StartDecision.FRESH, resolved_run_dir, None, None, None)
 
@@ -276,12 +342,15 @@ def select_restart(
     if recovery.refusal is not None:
         return RestartSelection(
             StartDecision.PARK, resolved_run_dir, published, recovery, None,
-            recovery.refusal.message,
+            reason=recovery.refusal.message, cause=RestartCause.RECOVERY_REFUSAL,
         )
     try:
         request = OperationalRestoreRequest(recovery)
     except (TypeError, ValueError) as exc:
-        return RestartSelection(StartDecision.PARK, resolved_run_dir, published, recovery, None, str(exc))
+        return RestartSelection(
+            StartDecision.PARK, resolved_run_dir, published, recovery, None,
+            reason=str(exc), cause=RestartCause.RESTORE_REQUEST_INVALID,
+        )
     return RestartSelection(StartDecision.RESTORE, resolved_run_dir, published, recovery, request)
 
 
@@ -364,7 +433,6 @@ def execute_restart(
         if selection.decision in {StartDecision.FRESH, StartDecision.RESTORE}:
             configure_attempt_local_diagnostics(cfg, attempt_dir)
         exit_code: int | None = None
-        invocation_error: str | None = None
         if selection.decision is StartDecision.FRESH:
             exit_code = run(cfg, config_path=str(config_path), command=command)
         elif selection.decision is StartDecision.RESTORE:
@@ -375,9 +443,16 @@ def execute_restart(
                 restore_request=selection.restore_request,
             )
         status, status_payload = _durable_status(selection.run_dir)
-        published_after = discover_published_checkpoint(selection.run_dir / "checkpoints")
+        try:
+            published_after = discover_published_checkpoint(selection.run_dir / "checkpoints")
+        except Exception as exc:
+            raise RestartPark(str(exc) or RestartCause.POST_RUN_DISCOVERY_ERROR.value) from exc
+        cause = selection.cause
+        reason = selection.reason
         if selection.decision is StartDecision.PARK:
             outcome = "parked"
+            cause = cause or RestartCause.INVOCATION_ERROR
+            reason = reason or cause.value
         elif selection.decision is StartDecision.COMPLETED:
             outcome = "completed"
         elif published_after is not None and published_after.next_iteration == target:
@@ -386,6 +461,11 @@ def execute_restart(
             outcome = status
         else:
             outcome = "parked"
+            cause = RestartCause.NO_PUBLICATION
+            reason = (
+                "no published checkpoint at admitted run directory: "
+                f"{selection.run_dir}"
+            )
         receipt = {
             "schema": OUTCOME_RECEIPT_SCHEMA,
             "lease": str(lease_path),
@@ -400,10 +480,16 @@ def execute_restart(
             "published_content_id": None if published_after is None else published_after.content_id,
             "next_iteration": None if published_after is None else published_after.next_iteration,
             "logs": {"attempt_dir": str(attempt_dir)},
-            "reason": selection.reason,
+            "cause": None if cause is None else cause.value,
+            "reason": reason,
         }
     except Exception as exc:
-        invocation_error = str(exc)
+        cause = selection.cause or (
+            RestartCause.POST_RUN_DISCOVERY_ERROR
+            if isinstance(exc, RestartPark)
+            else RestartCause.INVOCATION_ERROR
+        )
+        reason = str(exc).strip() or cause.value
         receipt = {
             "schema": OUTCOME_RECEIPT_SCHEMA,
             "lease": str(lease_path),
@@ -416,7 +502,8 @@ def execute_restart(
             "published_content_id": None,
             "next_iteration": None,
             "logs": {"attempt_dir": str(attempt_dir)},
-            "reason": invocation_error,
+            "cause": cause.value,
+            "reason": reason,
         }
         outcome = "parked"
         exit_code = None
@@ -451,6 +538,6 @@ def restart_train_from_row(
 __all__ = [
     "ATTEMPT_RECEIPT_SCHEMA", "OUTCOME_RECEIPT_SCHEMA", "RestartApproval",
     "RestartPark", "RestartRefusal", "RestartResult", "RestartSelection",
-    "StartDecision", "configure_attempt_local_diagnostics", "execute_restart",
+    "RestartCause", "StartDecision", "configure_attempt_local_diagnostics", "execute_restart",
     "restart_train_from_row", "select_restart",
 ]
