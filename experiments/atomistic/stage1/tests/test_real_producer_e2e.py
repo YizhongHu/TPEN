@@ -24,6 +24,7 @@ from experiments.atomistic.stage1.protocol import (
     HOOKE_SCIENCE_PROFILE,
     Protocol,
     SYSTEMS,
+    bind_evaluation_manifest,
     build_manifest,
     config_identities,
     manifest_hash,
