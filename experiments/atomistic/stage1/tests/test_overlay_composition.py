@@ -39,7 +39,7 @@ ROOT = Path(__file__).parents[1]
 CONFIG_ROOT = ROOT / "configs"
 OVERLAY = CONFIG_ROOT / "overlays" / "diagnostics-v1.yaml"
 APPROVED_PROPOSAL_SHA256 = "8bbaf291e90ec6c90b5a8afbe664bded96dcb9743ad0c24cda1f66ddcb4634c1"
-COMMITTED_OVERLAY_SHA256 = "fd80c4d7beb0a2c075e3ac85015ea975c0a505352e7dca58be951350b21fed7c"
+COMMITTED_OVERLAY_SHA256 = "bf7a78f5b3721f0486053301a0ed8165de58366bdd6ea4748e05b1f742161096"
 
 
 def _structured_diff(before: object, after: object, prefix: str = "") -> set[str]:
@@ -107,6 +107,51 @@ def test_repository_overlay_is_versioned_and_checkpoint_free() -> None:
     targets = [entry["_target_"] for entry in overlay_cfg.callbacks]
     assert "tpen.callback.InitialCheckpoint" not in targets
     assert "tpen.callback.Checkpoint" not in targets
+
+
+def test_hooke_overlay_is_system_qualified_and_has_amplitude_risk() -> None:
+    """Hooke uses the separate canonical overlay and exact risk settings."""
+
+    overlay = CONFIG_ROOT / "overlays" / "hooke-diagnostics-v1.yaml"
+    cfg = OmegaConf.load(overlay)
+    assert protocol_module.overlay_path_for_system("hooke1") == (
+        "configs/overlays/hooke-diagnostics-v1.yaml"
+    )
+    assert protocol_module.overlay_path_for_system("hooke2") == (
+        "configs/overlays/hooke-diagnostics-v1.yaml"
+    )
+    amplitude = [entry for entry in cfg.callbacks
+                 if entry.get("_target_") == "tpen.callback.AmplitudeRiskFraction"]
+    assert len(amplitude) == 1
+    assert list(amplitude[0].thresholds) == [-3, -4, -5, -7, -10]
+    assert amplitude[0].every_n_steps == 100
+    assert amplitude[0].start_step == 0
+
+
+def test_hooke_manifest_requires_its_overlay_and_rejects_he_overlay() -> None:
+    """Planner admission is finite and system-qualified."""
+
+    kwargs = dict(
+        protocol=Protocol(1, 2, 100000, 2, 3, 4, 2, 2, 1000),
+        source_sha="a" * 40,
+        config_sha256=config_identities(config_root=CONFIG_ROOT, systems=("hooke1",)),
+        checkpoints=list(range(0, 100001, 1000)),
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root="/n/netscratch/kozinsky_lab/Lab/rhu/stage1-overlay-test",
+        systems=("hooke1",),
+        phase=1,
+        science_profile="hooke-hv2-v1",
+        evaluation_selection="A37",
+    )
+    with pytest.raises(ProtocolError, match="require the Hooke diagnostics overlay"):
+        build_manifest(**kwargs)
+    with pytest.raises(ProtocolError, match="system-qualified"):
+        build_manifest(
+            **kwargs,
+            overlay=str(OVERLAY),
+            overlay_sha256=overlay_sha256(OVERLAY),
+        )
 
 
 def test_no_overlay_manifest_keeps_existing_identity_shape() -> None:

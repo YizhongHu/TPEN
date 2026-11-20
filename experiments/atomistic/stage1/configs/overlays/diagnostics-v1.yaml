@@ -1,4 +1,4 @@
-# Versioned He/H2 Stage-1 TRAIN (50k-update lineage) diagnostics overlay.
+# Versioned He/H2 Stage-1 TRAIN (100k-update lineage) diagnostics overlay.
 # This is copied from the approved proposal with checkpoint-retention keys
 # removed because checkpoint retention is manifest-owned.
 # Modeled directly on the APPROVED
@@ -9,8 +9,8 @@
 #     base config (burn_in=100, n_steps=10, proposal_scale=0.5, lr=0.005,
 #     n_walkers=4096), NOT Hooke-2e's -- no physics change, this overlay
 #     only ADDS observability.
-#   - trainer.max_steps is 50000, matching He/H2's real science budget
-#     (STAGE1_PROTOCOL.lineage_updates), not Hooke-2e's 30000.
+#   - trainer.max_steps is 100000, matching He/H2's real science budget
+#     (STAGE1_PROTOCOL.lineage_updates).
 # Same ElectronNucleusDistanceQuantiles omission note as the Hooke-2e
 # overlay: this diagnostic is H-specific and not carried over here either.
 
@@ -30,7 +30,7 @@ optimizer:
   lr: 0.005
 
 trainer:
-  max_steps: 50000
+  max_steps: 100000
   log_every_n_steps: 1
   return_terms: true
 

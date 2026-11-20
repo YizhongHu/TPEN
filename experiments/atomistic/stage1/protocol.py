@@ -35,8 +35,16 @@ HOOKE_EVAL_SELECTION = "A37"
 HOOKE_EVAL_SELECTION_ID = "hooke-hv2-a37-v1"
 HOOKE_A37 = tuple(range(0, 21_000, 1_000)) + tuple(range(25_000, 100_001, 5_000))
 OVERLAY_RELATIVE_PATH = "configs/overlays/diagnostics-v1.yaml"
+HOOKE_OVERLAY_RELATIVE_PATH = "configs/overlays/hooke-diagnostics-v1.yaml"
 OVERLAY_SYSTEMS = frozenset({"he", "h2"})
-OVERLAY_COMPOSITION_ORDER = "base-config -> diagnostics-v1 overlay -> manifest overrides"
+HOOKE_OVERLAY_SYSTEMS = frozenset({"hooke1", "hooke2"})
+OVERLAY_PATH_BY_SYSTEM = {
+    **{system: OVERLAY_RELATIVE_PATH for system in OVERLAY_SYSTEMS},
+    **{system: HOOKE_OVERLAY_RELATIVE_PATH for system in HOOKE_OVERLAY_SYSTEMS},
+}
+OVERLAY_COMPOSITION_ORDER = (
+    "base-config -> declared train diagnostics overlay -> manifest overrides"
+)
 CHECKPOINT_EVIDENCE_SCHEMA = "stage1-checkpoint-evidence/v1"
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -137,20 +145,109 @@ def overlay_sha256(overlay: str | Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _overlay_binding(*, overlay: str | Path, expected_sha256: object) -> tuple[str, str, Path]:
-    """Validate the canonical overlay path and its exact content digest."""
+def overlay_path_for_system(system: str) -> str:
+    """Return the only committed overlay admitted for one Stage-1 system."""
+
+    try:
+        return OVERLAY_PATH_BY_SYSTEM[system]
+    except KeyError as exc:
+        raise ProtocolError(f"no diagnostics overlay is approved for {system!r}") from exc
+
+
+def _overlay_binding(*, overlay: str | Path, expected_sha256: object,
+                     system: str | None = None) -> tuple[str, str, Path]:
+    """Validate one finite canonical overlay and its exact content digest.
+
+    ``system`` is supplied at planner/gateway boundaries so a valid overlay
+    cannot be replayed for a different physical system.  Composition tests may
+    omit it to exercise the overlay parser independently; the finite path
+    allowlist still applies in that mode.
+    """
 
     path = resolve_overlay_path(overlay).resolve()
-    canonical = resolve_overlay_path(OVERLAY_RELATIVE_PATH).resolve()
-    if path != canonical:
+    allowed = (
+        {resolve_overlay_path(overlay_path_for_system(system)).resolve()}
+        if system is not None
+        else {
+            resolve_overlay_path(candidate).resolve()
+            for candidate in set(OVERLAY_PATH_BY_SYSTEM.values())
+        }
+    )
+    if path not in allowed:
         raise ProtocolError(
-            f"overlay path must be the committed {OVERLAY_RELATIVE_PATH!r}"
+            "overlay path must be the committed system-qualified diagnostics overlay"
         )
     digest = _require_sha(expected_sha256, length=64, field="overlay_sha256")
     actual = overlay_sha256(path)
     if actual != digest:
         raise ProtocolError("overlay sha256 does not match the committed overlay bytes")
-    return OVERLAY_RELATIVE_PATH, digest, path
+    relative = path.relative_to(Path(__file__).resolve().parent).as_posix()
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ProtocolError("overlay must contain a YAML mapping")
+    _validate_overlay_payload(payload, relative=relative)
+    return relative, digest, path
+
+
+def _validate_overlay_payload(payload: Mapping[str, Any], *, relative: str) -> None:
+    """Reject a changed or incomplete committed overlay before composition."""
+
+    allowed = {"runtime", "sampler", "optimizer", "trainer", "callbacks", "loggers"}
+    if set(payload) != allowed:
+        raise ProtocolError("overlay contains unsupported or missing top-level sections")
+    for key in ("runtime", "sampler", "optimizer", "trainer"):
+        if not isinstance(payload[key], Mapping):
+            raise ProtocolError(f"overlay section {key!r} must be a mapping")
+    if dict(payload["runtime"]) != {"device": "cuda", "dtype": "float64"}:
+        raise ProtocolError("diagnostics overlay runtime profile drifted")
+    if dict(payload["sampler"]) != {
+        "n_walkers": 4096, "burn_in": 100, "n_steps": 10, "proposal_scale": 0.5,
+    }:
+        raise ProtocolError("diagnostics overlay sampler profile drifted")
+    if dict(payload["optimizer"]) != {
+        "_target_": "torch.optim.Adam", "_partial_": True, "lr": 0.005,
+    }:
+        raise ProtocolError("diagnostics overlay optimizer profile drifted")
+    if dict(payload["trainer"]) != {
+        "max_steps": STAGE1_PROTOCOL.lineage_updates,
+        "log_every_n_steps": 1,
+        "return_terms": True,
+    }:
+        raise ProtocolError("diagnostics overlay trainer profile drifted")
+    callbacks = payload["callbacks"]
+    if not isinstance(callbacks, list):
+        raise ProtocolError("overlay callbacks must be a list")
+    targets = [entry.get("_target_") for entry in callbacks if isinstance(entry, Mapping)]
+    expected = [
+        "tpen.callback.DataIntegrity",
+        "tpen.callback.GradientStats",
+        "tpen.callback.SamplerHealth",
+        "tpen.callback.FactorScalars",
+        "tpen.callback.ModuleNorms",
+        "tpen.callback.OptimizerState",
+        "tpen.callback.RawTrainingBatchRecorder",
+        "tpen.callback.ParameterActivity",
+        "tpen.callback.RunTiming",
+        "tpen.callback.TrainStepTiming",
+    ]
+    if relative == HOOKE_OVERLAY_RELATIVE_PATH:
+        expected.insert(4, "tpen.callback.AmplitudeRiskFraction")
+    if targets != expected:
+        raise ProtocolError("diagnostics overlay callback set drifted")
+    if relative == HOOKE_OVERLAY_RELATIVE_PATH:
+        amplitude = callbacks[4]
+        if (
+            list(amplitude.get("thresholds", ())) != [-3, -4, -5, -7, -10]
+            or amplitude.get("every_n_steps") != 100
+            or amplitude.get("start_step") != 0
+        ):
+            raise ProtocolError("Hooke amplitude-risk diagnostic profile drifted")
+    elif any(target == "tpen.callback.AmplitudeRiskFraction" for target in targets):
+        raise ProtocolError("AmplitudeRiskFraction is not admitted for He/H2 overlay")
+    if not isinstance(payload["loggers"], list) or payload["loggers"] != [
+        {"_target_": "tpen.logging.JSONL", "path": "${run.dir}/metrics.jsonl"}
+    ]:
+        raise ProtocolError("diagnostics overlay logger profile drifted")
 
 
 def _iter_mapping_leaves(value: Mapping[str, Any], prefix: str) -> Iterator[tuple[str, Any]]:
@@ -185,11 +282,7 @@ def compose_train_overlay(cfg: Any, *, overlay: str | Path, expected_sha256: str
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
         raise ProtocolError("overlay must contain a YAML mapping")
-    allowed = {"runtime", "sampler", "optimizer", "trainer", "callbacks", "loggers"}
-    if set(payload) != allowed:
-        raise ProtocolError("overlay contains unsupported or missing top-level sections")
-    if any(key in payload for key in ("system", "atoms", "model", "hamiltonian_terms")):
-        raise ProtocolError("overlay must not declare physics or model sections")
+    _validate_overlay_payload(payload, relative=relative)
     for key in ("runtime", "sampler", "optimizer", "trainer"):
         section = payload[key]
         if not isinstance(section, Mapping):
@@ -659,7 +752,13 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
             raise ProtocolError("overlay is supported only on train rows")
         if overlay != declared_overlay or overlay_sha256 != declared_overlay_sha:
             raise ProtocolError("gateway overlay does not match binding")
-        _overlay_binding(overlay=overlay, expected_sha256=overlay_sha256)
+        _overlay_binding(
+            overlay=overlay,
+            expected_sha256=overlay_sha256,
+            system=str(row.get("system")),
+        )
+    if kind == "train" and _is_hooke_science_row(row) and declared_overlay is None:
+        raise ProtocolError("Hooke science train rows require the Hooke diagnostics overlay")
     _validate_config_identity_for_row(row, resolve_config_path(config))
     _validate_run_identity(row)
     if kind == "train" and _is_hooke_science_row(row):
@@ -726,6 +825,94 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
             f"binding overrides do not match: missing={missing}, mismatched={mismatched}"
         )
     return row
+
+
+def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
+                                   base_config: Any | None = None) -> None:
+    """Validate the final producer config immediately before execution.
+
+    Gateway override admission proves the textual row binding.  This second
+    boundary proves that OmegaConf composition did not later replace a bound
+    science leaf, callback list, or physical model section.
+    """
+
+    if row.get("kind") != "train" or row.get("overlay") is None:
+        return
+    if row.get("overlay_sha256") is None:
+        raise ProtocolError("overlay-backed train row is missing overlay_sha256")
+    relative, digest, _ = _overlay_binding(
+        overlay=str(row["overlay"]),
+        expected_sha256=row["overlay_sha256"],
+        system=str(row.get("system")),
+    )
+    resolved = OmegaConf.to_container(cfg, resolve=True)
+    if not isinstance(resolved, Mapping):
+        raise ProtocolError("resolved train config is not a mapping")
+
+    def select(path: str) -> Any:
+        value: Any = resolved
+        for part in path.split("."):
+            if not isinstance(value, Mapping) or part not in value:
+                raise ProtocolError(f"resolved train config is missing {path}")
+            value = value[part]
+        return value
+
+    if select("stage1_overlay.path") != relative or select("stage1_overlay.sha256") != digest:
+        raise ProtocolError("resolved train config overlay provenance does not match binding")
+    if select("stage1_overlay.composition_order") != OVERLAY_COMPOSITION_ORDER:
+        raise ProtocolError("resolved train config composition order is not canonical")
+
+    if row.get("science_profile") != HOOKE_SCIENCE_PROFILE:
+        return
+    # A bounded train-kind qualification row may use this public gateway with
+    # a short horizon/walker count.  Its overlay provenance is still checked,
+    # but it is not admitted as the production science profile below.
+    if row.get("updates") != STAGE1_PROTOCOL.lineage_updates:
+        return
+    expected_device = row.get("device", "cuda")
+    expected_values = {
+        "runtime.device": expected_device,
+        "runtime.dtype": "float64",
+        "sampler.n_walkers": row["walkers"],
+        "sampler.burn_in": 100,
+        "sampler.n_steps": 10,
+        "sampler.proposal_scale": 0.5,
+        "sampler.seed": row["sampler_seed"],
+        "trainer.max_steps": row["updates"],
+        "trainer.log_every_n_steps": 1,
+        "trainer.return_terms": True,
+        "optimizer._target_": "torch.optim.Adam",
+        "optimizer.lr": 0.005,
+    }
+    for path, expected in expected_values.items():
+        if select(path) != expected:
+            raise ProtocolError(f"resolved Hooke science config mismatch at {path}")
+    checkpoint_steps = list(select("checkpoint_steps"))
+    expected_steps = [step for step in row.get("checkpoint_steps", ()) if step > 0]
+    if checkpoint_steps != expected_steps:
+        raise ProtocolError("resolved Hooke checkpoint schedule does not match the manifest")
+    callbacks = select("callbacks")
+    targets = [entry.get("_target_") for entry in callbacks if isinstance(entry, Mapping)]
+    if targets.count("tpen.callback.AmplitudeRiskFraction") != 1:
+        raise ProtocolError("resolved Hooke config must contain one amplitude-risk callback")
+    amplitude = next(
+        entry for entry in callbacks
+        if isinstance(entry, Mapping)
+        and entry.get("_target_") == "tpen.callback.AmplitudeRiskFraction"
+    )
+    if (
+        list(amplitude.get("thresholds", ())) != [-3, -4, -5, -7, -10]
+        or amplitude.get("every_n_steps") != 100
+        or amplitude.get("start_step") != 0
+    ):
+        raise ProtocolError("resolved Hooke amplitude-risk callback drifted")
+
+    if base_config is not None:
+        base = OmegaConf.to_container(base_config, resolve=True)
+        if isinstance(base, Mapping):
+            for section in ("system", "atoms", "system_descriptor", "model", "hamiltonian_terms", "runner"):
+                if resolved.get(section) != base.get(section):
+                    raise ProtocolError(f"overlay changed base-owned section {section}")
 
 
 def physical_system_id_from_config(
@@ -929,11 +1116,17 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
     overlay_name: str | None = None
     overlay_digest: str | None = None
     if overlay is not None:
-        if not set(selected).issubset(OVERLAY_SYSTEMS):
-            raise ProtocolError("the diagnostics overlay is approved only for He/H2 rows")
+        expected_paths = {overlay_path_for_system(system) for system in selected}
+        if len(expected_paths) != 1:
+            raise ProtocolError("one declared overlay cannot mix system-qualified profiles")
+        expected_system = next(iter(selected))
         overlay_name, overlay_digest, _ = _overlay_binding(
-            overlay=overlay, expected_sha256=overlay_sha256
+            overlay=overlay,
+            expected_sha256=overlay_sha256,
+            system=expected_system,
         )
+    elif science_profile == HOOKE_SCIENCE_PROFILE:
+        raise ProtocolError("Hooke science train rows require the Hooke diagnostics overlay")
     if not checkpoints or any(type(step) is not int or step < 0 for step in checkpoints):
         raise ProtocolError("checkpoints must be a non-empty list of non-negative updates")
     if len(set(checkpoints)) != len(checkpoints):

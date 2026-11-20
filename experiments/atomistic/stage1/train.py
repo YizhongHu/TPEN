@@ -18,6 +18,7 @@ from tpen.run import run_from_config
 from experiments.atomistic.stage1.protocol import (
     compose_train_overlay,
     resolve_config_path,
+    validate_resolved_train_config,
     validate_gateway_binding,
 )
 
@@ -68,6 +69,9 @@ def main() -> int:
     # Compose the declared train overlay before applying row overrides so the
     # manifest remains authoritative for seeds, sizes, and run identity.
     cfg = load_config(str(config_path))
+    # Keep an immutable resolved snapshot for the final Hooke science boundary;
+    # the same object is intentionally mutated by overlay composition below.
+    base_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
     if args.overlay is not None:
         compose_train_overlay(
             cfg, overlay=args.overlay, expected_sha256=args.overlay_sha256,
@@ -83,6 +87,7 @@ def main() -> int:
         if cfg.runtime.seed == cfg.sampler.seed:
             raise ValueError("Hooke science runtime and sampler seeds must be distinct")
     prepare_initial_checkpoint_config(cfg)
+    validate_resolved_train_config(cfg, row, base_config=base_cfg)
     return run_from_config(cfg, config_path=str(config_path), command="stage1 train")
 
 

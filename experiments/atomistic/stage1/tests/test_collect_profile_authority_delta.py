@@ -19,10 +19,12 @@ from experiments.atomistic.stage1.protocol import (
     build_manifest,
     config_identities,
     manifest_hash,
+    overlay_sha256,
 )
 
 
 ROOT = Path(__file__).parents[1]
+HOOKE_OVERLAY = ROOT / "configs" / "overlays" / "hooke-diagnostics-v1.yaml"
 
 
 def _two_hooke_document(tmp_path: Path) -> dict[str, object]:
@@ -42,6 +44,8 @@ def _two_hooke_document(tmp_path: Path) -> dict[str, object]:
         phase=1,
         science_profile=HOOKE_SCIENCE_PROFILE,
         evaluation_selection=HOOKE_EVAL_SELECTION,
+        overlay=str(HOOKE_OVERLAY),
+        overlay_sha256=overlay_sha256(HOOKE_OVERLAY),
         expected_physical_system_id=physical_ids,
     )
     phase1_manifest_hash = manifest_hash(phase1_rows)

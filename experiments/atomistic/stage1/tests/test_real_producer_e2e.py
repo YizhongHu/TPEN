@@ -26,6 +26,7 @@ from experiments.atomistic.stage1.protocol import (
     SYSTEMS,
     build_manifest,
     manifest_hash,
+    overlay_sha256,
     validate_gateway_binding,
 )
 from experiments.atomistic.stage1.train import prepare_initial_checkpoint_config
@@ -39,6 +40,7 @@ from tpen.run import load_config, run_from_config
 
 
 CONFIG_ROOT = Path(__file__).parents[1] / "configs"
+HOOKE_OVERLAY = CONFIG_ROOT / "overlays" / "hooke-diagnostics-v1.yaml"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 EXPECTED_REGISTRY = {
     "hooke1": ("hooke_one_electron_omega0.5", 0.75, "transcribed"),
@@ -158,8 +160,11 @@ def test_real_train_eval_inspect_collect_chain_for_all_stage1_systems(
         results_root=str(tmp_path / "hooke-science-gateway"),
         systems=("hooke1", "hooke2"),
         phase=1,
+        device="cpu",
         science_profile=HOOKE_SCIENCE_PROFILE,
         evaluation_selection=HOOKE_EVAL_SELECTION,
+        overlay=str(HOOKE_OVERLAY),
+        overlay_sha256=overlay_sha256(HOOKE_OVERLAY),
     )
     for row in hooke_science_rows:
         if row["kind"] != "train" or row["lineage"] != 0:
@@ -168,6 +173,8 @@ def test_real_train_eval_inspect_collect_chain_for_all_stage1_systems(
             "stage1-train", "--config", str(row["config"]), "--kind", "train",
             *row_overrides(row), "sampler.burn_in=1", "sampler.n_steps=1",
             "--binding", _binding_token(row),
+            "--overlay", str(row["overlay"]),
+            "--overlay-sha256", str(row["overlay_sha256"]),
         ]
         with monkeypatch.context() as isolated:
             isolated.setattr(sys, "argv", argv)
@@ -197,6 +204,8 @@ def test_real_train_eval_inspect_collect_chain_for_all_stage1_systems(
             [
                 "stage1-train", "--config", str(hooke_row["config"]), "--kind", "train",
                 *tampered_overrides, "--binding", _binding_token(hooke_row),
+                "--overlay", str(hooke_row["overlay"]),
+                "--overlay-sha256", str(hooke_row["overlay_sha256"]),
             ],
         )
         with pytest.raises(ValueError, match="runtime and sampler seeds are not bound"):

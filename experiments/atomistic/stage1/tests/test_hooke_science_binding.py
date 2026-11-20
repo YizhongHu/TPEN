@@ -29,10 +29,12 @@ from experiments.atomistic.stage1.protocol import (
     training_seed,
     validate_gateway_binding,
     validate_hooke_eval_grid,
+    overlay_sha256,
 )
 
 
 ROOT = Path(__file__).parents[1]
+HOOKE_OVERLAY = ROOT / "configs" / "overlays" / "hooke-diagnostics-v1.yaml"
 
 
 @pytest.mark.parametrize("system", ["hooke1", "hooke2"])
@@ -82,6 +84,8 @@ def _hooke_phase1() -> list[dict[str, object]]:
         phase=1,
         science_profile=HOOKE_SCIENCE_PROFILE,
         evaluation_selection=HOOKE_EVAL_SELECTION,
+        overlay=str(HOOKE_OVERLAY),
+        overlay_sha256=overlay_sha256(HOOKE_OVERLAY),
     )
 
 
@@ -90,19 +94,22 @@ def test_hooke_phase1_rows_bind_distinct_sampler_seeds_and_gateway() -> None:
     train = next(row for row in rows if row["kind"] == "train")
     assert train["training_seed_rule"] == HOOKE_TRAINING_SEED_RULE
     assert train["evaluation_selection_id"] == HOOKE_EVAL_SELECTION_ID
+    assert train["overlay"] == "configs/overlays/hooke-diagnostics-v1.yaml"
     assert train["seed"] != train["sampler_seed"]
     overrides = row_overrides(train)
     assert f"runtime.seed={train['seed']}" in overrides
     assert f"sampler.seed={train['sampler_seed']}" in overrides
     assert validate_gateway_binding(
         binding=_binding_token(train), config=str(train["config"]),
-        overrides=overrides, kind="train",
+        overrides=overrides, kind="train", overlay=str(train["overlay"]),
+        overlay_sha256=str(train["overlay_sha256"]),
     ) == train
     with pytest.raises(ProtocolError, match="sampler.seed"):
         validate_gateway_binding(
             binding=_binding_token(train), config=str(train["config"]),
             overrides=[item for item in overrides if not item.startswith("sampler.seed=")],
-            kind="train",
+            kind="train", overlay=str(train["overlay"]),
+            overlay_sha256=str(train["overlay_sha256"]),
         )
     tampered = dict(train)
     tampered["sampler_seed"] = tampered["seed"]
@@ -110,6 +117,8 @@ def test_hooke_phase1_rows_bind_distinct_sampler_seeds_and_gateway() -> None:
         validate_gateway_binding(
             binding=_binding_token(tampered), config=str(tampered["config"]),
             overrides=row_overrides(tampered), kind="train",
+            overlay=str(tampered["overlay"]),
+            overlay_sha256=str(tampered["overlay_sha256"]),
         )
 
     tampered = dict(train)
@@ -120,6 +129,8 @@ def test_hooke_phase1_rows_bind_distinct_sampler_seeds_and_gateway() -> None:
         validate_gateway_binding(
             binding=_binding_token(tampered), config=str(tampered["config"]),
             overrides=row_overrides(tampered), kind="train",
+            overlay=str(tampered["overlay"]),
+            overlay_sha256=str(tampered["overlay_sha256"]),
         )
 
 
@@ -150,6 +161,8 @@ def test_hooke_train_gateway_rechecks_resolved_seed_binding(
             [
                 "stage1-train", "--config", str(train["config"]), "--kind", "train",
                 *tampered_overrides, "--binding", _binding_token(train),
+                "--overlay", str(train["overlay"]),
+                "--overlay-sha256", str(train["overlay_sha256"]),
             ],
         )
         with pytest.raises(ValueError, match="runtime and sampler seeds are not bound"):
@@ -221,6 +234,8 @@ def test_hooke_grid_rejects_count_preserving_replacement(
             phase=2,
             science_profile=HOOKE_SCIENCE_PROFILE,
             evaluation_selection=HOOKE_EVAL_SELECTION,
+            overlay=str(HOOKE_OVERLAY),
+            overlay_sha256=overlay_sha256(HOOKE_OVERLAY),
             expected_physical_system_id={"hooke1": "d" * 64},
         )
 
@@ -244,6 +259,8 @@ def _two_hooke_phase2_document(tmp_path: Path) -> tuple[dict[str, object], objec
         phase=1,
         science_profile=HOOKE_SCIENCE_PROFILE,
         evaluation_selection=HOOKE_EVAL_SELECTION,
+        overlay=str(HOOKE_OVERLAY),
+        overlay_sha256=overlay_sha256(HOOKE_OVERLAY),
         expected_physical_system_id=physical_ids,
     )
     phase1_hash = protocol_module.manifest_hash(phase1_rows)

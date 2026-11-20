@@ -21,6 +21,10 @@ replanning seeds or source/config identity. `config_sha256` is computed by the
 planner under `stage1-config-v1`: sorted `configs/<system>/{train,eval}.yaml`
 paths and their canonical bytes are hashed. The rule id is recorded in each row;
 GPU intent is recorded as a row `device` only when explicitly requested.
+Overlay-backed train rows carry a separate exact-byte `overlay_sha256` and
+canonical overlay path. The base train/eval pair digest remains unchanged when
+only diagnostics bytes change, so `stage1-config-v1` alone never identifies an
+overlay-backed execution.
 The one-shot compatibility `--config-sha256` input is recorded as
 `legacy-config-sha256`; two-phase planning always records the computed rule.
 
