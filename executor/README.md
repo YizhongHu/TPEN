@@ -105,7 +105,9 @@ publication or launch work. A `LaunchIntentV1` is created exactly once in the
 member attempt directory while the task lock is held. Recovery may read an
 intent, but an existing intent without an executor acknowledgement is a
 permanent park decision for the controller layer; this storage slice never
-relaunches it.
+relaunches it. Every controller incarnation must supply a freshly generated,
+unique claimant nonce; retries reuse the same canonical record rather than
+minting a second nonce.
 
 ## GPU placement qualification
 

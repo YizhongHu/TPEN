@@ -349,15 +349,45 @@ class DirectoryStore:
             raise ControllerGenerationRejected("controller ledger escapes store root")
         return path
 
-    def _controller_records(self, directory: str) -> list[ControllerGenerationV1]:
-        records: list[ControllerGenerationV1] = []
+    def _controller_records(self, directory: str, group_id: GroupId) -> list[ControllerGenerationV1]:
+        """Load and validate the complete canonical generation chain."""
+        records: list[tuple[int, ControllerGenerationV1]] = []
         for name in os.listdir(directory):
-            if not name.startswith("generation-") or not name.endswith(".json"):
+            if name == _CONTROLLER_LOCK or name.startswith(".tmp-"):
                 continue
+            match = re.fullmatch(r"generation-(\d+)\.json", name)
+            if match is None:
+                raise ControllerGenerationRejected("unexpected controller ledger entry")
             path = os.path.join(directory, name)
-            _require_regular(path, "controller generation")
-            records.append(ControllerGenerationV1.decode(Path(path).read_bytes()))
-        return sorted(records, key=lambda record: record.generation)
+            _require_regular(path, "controller generation", ControllerGenerationRejected)
+            encoded = Path(path).read_bytes()
+            try:
+                record = ControllerGenerationV1.decode(encoded)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+                raise ControllerGenerationRejected("controller generation is malformed") from error
+            if encoded != record.encode() or int(match.group(1)) != record.generation or record.group_id != group_id:
+                raise ControllerGenerationRejected("controller generation identity is crossed")
+            records.append((record.generation, record))
+        records.sort(key=lambda item: item[0])
+        if records and records[0][0] != 1 or any(number != index for index, (number, _) in enumerate(records, 1)):
+            raise ControllerGenerationRejected("controller generation chain is not contiguous")
+        previous = None
+        for _, record in records:
+            expected = None if previous is None else previous.record_digest
+            if record.predecessor_record_digest != expected:
+                raise ControllerGenerationRejected("controller generation predecessor is crossed")
+            previous = record
+        return [record for _, record in records]
+
+    def _prepare_controller_dir(self, group: ReadyGroupV2) -> str:
+        """Create and durably publish the controller ledger ancestry."""
+        directory = self._controller_dir(group)
+        group_dir = os.path.dirname(directory)
+        ensure_durable_directory(self.root)
+        ensure_durable_directory(os.path.join(self.root, "groups"))
+        ensure_durable_directory(group_dir)
+        ensure_durable_directory(directory)
+        return directory
 
     def acquire_controller_generation(self, group: ReadyGroupV2, record: ControllerGenerationV1) -> ControllerGenerationV1:
         """Durably acquire the next controller generation for ``group``.
@@ -367,13 +397,10 @@ class DirectoryStore:
         """
         if not isinstance(record, ControllerGenerationV1) or record.group_id != group.group_id:
             raise ControllerGenerationRejected("controller generation is crossed")
-        directory = self._controller_dir(group)
-        _ensure_directory(self.root)
-        _ensure_directory(_lexical(os.path.join(self.root, "groups")))
-        _ensure_directory(_lexical(os.path.join(self.root, "groups", digest(group.group_id.to_dict()))))
-        _ensure_directory(directory)
+        directory = self._prepare_controller_dir(group)
         with _task_lock(os.path.join(directory, _CONTROLLER_LOCK)):
-            records = self._controller_records(directory)
+            records = self._controller_records(directory, group.group_id)
+            _fsync_directory(directory)  # replay barrier
             current = records[-1] if records else None
             if current is not None and record.generation == current.generation and record.encode() == current.encode():
                 return current
@@ -395,7 +422,8 @@ class DirectoryStore:
         directory = self._controller_dir(group)
         try:
             with _task_lock(os.path.join(directory, _CONTROLLER_LOCK)):
-                records = self._controller_records(directory)
+                records = self._controller_records(directory, group.group_id if isinstance(group, ReadyGroupV2) else group)
+                _fsync_directory(directory)
         except (FileNotFoundError, OSError, FenceRejected, ValueError, TypeError) as error:
             raise ControllerGenerationRejected("controller ledger is unavailable") from error
         if not records or records[-1].generation != generation or records[-1].claimant_nonce != nonce:
@@ -407,38 +435,62 @@ class DirectoryStore:
         """Exclusively create one launch intent after a current-controller check."""
         if not isinstance(controller_record, ControllerGenerationV1) or not isinstance(invocation, MemberInvocationV2):
             raise TypeError("launch intent requires typed controller and invocation records")
-        task_dir = self._task_dir_for_fence(fence)
-        if invocation.attempt_id != fence.attempt_id or invocation.group_digest != fence.group_digest:
-            raise LaunchIntentRejected("launch intent binding crosses its fence")
-        if (invocation.allocation_attempt.group_id != controller_record.group_id
-                or invocation.allocation_attempt.allocation_id != controller_record.allocation_id
-                or invocation.allocation_attempt.backend_job_id != controller_record.backend_job_id):
-            raise LaunchIntentRejected("launch intent group is crossed")
-        intent = LaunchIntentV1(controller_record.group_id, fence.task_id, fence.attempt_id, invocation.invocation_id,
-                                controller_record.generation, controller_record.claimant_nonce,
-                                controller_record.allocation_id, controller_record.backend_job_id)
-        intent_path = os.path.join(fence.output_dir, _LAUNCH_INTENT_FILENAME)
-        with _task_lock(os.path.join(task_dir, _TASK_LOCK)):
-            self.require_current_controller(controller_record.group_id, controller_record.generation, controller_record.claimant_nonce)
-            if os.path.lexists(intent_path):
-                raise LaunchIntentRejected("launch intent already exists")
-            try:
-                _write_new(intent_path, intent.encode())
-            except FileExistsError as error:
-                raise LaunchIntentRejected("launch intent already exists") from error
-        return intent
+        directory = self._controller_dir(controller_record.group_id)
+        with _task_lock(os.path.join(directory, _CONTROLLER_LOCK)):
+            records = self._controller_records(directory, controller_record.group_id)
+            if not records or records[-1].encode() != controller_record.encode():
+                raise ControllerGenerationRejected("controller record is not current")
+            task_dir = self._task_dir_for_fence(fence)
+            with _task_lock(os.path.join(task_dir, _TASK_LOCK)):
+                start = self._validate_fence(fence, task_dir)
+                self._validate_invocation(start, invocation)  # durable intent gate
+                if (invocation.attempt_id != fence.attempt_id
+                        or invocation.group_digest != fence.group_digest
+                        or invocation.allocation_attempt.group_id != controller_record.group_id
+                        or invocation.allocation_attempt.allocation_id != controller_record.allocation_id
+                        or invocation.allocation_attempt.backend_job_id != controller_record.backend_job_id):
+                    raise LaunchIntentRejected("launch intent binding crosses its fence")
+                intent = LaunchIntentV1(controller_record.group_id, fence.task_id, fence.attempt_id, invocation.invocation_id,
+                                        records[-1].generation, records[-1].claimant_nonce,
+                                        records[-1].allocation_id, records[-1].backend_job_id)
+                intent_path = os.path.join(fence.output_dir, _LAUNCH_INTENT_FILENAME)
+                if os.path.lexists(intent_path):
+                    raise LaunchIntentRejected("launch intent already exists")
+                try:
+                    _write_new(intent_path, intent.encode())
+                except FileExistsError as error:
+                    raise LaunchIntentRejected("launch intent already exists") from error
+                return intent
 
     def read_launch_intent(self, fence: AttemptFence) -> LaunchIntentV1:
-        """Read the canonical launch intent for recovery; never synthesize one."""
+        """Read a canonical historical launch intent for recovery.
+
+        The attempt start and invocation binding are revalidated, but current
+        controller authority is deliberately not required: an old intent is
+        evidence for permanent parking, never permission to relaunch.
+        """
         task_dir = self._task_dir_for_fence(fence)
         path = os.path.join(fence.output_dir, _LAUNCH_INTENT_FILENAME)
         with _task_lock(os.path.join(task_dir, _TASK_LOCK)):
             try:
+                start = self._validate_fence(fence, task_dir)
+                invocation_path = os.path.join(fence.output_dir, "invocation.json")
+                _require_regular(invocation_path, "invocation binding")
+                invocation_bytes = Path(invocation_path).read_bytes()
+                invocation = MemberInvocationV2.decode(invocation_bytes)
+                self._validate_invocation(start, invocation)
                 _require_regular(path, "launch intent", LaunchIntentRejected)
-                intent = LaunchIntentV1.decode(Path(path).read_bytes())
+                encoded = Path(path).read_bytes()
+                intent = LaunchIntentV1.decode(encoded)
+                if encoded != intent.encode():
+                    raise LaunchIntentRejected("launch intent is not canonical")
             except (OSError, ValueError, TypeError) as error:
                 raise LaunchIntentRejected("launch intent is unreadable") from error
-        if intent.attempt_id != fence.attempt_id or intent.task_id != fence.task_id:
+        if (intent.attempt_id != fence.attempt_id or intent.task_id != fence.task_id
+                or intent.group_id != invocation.allocation_attempt.group_id
+                or intent.invocation_id != invocation.invocation_id
+                or intent.allocation_id != invocation.allocation_attempt.allocation_id
+                or intent.backend_job_id != invocation.allocation_attempt.backend_job_id):
             raise LaunchIntentRejected("launch intent is crossed")
         return intent
 

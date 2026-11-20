@@ -15,7 +15,11 @@ MUTANTS = (
     ("predecessor-check-off", "executor/src/tpen_executor/storage.py", "record.predecessor_record_digest != predecessor", "False", "test_generation_rejects_forked_predecessor"),
     ("nonce-check-off", "executor/src/tpen_executor/storage.py", "records[-1].claimant_nonce != nonce", "False", "test_require_current_controller_rejects_wrong_nonce"),
     ("replay-byte-compare-off", "executor/src/tpen_executor/storage.py", "record.encode() == current.encode()", "True", "test_generation_rejects_differing_replay"),
-    ("intent-stale-check-off", "executor/src/tpen_executor/storage.py", "self.require_current_controller(controller_record.group_id, controller_record.generation, controller_record.claimant_nonce)", "None", "test_launch_intent_stale_controller_refuses"),
+    ("recovery-directory-fsync-off", "executor/src/tpen_executor/storage.py", "_fsync_directory(directory)  # replay barrier", "pass  # replay barrier", "test_visible_generation_recovery_requires_directory_barrier"),
+    ("chain-group-check-off", "executor/src/tpen_executor/storage.py", "record.group_id != group_id", "False", "test_invalid_ledger_never_grants_authority"),
+    ("chain-predecessor-check-off", "executor/src/tpen_executor/storage.py", "record.predecessor_record_digest != expected", "False", "test_invalid_ledger_never_grants_authority"),
+    ("full-controller-compare-off", "executor/src/tpen_executor/storage.py", "records[-1].encode() != controller_record.encode()", "False", "test_intent_rechecks_durable_fence_and_binding"),
+    ("intent-validation-off", "executor/src/tpen_executor/storage.py", "self._validate_invocation(start, invocation)  # durable intent gate", "pass  # durable intent gate", "test_intent_rechecks_durable_fence_and_binding"),
 )
 
 # No intent-exclusivity row: _write_new refuses an existing destination and create_launch_intent maps FileExistsError to the same LaunchIntentRejected.
@@ -115,6 +119,8 @@ def test_launch_intent_wire_is_canonical_and_strict():
 def test_mutant_anchors_are_unique_compile_and_name_real_killers():
     source = Path(__file__).parents[1].joinpath("src/tpen_executor/storage.py").read_text()
     names = {name for name, value in globals().items() if name.startswith("test_") and callable(value)}
+    import test_review_b1b2_l_r1 as review_r1
+    names.update(name for name, value in vars(review_r1).items() if name.startswith("test_") and callable(value))
     anchors = [row[2] for row in MUTANTS]
     assert len(anchors) == len(set(anchors)) >= 5
     for _, filename, before, after, killer in MUTANTS:

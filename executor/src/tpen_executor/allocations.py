@@ -241,7 +241,11 @@ class MemberInvocationV2:
 
 @frozen_record
 class ControllerGenerationV1:
-    """Store-owned, strictly ordered authority for one allocation group."""
+    """Store-owned, strictly ordered authority for one allocation group.
+
+    ``claimant_nonce`` must be freshly generated and unique for every
+    controller incarnation; it is not a retry counter or a reusable name.
+    """
 
     schema: ClassVar[str] = "tpen-executor/controller-generation-v1"
     group_id: GroupId
