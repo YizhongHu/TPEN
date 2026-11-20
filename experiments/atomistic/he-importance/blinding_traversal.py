@@ -33,6 +33,8 @@ def walk_blinding_content(
     *,
     is_forbidden: Predicate,
     error_factory: ErrorFactory,
+    reject_non_string_mapping_keys: bool = False,
+    dataclass_fields_first: bool = False,
 ) -> None:
     """Visit names and leaves reachable from ``value``.
 
@@ -50,6 +52,13 @@ def walk_blinding_content(
         Caller-owned exception constructor receiving ``(path, content,
         reason)``.  Reasons are ``"key"``, ``"value"``, ``"key-type"``, and
         ``"decode"``.
+    reject_non_string_mapping_keys
+        If true, refuse mapping keys that are not original ``str`` instances
+        before normalization.  The default preserves the historical walker
+        behavior, which normalizes UTF-8 bytes and path keys.
+    dataclass_fields_first
+        If true, traverse dataclass fields before Mapping/Sequence dispatch.
+        The default preserves the historical dispatch order for hybrid types.
 
     Raises
     ------
@@ -65,7 +74,15 @@ def walk_blinding_content(
     sets are ordered by type and representation to keep labels deterministic.
     """
 
-    _walk(value, label, is_forbidden=is_forbidden, error_factory=error_factory, active=set())
+    _walk(
+        value,
+        label,
+        is_forbidden=is_forbidden,
+        error_factory=error_factory,
+        reject_non_string_mapping_keys=reject_non_string_mapping_keys,
+        dataclass_fields_first=dataclass_fields_first,
+        active=set(),
+    )
 
 
 def _walk(
@@ -74,6 +91,8 @@ def _walk(
     *,
     is_forbidden: Predicate,
     error_factory: ErrorFactory,
+    reject_non_string_mapping_keys: bool,
+    dataclass_fields_first: bool,
     active: set[int],
 ) -> None:
     normalized = _normalize(value, label, error_factory=error_factory)
@@ -89,8 +108,26 @@ def _walk(
         return
     active.add(identity)
     try:
+        if dataclass_fields_first and is_dataclass(value) and not isinstance(value, type):
+            _walk_members(
+                value,
+                label,
+                is_forbidden=is_forbidden,
+                error_factory=error_factory,
+                reject_non_string_mapping_keys=reject_non_string_mapping_keys,
+                dataclass_fields_first=dataclass_fields_first,
+                active=active,
+            )
+            return
+
         if isinstance(value, Mapping):
             for key, nested in value.items():
+                if reject_non_string_mapping_keys and not isinstance(key, str):
+                    raise error_factory(
+                        _Path(f"{label} key", label),
+                        key,
+                        "key-type",
+                    )
                 key_text = _normalize_key(key, label, error_factory=error_factory)
                 _check(
                     key_text,
@@ -104,6 +141,8 @@ def _walk(
                     f"{label}.{key_text}",
                     is_forbidden=is_forbidden,
                     error_factory=error_factory,
+                    reject_non_string_mapping_keys=reject_non_string_mapping_keys,
+                    dataclass_fields_first=dataclass_fields_first,
                     active=active,
                 )
             return
@@ -115,6 +154,8 @@ def _walk(
                     f"{label}[{index}]",
                     is_forbidden=is_forbidden,
                     error_factory=error_factory,
+                    reject_non_string_mapping_keys=reject_non_string_mapping_keys,
+                    dataclass_fields_first=dataclass_fields_first,
                     active=active,
                 )
             return
@@ -127,30 +168,55 @@ def _walk(
                     f"{label}[{index}]",
                     is_forbidden=is_forbidden,
                     error_factory=error_factory,
+                    reject_non_string_mapping_keys=reject_non_string_mapping_keys,
+                    dataclass_fields_first=dataclass_fields_first,
                     active=active,
                 )
             return
 
-        members = _members(value)
-        if members is None:
-            return
-        for name, nested in members:
-            _check(
-                name,
-                _Path(f"{label}.{name}", label),
-                "key",
-                is_forbidden,
-                error_factory,
-            )
-            _walk(
-                nested,
-                f"{label}.{name}",
-                is_forbidden=is_forbidden,
-                error_factory=error_factory,
-                active=active,
-            )
+        _walk_members(
+            value,
+            label,
+            is_forbidden=is_forbidden,
+            error_factory=error_factory,
+            reject_non_string_mapping_keys=reject_non_string_mapping_keys,
+            dataclass_fields_first=dataclass_fields_first,
+            active=active,
+        )
     finally:
         active.remove(identity)
+
+
+def _walk_members(
+    value: Any,
+    label: str,
+    *,
+    is_forbidden: Predicate,
+    error_factory: ErrorFactory,
+    reject_non_string_mapping_keys: bool,
+    dataclass_fields_first: bool,
+    active: set[int],
+) -> None:
+    members = _members(value)
+    if members is None:
+        return
+    for name, nested in members:
+        _check(
+            name,
+            _Path(f"{label}.{name}", label),
+            "key",
+            is_forbidden,
+            error_factory,
+        )
+        _walk(
+            nested,
+            f"{label}.{name}",
+            is_forbidden=is_forbidden,
+            error_factory=error_factory,
+            reject_non_string_mapping_keys=reject_non_string_mapping_keys,
+            dataclass_fields_first=dataclass_fields_first,
+            active=active,
+        )
 
 
 def _normalize(value: Any, label: str, *, error_factory: ErrorFactory) -> str | None:

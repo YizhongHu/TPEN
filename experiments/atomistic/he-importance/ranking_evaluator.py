@@ -147,6 +147,8 @@ def _refuse_blinded_content(value: Any, path: str) -> None:
         path,
         is_forbidden=is_forbidden,
         error_factory=error_factory,
+        reject_non_string_mapping_keys=True,
+        dataclass_fields_first=True,
     )
 
 

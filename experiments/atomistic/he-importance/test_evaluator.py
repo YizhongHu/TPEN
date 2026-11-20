@@ -715,6 +715,22 @@ class _ObjectWitness:
         self.payload = payload
 
 
+@dataclass
+class _DataclassMappingHybrid(dict):
+    payload: object
+
+    def __post_init__(self) -> None:
+        dict.__init__(self, {"container": "benign"})
+
+
+@dataclass
+class _DataclassSequenceHybrid(list):
+    payload: object
+
+    def __post_init__(self) -> None:
+        list.__init__(self, ["benign"])
+
+
 @pytest.mark.parametrize(
     ("payload", "label"),
     [
@@ -736,3 +752,22 @@ def test_blinding_reaches_new_structural_and_normalized_leaves(payload: object, 
             analytic_oracle=lambda value: value,
         )
     assert exc.type is evaluator.EvaluatorQualificationError
+
+
+def test_l3a_default_preserves_normalized_keys_and_hybrid_container_precedence() -> None:
+    evaluator.qualify_factor(
+        "cusp",
+        {b"benign": "ok", Path("benign"): "ok"},
+        lambda value: value,
+        analytic_oracle=lambda value: value,
+    )
+    for value in (
+        _DataclassMappingHybrid("reference_energy"),
+        _DataclassSequenceHybrid("reference_energy"),
+    ):
+        evaluator.qualify_factor(
+            "cusp",
+            value,
+            lambda payload: payload,
+            analytic_oracle=lambda payload: payload,
+        )

@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import sys
 from types import MappingProxyType
+from typing import Callable
 
 import pytest
 
@@ -124,9 +125,25 @@ def test_blinding_refuses_forbidden_string_values() -> None:
         )
 
 
-@dataclass
 class _PlainObjectWitness:
+    def __init__(self, payload: object) -> None:
+        self.payload = payload
+
+
+@dataclass
+class _DataclassMappingHybrid(dict):
     payload: object
+
+    def __post_init__(self) -> None:
+        dict.__init__(self, {"container": "benign"})
+
+
+@dataclass
+class _DataclassSequenceHybrid(list):
+    payload: object
+
+    def __post_init__(self) -> None:
+        list.__init__(self, ["benign"])
 
 
 class _PrivateSlotWitness:
@@ -175,6 +192,76 @@ def test_l3b_shared_walker_reaches_new_structural_and_normalized_leaves(
                 {"checkpoint_id": payload, "disposition": "keep", "ordinal": 0}
             )
     assert exc.type is ranking_evaluator.RankingEvaluationError
+
+
+@pytest.mark.parametrize("key", [b"benign", Path("benign"), b"reference_energy"])
+@pytest.mark.parametrize("route", ["request", "output"])
+def test_l3b_refuses_non_string_mapping_keys_before_normalization(
+    key: object, route: str, tmp_path: Path
+) -> None:
+    if route == "request":
+        expected = "ranking request.rng_provenance keys must be strings"
+        with pytest.raises(ranking_evaluator.RankingEvaluationError, match=re.escape(expected)) as exc:
+            ranking_evaluator.evaluate_checkpoint(
+                replace(_request(tmp_path), rng_provenance={key: "benign"})
+            )
+    else:
+        expected = "ranking output.checkpoint_id keys must be strings"
+        with pytest.raises(ranking_evaluator.RankingEvaluationError, match=re.escape(expected)) as exc:
+            ranking_evaluator.validate_ranking_output(
+                {"checkpoint_id": {key: "benign"}, "disposition": "keep", "ordinal": 0}
+            )
+    assert exc.type is ranking_evaluator.RankingEvaluationError
+
+
+@pytest.mark.parametrize("hybrid", [_DataclassMappingHybrid, _DataclassSequenceHybrid])
+@pytest.mark.parametrize("payload", ["reference_energy", "benign"])
+@pytest.mark.parametrize("route", ["request", "output"])
+def test_l3b_dataclass_fields_precede_hybrid_container_dispatch(
+    hybrid: Callable[[object], object], payload: str, route: str, tmp_path: Path
+) -> None:
+    value = hybrid(payload)
+    if payload == "benign":
+        if route == "request":
+            ranking_evaluator.evaluate_checkpoint(
+                replace(_request(tmp_path), rng_provenance={"payload": value})
+            )
+        else:
+            ranking_evaluator.validate_ranking_output(
+                {"checkpoint_id": value, "disposition": "keep", "ordinal": 0}
+            )
+        return
+
+    if route == "request":
+        label = "ranking request.rng_provenance.payload.payload"
+        with pytest.raises(ranking_evaluator.RankingEvaluationError, match=re.escape(
+            f"{label} contains forbidden value 'reference_energy'"
+        )) as exc:
+            ranking_evaluator.evaluate_checkpoint(
+                replace(_request(tmp_path), rng_provenance={"payload": value})
+            )
+    else:
+        label = "ranking output.checkpoint_id.payload"
+        with pytest.raises(ranking_evaluator.RankingEvaluationError, match=re.escape(
+            f"{label} contains forbidden value 'reference_energy'"
+        )) as exc:
+            ranking_evaluator.validate_ranking_output(
+                {"checkpoint_id": value, "disposition": "keep", "ordinal": 0}
+            )
+    assert exc.type is ranking_evaluator.RankingEvaluationError
+
+
+@pytest.mark.parametrize("route", ["request", "output"])
+def test_l3b_undecorated_plain_object_benign_control(route: str, tmp_path: Path) -> None:
+    value = _PlainObjectWitness("benign")
+    if route == "request":
+        ranking_evaluator.evaluate_checkpoint(
+            replace(_request(tmp_path), rng_provenance={"payload": value})
+        )
+    else:
+        ranking_evaluator.validate_ranking_output(
+            {"checkpoint_id": value, "disposition": "keep", "ordinal": 0}
+        )
 
 
 def test_l3b_shared_walker_preserves_benign_cycles_enum_and_deque(tmp_path: Path) -> None:

@@ -29,7 +29,7 @@ class ProbeError(ValueError):
         self.reason = reason
 
 
-def _screen(value: object, label: str = "probe") -> list[str]:
+def _screen(value: object, label: str = "probe", **walker_options: object) -> list[str]:
     seen: list[str] = []
 
     def predicate(text: str) -> bool:
@@ -39,7 +39,13 @@ def _screen(value: object, label: str = "probe") -> list[str]:
     def error(path: str, content: object, reason: str) -> Exception:
         return ProbeError(path, content, reason)
 
-    walker.walk_blinding_content(value, label, is_forbidden=predicate, error_factory=error)
+    walker.walk_blinding_content(
+        value,
+        label,
+        is_forbidden=predicate,
+        error_factory=error,
+        **walker_options,
+    )
     return seen
 
 
@@ -55,6 +61,22 @@ class SlottedPayload:
     def __init__(self, name: str, nested: object):
         self.name = name
         self.nested = nested
+
+
+@dataclass
+class DataclassMappingHybrid(dict):
+    payload: object
+
+    def __post_init__(self) -> None:
+        dict.__init__(self, {"container": "benign"})
+
+
+@dataclass
+class DataclassSequenceHybrid(list):
+    payload: object
+
+    def __post_init__(self) -> None:
+        list.__init__(self, ["benign"])
 
 
 def test_walks_structural_nodes_and_normalizes_keys_and_leaves() -> None:
@@ -115,3 +137,36 @@ def test_undecodable_bytes_are_refused() -> None:
 def test_benign_normalized_values_reach_the_predicate() -> None:
     seen = _screen({b"key": bytearray(b"value"), Path("path"): ["leaf"]})
     assert seen == ["key", "value", "path", "leaf"]
+
+
+def test_default_mapping_dispatch_preserves_hybrid_l3a_behavior() -> None:
+    assert _screen(DataclassMappingHybrid("reference_energy")) == ["container", "benign"]
+    assert _screen(DataclassSequenceHybrid("reference_energy")) == ["benign"]
+
+
+@pytest.mark.parametrize("key", [b"benign", Path("benign")])
+def test_default_normalizes_non_string_mapping_keys(key: object) -> None:
+    assert _screen({key: "benign"}) == [str(key)]
+
+
+def test_opt_in_walker_policies_refuse_original_keys_and_prioritize_dataclass_fields() -> None:
+    with pytest.raises(ProbeError) as caught:
+        _screen({b"benign": "value"}, reject_non_string_mapping_keys=True)
+    assert caught.value.path == "probe key"
+    assert caught.value.reason == "key-type"
+
+    with pytest.raises(ProbeError) as caught:
+        _screen(
+            DataclassMappingHybrid("reference_energy"),
+            dataclass_fields_first=True,
+        )
+    assert caught.value.path == "probe.payload"
+    assert caught.value.reason == "value"
+
+    with pytest.raises(ProbeError) as caught:
+        _screen(
+            DataclassSequenceHybrid("reference_energy"),
+            dataclass_fields_first=True,
+        )
+    assert caught.value.path == "probe.payload"
+    assert caught.value.reason == "value"
