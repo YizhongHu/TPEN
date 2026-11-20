@@ -346,7 +346,7 @@ def test_stale_canonical_overlay_digest_is_rejected_at_every_binding_boundary() 
             config=str(row["config"]),
             overrides=row_overrides(row),
             kind="train",
-            overlay=str(OVERLAY),
+            overlay=str(row["overlay"]),
             overlay_sha256=stale_digest,
         )
 

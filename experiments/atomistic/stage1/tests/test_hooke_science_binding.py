@@ -177,6 +177,7 @@ def test_hooke_train_gateway_rechecks_resolved_model_binding(
     train = next(row for row in _hooke_phase1() if row["kind"] == "train")
     overrides = row_overrides(train) + ["model.readout.trainable=false"]
     with monkeypatch.context() as isolated:
+        isolated.setenv("TPEN_STAGE1_RESULTS_ROOT", "/external/stage1")
         isolated.setattr(
             stage1_train,
             "run_from_config",
