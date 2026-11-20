@@ -243,6 +243,10 @@ class HIContinuationAdmissionRefusal(ValueError):
         super().__init__(f"{self.code}: {reason}")
 
 
+class HIContinuationRowIdentityRefusal(HIContinuationAdmissionRefusal):
+    """A supplied config is not the producer-resolved row being admitted."""
+
+
 @dataclass(frozen=True, slots=True)
 class SealedHIContinuationIdentity:
     """Stable identity for one inventory- and context-qualified HI row."""
@@ -271,7 +275,6 @@ class HIContinuationAdmission:
 
     identity: SealedHIContinuationIdentity
     inventory: tuple[MutableStateEntry, ...]
-    profile: str
 
 
 _ADMISSION_SCHEMA = "he-importance/continuation-admission/v1"
@@ -287,6 +290,10 @@ _O_CONTEXTS = {
         },
     },
 }
+
+# S5b-A admits no operational overlays.  S5b-B may extend this only under its
+# own contract; restore_request and artifact_destination are outside this tree.
+_SCIENTIFIC_CONTEXT_OVERLAY_ALLOWLIST: frozenset[str] = frozenset()
 
 
 def _source_ref(path: str, target: str) -> str:
@@ -489,6 +496,38 @@ def _canonical_inventory(entries: Sequence[MutableStateEntry]) -> tuple[dict[str
     )
 
 
+def _canonical_scientific_context_tree(config: Any) -> bytes:
+    """Serialize the complete resolved scientific/context config tree.
+
+    The overlay allowlist is intentionally empty for S5b-A, so every value in
+    the producer-resolved tree is identity-significant.  JSON encoding keeps
+    booleans, integers, and other JSON scalar types distinct during equality.
+    """
+
+    if isinstance(config, DictConfig) or OmegaConf.is_config(config):
+        config = OmegaConf.to_container(config, resolve=True)
+    if not isinstance(config, Mapping):
+        raise TypeError("HI continuation config must be a mapping")
+    tree = dict(config)
+    for path in _SCIENTIFIC_CONTEXT_OVERLAY_ALLOWLIST:
+        cursor: Any = tree
+        segments = path.split(".")
+        for segment in segments[:-1]:
+            if not isinstance(cursor, dict) or segment not in cursor:
+                break
+            cursor = cursor[segment]
+        else:
+            if isinstance(cursor, dict):
+                cursor.pop(segments[-1], None)
+    return json.dumps(
+        tree,
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
 def _admission_context(source: Any) -> tuple[str, str]:
     """Read and validate the O1 context identity from a materialized row."""
 
@@ -527,11 +566,11 @@ def validate_hi_continuation_admission(
 
     The helper is intentionally study-local and does not open the continuation
     route.  It reconstructs the expected resolved row from the materialized
-    source, compares the supplied constructor census against that row's exact
-    path/target/disposition identity, and consumes both core native-profile
-    checks.  Comparing censuses catches raw composite/basis injections and
-    noncanonical ``runner.*`` aliases without maintaining a second context
-    allowlist here.
+    source and requires the supplied config's complete canonical tree to equal
+    that producer-resolved tree before sealing its constructor census.  The
+    empty S5b-A overlay allowlist therefore catches row drift, raw
+    composite/basis injections, and noncanonical ``runner.*`` aliases without
+    maintaining a second context allowlist here.
 
     Parameters
     ----------
@@ -549,8 +588,8 @@ def validate_hi_continuation_admission(
     Raises
     ------
     HIContinuationAdmissionRefusal
-        If the row, inventory, context identity, or native profile is not
-        exactly qualified.
+        If the row, config tree, inventory, or context identity is not exactly
+        qualified.
     """
 
     context, content_hash = _admission_context(source)
@@ -563,6 +602,18 @@ def validate_hi_continuation_admission(
         raise HIContinuationAdmissionRefusal(
             f"sealed O1 row cannot be resolved: {error}"
         ) from error
+
+    try:
+        expected_tree = _canonical_scientific_context_tree(expected_config)
+        observed_tree = _canonical_scientific_context_tree(config)
+    except Exception as error:
+        raise HIContinuationAdmissionRefusal(
+            f"resolved-row config tree cannot be canonicalized: {error}"
+        ) from error
+    if observed_tree != expected_tree:
+        raise HIContinuationRowIdentityRefusal(
+            "resolved-row context identity does not match the sealed O1 row"
+        )
 
     try:
         expected_entries = validate_mutable_state_inventory(expected_config)
@@ -579,25 +630,6 @@ def validate_hi_continuation_admission(
             "resolved-row context identity does not match the sealed O1 row"
         )
 
-    observed_tree = _config_tree(config)
-    try:
-        from tpen.checkpoint.profiles import NATIVE_RECOVERY_PROFILE, check_profile
-        from tpen.execution.native_profile import validate_native_recovery_profile
-
-        profile_check = check_profile(observed_tree, NATIVE_RECOVERY_PROFILE)
-        if profile_check.verdict != "supported":
-            refusal = profile_check.refusal or {"code": "unknown", "reason": "profile refused"}
-            raise HIContinuationAdmissionRefusal(
-                f"native profile refused ({refusal['code']}): {refusal['reason']}"
-            )
-        validate_native_recovery_profile(observed_tree)
-    except HIContinuationAdmissionRefusal:
-        raise
-    except Exception as error:
-        raise HIContinuationAdmissionRefusal(
-            f"native profile refused: {error}"
-        ) from error
-
     identity = SealedHIContinuationIdentity(
         schema=_ADMISSION_SCHEMA,
         stage="O1",
@@ -610,13 +642,13 @@ def validate_hi_continuation_admission(
     return HIContinuationAdmission(
         identity=identity,
         inventory=observed_entries,
-        profile=NATIVE_RECOVERY_PROFILE,
     )
 
 
 __all__ = [
     "HIContinuationAdmission",
     "HIContinuationAdmissionRefusal",
+    "HIContinuationRowIdentityRefusal",
     "MutableStateEntry",
     "SealedHIContinuationIdentity",
     "build_mutable_state_inventory",

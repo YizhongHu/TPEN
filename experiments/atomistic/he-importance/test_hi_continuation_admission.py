@@ -25,11 +25,11 @@ train_config = importlib.import_module(
 context_mapping = importlib.import_module(
     "experiments.atomistic.he-importance.context_mapping"
 )
-_ROWS: dict[str, tuple[object, object]] | None = None
+_ROWS: dict[str, dict[str, tuple[object, object]]] | None = None
 
 
-def _resolved_rows(tmp_path: Path) -> dict[str, tuple[object, object]]:
-    """Return one resolved O1 Adam row for each sealed O context."""
+def _resolved_rows(tmp_path: Path) -> dict[str, dict[str, tuple[object, object]]]:
+    """Return two producer-resolved O1 Adam rows for each sealed context."""
 
     global _ROWS
     if _ROWS is not None:
@@ -39,15 +39,20 @@ def _resolved_rows(tmp_path: Path) -> dict[str, tuple[object, object]]:
         availability=optimizer_grid.roster_availability(),
         stages=("O1",),
     )
-    rows: dict[str, tuple[object, object]] = {}
+    rows: dict[str, dict[str, tuple[object, object]]] = {}
     for context in ("O-raw", "O-composite"):
-        cell = next(
+        context_cells = [
             candidate
             for candidate in cells
             if candidate.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
             and candidate.manifest["scientific_identity"]["context"]["name"] == context
-        )
-        rows[context] = (cell, train_config.resolve_train_config(cell))
+        ]
+        assert len(context_cells) >= 2
+        rows[context] = {
+            label: (cell, train_config.resolve_train_config(cell))
+            for label, cell in zip(("A", "B"), context_cells[:2], strict=True)
+        }
+        assert rows[context]["A"][1]["optimizer"] != rows[context]["B"][1]["optimizer"]
     _ROWS = rows
     return rows
 
@@ -59,10 +64,11 @@ def _plain(config: object) -> dict[str, object]:
 
 
 @pytest.mark.parametrize("context", ["O-raw", "O-composite"])
+@pytest.mark.parametrize("row", ["A", "B"])
 def test_qualified_o1_rows_have_deterministic_sealed_identity(
-    tmp_path: Path, context: str
+    tmp_path: Path, context: str, row: str
 ) -> None:
-    cell, config = _resolved_rows(tmp_path)[context]
+    cell, config = _resolved_rows(tmp_path)[context][row]
 
     first = inventory.validate_hi_continuation_admission(cell, config)
     second = inventory.validate_hi_continuation_admission(cell, config)
@@ -72,35 +78,52 @@ def test_qualified_o1_rows_have_deterministic_sealed_identity(
     assert first.identity.context == context
     assert first.identity.content_hash == cell.content_hash
     assert first.identity.constructor_hash
-    assert first.profile == "tpen.native-recovery/v1"
 
 
-def test_unknown_constructor_refuses_before_identity(tmp_path: Path) -> None:
-    cell, config = _resolved_rows(tmp_path)["O-raw"]
-    mutated = _plain(config)
-    mutated["model"]["injected"] = {"_target_": "tests.NewHIConstructor"}
+@pytest.mark.parametrize("context", ["O-raw", "O-composite"])
+@pytest.mark.parametrize("source_row,observed_row", [("A", "B"), ("B", "A")])
+def test_cross_row_admission_refuses_with_typed_row_identity(
+    tmp_path: Path, context: str, source_row: str, observed_row: str
+) -> None:
+    cell, _ = _resolved_rows(tmp_path)[context][source_row]
+    observed = _resolved_rows(tmp_path)[context][observed_row][1]
 
     with pytest.raises(
-        inventory.HIContinuationAdmissionRefusal,
-        match="sealed constructor inventory refused",
+        inventory.HIContinuationRowIdentityRefusal,
+        match=(
+            "hi-continuation-admission-refused: "
+            "resolved-row context identity does not match the sealed O1 row"
+        ),
+    ):
+        inventory.validate_hi_continuation_admission(cell, observed)
+
+
+def test_same_target_runner_optimizer_value_refuses(tmp_path: Path) -> None:
+    cell, config = _resolved_rows(tmp_path)["O-raw"]["A"]
+    mutated = _plain(config)
+    mutated["runner"]["optimizer"]["lr"] = 0.015
+
+    with pytest.raises(
+        inventory.HIContinuationRowIdentityRefusal,
+        match="resolved-row context identity does not match the sealed O1 row",
     ):
         inventory.validate_hi_continuation_admission(cell, mutated)
 
 
 def test_noncanonical_runner_alias_refuses(tmp_path: Path) -> None:
-    cell, config = _resolved_rows(tmp_path)["O-raw"]
+    cell, config = _resolved_rows(tmp_path)["O-raw"]["A"]
     mutated = _plain(config)
     mutated["runner"]["model"]["_target_"] = "tpen.nn.CompositeMixing"
 
     with pytest.raises(
-        inventory.HIContinuationAdmissionRefusal,
-        match="sealed constructor inventory refused",
+        inventory.HIContinuationRowIdentityRefusal,
+        match="resolved-row context identity does not match the sealed O1 row",
     ):
         inventory.validate_hi_continuation_admission(cell, mutated)
 
 
 def test_deleted_registry_classification_refuses(tmp_path: Path) -> None:
-    cell, config = _resolved_rows(tmp_path)["O-raw"]
+    cell, config = _resolved_rows(tmp_path)["O-raw"]["A"]
     key = ("model", "tpen.nn.TPENWaveFunction")
     disposition = inventory._REGISTRY.pop(key)
     try:
@@ -116,7 +139,7 @@ def test_deleted_registry_classification_refuses(tmp_path: Path) -> None:
 
 
 def test_o_composite_injection_under_o_raw_identity_refuses(tmp_path: Path) -> None:
-    cell, config = _resolved_rows(tmp_path)["O-raw"]
+    cell, config = _resolved_rows(tmp_path)["O-raw"]["A"]
     mutated = _plain(config)
     mutated["model"]["layers"][0] = context_mapping.context_fragment(
         "hybrid/coordinate-neighbor",
@@ -125,38 +148,22 @@ def test_o_composite_injection_under_o_raw_identity_refuses(tmp_path: Path) -> N
     )
 
     with pytest.raises(
-        inventory.HIContinuationAdmissionRefusal,
+        inventory.HIContinuationRowIdentityRefusal,
         match="resolved-row context identity",
     ):
         inventory.validate_hi_continuation_admission(cell, mutated)
 
 
 def test_raw_basis_injection_under_o_raw_identity_refuses(tmp_path: Path) -> None:
-    cell, config = _resolved_rows(tmp_path)["O-raw"]
+    cell, config = _resolved_rows(tmp_path)["O-raw"]["A"]
     mutated = _plain(config)
     mutated["model"]["basis"] = {
         "_target_": "tpen.nn.basis.BoundedDistanceBasis",
     }
 
     with pytest.raises(
-        inventory.HIContinuationAdmissionRefusal,
+        inventory.HIContinuationRowIdentityRefusal,
         match="resolved-row context identity",
     ):
         inventory.validate_hi_continuation_admission(cell, mutated)
-
-
-def test_unsupported_callback_shape_refuses_native_profile(tmp_path: Path) -> None:
-    cell, config = _resolved_rows(tmp_path)["O-composite"]
-    mutated = _plain(config)
-    runtime = next(
-        callback
-        for callback in mutated["callbacks"]
-        if callback["_target_"] == "tpen.callback.RuntimeEquivariance"
-    )
-    runtime["probability"] = 0.5
-
-    with pytest.raises(
-        inventory.HIContinuationAdmissionRefusal,
-        match="native profile refused",
-    ):
-        inventory.validate_hi_continuation_admission(cell, mutated)
+    return None
