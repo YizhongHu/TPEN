@@ -299,6 +299,59 @@ def test_blinding_refuses_reference_name_in_local_energy_topology() -> None:
         evaluator.evaluate_local_energy_rows("checkpoint-a", rows, expected_chain_ids=("chain-0",))
 
 
+@pytest.mark.parametrize(
+    ("channel", "checkpoint_id", "expected_chain_ids", "rows", "label"),
+    [
+        (
+            "checkpoint id",
+            "reference_energy",
+            ("chain-0",),
+            (evaluator.LocalEnergyRow("checkpoint-a", "chain-0", {"rank": 0}, 1.0),),
+            "local-energy checkpoint id",
+        ),
+        (
+            "expected chain id",
+            "checkpoint-a",
+            ("reference_energy",),
+            (evaluator.LocalEnergyRow("checkpoint-a", "chain-0", {"rank": 0}, 1.0),),
+            "local-energy expected chain id[0]",
+        ),
+        (
+            "row chain id",
+            "checkpoint-a",
+            ("chain-0",),
+            (evaluator.LocalEnergyRow("checkpoint-a", "reference_energy", {"rank": 0}, 1.0),),
+            "local-energy row[0] chain id",
+        ),
+    ],
+)
+def test_blinding_refuses_reference_name_on_each_identifier_route(
+    channel: str,
+    checkpoint_id: str,
+    expected_chain_ids: tuple[str, ...],
+    rows: tuple[object, ...],
+    label: str,
+) -> None:
+    with pytest.raises(
+        evaluator.EvaluatorQualificationError,
+        match=rf"{label} contains forbidden blinding value 'reference_energy'",
+    ) as exc:
+        evaluator.evaluate_local_energy_rows(
+            checkpoint_id, rows, expected_chain_ids=expected_chain_ids
+        )
+    assert exc.type is evaluator.EvaluatorQualificationError
+    assert label in str(exc.value)
+
+
+@pytest.mark.parametrize("identifier", ["energy", "local_energy", "some-energy-value"])
+def test_local_energy_identifier_screen_allows_non_l3a_energy_names(identifier: str) -> None:
+    row = evaluator.LocalEnergyRow("checkpoint-a", identifier, {"rank": 0}, -2.8)
+    state = evaluator.evaluate_local_energy_rows(
+        "checkpoint-a", (row,), expected_chain_ids=(identifier,)
+    )
+    assert state.status is evaluator.InferenceStatus.READY
+
+
 def test_nonfinite_row_is_visible_with_its_chain_and_topology_witness() -> None:
     rows = _rows(1.0, float("nan"))
     state = evaluator.evaluate_local_energy_rows(

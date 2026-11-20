@@ -122,17 +122,23 @@ def evaluate_local_energy_rows(
     Raises
     ------
     EvaluatorQualificationError
-        If ``expected_chain_ids`` contains duplicated IDs, if a row has
-        mismatched checkpoint provenance, or if topology provenance is
-        blinding-bearing or empty.
+        If the checkpoint, expected chain IDs, row chain IDs, or topology
+        provenance contains blinding-bearing content; if
+        ``expected_chain_ids`` contains duplicated IDs; if a row has
+        mismatched checkpoint provenance; or if topology provenance is empty.
     IncompleteRankArtifactError
         If the rows contain missing, extra, or duplicated actual chain IDs.
     """
 
     if not rows:
         raise EvaluatorQualificationError("local-energy evaluation requires at least one row")
-    actual = tuple(row.chain_id for row in rows)
+    _refuse_blinding_content(checkpoint_id, "local-energy checkpoint id")
     required = tuple(expected_chain_ids)
+    for index, chain_id in enumerate(required):
+        _refuse_blinding_content(chain_id, f"local-energy expected chain id[{index}]")
+    actual = tuple(row.chain_id for row in rows)
+    for index, chain_id in enumerate(actual):
+        _refuse_blinding_content(chain_id, f"local-energy row[{index}] chain id")
     duplicate_expected = tuple(
         dict.fromkeys(chain_id for chain_id in required if required.count(chain_id) > 1)
     )
