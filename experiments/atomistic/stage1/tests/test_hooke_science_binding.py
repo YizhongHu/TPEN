@@ -100,7 +100,7 @@ def test_hooke_phase1_rows_bind_distinct_sampler_seeds_and_gateway() -> None:
         )
     tampered = dict(train)
     tampered["sampler_seed"] = tampered["seed"]
-        with pytest.raises(ProtocolError, match="sampler seed does not match"):
+    with pytest.raises(ProtocolError, match="sampler seed does not match"):
         validate_gateway_binding(
             binding=_binding_token(tampered), config=str(tampered["config"]),
             overrides=row_overrides(tampered), kind="train",
