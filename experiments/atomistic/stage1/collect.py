@@ -17,6 +17,7 @@ from experiments.atomistic.stage1.protocol import (
     CONFIG_IDENTITY_RULE,
     LEGACY_CONFIG_IDENTITY_RULE,
     _validate_config_identity_for_row,
+    HOOKE_SCIENCE_PROFILE,
     manifest_hash,
     ProtocolError,
     resolve_config_path,
@@ -106,8 +107,24 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
         raise CollectionError("manifest contains a malformed eval row")
     eval_rows = [row for row in rows if row.get("kind") == "eval"]
     phase1_rows = [row for row in rows if row.get("kind") != "eval"]
+    phase1_hooke_rows = [
+        row for row in phase1_rows if row.get("system") in {"hooke1", "hooke2"}
+    ]
+    phase1_profiles = {row.get("science_profile") for row in phase1_hooke_rows}
+    hooke_science = HOOKE_SCIENCE_PROFILE in phase1_profiles
+    if hooke_science and phase1_profiles != {HOOKE_SCIENCE_PROFILE}:
+        raise CollectionError("Hooke phase-1 rows mix science and legacy profiles")
+    # Science collection derives its required systems from the frozen phase-1
+    # rows.  The explicit no-profile path preserves genuinely legacy manifests.
+    expected_systems = tuple(dict.fromkeys(
+        str(row["system"]) for row in phase1_hooke_rows
+    )) if hooke_science else None
     try:
-        validate_hooke_eval_grid(eval_rows)
+        validate_hooke_eval_grid(
+            eval_rows,
+            expected_systems=expected_systems,
+            expected_profile=HOOKE_SCIENCE_PROFILE if hooke_science else None,
+        )
     except ProtocolError as exc:
         raise CollectionError(f"Hooke evaluation grid is incomplete: {exc}") from exc
     phase1_hashes = {row.get("phase1_manifest_hash") for row in eval_rows

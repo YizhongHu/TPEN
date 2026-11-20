@@ -463,7 +463,12 @@ def _validate_hooke_science_train_row(row: Mapping[str, Any]) -> None:
         raise ProtocolError("Hooke initialization and sampler seeds must be distinct")
 
 
-def validate_hooke_eval_grid(rows: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...]) -> None:
+def validate_hooke_eval_grid(
+    rows: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+    *,
+    expected_systems: tuple[str, ...] | list[str] | None = None,
+    expected_profile: str | None = None,
+) -> None:
     """Require the exact Hooke A37 x lineage x stream evaluation multiset.
 
     The check is intentionally a multiset comparison.  Row counts and
@@ -473,16 +478,22 @@ def validate_hooke_eval_grid(rows: list[Mapping[str, Any]] | tuple[Mapping[str, 
     """
 
     hooke_rows = [row for row in rows if row.get("system") in {"hooke1", "hooke2"}]
-    if not hooke_rows:
+    declared_systems = tuple(expected_systems) if expected_systems is not None else ()
+    if any(system not in {"hooke1", "hooke2"} for system in declared_systems):
+        raise ProtocolError("Hooke evaluation grid has an invalid expected system")
+    if len(set(declared_systems)) != len(declared_systems):
+        raise ProtocolError("Hooke evaluation grid has duplicate expected systems")
+    if not hooke_rows and not declared_systems:
         return
     # Historical and bounded tiny manifests remain readable under their
     # declared legacy mode.  Exact A37 admission is opt-in to the production
     # Hooke science profile.
-    if not any(_is_hooke_science_row(row) for row in hooke_rows):
+    if expected_profile is None and not any(_is_hooke_science_row(row) for row in hooke_rows):
         return
-    if any(not _is_hooke_science_row(row) for row in hooke_rows):
+    profile = expected_profile or HOOKE_SCIENCE_PROFILE
+    if any(row.get("science_profile") != profile for row in hooke_rows):
         raise ProtocolError("Hooke evaluation rows must declare hooke-hv2-v1")
-    systems = tuple(dict.fromkeys(str(row["system"]) for row in hooke_rows))
+    systems = declared_systems or tuple(dict.fromkeys(str(row["system"]) for row in hooke_rows))
     expected = [
         (system, lineage, checkpoint, stream)
         for system in systems
@@ -1093,7 +1104,11 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         for row in rows:
             row["device"] = device
     if science_profile == HOOKE_SCIENCE_PROFILE and phase == 2:
-        validate_hooke_eval_grid([row for row in rows if row["kind"] == "eval"])
+        validate_hooke_eval_grid(
+            [row for row in rows if row["kind"] == "eval"],
+            expected_systems=tuple(systems),
+            expected_profile=HOOKE_SCIENCE_PROFILE,
+        )
     return rows
 
 
@@ -1244,7 +1259,11 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         _require_sha(physical_ids.get(system), length=64,
                      field=f"expected_physical_system_id[{system!r}]")
     combined_row_ids = {row.get("row_id") for row in phase1_rows}
-    combined_seeds = {row.get("seed") for row in phase1_rows}
+    combined_seeds = {
+        seed
+        for row in phase1_rows
+        for seed in (row.get("seed"), row.get("sampler_seed"))
+    }
     for train_row in train_rows:
         system = str(train_row["system"])
         lineage = int(train_row["lineage"])
@@ -1292,7 +1311,11 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         _validate_run_identity(row)
         _checkpoint_binding(row)
     if hooke_science:
-        validate_hooke_eval_grid(rows)
+        validate_hooke_eval_grid(
+            rows,
+            expected_systems=tuple(systems),
+            expected_profile=HOOKE_SCIENCE_PROFILE,
+        )
     return rows
 
 
