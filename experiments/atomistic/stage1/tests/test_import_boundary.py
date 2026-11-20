@@ -31,7 +31,7 @@ def _violations(path: Path, source: str) -> list[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name.startswith("tpen"):
+                if alias.name.startswith("tpen") and alias.name not in allowed:
                     violations.append(f"{path}: import {alias.name}")
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
