@@ -203,15 +203,20 @@ class OptimizerCell:
 def _is_optimizer_cell(value: Any) -> bool:
     """Recognize an optimizer cell across intentionally isolated module loads."""
 
+    missing = object()
+    method = getattr(value, "method", missing)
+    status = getattr(value, "status", missing)
+    reason = getattr(value, "reason", missing)
     return (
         type(value).__name__ == "OptimizerCell"
-        and type(getattr(value, "method", None)) is str
-        and bool(value.method)
-        and type(getattr(value, "status", None)) is str
-        and value.status in {"available", "unavailable"}
-        and (getattr(value, "reason", None) is None or type(value.reason) is str)
-        and (value.status == "available" or bool(value.reason))
-        and (value.status == "unavailable" or value.reason is None)
+        and type(method) is str
+        and bool(method)
+        and type(status) is str
+        and status in {"available", "unavailable"}
+        and reason is not missing
+        and (reason is None or type(reason) is str)
+        and (status == "available" or bool(reason))
+        and (status == "unavailable" or reason is None)
     )
 
 
@@ -884,6 +889,13 @@ def intended_configurations() -> tuple[Mapping[str, Any], ...]:
     ``optimizer`` exactly, so a hand-edited file cannot drift the two apart;
     the generator always writes both from the same source, but this loader
     also accepts a file that was never regenerated.
+
+    Raises
+    ------
+    MaterializationError
+        If the committed inventory is not a list, has malformed entry or
+        optimizer schemas, contains malformed configurations, or has a
+        configuration whose optimizer identity disagrees with its entry.
     """
 
     raw = json.loads(_INTENDED_CONFIGURATIONS_PATH.read_text(encoding="utf-8"))
@@ -894,17 +906,28 @@ def intended_configurations() -> tuple[Mapping[str, Any], ...]:
             raise MaterializationError(
                 f"intended configuration entry[{entry_index}] must be a mapping"
             )
-        if frozenset(entry) != frozenset({"stage", "optimizer", "configurations"}):
+        expected_entry_keys = frozenset({"stage", "optimizer", "configurations"})
+        if frozenset(entry) != expected_entry_keys:
+            missing = sorted(expected_entry_keys - frozenset(entry))
+            unexpected = sorted(frozenset(entry) - expected_entry_keys)
             raise MaterializationError(
-                f"intended configuration entry[{entry_index}] has an invalid schema"
+                f"intended configuration entry[{entry_index}] has invalid keys: "
+                f"missing={missing!r}, unexpected={unexpected!r}"
             )
         if not isinstance(entry["stage"], str) or not entry["stage"]:
             raise MaterializationError(
                 f"intended configuration entry[{entry_index}].stage must be a non-empty string"
             )
         optimizer_data = entry["optimizer"]
-        if not isinstance(optimizer_data, Mapping) or frozenset(optimizer_data) != frozenset({"method", "levels"}):
-            raise MaterializationError("intended optimizer must declare exactly method and levels")
+        expected_optimizer_keys = frozenset({"method", "levels"})
+        if not isinstance(optimizer_data, Mapping) or frozenset(optimizer_data) != expected_optimizer_keys:
+            actual_keys = frozenset(optimizer_data) if isinstance(optimizer_data, Mapping) else frozenset()
+            missing = sorted(expected_optimizer_keys - actual_keys)
+            unexpected = sorted(actual_keys - expected_optimizer_keys)
+            raise MaterializationError(
+                "intended optimizer has invalid keys: "
+                f"missing={missing!r}, unexpected={unexpected!r}"
+            )
         if not isinstance(optimizer_data["method"], str) or not optimizer_data["method"]:
             raise MaterializationError("intended optimizer method must be a non-empty string")
         if not isinstance(optimizer_data["levels"], Mapping):
@@ -962,9 +985,12 @@ def materialize_intended_configurations(
     Raises
     ------
     MaterializationError
-        If the stage selection is empty or a string, a requested stage has
-        no committed inventory entry, or a method is absent from
-        ``availability``.
+        If the inventory, availability mapping, or stage selection is
+        malformed, or a method is absent from ``availability``.
+    ManifestSchemaError
+        If a requested stage code is not part of the stage authority. This is
+        a semantic stage-selection error, distinct from malformed inventory
+        and availability input.
     """
 
     if not isinstance(availability, Mapping):
