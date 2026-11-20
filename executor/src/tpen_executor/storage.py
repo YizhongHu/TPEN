@@ -674,7 +674,6 @@ class DirectoryStore:
                     if not isinstance(binding, MemberInvocationV2):
                         raise TypeError("leaf echo must be MemberInvocationV2")
                     if (binding.allocation_attempt.group_id != group.group_id
-                            or binding.allocation_attempt.allocation_attempt_id == allocation_attempt.allocation_attempt_id
                             or binding.lineage_id != task.lineage_id
                             or binding.group_digest != group.identity):
                         raise FenceRejected("crossed-allocation-evidence")

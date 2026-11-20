@@ -80,9 +80,11 @@ while a missing, crossed, symlinked, or differing record is refused.
 `AllocationAttemptV2`, but each existing member is validated against the
 allocation attempt recorded in that member's durable `invocation.json`. This
 allows recovered groups to combine evidence from several prior allocation
-generations. Evidence from another group, from the new controller lease, or
-whose durable invocation was tampered with parks the publication. Existing
-single-generation `ReconciliationPublicationV2` bytes remain unchanged.
+generations. Evidence from another group, with mismatched allocation facts, or
+whose durable invocation was tampered with parks the publication. The current
+controller lease is valid when it is also the member's recorded lease; prior
+and mixed leases are valid when each matches its own durable invocation.
+Existing single-generation `ReconciliationPublicationV2` bytes remain unchanged.
 
 ## GPU placement qualification
 
