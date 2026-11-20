@@ -28,7 +28,7 @@ HOOKE_OVERLAY = ROOT / "configs" / "overlays" / "hooke-diagnostics-v1.yaml"
 
 
 def _two_hooke_document(tmp_path: Path) -> dict[str, object]:
-    protocol = replace(STAGE1_PROTOCOL, eval_walkers=2, eval_draws=2)
+    protocol = STAGE1_PROTOCOL
     systems = ("hooke1", "hooke2")
     config_sha256 = config_identities(config_root=ROOT / "configs", systems=systems)
     physical_ids = {"hooke1": "a" * 64, "hooke2": "b" * 64}
@@ -89,10 +89,10 @@ def _install_collection_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
         "inspect_trajectory_record",
         lambda path, **kwargs: SimpleNamespace(
             record_schema="trajectory_records/v2",
-            draw_count=2,
-            walker_count=2,
-            row_count=4,
-            finite_count=4,
+            draw_count=256,
+            walker_count=4096,
+            row_count=256 * 4096,
+            finite_count=256 * 4096,
             mean=2.5,
             variance=1.25,
             csv_sha256="e" * 64,

@@ -217,37 +217,96 @@ def _validate_overlay_payload(payload: Mapping[str, Any], *, relative: str) -> N
     callbacks = payload["callbacks"]
     if not isinstance(callbacks, list):
         raise ProtocolError("overlay callbacks must be a list")
-    targets = [entry.get("_target_") for entry in callbacks if isinstance(entry, Mapping)]
-    expected = [
-        "tpen.callback.DataIntegrity",
-        "tpen.callback.GradientStats",
-        "tpen.callback.SamplerHealth",
-        "tpen.callback.FactorScalars",
-        "tpen.callback.ModuleNorms",
-        "tpen.callback.OptimizerState",
-        "tpen.callback.RawTrainingBatchRecorder",
-        "tpen.callback.ParameterActivity",
-        "tpen.callback.RunTiming",
-        "tpen.callback.TrainStepTiming",
-    ]
-    if relative == HOOKE_OVERLAY_RELATIVE_PATH:
-        expected.insert(4, "tpen.callback.AmplitudeRiskFraction")
-    if targets != expected:
+    expected_callbacks = _expected_overlay_callbacks(relative)
+    if callbacks != expected_callbacks:
         raise ProtocolError("diagnostics overlay callback set drifted")
-    if relative == HOOKE_OVERLAY_RELATIVE_PATH:
-        amplitude = callbacks[4]
-        if (
-            list(amplitude.get("thresholds", ())) != [-3, -4, -5, -7, -10]
-            or amplitude.get("every_n_steps") != 100
-            or amplitude.get("start_step") != 0
-        ):
-            raise ProtocolError("Hooke amplitude-risk diagnostic profile drifted")
-    elif any(target == "tpen.callback.AmplitudeRiskFraction" for target in targets):
-        raise ProtocolError("AmplitudeRiskFraction is not admitted for He/H2 overlay")
     if not isinstance(payload["loggers"], list) or payload["loggers"] != [
         {"_target_": "tpen.logging.JSONL", "path": "${run.dir}/metrics.jsonl"}
     ]:
         raise ProtocolError("diagnostics overlay logger profile drifted")
+
+
+def _expected_overlay_callbacks(relative: str) -> list[dict[str, Any]]:
+    """Return the complete callback contract for one canonical overlay."""
+
+    callbacks: list[dict[str, Any]] = [
+        {
+            "_target_": "tpen.callback.DataIntegrity",
+            "every_n_steps": 1,
+            "fail_fast": True,
+            "max_nonfinite_energy_fraction": 0.0,
+            "max_nonfinite_logabs_fraction": 0.0,
+            "check_loss": True,
+            "check_wavefunction_output": True,
+            "check_batch": True,
+            "strict_sign_values": True,
+        },
+        {
+            "_target_": "tpen.callback.GradientStats",
+            "every_n_steps": 1,
+            "fail_fast": True,
+            "check_finite": True,
+        },
+        {
+            "_target_": "tpen.callback.SamplerHealth",
+            "every_n_steps": 1,
+            "fail_fast": False,
+        },
+        {
+            "_target_": "tpen.callback.FactorScalars",
+            "every_n_steps": 1,
+            "fail_fast": False,
+        },
+    ]
+    if relative == HOOKE_OVERLAY_RELATIVE_PATH:
+        callbacks.append({
+            "_target_": "tpen.callback.AmplitudeRiskFraction",
+            "thresholds": [-3, -4, -5, -7, -10],
+            "every_n_steps": 100,
+            "start_step": 0,
+        })
+    callbacks.extend([
+        {
+            "_target_": "tpen.callback.ModuleNorms",
+            "every_n_steps": 1,
+            "groups": {
+                "embedding": ["embedding"],
+                "readout": ["readout"],
+                "factors": ["factors"],
+                "layer_0_mixing": ["stack.layers.0.mixing"],
+                "layer_0_path_aggregation": ["stack.layers.0.path_aggregation"],
+            },
+        },
+        {
+            "_target_": "tpen.callback.OptimizerState",
+            "every_n_steps": 1,
+            "groups": {
+                "embedding": ["embedding"],
+                "readout": ["readout"],
+                "factors": ["factors"],
+                "layer_0_mixing": ["stack.layers.0.mixing"],
+                "layer_0_path_aggregation": ["stack.layers.0.path_aggregation"],
+            },
+        },
+        {
+            "_target_": "tpen.callback.RawTrainingBatchRecorder",
+            "path": "${run.dir}/training_history",
+            "every_n_steps": 50,
+            "partition_size_steps": 1000,
+        },
+        {
+            "_target_": "tpen.callback.ParameterActivity",
+            "output_path": "${run.dir}/parameter_activity.json",
+        },
+        {"_target_": "tpen.callback.RunTiming"},
+        {
+            "_target_": "tpen.callback.TrainStepTiming",
+            "every_n_steps": 1,
+            "rolling_window": 20,
+            "accelerator_synchronize": False,
+        },
+    ])
+    return callbacks
 
 
 def _iter_mapping_leaves(value: Mapping[str, Any], prefix: str) -> Iterator[tuple[str, Any]]:
@@ -532,6 +591,12 @@ def _validate_hooke_science_train_row(row: Mapping[str, Any]) -> None:
         raise ProtocolError("Hooke science profile is only valid for Hooke systems")
     if row.get("kind") != "train":
         raise ProtocolError("Hooke science profile is only valid for train rows")
+    if row.get("updates") != STAGE1_PROTOCOL.lineage_updates:
+        raise ProtocolError("Hooke science profile requires the exact production update horizon")
+    if row.get("walkers") != STAGE1_PROTOCOL.lineage_walkers:
+        raise ProtocolError("Hooke science profile requires the exact production walker count")
+    if list(row.get("checkpoint_steps", ())) != list(range(0, 100001, 1000)):
+        raise ProtocolError("Hooke science profile requires 101 production checkpoints")
     if row.get("training_seed_rule") != HOOKE_TRAINING_SEED_RULE:
         raise ProtocolError("unknown Hooke training seed rule")
     if row.get("evaluation_selection") != HOOKE_EVAL_SELECTION:
@@ -862,12 +927,19 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
     if select("stage1_overlay.composition_order") != OVERLAY_COMPOSITION_ORDER:
         raise ProtocolError("resolved train config composition order is not canonical")
 
+    unresolved = OmegaConf.to_container(cfg, resolve=False)
+    if not isinstance(unresolved, Mapping):
+        raise ProtocolError("unresolved train config is not a mapping")
+    expected_callbacks = _expected_overlay_callbacks(relative)
+    callbacks = unresolved.get("callbacks")
+    if (
+        not isinstance(callbacks, list)
+        or len(callbacks) < len(expected_callbacks)
+        or callbacks[-len(expected_callbacks):] != expected_callbacks
+    ):
+        raise ProtocolError("resolved diagnostics callback profile drifted")
+
     if row.get("science_profile") != HOOKE_SCIENCE_PROFILE:
-        return
-    # A bounded train-kind qualification row may use this public gateway with
-    # a short horizon/walker count.  Its overlay provenance is still checked,
-    # but it is not admitted as the production science profile below.
-    if row.get("updates") != STAGE1_PROTOCOL.lineage_updates:
         return
     expected_device = row.get("device", "cuda")
     expected_values = {
@@ -910,9 +982,34 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
     if base_config is not None:
         base = OmegaConf.to_container(base_config, resolve=True)
         if isinstance(base, Mapping):
-            for section in ("system", "atoms", "system_descriptor", "model", "hamiltonian_terms", "runner"):
+            for section in ("system", "atoms", "system_descriptor", "model", "hamiltonian_terms"):
                 if resolved.get(section) != base.get(section):
                     raise ProtocolError(f"overlay changed base-owned section {section}")
+            base_runner = base.get("runner")
+            resolved_runner = resolved.get("runner")
+            if not isinstance(base_runner, Mapping) or not isinstance(resolved_runner, Mapping):
+                raise ProtocolError("resolved train config is missing runner wiring")
+
+            def runner_wiring(runner: Mapping[str, Any]) -> dict[str, Any]:
+                """Ignore only bound sampler/trainer leaves, not runner wiring."""
+
+                normalized = copy.deepcopy(dict(runner))
+                sampler = normalized.get("sampler")
+                if isinstance(sampler, Mapping):
+                    sampler = dict(sampler)
+                    for key in ("n_walkers", "burn_in", "n_steps", "proposal_scale", "seed"):
+                        sampler.pop(key, None)
+                    normalized["sampler"] = sampler
+                trainer = normalized.get("trainer")
+                if isinstance(trainer, Mapping):
+                    trainer = dict(trainer)
+                    for key in ("max_steps", "log_every_n_steps", "return_terms"):
+                        trainer.pop(key, None)
+                    normalized["trainer"] = trainer
+                return normalized
+
+            if runner_wiring(resolved_runner) != runner_wiring(base_runner):
+                raise ProtocolError("overlay changed base-owned section runner")
 
 
 def physical_system_id_from_config(
@@ -1104,6 +1201,18 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
     if science_profile == HOOKE_SCIENCE_PROFILE:
         if not set(selected).issubset({"hooke1", "hooke2"}):
             raise ProtocolError("Hooke science profile cannot mix in He/H2 systems")
+        if (
+            protocol.lineage_updates != STAGE1_PROTOCOL.lineage_updates
+            or protocol.lineage_walkers != STAGE1_PROTOCOL.lineage_walkers
+            or protocol.lineages != STAGE1_PROTOCOL.lineages
+            or protocol.eval_streams != STAGE1_PROTOCOL.eval_streams
+            or protocol.eval_walkers != STAGE1_PROTOCOL.eval_walkers
+            or protocol.eval_draws != STAGE1_PROTOCOL.eval_draws
+            or protocol.retention_cadence != STAGE1_PROTOCOL.retention_cadence
+        ):
+            raise ProtocolError(
+                "Hooke science profile requires the exact production protocol dimensions"
+            )
         if evaluation_selection not in {None, HOOKE_EVAL_SELECTION}:
             raise ProtocolError("unknown Hooke evaluation selection")
         evaluation_selection = HOOKE_EVAL_SELECTION

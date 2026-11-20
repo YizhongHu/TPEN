@@ -57,6 +57,29 @@ def _hooke_train_row(system: str, *, protocol: Protocol,
     )
 
 
+def _bounded_hooke_train_row(system: str) -> dict[str, object]:
+    """Build a bounded qualification row with no science-profile identity."""
+
+    protocol = Protocol(1, 2, 1, 2, 3, 4, 2, 2, 1)
+    return next(
+        row for row in build_manifest(
+            protocol=protocol,
+            source_sha="a" * 40,
+            config_sha256=config_identities(config_root=ROOT / "configs", systems=(system,)),
+            checkpoints=[0, 1],
+            lineage_seeds=[11, 12, 13],
+            checkpoint_sha256={},
+            results_root="/external/stage1-review-probes",
+            systems=(system,),
+            phase=1,
+            overlay=str(OVERLAY),
+            overlay_sha256=overlay_sha256(OVERLAY),
+            device="cuda",
+        )
+        if row["kind"] == "train"
+    )
+
+
 def _invoke_train(monkeypatch: pytest.MonkeyPatch, row: dict[str, object],
                   *, extra_overrides: list[str] | None = None,
                   run_stub: object) -> object:
@@ -102,10 +125,8 @@ def test_public_production_hooke_rows_reach_execution_stub(
     assert "cfg" in captured
 
 
-def test_production_hooke_profile_refuses_shortened_protocol_before_execution(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The science profile cannot be retained while budgets are shortened."""
+def test_planner_refuses_shortened_hooke_science_profile() -> None:
+    """The planner cannot issue a science row for reduced dimensions."""
 
     short_protocol = replace(
         STAGE1_PROTOCOL,
@@ -113,7 +134,38 @@ def test_production_hooke_profile_refuses_shortened_protocol_before_execution(
         lineage_walkers=2,
         retention_cadence=1,
     )
-    row = _hooke_train_row("hooke1", protocol=short_protocol, checkpoints=[0, 1])
+    with pytest.raises(ProtocolError, match="exact production protocol dimensions"):
+        _hooke_train_row("hooke1", protocol=short_protocol, checkpoints=[0, 1])
+
+
+def test_bounded_no_profile_row_reaches_execution_stub(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reduced qualification row is green when it carries no science profile."""
+
+    row = _bounded_hooke_train_row("hooke1")
+    captured: dict[str, object] = {}
+
+    def capture(cfg: object, **kwargs: object) -> int:
+        captured["cfg"] = cfg
+        return 0
+
+    assert _invoke_train(monkeypatch, row, run_stub=capture) == 0
+    assert "cfg" in captured
+
+
+def test_production_hooke_profile_refuses_shortened_forged_row_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gateway rejects a forged shortened science row before model overrides."""
+
+    row = _hooke_train_row(
+        "hooke1", protocol=STAGE1_PROTOCOL,
+        checkpoints=list(range(0, STAGE1_PROTOCOL.lineage_updates + 1, 1000)),
+    )
+    row["updates"] = 1
+    row["walkers"] = 2
+    row["checkpoint_steps"] = [0, 1]
 
     def reached_execution(*_args: object, **_kwargs: object) -> int:
         pytest.fail("shortened science-profile row reached execution")

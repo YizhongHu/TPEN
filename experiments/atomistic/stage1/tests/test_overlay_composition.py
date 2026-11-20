@@ -560,6 +560,52 @@ def test_overlay_hash_is_exact_file_bytes() -> None:
     assert overlay_sha256(OVERLAY) == hashlib.sha256(OVERLAY.read_bytes()).hexdigest()
 
 
+@pytest.mark.parametrize(
+    ("needle", "replacement"),
+    [("fail_fast: true", "fail_fast: false"), ("every_n_steps: 1", "every_n_steps: 1000")],
+)
+def test_recomputed_health_callback_drift_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, needle: str, replacement: str,
+) -> None:
+    """A fresh digest cannot authorize a weakened callback health contract."""
+
+    relative = f"configs/overlays/.s0c-health-{tmp_path.name}.yaml"
+    variant_path = ROOT / relative
+    variant_path.write_bytes(OVERLAY.read_bytes().replace(
+        needle.encode(), replacement.encode(), 1,
+    ))
+    monkeypatch.setitem(protocol_module.OVERLAY_PATH_BY_SYSTEM, "he", relative)
+    try:
+        with pytest.raises(ProtocolError, match="callback set drifted"):
+            build_manifest(
+                protocol=_protocol(),
+                source_sha="a" * 40,
+                config_sha256=config_identities(config_root=CONFIG_ROOT, systems=("he",)),
+                checkpoints=[0, 1],
+                lineage_seeds=[11, 12, 13],
+                checkpoint_sha256={},
+                results_root="/external/stage1-health-drift",
+                systems=("he",),
+                phase=1,
+                device="cpu",
+                overlay=relative,
+                overlay_sha256=overlay_sha256(relative),
+            )
+    finally:
+        variant_path.unlink(missing_ok=True)
+
+
+def test_final_guard_rejects_post_composition_health_drift() -> None:
+    """The final resolved-config guard independently checks callback settings."""
+
+    row = _overlay_row()
+    cfg = load_config(str(CONFIG_ROOT / "he" / "train.yaml"))
+    compose_train_overlay(cfg, overlay=str(OVERLAY), expected_sha256=overlay_sha256(OVERLAY))
+    cfg.callbacks[-len(protocol_module._expected_overlay_callbacks(protocol_module.OVERLAY_RELATIVE_PATH))]["fail_fast"] = False
+    with pytest.raises(ProtocolError, match="resolved diagnostics callback profile drifted"):
+        protocol_module.validate_resolved_train_config(cfg, row, base_config=cfg)
+
+
 def test_overlay_identity_has_separate_base_and_overlay_sides(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

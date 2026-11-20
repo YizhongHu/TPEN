@@ -248,7 +248,7 @@ def test_hooke_grid_rejects_count_preserving_replacement(
         for lineage in range(3)
         for checkpoint in HOOKE_A37
     }
-    with pytest.raises(ProtocolError, match="A37 grid mismatch"):
+    with pytest.raises(ProtocolError, match="exact production protocol dimensions"):
         build_manifest(
             # A37 is a phase-2 selection, not the phase-1 retention cadence.
             protocol=replace(STAGE1_PROTOCOL, retention_cadence=None),
@@ -271,7 +271,7 @@ def test_hooke_grid_rejects_count_preserving_replacement(
 def _two_hooke_phase2_document(tmp_path: Path) -> tuple[dict[str, object], object]:
     """Build a complete, planner-shaped two-Hooke A37 document for collection tests."""
 
-    protocol = replace(STAGE1_PROTOCOL, eval_walkers=2, eval_draws=2)
+    protocol = STAGE1_PROTOCOL
     systems = ("hooke1", "hooke2")
     config_sha256 = config_identities(config_root=ROOT / "configs", systems=systems)
     physical_ids = {"hooke1": "a" * 64, "hooke2": "b" * 64}
@@ -336,10 +336,10 @@ def _install_two_hooke_collection_fakes(monkeypatch: pytest.MonkeyPatch) -> None
         physical_id = "b" * 64 if "hooke2" in str(path) else "a" * 64
         return type("Record", (), {
             "record_schema": "trajectory_records/v2",
-            "draw_count": 2,
-            "walker_count": 2,
-            "row_count": 4,
-            "finite_count": 4,
+            "draw_count": 256,
+            "walker_count": 4096,
+            "row_count": 256 * 4096,
+            "finite_count": 256 * 4096,
             "mean": 2.5,
             "variance": 1.25,
             "csv_sha256": "e" * 64,
