@@ -8,12 +8,13 @@ import importlib
 import pytest
 
 import tpen_executor.lifecycle.controller as controller_module
+from tpen_executor.lifecycle.controller import MemberLaunchResult
 from tpen_executor._codec import digest
 from tpen_executor.allocations import AllocationAttemptV2, ConfiguredAllocation, ControllerGenerationV1, MemberInvocationV2
 from tpen_executor.contracts import AllocationAttemptId, AllocationId, AttemptId, BackendJobId, InvocationId
 from tpen_executor.lifecycle.balsam import BalsamGroupRegistrationIntent, BalsamGroupRegistrationReceipt, GroupFailure
 from tpen_executor.recovery import GroupReconciliationV2, MemberReconciliationV2, MemberRecoveryInputV2
-from tpen_executor.storage import DirectoryStore, LaunchIntentRejected
+from tpen_executor.storage import DirectoryStore, LaunchIntentAbsent, LaunchIntentRejected
 from tpen_executor.results import SuccessorAdmissionRecord
 from test_b1a_reconciliation import _group
 from test_b1a_b_publication import _fixture
@@ -23,11 +24,13 @@ MODULE_NAME = "executor/src/tpen_executor/lifecycle/controller.py"
 MUTANTS = (
     ("drop-job-id-check", MODULE_NAME, "if observed_job_id != bound_job_id or allocation.backend_job_id != observed_job_id:", "if False:", "test_job_id_mismatch_is_pre_start"),
     ("drop-acquire-refusal-park", MODULE_NAME, "controller = store.acquire_controller_generation(group, controller_request)", "controller = controller_request", "test_stale_controller_parks_before_publish"),
-    ("drop-pre-launch-authority-check", MODULE_NAME, "store.require_current_controller(group, controller.generation, controller.claimant_nonce)", "pass", "test_superseded_after_intent_does_not_launch"),
-    ("begin-attempt-for-successor", MODULE_NAME, "store.begin_admitted_successor(", "store.begin_attempt(", "test_real_store_admitted_successor_uses_durable_admission_once"),
+    ("drop-pre-launch-authority-check", MODULE_NAME, "store.require_current_controller(group, controller.generation, controller.claimant_nonce)", "pass", "test_t2_supersession_after_publication_preserves_newer_start"),
+    ("begin-attempt-for-successor", MODULE_NAME, "store.begin_admitted_successor_current_controller(", "store.begin_attempt_current_controller(", "test_real_store_admitted_successor_uses_durable_admission_once"),
     ("intent-probe-inverted", MODULE_NAME, "existing = store.read_launch_intent(fence)", "existing = None", "test_real_store_fresh_start_writes_intent_and_launches_once"),
     ("park-is-not-success", MODULE_NAME, "else 2)", "else 0)", "test_terminal_and_park_exit_two"),
     ("publish-equality-off", MODULE_NAME, "if published.encode() != checked.encode():", "if False:", "test_publication_conflict_parks"),
+    ("critical-section-off", "executor/src/tpen_executor/storage.py", "self._current_controller_locked(directory, group.group_id, controller_record)\n            return self.begin_attempt", "self._current_controller_locked(directory, group.group_id, controller_record)\n            raise ControllerGenerationRejected(\"start authority lost\")", "test_t2_supersession_after_publication_preserves_newer_start"),
+    ("outcome-receipt-off", MODULE_NAME, "store.record_controller_outcome(fence, controller, invocation, \"launched\", launched.detail)", "pass", "test_t2_typed_ack_launches_with_durable_intent"),
 )
 # Relaunch prevention is deliberately double-fenced: this controller probe
 # parks an existing intent, while DirectoryStore.create_launch_intent also
@@ -47,7 +50,7 @@ class FakeExecutor:
     def launch(self, fence, invocation):
         self.calls.append(fence.task_id)
         if self.error: raise self.error
-        return True
+        return MemberLaunchResult(True)
 
 
 class FakeStore:
@@ -78,14 +81,24 @@ class FakeStore:
     def begin_attempt(self, group, task_id, allocation, *args, **kwargs):
         self.calls.append("begin_attempt:" + task_id)
         return SimpleNamespace(task_id=task_id, attempt_id=AttemptId("attempt-" + task_id), output_dir=str(self.real.root))
+    def begin_attempt_current_controller(self, group, task_id, allocation, *args, **kwargs):
+        return self.begin_attempt(group, task_id, allocation, *args, **kwargs)
     def begin_admitted_successor(self, group, task_id, allocation, *args, **kwargs):
         self.calls.append("begin_admitted_successor:" + task_id)
         return SimpleNamespace(task_id=task_id, attempt_id=AttemptId("successor-" + task_id), output_dir=str(self.real.root))
+    def begin_admitted_successor_current_controller(self, group, task_id, allocation, *args, **kwargs):
+        return self.begin_admitted_successor(group, task_id, allocation, *args, **kwargs)
+    def read_reconciliation(self, group, allocation_attempt):
+        self.calls.append("read_reconciliation")
+        binding = MemberInvocationV2(allocation_attempt, group.identity, "task-0", group.members[0].lineage_id, AttemptId("successor-task-0"), InvocationId("successor-invocation-0"))
+        admission = SuccessorAdmissionRecord("task-0", AttemptId("predecessor-task-0"), "c" * 64, "task-0", binding.attempt_id, "d" * 64, "e" * 64, binding)
+        return SimpleNamespace(members=(SimpleNamespace(evidence=SimpleNamespace(task_id="task-0"), admission=admission),))
     def read_launch_intent(self, fence):
         self.calls.append("read_intent:" + fence.task_id)
         if self.recovered: return object()
-        raise LaunchIntentRejected("none")
+        raise LaunchIntentAbsent("none")
     def create_launch_intent(self, fence, controller, invocation): self.calls.append("intent:" + fence.task_id); return object()
+    def record_controller_outcome(self, fence, controller, invocation, status, reason=""): self.calls.append("outcome:" + fence.task_id); return object()
 
 
 def _setup(tmp_path, actions=("start_fresh",), **kwargs):
@@ -231,6 +244,11 @@ def test_static_audit_and_mutant_anchors():
     assert "from .balsam import" not in source.split("def _pre_start", 1)[0]
     assert all(token not in source for token in ("scheduler", "retry", "scancel"))
     names = {name for name, value in globals().items() if name.startswith("test_") and callable(value)}
+    import test_review_b1b2_t2_r1 as reviewer_tests
+    names.update(name for name, value in vars(reviewer_tests).items() if name.startswith("test_") and callable(value))
     anchors = [row[2] for row in MUTANTS]; assert len(anchors) == len(set(anchors))
     for _, filename, before, after, killer in MUTANTS:
-        assert source.count(before) == 1 and killer in names; compile(source.replace(before, after, 1), filename, "exec")
+        target = MODULE if filename == MODULE_NAME else Path(__file__).parents[1] / "src" / "tpen_executor" / "storage.py"
+        target_source = target.read_text(encoding="utf-8")
+        assert target_source.count(before) == 1 and killer in names
+        compile(target_source.replace(before, after, 1), filename, "exec")

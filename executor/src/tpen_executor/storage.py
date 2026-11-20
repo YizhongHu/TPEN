@@ -15,7 +15,7 @@ from typing import Any
 from uuid import uuid4
 
 from ._codec import canonical_bytes, decode_json, digest, fields, sha256_text, text, thaw
-from .allocations import AllocationAttemptV2, ConfiguredAllocation, ControllerGenerationV1, LaunchIntentV1, MemberInvocationV2
+from .allocations import AllocationAttemptV2, ConfiguredAllocation, ControllerGenerationV1, ControllerOutcomeReceiptV1, LaunchIntentV1, MemberInvocationV2
 from .contracts import AllocationId, AttemptId, BackendJobId, GroupId, InvocationId, ReadyGroup, ReadyGroupV2
 from .results import (
     AcceptedSegment, CoreOutcomeRecord, ManifestAttempt, OutcomeReceipt, PLACEMENT_RECEIPT_TYPES, RemoteTeardownReceipt, RunManifest,
@@ -42,6 +42,10 @@ class ControllerGenerationRejected(FenceRejected):
 
 class LaunchIntentRejected(FenceRejected):
     """Raised when a member launch intent cannot be created or read safely."""
+
+
+class LaunchIntentAbsent(FenceRejected):
+    """Raised only when a validated attempt has no launch-intent file."""
 
 
 @frozen_record
@@ -511,6 +515,8 @@ class DirectoryStore:
                 invocation_bytes = Path(invocation_path).read_bytes()
                 invocation = MemberInvocationV2.decode(invocation_bytes)
                 self._validate_invocation(start, invocation)
+                if not os.path.lexists(path):
+                    raise LaunchIntentAbsent("launch intent is absent")
                 _require_regular(path, "launch intent", LaunchIntentRejected)
                 encoded = Path(path).read_bytes()
                 intent = LaunchIntentV1.decode(encoded)
@@ -525,6 +531,52 @@ class DirectoryStore:
                 or intent.backend_job_id != invocation.allocation_attempt.backend_job_id):
             raise LaunchIntentRejected("launch intent is crossed")
         return intent
+
+    def record_controller_outcome(self, fence: AttemptFence, controller_record: ControllerGenerationV1,
+                                  invocation: MemberInvocationV2, status: str, reason: str = "") -> ControllerOutcomeReceiptV1:
+        """Exclusively write one typed controller outcome beside its intent."""
+        if not isinstance(controller_record, ControllerGenerationV1) or not isinstance(invocation, MemberInvocationV2):
+            raise TypeError("controller outcome requires typed controller and invocation")
+        intent = self.read_launch_intent(fence)
+        if (intent.controller_generation != controller_record.generation
+                or intent.claimant_nonce != controller_record.claimant_nonce
+                or intent.invocation_id != invocation.invocation_id):
+            raise FenceRejected("controller outcome crosses launch intent")
+        receipt = ControllerOutcomeReceiptV1(fence.task_id, fence.attempt_id, invocation.invocation_id,
+                                             controller_record.generation, controller_record.claimant_nonce, status, reason)
+        path = os.path.join(fence.output_dir, "controller-outcome.json")
+        if os.path.lexists(path):
+            encoded = Path(path).read_bytes()
+            existing = ControllerOutcomeReceiptV1.decode(encoded)
+            if encoded != existing.encode() or existing != receipt:
+                raise FenceRejected("controller outcome conflicts")
+            return existing
+        _write_new(path, receipt.encode())
+        return receipt
+
+    def begin_attempt_current_controller(self, group: ReadyGroupV2, task_id: str, allocation: ConfiguredAllocation,
+                                         started_at_utc: str, transport_kind: str | None, *,
+                                         allocation_attempt: AllocationAttemptV2, invocation_id: InvocationId,
+                                         controller_record: ControllerGenerationV1) -> AttemptFence:
+        """Start a fresh member while holding controller then task locks."""
+        directory = self._controller_dir(controller_record.group_id)
+        with _task_lock(os.path.join(directory, _CONTROLLER_LOCK)):
+            self._current_controller_locked(directory, group.group_id, controller_record)
+            return self.begin_attempt(group, task_id, allocation, started_at_utc, transport_kind,
+                                      allocation_attempt=allocation_attempt, invocation_id=invocation_id)
+
+    def begin_admitted_successor_current_controller(self, group: ReadyGroupV2, task_id: str,
+                                                    allocation: ConfiguredAllocation, started_at_utc: str,
+                                                    transport_kind: str | None, *,
+                                                    allocation_attempt: AllocationAttemptV2,
+                                                    admission: SuccessorAdmissionRecord,
+                                                    controller_record: ControllerGenerationV1) -> AttemptFence:
+        """Consume an admitted successor while holding controller then task locks."""
+        directory = self._controller_dir(controller_record.group_id)
+        with _task_lock(os.path.join(directory, _CONTROLLER_LOCK)):
+            self._current_controller_locked(directory, group.group_id, controller_record)
+            return self.begin_admitted_successor(group, task_id, allocation, started_at_utc, transport_kind,
+                                                 allocation_attempt=allocation_attempt, admission=admission)
 
     @staticmethod
     def _validate_task_id(task_id: str) -> None:
@@ -1894,4 +1946,4 @@ def _write_pointer(path: str, attempt_id: str) -> None:
             except FileNotFoundError: pass
 
 
-__all__ = ["AdmissionFork", "AttemptFence", "ControllerGenerationRejected", "DirectoryStore", "FenceRejected", "LaunchIntentRejected"]
+__all__ = ["AdmissionFork", "AttemptFence", "ControllerGenerationRejected", "DirectoryStore", "FenceRejected", "LaunchIntentAbsent", "LaunchIntentRejected"]

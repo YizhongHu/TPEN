@@ -13,11 +13,11 @@ from typing import Any, Mapping, Protocol, Sequence
 from uuid import uuid4
 
 from .._records import frozen_record
-from ..allocations import AllocationAttemptV2, ControllerGenerationV1, MemberInvocationV2
+from ..allocations import AllocationAttemptV2, ConfiguredAllocation, ControllerGenerationV1, MemberInvocationV2
 from ..contracts import AllocationAttemptId, BackendJobId, GroupId, InvocationId, ReadyGroupV2
-from ..recovery import CoreAdmissionPort, GroupReconciliationV2, MemberRecoveryInputV2, reconcile_group
+from ..recovery import CoreAdmissionPort, CoreAdmissionVerdictV2, GroupReconciliationV2, MemberRecoveryInputV2, reconcile_group
 from ..results import SuccessorAdmissionRecord
-from ..storage import AttemptFence, ControllerGenerationRejected, DirectoryStore, FenceRejected, LaunchIntentRejected
+from ..storage import AttemptFence, ControllerGenerationRejected, DirectoryStore, FenceRejected, LaunchIntentAbsent, LaunchIntentRejected
 
 
 @frozen_record
@@ -25,7 +25,7 @@ class GroupControllerFactsV1:
     """Immutable facts supplied by the registration/controller caller."""
 
     group: ReadyGroupV2
-    allocation: Any
+    allocation: ConfiguredAllocation
     registration_receipt_digest: str
     claimant_nonce: str
     observed_at_utc: str
@@ -37,6 +37,8 @@ class GroupControllerFactsV1:
     def __post_init__(self) -> None:
         if not isinstance(self.group, ReadyGroupV2):
             raise TypeError("group must be ReadyGroupV2")
+        if not isinstance(self.allocation, ConfiguredAllocation):
+            raise TypeError("allocation must be ConfiguredAllocation")
         if not isinstance(self.member_inputs, Sequence):
             raise TypeError("member_inputs must be a sequence")
         object.__setattr__(self, "member_inputs", tuple(self.member_inputs))
@@ -50,6 +52,10 @@ class MemberLaunchResult:
     acknowledged: bool
     status: str = "launched"
     detail: str = ""
+
+    def __post_init__(self) -> None:
+        if type(self.acknowledged) is not bool:
+            raise TypeError("acknowledged must be bool")
 
 
 class AllocationLocalExecutor(Protocol):
@@ -142,10 +148,23 @@ def run_group_controller(
         return _park(group, "controller-authority-refused")
     try:
         frozen_inputs = []
+        admission_failures = set()
         for item in facts.member_inputs:
-            verdict = admission_port.admit(item)
+            try:
+                verdict = admission_port.admit(item)
+                if verdict is not None and not isinstance(verdict, CoreAdmissionVerdictV2):
+                    admission_failures.add(item.task_id)
+                    verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "malformed-core-admission")
+            except Exception:
+                admission_failures.add(item.task_id)
+                verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "core-admission-unavailable")
             frozen_inputs.append(replace(item, core_verdict=verdict))
         checked = reconcile_group(group, tuple(frozen_inputs))
+        if admission_failures:
+            checked = replace(checked, members=tuple(
+                replace(member, action="park", reason_code="core-admission-unavailable")
+                if member.task_id in admission_failures else member for member in checked.members
+            ))
     except Exception:
         return _park(group, "admission-port-failed")
     try:
@@ -155,9 +174,16 @@ def run_group_controller(
             if item.start_receipt is not None:
                 invocation_path = Path(item.start_receipt.output_dir) / "invocation.json"
                 bindings[item.task_id] = MemberInvocationV2.decode(invocation_path.read_bytes())
+        successor_requests = {}
+        for task_id, (request, acceptance, proposed) in facts.successor_requests.items():
+            successor_requests[task_id] = (request, acceptance, MemberInvocationV2(
+                attempt, group.identity, task_id,
+                next(task.lineage_id for task in group.members if task.task_id == task_id),
+                proposed.attempt_id, InvocationId(uuid4().hex),
+            ))
         published = store.publish_reconciliation(
             group, attempt, tuple(frozen_inputs), bindings=bindings,
-            successors=facts.successor_requests,
+            successors=successor_requests,
         )
         if published.encode() != checked.encode():
             return _park(group, "reconciliation-publication-conflict")
@@ -171,9 +197,9 @@ def run_group_controller(
         try:
             if member.action == "start_fresh":
                 invocation_id = InvocationId(uuid4().hex)
-                fence = store.begin_attempt(
+                fence = store.begin_attempt_current_controller(
                     group, member.task_id, allocation, facts.observed_at_utc, "local",
-                    allocation_attempt=attempt, invocation_id=invocation_id,
+                    allocation_attempt=attempt, invocation_id=invocation_id, controller_record=controller,
                 )
                 invocation = MemberInvocationV2(
                     attempt, group.identity, member.task_id,
@@ -187,9 +213,10 @@ def run_group_controller(
                 record = next((item.admission for item in publication.members if item.evidence.task_id == member.task_id), None)
                 if not isinstance(record, SuccessorAdmissionRecord) or record.successor_binding is None:
                     raise LaunchIntentRejected("successor admission unavailable")
-                fence = store.begin_admitted_successor(
+                fence = store.begin_admitted_successor_current_controller(
                     group, member.task_id, allocation, facts.observed_at_utc, "local",
                     allocation_attempt=record.successor_binding.allocation_attempt, admission=record,
+                    controller_record=controller,
                 )
                 invocation = record.successor_binding
             else:
@@ -199,13 +226,27 @@ def run_group_controller(
                 existing = store.read_launch_intent(fence)
                 outcomes.append((member.task_id, "parked"))
                 continue
-            except Exception:
+            except LaunchIntentAbsent:
                 pass
+            except Exception:
+                outcomes.append((member.task_id, "parked"))
+                continue
             store.create_launch_intent(fence, controller, invocation)
             store.require_current_controller(group, controller.generation, controller.claimant_nonce)
-            launched = executor.launch(fence, invocation)
-            acknowledged = launched.acknowledged if isinstance(launched, MemberLaunchResult) else bool(launched)
-            outcomes.append((member.task_id, "launched" if acknowledged else "parked"))
+            try:
+                launched = executor.launch(fence, invocation)
+                if not isinstance(launched, MemberLaunchResult) or not launched.acknowledged:
+                    store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "invalid-launch-ack")
+                    outcomes.append((member.task_id, "parked"))
+                else:
+                    store.record_controller_outcome(fence, controller, invocation, "launched", launched.detail)
+                    outcomes.append((member.task_id, "launched"))
+            except Exception:
+                try:
+                    store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "executor-failed")
+                except (OSError, FenceRejected):
+                    pass
+                outcomes.append((member.task_id, "parked"))
         except Exception:
             outcomes.append((member.task_id, "parked"))
     parked = {task_id for task_id, status in outcomes if status == "parked"}
