@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, ClassVar
 
-from ._codec import _freeze, canonical_bytes, decode_json, fields, sha256_text, thaw, text
+from ._codec import _freeze, canonical_bytes, decode_json, digest, fields, sha256_text, thaw, text
 from .contracts import AllocationAttemptId, AllocationId, AttemptId, BackendJobId, GroupId, InvocationId
 from ._records import frozen_record
 from .results import AllocationObservation
@@ -285,8 +285,9 @@ class ControllerGenerationV1:
                       "registration_receipt_digest", "claimant_nonce", "predecessor_record_digest"}, cls.schema, cls.__name__)
         if type(data["generation"]) is not int:
             raise TypeError("generation must be an integer")
-        return cls(GroupId.from_mapping(data["group_id"]), data["generation"],
-                   AllocationId.from_mapping(data["allocation_id"]), BackendJobId.from_mapping(data["backend_job_id"]),
+        allocation_id = AllocationId.from_mapping(data["allocation_id"])
+        backend_job_id = BackendJobId.from_mapping(data["backend_job_id"])
+        return cls(GroupId.from_mapping(data["group_id"]), data["generation"], allocation_id, backend_job_id,
                    data["registration_receipt_digest"], data["claimant_nonce"], data["predecessor_record_digest"])
 
     @classmethod
@@ -331,9 +332,11 @@ class LaunchIntentV1:
     def from_mapping(cls, data: Any) -> "LaunchIntentV1":
         fields(data, {"schema", "group_id", "task_id", "attempt_id", "invocation_id", "controller_generation",
                       "claimant_nonce", "allocation_id", "backend_job_id"}, cls.schema, cls.__name__)
+        allocation_id = AllocationId.from_mapping(data["allocation_id"])
+        backend_job_id = BackendJobId.from_mapping(data["backend_job_id"])
         return cls(GroupId.from_mapping(data["group_id"]), data["task_id"], AttemptId.from_mapping(data["attempt_id"]),
                    InvocationId.from_mapping(data["invocation_id"]), data["controller_generation"], data["claimant_nonce"],
-                   AllocationId.from_mapping(data["allocation_id"]), BackendJobId.from_mapping(data["backend_job_id"]))
+                   allocation_id, backend_job_id)
 
     @classmethod
     def decode(cls, data: bytes | str | dict[str, Any]) -> "LaunchIntentV1":
