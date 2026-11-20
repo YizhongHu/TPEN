@@ -910,6 +910,10 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
         expected_sha256=row["overlay_sha256"],
         system=str(row.get("system")),
     )
+    if _is_hooke_science_row(row):
+        # The final guard is also a public boundary: callers can bypass the
+        # manifest planner and present a forged science row directly here.
+        _validate_hooke_science_train_row(row)
     resolved = OmegaConf.to_container(cfg, resolve=True)
     if not isinstance(resolved, Mapping):
         raise ProtocolError("resolved train config is not a mapping")
@@ -999,6 +1003,23 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
             resolved_runner = resolved.get("runner")
             if not isinstance(base_runner, Mapping) or not isinstance(resolved_runner, Mapping):
                 raise ProtocolError("resolved train config is missing runner wiring")
+
+            runner_leaf_fields = {
+                "sampler": ("n_walkers", "burn_in", "n_steps", "proposal_scale", "seed"),
+                "trainer": ("max_steps", "log_every_n_steps", "return_terms"),
+            }
+            for section, fields in runner_leaf_fields.items():
+                base_section = base_runner.get(section)
+                resolved_section = resolved_runner.get(section)
+                if not isinstance(base_section, Mapping) or not isinstance(resolved_section, Mapping):
+                    raise ProtocolError(f"resolved train config is missing runner {section} wiring")
+                for field in fields:
+                    root_value = select(f"{section}.{field}")
+                    if (field not in base_section or field not in resolved_section
+                            or resolved_section[field] != root_value):
+                        raise ProtocolError(
+                            f"runner {section}.{field} does not match root {section}.{field}"
+                        )
 
             def runner_wiring(runner: Mapping[str, Any]) -> dict[str, Any]:
                 """Ignore only bound sampler/trainer leaves, not runner wiring."""
