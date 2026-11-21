@@ -167,8 +167,10 @@ def _controller(payload):
     # supplied over the wire from the parent process.
     from test_b1a_b_publication import _fixture
 
+    controller_root = Path(payload["root"])
+    controller_root.mkdir(parents=True, exist_ok=True)
     store, group, lease, inputs, _bindings, successor_rows, _fences = _fixture(
-        Path(payload["root"]), ("ambiguous", "successor"), remote=False
+        controller_root, ("ambiguous", "successor"), remote=False
     )
 
     class RecordingExecutor:
@@ -317,7 +319,7 @@ def test_real_producer_and_decoder_cover_every_admission_class(tmp_path: Path) -
             "park",
             "unsupported-profile",
         ),
-        ("stale-checkpoint", admission_context(stale, stale_request), "park", "core-admission-refused"),
+        ("stale-checkpoint", admission_context(stale, stale_request), "park", "unsupported-profile"),
         ("missing-leaf", admission_context(None), "park", "core-admission-unavailable"),
     )
     for name, context, action, reason in cases:
@@ -326,7 +328,16 @@ def test_real_producer_and_decoder_cover_every_admission_class(tmp_path: Path) -
             context,
             status="completed" if name == "completed" else "failed",
         )
-        assert (result["action"], result["reason_code"]) == (action, reason), name
+        if name == "stale-checkpoint":
+            # Executor recovery._member_reconciliation checks profile before admission.
+            assert result["action"] == "park"
+            assert result["action"] != "admit_successor"
+            assert tuple(mapping[key] for key in ("outcome", "admission", "checkpoint")) == (
+                "successor", "refused", "invalid"
+            )
+            assert result["reason_code"] == "unsupported-profile"
+        else:
+            assert (result["action"], result["reason_code"]) == (action, reason), name
         if name == "missing-leaf":
             assert mapping is None
         else:

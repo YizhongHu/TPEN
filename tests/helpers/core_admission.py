@@ -74,10 +74,13 @@ def evidence(ref: CheckpointRef) -> RunEvidence:
     )
 
 
+_EVIDENCE_FACTORY = evidence
+
+
 def request(
     ref: CheckpointRef,
     *,
-    evidence_record: RunEvidence | None = None,
+    evidence: RunEvidence | None = None,
     task_id: str = "task-1",
     predecessor_attempt_id: str = "attempt-1",
     successor_attempt_id: str = "attempt-2",
@@ -86,7 +89,7 @@ def request(
 ) -> SuccessorAdmissionRequest:
     """Build a request whose identities and science digest match its evidence."""
 
-    evidence_record = evidence(ref) if evidence_record is None else evidence_record
+    evidence_record = _EVIDENCE_FACTORY(ref) if evidence is None else evidence
     science_payload = {"input": "cx04"} if science_payload is None else science_payload
     science_input_digest = ScienceIntent(
         science_payload, target_iterations=target_iterations
