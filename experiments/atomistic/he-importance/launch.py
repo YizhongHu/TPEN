@@ -474,6 +474,24 @@ def _validate_override_topology_agreement(
             "runtime.device override requires bound topology and must resolve "
             "to an exact string"
         )
+
+
+def _caller_override_has_interpolation(overrides: object) -> bool:
+    """Detect interpolation syntax without constructing or resolving a config."""
+
+    if type(overrides) is str:
+        return str.__contains__(overrides, "${")
+    if isinstance(overrides, Mapping):
+        return any(
+            _caller_override_has_interpolation(key)
+            or _caller_override_has_interpolation(value)
+            for key, value in overrides.items()
+        )
+    if isinstance(overrides, Sequence) and not isinstance(
+        overrides, (str, bytes, bytearray)
+    ):
+        return any(_caller_override_has_interpolation(value) for value in overrides)
+    return False
     configured_kind = configured.partition(":")[0]
     bound_kind = bound.partition(":")[0]
     if str.__eq__(configured_kind, bound_kind) is not True:
@@ -532,6 +550,10 @@ def prepare_train_launch(
                 ) from error
             raise
     else:
+        if restore_request is not None and _caller_override_has_interpolation(overrides):
+            raise HIContinuationRefusal(
+                "continuation overrides contain interpolation syntax"
+            )
         override_items = _TRAIN_CONFIG._override_items(overrides)
         try:
             config = _TRAIN_CONFIG.resolve_train_config(cell, overrides=overrides)
