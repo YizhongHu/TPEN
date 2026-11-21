@@ -1,6 +1,13 @@
 {
   "mutants": [
     {
+      "id": "sequence-claim-collision-raw",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "raise RestartRefusal(\n            f\"lineage claim lost: occupied lineage attempt sequence {attempt_key}\",\n            cause=RestartCause.LINEAGE_CLAIM_LOST,\n        ) from exc",
+      "new": "raise exc",
+      "killer": "tests/integration/test_stage1_restart_review_r1.py::test_lineage_claim_serializes_stale_and_current_selections"
+    },
+    {
       "id": "sequence-claim-content-key",
       "target": "experiments/atomistic/stage1/restart.py",
       "old": "attempt_key = f\"attempt-{number:06d}\"",

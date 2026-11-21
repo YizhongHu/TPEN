@@ -47,6 +47,8 @@ OUTCOME_RECEIPT_SCHEMA = "stage1/restart-outcome/v1"
 class RestartCause(str, Enum):
     """Typed causes for every parked or refused restart decision."""
 
+    LINEAGE_CLAIM_LOST = "lineage_claim_lost"
+    SELECTION_STALE_AFTER_CLAIM = "selection_stale_after_claim"
     DISCOVERY_ERROR = "checkpoint_discovery_error"
     NEWER_COMPLETE_CHECKPOINT = "newer_complete_checkpoint"
     RECOVERY_REFUSAL = "recovery_refusal"
@@ -476,7 +478,8 @@ def _claim_attempt(
         create_json_receipt(lease_path, lease_payload)
     except ReceiptExistsError as exc:
         raise RestartRefusal(
-            f"occupied lineage attempt sequence: {attempt_key}"
+            f"lineage claim lost: occupied lineage attempt sequence {attempt_key}",
+            cause=RestartCause.LINEAGE_CLAIM_LOST,
         ) from exc
     return attempt_key, lease_path
 
@@ -484,6 +487,7 @@ def _claim_attempt(
 def _write_claim_refusal(
     *, outcome_path: Path, lease_path: Path, selection: RestartSelection,
     identity: Mapping[str, Any], attempt_key: str, reason: str,
+    cause: RestartCause = RestartCause.INVOCATION_ERROR,
 ) -> None:
     """Close a claimed sequence with durable refusal evidence before raising."""
 
@@ -499,7 +503,7 @@ def _write_claim_refusal(
         "published_content_id": None,
         "next_iteration": None,
         "logs": {"attempt_dir": str(selection.run_dir / "attempts" / attempt_key)},
-        "cause": RestartCause.INVOCATION_ERROR.value,
+        "cause": cause.value,
         "reason": reason,
     })
 
@@ -562,10 +566,24 @@ def execute_restart(
     # live owner before entering the driver.
     try:
         refreshed_selection = select_restart(cfg=cfg, row=row, run_dir=run_dir)
+        if (
+            refreshed_selection.decision is not selection.decision
+            or refreshed_selection.content_id != selection.content_id
+            or refreshed_selection.run_dir.resolve() != selection.run_dir.resolve()
+        ):
+            raise RestartRefusal(
+                "selection became stale after lineage claim: "
+                f"before={selection.decision.value}/{selection.content_id} "
+                f"after={refreshed_selection.decision.value}/{refreshed_selection.content_id}",
+                cause=RestartCause.SELECTION_STALE_AFTER_CLAIM,
+            )
         if takeover is not None and refreshed_selection.content_id != expected_approval[
             "predecessor_content_id"
         ]:
-            raise RestartRefusal("takeover selection changed after lineage claim")
+            raise RestartRefusal(
+                "takeover selection changed after lineage claim",
+                cause=RestartCause.SELECTION_STALE_AFTER_CLAIM,
+            )
         selection = refreshed_selection
         if selection.decision is StartDecision.FRESH:
             _reject_configured_restore_on_fresh(cfg)
@@ -589,13 +607,14 @@ def execute_restart(
                 attempt_key=attempt_key, reason=reason,
             )
             raise RestartRefusal(reason)
-    except RestartRefusal:
+    except RestartRefusal as exc:
         if outcome_path.is_file():
             raise
         _write_claim_refusal(
             outcome_path=outcome_path, lease_path=lease_path,
             selection=selection, identity=identity,
-            attempt_key=attempt_key, reason="selection invalid after lineage claim",
+            attempt_key=attempt_key, reason=str(exc) or exc.cause.value,
+            cause=exc.cause,
         )
         raise
 

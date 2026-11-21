@@ -204,7 +204,12 @@ def test_lineage_claim_serializes_stale_and_current_selections(
     current.join(timeout=10)
     assert not stale.is_alive() and not current.is_alive()
     assert len(driver_calls) <= 1
-    assert all(isinstance(error, RestartRefusal) for error in errors)
+    assert all(
+        isinstance(error, RestartRefusal)
+        and error.cause.value
+        in {"lineage_claim_lost", "selection_stale_after_claim"}
+        for error in errors
+    ), [repr(error) for error in errors]
 
 
 @pytest.mark.integration
