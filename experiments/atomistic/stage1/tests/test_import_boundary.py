@@ -50,11 +50,14 @@ def _violations(path: Path, source: str) -> list[str]:
 
 
 def test_only_train_and_eval_use_the_public_tpen_gateway() -> None:
+    """Check production modules; tests deliberately probe core internals."""
+
     violations: list[str] = []
+    tests_root = HERE / "tests"
     for path in sorted(HERE.rglob("*.py")):
-        # Test probes may exercise core internals; the boundary applies to
-        # Stage-1 production modules, not the tests that inspect them.
-        if path.name.startswith("test_"):
+        # Stage-1 test probes may exercise core internals; production modules
+        # under the study root remain subject to this boundary.
+        if tests_root in path.parents:
             continue
         violations.extend(_violations(path, path.read_text(encoding="utf-8")))
     assert not violations, "import boundary violated:\n" + "\n".join(violations)
