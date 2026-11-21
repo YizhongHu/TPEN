@@ -117,6 +117,7 @@ def test_takeover_requires_terminal_quiescent_budget_and_identity() -> None:
         config_identity="config",
         overlay_identity="overlay",
         target_iterations=100000,
+        superseded_attempt_keys=("attempt-000000.json",),
     )
     approval.validate(
         expected={
@@ -132,6 +133,7 @@ def test_takeover_requires_terminal_quiescent_budget_and_identity() -> None:
             predecessor_content_id="content", terminal_pbs_proof="proof",
             quiescent=False, adopted_budget="budget", lineage_id="lineage",
             config_identity="config", overlay_identity="overlay", target_iterations=100000,
+            superseded_attempt_keys=("attempt-000000.json",),
         ).validate(expected={"predecessor_content_id": "content"})
 
 

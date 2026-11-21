@@ -49,6 +49,7 @@ class RestartCause(str, Enum):
 
     LINEAGE_CLAIM_LOST = "lineage_claim_lost"
     SELECTION_STALE_AFTER_CLAIM = "selection_stale_after_claim"
+    TAKEOVER_APPROVAL_SCOPE_MISMATCH = "takeover_approval_scope_mismatch"
     DISCOVERY_ERROR = "checkpoint_discovery_error"
     NEWER_COMPLETE_CHECKPOINT = "newer_complete_checkpoint"
     RECOVERY_REFUSAL = "recovery_refusal"
@@ -88,7 +89,9 @@ class RestartApproval:
 
     This object carries proof; it does not create takeover authority.  The
     orchestrator remains responsible for producing the terminal/quiescence
-    and budget facts represented here.
+    and budget facts represented here.  ``superseded_attempt_keys`` is a
+    non-empty, exact set of active lease filenames that this approval replaces;
+    it is checked both before and after the new attempt lease is claimed.
     """
 
     predecessor_content_id: str
@@ -99,6 +102,7 @@ class RestartApproval:
     config_identity: str
     overlay_identity: str
     target_iterations: int
+    superseded_attempt_keys: tuple[str, ...]
 
     def validate(self, *, expected: Mapping[str, Any]) -> None:
         """Validate approval facts against the immutable selected lineage."""
@@ -109,6 +113,15 @@ class RestartApproval:
             raise RestartRefusal("takeover approval lacks predecessor quiescence")
         if not self.adopted_budget.strip():
             raise RestartRefusal("takeover approval lacks an adopted recovery budget")
+        if (
+            not self.superseded_attempt_keys
+            or any(not isinstance(key, str) or not key for key in self.superseded_attempt_keys)
+            or len(set(self.superseded_attempt_keys)) != len(self.superseded_attempt_keys)
+        ):
+            raise RestartRefusal(
+                "takeover approval must name a non-empty unique superseded attempt set",
+                cause=RestartCause.TAKEOVER_APPROVAL_SCOPE_MISMATCH,
+            )
         checks = {
             "predecessor_content_id": self.predecessor_content_id,
             "lineage_id": self.lineage_id,
@@ -542,8 +555,18 @@ def execute_restart(
         "predecessor_content_id": selection.content_id,
     }
     active_leases = _active_attempt_lease_paths(attempts)
+    approved_attempt_keys: frozenset[str] = frozenset()
     if takeover is not None:
         takeover.validate(expected=expected_approval)
+        approved_attempt_keys = frozenset(takeover.superseded_attempt_keys)
+        active_attempt_keys = frozenset(path.name for path in active_leases)
+        if active_attempt_keys != approved_attempt_keys:
+            raise RestartRefusal(
+                "takeover approval superseded attempt scope does not match active leases: "
+                f"approved={sorted(approved_attempt_keys)} "
+                f"active={sorted(active_attempt_keys)}",
+                cause=RestartCause.TAKEOVER_APPROVAL_SCOPE_MISMATCH,
+            )
     elif active_leases:
         raise RestartRefusal(
             "occupied predecessor lease requires orchestrator takeover approval: "
@@ -554,7 +577,10 @@ def execute_restart(
     # The sequence receipt is the lineage-wide admission barrier.  A takeover
     # claims the next number too and durably names every active predecessor it
     # is authorized to supersede; old receipts are never rewritten.
-    superseded_attempts = active_leases if takeover is not None else []
+    superseded_attempts = (
+        [attempts / key for key in sorted(approved_attempt_keys)]
+        if takeover is not None else []
+    )
     attempt_key, lease_path = _claim_attempt(
         attempts=attempts, selection=selection, identity=identity,
         takeover=takeover, superseded_attempts=superseded_attempts,
@@ -591,22 +617,31 @@ def execute_restart(
             path for path in _active_attempt_lease_paths(attempts)
             if path.resolve() != lease_path.resolve()
         ]
+        post_claim_active_keys = frozenset(path.name for path in post_claim_active)
         if takeover is not None:
-            post_claim_active = [
-                path for path in post_claim_active
-                if path not in superseded_attempts
-            ]
-        if post_claim_active:
+            scope_mismatch = post_claim_active_keys != approved_attempt_keys
+        else:
+            scope_mismatch = bool(post_claim_active)
+        if scope_mismatch:
             reason = (
-                "occupied lineage attempt after sequence claim: "
+                "takeover approval superseded attempt scope changed after sequence claim: "
+                f"approved={sorted(approved_attempt_keys)} "
+                f"active={sorted(post_claim_active_keys)}"
+                if takeover is not None
+                else "occupied lineage attempt after sequence claim: "
                 + ", ".join(str(path) for path in post_claim_active)
+            )
+            cause = (
+                RestartCause.TAKEOVER_APPROVAL_SCOPE_MISMATCH
+                if takeover is not None
+                else RestartCause.INVOCATION_ERROR
             )
             _write_claim_refusal(
                 outcome_path=outcome_path, lease_path=lease_path,
                 selection=selection, identity=identity,
-                attempt_key=attempt_key, reason=reason,
+                attempt_key=attempt_key, reason=reason, cause=cause,
             )
-            raise RestartRefusal(reason)
+            raise RestartRefusal(reason, cause=cause)
     except RestartRefusal as exc:
         if outcome_path.is_file():
             raise

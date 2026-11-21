@@ -132,6 +132,8 @@ def test_lineage_claim_serializes_stale_and_current_selections(
     release_publisher = Event()
     first_selected = Event()
     release_first = Event()
+    stale_claimed = Event()
+    current_claimed = Event()
     scans = Barrier(2)
     select_counts: dict[str, int] = {}
     scan_counts: dict[str, int] = {}
@@ -140,6 +142,7 @@ def test_lineage_claim_serializes_stale_and_current_selections(
     stale_revalidated = Event()
     original_select = restart.select_restart
     original_active = restart._active_attempt_lease_paths
+    original_claim = restart._claim_attempt
 
     def delayed_select(**kwargs):
         selected = original_select(**kwargs)
@@ -164,8 +167,19 @@ def test_lineage_claim_serializes_stale_and_current_selections(
             scans.wait(timeout=10)
         return paths
 
+    def deterministic_claim(**kwargs):
+        claimed = original_claim(**kwargs)
+        if current_thread().name == "stale-contender":
+            stale_claimed.set()
+            assert current_claimed.wait(timeout=10)
+        elif current_thread().name == "current-contender":
+            assert stale_claimed.wait(timeout=10)
+            current_claimed.set()
+        return claimed
+
     monkeypatch.setattr(restart, "select_restart", delayed_select)
     monkeypatch.setattr(restart, "_active_attempt_lease_paths", synchronized_scan)
+    monkeypatch.setattr(restart, "_claim_attempt", deterministic_claim)
 
     def publisher_driver(_cfg, **_kwargs):
         _publish(run_dir, step=1000)
@@ -212,6 +226,7 @@ def test_lineage_claim_serializes_stale_and_current_selections(
     current.join(timeout=10)
     assert not stale.is_alive() and not current.is_alive()
     assert len(driver_calls) <= 1
+    assert stale_claimed.is_set()
     assert stale_revalidated.is_set()
     assert all(
         isinstance(error, RestartRefusal)
@@ -340,6 +355,7 @@ def test_invalid_initial_takeover_approval_refuses_before_takeover_lease(tmp_pat
         config_identity="wrong-config",
         overlay_identity="wrong-overlay",
         target_iterations=-1,
+        superseded_attempt_keys=("initial.json",),
     )
 
     with pytest.raises(RestartRefusal):
@@ -382,6 +398,7 @@ def test_approved_takeover_releases_abandoned_initial_owner_for_successor(
         config_identity=config_identity,
         overlay_identity="none",
         target_iterations=row["updates"],
+        superseded_attempt_keys=("initial.json",),
     )
     takeover_calls: list[object] = []
 
@@ -461,6 +478,7 @@ def test_reused_takeover_approval_refuses_while_first_driver_is_live(
         config_identity=row["config_sha256"],
         overlay_identity="none",
         target_iterations=row["updates"],
+        superseded_attempt_keys=("attempt-000000.json",),
     )
 
     first_entered = Event()
@@ -493,16 +511,18 @@ def test_reused_takeover_approval_refuses_while_first_driver_is_live(
     assert first_entered.wait(timeout=10), "first approved driver did not start"
 
     try:
-        with pytest.raises(
-            RestartRefusal,
-            match="takeover|occupied|lineage|selection",
-        ):
+        second_error: BaseException | None = None
+        try:
             execute_restart(
                 cfg=_attempt_cfg(row, system), row=row,
                 config_path=config_path,
                 run=lambda *_args, **_kwargs: second_calls.append(True) or 0,
                 run_dir=run_dir, takeover=approval,
             )
+        except BaseException as exc:  # pragma: no cover - diagnostic capture
+            second_error = exc
+        assert isinstance(second_error, RestartRefusal), repr(second_error)
+        assert "takeover" in str(second_error) or "occupied" in str(second_error)
         assert second_calls == [], (
             "reused approval entered a second driver; first_alive="
             f"{first.is_alive()} first_errors={[repr(error) for error in first_errors]}"
@@ -521,6 +541,202 @@ def test_reused_takeover_approval_refuses_while_first_driver_is_live(
     )
     assert first_errors == []
     assert len(first_results) == 1
+
+
+@pytest.mark.integration
+def test_takeover_approval_scope_revalidated_after_claim(tmp_path: Path, monkeypatch) -> None:
+    """A second replacement claimed during admission invalidates the first approval."""
+
+    from experiments.atomistic.stage1 import restart
+
+    system = "he"
+    row = _row(system, tmp_path)
+    config_path = CONFIG_ROOT / system / "train.yaml"
+    run_dir = resolve_run_dir(row)
+    attempts = run_dir / "attempts"
+    with pytest.raises(SystemExit):
+        execute_restart(
+            cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
+            run=lambda _cfg, **_kwargs: (
+                _publish(run_dir, step=1000) or (_ for _ in ()).throw(SystemExit(17))
+            ),
+            run_dir=run_dir,
+        )
+
+    selected = select_restart(cfg=_attempt_cfg(row, system), row=row, run_dir=run_dir)
+    assert selected.predecessor is not None
+    approval = RestartApproval(
+        predecessor_content_id=selected.predecessor.content_id,
+        terminal_pbs_proof="pbs-terminal-approval",
+        quiescent=True,
+        adopted_budget="budget-replacement-1",
+        lineage_id=row["row_id"],
+        config_identity=row["config_sha256"],
+        overlay_identity="none",
+        target_iterations=row["updates"],
+        superseded_attempt_keys=("attempt-000000.json",),
+    )
+    replacement_approval = RestartApproval(
+        predecessor_content_id=approval.predecessor_content_id,
+        terminal_pbs_proof="pbs-terminal-approval-2",
+        quiescent=True,
+        adopted_budget="budget-replacement-2",
+        lineage_id=approval.lineage_id,
+        config_identity=approval.config_identity,
+        overlay_identity=approval.overlay_identity,
+        target_iterations=approval.target_iterations,
+        superseded_attempt_keys=("attempt-000001.json",),
+    )
+
+    second_entered = Event()
+    release_second = Event()
+    first_errors: list[BaseException] = []
+    first_driver_calls: list[bool] = []
+    second_results: list[object] = []
+    second_errors: list[BaseException] = []
+    original_claim = restart._claim_attempt
+    second_thread: Thread | None = None
+
+    def second_driver(_cfg, **_kwargs):
+        second_entered.set()
+        assert release_second.wait(timeout=10), "second replacement was not released"
+        _publish(run_dir, step=2000)
+        (run_dir / "status.json").write_text(
+            json.dumps({"status": "planned_yield"}) + "\n", encoding="utf-8"
+        )
+        return 0
+
+    def second_attempt() -> None:
+        try:
+            second_results.append(execute_restart(
+                cfg=_attempt_cfg(row, system), row=row,
+                config_path=config_path, run=second_driver,
+                run_dir=run_dir, takeover=replacement_approval,
+            ))
+        except BaseException as exc:  # pragma: no cover - diagnostic propagation
+            second_errors.append(exc)
+
+    def interleaved_claim(**kwargs):
+        nonlocal second_thread
+        claimed = original_claim(**kwargs)
+        if current_thread().name == "first-takeover":
+            second_thread = Thread(target=second_attempt, name="second-takeover")
+            second_thread.start()
+            assert second_entered.wait(timeout=10), "second replacement did not claim"
+        return claimed
+
+    monkeypatch.setattr(restart, "_claim_attempt", interleaved_claim)
+    try:
+        def first_driver(_cfg, **_kwargs):
+            first_driver_calls.append(True)
+            return 0
+
+        def first_attempt() -> None:
+            try:
+                execute_restart(
+                    cfg=_attempt_cfg(row, system), row=row,
+                    config_path=config_path, run=first_driver,
+                    run_dir=run_dir, takeover=approval,
+                )
+            except BaseException as exc:  # pragma: no cover - diagnostic propagation
+                first_errors.append(exc)
+
+        first = Thread(target=first_attempt, name="first-takeover")
+        first.start()
+        first.join(timeout=10)
+        assert not first.is_alive(), "first takeover did not finish"
+        assert first_driver_calls == []
+        assert len(first_errors) == 1
+        assert isinstance(first_errors[0], RestartRefusal)
+        assert first_errors[0].cause is RestartCause.TAKEOVER_APPROVAL_SCOPE_MISMATCH
+    finally:
+        release_second.set()
+        if second_thread is not None:
+            second_thread.join(timeout=10)
+    assert second_thread is not None and not second_thread.is_alive()
+    assert second_errors == []
+    assert len(second_results) == 1
+
+
+@pytest.mark.integration
+def test_crashed_replacement_requires_fresh_approval_scope(tmp_path: Path) -> None:
+    """A crashed replacement must be named by its next approval."""
+
+    system = "he"
+    row = _row(system, tmp_path)
+    config_path = CONFIG_ROOT / system / "train.yaml"
+    run_dir = resolve_run_dir(row)
+    with pytest.raises(SystemExit):
+        execute_restart(
+            cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
+            run=lambda _cfg, **_kwargs: (
+                _publish(run_dir, step=1000) or (_ for _ in ()).throw(SystemExit(17))
+            ),
+            run_dir=run_dir,
+        )
+
+    selected = select_restart(cfg=_attempt_cfg(row, system), row=row, run_dir=run_dir)
+    assert selected.predecessor is not None
+    approval = RestartApproval(
+        predecessor_content_id=selected.predecessor.content_id,
+        terminal_pbs_proof="pbs-terminal-approval",
+        quiescent=True,
+        adopted_budget="budget-replacement-1",
+        lineage_id=row["row_id"],
+        config_identity=row["config_sha256"],
+        overlay_identity="none",
+        target_iterations=row["updates"],
+        superseded_attempt_keys=("attempt-000000.json",),
+    )
+    with pytest.raises(SystemExit):
+        execute_restart(
+            cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
+            run=lambda _cfg, **_kwargs: (
+                _publish(run_dir, step=2000) or (_ for _ in ()).throw(SystemExit(18))
+            ),
+            run_dir=run_dir, takeover=approval,
+        )
+
+    stale_calls: list[bool] = []
+    with pytest.raises(RestartRefusal) as stale_error:
+        execute_restart(
+            cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
+            run=lambda *_args, **_kwargs: stale_calls.append(True) or 0,
+            run_dir=run_dir, takeover=approval,
+        )
+    assert stale_error.value.cause is RestartCause.TAKEOVER_APPROVAL_SCOPE_MISMATCH
+    assert stale_calls == []
+
+    replacement = select_restart(
+        cfg=_attempt_cfg(row, system), row=row, run_dir=run_dir,
+    )
+    assert replacement.predecessor is not None
+    fresh_approval = RestartApproval(
+        predecessor_content_id=replacement.predecessor.content_id,
+        terminal_pbs_proof="pbs-terminal-approval-2",
+        quiescent=True,
+        adopted_budget="budget-replacement-2",
+        lineage_id=row["row_id"],
+        config_identity=row["config_sha256"],
+        overlay_identity="none",
+        target_iterations=row["updates"],
+        superseded_attempt_keys=("attempt-000001.json",),
+    )
+    fresh_calls: list[bool] = []
+    result = execute_restart(
+        cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
+        run=lambda _cfg, **_kwargs: (
+            fresh_calls.append(True)
+            or _publish(run_dir, step=3000)
+            or (run_dir / "status.json").write_text(
+                json.dumps({"status": "planned_yield"}) + "\n", encoding="utf-8"
+            )
+            or 0
+        ),
+        run_dir=run_dir, takeover=fresh_approval,
+    )
+    assert fresh_calls == [True]
+    assert result.outcome == "planned_yield"
 
 
 @pytest.mark.integration
