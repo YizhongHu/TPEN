@@ -120,7 +120,11 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
             "sampler": _digest(sampler_state),
             "sampler_cursor": sampler_cursor,
             "process_rng": _digest(process_rng),
-            "callback_dispositions": [type(callback).__qualname__ for callback in getattr(context, "callbacks", ())],
+            "callback_dispositions": [
+                type(callback).__qualname__
+                for callback in getattr(context, "callbacks", ())
+                if type(callback).__qualname__ != "PlannedYield"
+            ],
             "report": None if report is None else repr(report),
         }
 
