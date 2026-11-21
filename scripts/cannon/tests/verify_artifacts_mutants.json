@@ -1,0 +1,23 @@
+[
+  {
+    "id": "exclusion-disabled",
+    "target": "scripts/cannon/verify.sh",
+    "old": "artifact_is_excluded \"$destination_rel\" && return 0",
+    "new": ": # exclusion disabled",
+    "killer": "scripts/cannon/tests/test_verify_artifacts.py::test_full_suite_collector_copies_allowlist_and_writes_inventory"
+  },
+  {
+    "id": "work-copy-disabled",
+    "target": "scripts/cannon/verify.sh",
+    "old": "artifact_copy_work_allowlist \"$inventory\" || return 1",
+    "new": ":",
+    "killer": "scripts/cannon/tests/test_verify_artifacts.py::test_full_suite_collector_copies_allowlist_and_writes_inventory"
+  },
+  {
+    "id": "verdict-overwritten",
+    "target": "scripts/cannon/verify.sh",
+    "old": "printf 'DRIVER_EXIT=%s\\n' \"$rc\" > \"$RUN_ROOT/evidence/driver-exit.txt\"",
+    "new": "printf 'DRIVER_EXIT=0\\n' \"$rc\" > \"$RUN_ROOT/evidence/driver-exit.txt\"",
+    "killer": "scripts/cannon/tests/test_verify_artifacts.py::test_collector_is_full_suite_only_and_verdict_isolation_is_fail_closed"
+  }
+]
