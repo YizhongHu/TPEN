@@ -100,12 +100,17 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
         except ImportError:  # pragma: no cover - TPEN requires torch on Cannon
             pass
         sampler_state = sampler.mcmc_state_dict()
+        sampler_cursor = _digest({
+            "walkers": sampler_state.get("walkers"),
+            "generator_state": sampler_state.get("generator_state"),
+        })
         return {
             "model": _digest(model.state_dict()),
             "observable": float(next(model.parameters()).detach().reshape(-1)[0]),
             "optimizer": _digest(optimizer.state_dict()),
             "trainer": {"next_iteration": int(trainer.next_iteration), "completed_updates": int(trainer.completed_updates), "max_steps": int(trainer.max_steps)},
             "sampler": _digest(sampler_state),
+            "sampler_cursor": sampler_cursor,
             "process_rng": _digest(process_rng),
             "callback_dispositions": [type(callback).__qualname__ for callback in getattr(context, "callbacks", ())],
             "report": None if report is None else repr(report),
@@ -190,9 +195,9 @@ def _spawn(action: str, config: Path, record: Path, checkpoint: Path | None = No
 def _assert_equivalent(expected: dict[str, Any], observed: dict[str, Any]) -> None:
     assert expected["trainer"] == observed["trainer"]
     np.testing.assert_allclose(expected["observable"], observed["observable"], rtol=RTOL, atol=ATOL)
-    for key in ("model", "optimizer", "sampler", "process_rng", "callback_dispositions"):
+    for key in ("model", "optimizer", "sampler", "sampler_cursor", "process_rng", "callback_dispositions"):
         assert key in expected and key in observed
-    for key in ("sampler", "process_rng", "callback_dispositions"):
+    for key in ("sampler_cursor", "process_rng", "callback_dispositions"):
         assert expected[key] == observed[key], key
 
 
@@ -230,8 +235,8 @@ def test_hi_s5b_b2_three_process_stateful_continuation(tmp_path: Path) -> None:
 
 def test_hi_s5b_b2_mutant_detection_contract() -> None:
     """The qualification assertions reject the three required real faults."""
-    baseline = {"trainer": {"next_iteration": 1, "completed_updates": 1, "max_steps": H}, "model": "m", "optimizer": "o", "sampler": "s", "process_rng": "r", "callback_dispositions": [], "observable": 1.0}
-    for field in ("sampler", "process_rng"):
+    baseline = {"trainer": {"next_iteration": 1, "completed_updates": 1, "max_steps": H}, "model": "m", "optimizer": "o", "sampler": "s", "sampler_cursor": "sc", "process_rng": "r", "callback_dispositions": [], "observable": 1.0}
+    for field in ("sampler_cursor", "process_rng"):
         mutant = copy.deepcopy(baseline)
         mutant[field] = "mutated"
         try:
