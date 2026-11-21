@@ -135,7 +135,7 @@ def _child(action: str, config_path: str, record_path: str, checkpoint_path: str
         callbacks.append(PlannedYield(PREFIX, H))
     elif action == "successor":
         ref = CheckpointRef.from_directory(Path(checkpoint_path))
-        intent = ScienceIntent({"fixture": "hi-s5b-b2", "H": H, "prefix": PREFIX})
+        intent = ScienceIntent({"fixture": "hi-s5b-b2", "H": H, "prefix": PREFIX}, target_iterations=H)
         evidence = CheckpointEvidence.from_ref(ref, science_input_digest=intent.science_input_digest, target_iterations=H)
         decision = select_recovery(intent, phase=RecoveryPhase.RECOVERY, evidence=evidence)
         assert decision.refusal is None
@@ -143,7 +143,7 @@ def _child(action: str, config_path: str, record_path: str, checkpoint_path: str
     elif action == "refused":
         cfg.trainer.max_steps = H + 1
         ref = CheckpointRef.from_directory(Path(checkpoint_path))
-        intent = ScienceIntent({"fixture": "hi-s5b-b2", "H": H, "prefix": PREFIX})
+        intent = ScienceIntent({"fixture": "hi-s5b-b2", "H": H, "prefix": PREFIX}, target_iterations=H)
         evidence = CheckpointEvidence.from_ref(ref, science_input_digest=intent.science_input_digest, target_iterations=H)
         decision = select_recovery(intent, phase=RecoveryPhase.RECOVERY, evidence=evidence)
         assert decision.refusal is None
