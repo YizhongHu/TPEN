@@ -90,7 +90,9 @@ def test_full_suite_collector_copies_allowlist_and_writes_inventory(tmp_path: Pa
     for line in inventory[:5]:
         digest, relative = line.split("  ", 1)
         assert digest == hashlib.sha256((artifacts / relative).read_bytes()).hexdigest()
-    assert any("checkout/outputs/newline$'\\n'name.txt" in line for line in inventory)
+    escaped_newline_paths = [line for line in inventory if "newline" in line and "name.txt" in line]
+    assert len(escaped_newline_paths) == 1
+    assert "\\n" in escaped_newline_paths[0]
     size_line = (run_root / "evidence/artifacts-size.txt").read_text().strip()
     expected_bytes = sum(
         len(content)
