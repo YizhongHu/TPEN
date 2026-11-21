@@ -133,7 +133,6 @@ def test_lineage_claim_serializes_stale_and_current_selections(
     first_selected = Event()
     release_first = Event()
     stale_claimed = Event()
-    current_claimed = Event()
     scans = Barrier(2)
     select_counts: dict[str, int] = {}
     scan_counts: dict[str, int] = {}
@@ -171,10 +170,8 @@ def test_lineage_claim_serializes_stale_and_current_selections(
         claimed = original_claim(**kwargs)
         if current_thread().name == "stale-contender":
             stale_claimed.set()
-            assert current_claimed.wait(timeout=10)
         elif current_thread().name == "current-contender":
             assert stale_claimed.wait(timeout=10)
-            current_claimed.set()
         return claimed
 
     monkeypatch.setattr(restart, "select_restart", delayed_select)
@@ -545,7 +542,7 @@ def test_reused_takeover_approval_refuses_while_first_driver_is_live(
 
 @pytest.mark.integration
 def test_takeover_approval_scope_revalidated_after_claim(tmp_path: Path, monkeypatch) -> None:
-    """A second replacement claimed during admission invalidates the first approval."""
+    """A concurrent reuse is refused even after the first replacement finishes."""
 
     from experiments.atomistic.stage1 import restart
 
@@ -553,7 +550,6 @@ def test_takeover_approval_scope_revalidated_after_claim(tmp_path: Path, monkeyp
     row = _row(system, tmp_path)
     config_path = CONFIG_ROOT / system / "train.yaml"
     run_dir = resolve_run_dir(row)
-    attempts = run_dir / "attempts"
     with pytest.raises(SystemExit):
         execute_restart(
             cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
@@ -576,86 +572,66 @@ def test_takeover_approval_scope_revalidated_after_claim(tmp_path: Path, monkeyp
         target_iterations=row["updates"],
         superseded_attempt_keys=("attempt-000000.json",),
     )
-    replacement_approval = RestartApproval(
-        predecessor_content_id=approval.predecessor_content_id,
-        terminal_pbs_proof="pbs-terminal-approval-2",
-        quiescent=True,
-        adopted_budget="budget-replacement-2",
-        lineage_id=approval.lineage_id,
-        config_identity=approval.config_identity,
-        overlay_identity=approval.overlay_identity,
-        target_iterations=approval.target_iterations,
-        superseded_attempt_keys=("attempt-000001.json",),
-    )
-
-    second_entered = Event()
-    release_second = Event()
+    second_admitted = Event()
+    release_second_claim = Event()
     first_errors: list[BaseException] = []
-    first_driver_calls: list[bool] = []
-    second_results: list[object] = []
+    first_results: list[object] = []
+    second_calls: list[bool] = []
     second_errors: list[BaseException] = []
     original_claim = restart._claim_attempt
-    second_thread: Thread | None = None
 
     def second_driver(_cfg, **_kwargs):
-        second_entered.set()
-        assert release_second.wait(timeout=10), "second replacement was not released"
-        _publish(run_dir, step=2000)
-        (run_dir / "status.json").write_text(
-            json.dumps({"status": "planned_yield"}) + "\n", encoding="utf-8"
-        )
+        second_calls.append(True)
         return 0
 
     def second_attempt() -> None:
         try:
-            second_results.append(execute_restart(
+            execute_restart(
                 cfg=_attempt_cfg(row, system), row=row,
                 config_path=config_path, run=second_driver,
-                run_dir=run_dir, takeover=replacement_approval,
-            ))
+                run_dir=run_dir, takeover=approval,
+            )
         except BaseException as exc:  # pragma: no cover - diagnostic propagation
             second_errors.append(exc)
 
     def interleaved_claim(**kwargs):
-        nonlocal second_thread
-        claimed = original_claim(**kwargs)
-        if current_thread().name == "first-takeover":
-            second_thread = Thread(target=second_attempt, name="second-takeover")
-            second_thread.start()
-            assert second_entered.wait(timeout=10), "second replacement did not claim"
-        return claimed
+        if current_thread().name == "second-takeover":
+            second_admitted.set()
+            assert release_second_claim.wait(timeout=10)
+        return original_claim(**kwargs)
 
     monkeypatch.setattr(restart, "_claim_attempt", interleaved_claim)
-    try:
-        def first_driver(_cfg, **_kwargs):
-            first_driver_calls.append(True)
-            return 0
 
-        def first_attempt() -> None:
-            try:
-                execute_restart(
-                    cfg=_attempt_cfg(row, system), row=row,
-                    config_path=config_path, run=first_driver,
-                    run_dir=run_dir, takeover=approval,
-                )
-            except BaseException as exc:  # pragma: no cover - diagnostic propagation
-                first_errors.append(exc)
+    second = Thread(target=second_attempt, name="second-takeover")
+    second.start()
+    assert second_admitted.wait(timeout=10), "second takeover did not reach its claim gate"
 
-        first = Thread(target=first_attempt, name="first-takeover")
-        first.start()
-        first.join(timeout=10)
-        assert not first.is_alive(), "first takeover did not finish"
-        assert first_driver_calls == []
-        assert len(first_errors) == 1
-        assert isinstance(first_errors[0], RestartRefusal)
-        assert first_errors[0].cause is RestartCause.TAKEOVER_APPROVAL_SCOPE_MISMATCH
-    finally:
-        release_second.set()
-        if second_thread is not None:
-            second_thread.join(timeout=10)
-    assert second_thread is not None and not second_thread.is_alive()
-    assert second_errors == []
-    assert len(second_results) == 1
+    def first_driver(_cfg, **_kwargs):
+        return 0
+
+    def first_attempt() -> None:
+        try:
+            first_results.append(execute_restart(
+                cfg=_attempt_cfg(row, system), row=row,
+                config_path=config_path, run=first_driver,
+                run_dir=run_dir, takeover=approval,
+            ))
+        except BaseException as exc:  # pragma: no cover - diagnostic propagation
+            first_errors.append(exc)
+        finally:
+            release_second_claim.set()
+
+    first = Thread(target=first_attempt, name="first-takeover")
+    first.start()
+    first.join(timeout=10)
+    second.join(timeout=10)
+    assert not first.is_alive() and not second.is_alive()
+    assert first_errors == []
+    assert len(first_results) == 1
+    assert second_calls == []
+    assert len(second_errors) == 1
+    assert isinstance(second_errors[0], RestartRefusal)
+    assert second_errors[0].cause is RestartCause.TAKEOVER_APPROVAL_SCOPE_MISMATCH
 
 
 @pytest.mark.integration

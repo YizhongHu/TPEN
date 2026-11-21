@@ -433,6 +433,36 @@ def _active_attempt_lease_paths(attempts: Path) -> list[Path]:
     return active
 
 
+def _takeover_receipts_overlapping(
+    attempts: Path, approved_attempt_keys: frozenset[str], *, exclude: Path,
+) -> list[Path]:
+    """Return other takeover receipts that name any approved lease key."""
+
+    if not approved_attempt_keys or not attempts.is_dir():
+        return []
+    overlapping: list[Path] = []
+    for receipt_path in sorted(attempts.glob("attempt-*.json")):
+        if (
+            receipt_path.resolve() == exclude.resolve()
+            or receipt_path.name.endswith(".outcome.json")
+        ):
+            continue
+        try:
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        takeover = payload.get("takeover") if isinstance(payload, dict) else None
+        names = (
+            takeover.get("superseded_attempts", [])
+            if isinstance(takeover, dict) else []
+        )
+        if isinstance(names, list) and approved_attempt_keys.intersection(
+            name for name in names if isinstance(name, str)
+        ):
+            overlapping.append(receipt_path)
+    return overlapping
+
+
 def _reject_configured_restore_on_fresh(cfg: Any) -> None:
     """Reject concrete raw restore input before acquiring a restart lease."""
 
@@ -619,14 +649,19 @@ def execute_restart(
         ]
         post_claim_active_keys = frozenset(path.name for path in post_claim_active)
         if takeover is not None:
-            scope_mismatch = post_claim_active_keys != approved_attempt_keys
+            overlapping_takeovers = _takeover_receipts_overlapping(
+                attempts, approved_attempt_keys, exclude=lease_path,
+            )
+            scope_mismatch = bool(post_claim_active or overlapping_takeovers)
         else:
+            overlapping_takeovers = []
             scope_mismatch = bool(post_claim_active)
         if scope_mismatch:
             reason = (
                 "takeover approval superseded attempt scope changed after sequence claim: "
                 f"approved={sorted(approved_attempt_keys)} "
-                f"active={sorted(post_claim_active_keys)}"
+                f"active={sorted(post_claim_active_keys)} "
+                f"overlapping_takeovers={[path.name for path in overlapping_takeovers]}"
                 if takeover is not None
                 else "occupied lineage attempt after sequence claim: "
                 + ", ".join(str(path) for path in post_claim_active)
