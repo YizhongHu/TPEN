@@ -25,17 +25,17 @@ MUTANTS = (
         "test_v2_manifest_rebuilds_attempts_segments_and_admissions",
     ),
     (
-        "v2-manifest-uses-v1-member-list",
+        "v2-manifest-group-id-projection",
         MODULE_NAME,
-        "members = set(group.execution_plan.member_task_ids)",
-        "members = {member.task_id for member in group.members}",
-        "test_v2_manifest_uses_plan_member_namespace",
+        "manifest_group_id = group.group_id.value",
+        "manifest_group_id = str(group.group_id)",
+        "test_v2_manifest_rebuilds_attempts_segments_and_admissions",
     ),
     (
         "v1-routed-through-v2-branch",
         MODULE_NAME,
-        "if isinstance(group, ReadyGroupV2):\n            members = set(group.execution_plan.member_task_ids)",
-        "if True:\n            members = set(group.execution_plan.member_task_ids)",
+        "if isinstance(group, ReadyGroupV2):\n            manifest_group_id = group.group_id.value",
+        "if True:\n            manifest_group_id = group.group_id.value",
         "test_v1_manifest_path_keeps_legacy_encoding",
     ),
 )
@@ -57,6 +57,8 @@ def test_v2_manifest_rebuilds_attempts_segments_and_admissions(tmp_path: Path) -
 
     manifest = DirectoryStore(store.root).manifest(group)
 
+    assert manifest.group_id == group.group_id.value
+    assert manifest.group_digest == group.identity
     assert {attempt.task_id for attempt in manifest.attempts} == {"successor", "completed"}
     successor = next(attempt for attempt in manifest.attempts if attempt.task_id == "successor")
     assert successor.successor_admission is not None
@@ -79,13 +81,6 @@ def test_v2_manifest_rejects_crossed_receipt_identity(tmp_path: Path) -> None:
         store.manifest(group)
 
 
-def test_v2_manifest_uses_plan_member_namespace() -> None:
-    """The v2 branch must be visibly bound to its plan member roster."""
-
-    source = MODULE.read_text(encoding="utf-8")
-    assert "members = set(group.execution_plan.member_task_ids)" in source
-
-
 def test_v1_manifest_path_keeps_legacy_encoding(tmp_path: Path) -> None:
     """The v1 path still emits the existing RunManifest wire shape."""
 
@@ -98,6 +93,9 @@ def test_v1_manifest_path_keeps_legacy_encoding(tmp_path: Path) -> None:
     store.finish_attempt(fence, "completed", "2026-11-05T00:01:00Z")
 
     manifest = store.manifest(group)
+    assert manifest.group_id == group.group_id
+    assert manifest.group_digest == group.identity
+    assert [attempt.task_id for attempt in manifest.attempts] == ["task-a"]
     assert RunManifest.decode(manifest.encode()) == manifest
     assert manifest.schema == "tpen-executor/run-manifest-v2"
 

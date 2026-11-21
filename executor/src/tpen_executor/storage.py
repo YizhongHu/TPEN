@@ -1823,13 +1823,11 @@ class DirectoryStore:
         attempts: list[ManifestAttempt] = []
         segments: list[AcceptedSegment] = []
         admissions: dict[tuple[str, AttemptId], SuccessorAdmissionRecord] = {}
-        # v2's execution plan is the authoritative ordered member namespace;
-        # v1 retains its original task-record namespace unchanged.
+        # ReadyGroupV2 validates that plan member IDs equal the task records.
+        members = {member.task_id for member in group.members}
         if isinstance(group, ReadyGroupV2):
-            members = set(group.execution_plan.member_task_ids)
             manifest_group_id = group.group_id.value
         else:
-            members = {member.task_id for member in group.members}
             manifest_group_id = group.group_id
         if not os.path.lexists(self.root):
             return RunManifest(manifest_group_id, group.identity, ())
