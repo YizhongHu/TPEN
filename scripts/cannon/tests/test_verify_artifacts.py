@@ -38,6 +38,34 @@ collect_full_suite_artifacts
 """
 
 
+def _cleanup_harness(source: str, run_root: Path, work_root: Path, marker: Path, mode: str, driver_exit: int) -> str:
+    """Return the real cleanup path with only scratch deletion observed."""
+
+    start = source.index("artifact_is_excluded() {")
+    cleanup_start = source.index("\ncleanup() {")
+    trap_start = source.index("\ntrap cleanup EXIT", cleanup_start)
+    functions = source[start:cleanup_start]
+    cleanup = source[cleanup_start:trap_start]
+    return f"""\
+set -Eeuo pipefail
+RUN_ROOT={shlex.quote(str(run_root))}
+WORK_ROOT=/scratch/fixture-user/fixture-job
+TMPDIR={shlex.quote(str(work_root / 'tmp'))}
+CLONE={shlex.quote(str(work_root / 'clone'))}
+USER=fixture-user
+SLURM_JOB_ID=fixture-job
+MODE={shlex.quote(mode)}
+FULL_SUITE=1
+PYTHON=python3
+assert_write_path() {{ :; }}
+rm() {{ touch {shlex.quote(str(marker))}; }}
+{functions}
+{cleanup}
+trap cleanup EXIT
+exit {driver_exit}
+"""
+
+
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
 
@@ -110,20 +138,45 @@ def test_full_suite_collector_copies_allowlist_and_writes_inventory(tmp_path: Pa
     assert (run_root / "evidence/artifacts-timing.txt").read_text().startswith("artifact_collection_seconds=")
 
 
-def test_collector_is_full_suite_only_and_verdict_isolation_is_fail_closed() -> None:
-    source = VERIFY.read_text()
-    cleanup = source[source.index("cleanup() {") : source.index("trap cleanup EXIT")]
-    assert 'if [[ "$MODE" == measure && "$FULL_SUITE" == 1 ]]' in cleanup
-    assert 'printf \'DRIVER_EXIT=%s\\n\' "$rc"' in cleanup
-    assert "ARTIFACTS_FAILED reason=" in cleanup
-    assert 'exit "$rc"' in cleanup
-    assert '[[ "$WORK_ROOT" == "/scratch/$USER/$SLURM_JOB_ID" ]] && rm -rf' in cleanup
+def test_collector_failure_preserves_verdict_and_cleans_scratch(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    (run_root / "evidence").mkdir(parents=True)
+    (run_root / "evidence/verdict.txt").write_text("FAIL\n")
+    work_root = tmp_path / "work"
+    (work_root / "tmp").mkdir(parents=True)
+    marker = tmp_path / "scratch-cleaned"
+    script = _cleanup_harness(VERIFY.read_text(), run_root, work_root, marker, "measure", 7)
+    result = subprocess.run(
+        ["bash", "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ["PATH"], "ARTIFACTS_FORCE_FAILURE": "1"},
+    )
+    assert result.returncode == 7, result.stdout + result.stderr
+    assert (run_root / "evidence/driver-exit.txt").read_text() == "DRIVER_EXIT=7\n"
+    assert (run_root / "evidence/verdict.txt").read_text() == "FAIL\n"
+    assert (run_root / "evidence/artifacts-status.txt").read_text().startswith("ARTIFACTS_FAILED reason=")
+    assert marker.exists()
 
-    # The test-only failure switch proves that a collection failure is possible
-    # without making it a second product verdict or changing quick mode.
-    assert 'ARTIFACTS_FORCE_FAILURE' in source
-    assert 'FULL_SUITE="${FULL_SUITE:-0}"' in source
-    assert "collect_full_suite_artifacts" in source
+
+def test_quick_mode_cleanup_does_not_create_artifact_tree(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    (run_root / "evidence").mkdir(parents=True)
+    work_root = tmp_path / "work"
+    (work_root / "tmp").mkdir(parents=True)
+    marker = tmp_path / "scratch-cleaned"
+    script = _cleanup_harness(VERIFY.read_text(), run_root, work_root, marker, "quick", 0)
+    result = subprocess.run(
+        ["bash", "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ["PATH"]},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (run_root / "artifacts").exists()
+    assert marker.exists()
 
 
 def test_full_suite_does_not_overwrite_an_existing_inventory(tmp_path: Path) -> None:
