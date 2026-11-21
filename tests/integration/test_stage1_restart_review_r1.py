@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 
 from experiments.atomistic.stage1.restart import (
     RestartApproval,
+    RestartCause,
     RestartRefusal,
     execute_restart,
     select_restart,
@@ -218,6 +219,103 @@ def test_lineage_claim_serializes_stale_and_current_selections(
         in {"lineage_claim_lost", "selection_stale_after_claim"}
         for error in errors
     ), [repr(error) for error in errors]
+
+
+@pytest.mark.integration
+def test_lineage_claim_collision_refuses_loser_without_orphan_lease(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A same-sequence collision refuses the loser and leaves no orphan lease."""
+
+    from experiments.atomistic.stage1 import restart
+
+    system = "he"
+    row = _row(system, tmp_path)
+    config_path = CONFIG_ROOT / system / "train.yaml"
+    run_dir = resolve_run_dir(row)
+    cfg = _attempt_cfg(row, system)
+    claim_gate = Barrier(2)
+    lease_calls: list[Path] = []
+    original_create = restart.create_json_receipt
+
+    def synchronized_create(path: Path, payload: object) -> None:
+        path = Path(path)
+        is_lease = (
+            path.parent == run_dir / "attempts"
+            and path.name.startswith("attempt-")
+            and path.name.endswith(".json")
+            and not path.name.endswith(".outcome.json")
+        )
+        if is_lease:
+            lease_calls.append(path)
+            # Both contenders must compute attempt-000000 before either
+            # exclusive create is allowed to run.  A retry-next mutant then
+            # necessarily writes a second lease, which the assertions expose.
+            if len(lease_calls) <= 2:
+                claim_gate.wait(timeout=10)
+        original_create(path, payload)
+
+    monkeypatch.setattr(restart, "create_json_receipt", synchronized_create)
+    errors: list[tuple[str, BaseException]] = []
+    driver_calls: list[str] = []
+
+    def contender(name: str) -> None:
+        try:
+            execute_restart(
+                cfg=cfg, row=row, config_path=config_path,
+                run=lambda *_args, **_kwargs: driver_calls.append(name) or 0,
+                run_dir=run_dir,
+            )
+        except BaseException as exc:  # pragma: no cover - diagnostic propagation
+            errors.append((name, exc))
+
+    contenders = [
+        Thread(target=contender, args=(name,), name=f"{name}-contender")
+        for name in ("first", "second")
+    ]
+    for thread in contenders:
+        thread.start()
+    for thread in contenders:
+        thread.join(timeout=10)
+    assert all(not thread.is_alive() for thread in contenders)
+
+    attempts = run_dir / "attempts"
+    lease_files = sorted(
+        path for path in attempts.glob("attempt-*.json")
+        if not path.name.endswith(".outcome.json")
+    )
+    outcome_files = sorted(attempts.glob("attempt-*.outcome.json"))
+    assert lease_calls == [attempts / "attempt-000000.json"] * 2
+    assert [path.name for path in lease_files] == ["attempt-000000.json"]
+    assert len(driver_calls) == 1
+    assert len(errors) == 1
+    loser_error = errors[0][1]
+    assert isinstance(loser_error, RestartRefusal)
+    assert loser_error.cause is RestartCause.LINEAGE_CLAIM_LOST
+
+    # The winner may publish its ordinary parked outcome.  A refusal receipt,
+    # if the implementation chooses to persist one, must still reference the
+    # winning lease and carry a typed collision cause; it cannot create an
+    # outcome for a non-existent retry lease.
+    assert outcome_files
+    winner = lease_files[0]
+    for outcome_path in outcome_files:
+        outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+        assert outcome["lease"] == str(winner)
+        assert outcome["attempt"] == winner.stem
+        if outcome.get("cause") == RestartCause.LINEAGE_CLAIM_LOST.value:
+            assert outcome["outcome"] == "parked"
+
+    # Once the winner's outcome is durable, an ordinary restart must be able
+    # to claim the next sequence; only an orphan lease would block it.
+    successor_calls: list[bool] = []
+    successor = execute_restart(
+        cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
+        run=lambda *_args, **_kwargs: successor_calls.append(True) or 0,
+        run_dir=run_dir,
+    )
+    assert successor_calls == [True]
+    assert successor.lease_path.name == "attempt-000001.json"
 
 
 @pytest.mark.integration
