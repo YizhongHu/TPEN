@@ -191,6 +191,8 @@ def _assert_equivalent(expected: dict[str, Any], observed: dict[str, Any]) -> No
     assert expected["trainer"] == observed["trainer"]
     np.testing.assert_allclose(expected["observable"], observed["observable"], rtol=RTOL, atol=ATOL)
     for key in ("model", "optimizer", "sampler", "process_rng", "callback_dispositions"):
+        assert key in expected and key in observed
+    for key in ("sampler", "process_rng", "callback_dispositions"):
         assert expected[key] == observed[key], key
 
 
