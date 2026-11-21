@@ -63,7 +63,7 @@ MUTANTS = (
         "request-binding-bypass",
         "tpen/execution/core_admission.py",
         "if not _request_binds_to_inspection(context, evidence, request):",
-        "if True:",
+        "if False:",
         "test_review_request_for_another_leaf_is_unknown",
     ),
     (
@@ -71,7 +71,7 @@ MUTANTS = (
         "tpen/execution/core_admission.py",
         'if evidence.verdict == "refused" or evidence.refusal is not None:',
         "if False:",
-        "test_review_contradictory_terminal_outcome_is_unknown",
+        "test_stale_inspection_is_not_admitted_from_request_bytes",
     ),
     # typed-v3-only-bypass is intentionally omitted: RunEvidence rejects
     # typed outcomes on non-v3 records, and binding/validity reject the rest.
@@ -99,8 +99,8 @@ MUTANTS = (
     (
         "missing-payload-to-unavailable",
         "tpen/inspection.py",
-        "except FileNotFoundError as exc:  # named checkpoint payload remains typed",
-        "except OSError as exc:  # named checkpoint payload remains typed",
+        "    try:\n        ref.validate()\n    except FileNotFoundError as exc:\n        raise _InspectionRefusal(\n            \"stale-checkpoint-ref\", f\"checkpoint ref no longer matches its bytes: {exc}\"\n        ) from exc\n",
+        "    try:\n        ref.validate()\n",
         "test_delta_missing_model_remains_typed_stale_refusal",
     ),
     (
