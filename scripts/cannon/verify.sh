@@ -127,27 +127,11 @@ artifact_is_excluded() {
 artifact_copy_file() {
   local source="$1" destination_rel="$2" inventory="$3"
   local source_class="${4:-unknown}" producer="${5:-harness}"
-  local destination hash source_hash size escaped_destination escaped_source
   [[ -f "$source" ]] || return 1
   [[ "${ARTIFACTS_FORCE_FAILURE:-0}" != 1 ]] || return 1
   artifact_is_excluded "$destination_rel" && return 0
-  destination="$RUN_ROOT/artifacts/$destination_rel"
-  [[ ! -e "$destination" ]] || return 1
-  assert_write_path "$destination" || return 1
-  mkdir -p -- "$(dirname -- "$destination")" || return 1
-  cp -- "$source" "$destination" || return 1
-  hash="$(sha256sum -- "$destination" | awk '{print $1}')" || return 1
-  source_hash="$(sha256sum -- "$source" | awk '{print $1}')" || return 1
-  [[ "$hash" == "$source_hash" ]] || return 1
-  size="$(wc -c < "$destination")" || return 1
-  escaped_destination="$(printf '%q' "$destination_rel")"
-  escaped_source="$(printf '%q' "$source")"
-  ARTIFACT_FILE_COUNT=$((ARTIFACT_FILE_COUNT + 1))
-  ARTIFACT_BYTES=$((ARTIFACT_BYTES + size))
-  printf '%s  %s\n' "$hash" "$escaped_destination" >> "$inventory" || return 1
-  if [[ -n "${ARTIFACTS_METADATA:-}" ]]; then
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$source_class" "$escaped_source" "on" "$escaped_destination" "$size" "$hash" "$producer" >> "$ARTIFACTS_METADATA" || return 1
-  fi
+  assert_write_path "$RUN_ROOT/artifacts/$destination_rel" || return 1
+  printf '%s\0%s\0%s\0%s\0' "$source" "$destination_rel" "$source_class" "$producer" >> "$ARTIFACT_CANDIDATES" || return 1
 }
 
 artifact_copy_tree() {
@@ -215,8 +199,10 @@ artifact_copy_work_allowlist() {
 collect_full_suite_artifacts() {
   local inventory="$RUN_ROOT/artifacts/.INVENTORY.sha256.tmp"
   local metadata="$RUN_ROOT/artifacts/.artifact-inventory.tsv.tmp"
+  local candidates="$RUN_ROOT/artifacts/.artifact-candidates.tmp"
   local status_file="$RUN_ROOT/evidence/artifacts-status.txt"
   local size_file="$RUN_ROOT/evidence/artifacts-size.txt"
+  local collector_summary collector_rc collector_status collector_count collector_bytes collector_reason
   ARTIFACT_FILE_COUNT=0
   ARTIFACT_BYTES=0
   [[ ! -e "$RUN_ROOT/artifacts/INVENTORY.sha256" ]] || return 1
@@ -225,16 +211,100 @@ collect_full_suite_artifacts() {
   mkdir -p -- "$RUN_ROOT/artifacts" || return 1
   assert_write_path "$inventory" || return 1
   assert_write_path "$metadata" || return 1
+  assert_write_path "$candidates" || return 1
   : > "$inventory" || return 1
   printf 'source_class\tsource_path\tarm\tretained_path\tbytes\tsha256\tproducer\n' > "$metadata" || return 1
-  ARTIFACTS_METADATA="$metadata"
+  : > "$candidates" || return 1
+  ARTIFACT_CANDIDATES="$candidates"
   artifact_copy_work_allowlist "$inventory" || return 1
   artifact_copy_clone_deltas "$inventory" || return 1
+  if collector_summary="$(${PYTHON:-python3} - "$RUN_ROOT/artifacts" "$inventory" "$metadata" "$candidates" "${ARTIFACT_COLLECTION_BUDGET_SECONDS:-900}" <<'PY'
+import hashlib
+import os
+import sys
+import time
+from pathlib import Path
+
+
+artifacts, inventory_path, metadata_path, candidates_path, budget = sys.argv[1:]
+started = time.monotonic()
+deadline = time.monotonic() + float(budget)
+delay = float(os.environ.get("ARTIFACT_TEST_COPY_DELAY_SECONDS", "0"))
+records = Path(candidates_path).read_bytes().split(b"\0")
+seen = set()
+count = 0
+total = 0
+partial = False
+reason = ""
+
+with Path(inventory_path).open("w", encoding="utf-8") as inventory, Path(metadata_path).open("a", encoding="utf-8") as metadata:
+    for index in range(0, len(records) - 1, 4):
+        if time.monotonic() >= deadline:
+            partial = True
+            reason = "collection budget exceeded"
+            break
+        source = os.fsdecode(records[index])
+        destination_rel = os.fsdecode(records[index + 1])
+        source_class = os.fsdecode(records[index + 2])
+        producer = os.fsdecode(records[index + 3])
+        if destination_rel in seen:
+            print(f"duplicate retained path: {destination_rel}", file=sys.stderr)
+            sys.exit(1)
+        seen.add(destination_rel)
+        destination = Path(artifacts, destination_rel)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        hasher = hashlib.sha256()
+        size = 0
+        with open(source, "rb") as src, destination.open("wb") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                hasher.update(chunk)
+                size += len(chunk)
+                if delay:
+                    time.sleep(delay)
+        digest = hasher.hexdigest()
+        escaped_destination = repr(destination_rel)[1:-1]
+        escaped_source = repr(source)[1:-1]
+        inventory.write(f"{digest}  {escaped_destination}\n")
+        metadata.write(f"{source_class}\t{escaped_source}\ton\t{escaped_destination}\t{size}\t{digest}\t{producer}\n")
+        count += 1
+        total += size
+        if time.monotonic() >= deadline:
+            partial = True
+            reason = "collection budget exceeded"
+            break
+
+if partial:
+    print(f"PARTIAL\t{count}\t{total}\t{time.monotonic() - started:.3f}\t{reason}")
+else:
+    print(f"OK\t{count}\t{total}\t{time.monotonic() - started:.3f}")
+PY
+  )"; then
+    collector_rc=0
+  else
+    collector_rc=$?
+  fi
+  rm -f -- "$candidates"
+  ARTIFACT_CANDIDATES=""
+  ((collector_rc == 0)) || return "$collector_rc"
+  IFS=$'\t' read -r collector_status collector_count collector_bytes collector_elapsed collector_reason <<< "$collector_summary"
+  ARTIFACT_FILE_COUNT="$collector_count"
+  ARTIFACT_BYTES="$collector_bytes"
   mv -- "$inventory" "$RUN_ROOT/artifacts/INVENTORY.sha256" || return 1
   mv -- "$metadata" "$RUN_ROOT/artifacts/artifact-inventory.tsv" || return 1
+  assert_write_path "$RUN_ROOT/evidence/artifacts-timing.txt" || return 1
+  printf 'artifact_collection_seconds=%s\n' "$collector_elapsed" > "$RUN_ROOT/evidence/artifacts-timing.txt" || return 1
   assert_write_path "$size_file" || return 1
   printf 'artifact_file_count=%s artifact_bytes=%s\n' "$ARTIFACT_FILE_COUNT" "$ARTIFACT_BYTES" > "$size_file" || return 1
-  printf 'ARTIFACTS_OK\n' > "$status_file" || return 1
+  if [[ "$collector_status" == PARTIAL ]]; then
+    printf 'ARTIFACTS_PARTIAL reason=%s artifact_file_count=%s artifact_bytes=%s\n' \
+      "$collector_reason" "$ARTIFACT_FILE_COUNT" "$ARTIFACT_BYTES" > "$status_file" || return 1
+  else
+    printf 'ARTIFACTS_OK\n' > "$status_file" || return 1
+  fi
 }
 
 cleanup() {

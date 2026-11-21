@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ast
 import os
 import shlex
 import subprocess
@@ -10,6 +11,12 @@ from pathlib import Path
 
 
 VERIFY = Path(__file__).resolve().parents[3] / "scripts" / "cannon" / "verify.sh"
+
+
+def _decode_inventory_path(value: str) -> str:
+    """Decode the collector's one-line escaped path representation."""
+
+    return ast.literal_eval(f"'{value}'")
 
 
 def _collector_harness(source: str, run_root: Path, work_root: Path, clone: Path) -> str:
@@ -89,10 +96,9 @@ def test_full_suite_collector_copies_allowlist_and_writes_inventory(tmp_path: Pa
     assert len(inventory) == 6
     for line in inventory[:5]:
         digest, relative = line.split("  ", 1)
-        assert digest == hashlib.sha256((artifacts / relative).read_bytes()).hexdigest()
-    escaped_newline_paths = [line for line in inventory if "newline" in line and "name.txt" in line]
-    assert len(escaped_newline_paths) == 1
-    assert "\\n" in escaped_newline_paths[0]
+        assert digest == hashlib.sha256((artifacts / _decode_inventory_path(relative)).read_bytes()).hexdigest()
+    decoded_paths = [_decode_inventory_path(line.split("  ", 1)[1]) for line in inventory]
+    assert decoded_paths.count("checkout/outputs/newline\nname.txt") == 1
     size_line = (run_root / "evidence/artifacts-size.txt").read_text().strip()
     expected_bytes = sum(
         len(content)
@@ -100,6 +106,7 @@ def test_full_suite_collector_copies_allowlist_and_writes_inventory(tmp_path: Pa
     )
     assert size_line == f"artifact_file_count=6 artifact_bytes={expected_bytes}"
     assert (run_root / "evidence/artifacts-status.txt").read_text() == "ARTIFACTS_OK\n"
+    assert (run_root / "evidence/artifacts-timing.txt").read_text().startswith("artifact_collection_seconds=")
 
 
 def test_collector_is_full_suite_only_and_verdict_isolation_is_fail_closed() -> None:
@@ -133,3 +140,28 @@ def test_full_suite_does_not_overwrite_an_existing_inventory(tmp_path: Path) -> 
     )
     assert result.returncode != 0
     assert (run_root / "artifacts/INVENTORY.sha256").read_text() == "sentinel\n"
+
+
+def test_collection_budget_writes_partial_without_touching_verdict_or_scratch(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    (run_root / "evidence").mkdir(parents=True)
+    (run_root / "evidence/driver-exit.txt").write_text("DRIVER_EXIT=7\n")
+    work_root = tmp_path / "work"
+    (work_root / "tmp" / "pytest-basetemp").mkdir(parents=True)
+    (work_root / "tmp" / "pytest-basetemp" / "test.log").write_text("pytest\n")
+    clone = _make_clone(tmp_path)
+
+    script = _collector_harness(VERIFY.read_text(), run_root, work_root, clone)
+    result = subprocess.run(
+        ["bash", "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "ARTIFACT_COLLECTION_BUDGET_SECONDS": "0"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (run_root / "evidence/artifacts-status.txt").read_text().startswith("ARTIFACTS_PARTIAL reason=")
+    assert "artifact_file_count=0 artifact_bytes=0" in (run_root / "evidence/artifacts-size.txt").read_text()
+    assert (run_root / "evidence/artifacts-timing.txt").read_text().startswith("artifact_collection_seconds=")
+    assert (run_root / "evidence/driver-exit.txt").read_text() == "DRIVER_EXIT=7\n"
+    assert work_root.exists()
