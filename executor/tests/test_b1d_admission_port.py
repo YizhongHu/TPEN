@@ -17,7 +17,7 @@ from tpen_executor.contracts import (
     ReadyGroupV2,
     TaskSpec,
 )
-from tpen_executor.recovery import MappingCoreAdmissionPort, MemberRecoveryInputV2, ProfileCheck, reconcile_group
+from tpen_executor.recovery import CoreAdmissionUnavailable, MappingCoreAdmissionPort, MemberRecoveryInputV2, ProfileCheck, reconcile_group
 from tpen_executor.results import OutcomeReceipt, StartReceipt
 
 
@@ -130,7 +130,10 @@ def test_malformed_wire_mapping_parks_core_admission_unavailable(mutation: str) 
         del wire["reason"]
     else:
         wire["admission"] = 1
-    result = _result(_group("task"), wire)
+    group = _group("task")
+    with pytest.raises(CoreAdmissionUnavailable):
+        MappingCoreAdmissionPort(lambda _member: wire).admit(_member(group, "task"))
+    result = _result(group, wire)
     assert (result.action, result.reason_code) == ("park", "core-admission-unavailable")
 
 
@@ -166,7 +169,9 @@ def test_evaluator_exceptions_are_unavailable(error: Exception) -> None:
 def test_none_evidence_is_unavailable_and_never_admitted() -> None:
     """An absent core mapping is different from a terminal core verdict."""
 
-    result = _result(_group("task"), None)
+    group = _group("task")
+    assert MappingCoreAdmissionPort(lambda _member: None).admit(_member(group, "task")) is None
+    result = _result(group, None)
     assert (result.action, result.reason_code) == ("park", "core-admission-unavailable")
 
 
@@ -250,15 +255,22 @@ MUTANTS = (
     (
         "catch-only-runtime-error",
         "recovery.py",
-        'except Exception:\n            # Any evaluator or decoder failure is unavailable evidence.\n            return None  # unavailable',
-        'except RuntimeError:\n            # Any evaluator or decoder failure is unavailable evidence.\n            return None  # unavailable',
+        'except Exception as exc:\n            # Failure is typed so controller consumers distinguish uncertainty\n            # from the evaluator\'s affirmative absent-leaf result.\n            # Evaluator failures are unavailable evidence.\n            raise CoreAdmissionUnavailable("core admission evaluator failed") from exc',
+        'except RuntimeError:\n            # Failure is typed so controller consumers distinguish uncertainty\n            # from the evaluator\'s affirmative absent-leaf result.\n            # Evaluator failures are unavailable evidence.\n            raise CoreAdmissionUnavailable("core admission evaluator failed")',
         "test_evaluator_exceptions_are_unavailable",
     ),
     (
         "admit-on-exception",
         "recovery.py",
-        'return None  # unavailable',
-        'return CoreAdmissionVerdictV2("successor", "admitted", "valid", "valid", ProfileCheck("native-recovery/v2", "supported", frozenset({"model"}), None), "exception")',
+        '            # Evaluator failures are unavailable evidence.\n            raise CoreAdmissionUnavailable("core admission evaluator failed") from exc',
+        '            return CoreAdmissionVerdictV2("successor", "admitted", "valid", "valid", ProfileCheck("native-recovery/v2", "supported", frozenset({"model"}), None), "exception")',
         "test_evaluator_exceptions_are_unavailable",
+    ),
+    (
+        "failure-collapses-to-none",
+        "recovery.py",
+        '            # Failure is typed so controller consumers distinguish uncertainty\n            # from the evaluator\'s affirmative absent-leaf result.\n            # Evaluator failures are unavailable evidence.\n            raise CoreAdmissionUnavailable("core admission evaluator failed") from exc',
+        '            # Failure is typed so controller consumers distinguish uncertainty\n            # from the evaluator\'s affirmative absent-leaf result.\n            # Evaluator failures are unavailable evidence.\n            return None',
+        "test_mapping_failure_cannot_authorize_fresh_launch",
     ),
 )

@@ -465,6 +465,10 @@ class CoreAdmissionPort(Protocol):
         """Return a typed verdict, or ``None`` when core evidence is absent."""
 
 
+class CoreAdmissionUnavailable(RuntimeError):
+    """Raised when core admission evidence cannot be trusted or decoded."""
+
+
 CORE_ADMISSION_WIRE_SCHEMA = "tpen-core-admission-v1"
 _CORE_ADMISSION_WIRE_FIELDS = frozenset(
     {"schema", "outcome", "admission", "checkpoint", "quiescence", "profile", "reason"}
@@ -487,9 +491,12 @@ class MappingCoreAdmissionPort:
     Scalar fields are exact strings, while ``profile`` is either ``None`` or
     decoded by :meth:`ProfileCheck.from_mapping`.  Core-owned quiescence is
     deliberately ignored: the executor fills it as ``valid`` only when the
-    member has a settled outcome receipt, and as ``unknown`` otherwise.  Any
-    callable exception, malformed mapping, or absent evidence returns
-    ``None``.  The callable is in-process; no timeout machinery is provided.
+    member has a settled outcome receipt, and as ``unknown`` otherwise.  An
+    evaluator returning ``None`` is genuine absent evidence and is returned as
+    ``None``.  Evaluator exceptions and malformed or invalid mappings raise
+    :class:`CoreAdmissionUnavailable`, so uncertainty cannot be mistaken for
+    absent evidence by a controller.  The callable is in-process; no timeout
+    machinery is provided.
     """
 
     def __init__(self, evaluate: Callable[[MemberRecoveryInputV2], Mapping[str, Any] | None]) -> None:
@@ -502,8 +509,16 @@ class MappingCoreAdmissionPort:
 
         try:
             payload = self._evaluate(member)
-            if payload is None:
-                return None
+        except CoreAdmissionUnavailable:
+            raise
+        except Exception as exc:
+            # Failure is typed so controller consumers distinguish uncertainty
+            # from the evaluator's affirmative absent-leaf result.
+            # Evaluator failures are unavailable evidence.
+            raise CoreAdmissionUnavailable("core admission evaluator failed") from exc
+        if payload is None:
+            return None
+        try:
             if not isinstance(payload, Mapping):
                 raise TypeError("payload must be a mapping")
             if set(payload) != _CORE_ADMISSION_WIRE_FIELDS:
@@ -532,9 +547,10 @@ class MappingCoreAdmissionPort:
                 profile,
                 payload["reason"],
             )
-        except Exception:
-            # Any evaluator or decoder failure is unavailable evidence.
-            return None  # unavailable
+        except CoreAdmissionUnavailable:
+            raise
+        except Exception as exc:
+            raise CoreAdmissionUnavailable("core admission payload invalid") from exc
 
 
 def _park(member: MemberRecoveryInputV2, reason_code: str) -> MemberReconciliationV2:
@@ -668,7 +684,7 @@ reconcile = reconcile_group
 __all__ = [
     "CORE_ADMISSION_VERDICTS", "CORE_CHECKPOINT_VERDICTS", "CORE_QUIESCENCE_VERDICTS", "CORE_RECOVERY_OUTCOMES",
     "CoreProfileReference",
-    "CoreAdmissionPort", "CoreAdmissionVerdictV2", "CORE_ADMISSION_WIRE_SCHEMA", "GroupReconciliationV2", "MappingCoreAdmissionPort", "MemberReconciliationV2", "MemberRecoveryInputV2",
+    "CoreAdmissionPort", "CoreAdmissionUnavailable", "CoreAdmissionVerdictV2", "CORE_ADMISSION_WIRE_SCHEMA", "GroupReconciliationV2", "MappingCoreAdmissionPort", "MemberReconciliationV2", "MemberRecoveryInputV2",
     "PROFILE_REFUSAL_CODES",
     "ProfileCheck",
     "ProfileUnavailable",
