@@ -45,6 +45,13 @@ def _digest(value: object) -> str:
     return hashlib.sha256(pickle.dumps(value, protocol=5)).hexdigest()
 
 
+def _tensor_digest(value: object) -> str:
+    """Hash tensor bytes, independent of device/storage metadata."""
+    import torch
+    tensor = value.detach().cpu().contiguous()
+    return hashlib.sha256(tensor.numpy().tobytes()).hexdigest()
+
+
 def _tree_digest(root: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
@@ -100,10 +107,11 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
         except ImportError:  # pragma: no cover - TPEN requires torch on Cannon
             pass
         sampler_state = sampler.mcmc_state_dict()
-        sampler_cursor = _digest({
-            "walkers": sampler_state.get("walkers"),
-            "generator_state": sampler_state.get("generator_state"),
-        })
+        sampler_cursor = (
+            _tensor_digest(sampler_state["walkers"])
+            + ":"
+            + _tensor_digest(sampler_state["generator_state"])
+        )
         return {
             "model": _digest(model.state_dict()),
             "observable": float(next(model.parameters()).detach().reshape(-1)[0]),
