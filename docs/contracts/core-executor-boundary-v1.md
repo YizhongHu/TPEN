@@ -51,11 +51,11 @@ The executor decodes this mapping as a strict closed set: unknown schemas,
 extra or missing fields, invalid scalar values, invalid profile records,
 evaluator exceptions, and any non-`unknown` core quiescence claim are
 unavailable evidence and are parked. Core quiescence must remain `unknown`;
-the executor fills it only from a settled outcome receipt, and only that
-settled receipt can support successor admission. Every typed failure or
-refusal therefore preserves or parks the member, never admits it; a successor
-is admitted only after the decoder has produced the settled outcome receipt
-and the complete `successor/admitted/valid` evidence set.
+the executor fills quiescence as `valid` only when the member already has a
+settled operational outcome receipt, and only that settled receipt can support
+successor admission. Every typed failure or refusal therefore preserves or
+parks the member, never admits it; a successor is admitted only with the
+complete `successor/admitted/valid` evidence and that settled receipt.
 
 ## 1. Scope and authority
 

@@ -121,12 +121,13 @@ def _reconcile_real_mapping(
     context,
     *,
     task_id: str = "task",
+    status: str = "failed",
 ) -> tuple[dict[str, object] | None, object]:
     """Run the real producer through the real executor decoder and reducer."""
 
     mapping = evaluate_core_admission(context)
     group = _group((task_id,))
-    member = _member(group, task_id, root=tmp_path)
+    member = _member(group, task_id, status=status, root=tmp_path)
     result = reconcile_group(
         group,
         (member,),
@@ -196,12 +197,26 @@ def test_real_producer_and_decoder_cover_every_admission_class(tmp_path: Path) -
         ("missing-leaf", admission_context(None), "park", "core-admission-unavailable"),
     )
     for name, context, action, reason in cases:
-        mapping, result = _reconcile_real_mapping(tmp_path / name, context)
+        mapping, result = _reconcile_real_mapping(
+            tmp_path / name,
+            context,
+            status="completed" if name == "completed" else "failed",
+        )
         assert (result.action, result.reason_code) == (action, reason), name
         if name == "missing-leaf":
             assert mapping is None
         else:
             assert mapping is not None
+
+    _, contradictory = _reconcile_real_mapping(
+        tmp_path / "contradictory-completion",
+        admission_context(completed),
+        status="failed",
+    )
+    assert (contradictory.action, contradictory.reason_code) == (
+        "park",
+        "contradictory-completion",
+    )
 
 
 def test_real_mapping_does_not_claim_quiescence(tmp_path: Path) -> None:
