@@ -347,4 +347,45 @@ class LaunchIntentV1:
         return cls.from_mapping(decode_json(data))
 
 
-__all__ = ["AllocationAttemptV2", "ConfiguredAllocation", "ControllerGenerationV1", "LaunchIntentV1", "MemberInvocationV2"]
+@frozen_record
+class ControllerOutcomeReceiptV1:
+    """Write-once operational acknowledgement for one fenced launch."""
+
+    schema: ClassVar[str] = "tpen-executor/controller-outcome-v1"
+    task_id: str
+    attempt_id: AttemptId
+    invocation_id: InvocationId
+    controller_generation: int
+    claimant_nonce: str
+    status: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.attempt_id, AttemptId) or not isinstance(self.invocation_id, InvocationId):
+            raise TypeError("controller outcome identities have invalid types")
+        object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
+        if type(self.controller_generation) is not int or self.controller_generation < 1:
+            raise TypeError("controller_generation must be positive")
+        object.__setattr__(self, "claimant_nonce", text(self.claimant_nonce, "claimant_nonce"))
+        object.__setattr__(self, "status", text(self.status, "status"))
+        object.__setattr__(self, "reason", text(self.reason, "reason"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"schema": self.schema, "task_id": self.task_id, "attempt_id": self.attempt_id.to_dict(),
+                "invocation_id": self.invocation_id.to_dict(), "controller_generation": self.controller_generation,
+                "claimant_nonce": self.claimant_nonce, "status": self.status, "reason": self.reason}
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "ControllerOutcomeReceiptV1":
+        fields(data, {"schema", "task_id", "attempt_id", "invocation_id", "controller_generation", "claimant_nonce", "status", "reason"}, cls.schema, cls.__name__)
+        return cls(data["task_id"], AttemptId.from_mapping(data["attempt_id"]), InvocationId.from_mapping(data["invocation_id"]), data["controller_generation"], data["claimant_nonce"], data["status"], data["reason"])
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "ControllerOutcomeReceiptV1":
+        return cls.from_mapping(decode_json(data))
+
+
+__all__ = ["AllocationAttemptV2", "ConfiguredAllocation", "ControllerGenerationV1", "ControllerOutcomeReceiptV1", "LaunchIntentV1", "MemberInvocationV2"]

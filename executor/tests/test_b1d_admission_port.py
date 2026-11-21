@@ -23,19 +23,24 @@ from tpen_executor.results import OutcomeReceipt, StartReceipt
 
 def _group(*task_ids: str) -> ReadyGroupV2:
     members = tuple(
-        TaskSpec(
-            task_id,
-            f"lineage-{task_id}",
-            ProgramSpecRef({"entrypoint": "opaque", "task": task_id}, digest({"task": task_id})),
-            digest({"task": task_id}),
-            1,
-            "steps",
-        )
+        _task(task_id)
         for task_id in task_ids
     )
     plan_ref = {"members": list(task_ids), "plan": "b1d-exec"}
     plan = ExecutionPlanV2(plan_ref, digest(plan_ref), task_ids, "native-recovery/v2", "preserve-or-park/v1")
     return ReadyGroupV2(GroupId("group-b1d"), members, plan)
+
+
+def _task(task_id: str) -> TaskSpec:
+    config_ref = {"entrypoint": "opaque", "task": task_id}
+    return TaskSpec(
+        task_id,
+        f"lineage-{task_id}",
+        ProgramSpecRef(config_ref, digest(config_ref)),
+        digest({"task": task_id}),
+        1,
+        "steps",
+    )
 
 
 def _member(group: ReadyGroupV2, task_id: str, *, status: str = "failed") -> MemberRecoveryInputV2:

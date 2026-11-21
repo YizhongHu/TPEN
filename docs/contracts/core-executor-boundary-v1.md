@@ -8,6 +8,45 @@ Core owns scientific run artifacts, public inspection, and checkpoint facts.
 The executor owns process launch, attempt fencing, operational receipts, and
 its immutable mirror of core evidence.
 
+## 4.2 Core admission mapping v1
+
+`tpen.execution.core_admission.evaluate_core_admission` produces the
+standalone mapping `tpen-core-admission-v1`.  The core module has no
+`tpen_executor` import; a composition root passes its mapping to the executor
+port.  The closed mapping is canonical JSON with these fields:
+
+```json
+{
+  "schema": "tpen-core-admission-v1",
+  "outcome": "completed|successor|terminal|unknown",
+  "admission": "admitted|refused|unknown",
+  "checkpoint": "valid|invalid|absent|unknown",
+  "quiescence": "unknown",
+  "profile": {"schema":"tpen.profile-check/v1", "profile":"...", "verdict":"supported|refused", "state_owners":[], "refusal":null},
+  "reason": "stable reason code"
+}
+```
+
+The mapping is read-only and deterministic.  A missing core leaf returns
+`null`, allowing the executor's existing `start_fresh` rule.  Before any
+authoritative mapping, the evaluator binds the context to the freshly
+inspected normalized leaf, run/config identity, checkpoint facts, and request
+science digest.  The composition root guarantees the context's task/lineage
+to leaf mapping; `RunEvidence` carries no lineage and the evaluator does not
+claim to verify that outer binding.  A binding failure, malformed request,
+decoder refusal, unavailable read, inspection refusal/contradiction, or
+non-v3 evidence maps to all-unknown.  Only a valid typed v3 decision may map
+to a terminal result: `completed` maps to `completed`; typed `failed` or
+`refused` maps to `terminal/refused/absent`; typed `unknown` maps to all
+unknown.  A genuine typed missing/stale publication refusal retains its
+stable refusal code and maps to `successor/refused/invalid`; an unavailable
+catalog/ref read is all-unknown even when the inspection code is otherwise
+the same.  A valid typed planned yield is checked by the native profile gate
+and then by `select_successor_admission`: accepted evidence maps to
+`successor/admitted/valid`, while a typed profile or admission refusal maps to
+`successor/refused/invalid` with its stable refusal code.  Core never infers
+operational quiescence, so `quiescence` is always `unknown`.
+
 ## 1. Scope and authority
 
 The public core evidence record is produced by `tpen.inspection.inspect_run`
