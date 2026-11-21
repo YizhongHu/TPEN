@@ -474,6 +474,13 @@ def _validate_override_topology_agreement(
             "runtime.device override requires bound topology and must resolve "
             "to an exact string"
         )
+    configured_kind = configured.partition(":")[0]
+    bound_kind = bound.partition(":")[0]
+    if str.__eq__(configured_kind, bound_kind) is not True:
+        raise LaunchValidationError(
+            "override path 'runtime.device' disagrees with bound topology.device: "
+            f"resolved={configured!r}, bound={bound!r}"
+        )
 
 
 def _caller_override_has_interpolation(overrides: object) -> bool:
@@ -492,13 +499,6 @@ def _caller_override_has_interpolation(overrides: object) -> bool:
     ):
         return any(_caller_override_has_interpolation(value) for value in overrides)
     return False
-    configured_kind = configured.partition(":")[0]
-    bound_kind = bound.partition(":")[0]
-    if str.__eq__(configured_kind, bound_kind) is not True:
-        raise LaunchValidationError(
-            "override path 'runtime.device' disagrees with bound topology.device: "
-            f"resolved={configured!r}, bound={bound!r}"
-        )
 
 
 def prepare_train_launch(
