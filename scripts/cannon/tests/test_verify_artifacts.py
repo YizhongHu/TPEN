@@ -265,7 +265,7 @@ def test_collection_budget_covers_git_listing_time(tmp_path: Path) -> None:
     fake_git = fake_bin / "git"
     fake_git.write_text(
         "#!/bin/sh\n"
-        "case \"$*\" in *' diff '*|*' ls-files '*) sleep 0.05; exit 0;; esac\n"
+        "case \"$*\" in *' diff '*|*' ls-files '*) sleep 5; exit 0;; esac\n"
         f"exec {shlex.quote(real_git)} \"$@\"\n"
     )
     fake_git.chmod(0o755)
@@ -278,9 +278,13 @@ def test_collection_budget_covers_git_listing_time(tmp_path: Path) -> None:
         env={
             **os.environ,
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
-            "ARTIFACT_COLLECTION_BUDGET_SECONDS": "0.01",
+            "ARTIFACT_COLLECTION_BUDGET_SECONDS": "1",
         },
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert (run_root / "evidence/artifacts-status.txt").read_text().startswith("ARTIFACTS_PARTIAL reason=")
+    assert (run_root / "evidence/artifacts-status.txt").read_text().startswith(
+        "ARTIFACTS_PARTIAL reason=collection budget exceeded during git listing"
+    )
     assert (run_root / "evidence/artifacts-size.txt").read_text().startswith("artifact_file_count=0 artifact_bytes=0")
+    elapsed = float((run_root / "evidence/artifacts-timing.txt").read_text().split("=", 1)[1])
+    assert elapsed < 3
