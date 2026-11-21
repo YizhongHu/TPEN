@@ -38,6 +38,25 @@ MUTANTS = (
         "if True:\n            manifest_group_id = group.group_id.value",
         "test_v1_manifest_path_keeps_legacy_encoding",
     ),
+    (
+        "v2-manifest-skips-admission-context",
+        MODULE_NAME,
+        """                if isinstance(group, ReadyGroupV2):
+                    binding = admission.successor_binding
+                    member = next(member for member in group.members if member.task_id == task_id)
+                    if (
+                        binding is None
+                        or binding.allocation_attempt.group_id != group.group_id
+                        or binding.group_digest != group.identity
+                        or binding.lineage_id != member.lineage_id
+                    ):
+                        raise ValueError(\"successor admission binding is foreign to v2 group\")
+""",
+        """                if False:
+                    pass
+""",
+        "test_review_s6aa_manifest_checks_admission_context",
+    ),
 )
 
 
@@ -109,6 +128,12 @@ def test_s6a_mutant_table_targets_unique_compilable_killers() -> None:
         for name, value in globals().items()
         if name.startswith("test_") and callable(value)
     }
+    import test_review_s6aa_manifest as reviewer_tests
+    names.update(
+        name
+        for name, value in vars(reviewer_tests).items()
+        if name.startswith("test_") and callable(value)
+    )
     anchors = [row[2] for row in MUTANTS]
     assert len(anchors) == len(set(anchors))
     for _name, filename, before, after, killer in MUTANTS:

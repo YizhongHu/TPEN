@@ -1911,6 +1911,16 @@ class DirectoryStore:
                     segments.append(segment)
                 attempts.append(ManifestAttempt(task_id, start.attempt_id, start, outcome, start.output_dir, placement, core_outcome))
             for admission in self._admission_records_for_task(task_dir, task_id):
+                if isinstance(group, ReadyGroupV2):
+                    binding = admission.successor_binding
+                    member = next(member for member in group.members if member.task_id == task_id)
+                    if (
+                        binding is None
+                        or binding.allocation_attempt.group_id != group.group_id
+                        or binding.group_digest != group.identity
+                        or binding.lineage_id != member.lineage_id
+                    ):
+                        raise ValueError("successor admission binding is foreign to v2 group")
                 key = (task_id, admission.predecessor_attempt_id)
                 if key in admissions:
                     raise ValueError("successor admission ledger contains a predecessor fork")

@@ -172,6 +172,9 @@ class PreservedAttempt:
         Why the attempt is preserved rather than counted in a committed chain.
     placement_receipt : mapping or None
         Independently validated operational placement evidence for the attempt.
+    successor_admission : mapping or None
+        Independently validated successor-admission evidence, including the
+        v2 successor binding when present.
     """
 
     task_id: str
@@ -181,6 +184,7 @@ class PreservedAttempt:
     reason: str = "not-selected"
     placement_receipt: Mapping[str, Any] | None = None
     core_outcome: Mapping[str, Any] | None = None
+    successor_admission: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1413,6 +1417,7 @@ def _manifest(path: Path) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], t
     if isinstance(value["attempts"], (str, bytes, bytearray)) or not isinstance(value["attempts"], list):
         raise ManifestRefusal("malformed-record", "manifest attempts must be a sequence")
     attempts = tuple(_attempt(item, value["group_digest"]) for item in value["attempts"])
+    _check_successor_admission_context(attempts, value["group_id"], value["group_digest"])
     for attempt in attempts:
         if attempt["start_receipt"]["group_digest"] != value["group_digest"]:
             raise ManifestRefusal("group-digest-mismatch", "start receipt group_digest differs from manifest")
@@ -1507,6 +1512,28 @@ def _manifest(path: Path) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], t
         if advertised_blocking != actual_blocking or advertised_not_sampled != actual_not_sampled:
             raise ManifestRefusal("placement-verdict-mismatch", "manifest placement verdict disagrees with v2 receipts")
     return dict(value), attempts, raw_segments, placement_verdict
+
+
+def _check_successor_admission_context(
+    attempts: tuple[dict[str, Any], ...], group_id: str, group_digest: str
+) -> None:
+    """Require each v2 successor binding to belong to its enclosing group."""
+
+    for attempt in attempts:
+        admission = attempt.get("successor_admission")
+        if admission is None or admission["schema"] != "tpen-executor/successor-admission-v2":
+            continue
+        binding = admission["successor_binding"]
+        if binding["allocation_attempt"]["group_id"]["value"] != group_id:
+            raise ManifestRefusal(
+                "group-binding-mismatch",
+                "successor admission allocation_attempt.group_id differs from manifest",
+            )
+        if binding["group_digest"] != group_digest:
+            raise ManifestRefusal(
+                "group-binding-mismatch",
+                "successor admission group_digest differs from manifest",
+            )
 
 
 def _check_segments(attempts: tuple[dict[str, Any], ...], segments: tuple[dict[str, Any], ...]) -> None:
@@ -1659,6 +1686,7 @@ def read(
             ),
             _freeze_json(attempt["placement_receipt"]),
             _freeze_json(attempt["core_outcome"]),
+            _freeze_json(attempt.get("successor_admission")),
         )
         for attempt in attempts
         if attempt["attempt_id"] not in selected_ids
