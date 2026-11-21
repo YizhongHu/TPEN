@@ -430,6 +430,39 @@ def test_real_controller_launches_only_the_admitted_successor(tmp_path: Path) ->
     assert result["launch_count"] == 1
 
 
+def test_controller_unknown_mapping_overrides_prefilled_successor(tmp_path: Path) -> None:
+    """Expected PASS: real uncertainty overrides the fixture's admitted verdict.
+
+    Paired with the existing launch control, this distinguishes consumption of
+    the parent mapping from reuse of the child's prefilled core verdict. With
+    controller ``verdict = item.core_verdict`` in place of the port call, expect
+    FAIL: the fixture's successor launches. Neither arm was run by the reviewer.
+    """
+
+    mappings = {}
+    for task_id in ("ambiguous", "successor"):
+        run_dir = tmp_path / task_id
+        run_dir.mkdir()
+        write_run_start(run_dir)
+        (run_dir / "status.json").write_text('{"status":"unknown"}\n', encoding="utf-8")
+        write_outcome(run_dir, "unknown")
+        mappings[task_id] = evaluate_core_admission(
+            admission_context(run_dir, task_id=task_id)
+        )
+        assert mappings[task_id] is not None
+        assert mappings[task_id]["outcome"] == "unknown"
+
+    result = executor_call(
+        _EXECUTOR_CHILD,
+        tmp_path,
+        "controller",
+        {"mappings": mappings, "root": str(tmp_path / "controller-child")},
+    )
+    assert result["member_outcomes"] == {"ambiguous": "parked", "successor": "parked"}
+    assert result["launch_calls"] == []
+    assert result["launch_count"] == 0
+
+
 def test_mutant_rows_are_well_formed_and_have_named_killers() -> None:
     """Mutation rows select one compilable source anchor and a real killer."""
 
