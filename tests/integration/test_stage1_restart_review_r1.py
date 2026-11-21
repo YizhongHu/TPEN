@@ -132,20 +132,27 @@ def test_lineage_claim_serializes_stale_and_current_selections(
     first_selected = Event()
     release_first = Event()
     scans = Barrier(2)
+    select_counts: dict[str, int] = {}
     scan_counts: dict[str, int] = {}
     driver_calls: list[str] = []
     errors: list[BaseException] = []
+    stale_revalidated = Event()
     original_select = restart.select_restart
     original_active = restart._active_attempt_lease_paths
 
     def delayed_select(**kwargs):
         selected = original_select(**kwargs)
         name = current_thread().name
-        if name == "stale-contender":
+        select_counts[name] = select_counts.get(name, 0) + 1
+        if name == "stale-contender" and select_counts[name] == 1:
             assert selected.predecessor is not None
             assert selected.predecessor.next_iteration == 1000
             first_selected.set()
             assert release_first.wait(timeout=10)
+        elif name == "stale-contender":
+            assert selected.predecessor is not None
+            assert selected.predecessor.next_iteration == 2000
+            stale_revalidated.set()
         return selected
 
     def synchronized_scan(attempts: Path):
@@ -204,6 +211,7 @@ def test_lineage_claim_serializes_stale_and_current_selections(
     current.join(timeout=10)
     assert not stale.is_alive() and not current.is_alive()
     assert len(driver_calls) <= 1
+    assert stale_revalidated.is_set()
     assert all(
         isinstance(error, RestartRefusal)
         and error.cause.value
