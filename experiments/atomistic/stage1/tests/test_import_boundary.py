@@ -17,7 +17,9 @@ _RESTART_IMPORTS = {
         "OperationalRestoreRequest", "ScienceIntent", "CheckpointEvidence",
         "select_recovery", "validate_native_recovery_profile",
     },
-    "tpen.checkpoint": {"list_complete_checkpoints", "CheckpointRef"},
+    "tpen.checkpoint": {
+        "list_complete_checkpoints", "CheckpointRef", "configured_load_mode",
+    },
     "tpen.run": {"run_from_config", "load_config"},
 }
 

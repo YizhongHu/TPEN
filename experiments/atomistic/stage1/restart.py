@@ -24,7 +24,7 @@ from experiments.atomistic.stage1.protocol import (
 )
 from experiments.atomistic.stage1.train import prepare_initial_checkpoint_config
 from experiments.toolkit.run_paths import resolve_run_dir
-from tpen.checkpoint import CheckpointRef, list_complete_checkpoints
+from tpen.checkpoint import CheckpointRef, configured_load_mode, list_complete_checkpoints
 from tpen.execution import (
     CheckpointEvidence,
     OperationalRestoreRequest,
@@ -39,6 +39,7 @@ from tpen.run import load_config, run_from_config
 
 
 _STEP_NAME = re.compile(r"step_(?P<step>[0-9]{6})$")
+_ATTEMPT_SEQUENCE = re.compile(r"attempt-(?P<number>[0-9]{6})\.json$")
 ATTEMPT_RECEIPT_SCHEMA = "stage1/restart-attempt/v1"
 OUTCOME_RECEIPT_SCHEMA = "stage1/restart-outcome/v1"
 
@@ -391,9 +392,26 @@ def _active_attempt_lease_paths(attempts: Path) -> list[Path]:
 
     if not attempts.is_dir():
         return []
+    superseded: set[str] = set()
+    for takeover_path in sorted(attempts.glob("attempt-*.json")):
+        if takeover_path.name.endswith(".outcome.json"):
+            continue
+        try:
+            payload = json.loads(takeover_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        takeover = payload.get("takeover") if isinstance(payload, dict) else None
+        if not isinstance(takeover, dict) or takeover.get("approved") is not True:
+            continue
+        names = takeover.get("superseded_attempts", [])
+        if isinstance(names, list):
+            superseded.update(name for name in names if isinstance(name, str))
+
     active: list[Path] = []
     for lease_path in sorted(attempts.glob("*.json")):
         if lease_path.name.endswith(".outcome.json"):
+            continue
+        if lease_path.name in superseded:
             continue
         if not (attempts / f"{lease_path.stem}.outcome.json").is_file():
             active.append(lease_path)
@@ -403,18 +421,87 @@ def _active_attempt_lease_paths(attempts: Path) -> list[Path]:
 def _reject_configured_restore_on_fresh(cfg: Any) -> None:
     """Reject concrete raw restore input before acquiring a restart lease."""
 
-    configured_load = OmegaConf.select(cfg, "runner.load", default=None)
-    if configured_load is None:
-        return
     try:
-        load_payload = OmegaConf.to_container(configured_load, resolve=False)
-    except (TypeError, ValueError) as exc:
-        raise RestartRefusal("configured runner.load is not an admitted typed restore") from exc
-    if load_payload not in (None, {}, []):
+        mode = configured_load_mode(cfg)
+    except ValueError as exc:
+        raise RestartRefusal("configured load is not an admitted typed restore") from exc
+    if mode != "none":
         raise RestartRefusal(
-            "fresh restart refuses concrete runner.load; use the selected "
+            "fresh restart refuses concrete configured load; use the selected "
             "OperationalRestoreRequest"
         )
+
+
+def _attempt_number(path: Path) -> int | None:
+    match = _ATTEMPT_SEQUENCE.fullmatch(path.name)
+    return None if match is None else int(match.group("number"))
+
+
+def _claim_attempt(
+    *, attempts: Path, selection: RestartSelection, identity: Mapping[str, Any],
+    takeover: RestartApproval | None, superseded_attempts: list[Path],
+) -> tuple[str, Path]:
+    """Exclusively claim the next monotonic lineage attempt sequence number."""
+
+    existing = [
+        number for path in attempts.glob("attempt-*.json")
+        if (number := _attempt_number(path)) is not None
+    ]
+    number = max(existing, default=-1) + 1
+    while True:
+        attempt_key = f"attempt-{number:06d}"
+        lease_path = attempts / f"{attempt_key}.json"
+        lease_payload: dict[str, Any] = {
+            "schema": ATTEMPT_RECEIPT_SCHEMA,
+            "lineage": dict(identity),
+            "predecessor_content_id": selection.content_id,
+            "attempt_sequence": number,
+            "attempt_key": attempt_key,
+            "decision": selection.decision.value,
+            "run_dir": str(selection.run_dir),
+        }
+        if takeover is not None:
+            lease_payload["takeover"] = {
+                "approved": True,
+                "predecessor_content_id": takeover.predecessor_content_id,
+                "lineage_id": takeover.lineage_id,
+                "config_identity": takeover.config_identity,
+                "overlay_identity": takeover.overlay_identity,
+                "target_iterations": takeover.target_iterations,
+                "terminal_pbs_proof": takeover.terminal_pbs_proof,
+                "quiescent": takeover.quiescent,
+                "adopted_budget": takeover.adopted_budget,
+                "superseded_attempts": [path.name for path in superseded_attempts],
+            }
+        try:
+            create_json_receipt(lease_path, lease_payload)
+        except ReceiptExistsError:
+            number += 1
+            continue
+        return attempt_key, lease_path
+
+
+def _write_claim_refusal(
+    *, outcome_path: Path, lease_path: Path, selection: RestartSelection,
+    identity: Mapping[str, Any], attempt_key: str, reason: str,
+) -> None:
+    """Close a claimed sequence with durable refusal evidence before raising."""
+
+    _write_outcome(outcome_path, {
+        "schema": OUTCOME_RECEIPT_SCHEMA,
+        "lease": str(lease_path),
+        "lineage": dict(identity),
+        "run_dir": str(selection.run_dir),
+        "attempt": attempt_key,
+        "decision": selection.decision.value,
+        "outcome": "parked",
+        "exit_code": None,
+        "published_content_id": None,
+        "next_iteration": None,
+        "logs": {"attempt_dir": str(selection.run_dir / "attempts" / attempt_key)},
+        "cause": RestartCause.INVOCATION_ERROR.value,
+        "reason": reason,
+    })
 
 
 def execute_restart(
@@ -460,23 +547,57 @@ def execute_restart(
         )
 
     attempts.mkdir(parents=True, exist_ok=True)
-    # A takeover never overwrites the predecessor lease.  Its approval is an
-    # explicit new attempt namespace, while the original content identity is
-    # retained in the receipt for S1-RC to reconcile later.
-    attempt_key = selection.content_id if takeover is None else f"{selection.content_id}.takeover"
-    lease_path = attempts / f"{attempt_key}.json"
-    lease_payload = {
-        "schema": ATTEMPT_RECEIPT_SCHEMA,
-        "lineage": identity,
-        "predecessor_content_id": selection.content_id,
-        "attempt_key": attempt_key,
-        "decision": selection.decision.value,
-        "run_dir": str(selection.run_dir),
-    }
+    # The sequence receipt is the lineage-wide admission barrier.  A takeover
+    # claims the next number too and durably names every active predecessor it
+    # is authorized to supersede; old receipts are never rewritten.
+    superseded_attempts = active_leases if takeover is not None else []
+    attempt_key, lease_path = _claim_attempt(
+        attempts=attempts, selection=selection, identity=identity,
+        takeover=takeover, superseded_attempts=superseded_attempts,
+    )
+    outcome_path = attempts / f"{attempt_key}.outcome.json"
+
+    # Selection is read-only before the claim, but publication may advance in
+    # the gap.  Re-derive it after the sequence claim and reject any other
+    # live owner before entering the driver.
     try:
-        create_json_receipt(lease_path, lease_payload)
-    except ReceiptExistsError as exc:
-        raise RestartRefusal(f"occupied predecessor lease: {lease_path}") from exc
+        refreshed_selection = select_restart(cfg=cfg, row=row, run_dir=run_dir)
+        if takeover is not None and refreshed_selection.content_id != expected_approval[
+            "predecessor_content_id"
+        ]:
+            raise RestartRefusal("takeover selection changed after lineage claim")
+        selection = refreshed_selection
+        if selection.decision is StartDecision.FRESH:
+            _reject_configured_restore_on_fresh(cfg)
+        post_claim_active = [
+            path for path in _active_attempt_lease_paths(attempts)
+            if path.resolve() != lease_path.resolve()
+        ]
+        if takeover is not None:
+            post_claim_active = [
+                path for path in post_claim_active
+                if path not in superseded_attempts
+            ]
+        if post_claim_active:
+            reason = (
+                "occupied lineage attempt after sequence claim: "
+                + ", ".join(str(path) for path in post_claim_active)
+            )
+            _write_claim_refusal(
+                outcome_path=outcome_path, lease_path=lease_path,
+                selection=selection, identity=identity,
+                attempt_key=attempt_key, reason=reason,
+            )
+            raise RestartRefusal(reason)
+    except RestartRefusal:
+        if outcome_path.is_file():
+            raise
+        _write_claim_refusal(
+            outcome_path=outcome_path, lease_path=lease_path,
+            selection=selection, identity=identity,
+            attempt_key=attempt_key, reason="selection invalid after lineage claim",
+        )
+        raise
 
     attempt_dir = attempts / attempt_key
     try:
@@ -559,7 +680,6 @@ def execute_restart(
         }
         outcome = "parked"
         exit_code = None
-    outcome_path = attempts / f"{attempt_key}.outcome.json"
     _write_outcome(outcome_path, receipt)
     return RestartResult(selection, lease_path, outcome_path, outcome, exit_code, receipt)
 
