@@ -158,12 +158,8 @@ def _config(path: Path, root: Path, run_id: str) -> None:
     cfg.runtime.device = "cpu"
     cfg.runtime.dtype = "float64"
     cfg.trainer.max_steps = H
-    if run_id in {"successor", "disabled"}:
-        # Start these fresh processes from a distinct seed.  A real restore must
-        # replace the successor's process RNG with the prefix state; skipping
-        # apply_rng_state must therefore be observable at the boundary.  The
-        # no-restore control likewise has a genuine divergence, not pickle
-        # metadata differences.
+    if run_id == "disabled":
+        # Give the no-restore control a genuine divergence, not pickle metadata.
         cfg.runtime.seed = 1
     cfg.sampler.n_walkers = 4
     cfg.sampler.burn_in = 1
@@ -186,6 +182,14 @@ def _child(action: str, config_path: str, record_path: str, checkpoint_path: str
 
     def capture_optimizer(*args, **kwargs):
         observer._optimizer = original_make_optimizer(*args, **kwargs)
+        if action == "successor":
+            # Perturb process RNG after construction/config hashing but before
+            # the restore boundary. A real restore replaces this state; a
+            # skipped apply_rng_state leaves the perturbation observable.
+            random.seed(1)
+            np.random.seed(1)
+            import torch
+            torch.manual_seed(1)
         return observer._optimizer
 
     def capture_runner(runner, context):
