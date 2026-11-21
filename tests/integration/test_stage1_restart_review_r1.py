@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from threading import Event, Thread
+from threading import Barrier, Event, Thread, current_thread
 from types import SimpleNamespace
 
 import pytest
@@ -110,6 +110,100 @@ def test_inflight_initial_lease_blocks_second_driver_after_publication(tmp_path:
         thread.join(timeout=10)
     assert not thread.is_alive()
     assert first_errors == []
+
+
+@pytest.mark.integration
+def test_lineage_claim_serializes_stale_and_current_selections(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A stale selection and a current selection cannot both enter the driver."""
+
+    from experiments.atomistic.stage1 import restart
+
+    system = "he"
+    row = _row(system, tmp_path)
+    config_path = CONFIG_ROOT / system / "train.yaml"
+    run_dir = resolve_run_dir(row)
+    first_cfg = _attempt_cfg(row, system)
+    second_cfg = _attempt_cfg(row, system)
+
+    publisher_at_1000 = Event()
+    release_publisher = Event()
+    first_selected = Event()
+    release_first = Event()
+    scans = Barrier(2)
+    driver_calls: list[str] = []
+    errors: list[BaseException] = []
+    original_select = restart.select_restart
+    original_active = restart._active_attempt_lease_paths
+
+    def delayed_select(**kwargs):
+        selected = original_select(**kwargs)
+        name = current_thread().name
+        if name == "stale-contender":
+            assert selected.predecessor is not None
+            assert selected.predecessor.next_iteration == 1000
+            first_selected.set()
+            assert release_first.wait(timeout=10)
+        return selected
+
+    def synchronized_scan(attempts: Path):
+        paths = original_active(attempts)
+        if current_thread().name in {
+            "stale-contender", "current-contender",
+        }:
+            scans.wait(timeout=10)
+        return paths
+
+    monkeypatch.setattr(restart, "select_restart", delayed_select)
+    monkeypatch.setattr(restart, "_active_attempt_lease_paths", synchronized_scan)
+
+    def publisher_driver(_cfg, **_kwargs):
+        _publish(run_dir, step=1000)
+        publisher_at_1000.set()
+        assert release_publisher.wait(timeout=10)
+        _publish(run_dir, step=2000)
+        (run_dir / "status.json").write_text(
+            json.dumps({"status": "planned_yield"}) + "\n", encoding="utf-8"
+        )
+        return 0
+
+    def contender(name: str, cfg: object) -> None:
+        try:
+            execute_restart(
+                cfg=cfg, row=row, config_path=config_path,
+                run=lambda *_args, **_kwargs: driver_calls.append(name) or 0,
+                run_dir=run_dir,
+            )
+        except BaseException as exc:  # pragma: no cover - diagnostic propagation
+            errors.append(exc)
+
+    publisher = Thread(
+        target=lambda: execute_restart(
+            cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
+            run=publisher_driver, run_dir=run_dir,
+        ),
+        name="publisher",
+    )
+    publisher.start()
+    assert publisher_at_1000.wait(timeout=10)
+
+    stale = Thread(target=contender, args=("stale", first_cfg), name="stale-contender")
+    stale.start()
+    assert first_selected.wait(timeout=10)
+
+    # The publisher completes after the first contender selected step 1000.
+    release_publisher.set()
+    publisher.join(timeout=10)
+    assert not publisher.is_alive()
+    current = Thread(target=contender, args=("current", second_cfg), name="current-contender")
+    current.start()
+    release_first.set()
+    stale.join(timeout=10)
+    current.join(timeout=10)
+    assert not stale.is_alive() and not current.is_alive()
+    assert len(driver_calls) <= 1
+    assert all(isinstance(error, RestartRefusal) for error in errors)
 
 
 @pytest.mark.integration
