@@ -1,0 +1,121 @@
+[
+  {
+    "id": "polaris-gpu-count-check-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "[[ \"${#gpu_lines[@]}\" == 4 ]] || die \"expected 4 GPUs, got ${#gpu_lines[@]}\"",
+    "new": "true",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_wrong_gpu_count"
+  },
+  {
+    "id": "polaris-mig-check-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "[[ \"$line\" == \"Disabled\" ]] || die \"MIG mode is not Disabled: $line\"",
+    "new": "true",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_mig_enabled"
+  },
+  {
+    "id": "polaris-single-visible-gpu-check-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "[[ \"$count\" == 1 ]] || die \"expected one visible GPU for binding $i, got $count\"",
+    "new": "true",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_multiple_visible_devices"
+  },
+  {
+    "id": "polaris-eagle-prefix-check-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "assert_contained_path \"$RESULTS_ROOT\" \"$RESULTS_PREFIX\" RESULTS_ROOT",
+    "new": ":",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_non_eagle_results_root"
+  },
+  {
+    "id": "polaris-external-cache-check-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "[[ -d \"$UV_CACHE_DIR\" ]] || die \"UV_CACHE_DIR is missing: $UV_CACHE_DIR\"",
+    "new": "true",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_dry_exec_rejects_missing_external_cache"
+  },
+  {
+    "id": "polaris-guard-interpreter-default-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "GUARD_PYTHON_BIN=\"${GUARD_PYTHON_BIN:-$PYTHON_BIN}\"",
+    "new": ":",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
+  },
+  {
+    "id": "polaris-promisor-check-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "[[ -z \"$(git -C \"$CHECKOUT\" config --local --get-regexp '^remote\\..*\\.promisor$' || true)\" ]] ||",
+    "new": "true ||",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_rejects_promisor_checkout_before_uv"
+  },
+  {
+    "id": "polaris-uv-interpreter-controls-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "export UV_PYTHON=\"$PYBIN\" UV_NO_MANAGED_PYTHON=1 UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy",
+    "new": "export UV_PYTHON=\"$PYBIN\" UV_NO_MANAGED_PYTHON=1 UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=hardlink",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
+  },
+  {
+    "id": "polaris-owned-boot-rejection-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "die \"BOOT_ROOT already exists and is not owned: $BOOT_ROOT\"",
+    "new": "true",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_dry_exec_rejects_existing_boot_root_without_touching_it"
+  },
+  {
+    "id": "polaris-resolved-root-check-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "canonical.relative_to(root.resolve())",
+    "new": "pass",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_dot_dot_escape_before_any_write"
+  },
+  {
+    "id": "polaris-lexical-dot-dot-check-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "if [[ \"$RESULTS_ROOT\" == .. || \"$RESULTS_ROOT\" == ../* || \"$RESULTS_ROOT\" == */../* || \"$RESULTS_ROOT\" == */.. ]]; then",
+    "new": "if false; then",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_rejects_dot_dot_escape_before_any_write"
+  },
+  {
+    "id": "polaris-cuda-row-admission-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "# Replace launch.render's GPU-row admission before any guard or driver.\n    if row.get(\"device\") != \"cuda\":\n        raise SystemExit(f\"row {row.get('row_id', '<unknown>')} must have device=cuda\")",
+    "new": "# Mutant drops launch.render's GPU-row admission.\nif False:\n    raise SystemExit(\"mutated row admission\")",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
+  },
+  {
+    "id": "polaris-test-prefix-pbs-guard-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "if [[ \"${PBS_ENVIRONMENT:-}\" == PBS_BATCH || \"${PBS_ENVIRONMENT:-}\" == PBS_INTERACTIVE || -n \"${PBS_JOBID:-}\" ]]; then",
+    "new": "if false; then",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_test_prefix_override_refused_in_pbs_batch"
+  },
+  {
+    "id": "polaris-smt-dedup-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "if core in seen_cores:\n        continue",
+    "new": "if False:\n        continue",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_derives_smt_deduplicated_disjoint_layout"
+  },
+  {
+    "id": "polaris-layout-disjoint-assert-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "assert not (core_sets[left] & core_sets[right]), (\n            f\"lineage core sets overlap: {left} and {right}\"\n        )",
+    "new": "assert True",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_guard_derives_smt_deduplicated_disjoint_layout"
+  },
+  {
+    "id": "polaris-omp-core-count-dropped",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "export CUDA_VISIBLE_DEVICES=\"$gpu\" OMP_NUM_THREADS=\"$core_count\" MKL_NUM_THREADS=\"$core_count\"",
+    "new": "export CUDA_VISIBLE_DEVICES=\"$gpu\" OMP_NUM_THREADS=16 MKL_NUM_THREADS=16",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
+  },
+  {
+    "id": "polaris-hard-coded-cpu-range-restored",
+    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
+    "old": "lineage=0\n      cpu_set=\"${LINEAGE_CPU_SETS[$lineage]}\"\n      core_count=\"${LINEAGE_CORE_COUNTS[$lineage]}\"",
+    "new": "lineage=0\n      cpu_set=\"0-15\"\n      core_count=\"${LINEAGE_CORE_COUNTS[$lineage]}\"",
+    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
+  }
+]

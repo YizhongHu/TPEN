@@ -11,12 +11,16 @@ import json
 import re
 import base64
 import binascii
+import copy
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from omegaconf import OmegaConf
+from omegaconf._utils import split_key
+import yaml
 
 from experiments.baselines.systems import load_registry
 from experiments.toolkit.run_paths import resolve_run_dir
@@ -25,6 +29,22 @@ SYSTEMS = ("hooke1", "hooke2", "he", "h2")
 KINDS = ("smoke", "train", "eval")
 CONFIG_IDENTITY_RULE = "stage1-config-v1"
 LEGACY_CONFIG_IDENTITY_RULE = "legacy-config-sha256"
+HOOKE_SCIENCE_PROFILE = "hooke-hv2-v1"
+HOOKE_TRAINING_SEED_RULE = "stage1-training-seeds-v1"
+HOOKE_EVAL_SELECTION = "A37"
+HOOKE_EVAL_SELECTION_ID = "hooke-hv2-a37-v1"
+HOOKE_A37 = tuple(range(0, 21_000, 1_000)) + tuple(range(25_000, 100_001, 5_000))
+OVERLAY_RELATIVE_PATH = "configs/overlays/diagnostics-v1.yaml"
+HOOKE_OVERLAY_RELATIVE_PATH = "configs/overlays/hooke-diagnostics-v1.yaml"
+OVERLAY_SYSTEMS = frozenset({"he", "h2"})
+HOOKE_OVERLAY_SYSTEMS = frozenset({"hooke1", "hooke2"})
+OVERLAY_PATH_BY_SYSTEM = {
+    **{system: OVERLAY_RELATIVE_PATH for system in OVERLAY_SYSTEMS},
+    **{system: HOOKE_OVERLAY_RELATIVE_PATH for system in HOOKE_OVERLAY_SYSTEMS},
+}
+OVERLAY_COMPOSITION_ORDER = (
+    "base-config -> declared train diagnostics overlay -> manifest overrides"
+)
 CHECKPOINT_EVIDENCE_SCHEMA = "stage1-checkpoint-evidence/v1"
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -70,6 +90,7 @@ class Protocol:
     eval_streams: int
     eval_walkers: int
     eval_draws: int
+    retention_cadence: int | None = None
 
     def validate(self) -> None:
         """Reject non-positive dimensions and underspecified stream counts."""
@@ -81,9 +102,11 @@ class Protocol:
             raise ProtocolError(f"protocol dimensions must be positive: {values}")
         if self.lineages < 3 or self.eval_streams < 4:
             raise ProtocolError("Stage-1 requires at least 3 lineages and 4 eval streams")
+        if self.retention_cadence is not None and self.retention_cadence <= 0:
+            raise ProtocolError("retention_cadence must be positive when declared")
 
 
-STAGE1_PROTOCOL = Protocol(1000, 256, 50000, 4096, 3, 4, 4096, 256)
+STAGE1_PROTOCOL = Protocol(1000, 256, 100000, 4096, 3, 4, 4096, 256, 1000)
 SYSTEM_SPECS = tuple(SystemSpec(name, system_id) for name, system_id in (
     ("hooke1", "hooke_one_electron_omega0.5"),
     ("hooke2", "hooke_pair_singlet_omega0.5"),
@@ -104,6 +127,253 @@ def resolve_config_path(config: str | Path) -> Path:
     if path.is_absolute():
         return path
     return Path(__file__).resolve().parent / path
+
+
+def resolve_overlay_path(overlay: str | Path) -> Path:
+    """Resolve one Stage-1 overlay relative to the study directory."""
+
+    path = Path(overlay)
+    return path if path.is_absolute() else Path(__file__).resolve().parent / path
+
+
+def overlay_sha256(overlay: str | Path) -> str:
+    """Return the SHA-256 digest of one overlay file's exact bytes."""
+
+    path = resolve_overlay_path(overlay)
+    if not path.is_file():
+        raise ProtocolError(f"overlay file does not exist: {path}")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def overlay_path_for_system(system: str) -> str:
+    """Return the only committed overlay admitted for one Stage-1 system."""
+
+    try:
+        return OVERLAY_PATH_BY_SYSTEM[system]
+    except KeyError as exc:
+        raise ProtocolError(f"no diagnostics overlay is approved for {system!r}") from exc
+
+
+def _overlay_binding(*, overlay: str | Path, expected_sha256: object,
+                     system: str | None = None) -> tuple[str, str, Path]:
+    """Validate one finite canonical overlay and its exact content digest.
+
+    ``system`` is supplied at planner/gateway boundaries so a valid overlay
+    cannot be replayed for a different physical system.  Composition tests may
+    omit it to exercise the overlay parser independently; the finite path
+    allowlist still applies in that mode.
+    """
+
+    path = resolve_overlay_path(overlay).resolve()
+    allowed = (
+        {resolve_overlay_path(overlay_path_for_system(system)).resolve()}
+        if system is not None
+        else {
+            resolve_overlay_path(candidate).resolve()
+            for candidate in set(OVERLAY_PATH_BY_SYSTEM.values())
+        }
+    )
+    if path not in allowed:
+        raise ProtocolError(
+            "overlay path must be the committed system-qualified diagnostics overlay"
+        )
+    digest = _require_sha(expected_sha256, length=64, field="overlay_sha256")
+    actual = overlay_sha256(path)
+    if actual != digest:
+        raise ProtocolError("overlay sha256 does not match the committed overlay bytes")
+    relative = path.relative_to(Path(__file__).resolve().parent).as_posix()
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ProtocolError("overlay must contain a YAML mapping")
+    _validate_overlay_payload(payload, relative=relative)
+    return relative, digest, path
+
+
+def _validate_overlay_payload(payload: Mapping[str, Any], *, relative: str) -> None:
+    """Reject a changed or incomplete committed overlay before composition."""
+
+    allowed = {"runtime", "sampler", "optimizer", "trainer", "callbacks", "loggers"}
+    if set(payload) != allowed:
+        raise ProtocolError("overlay contains unsupported or missing top-level sections")
+    for key in ("runtime", "sampler", "optimizer", "trainer"):
+        if not isinstance(payload[key], Mapping):
+            raise ProtocolError(f"overlay section {key!r} must be a mapping")
+    if dict(payload["runtime"]) != {"device": "cuda", "dtype": "float64"}:
+        raise ProtocolError("diagnostics overlay runtime profile drifted")
+    if dict(payload["sampler"]) != {
+        "n_walkers": 4096, "burn_in": 100, "n_steps": 10, "proposal_scale": 0.5,
+    }:
+        raise ProtocolError("diagnostics overlay sampler profile drifted")
+    if dict(payload["optimizer"]) != {
+        "_target_": "torch.optim.Adam", "_partial_": True, "lr": 0.005,
+    }:
+        raise ProtocolError("diagnostics overlay optimizer profile drifted")
+    if dict(payload["trainer"]) != {
+        "max_steps": STAGE1_PROTOCOL.lineage_updates,
+        "log_every_n_steps": 1,
+        "return_terms": True,
+    }:
+        raise ProtocolError("diagnostics overlay trainer profile drifted")
+    callbacks = payload["callbacks"]
+    if not isinstance(callbacks, list):
+        raise ProtocolError("overlay callbacks must be a list")
+    expected_callbacks = _expected_overlay_callbacks(relative)
+    if callbacks != expected_callbacks:
+        raise ProtocolError("diagnostics overlay callback set drifted")
+    if not isinstance(payload["loggers"], list) or payload["loggers"] != [
+        {"_target_": "tpen.logging.JSONL", "path": "${run.dir}/metrics.jsonl"}
+    ]:
+        raise ProtocolError("diagnostics overlay logger profile drifted")
+
+
+def _expected_overlay_callbacks(relative: str) -> list[dict[str, Any]]:
+    """Return the complete callback contract for one canonical overlay."""
+
+    callbacks: list[dict[str, Any]] = [
+        {
+            "_target_": "tpen.callback.DataIntegrity",
+            "every_n_steps": 1,
+            "fail_fast": True,
+            "max_nonfinite_energy_fraction": 0.0,
+            "max_nonfinite_logabs_fraction": 0.0,
+            "check_loss": True,
+            "check_wavefunction_output": True,
+            "check_batch": True,
+            "strict_sign_values": True,
+        },
+        {
+            "_target_": "tpen.callback.GradientStats",
+            "every_n_steps": 1,
+            "fail_fast": True,
+            "check_finite": True,
+        },
+        {
+            "_target_": "tpen.callback.SamplerHealth",
+            "every_n_steps": 1,
+            "fail_fast": False,
+        },
+        {
+            "_target_": "tpen.callback.FactorScalars",
+            "every_n_steps": 1,
+            "fail_fast": False,
+        },
+    ]
+    if relative == HOOKE_OVERLAY_RELATIVE_PATH:
+        callbacks.append({
+            "_target_": "tpen.callback.AmplitudeRiskFraction",
+            "thresholds": [-3, -4, -5, -7, -10],
+            "every_n_steps": 100,
+            "start_step": 0,
+        })
+    callbacks.extend([
+        {
+            "_target_": "tpen.callback.ModuleNorms",
+            "every_n_steps": 1,
+            "groups": {
+                "embedding": ["embedding"],
+                "readout": ["readout"],
+                "factors": ["factors"],
+                "layer_0_mixing": ["stack.layers.0.mixing"],
+                "layer_0_path_aggregation": ["stack.layers.0.path_aggregation"],
+            },
+        },
+        {
+            "_target_": "tpen.callback.OptimizerState",
+            "every_n_steps": 1,
+            "groups": {
+                "embedding": ["embedding"],
+                "readout": ["readout"],
+                "factors": ["factors"],
+                "layer_0_mixing": ["stack.layers.0.mixing"],
+                "layer_0_path_aggregation": ["stack.layers.0.path_aggregation"],
+            },
+        },
+        {
+            "_target_": "tpen.callback.RawTrainingBatchRecorder",
+            "path": "${run.dir}/training_history",
+            "every_n_steps": 50,
+            "partition_size_steps": 1000,
+        },
+        {
+            "_target_": "tpen.callback.ParameterActivity",
+            "output_path": "${run.dir}/parameter_activity.json",
+        },
+        {"_target_": "tpen.callback.RunTiming"},
+        {
+            "_target_": "tpen.callback.TrainStepTiming",
+            "every_n_steps": 1,
+            "rolling_window": 20,
+            "accelerator_synchronize": False,
+        },
+    ])
+    return callbacks
+
+
+def _iter_mapping_leaves(value: Mapping[str, Any], prefix: str) -> Iterator[tuple[str, Any]]:
+    """Yield dotted paths for every scalar leaf in a mapping.
+
+    Overlay sections are applied one leaf at a time so a section cannot
+    replace a mapping owned by the base config.  Lists remain values at their
+    containing path and are handled explicitly by the append-only sections.
+    """
+
+    for key, nested in value.items():
+        dotted = f"{prefix}.{key}"
+        if isinstance(nested, Mapping):
+            yield from _iter_mapping_leaves(nested, dotted)
+        else:
+            yield dotted, nested
+
+
+def compose_train_overlay(cfg: Any, *, overlay: str | Path, expected_sha256: str) -> Any:
+    """Compose the approved train overlay without touching physics sections.
+
+    The overlay owns train-side runtime/sampler/optimizer/trainer leaves plus
+    diagnostic callbacks and loggers.  Base callbacks are retained and the
+    diagnostics are appended explicitly; checkpoint retention therefore stays
+    manifest-owned.  A blind ``OmegaConf.merge`` is avoided so a future list
+    or nested model section cannot be silently replaced.
+    """
+
+    relative, digest, path = _overlay_binding(
+        overlay=overlay, expected_sha256=expected_sha256
+    )
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ProtocolError("overlay must contain a YAML mapping")
+    _validate_overlay_payload(payload, relative=relative)
+    for key in ("runtime", "sampler", "optimizer", "trainer"):
+        section = payload[key]
+        if not isinstance(section, Mapping):
+            raise ProtocolError(f"overlay section {key!r} must be a mapping")
+        for dotted, value in _iter_mapping_leaves(section, key):
+            OmegaConf.update(cfg, dotted, copy.deepcopy(value), merge=False)
+
+    for key in ("callbacks", "loggers"):
+        base_config = cfg.get(key)
+        base_entries = (
+            [] if base_config is None else OmegaConf.to_container(base_config, resolve=False)
+        )
+        overlay_entries = copy.deepcopy(payload[key])
+        if not isinstance(base_entries, list) or not isinstance(overlay_entries, list):
+            raise ProtocolError(f"overlay {key} must be lists")
+        # Both callback and logger entries are additive.  In particular, the
+        # diagnostics overlay must never discard base callbacks such as the
+        # resolved-config snapshot or checkpoint publisher.
+        OmegaConf.update(
+            cfg, key, base_entries + overlay_entries, merge=False, force_add=True,
+        )
+
+    provenance = {
+        "schema": "stage1-overlay/v1",
+        "path": relative,
+        "sha256": digest,
+        "composition_order": OVERLAY_COMPOSITION_ORDER,
+        "stream": "train",
+    }
+    for dotted, value in _iter_mapping_leaves(provenance, "stage1_overlay"):
+        OmegaConf.update(cfg, dotted, value, merge=False, force_add=True)
+    return cfg
 
 
 def _config_files_for_system(system: str, config_root: str | Path) -> tuple[Path, ...]:
@@ -284,6 +554,134 @@ def training_seed(*, system: str, lineage: int, lineage_seed: int) -> int:
                         lineage_seed=lineage_seed)
 
 
+def sampler_seed(*, system: str, lineage: int, lineage_seed: int) -> int:
+    """Derive the Hooke science training-chain seed.
+
+    This namespace is deliberately separate from :func:`training_seed`.  The
+    compact JSON payload is part of the protocol, rather than an implementation
+    detail, so a future seed-rule revision cannot silently reinterpret a row.
+    """
+
+    if (system not in SYSTEMS or type(lineage) is not int or type(lineage_seed) is not int
+            or lineage < 0 or lineage >= 10**6
+            or lineage_seed < 0 or lineage_seed >= 10**9):
+        raise ProtocolError("invalid sampler seed coordinates")
+    payload = json.dumps(
+        ["stage1/train-sampler-v1", system, lineage, lineage_seed],
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % _TORCH_SEED_MODULUS
+
+
+# Descriptive aliases used by launch/analysis tooling.
+training_sampler_seed = sampler_seed
+hooke_sampler_seed = sampler_seed
+
+
+def _is_hooke_science_row(row: Mapping[str, Any]) -> bool:
+    """Return whether a row opts into the versioned Hooke science profile."""
+
+    return row.get("science_profile") == HOOKE_SCIENCE_PROFILE
+
+
+def _validate_hooke_science_train_row(row: Mapping[str, Any]) -> None:
+    """Validate the complete provenance and seed binding for a Hooke row."""
+
+    if row.get("system") not in {"hooke1", "hooke2"}:
+        raise ProtocolError("Hooke science profile is only valid for Hooke systems")
+    if row.get("kind") != "train":
+        raise ProtocolError("Hooke science profile is only valid for train rows")
+    if row.get("updates") != STAGE1_PROTOCOL.lineage_updates:
+        raise ProtocolError("Hooke science profile requires the exact production update horizon")
+    if row.get("walkers") != STAGE1_PROTOCOL.lineage_walkers:
+        raise ProtocolError("Hooke science profile requires the exact production walker count")
+    if list(row.get("checkpoint_steps", ())) != list(range(0, 100001, 1000)):
+        raise ProtocolError("Hooke science profile requires 101 production checkpoints")
+    if row.get("training_seed_rule") != HOOKE_TRAINING_SEED_RULE:
+        raise ProtocolError("unknown Hooke training seed rule")
+    if row.get("evaluation_selection") != HOOKE_EVAL_SELECTION:
+        raise ProtocolError("Hooke science row must bind the A37 evaluation selection")
+    if row.get("evaluation_selection_id", row.get("selection_id")) != HOOKE_EVAL_SELECTION_ID:
+        raise ProtocolError("Hooke science row has an invalid evaluation selection id")
+    lineage = row.get("lineage")
+    lineage_seed = row.get("lineage_seed")
+    if type(lineage) is not int or type(lineage_seed) is not int:
+        raise ProtocolError("Hooke science row requires integer lineage coordinates")
+    expected_training = training_seed(
+        system=str(row["system"]), lineage=lineage, lineage_seed=lineage_seed,
+    )
+    expected_sampler = sampler_seed(
+        system=str(row["system"]), lineage=lineage, lineage_seed=lineage_seed,
+    )
+    if type(row.get("seed")) is not int or row.get("seed") != expected_training:
+        raise ProtocolError("Hooke training seed does not match its declared rule")
+    if type(row.get("sampler_seed")) is not int or row.get("sampler_seed") != expected_sampler:
+        raise ProtocolError("Hooke sampler seed does not match its declared rule")
+    if expected_training == expected_sampler:
+        raise ProtocolError("Hooke initialization and sampler seeds must be distinct")
+
+
+def validate_hooke_eval_grid(
+    rows: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+    *,
+    expected_systems: tuple[str, ...] | list[str] | None = None,
+    expected_profile: str | None = None,
+) -> None:
+    """Require the exact Hooke A37 x lineage x stream evaluation multiset.
+
+    The check is intentionally a multiset comparison.  Row counts and
+    per-coordinate stream checks cannot detect a balanced deletion/replacement
+    or a wholly absent checkpoint, which would make a partial collection look
+    complete.
+    """
+
+    hooke_rows = [row for row in rows if row.get("system") in {"hooke1", "hooke2"}]
+    declared_systems = tuple(expected_systems) if expected_systems is not None else ()
+    if any(system not in {"hooke1", "hooke2"} for system in declared_systems):
+        raise ProtocolError("Hooke evaluation grid has an invalid expected system")
+    if len(set(declared_systems)) != len(declared_systems):
+        raise ProtocolError("Hooke evaluation grid has duplicate expected systems")
+    if not hooke_rows and not declared_systems:
+        return
+    # Historical and bounded tiny manifests remain readable under their
+    # declared legacy mode.  Exact A37 admission is opt-in to the production
+    # Hooke science profile.
+    if expected_profile is None and not any(_is_hooke_science_row(row) for row in hooke_rows):
+        return
+    profile = expected_profile or HOOKE_SCIENCE_PROFILE
+    if any(row.get("science_profile") != profile for row in hooke_rows):
+        raise ProtocolError("Hooke evaluation rows must declare hooke-hv2-v1")
+    systems = declared_systems or tuple(dict.fromkeys(str(row["system"]) for row in hooke_rows))
+    expected = [
+        (system, lineage, checkpoint, stream)
+        for system in systems
+        for lineage in range(STAGE1_PROTOCOL.lineages)
+        for checkpoint in HOOKE_A37
+        for stream in range(STAGE1_PROTOCOL.eval_streams)
+    ]
+    actual: list[tuple[str, int, int, int]] = []
+    for row in hooke_rows:
+        if row.get("kind") != "eval":
+            raise ProtocolError("Hooke A37 grid contains a non-eval row")
+        coordinates = (row.get("system"), row.get("lineage"),
+                       row.get("checkpoint"), row.get("stream"))
+        if (type(coordinates[1]) is not int or type(coordinates[2]) is not int
+                or type(coordinates[3]) is not int):
+            raise ProtocolError("Hooke A37 grid coordinates must be integers")
+        if row.get("evaluation_selection") != HOOKE_EVAL_SELECTION:
+            raise ProtocolError("Hooke eval row does not bind A37")
+        actual.append(coordinates)  # type: ignore[arg-type]
+    if sorted(actual) != sorted(expected):
+        raise ProtocolError(
+            f"Hooke A37 grid mismatch: expected {len(expected)} rows, got {len(actual)}"
+        )
+
+
+# Explicit names for callers that do not want to depend on the profile name.
+validate_exact_hooke_eval_grid = validate_hooke_eval_grid
+validate_exact_eval_grid = validate_hooke_eval_grid
+
+
 def smoke_seed(*, system: str) -> int:
     """Derive the dedicated smoke namespace seed for one system."""
 
@@ -359,8 +757,40 @@ def decode_binding(token: str) -> dict[str, Any]:
     return value
 
 
+def _is_overlay_owned_override(key: str) -> bool:
+    """Identify override paths reserved by the declared train overlay."""
+
+    return (
+        key == "callbacks"
+        or key.startswith("callbacks.")
+        or key == "loggers"
+        or key.startswith("loggers.")
+        or key == "stage1_overlay"
+        or key.startswith("stage1_overlay.")
+    )
+
+
+def _canonical_override_key(key: str, *, reject_noncanonical: bool) -> str:
+    """Return the path spelling used by OmegaConf's update implementation.
+
+    ``OmegaConf.update`` resolves both dotted and getitem-style paths through
+    ``split_key``.  Admission must inspect that same path, while science rows
+    require the unambiguous dotted spelling at the gateway boundary.
+    """
+
+    try:
+        canonical = ".".join(split_key(key))
+    except Exception as exc:
+        raise ProtocolError(f"invalid gateway override key: {key!r}") from exc
+    if reject_noncanonical and ("[" in key or "]" in key or key.startswith(".")):
+        raise ProtocolError(f"non-canonical gateway override key: {key!r}")
+    return canonical
+
+
 def validate_gateway_binding(*, binding: str, config: str, overrides: list[str], kind: str,
-                             expected_checkpoint_sha256: str | None = None) -> dict[str, Any]:
+                             expected_checkpoint_sha256: str | None = None,
+                             overlay: str | None = None,
+                             overlay_sha256: str | None = None) -> dict[str, Any]:
     """Validate that gateway arguments still match the rendered row binding."""
 
     row = decode_binding(binding)
@@ -375,8 +805,29 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
         raise ProtocolError("binding config identity rule is unsupported")
     if resolve_config_path(config) != resolve_config_path(row_config):
         raise ProtocolError("gateway config does not match binding")
+    declared_overlay = row.get("overlay")
+    declared_overlay_sha = row.get("overlay_sha256")
+    if (declared_overlay is None) != (declared_overlay_sha is None):
+        raise ProtocolError("binding overlay declaration is incomplete")
+    if declared_overlay is None or declared_overlay_sha is None:
+        if overlay is not None or overlay_sha256 is not None:
+            raise ProtocolError("overlay was applied without being declared in the binding")
+    else:
+        if kind != "train":
+            raise ProtocolError("overlay is supported only on train rows")
+        if overlay != declared_overlay or overlay_sha256 != declared_overlay_sha:
+            raise ProtocolError("gateway overlay does not match binding")
+        _overlay_binding(
+            overlay=overlay,
+            expected_sha256=overlay_sha256,
+            system=str(row.get("system")),
+        )
+    if kind == "train" and _is_hooke_science_row(row) and declared_overlay is None:
+        raise ProtocolError("Hooke science train rows require the Hooke diagnostics overlay")
     _validate_config_identity_for_row(row, resolve_config_path(config))
     _validate_run_identity(row)
+    if kind == "train" and _is_hooke_science_row(row):
+        _validate_hooke_science_train_row(row)
     expected = {
         f"runtime.seed={row['seed']}",
         f"run.root={row['results_root']}",
@@ -408,6 +859,8 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
     else:
         expected.update({f"sampler.n_walkers={row['walkers']}",
                          f"trainer.max_steps={row['updates']}"})
+        if _is_hooke_science_row(row):
+            expected.add(f"sampler.seed={row['sampler_seed']}")
         if row.get("checkpoint_steps"):
             steps = ",".join(str(step) for step in row["checkpoint_steps"])
             expected.add(f"checkpoint_steps=[{steps}]")
@@ -418,9 +871,14 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
             raise ProtocolError("prefixed gateway overrides are not allowed")
         if not separator or not key:
             raise ProtocolError(f"invalid gateway override: {override!r}")
-        if key in override_map:
+        canonical_key = _canonical_override_key(
+            key, reject_noncanonical=kind in {"train", "eval"},
+        )
+        if declared_overlay is not None and _is_overlay_owned_override(canonical_key):
+            raise ProtocolError(f"gateway override targets overlay-owned path: {key}")
+        if canonical_key in override_map:
             raise ProtocolError(f"duplicate gateway override: {key}")
-        override_map[key] = value
+        override_map[canonical_key] = value
     expected_map = {entry.partition("=")[0]: entry.partition("=")[2] for entry in expected}
     missing = sorted(key for key in expected_map if key not in override_map)
     mismatched = sorted(
@@ -432,6 +890,157 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
             f"binding overrides do not match: missing={missing}, mismatched={mismatched}"
         )
     return row
+
+
+def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
+                                   base_config: Any | None = None) -> None:
+    """Validate the final producer config immediately before execution.
+
+    Gateway override admission proves the textual row binding.  This second
+    boundary proves that OmegaConf composition did not later replace a bound
+    science leaf, callback list, or physical model section.
+    """
+
+    if row.get("kind") != "train" or row.get("overlay") is None:
+        return
+    if row.get("overlay_sha256") is None:
+        raise ProtocolError("overlay-backed train row is missing overlay_sha256")
+    relative, digest, _ = _overlay_binding(
+        overlay=str(row["overlay"]),
+        expected_sha256=row["overlay_sha256"],
+        system=str(row.get("system")),
+    )
+    if _is_hooke_science_row(row):
+        # The final guard is also a public boundary: callers can bypass the
+        # manifest planner and present a forged science row directly here.
+        _validate_hooke_science_train_row(row)
+    resolved = OmegaConf.to_container(cfg, resolve=True)
+    if not isinstance(resolved, Mapping):
+        raise ProtocolError("resolved train config is not a mapping")
+
+    def select(path: str) -> Any:
+        value: Any = resolved
+        for part in path.split("."):
+            if not isinstance(value, Mapping) or part not in value:
+                raise ProtocolError(f"resolved train config is missing {path}")
+            value = value[part]
+        return value
+
+    if select("stage1_overlay.path") != relative or select("stage1_overlay.sha256") != digest:
+        raise ProtocolError("resolved train config overlay provenance does not match binding")
+    if select("stage1_overlay.composition_order") != OVERLAY_COMPOSITION_ORDER:
+        raise ProtocolError("resolved train config composition order is not canonical")
+
+    unresolved = OmegaConf.to_container(cfg, resolve=False)
+    if not isinstance(unresolved, Mapping):
+        raise ProtocolError("unresolved train config is not a mapping")
+    expected_callbacks = _expected_overlay_callbacks(relative)
+    callbacks = unresolved.get("callbacks")
+    overlay_start = None
+    if isinstance(callbacks, list):
+        for index in range(len(callbacks) - len(expected_callbacks) + 1):
+            if callbacks[index:index + len(expected_callbacks)] == expected_callbacks:
+                overlay_start = index
+                break
+    if overlay_start is None:
+        raise ProtocolError("resolved diagnostics callback profile drifted")
+    trailing_callbacks = callbacks[overlay_start + len(expected_callbacks):]
+    if any(
+        not isinstance(entry, Mapping)
+        or entry.get("_target_") != "tpen.callback.InitialCheckpoint"
+        or set(entry) != {"_target_", "output_dir"}
+        for entry in trailing_callbacks
+    ):
+        raise ProtocolError("resolved diagnostics callback profile drifted")
+
+    if row.get("science_profile") != HOOKE_SCIENCE_PROFILE:
+        return
+    expected_device = row.get("device", "cuda")
+    expected_values = {
+        "runtime.device": expected_device,
+        "runtime.dtype": "float64",
+        "sampler.n_walkers": row["walkers"],
+        "sampler.burn_in": 100,
+        "sampler.n_steps": 10,
+        "sampler.proposal_scale": 0.5,
+        "sampler.seed": row["sampler_seed"],
+        "trainer.max_steps": row["updates"],
+        "trainer.log_every_n_steps": 1,
+        "trainer.return_terms": True,
+        "optimizer._target_": "torch.optim.Adam",
+        "optimizer.lr": 0.005,
+    }
+    for path, expected in expected_values.items():
+        if select(path) != expected:
+            raise ProtocolError(f"resolved Hooke science config mismatch at {path}")
+    checkpoint_steps = list(select("checkpoint_steps"))
+    expected_steps = [step for step in row.get("checkpoint_steps", ()) if step > 0]
+    if checkpoint_steps != expected_steps:
+        raise ProtocolError("resolved Hooke checkpoint schedule does not match the manifest")
+    callbacks = select("callbacks")
+    targets = [entry.get("_target_") for entry in callbacks if isinstance(entry, Mapping)]
+    if targets.count("tpen.callback.AmplitudeRiskFraction") != 1:
+        raise ProtocolError("resolved Hooke config must contain one amplitude-risk callback")
+    amplitude = next(
+        entry for entry in callbacks
+        if isinstance(entry, Mapping)
+        and entry.get("_target_") == "tpen.callback.AmplitudeRiskFraction"
+    )
+    if (
+        list(amplitude.get("thresholds", ())) != [-3, -4, -5, -7, -10]
+        or amplitude.get("every_n_steps") != 100
+        or amplitude.get("start_step") != 0
+    ):
+        raise ProtocolError("resolved Hooke amplitude-risk callback drifted")
+
+    if base_config is not None:
+        base = OmegaConf.to_container(base_config, resolve=True)
+        if isinstance(base, Mapping):
+            for section in ("system", "atoms", "system_descriptor", "model", "hamiltonian_terms"):
+                if resolved.get(section) != base.get(section):
+                    raise ProtocolError(f"overlay changed base-owned section {section}")
+            base_runner = base.get("runner")
+            resolved_runner = resolved.get("runner")
+            if not isinstance(base_runner, Mapping) or not isinstance(resolved_runner, Mapping):
+                raise ProtocolError("resolved train config is missing runner wiring")
+
+            runner_leaf_fields = {
+                "sampler": ("n_walkers", "burn_in", "n_steps", "proposal_scale", "seed"),
+                "trainer": ("max_steps", "log_every_n_steps", "return_terms"),
+            }
+            for section, fields in runner_leaf_fields.items():
+                base_section = base_runner.get(section)
+                resolved_section = resolved_runner.get(section)
+                if not isinstance(base_section, Mapping) or not isinstance(resolved_section, Mapping):
+                    raise ProtocolError(f"resolved train config is missing runner {section} wiring")
+                for field in fields:
+                    root_value = select(f"{section}.{field}")
+                    if (field not in base_section or field not in resolved_section
+                            or resolved_section[field] != root_value):
+                        raise ProtocolError(
+                            f"runner {section}.{field} does not match root {section}.{field}"
+                        )
+
+            def runner_wiring(runner: Mapping[str, Any]) -> dict[str, Any]:
+                """Ignore only bound sampler/trainer leaves, not runner wiring."""
+
+                normalized = copy.deepcopy(dict(runner))
+                sampler = normalized.get("sampler")
+                if isinstance(sampler, Mapping):
+                    sampler = dict(sampler)
+                    for key in ("n_walkers", "burn_in", "n_steps", "proposal_scale", "seed"):
+                        sampler.pop(key, None)
+                    normalized["sampler"] = sampler
+                trainer = normalized.get("trainer")
+                if isinstance(trainer, Mapping):
+                    trainer = dict(trainer)
+                    for key in ("max_steps", "log_every_n_steps", "return_terms"):
+                        trainer.pop(key, None)
+                    normalized["trainer"] = trainer
+                return normalized
+
+            if runner_wiring(resolved_runner) != runner_wiring(base_runner):
+                raise ProtocolError("overlay changed base-owned section runner")
 
 
 def physical_system_id_from_config(
@@ -596,7 +1205,11 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                    results_root: str,
                    expected_physical_system_id: Mapping[str, str] | None = None,
                    systems: tuple[str, ...] | list[str] | None = None,
-                   phase: int = 2, device: str | None = None) -> list[dict[str, Any]]:
+                   phase: int = 2, device: str | None = None,
+                   overlay: str | Path | None = None,
+                   overlay_sha256: str | None = None,
+                   science_profile: str | None = None,
+                   evaluation_selection: str | None = None) -> list[dict[str, Any]]:
     """Expand systems into validated smoke, train, and eval rows.
 
     Parameters are explicit rather than defaulted so a missing identity or
@@ -614,10 +1227,65 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         raise ProtocolError("systems must contain distinct known Stage-1 systems")
     if device is not None and device not in {"cpu", "cuda"}:
         raise ProtocolError("device must be 'cpu' or 'cuda'")
-    if not checkpoints or any(step <= 0 for step in checkpoints):
-        raise ProtocolError("checkpoints must be a non-empty list of positive updates")
+    if science_profile not in {None, HOOKE_SCIENCE_PROFILE}:
+        raise ProtocolError("unknown science profile")
+    if science_profile == HOOKE_SCIENCE_PROFILE:
+        if not set(selected).issubset({"hooke1", "hooke2"}):
+            raise ProtocolError("Hooke science profile cannot mix in He/H2 systems")
+        if evaluation_selection not in {None, HOOKE_EVAL_SELECTION}:
+            raise ProtocolError("unknown Hooke evaluation selection")
+        evaluation_selection = HOOKE_EVAL_SELECTION
+        if phase == 2 and list(checkpoints) != list(HOOKE_A37):
+            raise ProtocolError("Hooke science phase 2 requires the exact A37 roster")
+    elif evaluation_selection is not None:
+        raise ProtocolError("evaluation_selection requires the Hooke science profile")
+    if (overlay is None) != (overlay_sha256 is None):
+        raise ProtocolError("overlay and overlay_sha256 must be supplied together")
+    overlay_name: str | None = None
+    overlay_digest: str | None = None
+    if overlay is not None:
+        expected_paths = {overlay_path_for_system(system) for system in selected}
+        if len(expected_paths) != 1:
+            raise ProtocolError("one declared overlay cannot mix system-qualified profiles")
+        expected_system = next(iter(selected))
+        overlay_name, overlay_digest, _ = _overlay_binding(
+            overlay=overlay,
+            expected_sha256=overlay_sha256,
+            system=expected_system,
+        )
+    elif science_profile == HOOKE_SCIENCE_PROFILE:
+        raise ProtocolError("Hooke science train rows require the Hooke diagnostics overlay")
+    if science_profile == HOOKE_SCIENCE_PROFILE and (
+        protocol.lineage_updates != STAGE1_PROTOCOL.lineage_updates
+        or protocol.lineage_walkers != STAGE1_PROTOCOL.lineage_walkers
+        or protocol.lineages != STAGE1_PROTOCOL.lineages
+        or protocol.eval_streams != STAGE1_PROTOCOL.eval_streams
+        or protocol.eval_walkers != STAGE1_PROTOCOL.eval_walkers
+        or protocol.eval_draws != STAGE1_PROTOCOL.eval_draws
+        or protocol.retention_cadence != STAGE1_PROTOCOL.retention_cadence
+    ):
+        raise ProtocolError(
+            "Hooke science profile requires the exact production protocol dimensions"
+        )
+    if not checkpoints or any(type(step) is not int or step < 0 for step in checkpoints):
+        raise ProtocolError("checkpoints must be a non-empty list of non-negative updates")
     if len(set(checkpoints)) != len(checkpoints):
         raise ProtocolError("checkpoints must not contain duplicates")
+    if protocol.retention_cadence is not None:
+        expected_checkpoints = list(range(
+            0, protocol.lineage_updates + 1, protocol.retention_cadence
+        ))
+        if checkpoints != expected_checkpoints:
+            raise ProtocolError(
+                "train checkpoints must equal the declared retention cadence"
+            )
+    if phase in {1, 2}:
+        if any(step > protocol.lineage_updates for step in checkpoints):
+            raise ProtocolError("checkpoints must not exceed lineage_updates")
+        if protocol.lineage_updates not in checkpoints:
+            raise ProtocolError("checkpoints must retain the terminal lineage_updates checkpoint")
+        if 0 not in checkpoints:
+            raise ProtocolError("checkpoints must retain the initial zero checkpoint")
     if isinstance(config_sha256, Mapping):
         config_ids = {system: _require_sha(config_sha256.get(system), length=64,
                                            field=f"config_sha256[{system!r}]") for system in selected}
@@ -636,6 +1304,8 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                          field=f"expected_physical_system_id[{name!r}]")
     if len(lineage_seeds) != protocol.lineages or len(set(lineage_seeds)) != len(lineage_seeds):
         raise ProtocolError("lineage_seeds must contain one distinct seed per lineage")
+    if any(type(seed) is not int or seed < 0 or seed >= _LINEAGE_SEED_RADIX for seed in lineage_seeds):
+        raise ProtocolError("lineage_seeds must be bounded integers")
     # Check the complete protocol before applying a selected-system filter.
     # Otherwise an excluded system can hide a seed collision from the plan.
     protocol_seeds: set[int] = set()
@@ -645,6 +1315,11 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
             training_seed(system=spec.name, lineage=lineage, lineage_seed=seed)
             for lineage, seed in enumerate(lineage_seeds)
         )
+        if science_profile == HOOKE_SCIENCE_PROFILE and spec.name in {"hooke1", "hooke2"}:
+            candidate_seeds.extend(
+                sampler_seed(system=spec.name, lineage=lineage, lineage_seed=seed)
+                for lineage, seed in enumerate(lineage_seeds)
+            )
         candidate_seeds.extend(
             evaluation_seed(system=spec.name, lineage=lineage,
                             checkpoint=checkpoint, stream=stream)
@@ -686,7 +1361,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                 raise ProtocolError("seed collision across Stage-1 rows")
             seen_seeds.add(train_seed)
             train_id = stable_row_id(system=spec.name, kind="train", lineage=lineage)
-            rows.append({
+            row: dict[str, Any] = {
                 "row_id": train_id, "system": spec.name, "system_id": spec.system_id,
                 "kind": "train", "lineage": lineage, "seed": train_seed,
                 "source_sha": source_sha, "config_sha256": config_ids[spec.name],
@@ -697,7 +1372,24 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                 "updates": protocol.lineage_updates,
                 "walkers": protocol.lineage_walkers,
                 "checkpoint_steps": list(checkpoints),
-            })
+            }
+            if science_profile == HOOKE_SCIENCE_PROFILE:
+                row.update({
+                    "science_profile": HOOKE_SCIENCE_PROFILE,
+                    "training_seed_rule": HOOKE_TRAINING_SEED_RULE,
+                    "lineage_seed": seed,
+                    "evaluation_selection": HOOKE_EVAL_SELECTION,
+                    "evaluation_selection_id": HOOKE_EVAL_SELECTION_ID,
+                    "selection_id": HOOKE_EVAL_SELECTION_ID,
+                    "sampler_seed": sampler_seed(
+                        system=spec.name, lineage=lineage, lineage_seed=seed,
+                    ),
+                })
+                _validate_hooke_science_train_row(row)
+            if overlay_name is not None:
+                row["overlay"] = overlay_name
+                row["overlay_sha256"] = overlay_digest
+            rows.append(row)
             train_row = rows[-1]
             if phase == 1:
                 continue
@@ -730,6 +1422,12 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                         "experiment_name": "stage1", "sector": spec.name, "run_id": eval_id,
                         "checkpoint_dir": str(checkpoint_dir), "checkpoint_file": str(checkpoint_file),
                         "checkpoint_sha256": checkpoint_digest, "depends_on": train_id,
+                        **({
+                            "science_profile": HOOKE_SCIENCE_PROFILE,
+                            "evaluation_selection": HOOKE_EVAL_SELECTION,
+                            "evaluation_selection_id": HOOKE_EVAL_SELECTION_ID,
+                            "selection_id": HOOKE_EVAL_SELECTION_ID,
+                        } if science_profile == HOOKE_SCIENCE_PROFILE else {}),
                     })
     for row in rows:
         _validate_run_identity(row)
@@ -738,6 +1436,8 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
     if device is not None:
         for row in rows:
             row["device"] = device
+    if science_profile == HOOKE_SCIENCE_PROFILE and phase == 2:
+        validate_hooke_eval_grid([row for row in rows if row["kind"] == "eval"])
     return rows
 
 
@@ -780,6 +1480,15 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         raise ProtocolError("phase-1 manifest contains duplicate seed")
     train_rows = [row for row in phase1_rows if row.get("kind") == "train"]
     systems = tuple(dict.fromkeys(str(row["system"]) for row in train_rows))
+    hooke_science = any(_is_hooke_science_row(row) for row in train_rows)
+    if hooke_science:
+        if not set(systems).issubset({"hooke1", "hooke2"}):
+            raise ProtocolError("Hooke science phase cannot mix in He/H2 rows")
+        for row in train_rows:
+            if row.get("system") in {"hooke1", "hooke2"}:
+                _validate_hooke_science_train_row(row)
+        if list(checkpoints) != list(HOOKE_A37):
+            raise ProtocolError("Hooke science phase 2 requires the exact A37 roster")
     train_identity_keys = [f"{row.get('system')}:{row.get('lineage')}" for row in train_rows]
     if len(set(train_identity_keys)) != len(train_identity_keys):
         raise ProtocolError("phase-1 manifest contains duplicate train identity")
@@ -844,8 +1553,8 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         eval_streams, eval_walkers, eval_draws = protocol.eval_streams, protocol.eval_walkers, protocol.eval_draws
     if eval_streams <= 0 or eval_walkers <= 0 or eval_draws <= 0:
         raise ProtocolError("evaluation dimensions must be positive")
-    if not checkpoints or any(not isinstance(step, int) or step <= 0 for step in checkpoints):
-        raise ProtocolError("checkpoints must be a non-empty list of positive updates")
+    if not checkpoints or any(type(step) is not int or step < 0 for step in checkpoints):
+        raise ProtocolError("checkpoints must be a non-empty list of non-negative updates")
     if len(set(checkpoints)) != len(checkpoints):
         raise ProtocolError("checkpoints must not contain duplicates")
     phase1_checkpoint_steps = {
@@ -879,7 +1588,11 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         _require_sha(physical_ids.get(system), length=64,
                      field=f"expected_physical_system_id[{system!r}]")
     combined_row_ids = {row.get("row_id") for row in phase1_rows}
-    combined_seeds = {row.get("seed") for row in phase1_rows}
+    combined_seeds = {
+        seed
+        for row in phase1_rows
+        for seed in (row.get("seed"), row.get("sampler_seed"))
+    }
     for train_row in train_rows:
         system = str(train_row["system"])
         lineage = int(train_row["lineage"])
@@ -909,6 +1622,12 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
                     "run_id": f"{system}-lineage-{lineage}-checkpoint-{checkpoint}-stream-{stream}",
                     "checkpoint_dir": str(checkpoint_dir), "checkpoint_file": str(checkpoint_dir / "model.pt"),
                     "checkpoint_sha256": digest, "depends_on": train_row["row_id"],
+                    **({
+                        "science_profile": HOOKE_SCIENCE_PROFILE,
+                        "evaluation_selection": HOOKE_EVAL_SELECTION,
+                        "evaluation_selection_id": HOOKE_EVAL_SELECTION_ID,
+                        "selection_id": HOOKE_EVAL_SELECTION_ID,
+                    } if hooke_science else {}),
                 }
                 if row["row_id"] in combined_row_ids or row["seed"] in combined_seeds:
                     raise ProtocolError("phase-1 and phase-2 rows are not jointly unique")
@@ -920,6 +1639,12 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
     for row in rows:
         _validate_run_identity(row)
         _checkpoint_binding(row)
+    if hooke_science:
+        validate_hooke_eval_grid(
+            rows,
+            expected_systems=tuple(systems),
+            expected_profile=HOOKE_SCIENCE_PROFILE,
+        )
     return rows
 
 

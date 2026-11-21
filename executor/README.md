@@ -41,6 +41,74 @@ Operational outcome receipts use the closed vocabulary `completed`, `failed`,
 `timed_out`, and `launch_failed`. These statuses describe execution only;
 scientific validity remains the responsibility of core evidence.
 
+## Allocation-group reconciliation (B1a)
+
+The executor exposes a fake-driven, pure Layer A contract for reconciling an
+immutable allocation group. `ExecutionPlanV2` binds opaque plan content to an
+ordered task list and explicit continuation/reconciliation protocol tokens;
+`ReadyGroupV2` binds that plan to an opaque `GroupId`. An
+`AllocationAttemptV2` separately identifies one controller/allocation
+generation. `GroupId`, `AllocationAttemptId`, and `InvocationId` are
+deliberately non-interchangeable with `AttemptId`, `AllocationId`, or
+`BackendJobId`.
+
+`reconcile_group()` consumes typed executor start/outcome receipt references
+and a typed `CoreAdmissionPort` verdict. It derives one of
+`preserve_completed`, `admit_successor`, `start_fresh`, `preserve_terminal`,
+or `park` for every member. Parked evidence dominates the group aggregate;
+otherwise a successor or fresh member yields `replacement_required`, and a
+fully preserved group is `settled` with completed/terminal counts. The
+reconciler publishes no ledger, starts no process, replaces no allocation,
+scans no checkpoint, and maps no result to a scheduler or Balsam status.
+
+The profile/admission port is intentionally a narrow typed fake seam. A
+missing or refused native profile parks a member before an optional restore
+callback can run. Real-core compatibility, durable publication, successor
+fencing, Balsam lifecycle, and facility integration are later layers and are
+not claimed by B1a.
+
+### B1a-C durable successor and multi-generation publication
+
+`DirectoryStore.begin_admitted_successor()` is the only executor start path
+for a CX-04 admitted successor. It locks the task, rereads the canonical
+successor-admission ledger, requires the predecessor to remain current, and
+consumes the recorded `AttemptId` and `InvocationId` exactly. The start and
+invocation files are write-once; an identical replay returns the same fence,
+while a missing, crossed, symlinked, or differing record is refused.
+
+`publish_reconciliation()` is keyed by the new controller's
+`AllocationAttemptV2`, but each existing member is validated against the
+allocation attempt recorded in that member's durable `invocation.json`. This
+allows recovered groups to combine evidence from several prior allocation
+generations. Evidence from another group, with mismatched allocation facts, or
+whose durable invocation was tampered with parks the publication. The current
+controller lease is valid when it is also the member's recorded lease; prior
+and mixed leases are valid when each matches its own durable invocation.
+Existing single-generation `ReconciliationPublicationV2` bytes remain unchanged.
+If a crash leaves an admitted successor directory visible while the predecessor
+pointer is still current, the next start validates existing canonical files,
+writes only missing files, and advances the pointer to the admitted attempt.
+Recovery revalidates the predecessor fence, verifies or completes both receipt
+files, fsyncs the successor directory, and only then advances the pointer.
+Allocation-attempt IDs are also one-to-one with complete attempt facts across
+the controller, member bindings, and proposed successors; conflicting facts
+park before any admission ledger write.
+
+### Controller authority ledger
+
+`ControllerGenerationV1` is the store-owned, canonical authority record for a
+`GroupId`. `DirectoryStore.acquire_controller_generation()` writes only the
+next generation under a per-group lock, linked to the exact digest of its
+predecessor; an identical retry is idempotent and stale, skipped, or forked
+records are refused. `require_current_controller()` rereads that ledger before
+publication or launch work. A `LaunchIntentV1` is created exactly once in the
+member attempt directory while the task lock is held. Recovery may read an
+intent, but an existing intent without an executor acknowledgement is a
+permanent park decision for the controller layer; this storage slice never
+relaunches it. Every controller incarnation must supply a freshly generated,
+unique claimant nonce; retries reuse the same canonical record rather than
+minting a second nonce.
+
 ## GPU placement qualification
 
 The L1a v2 placement receipt reports an explicit reason class: `not-sampled`,
@@ -180,8 +248,15 @@ python -m tpen_executor dispatch \
   --allocation <allocation.json> \
   --worker-config <worker.yaml> \
   --runs <configured-runs.json> \
-  [--dispatcher local|parsl] [--timeout SECONDS]
+  [--dispatcher local|parsl] [--transport <attached-transport.json>] \
+  [--timeout SECONDS]
 ```
+
+`--transport` is optional and is accepted only with `--dispatcher parsl`. Its
+file must be a strict `tpen-executor/attached-transport-v1` mapping accepted by
+`AttachedTransportSpec`; without it, Parsl uses the unchanged in-process
+ThreadPool route. The transport profile supplies only generic attached-route
+values; the executor does not provide facility defaults.
 
 The command writes a JSON manifest to stdout on dispatch and a typed
 `tpen-executor/cli-error-v1` envelope to stderr on refusal or failure. Exit
@@ -192,6 +267,10 @@ codes are:
 * `3`: dispatch completed with a failed, timed-out, or launch-failed member;
 * `4`: unexpected dispatch or publication failure after admission;
 * `130`: cancellation after an attempt began.
+
+Attached transport capacity and standard-worker shape refusals are reported as
+typed `dispatcher-admission` errors with exit code `2`, before the store is
+reserved. Shared-store reachability checks remain runtime dispatch failures.
 
 ## Remote-leaf wire (S3 Layer A)
 
@@ -317,6 +396,47 @@ each named node by operator-supplied launcher data, each slot submitted only
 to its node's label, and observed node identity preflighted, which revises
 Layer B's one-executor validator.
 
+### Routed attached transport v2 (Layers D2a/D2b)
+
+The strict `tpen-executor/attached-routed-transport-v2` profile describes an
+ordered pool for each captured allocation node. Each pool carries its node,
+label, worker count, worker setup, interchange address, and opaque
+`MpiExecLauncher` bind/override values. The executor supplies no facility
+values and does not interpret those launcher strings. Its matching
+`tpen-executor/allocation-slots-v2` record may contain several slots per node;
+admission requires the exact node set from the captured scheduler host map and
+requires `pool.workers == slot_count` for every node. Host strings are compared
+exactly at this boundary; aliases and DNS normalization are not inferred.
+
+Admission constructs one fresh `HighThroughputExecutor` with a
+`LocalProvider(MpiExecLauncher(...))` for each pool. Every pool is a single
+initial block with its own label and worker count, and the route retains the
+no-retry, no-scaling, interpreter-module launch settings. Before any
+`lifecycle.begin`, the controller submits exactly the pool's worker count of
+shared-store probes through that pool's label. All probes join one aggregate
+barrier, and each returned hostname must equal the pool node exactly. A typed
+`RoutedTransportPreflightError` refuses wrong, missing, extra, or late facts.
+
+At each member launch, the controller resolves the binding's captured
+physical node to exactly one pool label and submits the leaf with only
+`executors=[that_label]`. An absent or ambiguous node-to-label mapping is an
+admission refusal before `begin`; the v1 attached profile remains the
+one-executor, single-label path described above.
+
+Routed children carry an internal strict-host flag. `RUN_SHIM` still writes
+the identity-bound placement sidecar, but a declared-host mismatch under that
+flag aborts before importing core. The controller recognizes only that
+routed sidecar case as `PlacementRefusal(code="routed-child-node-mismatch")`,
+publishes the refusal receipt, finishes the attempt as `launch_failed`, and
+accepts no segment. v1 and non-routed children retain the advisory
+`child-placement-mismatch` behavior and may complete.
+
+All routed normal and refusal replies continue through the CX-06 remote
+completion lifecycle. Cancellation or remote loss sweeps every active label
+under one bounded teardown deadline; missing or unacknowledged replies remain
+`remote-quiescence-unconfirmed` and close admission. D2b adds no retry,
+continuation, successor, or resubmission behavior.
+
 ## Local dispatch
 
 `LocalDispatcher` is the attached-allocation baseline. It admits an exact
@@ -345,3 +465,60 @@ their fences are finished. After processing, the first `begin` exception is
 raised as the primary error. A later `finish` exception is retained as a note
 on that same exception; when there was no `begin` failure, a `finish` exception
 is raised normally.
+
+## Balsam group registration and application boundary (B1b)
+
+`tpen_executor.lifecycle.balsam` provides an optional, group-keyed registration
+port and application factory. It does not import Balsam until
+`make_group_application(api=None, ...)` is called. Tests inject a fake API;
+no SDK dependency or installation is added by this slice.
+
+`register_group(intent, store, client)` binds one persistent `BackendJobId` to
+one `GroupId` in the configured `DirectoryStore`. The intent includes the
+ready-group digest and the digest of the complete backend request (including
+application identity and deployment options). The client owns constructing
+that request and must honor those digests. Registration uses the store's POSIX
+durable no-replace publication primitives: an exclusive intent is persisted
+before the sole backend call. Identical acknowledged intent reuses its receipt;
+changed intent raises `BalsamGroupRefusal`. A missing/ambiguous acknowledgement,
+including failure to persist it, raises `BalsamGroupParked`. Reopening an intent
+without acknowledgement never calls registration again, even if the original
+process died before making the call. Permanent client refusal is retained.
+Do not remove these records to request a retry. The one-Job guarantee is scoped
+to this shared store; independent stores are not coordinated.
+
+`GroupExitContract(backend_retry_codes=...)` requires an explicit deployed retry
+set and rejects overlap with exit 2 (or success 0). Its version-one no-retry
+code is fixed at 2. The historical set `(-11, 1, 255, 12345)` is test input,
+not an installed-version assertion or automatic default. `group_exit_code`
+accepts typed B1a reconciliation or a `GroupFailure`:
+
+| Authoritative outcome | Process exit |
+| --- | --- |
+| Every member `preserve_completed` | 0 |
+| Settled with any terminal member | 2 |
+| Parked | 2 |
+| Pre-start failure | 2 |
+| Uncaught exception | 2 |
+| Voluntary exit with replacement required | 2 |
+
+Backend observations, `JOB_FINISHED`, and integer return values cannot establish
+completion. `make_group_application(api, controller=..., contract=...,
+record_failure=...)` builds an `ApplicationDefinition` at call time. Its
+`run()` passes the Job to the injected controller exactly once. Non-success
+raises `SystemExit(2)` instead of returning an integer that a backend Python
+runner might serialize while exiting zero. Exceptions (including an injected
+`SystemExit(1)`) go through the failure recorder and also exit 2. If recording
+itself fails, the original exception retains that fact and the process still
+exits 2; storage failure cannot guarantee a durable receipt.
+
+The shell preamble is empty and `environment_variables` is empty, so this
+boundary preserves inherited environment. The injected controller owns
+prepending configured paths, recording the effective environment, durable
+start/pre-start receipts before work, allocation and invocation identities,
+reconciliation, successor admission and dispatch. Those controller mechanics
+are **not implemented or qualified by B1b**. Per the scope split, B1a-C supplies
+the storage seams and B1b2 supplies `run_group_controller`. No scheduler,
+reaper, retry loop, allocation replacement, walltime/signal behavior, or real
+core admission is supplied here. Deployment exit behavior and durability need
+independent B1c qualification; fake tests are not facility evidence.

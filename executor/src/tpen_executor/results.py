@@ -404,6 +404,7 @@ class SuccessorAdmissionRecord:
     """
 
     schema: ClassVar[str] = "tpen-executor/successor-admission-v1"
+    schema_v2: ClassVar[str] = "tpen-executor/successor-admission-v2"
     predecessor_task_id: str
     predecessor_attempt_id: AttemptId
     predecessor_content_id: str
@@ -411,6 +412,7 @@ class SuccessorAdmissionRecord:
     successor_attempt_id: AttemptId
     request_digest: str
     core_acceptance_digest: str
+    successor_binding: Any = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "predecessor_task_id", text(self.predecessor_task_id, "predecessor_task_id"))
@@ -420,6 +422,14 @@ class SuccessorAdmissionRecord:
         _identity(self.successor_attempt_id, AttemptId, "successor_attempt_id")
         object.__setattr__(self, "request_digest", sha256_text(self.request_digest, "request_digest"))
         object.__setattr__(self, "core_acceptance_digest", sha256_text(self.core_acceptance_digest, "core_acceptance_digest"))
+        if self.successor_binding is not None:
+            from .allocations import MemberInvocationV2
+
+            if not isinstance(self.successor_binding, MemberInvocationV2):
+                raise TypeError("successor_binding must be MemberInvocationV2")
+            if (self.successor_binding.task_id != self.successor_task_id
+                    or self.successor_binding.attempt_id != self.successor_attempt_id):
+                raise ValueError("successor binding crosses admission identity")
 
     @property
     def predecessor(self) -> dict[str, Any]:
@@ -438,20 +448,31 @@ class SuccessorAdmissionRecord:
         return {"task_id": self.successor_task_id, "attempt_id": self.successor_attempt_id.value}
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "schema": self.schema,
+        result = {
+            "schema": self.schema if self.successor_binding is None else self.schema_v2,
             "predecessor": self.predecessor,
             "successor": self.successor,
             "request_digest": self.request_digest,
             "core_acceptance_digest": self.core_acceptance_digest,
         }
+        if self.successor_binding is not None:
+            result["successor_binding"] = self.successor_binding.to_dict()
+        return result
 
     def encode(self) -> bytes:
         return canonical_bytes(self.to_dict())
 
     @classmethod
     def from_mapping(cls, data: Any) -> "SuccessorAdmissionRecord":
-        fields(data, {"schema", "predecessor", "successor", "request_digest", "core_acceptance_digest"}, cls.schema, cls.__name__)
+        from .allocations import MemberInvocationV2
+
+        keys = {"schema", "predecessor", "successor", "request_digest", "core_acceptance_digest"}
+        binding = None
+        if isinstance(data, Mapping) and data.get("schema") == cls.schema_v2:
+            fields(data, keys | {"successor_binding"}, cls.schema_v2, cls.__name__)
+            binding = MemberInvocationV2.from_mapping(data["successor_binding"])
+        else:
+            fields(data, keys, cls.schema, cls.__name__)
         if not isinstance(data["predecessor"], Mapping) or set(data["predecessor"]) != {"task_id", "attempt_id", "content_id"}:
             raise ValueError("SuccessorAdmissionRecord.predecessor keys differ")
         if not isinstance(data["successor"], Mapping) or set(data["successor"]) != {"task_id", "attempt_id"}:
@@ -470,6 +491,7 @@ class SuccessorAdmissionRecord:
             AttemptId(data["successor"]["attempt_id"]),
             data["request_digest"],
             data["core_acceptance_digest"],
+            binding,
         )
 
     @classmethod
@@ -1548,7 +1570,7 @@ __all__ = [
     "PLACEMENT_NOT_SAMPLED_MESSAGE", "PLACEMENT_RECEIPT_TYPES", "PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE",
     "PLACEMENT_UNQUALIFIED_MESSAGE", "PLACEMENT_V3_WARNINGS", "RunManifest", "SciencePlacementReceipt",
     "SciencePlacementReceiptV2", "SciencePlacementReceiptV3", "StartReceipt", "SuccessorAdmission", "SuccessorAdmissionRecord", "decode_placement_receipt",
-    "placement_unqualified_message",
+    "placement_unqualified_message", "MemberPublicationV2", "ReconciliationPublicationV2",
 ]
 
 
@@ -1564,3 +1586,193 @@ def decode_manifest(data: bytes | str | dict[str, Any]) -> RunManifest:
     """Decode one run manifest."""
 
     return RunManifest.decode(data)
+
+
+@frozen_record
+class MemberPublicationV2:
+    """Durable operational outcome with the exact evidence and admission.
+
+    Recovery types are imported at the decode boundary to keep their owner
+    module independent of the receipt definitions it consumes.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/member-publication-v2"
+    evidence: Any
+    reconciliation: Any
+    binding: Any = None
+    admission: SuccessorAdmissionRecord | None = None
+
+    def __post_init__(self) -> None:
+        from .allocations import MemberInvocationV2
+        from .recovery import MemberRecoveryInputV2, MemberReconciliationV2
+
+        if not isinstance(self.evidence, MemberRecoveryInputV2) or not isinstance(self.reconciliation, MemberReconciliationV2):
+            raise TypeError("publication requires typed evidence and reconciliation")
+        if (self.evidence.task_id != self.reconciliation.task_id
+                or self.evidence.attempt_id != self.reconciliation.attempt_id):
+            raise ValueError("publication crosses member identity")
+        if self.binding is not None:
+            if not isinstance(self.binding, MemberInvocationV2):
+                raise TypeError("binding must be MemberInvocationV2")
+            if (self.binding.task_id != self.evidence.task_id
+                    or self.binding.lineage_id != self.evidence.lineage_id
+                    or self.binding.attempt_id != self.evidence.attempt_id):
+                raise ValueError("publication crosses invocation identity")
+        if (self.evidence.start_receipt is None) != (self.binding is None):
+            raise ValueError("started publication requires an invocation binding")
+        if self.reconciliation.action == "admit_successor":
+            if not isinstance(self.admission, SuccessorAdmissionRecord) or self.admission.successor_binding is None:
+                raise ValueError("successor outcome requires a bound admission ledger")
+            if (self.admission.predecessor_task_id != self.evidence.task_id
+                    or self.admission.predecessor_attempt_id != self.evidence.attempt_id):
+                raise ValueError("publication crosses predecessor admission")
+        elif self.admission is not None:
+            raise ValueError("non-successor outcome cannot carry admission")
+
+    @property
+    def outcome(self) -> str:
+        return {
+            "preserve_completed": "completed", "preserve_terminal": "terminal",
+            "start_fresh": "fresh_pending", "admit_successor": "successor_admitted",
+            "park": "parked",
+        }[self.reconciliation.action]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema, "evidence": self.evidence.to_dict(),
+            "reconciliation": self.reconciliation.to_dict(), "outcome": self.outcome,
+            "binding": None if self.binding is None else self.binding.to_dict(),
+            "admission": None if self.admission is None else self.admission.to_dict(),
+        }
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "MemberPublicationV2":
+        from .allocations import MemberInvocationV2
+        from .recovery import MemberRecoveryInputV2, MemberReconciliationV2
+
+        fields(data, {"schema", "evidence", "reconciliation", "outcome", "binding", "admission"}, cls.schema, cls.__name__)
+        result = cls(
+            MemberRecoveryInputV2.from_mapping(data["evidence"]),
+            MemberReconciliationV2.from_mapping(data["reconciliation"]),
+            None if data["binding"] is None else MemberInvocationV2.from_mapping(data["binding"]),
+            None if data["admission"] is None else SuccessorAdmissionRecord.from_mapping(data["admission"]),
+        )
+        if result.outcome != data["outcome"]:
+            raise ValueError("member outcome is not derived from reconciliation")
+        return result
+
+
+@frozen_record
+class ReconciliationPublicationV2:
+    """One immutable allocation-attempt result, including exact member digests."""
+
+    schema: ClassVar[str] = "tpen-executor/reconciliation-publication-v2"
+    group: Any
+    allocation_attempt: Any
+    members: tuple[MemberPublicationV2, ...]
+
+    def __post_init__(self) -> None:
+        from .allocations import AllocationAttemptV2
+        from .contracts import ReadyGroupV2
+        from .recovery import reconcile_group
+
+        if not isinstance(self.group, ReadyGroupV2) or not isinstance(self.allocation_attempt, AllocationAttemptV2):
+            raise TypeError("publication requires v2 group and allocation attempt")
+        if self.group.group_id != self.allocation_attempt.group_id:
+            raise ValueError("publication crosses allocation group")
+        members = sequence(self.members, "members")
+        if any(not isinstance(member, MemberPublicationV2) for member in members):
+            raise TypeError("members must contain MemberPublicationV2")
+        if tuple(member.evidence.task_id for member in members) != tuple(task.task_id for task in self.group.members):
+            raise ValueError("publication members differ from immutable plan order")
+        object.__setattr__(self, "members", members)
+        expected = reconcile_group(self.group, tuple(member.evidence for member in members))
+        if tuple(member.reconciliation for member in members) != expected.members:
+            raise ValueError("publication outcomes differ from evidence")
+        allocation_attempts = {self.allocation_attempt.allocation_attempt_id: self.allocation_attempt}
+        invocations = set()
+        for member, task in zip(members, self.group.members):
+            if member.evidence.lineage_id != task.lineage_id:
+                raise ValueError("publication crosses lineage")
+            binding = member.binding
+            if binding is None:
+                continue
+            start = member.evidence.start_receipt
+            if (binding.group_digest != self.group.identity
+                    or binding.allocation_attempt.group_id != self.group.group_id
+                    or start.group_digest != self.group.identity
+                    or start.allocation_id != binding.allocation_attempt.allocation_id
+                    or start.backend_job_id != binding.allocation_attempt.backend_job_id):
+                raise ValueError("publication crosses allocation or group")
+            previous = allocation_attempts.get(binding.allocation_attempt.allocation_attempt_id)
+            if previous is not None and previous != binding.allocation_attempt:
+                raise ValueError("conflicting allocation-attempt facts")
+            allocation_attempts[binding.allocation_attempt.allocation_attempt_id] = binding.allocation_attempt
+            if binding.invocation_id in invocations:
+                raise ValueError("publication repeats invocation identity")
+            invocations.add(binding.invocation_id)
+            if member.admission is not None:
+                successor = member.admission.successor_binding
+                if (successor.group_digest != self.group.identity
+                        or successor.allocation_attempt.group_id != self.group.group_id
+                        or successor.lineage_id != task.lineage_id
+                        or successor.allocation_attempt.allocation_attempt_id == self.allocation_attempt.allocation_attempt_id
+                        or successor.invocation_id == binding.invocation_id):
+                    raise ValueError("successor binding is crossed or not fresh")
+                previous = allocation_attempts.get(successor.allocation_attempt.allocation_attempt_id)
+                if previous is not None and previous != successor.allocation_attempt:
+                    raise ValueError("conflicting successor allocation-attempt facts")
+                allocation_attempts[successor.allocation_attempt.allocation_attempt_id] = successor.allocation_attempt
+        # One allocation-attempt identity denotes one complete immutable record.
+        # Storage constructs this candidate before writing any admission ledger;
+        # decoding follows the same constructor validation.
+        successor_allocations = {}
+        for member in members:
+            if member.admission is None:
+                continue
+            allocation = member.admission.successor_binding.allocation_attempt
+            previous = successor_allocations.setdefault(allocation.allocation_attempt_id, allocation)
+            if previous != allocation:
+                raise ValueError("conflicting successor allocation-attempt binding")
+        successor_invocations = [member.admission.successor_binding.invocation_id for member in members if member.admission is not None]
+        if len(set(successor_invocations)) != len(successor_invocations) or set(successor_invocations) & invocations:
+            raise ValueError("successor invocation identity is reused")
+
+    @property
+    def reconciliation(self):
+        from .recovery import GroupReconciliationV2
+
+        return GroupReconciliationV2(self.group.group_id, self.group.identity, tuple(member.reconciliation for member in self.members))
+
+    def to_dict(self) -> dict[str, Any]:
+        from ._codec import digest
+
+        return {
+            "schema": self.schema, "group": self.group.to_dict(),
+            "allocation_attempt": self.allocation_attempt.to_dict(),
+            "members": [member.to_dict() for member in self.members],
+            "member_digests": [digest(member.to_dict()) for member in self.members],
+            "reconciliation": self.reconciliation.to_dict(),
+        }
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "ReconciliationPublicationV2":
+        from .allocations import AllocationAttemptV2
+        from .contracts import ReadyGroupV2
+
+        data = decode_json(data)
+        fields(data, {"schema", "group", "allocation_attempt", "members", "member_digests", "reconciliation"}, cls.schema, cls.__name__)
+        result = cls(
+            ReadyGroupV2.from_mapping(data["group"]),
+            AllocationAttemptV2.from_mapping(data["allocation_attempt"]),
+            tuple(MemberPublicationV2.from_mapping(member) for member in sequence(data["members"], "members")),
+        )
+        if result.to_dict() != data:
+            raise ValueError("publication digest or aggregate mismatch")
+        return result

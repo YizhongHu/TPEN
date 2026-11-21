@@ -320,21 +320,26 @@ Interaction order m:
 
 ## Checks After Changes
 
-After code changes, run the fast syntax and test checks:
+Choose checks for the changed behavior using the
+[test-execution skill](.agents/skills/test-execution/SKILL.md). State the run's
+purpose, explicit test selection and stopping condition in the existing TO note
+or runbook. Start diagnosis with a small discriminating case; independent PR
+verification completes the declared affected set. The full suite runs once per
+merge batch on `dev`; broader per-PR checks need a change-specific reason.
 
-```bash
-uv run python -m compileall tpen run.py typechecked.py
-uv run pytest -q
-```
+All TPEN tests run on clusters under `cluster-access` and current facility notes.
+Documentation-only changes can use static review without a pytest run.
 
 ## Runtime Type Checking
 
 Pytest installs Typeguard instrumentation for `tpen` by default.
 
-Run tests with Typeguard instrumentation for `tpen`:
+For example, a change to permutation behavior may use the following selected
+file inside the approved cluster environment. Choose the actual affected scope
+from the change; this example is not a universal verification set:
 
 ```bash
-uv run pytest -q
+uv run pytest -q tests/unit/data/test_permutation.py
 ```
 
 ## Equivariance Checking
@@ -431,7 +436,7 @@ uv run --extra cpu python -m http.server --directory docs/_build/html 8000
 
 ## Versioning
 
-The current Hooke integration release is `v0.5.4`; release notes live in
+The current Hooke integration release is `v0.5.5`; release notes live in
 [`RELEASE_NOTES.md`](RELEASE_NOTES.md).
 
 The backwards compatibility of this repository is only with respect to the behavior

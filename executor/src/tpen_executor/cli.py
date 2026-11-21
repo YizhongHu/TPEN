@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_parser.add_argument("--worker-config", required=True, metavar="FILE", help="executor worker YAML")
     dispatch_parser.add_argument("--runs", required=True, metavar="FILE", help="configured-runs sidecar JSON")
     dispatch_parser.add_argument("--dispatcher", choices=("local", "parsl"), default="local")
+    dispatch_parser.add_argument("--transport", metavar="FILE", help="attached transport JSON (Parsl only)")
     dispatch_parser.add_argument("--timeout", type=float, default=None, metavar="SECONDS")
     return parser
 
@@ -93,6 +94,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.worker_config,
             args.runs,
             dispatcher_name=args.dispatcher,
+            transport_path=args.transport,
             timeout=args.timeout,
         )
     except CLIRefusal as error:

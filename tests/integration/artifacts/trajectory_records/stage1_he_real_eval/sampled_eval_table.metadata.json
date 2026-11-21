@@ -1,0 +1,121 @@
+{
+  "burn_in_draws": 0,
+  "byte_count": 59764,
+  "checkpoint_sha256": "b9f5582db5e4cef55e14c903ed550f788473d1a7f3f336a3472f22e61ad84834",
+  "csv_filename": "sampled_eval_table.csv",
+  "csv_sha256": "0b44ce4d1cb3ee97b8528ecee1c8e955fcae23387b18004a0de75eb62a984721",
+  "draw_count": 4,
+  "draw_stride": 10,
+  "execution_receipt": {
+    "diagnostics": [],
+    "implementation": "tpen.physics.hamiltonian.NaiveLocalEnergyEvaluator",
+    "manifest": [
+      {
+        "contributions": [
+          "kinetic"
+        ],
+        "name": "kinetic_energy",
+        "namespace": "tpen.physics"
+      },
+      {
+        "contributions": [
+          "electron_nucleus"
+        ],
+        "name": "electron_nucleus_coulomb",
+        "namespace": "tpen.physics"
+      },
+      {
+        "contributions": [
+          "electron_electron"
+        ],
+        "name": "electron_electron_coulomb",
+        "namespace": "tpen.physics"
+      }
+    ],
+    "numerical_policy": {
+      "accumulation": "sequential_sum",
+      "contribution_order": "000000000000000300000000000000076b696e657469630000000000000010656c656374726f6e5f6e75636c6575730000000000000011656c656374726f6e5f656c656374726f6e",
+      "term_order": "configured_declaration_order"
+    },
+    "system_id": "093086f1343c96add6ca23d7a2af404db274ba200cfa772dff6f1f68b6b27a18",
+    "version": 2
+  },
+  "execution_receipt_method_id": "08ea539e4ef3dbe0359e42f9f4977dd9c104f1bc90c7d91264cd348a69593d4f",
+  "finite_count": 256,
+  "mean": -2.9153292641832143,
+  "model_provenance": "checkpoint",
+  "n_electrons": 2,
+  "nonfinite_count": 0,
+  "observable": "local_energy",
+  "observable_values_content_id": "cdb6ed96ac8443acd3039e68bdc25de9cdc4139756057f13cc50382cd6ed7c5f",
+  "record_content_id": "96a06302dc64e6b43c6f364d622274a7197515a21f7798ed7c9af537f1452116",
+  "resolved_config_identity": {
+    "schema": "tpen-config-identity-v1",
+    "sha256": "f31b43dbbfd784e31cf60a3f2971658134a0b22ed6ac5a6d4f7d304c0bfd1b50"
+  },
+  "row_count": 256,
+  "row_semantics": "complete_draw_walker_grid",
+  "schema": "trajectory_records/v2",
+  "spatial_dim": 3,
+  "system_descriptor": {
+    "particle": {
+      "n_electrons": 2,
+      "n_spin_down": 1,
+      "n_spin_up": 1,
+      "spatial_dim": 3
+    },
+    "resources": {
+      "e16d9fcab35e27bae5c7a878ce47c39fe4e3727d49a989324547dcb4ceab82bc": {
+        "charges": [
+          2.0
+        ],
+        "positions": [
+          [
+            0.0,
+            0.0,
+            0.0
+          ]
+        ]
+      }
+    },
+    "terms": [
+      {
+        "name": "kinetic_energy",
+        "namespace": "tpen.physics",
+        "parameters": {},
+        "resource_id": null,
+        "slot": "kinetic",
+        "version": 1
+      },
+      {
+        "name": "electron_nucleus_coulomb",
+        "namespace": "tpen.physics",
+        "parameters": {
+          "eps": 0.0
+        },
+        "resource_id": "e16d9fcab35e27bae5c7a878ce47c39fe4e3727d49a989324547dcb4ceab82bc",
+        "slot": "electron_nucleus",
+        "version": 1
+      },
+      {
+        "name": "electron_electron_coulomb",
+        "namespace": "tpen.physics",
+        "parameters": {
+          "eps": 0.0
+        },
+        "resource_id": null,
+        "slot": "electron_electron",
+        "version": 1
+      }
+    ],
+    "units": "atomic_units"
+  },
+  "system_descriptor_id": "093086f1343c96add6ca23d7a2af404db274ba200cfa772dff6f1f68b6b27a18",
+  "term_names": [
+    "kinetic",
+    "electron_nucleus",
+    "electron_electron"
+  ],
+  "variance": 0.04906545786640315,
+  "walker_count": 64
+}

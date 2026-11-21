@@ -437,6 +437,17 @@ def run_from_config(
         :func:`prepare_run_context`; see its docstring for the routing
         contract. ``cfg`` and the recorded ``run.dir`` are unaffected.
 
+    Raises
+    ------
+    tpen.checkpoint.profiles.UnsupportedMutableStateError
+        With ``raise_exceptions=True``, a train-resume configuration outside
+        the native recovery profile is refused before context construction,
+        callback execution or mutable state initialization. Both configured
+        ``runner.load`` (or Train's sixth positional argument) and
+        ``restore_request`` use this admission boundary. Indeterminate load
+        syntax refuses with ``malformed-config`` without executing resolvers.
+        Fresh and model-only runs do not undergo profile admission.
+
     Returns
     -------
     int
@@ -460,21 +471,14 @@ def run_from_config(
     runner: Runner | None = None
     evidence_result: RunResult | None = None
     try:
-        # PRECONSTRUCTION FIREWALL. This is the first statement in the try on
-        # purpose: `prepare_run_context` below already creates the run
-        # directory and instantiates every logger and callback, so a check
-        # placed after it would be enforcing a rule against a run that had
-        # already begun to exist. Nothing above this line constructs anything,
-        # so a refusal here leaves no directory, no callback and no model.
-        #
-        # A configuration that declares no HI schema passes straight through --
-        # see `tpen.hi_schema` on why the firewall is opt-in.
-        #
-        # `prepare_run_context` enforces the same rule for callers that bypass
-        # this entry point. Keeping the check here as well means a refusal is
-        # reported through this function's own failure path (status update,
-        # exception event, logger teardown, `return 1`) rather than escaping as
-        # a bare exception from a helper.
+        # Native admission must precede HI validation, which resolves config
+        # and can execute user resolvers. Inspect restore intent as syntax only.
+        from tpen.checkpoint.profiles import (
+            configured_load_mode, validate_native_recovery_profile,
+        )
+
+        if restore_request is not None or configured_load_mode(cfg) == "train_resume":
+            validate_native_recovery_profile(cfg)
         validate_hi_train_config(cfg)
         if topology is not None:
             topology = execution_topology_from_facts(topology)

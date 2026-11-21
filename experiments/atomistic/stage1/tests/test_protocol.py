@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 import experiments.atomistic.stage1.protocol as protocol_module
 
+from dataclasses import replace
+
 from experiments.atomistic.stage1.protocol import (
     _encode_seed,
     _TORCH_SEED_MODULUS,
@@ -30,18 +32,20 @@ from experiments.atomistic.stage1.protocol import (
     training_seed,
 )
 
+TEST_PROTOCOL = replace(STAGE1_PROTOCOL, lineage_updates=101, retention_cadence=None)
+
 
 SHA1 = "a" * 40
 SHA256 = "b" * 64
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
-def _manifest(checkpoints: list[int] = [7, 101]) -> list[dict[str, object]]:
+def _manifest(checkpoints: list[int] = [0, 7, 101]) -> list[dict[str, object]]:
     bindings = {(system, lineage, checkpoint): SHA256
                 for system in SYSTEMS
                 for lineage in range(3)
                 for checkpoint in checkpoints}
-    return build_manifest(protocol=STAGE1_PROTOCOL, source_sha=SHA1,
+    return build_manifest(protocol=TEST_PROTOCOL, source_sha=SHA1,
                           config_sha256=SHA256, checkpoints=checkpoints,
                           lineage_seeds=[11, 12, 13], checkpoint_sha256=bindings,
                           results_root="/external/stage1")
@@ -121,15 +125,54 @@ def test_seed_known_vectors_are_cross_process_stable_across_hash_seeds() -> None
 
 
 def test_manifest_refuses_forced_seed_collision(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(protocol_module, "_encode_seed", lambda **_: 123)
+    original_training_seed = protocol_module.training_seed
+    training_calls = 0
+
+    def collide_across_training_lineages(*, system: str, lineage: int,
+                                          lineage_seed: int) -> int:
+        nonlocal training_calls
+        training_calls += 1
+        # The first 12 calls are the complete-plan audit.  Collide only when
+        # the row loop reaches hooke1 lineage 1, proving its own guard is live.
+        if training_calls == 14:
+            return original_training_seed(
+                system="hooke1", lineage=0, lineage_seed=11,
+            )
+        return original_training_seed(
+            system=system, lineage=lineage, lineage_seed=lineage_seed,
+        )
+
+    monkeypatch.setattr(protocol_module, "training_seed", collide_across_training_lineages)
     with pytest.raises(ProtocolError, match="seed collision"):
-        _manifest(checkpoints=[7])
+        _manifest(checkpoints=[0, 7, 101])
+    monkeypatch.setattr(protocol_module, "training_seed", original_training_seed)
+
+    original_evaluation_seed = protocol_module.evaluation_seed
+    evaluation_calls = 0
+
+    def collide_across_evaluation_lineages(*, system: str, lineage: int,
+                                            checkpoint: int, stream: int) -> int:
+        nonlocal evaluation_calls
+        evaluation_calls += 1
+        # The complete-plan audit emits 144 eval seeds first.  The row loop
+        # reaches hooke1 lineage 1 after 12 rows for lineage 0.
+        if evaluation_calls == 157:
+            return original_evaluation_seed(
+                system="hooke1", lineage=0, checkpoint=0, stream=0,
+            )
+        return original_evaluation_seed(
+            system=system, lineage=lineage, checkpoint=checkpoint, stream=stream,
+        )
+
+    monkeypatch.setattr(protocol_module, "evaluation_seed", collide_across_evaluation_lineages)
+    with pytest.raises(ProtocolError, match="seed collision"):
+        _manifest(checkpoints=[0, 7, 101])
 
 
 def test_manifest_rejects_duplicate_checkpoint() -> None:
     with pytest.raises(ProtocolError, match="duplicates"):
         build_manifest(
-            protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256=SHA256,
+            protocol=TEST_PROTOCOL, source_sha=SHA1, config_sha256=SHA256,
             checkpoints=[7, 7], lineage_seeds=[11, 12, 13],
             checkpoint_sha256={(system, lineage, 7): SHA256 for system in SYSTEMS
                                for lineage in range(3)},
@@ -152,7 +195,7 @@ def test_seeds_fit_torch_at_coordinate_maxima_and_reject_overflow() -> None:
 
 def test_manifest_binds_real_identity_and_checkpoint_expectations() -> None:
     rows = _manifest()
-    expected_rows = len(SYSTEMS) * (1 + 3 + 3 * 2 * 4)
+    expected_rows = len(SYSTEMS) * (1 + 3 + 3 * 3 * 4)
     assert len(rows) == expected_rows
     assert len({row["row_id"] for row in rows}) == expected_rows
     assert all("seed" in row for row in rows)
@@ -178,7 +221,7 @@ def test_smoke_rows_use_real_train_config_and_final_checkpoint_step() -> None:
 
 
 def test_manifest_pins_configured_physical_identity_on_eval_rows() -> None:
-    rows = _manifest(checkpoints=[7])
+    rows = _manifest(checkpoints=[0, 7, 101])
     config_root = Path(__file__).parents[1] / "configs"
     for row in rows:
         if row["kind"] == "eval":
@@ -204,26 +247,58 @@ def test_manifest_rejects_missing_or_invalid_explicit_physical_identity(ids: dic
                 for system in SYSTEMS for lineage in range(3)}
     with pytest.raises(ProtocolError, match="expected_physical_system_id"):
         build_manifest(
-            protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256=SHA256,
-            checkpoints=[7], lineage_seeds=[11, 12, 13], checkpoint_sha256=bindings,
+            protocol=TEST_PROTOCOL, source_sha=SHA1, config_sha256=SHA256,
+            checkpoints=[0, 7, 101], lineage_seeds=[11, 12, 13], checkpoint_sha256=bindings,
             results_root="/external/stage1", expected_physical_system_id=ids,
         )
+
+
+def _complete_checkpoint_bindings(
+    checkpoints: list[int],
+) -> dict[tuple[str, int, int], str]:
+    """Provide a digest for every requested system/lineage/checkpoint tuple."""
+
+    return {
+        (system, lineage, checkpoint): SHA256
+        for system in SYSTEMS
+        for lineage in range(3)
+        for checkpoint in checkpoints
+    }
 
 
 @pytest.mark.parametrize("field,value", [("source_sha", "tiny"), ("config_sha256", "tiny")])
 def test_manifest_rejects_placeholder_identity(field: str, value: str) -> None:
     kwargs = {"source_sha": SHA1, "config_sha256": SHA256, field: value}
-    with pytest.raises(ProtocolError):
-        build_manifest(protocol=STAGE1_PROTOCOL, checkpoints=[7], lineage_seeds=[11, 12, 13],
-                       checkpoint_sha256={(s, l, 7): SHA256 for s in SYSTEMS
-                                          for l in range(3)},
-                       results_root="/external/stage1", **kwargs)
+    with pytest.raises(ProtocolError, match=field):
+        build_manifest(
+            protocol=TEST_PROTOCOL,
+            checkpoints=[0, 7, 101],
+            lineage_seeds=[11, 12, 13],
+            checkpoint_sha256=_complete_checkpoint_bindings([0, 7, 101]),
+            results_root="/external/stage1",
+            **kwargs,
+        )
+
+
+def test_manifest_accepts_complete_identity_bindings() -> None:
+    """A valid identity and complete checkpoint packet is admitted."""
+
+    rows = build_manifest(
+        protocol=TEST_PROTOCOL,
+        source_sha=SHA1,
+        config_sha256=SHA256,
+        checkpoints=[0, 7, 101],
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256=_complete_checkpoint_bindings([0, 7, 101]),
+        results_root="/external/stage1",
+    )
+    assert len([row for row in rows if row["kind"] == "eval"]) == len(SYSTEMS) * 3 * 3 * 4
 
 
 def test_manifest_rejects_placeholder_config_sha256() -> None:
     with pytest.raises(ProtocolError, match="config_sha256"):
-        build_manifest(protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256="tiny",
-                       checkpoints=[7], lineage_seeds=[11, 12, 13],
+        build_manifest(protocol=TEST_PROTOCOL, source_sha=SHA1, config_sha256="tiny",
+                       checkpoints=[0, 7, 101], lineage_seeds=[11, 12, 13],
                        checkpoint_sha256={(s, l, 7): SHA256 for s in SYSTEMS
                                           for l in range(3)},
                        results_root="/external/stage1")
@@ -232,8 +307,8 @@ def test_manifest_rejects_placeholder_config_sha256() -> None:
 def test_manifest_rejects_relative_results_root() -> None:
     with pytest.raises(ProtocolError, match="results_root must be an absolute"):
         build_manifest(
-            protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256=SHA256,
-            checkpoints=[7], lineage_seeds=[11, 12, 13],
+            protocol=TEST_PROTOCOL, source_sha=SHA1, config_sha256=SHA256,
+            checkpoints=[0, 7, 101], lineage_seeds=[11, 12, 13],
             checkpoint_sha256={(s, l, 7): SHA256 for s in SYSTEMS
                                for l in range(3)},
             results_root="relative/stage1",
@@ -242,9 +317,9 @@ def test_manifest_rejects_relative_results_root() -> None:
 
 def _phase1_rows() -> list[dict[str, object]]:
     return build_manifest(
-        protocol=STAGE1_PROTOCOL, source_sha=SHA1,
+        protocol=TEST_PROTOCOL, source_sha=SHA1,
         config_sha256={system: SHA256 for system in SYSTEMS},
-        checkpoints=[7], lineage_seeds=[11, 12, 13], checkpoint_sha256={},
+        checkpoints=[0, 7, TEST_PROTOCOL.lineage_updates], lineage_seeds=[11, 12, 13], checkpoint_sha256={},
         results_root="/external/stage1", systems=("he",), phase=1,
     )
 
@@ -265,10 +340,12 @@ def _phase2_evidence(phase1: list[dict[str, object]] | None = None) -> dict[str,
 def test_phase1_selected_system_preserves_full_manifest_identity() -> None:
     selected = _phase1_rows()
     full = build_manifest(
-        protocol=STAGE1_PROTOCOL, source_sha=SHA1,
+        protocol=TEST_PROTOCOL, source_sha=SHA1,
         config_sha256={system: SHA256 for system in SYSTEMS},
-        checkpoints=[7], lineage_seeds=[11, 12, 13],
-        checkpoint_sha256={(system, lineage, 7): SHA256 for system in SYSTEMS for lineage in range(3)},
+        checkpoints=[0, 7, TEST_PROTOCOL.lineage_updates], lineage_seeds=[11, 12, 13],
+            checkpoint_sha256={(system, lineage, checkpoint): SHA256
+                               for system in SYSTEMS for lineage in range(3)
+                               for checkpoint in (0, 7, TEST_PROTOCOL.lineage_updates)},
         results_root="/external/stage1",
         expected_physical_system_id={system: "c" * 64 for system in SYSTEMS},
     )
@@ -337,9 +414,9 @@ def test_phase2_rejects_bare_checkpoint_digest_map() -> None:
 def test_phase2_rejects_checkpoint_evidence_from_a_foreign_phase1_manifest() -> None:
     phase1_a = _phase1_rows()
     phase1_b = build_manifest(
-        protocol=STAGE1_PROTOCOL, source_sha=SHA1,
+        protocol=TEST_PROTOCOL, source_sha=SHA1,
         config_sha256={system: SHA256 for system in SYSTEMS},
-        checkpoints=[7], lineage_seeds=[21, 22, 23], checkpoint_sha256={},
+        checkpoints=[0, 7, TEST_PROTOCOL.lineage_updates], lineage_seeds=[21, 22, 23], checkpoint_sha256={},
         results_root="/external/stage1", systems=("he",), phase=1,
     )
     with pytest.raises(ProtocolError, match="checkpoint evidence"):
@@ -364,12 +441,12 @@ def test_phase2_rejects_evidence_with_a_forged_manifest_hash() -> None:
 def test_phase2_rejects_checkpoint_outside_phase1_steps() -> None:
     evidence = _phase2_evidence()
     evidence["checkpoints"] = {
-        **evidence["checkpoints"], "he:0:101": SHA256,
-        "he:1:101": SHA256, "he:2:101": SHA256,
+        **evidence["checkpoints"], "he:0:99": SHA256,
+        "he:1:99": SHA256, "he:2:99": SHA256,
     }
     with pytest.raises(ProtocolError, match="checkpoint_steps"):
         bind_evaluation_manifest(
-            phase1_rows=_phase1_rows(), checkpoints=[101], checkpoint_evidence=evidence,
+            phase1_rows=_phase1_rows(), checkpoints=[99], checkpoint_evidence=evidence,
             expected_physical_system_id={"he": "c" * 64},
         )
 

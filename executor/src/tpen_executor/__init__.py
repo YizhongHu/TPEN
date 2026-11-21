@@ -2,18 +2,18 @@
 
 from importlib import import_module
 
-from .contracts import AllocationId, AttemptId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
-from .allocations import ConfiguredAllocation
+from .contracts import AllocationAttemptId, AllocationId, AttemptId, BackendJobId, ExecutionPlanV2, GroupId, InvocationId, ProgramSpecRef, ReadyGroup, ReadyGroupV2, TaskSpec
+from .allocations import AllocationAttemptV2, ConfiguredAllocation, ControllerGenerationV1, LaunchIntentV1
 from .delivery import PreparedInputBundle
 from .environments import PreparedPythonEnvironment, SourceScript
 from .results import AcceptedSegment, AllocationObservation, CoreOutcomeRecord, ManifestAttempt, OutcomeReceipt, OUTCOME_STATUSES, RunManifest, SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3, StartReceipt, decode_manifest, encode_manifest
 from .runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
-from .recovery import CoreProfileReference, ProfileCheck, ProfileUnavailable
-from .storage import AttemptFence, DirectoryStore, FenceRejected
+from .recovery import CoreAdmissionPort, CoreAdmissionVerdictV2, CoreProfileReference, GroupReconciliationV2, MemberReconciliationV2, MemberRecoveryInputV2, ProfileCheck, ProfileUnavailable, reconcile, reconcile_allocation_group, reconcile_group
+from .storage import AttemptFence, ControllerGenerationRejected, DirectoryStore, FenceRejected, LaunchIntentRejected
 from .tasks import ConfiguredRun
 from .lifecycle import AttachedAllocation
 from .workers import ProcessOutcome, SubprocessWorker
-from .placement import AllocationSlot, BindingError, ChildPlacementObservation, PlacementRefusal, WorkerBinding, binding_from_allocation, bindings_from_allocation, parse_cpu_set, parse_proc_start_ticks, read_child_placement, slots_from_allocation
+from .placement import AllocationSlot, ALLOCATION_SLOTS_V2_SCHEMA, BindingError, ChildPlacementObservation, PlacementRefusal, WorkerBinding, binding_from_allocation, bindings_from_allocation, captured_scheduler_host_map, parse_cpu_set, parse_proc_start_ticks, read_child_placement, routed_slots_from_allocation, slots_from_allocation
 
 __version__ = "0.1.0"
 
@@ -26,6 +26,10 @@ _LAZY_EXPORTS = {
     "LocalDispatcher": (".dispatch", "LocalDispatcher"),
     "ParslDispatcher": (".dispatch", "ParslDispatcher"),
     "ParslUnavailableError": (".dispatch", "ParslUnavailableError"),
+    "AttachedTransportSpec": (".dispatch.parsl", "AttachedTransportSpec"),
+    "RoutedAttachedTransportSpec": (".dispatch.parsl", "RoutedAttachedTransportSpec"),
+    "RoutedTransportPool": (".dispatch.parsl", "RoutedTransportPool"),
+    "decode_attached_transport": (".dispatch.parsl", "decode_attached_transport"),
 }
 
 
@@ -41,11 +45,11 @@ def __getattr__(name: str):
     return value
 
 __all__ = [
-    "__version__", "AcceptedSegment", "AllocationId", "AllocationObservation", "AllocationProgram", "CoreOutcomeRecord",
-    "AttemptId", "AttachedAllocation", "AttemptFence", "BackendJobId", "ConfiguredAllocation", "ConfiguredRun", "CoreRunEvidence", "DirectoryStore", "EvidenceUnavailable", "FenceRejected", "ManifestAttempt", "MaterializedProgram", "OUTCOME_STATUSES", "OutcomeReceipt", "ProcessOutcome",
-    "ProgramSpecRef", "ProfileCheck", "ProfileUnavailable", "ReadyGroup", "RunManifest", "SciencePlacementReceipt", "SciencePlacementReceiptV2", "SciencePlacementReceiptV3", "StagedConfig", "StagedHydra", "LocalDispatcher", "ParslDispatcher", "ParslUnavailableError",
+    "__version__", "AcceptedSegment", "AllocationAttemptId", "AllocationAttemptV2", "AllocationId", "AllocationObservation", "AllocationProgram", "CoreOutcomeRecord",
+    "AttemptId", "AttachedAllocation", "AttemptFence", "BackendJobId", "ConfiguredAllocation", "ConfiguredRun", "ControllerGenerationRejected", "ControllerGenerationV1", "CoreAdmissionPort", "CoreAdmissionVerdictV2", "CoreRunEvidence", "DirectoryStore", "EvidenceUnavailable", "ExecutionPlanV2", "FenceRejected", "GroupId", "GroupReconciliationV2", "InvocationId", "LaunchIntentRejected", "LaunchIntentV1", "ManifestAttempt", "MaterializedProgram", "MemberReconciliationV2", "MemberRecoveryInputV2", "OUTCOME_STATUSES", "OutcomeReceipt", "ProcessOutcome",
+    "ProgramSpecRef", "ProfileCheck", "ProfileUnavailable", "ReadyGroup", "ReadyGroupV2", "RunManifest", "SciencePlacementReceipt", "SciencePlacementReceiptV2", "SciencePlacementReceiptV3", "StagedConfig", "StagedHydra", "LocalDispatcher", "ParslDispatcher", "ParslUnavailableError",
     "PreparedInputBundle", "PreparedPythonEnvironment", "SourceScript", "StartReceipt",
-    "TaskSpec", "TPENCommand", "TPENEvidence", "SubprocessWorker", "WorkerProgram", "CoreProfileReference",
-    "AllocationSlot", "BindingError", "ChildPlacementObservation", "PlacementRefusal", "WorkerBinding", "binding_from_allocation", "bindings_from_allocation", "parse_cpu_set", "parse_proc_start_ticks", "read_child_placement", "slots_from_allocation",
+    "TaskSpec", "TPENCommand", "TPENEvidence", "SubprocessWorker", "WorkerProgram", "CoreProfileReference", "reconcile", "reconcile_allocation_group", "reconcile_group",
+    "AllocationSlot", "ALLOCATION_SLOTS_V2_SCHEMA", "AttachedTransportSpec", "BindingError", "captured_scheduler_host_map", "ChildPlacementObservation", "PlacementRefusal", "RoutedAttachedTransportSpec", "RoutedTransportPool", "WorkerBinding", "binding_from_allocation", "bindings_from_allocation", "decode_attached_transport", "parse_cpu_set", "parse_proc_start_ticks", "read_child_placement", "routed_slots_from_allocation", "slots_from_allocation",
     "decode_manifest", "encode_manifest",
 ]

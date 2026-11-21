@@ -357,7 +357,12 @@ class SubprocessWorker:
                 environment.setup.path,
                 *logical_argv,
             ]
+        # Import at launch time because runners also uses this worker class.
+        from .runners import ROUTED_STRICT_HOST_ENV
+
         child_env = os.environ.copy()
+        # Only the controller-prepared descriptor may enable strict host policy.
+        child_env.pop(ROUTED_STRICT_HOST_ENV, None)
         child_env.update(environment.env)
         # Only the explicit prepared descriptor opts this launch into
         # sampling or names its quarantine directory; an ambient

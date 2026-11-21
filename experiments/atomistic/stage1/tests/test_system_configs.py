@@ -3,12 +3,23 @@
 from pathlib import Path
 
 import pytest
+import sys
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
 from tpen.run import load_config
-from experiments.atomistic.stage1.protocol import SYSTEMS, physical_system_id_from_config
+from experiments.atomistic.stage1.protocol import (
+    ProtocolError,
+    SYSTEMS,
+    STAGE1_PROTOCOL,
+    build_manifest,
+    config_identities,
+    physical_system_id_from_config,
+)
 from experiments.atomistic.stage1.launch import row_overrides
+from experiments.atomistic.stage1 import train as stage1_train
+from experiments.atomistic.stage1.launch import _binding_token
+from experiments.atomistic.stage1.protocol import validate_gateway_binding
 
 
 ROOT = Path(__file__).parents[1] / "configs"
@@ -42,8 +53,139 @@ def test_train_config_declares_checkpoint_publication(system: str) -> None:
                           if entry.get("_target_") == "tpen.callback.Checkpoint")
     assert raw_checkpoint["output_dir"] == "${run.dir}/checkpoints"
     assert checkpoints[0].schedule._target_ == "tpen.checkpoint.ExplicitUpdates"
-    assert list(checkpoints[0].schedule.updates) == [1000]
-    assert list(cfg.checkpoint_steps) == [1000]
+    if system in {"he", "h2"}:
+        expected_steps = [0, *range(1000, 100001, 1000)]
+        assert list(checkpoints[0].schedule.updates) == expected_steps
+        assert list(cfg.checkpoint_steps) == expected_steps
+        assert cfg.trainer.max_steps == 100000
+    else:
+        assert list(checkpoints[0].schedule.updates) == [1000]
+        assert list(cfg.checkpoint_steps) == [1000]
+
+
+def test_real_he_h2_phase1_rows_bind_protocol_horizon() -> None:
+    """The production phase-1 rows must carry the configured horizon."""
+
+    train_configs = {
+        system: load_config(str(ROOT / system / "train.yaml"))
+        for system in ("he", "h2")
+    }
+    checkpoints = list(train_configs["he"].checkpoint_steps)
+    assert checkpoints == list(train_configs["h2"].checkpoint_steps)
+    rows = build_manifest(
+        protocol=STAGE1_PROTOCOL,
+        source_sha="a" * 40,
+        config_sha256=config_identities(config_root=ROOT, systems=("he", "h2")),
+        checkpoints=checkpoints,
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root="/external/stage1",
+        systems=("he", "h2"),
+        phase=1,
+    )
+    train_rows = [row for row in rows if row["kind"] == "train"]
+    assert {row["system"] for row in train_rows} == {"he", "h2"}
+    assert all(row["updates"] == STAGE1_PROTOCOL.lineage_updates for row in train_rows)
+    assert all(row["checkpoint_steps"] == checkpoints for row in train_rows)
+
+
+@pytest.mark.parametrize("system", ["he", "h2"])
+def test_real_phase1_rejects_missing_interior_retention(system: str) -> None:
+    """The real 100k train contract cannot silently thin its 101 checkpoints."""
+
+    with pytest.raises(ProtocolError, match="retention|checkpoint"):
+        build_manifest(
+            protocol=STAGE1_PROTOCOL,
+            source_sha="a" * 40,
+            config_sha256=config_identities(config_root=ROOT, systems=(system,)),
+            checkpoints=[0, STAGE1_PROTOCOL.lineage_updates],
+            lineage_seeds=[11, 12, 13],
+            checkpoint_sha256={},
+            results_root="/external/stage1",
+            systems=(system,),
+            phase=1,
+        )
+
+
+@pytest.mark.parametrize("system", ["he", "h2"])
+def test_real_train_config_horizon_matches_protocol(system: str) -> None:
+    """The real train config and protocol must share one terminal update."""
+
+    cfg = load_config(str(ROOT / system / "train.yaml"))
+    assert cfg.trainer.max_steps == STAGE1_PROTOCOL.lineage_updates
+    assert max(cfg.checkpoint_steps) == STAGE1_PROTOCOL.lineage_updates
+
+
+@pytest.mark.parametrize("system", ["he", "h2"])
+def test_real_train_row_reaches_gateway_zero_preparation(
+    system: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real He/H2 rows reach the gateway with zero routed separately."""
+
+    checkpoints = list(load_config(str(ROOT / system / "train.yaml")).checkpoint_steps)
+    rows = build_manifest(
+        protocol=STAGE1_PROTOCOL,
+        source_sha="a" * 40,
+        config_sha256=config_identities(config_root=ROOT, systems=(system,)),
+        checkpoints=checkpoints,
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root=str(tmp_path / "results"),
+        systems=(system,),
+        phase=1,
+        device="cpu",
+    )
+    row = next(row for row in rows if row["kind"] == "train" and row["lineage"] == 0)
+    overrides = row_overrides(row)
+    assert validate_gateway_binding(
+        binding=_binding_token(row),
+        config=str(row["config"]),
+        overrides=overrides,
+        kind="train",
+    ) == row
+
+    observed = {}
+    monkeypatch.setattr(
+        stage1_train,
+        "run_from_config",
+        lambda cfg, **_: observed.update(cfg=cfg) or 0,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage1-train",
+            "--config", str(ROOT / system / "train.yaml"),
+            "--kind", "train",
+            *overrides,
+            "--binding", _binding_token(row),
+        ],
+    )
+    assert stage1_train.main() == 0
+    cfg = observed["cfg"]
+    assert cfg.trainer.max_steps == STAGE1_PROTOCOL.lineage_updates
+    assert list(cfg.checkpoint_steps) == checkpoints[1:]
+    targets = [str(callback.get("_target_")) for callback in cfg.callbacks]
+    assert targets.count("tpen.callback.Checkpoint") == 1
+    assert targets.count("tpen.callback.InitialCheckpoint") == 1
+    checkpoint = next(
+        callback for callback in cfg.callbacks
+        if callback.get("_target_") == "tpen.callback.Checkpoint"
+    )
+    assert list(checkpoint.schedule.updates) == checkpoints[1:]
+
+
+@pytest.mark.parametrize("system", ["he", "h2"])
+def test_width32_model_is_identical_between_train_and_eval(system: str) -> None:
+    train = load_config(str(ROOT / system / "train.yaml"))
+    eval_cfg = load_config(str(ROOT / system / "eval.yaml"))
+    eval_model = eval_cfg.stage1_he_model if system == "he" else eval_cfg.stage1_h2_model
+    for model in (train.model, eval_model):
+        assert model.embedding.out_channels == 32
+        assert model.embedding.hidden_channels == 128
+        assert model.layers[0].mixing.channels == 32
+        assert model.layers[0].path_aggregation.channels == 32
+        assert model.readout.channels == 32
 
 
 @pytest.mark.parametrize("system", ["hooke1", "hooke2", "he"])

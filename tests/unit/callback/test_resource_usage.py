@@ -9,13 +9,20 @@ by the real dispatcher, and their emission by `tpen.run`, are covered in
 
 from __future__ import annotations
 
+import copy
 import json
 import math
+import random
 import pytest
 from types import SimpleNamespace
 
+import numpy as np
+import torch
+from omegaconf import OmegaConf
+
 from tpen.callback import ResourceUsage
 from tpen.callback import resource_usage as resource_usage_module
+from tpen.checkpoint import TrainResume, save_checkpoint
 from tpen.events import Occurrence
 from tpen.run_events import RunCompleted, RunFailed, RunStarted
 from tpen.process_resources import (
@@ -57,6 +64,52 @@ class _FakeAllocatorProbe:
 
     def read(self) -> AllocatorUsage:
         return self.usage
+
+
+class _AttemptAllocatorProbe(_FakeAllocatorProbe):
+    """Probe fake with attempt-specific reset evidence."""
+
+    def __init__(self, usage: AllocatorUsage, reset_result: object) -> None:
+        super().__init__(usage)
+        self.reset_result = reset_result
+
+    def reset(self) -> object:
+        self.reset_calls += 1
+        return self.reset_result
+
+
+class _CountingProcessProbe(ProcessRUsageProbe):
+    """Process fake proving each RunStarted captures a new baseline."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.baselines: list[ProcessResourceBaseline] = []
+        self.result_baselines: list[ProcessResourceBaseline] = []
+
+    def read(self) -> ProcessResourceBaseline:
+        baseline = ProcessResourceBaseline(
+            user_cpu_seconds=len(self.baselines),
+            system_cpu_seconds=0,
+            read_block_operations=0,
+            write_block_operations=0,
+            voluntary_context_switches=0,
+            involuntary_context_switches=0,
+            peak_rss_mb=0,
+        )
+        self.baselines.append(baseline)
+        return baseline
+
+    def result(self, baseline: ProcessResourceBaseline) -> ProcessResourceResult:
+        self.result_baselines.append(baseline)
+        return ProcessResourceResult(
+            user_cpu_seconds=float(baseline.user_cpu_seconds) + 10.0,
+            system_cpu_seconds=1.0,
+            read_block_operations=2,
+            write_block_operations=3,
+            voluntary_context_switches=4,
+            involuntary_context_switches=5,
+            peak_rss_mb=6.0,
+        )
 
 
 def test_resource_usage_logs_peak_rss_at_run_completion(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -272,6 +325,293 @@ def test_resource_usage_recreates_auto_probe_for_each_context(
     assert [probe.reset_calls for probe in probes] == [1, 1]
     assert contexts[0].latest("runtime")["accelerator_max_memory_allocated_mb"] == 1.0
     assert contexts[1].latest("runtime")["accelerator_max_memory_allocated_mb"] == 2.0
+
+
+def test_resource_usage_starts_each_attempt_with_fresh_baseline_device_reset_and_terminal_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resource telemetry is fresh and observational at each attempt boundary."""
+
+    contexts = (RecordingContext(), RecordingContext())
+    contexts[0].metadata.device = "cuda:0"
+    contexts[1].metadata.device = "cuda:1"
+    probes: list[_AttemptAllocatorProbe] = []
+    process_probe = _CountingProcessProbe()
+
+    def build_probe(device: str) -> _AttemptAllocatorProbe:
+        index = int(device.rsplit(":", 1)[1])
+        probe = _AttemptAllocatorProbe(
+            AllocatorUsage(
+                identity=AcceleratorIdentity(AcceleratorKind.CUDA, index, f"GPU-{index}"),
+                allocated_mb=float(index + 1),
+                reserved_mb=float(index + 2),
+                device_count=1,
+            ),
+            AllocatorUnavailable("reset failed") if index == 0 else AcceleratorIdentity(
+                AcceleratorKind.CUDA, index, f"GPU-{index}"
+            ),
+        )
+        probes.append(probe)
+        return probe
+
+    monkeypatch.setattr(resource_usage_module, "TorchAllocatorPeakProbe", build_probe)
+    callback = ResourceUsage(process_probe=process_probe)
+
+    _deliver(callback, contexts[0], RunStarted())
+    _deliver(callback, contexts[0], RunCompleted())
+    _deliver(callback, contexts[0], RunFailed(exception_type="RuntimeError", exception_message="late"))
+    _deliver(callback, contexts[1], RunStarted())
+    _deliver(callback, contexts[1], RunFailed(exception_type="RuntimeError", exception_message="boom"))
+    _deliver(callback, contexts[1], RunCompleted())
+
+    assert [probe.reset_calls for probe in probes] == [1, 1]
+    assert [baseline.user_cpu_seconds for baseline in process_probe.baselines] == [0, 1]
+    assert [baseline.user_cpu_seconds for baseline in process_probe.result_baselines] == [0, 1]
+    assert len(contexts[0].by_namespace("runtime")) == 1
+    assert len(contexts[1].by_namespace("runtime")) == 1
+    assert len(contexts[0].by_namespace("process")) == 1
+    assert len(contexts[1].by_namespace("process")) == 1
+    assert contexts[0].latest("runtime")["accelerator_max_memory_allocated_unavailable"] is True
+    assert contexts[1].latest("runtime")["accelerator_max_memory_allocated_mb"] == 2.0
+
+
+class _RngPerturbingProcessProbe(ProcessRUsageProbe):
+    """Test-only resource reader that deliberately consumes the global RNG."""
+
+    def __init__(self, result: ProcessResourceResult) -> None:
+        super().__init__()
+        self.result_value = result
+
+    def read(self) -> ProcessResourceBaseline:
+        torch.rand(1)
+        return ProcessResourceBaseline(
+            user_cpu_seconds=0,
+            system_cpu_seconds=0,
+            read_block_operations=0,
+            write_block_operations=0,
+            voluntary_context_switches=0,
+            involuntary_context_switches=0,
+            peak_rss_mb=0,
+        )
+
+    def result(self, baseline: ProcessResourceBaseline) -> ProcessResourceResult:
+        del baseline
+        return self.result_value
+
+
+def _run_real_resource_attempt(
+    root,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    allocated_mb: float,
+    reset_result: object,
+    perturb_rng: bool = False,
+) -> dict[str, object]:
+    """Run ResourceUsage beside real bounded trainer updates and checkpoint after it."""
+
+    from tests.helpers import runtime_equivariance_recovery as recovery
+    from tpen.training import trainer as trainer_module
+
+    random.seed(19)
+    np.random.seed(19)
+    torch.manual_seed(19)
+    # Keep the logical config identical while each context writes to its own
+    # attempt directory; resolved_config.yaml is part of the checkpoint too.
+    config = recovery._config(root.parent / "logical-run", "resource")
+    context = recovery._context(root, "resource", config)
+    context.monotonic_clock = lambda: 42.0
+    model = recovery._ProbeModel(non_equivariant=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    sampler = recovery._Sampler()
+    trainer = recovery.VMCTrainer(max_steps=4, log_every_n_steps=1)
+
+    class _InjectedTorchAllocatorProbe:
+        def __init__(self) -> None:
+            self.reset_calls = 0
+            self.usage = AllocatorUsage(
+                identity=AcceleratorIdentity(AcceleratorKind.CUDA, 0, "GPU-0"),
+                allocated_mb=allocated_mb,
+                reserved_mb=allocated_mb + 1.0,
+                device_count=1,
+            )
+
+        def reset(self) -> object:
+            self.reset_calls += 1
+            return reset_result
+
+        def read(self) -> AllocatorUsage:
+            return self.usage
+
+    process_probe = (
+        _RngPerturbingProcessProbe(_fixed_result())
+        if perturb_rng
+        else _FixedProbe(_fixed_result())
+    )
+    allocator_probe = _InjectedTorchAllocatorProbe()
+    callback = ResourceUsage(
+        process_probe=process_probe,
+        peak_rss_mb_reader=lambda: 512.0,
+        allocator_probe=allocator_probe,
+    )
+    context.callbacks.append(callback)
+    original_local_energy = trainer_module.local_energy
+    trainer_module.local_energy = recovery._fake_local_energy
+    try:
+        context.emit(RunStarted())
+        trainer.fit(
+            model=model,
+            sampler=sampler,
+            hamiltonian_terms=[],
+            optimizer=optimizer,
+            context=context,
+            emit=lambda *_args, **_kwargs: None,
+        )
+        # The checkpoint is deliberately written after the terminal callback,
+        # so the paired comparison includes the actual completed attempt.
+        context.emit(RunCompleted())
+        checkpoint = save_checkpoint(
+            output_dir=root / "checkpoint",
+            next_iteration=trainer.next_iteration,
+            completed_updates=trainer.completed_updates,
+            model=model,
+            optimizer=optimizer,
+            trainer=trainer,
+            sampler=sampler,
+            context=context,
+            payload=TrainResume(),
+        )
+    finally:
+        trainer_module.local_energy = original_local_energy
+
+    manifest = json.loads((checkpoint / "manifest.json").read_text(encoding="utf-8"))
+    resource_namespaces = {"runtime", "process"}
+    return {
+        "model": copy.deepcopy(model.state_dict()),
+        "optimizer": copy.deepcopy(optimizer.state_dict()),
+        "sampler": copy.deepcopy(sampler.mcmc_state_dict()),
+        "trainer": copy.deepcopy(trainer.state_dict()),
+        "rng": torch.get_rng_state().clone(),
+        "records": [
+            record
+            for record in context.records
+            if record["namespace"] not in resource_namespaces
+        ],
+        "resource_records": [
+            record
+            for record in context.records
+            if record["namespace"] in resource_namespaces
+        ],
+        "manifest": manifest,
+        "probe": allocator_probe,
+    }
+
+
+def _assert_state_tree_equal(first, second) -> None:
+    if isinstance(first, torch.Tensor) or isinstance(second, torch.Tensor):
+        assert isinstance(first, torch.Tensor) and isinstance(second, torch.Tensor)
+        assert torch.equal(first, second)
+    elif isinstance(first, dict) or isinstance(second, dict):
+        assert isinstance(first, dict) and isinstance(second, dict)
+        assert first.keys() == second.keys()
+        for key in first:
+            _assert_state_tree_equal(first[key], second[key])
+    elif isinstance(first, (list, tuple)) or isinstance(second, (list, tuple)):
+        assert type(first) is type(second)
+        assert len(first) == len(second)
+        for left, right in zip(first, second, strict=True):
+            _assert_state_tree_equal(left, right)
+    else:
+        assert first == second
+
+
+def _assert_real_resource_attempts_equal(first, second) -> None:
+    """Compare every scientific/resume output, excluding only ResourceUsage namespaces."""
+
+    _assert_state_tree_equal(first["model"], second["model"])
+    _assert_state_tree_equal(first["optimizer"], second["optimizer"])
+    _assert_state_tree_equal(first["sampler"], second["sampler"])
+    _assert_state_tree_equal(first["trainer"], second["trainer"])
+    assert torch.equal(first["rng"], second["rng"]), "resource probe changed RNG state"
+    assert first["records"] == second["records"]
+    first_manifest = first["manifest"]
+    second_manifest = second["manifest"]
+    expected_components = {"resolved_config", "model", "optimizer", "trainer", "sampler", "rng"}
+    for attempt, manifest in (("first", first_manifest), ("second", second_manifest)):
+        assert set(manifest["files"]) == expected_components, (
+            f"{attempt} checkpoint component set differs: {set(manifest['files'])}"
+        )
+    assert first_manifest["files"] == second_manifest["files"], "checkpoint filenames differ"
+    assert first_manifest["next_iteration"] == second_manifest["next_iteration"]
+    assert first_manifest["completed_updates"] == second_manifest["completed_updates"]
+    assert first_manifest["payload"] == second_manifest["payload"]
+    assert first_manifest["runtime"] == second_manifest["runtime"]
+    stable_provenance = {
+        key: value
+        for key, value in first_manifest["provenance"].items()
+        if key != "run_dir"
+    }
+    assert stable_provenance == {
+        key: value
+        for key, value in second_manifest["provenance"].items()
+        if key != "run_dir"
+    }
+    # Fixed basenames and identical state in one process produce identical
+    # torch.save archives (no ZIP timestamps); include JSON/YAML files as well.
+    for component in first_manifest["files"]:
+        digest_key = f"{component}_sha256"
+        for attempt, manifest in (("first", first_manifest), ("second", second_manifest)):
+            assert digest_key in manifest["hashes"], (
+                f"{attempt} checkpoint is missing the {component} file digest ({digest_key})"
+            )
+        assert first_manifest["hashes"][digest_key] == second_manifest["hashes"][digest_key], (
+            f"resource probe changed checkpoint component {component} ({digest_key})"
+        )
+
+
+def test_resource_usage_probe_variation_cannot_change_real_checkpoint_or_science(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Contrasting attempt-local probes leave real training and resume state unchanged."""
+
+    first = _run_real_resource_attempt(
+        tmp_path / "first",
+        monkeypatch,
+        allocated_mb=3.0,
+        reset_result=AcceleratorIdentity(AcceleratorKind.CUDA, 0, "GPU-0"),
+    )
+    second = _run_real_resource_attempt(
+        tmp_path / "second",
+        monkeypatch,
+        allocated_mb=17.0,
+        reset_result=AllocatorUnavailable("reset failed"),
+    )
+
+    assert first["probe"].reset_calls == second["probe"].reset_calls == 1
+    _assert_real_resource_attempts_equal(first, second)
+    assert first["resource_records"] != second["resource_records"]
+
+
+def test_resource_dependent_rng_perturbation_fails_science_isolation_check(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Negative control: a resource reader that consumes RNG is not harmless."""
+
+    baseline = _run_real_resource_attempt(
+        tmp_path / "baseline",
+        monkeypatch,
+        allocated_mb=3.0,
+        reset_result=AcceleratorIdentity(AcceleratorKind.CUDA, 0, "GPU-0"),
+    )
+    perturbed = _run_real_resource_attempt(
+        tmp_path / "perturbed",
+        monkeypatch,
+        allocated_mb=3.0,
+        reset_result=AcceleratorIdentity(AcceleratorKind.CUDA, 0, "GPU-0"),
+        perturb_rng=True,
+    )
+
+    with pytest.raises(AssertionError, match="RNG state"):
+        _assert_real_resource_attempts_equal(baseline, perturbed)
 
 
 def test_resource_usage_does_not_emit_allocator_metrics_for_xpu() -> None:

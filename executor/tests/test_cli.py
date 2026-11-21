@@ -15,7 +15,9 @@ import pytest
 from tpen_executor import composition
 from tpen_executor._codec import digest
 from tpen_executor.allocations import ConfiguredAllocation
+from tpen_executor.cli import build_parser
 from tpen_executor.contracts import AllocationId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
+from tpen_executor.dispatch.parsl import AttachedTransportSpec
 from tpen_executor.tasks import ConfiguredRun, ConfiguredRunTable
 
 
@@ -125,6 +127,126 @@ def _run_cli(paths: dict[str, Path | ReadyGroup], *extra: str) -> subprocess.Com
     env["PYTHONPATH"] = str(SRC)
     command = [sys.executable, "-m", "tpen_executor", "dispatch", "--input", str(paths["input"]), "--store", str(paths["store"]), "--allocation", str(paths["allocation"]), "--worker-config", str(paths["worker"]), "--runs", str(paths["runs"]), *extra]
     return subprocess.run(command, env=env, capture_output=True, text=True)
+
+
+def _transport_file(tmp_path: Path, payload: object) -> Path:
+    path = tmp_path / "attached-transport.json"
+    if isinstance(payload, str):
+        path.write_text(payload, encoding="utf-8")
+    else:
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _valid_transport() -> dict[str, object]:
+    return {"schema": "tpen-executor/attached-transport-v1", "label": "generic-htex"}
+
+
+def test_b1_transport_cli_argument_round_trip() -> None:
+    args = build_parser().parse_args(
+        [
+            "dispatch",
+            "--input", "input.json",
+            "--store", "store",
+            "--allocation", "allocation.json",
+            "--worker-config", "worker.yaml",
+            "--runs", "runs.json",
+            "--dispatcher", "parsl",
+            "--transport", "transport.json",
+        ]
+    )
+    assert args.transport == "transport.json"
+
+
+def test_b1_transport_requires_parsl_before_store_reservation(tmp_path: Path) -> None:
+    paths = _inputs(tmp_path)
+    transport = _transport_file(tmp_path, _valid_transport())
+    result = _run_cli(paths, "--dispatcher", "local", "--transport", str(transport))
+    assert result.returncode == 2
+    assert json.loads(result.stderr)["code"] == "transport-requires-parsl"
+    assert not Path(paths["store"]).exists()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{",
+        {"schema": "wrong-schema"},
+        {"schema": "tpen-executor/attached-transport-v1", "provider": "generic"},
+    ],
+    ids=["malformed-json", "wrong-schema", "disallowed-form"],
+)
+def test_b1_invalid_transport_refuses_before_store_reservation(tmp_path: Path, payload: object) -> None:
+    paths = _inputs(tmp_path)
+    transport = _transport_file(tmp_path, payload)
+    result = _run_cli(paths, "--dispatcher", "parsl", "--transport", str(transport))
+    assert result.returncode == 2
+    assert json.loads(result.stderr)["code"] == "invalid-transport"
+    assert not Path(paths["store"]).exists()
+
+
+@pytest.mark.parametrize("timeout_field", ["preflight_timeout", "teardown_timeout"])
+def test_b1_oversized_transport_timeout_is_typed_refusal(tmp_path: Path, timeout_field: str) -> None:
+    paths = _inputs(tmp_path)
+    payload = _valid_transport()
+    payload[timeout_field] = 10**400
+    transport = _transport_file(tmp_path, payload)
+    result = _run_cli(paths, "--dispatcher", "parsl", "--transport", str(transport))
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "Traceback" not in result.stderr
+    assert json.loads(result.stderr)["code"] == "invalid-transport"
+    assert not Path(paths["store"]).exists()
+
+
+def test_b1_admitted_transport_is_retained_on_dispatch_plan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = _inputs(tmp_path)
+    payload = _valid_transport()
+    transport = _transport_file(tmp_path, payload)
+    observed: dict[str, object] = {}
+
+    class StubParslDispatcher:
+        def __init__(self, worker, *, transport=None):
+            observed["worker"] = worker
+            self.transport = transport
+
+        def admit_transport_shape(self, allocation, env=None):
+            observed["shape_calls"] = observed.get("shape_calls", 0) + 1
+            observed["shape_allocation"] = allocation
+
+    monkeypatch.setattr(composition, "ParslDispatcher", StubParslDispatcher)
+    monkeypatch.setattr(composition, "bindings_from_allocation", lambda allocation: ())
+    plan = composition.admit(
+        paths["input"], paths["store"], paths["allocation"], paths["worker"], paths["runs"],
+        dispatcher_name="parsl", transport_path=transport,
+    )
+    expected = AttachedTransportSpec.from_mapping(payload)
+    assert plan.transport == expected
+    assert plan.dispatcher.transport is plan.transport
+    assert observed["shape_calls"] == 1
+    assert observed["shape_allocation"] is plan.allocation
+    assert observed["worker"] is plan.worker
+
+
+def test_b1_parsl_admission_without_transport_keeps_legacy_dispatcher_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _inputs(tmp_path)
+    observed: dict[str, object] = {}
+
+    class StubParslDispatcher:
+        def __init__(self, worker, *, transport=None):
+            observed["worker"] = worker
+            observed["transport"] = transport
+
+    monkeypatch.setattr(composition, "ParslDispatcher", StubParslDispatcher)
+    monkeypatch.setattr(composition, "bindings_from_allocation", lambda allocation: ())
+    plan = composition.admit(
+        paths["input"], paths["store"], paths["allocation"], paths["worker"], paths["runs"],
+        dispatcher_name="parsl",
+    )
+    assert plan.transport is None
+    assert observed == {"worker": plan.worker, "transport": None}
 
 
 def test_a1_help_and_typed_usage_refusal(tmp_path: Path) -> None:

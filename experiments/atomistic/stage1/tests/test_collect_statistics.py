@@ -416,12 +416,12 @@ def test_unknown_and_unsourced_references_are_refused(tmp_path: Path) -> None:
 def _two_phase_document(tmp_path: Path) -> dict:
     """Build a real planner-shaped phase-1 + phase-2 document (no disk I/O)."""
 
-    protocol = Protocol(smoke_updates=1, smoke_walkers=2, lineage_updates=1, lineage_walkers=2,
+    protocol = Protocol(smoke_updates=1, smoke_walkers=2, lineage_updates=7, lineage_walkers=2,
                         lineages=3, eval_streams=4, eval_walkers=2, eval_draws=2)
     config_sha256 = config_identities(config_root=_TWO_PHASE_CONFIG_ROOT, systems=("he",))
     phase1_rows = build_manifest(
         protocol=protocol, source_sha=_TWO_PHASE_SOURCE_SHA, config_sha256=config_sha256,
-        checkpoints=[7], lineage_seeds=[11, 12, 13], checkpoint_sha256={},
+        checkpoints=[0, 7], lineage_seeds=[11, 12, 13], checkpoint_sha256={},
         results_root=str(tmp_path), systems=("he",), phase=1,
     )
     phase1_hash = manifest_hash(phase1_rows)

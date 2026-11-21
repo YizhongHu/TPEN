@@ -14,9 +14,15 @@ from .allocations import ConfiguredAllocation
 from .configuration import StagedHydra
 from .contracts import ReadyGroup
 from .dispatch import LocalDispatcher, ParslDispatcher, ParslUnavailableError
+from .dispatch.parsl import (
+    AttachedTransportSpec,
+    RoutedAttachedTransportSpec,
+    UnsupportedTransportError,
+    decode_attached_transport,
+)
 from .environments import PreparedPythonEnvironment
 from .lifecycle import AttachedAllocation
-from .placement import BindingError, bindings_from_allocation
+from .placement import BindingError, PlacementRefusal, bindings_from_allocation
 from .programs import WorkerProgram
 from .results import RunManifest
 from .storage import DirectoryStore, _write_new
@@ -185,6 +191,8 @@ class DispatchPlan:
         Store-owning lifecycle used for fenced receipts.
     timeout : float or None
         Positive child/evidence timeout, if supplied.
+    transport : AttachedTransportSpec or None
+        Admitted attached transport selection, if supplied.
 
     Returns
     -------
@@ -204,6 +212,7 @@ class DispatchPlan:
     dispatcher: Any
     lifecycle: AttachedAllocation
     timeout: float | None
+    transport: AttachedTransportSpec | RoutedAttachedTransportSpec | None = None
 
 
 def admit(
@@ -214,6 +223,7 @@ def admit(
     runs_path: str | os.PathLike[str],
     *,
     dispatcher_name: str = "local",
+    transport_path: str | os.PathLike[str] | None = None,
     timeout: float | None = None,
 ) -> DispatchPlan:
     """Decode and preflight a dispatch without beginning an attempt.
@@ -225,6 +235,9 @@ def admit(
         configured-runs sidecar.
     dispatcher_name : {"local", "parsl"}, default="local"
         Attached dispatcher backend.
+    transport_path : str or os.PathLike or None, optional
+        JSON file containing a strict attached transport mapping. It is only
+        valid with the ``parsl`` dispatcher.
     timeout : float or None, optional
         Positive timeout passed to child and evidence operations.
 
@@ -244,6 +257,18 @@ def admit(
         raise CLIRefusal("invalid-dispatcher", f"unknown dispatcher {dispatcher_name!r}")
     if timeout is not None and (type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0):
         raise CLIRefusal("invalid-timeout", "timeout must be finite and strictly positive")
+
+    transport: AttachedTransportSpec | RoutedAttachedTransportSpec | None = None
+    if transport_path is not None:
+        if dispatcher_name != "parsl":
+            raise CLIRefusal("transport-requires-parsl", "transport requires the parsl dispatcher")
+        try:
+            raw_transport = _decode(_path(transport_path, "transport"), "transport")
+            transport = decode_attached_transport(raw_transport)
+        except CLIRefusal as error:
+            raise CLIRefusal("invalid-transport", error.reason) from error
+        except (OverflowError, RecursionError, TypeError, ValueError) as error:
+            raise CLIRefusal("invalid-transport", f"transport is invalid: {error}") from error
 
     input_file = _path(input_path, "input")
     if input_file.name == "executor_input_diagnostics.json":
@@ -279,13 +304,20 @@ def admit(
         if dispatcher_name == "local":
             dispatcher = LocalDispatcher(worker)
         else:
-            # Resolve every slot before reserving the store.  Parsl repeats
-            # this immutable admission at run time, after its DFK exists.
-            bindings_from_allocation(allocation)
-            dispatcher = ParslDispatcher(worker)
+            # Preserve the legacy no-transport binding gate exactly.  The
+            # attached route uses dispatcher-owned shape admission below.
+            if transport is None:
+                bindings_from_allocation(allocation)
+            dispatcher = (
+                ParslDispatcher(worker, transport=transport)
+                if transport is not None
+                else ParslDispatcher(worker)
+            )
+            if transport is not None:
+                dispatcher.admit_transport_shape(allocation)
     except ParslUnavailableError as error:
         raise CLIRefusal("parsl-unavailable", str(error)) from error
-    except (BindingError, TypeError, ValueError) as error:
+    except (BindingError, PlacementRefusal, UnsupportedTransportError, TypeError, ValueError) as error:
         raise CLIRefusal("dispatcher-admission", str(error)) from error
 
     store_file = _path(store_path, "store")
@@ -293,7 +325,7 @@ def admit(
         raise CLIRefusal("store-path", "store path must not contain OmegaConf interpolation syntax '${'")
     store = _reserve_store(store_file)
     lifecycle = AttachedAllocation(allocation, store)
-    return DispatchPlan(group, table, allocation, worker, dispatcher, lifecycle, timeout)
+    return DispatchPlan(group, table, allocation, worker, dispatcher, lifecycle, timeout, transport)
 
 
 _publish_new = _write_new

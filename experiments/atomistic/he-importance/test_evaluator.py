@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import re
 import sys
 from types import MappingProxyType
 
@@ -299,6 +300,55 @@ def test_blinding_refuses_reference_name_in_local_energy_topology() -> None:
         evaluator.evaluate_local_energy_rows("checkpoint-a", rows, expected_chain_ids=("chain-0",))
 
 
+@pytest.mark.parametrize(
+    ("checkpoint_id", "expected_chain_ids", "rows", "label"),
+    [
+        (
+            "reference_energy",
+            ("chain-0",),
+            (evaluator.LocalEnergyRow("checkpoint-a", "chain-0", {"rank": 0}, 1.0),),
+            "local-energy checkpoint id",
+        ),
+        (
+            "checkpoint-a",
+            ("reference_energy",),
+            (evaluator.LocalEnergyRow("checkpoint-a", "chain-0", {"rank": 0}, 1.0),),
+            "local-energy expected chain id[0]",
+        ),
+        (
+            "checkpoint-a",
+            ("chain-0",),
+            (evaluator.LocalEnergyRow("checkpoint-a", "reference_energy", {"rank": 0}, 1.0),),
+            "local-energy row[0] chain id",
+        ),
+    ],
+)
+def test_blinding_refuses_reference_name_on_each_identifier_route(
+    checkpoint_id: str,
+    expected_chain_ids: tuple[str, ...],
+    rows: tuple[object, ...],
+    label: str,
+) -> None:
+    with pytest.raises(
+        evaluator.EvaluatorQualificationError,
+        match=rf"{re.escape(label)} contains forbidden blinding value 'reference_energy'",
+    ) as exc:
+        evaluator.evaluate_local_energy_rows(
+            checkpoint_id, rows, expected_chain_ids=expected_chain_ids
+        )
+    assert exc.type is evaluator.EvaluatorQualificationError
+    assert label in str(exc.value)
+
+
+@pytest.mark.parametrize("identifier", ["energy", "local_energy", "some-energy-value"])
+def test_local_energy_identifier_screen_allows_non_l3a_energy_names(identifier: str) -> None:
+    row = evaluator.LocalEnergyRow("checkpoint-a", identifier, {"rank": 0}, -2.8)
+    state = evaluator.evaluate_local_energy_rows(
+        "checkpoint-a", (row,), expected_chain_ids=(identifier,)
+    )
+    assert state.status is evaluator.InferenceStatus.READY
+
+
 def test_nonfinite_row_is_visible_with_its_chain_and_topology_witness() -> None:
     rows = _rows(1.0, float("nan"))
     state = evaluator.evaluate_local_energy_rows(
@@ -349,6 +399,29 @@ def test_local_energy_chain_completeness_has_a_discriminating_witness(
         evaluator.evaluate_local_energy_rows("checkpoint-a", rows, expected_chain_ids=expected)
 
 
+def test_local_energy_rejects_duplicate_expected_chain_ids() -> None:
+    with pytest.raises(evaluator.EvaluatorQualificationError) as exc:
+        evaluator.evaluate_local_energy_rows(
+            "checkpoint-a", _rows(1.0), expected_chain_ids=("chain-0", "chain-0")
+        )
+    assert exc.type is evaluator.EvaluatorQualificationError
+    assert "chain-0" in str(exc.value)
+
+
+def test_local_energy_screen_precedes_duplicate_expected_chain_guard() -> None:
+    with pytest.raises(
+        evaluator.EvaluatorQualificationError,
+        match=rf"{re.escape('local-energy expected chain id[0]')} contains forbidden blinding value 'reference_energy'",
+    ) as exc:
+        evaluator.evaluate_local_energy_rows(
+            "checkpoint-a",
+            _rows(1.0),
+            expected_chain_ids=("reference_energy", "reference_energy"),
+        )
+    assert exc.type is evaluator.EvaluatorQualificationError
+    assert "local-energy expected chain id[0]" in str(exc.value)
+
+
 def test_rank_artifact_rejects_nonfinite_state_instead_of_silently_dropping_it() -> None:
     ready = evaluator.evaluate_local_energy_rows("checkpoint-a", _rows(1.0), expected_chain_ids=("chain-0",))
     bad_rows = tuple(
@@ -373,6 +446,88 @@ def test_rank_artifact_rejects_duplicate_checkpoint_ids() -> None:
         evaluator.require_complete_rank_artifact(
             (ready, ready), expected_checkpoint_ids=("checkpoint-a",)
         )
+
+
+def test_rank_artifact_rejects_duplicate_expected_checkpoint_ids() -> None:
+    ready = evaluator.InferenceState("checkpoint-a", evaluator.InferenceStatus.READY, ())
+    with pytest.raises(evaluator.EvaluatorQualificationError) as exc:
+        evaluator.require_complete_rank_artifact(
+            (ready,), expected_checkpoint_ids=("checkpoint-a", "checkpoint-a")
+        )
+    assert exc.type is evaluator.EvaluatorQualificationError
+    assert "checkpoint-a" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("states", "expected", "label"),
+    [
+        (
+            (evaluator.InferenceState("checkpoint-a", evaluator.InferenceStatus.READY, ()),),
+            ("reference_energy",),
+            "rank-artifact expected checkpoint id[0]",
+        ),
+        (
+            (evaluator.InferenceState("reference_energy", evaluator.InferenceStatus.READY, ()),),
+            ("checkpoint-a",),
+            "rank-artifact state[0] checkpoint id",
+        ),
+        (
+            (
+                evaluator.InferenceState(
+                    "checkpoint-a",
+                    evaluator.InferenceStatus.READY,
+                    (evaluator.LocalEnergyRow("reference_energy", "chain-0", {"rank": 0}, 1.0),),
+                ),
+            ),
+            ("checkpoint-a",),
+            "rank-artifact state[0] row[0] checkpoint id",
+        ),
+        (
+            (
+                evaluator.InferenceState(
+                    "checkpoint-a",
+                    evaluator.InferenceStatus.READY,
+                    (evaluator.LocalEnergyRow("checkpoint-a", "reference_energy", {"rank": 0}, 1.0),),
+                ),
+            ),
+            ("checkpoint-a",),
+            "rank-artifact state[0] row[0] chain id",
+        ),
+    ],
+)
+def test_rank_artifact_screens_each_identifier_route(
+    states: tuple[object, ...], expected: tuple[str, ...], label: str
+) -> None:
+    with pytest.raises(
+        evaluator.EvaluatorQualificationError,
+        match=rf"{re.escape(label)} contains forbidden blinding value 'reference_energy'",
+    ) as exc:
+        evaluator.require_complete_rank_artifact(states, expected_checkpoint_ids=expected)
+    assert exc.type is evaluator.EvaluatorQualificationError
+    assert label in str(exc.value)
+
+
+@pytest.mark.parametrize("identifier", ["energy", "local_energy", "some-energy-value"])
+def test_rank_artifact_identifier_screen_allows_non_l3a_energy_names(identifier: str) -> None:
+    state = evaluator.InferenceState(
+        "checkpoint-a",
+        evaluator.InferenceStatus.READY,
+        (evaluator.LocalEnergyRow("checkpoint-a", identifier, {"rank": 0}, 1.0),),
+    )
+    evaluator.require_complete_rank_artifact((state,), expected_checkpoint_ids=("checkpoint-a",))
+
+
+def test_rank_artifact_screen_precedes_duplicate_expected_checkpoint_guard() -> None:
+    state = evaluator.InferenceState("checkpoint-a", evaluator.InferenceStatus.READY, ())
+    with pytest.raises(
+        evaluator.EvaluatorQualificationError,
+        match=rf"{re.escape('rank-artifact expected checkpoint id[0]')} contains forbidden blinding value 'reference_energy'",
+    ) as exc:
+        evaluator.require_complete_rank_artifact(
+            (state,), expected_checkpoint_ids=("reference_energy", "reference_energy")
+        )
+    assert exc.type is evaluator.EvaluatorQualificationError
+    assert "rank-artifact expected checkpoint id[0]" in str(exc.value)
 
 
 @pytest.mark.parametrize(

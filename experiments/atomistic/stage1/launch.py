@@ -7,8 +7,15 @@ import base64
 import json
 import re
 import shlex
+import sys
 from pathlib import Path
 from typing import Any, Mapping
+
+# Direct script execution puts only this directory on sys.path.  Add the
+# checkout root before importing the source-owned experiments package.
+_REPO_ROOT = str(Path(__file__).resolve().parents[3])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from experiments.atomistic.stage1.protocol import (
     _require_path_component,
@@ -74,6 +81,8 @@ def row_overrides(row: Mapping[str, Any]) -> list[str]:
             f"sampler.n_walkers={row['walkers']}",
             f"trainer.max_steps={row['updates']}",
         ])
+        if "sampler_seed" in row:
+            overrides.append(f"sampler.seed={row['sampler_seed']}")
         if row.get("checkpoint_steps"):
             steps = ",".join(str(step) for step in row["checkpoint_steps"])
             overrides.append(f"checkpoint_steps=[{steps}]")
@@ -174,6 +183,15 @@ def command_for_row(row: Mapping[str, Any], *, python: str, driver: str) -> str:
         _require_safe_value(override, field="override")
         args.append(override)
     args.extend(["--binding", _binding_token(row)])
+    if row.get("overlay") is not None or row.get("overlay_sha256") is not None:
+        if row.get("kind") != "train":
+            raise ValueError("only train rows may declare an overlay")
+        if not isinstance(row.get("overlay"), str) or not isinstance(row.get("overlay_sha256"), str):
+            raise ValueError("overlay rows require overlay and overlay_sha256")
+        args.extend([
+            "--overlay", str(row["overlay"]),
+            "--overlay-sha256", str(row["overlay_sha256"]),
+        ])
     if row.get("kind") == "eval":
         args.extend([
             "--expected-checkpoint-sha256", str(row["checkpoint_sha256"]),
