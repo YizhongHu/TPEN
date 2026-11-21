@@ -158,6 +158,10 @@ def _config(path: Path, root: Path, run_id: str) -> None:
     cfg.runtime.device = "cpu"
     cfg.runtime.dtype = "float64"
     cfg.trainer.max_steps = H
+    if run_id == "disabled":
+        # Use a distinct fresh-run seed so the no-restore control has a genuine
+        # state divergence rather than relying on pickle metadata differences.
+        cfg.runtime.seed = 1
     cfg.sampler.n_walkers = 4
     cfg.sampler.burn_in = 1
     cfg.sampler.n_steps = 1
