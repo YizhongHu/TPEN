@@ -448,37 +448,37 @@ def _claim_attempt(
         if (number := _attempt_number(path)) is not None
     ]
     number = max(existing, default=-1) + 1
-    while True:
-        attempt_key = f"attempt-{number:06d}"
-        lease_path = attempts / f"{attempt_key}.json"
-        lease_payload: dict[str, Any] = {
-            "schema": ATTEMPT_RECEIPT_SCHEMA,
-            "lineage": dict(identity),
-            "predecessor_content_id": selection.content_id,
-            "attempt_sequence": number,
-            "attempt_key": attempt_key,
-            "decision": selection.decision.value,
-            "run_dir": str(selection.run_dir),
+    attempt_key = f"attempt-{number:06d}"
+    lease_path = attempts / f"{attempt_key}.json"
+    lease_payload: dict[str, Any] = {
+        "schema": ATTEMPT_RECEIPT_SCHEMA,
+        "lineage": dict(identity),
+        "predecessor_content_id": selection.content_id,
+        "attempt_sequence": number,
+        "attempt_key": attempt_key,
+        "decision": selection.decision.value,
+        "run_dir": str(selection.run_dir),
+    }
+    if takeover is not None:
+        lease_payload["takeover"] = {
+            "approved": True,
+            "predecessor_content_id": takeover.predecessor_content_id,
+            "lineage_id": takeover.lineage_id,
+            "config_identity": takeover.config_identity,
+            "overlay_identity": takeover.overlay_identity,
+            "target_iterations": takeover.target_iterations,
+            "terminal_pbs_proof": takeover.terminal_pbs_proof,
+            "quiescent": takeover.quiescent,
+            "adopted_budget": takeover.adopted_budget,
+            "superseded_attempts": [path.name for path in superseded_attempts],
         }
-        if takeover is not None:
-            lease_payload["takeover"] = {
-                "approved": True,
-                "predecessor_content_id": takeover.predecessor_content_id,
-                "lineage_id": takeover.lineage_id,
-                "config_identity": takeover.config_identity,
-                "overlay_identity": takeover.overlay_identity,
-                "target_iterations": takeover.target_iterations,
-                "terminal_pbs_proof": takeover.terminal_pbs_proof,
-                "quiescent": takeover.quiescent,
-                "adopted_budget": takeover.adopted_budget,
-                "superseded_attempts": [path.name for path in superseded_attempts],
-            }
-        try:
-            create_json_receipt(lease_path, lease_payload)
-        except ReceiptExistsError:
-            number += 1
-            continue
-        return attempt_key, lease_path
+    try:
+        create_json_receipt(lease_path, lease_payload)
+    except ReceiptExistsError as exc:
+        raise RestartRefusal(
+            f"occupied lineage attempt sequence: {attempt_key}"
+        ) from exc
+    return attempt_key, lease_path
 
 
 def _write_claim_refusal(
