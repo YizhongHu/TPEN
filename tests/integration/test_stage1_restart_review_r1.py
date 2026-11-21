@@ -14,6 +14,7 @@ from experiments.atomistic.stage1.restart import (
     RestartApproval,
     RestartRefusal,
     execute_restart,
+    select_restart,
 )
 from experiments.atomistic.stage1.protocol import STAGE1_PROTOCOL
 from experiments.toolkit.run_paths import resolve_run_dir
@@ -143,6 +144,144 @@ def test_invalid_initial_takeover_approval_refuses_before_takeover_lease(tmp_pat
         )
     assert calls == []
     assert not (attempts / "initial.takeover.json").exists()
+
+
+@pytest.mark.integration
+def test_approved_takeover_releases_abandoned_initial_owner_for_successor(
+    tmp_path: Path,
+) -> None:
+    """A durable takeover outcome must quiesce the abandoned initial owner."""
+
+    system = "he"
+    row = _row(system, tmp_path)
+    config_path = CONFIG_ROOT / system / "train.yaml"
+    run_dir = resolve_run_dir(row)
+    attempts = run_dir / "attempts"
+    attempts.mkdir(parents=True)
+    # Simulate a crashed initial owner: its lease is present, but no outcome
+    # receipt was published before the successor checkpoint became visible.
+    (attempts / "initial.json").write_text("{}\n", encoding="utf-8")
+    cfg = _attempt_cfg(row, system)
+    _publish(run_dir, step=1000)
+    selected = select_restart(cfg=cfg, row=row, run_dir=run_dir)
+    assert selected.decision.value == "restore"
+    assert selected.predecessor is not None
+    config_identity = row["config_sha256"]
+    approval = RestartApproval(
+        predecessor_content_id=selected.predecessor.content_id,
+        terminal_pbs_proof="pbs-terminal-approval",
+        quiescent=True,
+        adopted_budget="budget-replacement-1",
+        lineage_id=row["row_id"],
+        config_identity=config_identity,
+        overlay_identity="none",
+        target_iterations=row["updates"],
+    )
+    takeover_calls: list[object] = []
+
+    def takeover_driver(_cfg, **_kwargs):
+        takeover_calls.append(True)
+        _publish(run_dir, step=2000)
+        (run_dir / "status.json").write_text(
+            json.dumps({"status": "planned_yield"}) + "\n", encoding="utf-8"
+        )
+        return 0
+
+    takeover_result = execute_restart(
+        cfg=cfg, row=row, config_path=config_path,
+        run=takeover_driver, run_dir=run_dir, takeover=approval,
+    )
+    assert takeover_calls == [True]
+    assert takeover_result.outcome == "planned_yield"
+    assert takeover_result.outcome_path.is_file()
+    assert json.loads(takeover_result.outcome_path.read_text())[
+        "outcome"
+    ] == "planned_yield"
+
+    successor_calls: list[object] = []
+
+    def successor_driver(_cfg, **_kwargs):
+        successor_calls.append(True)
+        _publish(run_dir, step=3000)
+        (run_dir / "status.json").write_text(
+            json.dumps({"status": "planned_yield"}) + "\n", encoding="utf-8"
+        )
+        return 0
+
+    successor_result = execute_restart(
+        cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
+        run=successor_driver, run_dir=run_dir,
+    )
+    assert successor_calls == [True]
+    assert successor_result.outcome == "planned_yield"
+
+
+@pytest.mark.integration
+def test_fresh_positional_train_resume_is_refused_before_driver_or_lease(
+    tmp_path: Path,
+) -> None:
+    """A concrete Train sixth positional load is still a configured restore."""
+
+    system = "he"
+    row = _row(system, tmp_path)
+    config_path = CONFIG_ROOT / system / "train.yaml"
+    run_dir = resolve_run_dir(row)
+    cfg = _attempt_cfg(row, system)
+    OmegaConf.update(
+        cfg, "load", {"mode": "train_resume", "path": str(tmp_path / "foreign")},
+        merge=False, force_add=True,
+    )
+    cfg.runner = {
+        "_target_": "tpen.runner.Train",
+        "_args_": [
+            "${model}", "${sampler}", "${hamiltonian_terms}",
+            "${optimizer}", "${trainer}", "${load}",
+        ],
+    }
+    calls: list[object] = []
+    try:
+        result = execute_restart(
+            cfg=cfg, row=row, config_path=config_path,
+            run=lambda *_args, **_kwargs: calls.append(True) or 0,
+            run_dir=run_dir,
+        )
+    except RestartRefusal as exc:
+        assert "restore" in str(exc) or "runner.load" in str(exc)
+        result = None
+    else:
+        assert result.outcome == "parked"
+    assert calls == []
+    assert not (run_dir / "attempts").exists()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "configured_load",
+    [pytest.param(None, id="missing"), {}, {"mode": "none", "path": None}],
+)
+def test_inactive_named_load_does_not_block_fresh_driver(
+    tmp_path: Path, configured_load: object,
+) -> None:
+    """Inactive named load forms are not concrete typed restore requests."""
+
+    system = "he"
+    row = _row(system, tmp_path)
+    config_path = CONFIG_ROOT / system / "train.yaml"
+    run_dir = resolve_run_dir(row)
+    cfg = _attempt_cfg(row, system)
+    if configured_load is not None:
+        OmegaConf.update(
+            cfg, "runner.load", configured_load, merge=False, force_add=True,
+        )
+    calls: list[object] = []
+    result = execute_restart(
+        cfg=cfg, row=row, config_path=config_path,
+        run=lambda *_args, **_kwargs: calls.append(True) or 0,
+        run_dir=run_dir,
+    )
+    assert calls == [True]
+    assert result.outcome == "parked"
+    assert result.outcome_path.is_file()
 
 
 @pytest.mark.integration
