@@ -254,6 +254,7 @@ def test_lineage_claim_serializes_stale_and_current_selections(
                 if stale_outcome_path is not None and stale_outcome_path.is_file():
                     json.loads(stale_outcome_path.read_text(encoding="utf-8"))
                     stale_outcome_written.set()
+        finally:
             contender_done[name].set()
 
     publisher_done = Event()
