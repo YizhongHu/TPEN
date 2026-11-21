@@ -18,6 +18,27 @@
     "target": "scripts/cannon/verify.sh",
     "old": "printf 'DRIVER_EXIT=%s\\n' \"$rc\" > \"$RUN_ROOT/evidence/driver-exit.txt\"",
     "new": "printf 'DRIVER_EXIT=0\\n' \"$rc\" > \"$RUN_ROOT/evidence/driver-exit.txt\"",
-    "killer": "test_verify_artifacts.py::test_collector_is_full_suite_only_and_verdict_isolation_is_fail_closed"
+    "killer": "test_verify_artifacts.py::test_collector_failure_preserves_verdict_and_cleans_scratch"
+  },
+  {
+    "id": "symlink-follow-reenabled",
+    "target": "scripts/cannon/verify.sh",
+    "old": "if source.is_symlink() or not source_is_safe(source, clone_root):",
+    "new": "if False:",
+    "killer": "test_verify_artifacts.py::test_changed_or_untracked_symlink_cannot_copy_outside_clone"
+  },
+  {
+    "id": "git-listing-deadline-removed",
+    "target": "scripts/cannon/verify.sh",
+    "old": "result = subprocess.run(\\n            [\"git\", \"-C\", clone, *args], check=True, capture_output=True, timeout=remaining\\n        )\\n    except subprocess.TimeoutExpired:\\n        mark_partial(\"collection budget exceeded during git listing\")\\n        return []\\n    if budget_exceeded():\\n        mark_partial(\"collection budget exceeded during git listing\")",
+    "new": "result = subprocess.run(\\n            [\"git\", \"-C\", clone, *args], check=True, capture_output=True\\n        )\\n    except subprocess.TimeoutExpired:\\n        mark_partial(\"collection budget exceeded during git listing\")\\n        return []",
+    "killer": "test_verify_artifacts.py::test_collection_budget_covers_git_listing_time"
+  },
+  {
+    "id": "destination-exists-check-removed",
+    "target": "scripts/cannon/verify.sh",
+    "old": "[[ ! -e \"$RUN_ROOT/artifacts\" && ! -L \"$RUN_ROOT/artifacts\" ]] || return 1",
+    "new": ":",
+    "killer": "test_verify_artifacts.py::test_full_suite_does_not_overwrite_an_existing_inventory"
   }
 ]

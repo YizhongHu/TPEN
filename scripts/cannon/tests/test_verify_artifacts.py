@@ -183,7 +183,7 @@ def test_full_suite_does_not_overwrite_an_existing_inventory(tmp_path: Path) -> 
     run_root = tmp_path / "run"
     (run_root / "evidence").mkdir(parents=True)
     (run_root / "artifacts").mkdir()
-    (run_root / "artifacts/INVENTORY.sha256").write_text("sentinel\n")
+    (run_root / "artifacts/sentinel.txt").write_text("sentinel\n")
     work_root = tmp_path / "work"
     (work_root / "tmp").mkdir(parents=True)
     clone = _make_clone(tmp_path)
@@ -193,7 +193,8 @@ def test_full_suite_does_not_overwrite_an_existing_inventory(tmp_path: Path) -> 
         ["bash", "-c", script], check=False, capture_output=True, text=True, env={"PATH": os.environ["PATH"]}
     )
     assert result.returncode != 0
-    assert (run_root / "artifacts/INVENTORY.sha256").read_text() == "sentinel\n"
+    assert (run_root / "artifacts/sentinel.txt").read_text() == "sentinel\n"
+    assert sorted(path.name for path in (run_root / "artifacts").iterdir()) == ["sentinel.txt"]
 
 
 def test_collection_budget_writes_partial_without_touching_verdict_or_scratch(tmp_path: Path) -> None:
