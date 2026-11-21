@@ -6,6 +6,7 @@ import hashlib
 import ast
 import os
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -169,3 +170,63 @@ def test_collection_budget_writes_partial_without_touching_verdict_or_scratch(tm
     assert (run_root / "evidence/artifacts-timing.txt").read_text().startswith("artifact_collection_seconds=")
     assert (run_root / "evidence/driver-exit.txt").read_text() == "DRIVER_EXIT=7\n"
     assert work_root.exists()
+
+
+def test_changed_or_untracked_symlink_cannot_copy_outside_clone(tmp_path: Path) -> None:
+    """A git-listed symlink must not make checkout retention escape CLONE."""
+
+    run_root = tmp_path / "run"
+    (run_root / "evidence").mkdir(parents=True)
+    work_root = tmp_path / "work"
+    (work_root / "tmp").mkdir(parents=True)
+    clone = _make_clone(tmp_path)
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("outside secret\n")
+    (clone / "escape.txt").symlink_to(outside)
+
+    result = subprocess.run(
+        ["bash", "-c", _collector_harness(VERIFY.read_text(), run_root, work_root, clone)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ["PATH"]},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (run_root / "artifacts/checkout/escape.txt").exists()
+
+
+def test_collection_budget_covers_git_listing_time(tmp_path: Path) -> None:
+    """A slow git enumeration must produce partial artifacts at the deadline."""
+
+    run_root = tmp_path / "run"
+    (run_root / "evidence").mkdir(parents=True)
+    work_root = tmp_path / "work"
+    (work_root / "tmp").mkdir(parents=True)
+    clone = _make_clone(tmp_path)
+    shutil.rmtree(clone / "outputs")
+    real_git = shutil.which("git")
+    assert real_git
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in *' diff '*|*' ls-files '*) sleep 0.05; exit 0;; esac\n"
+        f"exec {shlex.quote(real_git)} \"$@\"\n"
+    )
+    fake_git.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", "-c", _collector_harness(VERIFY.read_text(), run_root, work_root, clone)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "ARTIFACT_COLLECTION_BUDGET_SECONDS": "0.01",
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (run_root / "evidence/artifacts-status.txt").read_text().startswith("ARTIFACTS_PARTIAL reason=")
+    assert (run_root / "evidence/artifacts-size.txt").read_text().startswith("artifact_file_count=0 artifact_bytes=0")
