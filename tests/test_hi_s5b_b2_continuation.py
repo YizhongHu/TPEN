@@ -185,14 +185,15 @@ def test_hi_s5b_b2_three_process_stateful_continuation(tmp_path: Path) -> None:
     full_record, prefix_record, successor_record, disabled_record = [tmp_path / f"{name}.json" for name in ("full", "prefix", "successor", "disabled")]
     _spawn("full", full_cfg, full_record)
     _spawn("prefix", prefix_cfg, prefix_record)
-    checkpoint = roots["prefix"] / "checkpoints" / "step_000001"
+    run_dir = roots["prefix"] / "tpen_he_importance" / "atomistic" / "prefix"
+    checkpoint = run_dir / "checkpoints" / "step_000001"
     assert checkpoint.is_dir()
-    before = _tree_digest(roots["prefix"])
+    before = _tree_digest(run_dir)
     _spawn("successor", successor_cfg, successor_record, checkpoint)
-    assert _tree_digest(roots["prefix"]) == before
-    before_refused = _tree_digest(roots["prefix"])
+    assert _tree_digest(run_dir) == before
+    before_refused = _tree_digest(run_dir)
     _spawn("refused", successor_cfg, tmp_path / "refused.json", checkpoint)
-    assert _tree_digest(roots["prefix"]) == before_refused
+    assert _tree_digest(run_dir) == before_refused
     _spawn("disabled", disabled_cfg, disabled_record)
     full = json.loads(full_record.read_text())
     restored = json.loads(successor_record.read_text())
@@ -205,7 +206,7 @@ def test_hi_s5b_b2_three_process_stateful_continuation(tmp_path: Path) -> None:
 
 def test_hi_s5b_b2_mutant_detection_contract() -> None:
     """The qualification assertions reject the three required real faults."""
-    baseline = {"trainer": {"next_iteration": 1, "completed_updates": 1, "max_steps": H}, "model": "m", "optimizer": "o", "sampler": "s", "process_rng": "r", "callback_dispositions": []}
+    baseline = {"trainer": {"next_iteration": 1, "completed_updates": 1, "max_steps": H}, "model": "m", "optimizer": "o", "sampler": "s", "process_rng": "r", "callback_dispositions": [], "observable": 1.0}
     for field in ("sampler", "process_rng"):
         mutant = copy.deepcopy(baseline)
         mutant[field] = "mutated"
