@@ -6,103 +6,28 @@ stable code but does not detect executor admission-ledger conflicts.
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
-from omegaconf import OmegaConf
 
 from tpen.checkpoint.catalog import publication_catalog_path, read_publications
-from tpen.checkpoint import CheckpointRef, TrainResume, save_checkpoint
-from tpen.checkpoint.hashing import resolved_config_identity
 from tpen.execution.recovery import (
     AdmissionRefusalCode,
     SUCCESSOR_ADMISSION_SCHEMA,
     ScienceIntent,
-    SuccessorAdmissionPredecessor,
-    SuccessorAdmissionRequest,
     SuccessorAdmissionResult,
-    SuccessorAdmissionSuccessor,
     decode_successor_admission_request,
     select_successor_admission,
 )
-from tpen.inspection import RUN_EVIDENCE_SCHEMA_V3, RunEvidence
-
-
-_TARGET = 8
-
-
-def _checkpoint(tmp_path: Path) -> CheckpointRef:
-    """Create one complete published train-resume checkpoint."""
-
-    import torch
-
-    model = torch.nn.Linear(1, 1, bias=False)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-    context = SimpleNamespace(
-        cfg=OmegaConf.create({"study": {"name": "cx04"}, "trainer": {"max_steps": _TARGET}}),
-        metadata=SimpleNamespace(device="cpu", dtype="float64", run_id="cx04", extra={}),
-        run_dir=tmp_path,
-    )
-    trainer = SimpleNamespace(
-        state_dict=lambda: {"next_iteration": 3, "completed_updates": 3}
-    )
-    sampler = SimpleNamespace(mcmc_state_dict=lambda: {"walker": 3})
-    directory = save_checkpoint(
-        output_dir=tmp_path / "checkpoints",
-        next_iteration=3,
-        completed_updates=3,
-        model=model,
-        optimizer=optimizer,
-        trainer=trainer,
-        sampler=sampler,
-        payload=TrainResume(),
-        context=context,
-    )
-    return CheckpointRef.from_directory(directory)
-
-
-def _evidence(ref: CheckpointRef) -> RunEvidence:
-    """Build v3 planned-yield evidence from the real published ref."""
-
-    identity = resolved_config_identity({"study": "cx04"})
-    return RunEvidence(
-        schema=RUN_EVIDENCE_SCHEMA_V3,
-        run_dir=str(ref.checkpoint_dir.parent.parent),
-        verdict="incomplete",
-        run_status="planned_yield",
-        checkpoint={
-            "checkpoint_dir": str(ref.checkpoint_dir),
-            "schema_version": ref.schema_version,
-            "next_iteration": ref.next_iteration,
-            "completed_updates": ref.completed_updates,
-        },
-        refusal=None,
-        resolved_config_identity=identity,
-        outcome="planned_yield",
-        checkpoint_ref={**ref.to_dict(), "profile": "train_resume"},
-    )
-
-
-def _request(ref: CheckpointRef, *, evidence: RunEvidence | None = None) -> SuccessorAdmissionRequest:
-    """Build a request carrying the supplied evidence and matching intent."""
-
-    evidence = _evidence(ref) if evidence is None else evidence
-    return SuccessorAdmissionRequest(
-        predecessor=SuccessorAdmissionPredecessor(
-            task_id="task-1",
-            attempt_id="attempt-1",
-            core_outcome_digest=hashlib.sha256(b"core-outcome").hexdigest(),
-            resolved_config_identity=evidence.resolved_config_identity or {},
-        ),
-        successor=SuccessorAdmissionSuccessor(task_id="task-1", attempt_id="attempt-2"),
-        science_input_digest=ScienceIntent({"input": "cx04"}, target_iterations=_TARGET).science_input_digest,
-        target_iterations=_TARGET,
-        core_evidence=evidence,
-    )
+from tpen.inspection import RunEvidence
+from tests.helpers.core_admission import (
+    TARGET_ITERATIONS as _TARGET,
+    checkpoint as _checkpoint,
+    evidence as _evidence,
+    request as _request,
+)
 
 
 def _intent() -> ScienceIntent:
