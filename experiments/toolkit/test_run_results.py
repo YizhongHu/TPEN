@@ -88,27 +88,34 @@ destination.joinpath("manifest.json").write_bytes(store.manifest(group).encode()
         read(manifest)
 
 
-def test_real_executor_successor_admission_manifest_round_trips(tmp_path: Path) -> None:
+def test_real_executor_v2_successor_admission_manifest_round_trips(tmp_path: Path) -> None:
     manifest = tmp_path / "manifest.json"
     code = '''import json
 import sys
 from pathlib import Path
 from tpen_executor._codec import digest
-from tpen_executor.allocations import ConfiguredAllocation
-from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
+from tpen_executor.allocations import AllocationAttemptV2, ConfiguredAllocation, MemberInvocationV2
+from tpen_executor.contracts import AllocationAttemptId, AllocationId, AttemptId, BackendJobId, ExecutionPlanV2, GroupId, InvocationId, ProgramSpecRef, ReadyGroupV2, TaskSpec
 from tpen_executor.runners import CoreRunEvidence
 from tpen_executor.storage import DirectoryStore
 
 destination = Path(sys.argv[1])
 fixture = Path(sys.argv[2])
 program = ProgramSpecRef({}, digest({}))
-group = ReadyGroup("g", (TaskSpec("task", "task", program, digest("task"), 1, "steps"),), digest("group"))
+task = TaskSpec("task", "task", program, digest("task"), 1, "steps")
+plan_ref = {"members": ["task"], "plan": "s6a"}
+plan = ExecutionPlanV2(plan_ref, digest(plan_ref), ("task",), "native-recovery/v2", "preserve-or-park/v1")
+group = ReadyGroupV2(GroupId("g"), (task,), plan)
 store = DirectoryStore(destination / "store")
+allocation = ConfiguredAllocation(AllocationId("allocation"), BackendJobId("job"), {})
+lease = AllocationAttemptV2(group.group_id, AllocationAttemptId("lease"), allocation.allocation_id, allocation.backend_job_id, "controller", "2026-11-14T00:00:00Z")
 fence = store.begin_attempt(
     group,
     "task",
-    ConfiguredAllocation(AllocationId("allocation"), BackendJobId("job"), {}),
+    allocation,
     "2026-11-14T00:00:00Z",
+    allocation_attempt=lease,
+    invocation_id=InvocationId("invocation"),
 )
 core_dir = Path(fence.output_dir) / "core"
 core_dir.mkdir()
@@ -120,7 +127,10 @@ payload["checkpoint_ref"]["checkpoint_dir"] = checkpoint_dir
 store.finish_attempt(fence, "failed", "2026-11-14T00:01:00Z")
 store.record_core_outcome(fence, CoreRunEvidence.from_mapping(payload))
 request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
-store.record_successor_admission(fence, request, "b" * 64)
+predecessor_binding = MemberInvocationV2.decode((Path(fence.output_dir) / "invocation.json").read_bytes())
+successor_lease = AllocationAttemptV2(group.group_id, AllocationAttemptId("successor-lease"), allocation.allocation_id, allocation.backend_job_id, "controller", "2026-11-14T00:02:00Z")
+successor_binding = MemberInvocationV2(successor_lease, group.identity, "task", task.lineage_id, AttemptId("successor-1"), InvocationId("successor-invocation"))
+store.record_successor_admission(fence, request, "b" * 64, predecessor_binding=predecessor_binding, successor_binding=successor_binding)
 (destination / "manifest.json").write_bytes(store.manifest(group).encode())
 '''
     written = _executor(
@@ -150,6 +160,73 @@ store.record_successor_admission(fence, request, "b" * 64)
     manifest.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ManifestRefusal, match="successor admission predecessor"):
         read(manifest)
+
+
+def test_real_executor_v2_segment_manifest_reads_as_committed_chain(tmp_path: Path) -> None:
+    """The toolkit reader consumes a DirectoryStore v2 segment end to end."""
+
+    manifest = tmp_path / "manifest.json"
+    code = '''import sys
+from pathlib import Path
+from tpen_executor._codec import digest
+from tpen_executor.allocations import AllocationAttemptV2, ConfiguredAllocation
+from tpen_executor.contracts import AllocationAttemptId, AllocationId, BackendJobId, ExecutionPlanV2, GroupId, InvocationId, ProgramSpecRef, ReadyGroupV2, TaskSpec
+from tpen_executor.runners import CoreRunEvidence
+from tpen_executor.storage import DirectoryStore
+
+destination = Path(sys.argv[1])
+program = ProgramSpecRef({}, digest({}))
+task = TaskSpec("task", "task", program, digest("task"), 1, "steps")
+plan_ref = {"members": ["task"], "plan": "s6a"}
+plan = ExecutionPlanV2(plan_ref, digest(plan_ref), ("task",), "native-recovery/v2", "preserve-or-park/v1")
+group = ReadyGroupV2(GroupId("g"), (task,), plan)
+store = DirectoryStore(destination / "store")
+allocation = ConfiguredAllocation(AllocationId("allocation"), BackendJobId("job"), {})
+lease = AllocationAttemptV2(group.group_id, AllocationAttemptId("lease"), allocation.allocation_id, allocation.backend_job_id, "controller", "2026-11-14T00:00:00Z")
+fence = store.begin_attempt(group, "task", allocation, "2026-11-14T00:00:00Z", allocation_attempt=lease, invocation_id=InvocationId("invocation"))
+store.finish_attempt(fence, "completed", "2026-11-14T00:01:00Z")
+core_dir = Path(fence.output_dir) / "core"
+checkpoint_dir = core_dir / "checkpoints" / "step_000001"
+checkpoint_dir.mkdir(parents=True)
+evidence = CoreRunEvidence.from_mapping({
+    "schema": "tpen.run-evidence/v2",
+    "run_dir": str(core_dir),
+    "verdict": "completed",
+    "run_status": "completed",
+    "checkpoint": {
+        "checkpoint_dir": str(checkpoint_dir),
+        "schema_version": 1,
+        "next_iteration": 1,
+        "completed_updates": 1,
+    },
+    "refusal": None,
+    "resolved_config_identity": {"schema": "tpen-config-identity-v1", "sha256": "a" * 64},
+})
+store.accept_segment(fence, evidence)
+(destination / "manifest.json").write_bytes(store.manifest(group).encode())
+'''
+    written = _executor(code, tmp_path)
+    assert written.returncode == 0, written.stderr
+
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    checkpoint_dir = payload["segments"][0]["checkpoint_dir"]
+
+    def inspect(run_dir: str | Path) -> dict[str, object]:
+        return {
+            "verdict": "completed",
+            "checkpoint": {
+                "checkpoint_dir": checkpoint_dir,
+                "schema_version": 1,
+                "next_iteration": 1,
+                "completed_updates": 1,
+            },
+            "resolved_config_identity": {"schema": "tpen-config-identity-v1", "sha256": "a" * 64},
+        }
+
+    result = read(manifest, inspect)
+    assert len(result.chains) == 1
+    assert result.chains[0].task_id == "task"
+    assert result.chains[0].segments[0].checkpoint_dir == checkpoint_dir
 
 
 def _placement_receipt(output_dir: str = "/runs/group-1/task-a/attempt-1") -> dict[str, object]:
