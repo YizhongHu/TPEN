@@ -30,8 +30,8 @@
   {
     "id": "git-listing-deadline-removed",
     "target": "scripts/cannon/verify.sh",
-    "old": "result = subprocess.run(\\n            [\"git\", \"-C\", clone, *args], check=True, capture_output=True, timeout=remaining\\n        )\\n    except subprocess.TimeoutExpired:\\n        mark_partial(\"collection budget exceeded during git listing\")\\n        return []\\n    if budget_exceeded():\\n        mark_partial(\"collection budget exceeded during git listing\")",
-    "new": "result = subprocess.run(\\n            [\"git\", \"-C\", clone, *args], check=True, capture_output=True\\n        )\\n    except subprocess.TimeoutExpired:\\n        mark_partial(\"collection budget exceeded during git listing\")\\n        return []",
+    "old": "result = subprocess.run(\n            [\"git\", \"-C\", clone, *args], check=True, capture_output=True, timeout=remaining\n        )\n    except subprocess.TimeoutExpired:\n        mark_partial(\"collection budget exceeded during git listing\")\n        return []\n    if budget_exceeded():\n        mark_partial(\"collection budget exceeded during git listing\")",
+    "new": "result = subprocess.run(\n            [\"git\", \"-C\", clone, *args], check=True, capture_output=True\n        )\n    except subprocess.TimeoutExpired:\n        mark_partial(\"collection budget exceeded during git listing\")\n        return []",
     "killer": "test_verify_artifacts.py::test_collection_budget_covers_git_listing_time"
   },
   {
