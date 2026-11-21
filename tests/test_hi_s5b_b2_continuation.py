@@ -148,16 +148,18 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
         }
         if walkers is not None:
             sampler_semantic["walkers"] = _tensor_digest(walkers.positions)
-        cadence = next(
-            (
-                int(callback.schedule.every_n)
-                for callback in getattr(context, "callbacks", ())
-                if type(callback).__qualname__ == "Checkpoint"
-                and hasattr(callback, "schedule")
-                and hasattr(callback.schedule, "every_n")
-            ),
-            CHECKPOINT_EVERY,
+        checkpoint_callbacks = [
+            callback
+            for callback in getattr(context, "callbacks", ())
+            if type(callback).__qualname__ == "Checkpoint"
+        ]
+        assert len(checkpoint_callbacks) == 1, "expected exactly one live Checkpoint callback"
+        schedule = getattr(checkpoint_callbacks[0], "schedule", None)
+        every_n = getattr(schedule, "every_n", None)
+        assert isinstance(every_n, int) and not isinstance(every_n, bool) and every_n > 0, (
+            "live Checkpoint schedule must expose a positive integer every_n"
         )
+        cadence = int(every_n)
         return {
             "model": _semantic_digest(model.state_dict()),
             "observable": float(next(model.parameters()).detach().reshape(-1)[0]),
@@ -326,6 +328,7 @@ def test_hi_s5b_b2_three_process_stateful_continuation(tmp_path: Path) -> None:
     assert disabled["training_started"]["model"] != restored["training_started"]["model"]
     assert disabled["training_started"]["trainer"] == {"next_iteration": 0, "completed_updates": 0, "max_steps": H}
     assert disabled["training_started"]["optimizer"] != restored["training_started"]["optimizer"]
+    assert disabled["training_started"]["checkpoint_cadence"] == CHECKPOINT_EVERY
     assert "restored" not in disabled and "boundary" not in disabled
     assert refused == {}
     refused_error = roots["refused"] / "tpen_he_importance" / "atomistic" / "refused" / "error.json"
