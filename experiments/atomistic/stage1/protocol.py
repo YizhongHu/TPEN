@@ -13,6 +13,7 @@ import base64
 import binascii
 import copy
 import math
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -674,9 +675,14 @@ def validate_he_h2_eval_grid(
         if any(type(value) is not int for value in coordinates[1:]):
             raise ProtocolError("He/H2 roster-B grid coordinates must be integers")
         actual.append(coordinates)  # type: ignore[arg-type]
-    if sorted(actual) != sorted(expected):
+    expected_counts = Counter(expected)
+    actual_counts = Counter(actual)
+    if actual_counts != expected_counts:
+        missing = sorted((expected_counts - actual_counts).elements())
+        extra = sorted((actual_counts - expected_counts).elements())
         raise ProtocolError(
-            f"He/H2 roster-B grid mismatch: expected {len(expected)} rows, got {len(actual)}"
+            f"He/H2 roster-B grid mismatch: expected {len(expected)} rows, got {len(actual)}; "
+            f"missing={missing!r}; extra={extra!r}"
         )
 
 

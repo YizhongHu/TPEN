@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import pytest
 
@@ -141,10 +142,18 @@ def test_roster_b_grid_rejects_131_or_128_rows(tmp_path: Path, drop_count: int) 
     document = _phase2_document(tmp_path)
     eval_rows = [row for row in document["rows"] if row["kind"] == "eval"]
     validate_he_h2_eval_grid(eval_rows, expected_systems=("he",), expected_profile="B")
-    with pytest.raises(ProtocolError, match="grid mismatch"):
+    missing = [
+        (row["system"], row["lineage"], row["checkpoint"], row["stream"])
+        for row in eval_rows[:drop_count]
+    ]
+    with pytest.raises(ProtocolError, match=r"^He/H2 roster-B grid mismatch: ") as excinfo:
         validate_he_h2_eval_grid(
-            eval_rows[:-drop_count], expected_systems=("he",), expected_profile="B"
+            eval_rows[drop_count:], expected_systems=("he",), expected_profile="B"
         )
+    message = str(excinfo.value)
+    assert f"expected 132 rows, got {132 - drop_count}" in message
+    assert f"missing={missing!r}" in message
+    assert "extra=[]" in message
 
 
 @pytest.mark.parametrize("checkpoint", [0, 100_000])
@@ -172,8 +181,15 @@ def test_collection_rejects_missing_checkpoint_group_before_run_io(
     monkeypatch.setattr(
         collect_module, "inspect_eval_run", lambda *_: pytest.fail("run I/O before grid check")
     )
-    with pytest.raises(collect_module.CollectionError, match="He/H2 evaluation grid"):
+    with pytest.raises(
+        collect_module.CollectionError,
+        match=r"^Hooke evaluation grid is incomplete: He/H2 roster-B grid mismatch: ",
+    ) as excinfo:
         collect_module.collect(document)
+    message = str(excinfo.value)
+    assert "expected 132 rows, got 120" in message
+    assert "missing=[('he', 0, 0, 0), ('he', 0, 0, 1), ('he', 0, 0, 2), ('he', 0, 0, 3)" in message
+    assert "extra=[]" in message
 
 
 @pytest.mark.parametrize(
@@ -186,7 +202,20 @@ def test_collection_rejects_missing_checkpoint_group_before_run_io(
 )
 def test_semantic_docs_pin_roster_b_contract(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
-    assert "roster B" in text
-    assert "132" in text
-    assert "phase-1 retention" in text
-    assert "paid" in text
+    semantic = text.split("## Identities and paths", 1)[0]
+    assert re.search(r"(?<!\d)1,?000(?!\d)", semantic)
+    assert re.search(r"(?<!\d)20(?!\d)", semantic)
+    assert re.search(r"(?<!\d)132(?!\d)", semantic)
+    if path.name == "README.md":
+        he_h2_sampler_rows = "\n".join(
+            line for line in semantic.splitlines()
+            if "He eval sampler" in line or "H2 eval sampler" in line
+        )
+        assert "1000" in he_h2_sampler_rows
+        assert "steps 20" in he_h2_sampler_rows
+        assert "burn-in 100, steps 10" not in he_h2_sampler_rows
+    else:
+        assert "burn-in=1000" in semantic
+        assert "stride=20" in semantic
+        assert not re.search(r"burn-in[ =`]+100(?:\D|$)", semantic)
+        assert not re.search(r"stride[ =`]+10(?:\D|$)", semantic)

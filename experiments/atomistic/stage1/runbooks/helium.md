@@ -50,6 +50,8 @@ streams is evidence of an invalid measurement, not a scientific result.
 - Run streams `0,1,2,3` separately for every selected checkpoint: each is a
   fresh 4,096-walker, 256-draw strict `model_only` restore. This is 132 eval
   rows and 33,554,432 retained local-energy rows across the experiment.
+- Each evaluation stream uses the approved `burn-in=1000` and `stride=20`
+  sampler settings; these values are part of the He evaluation contract.
 - Collection rejects any source/config/checkpoint/physical-system identity
   mismatch, non-finite value, incomplete `4096 x 256` grid, non-checkpoint
   provenance, a phase-2 row not bound to its phase-1 train row, or an
