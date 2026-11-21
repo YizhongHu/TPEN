@@ -2037,6 +2037,22 @@ def test_launcher_refuses_source_row_mismatch_before_runner_or_write(
         "resolve_train_config",
         lambda cell, **_: mismatched_config,
     )
+    inventory = import_module(
+        "experiments.atomistic.he-importance.mutable_state_inventory"
+    )
+
+    def refuse_mismatched_row(cell: object, config: object) -> object:
+        del cell
+        assert config["runner"]["optimizer"]["lr"] != source_config["runner"]["optimizer"]["lr"]
+        raise inventory.HIContinuationRowIdentityRefusal(
+            "hi-continuation-admission-refused: resolved-row context identity mismatch"
+        )
+
+    monkeypatch.setattr(
+        inventory,
+        "validate_hi_continuation_admission",
+        refuse_mismatched_row,
+    )
     calls: list[object] = []
 
     def runner(config: object, **_: object) -> int:
