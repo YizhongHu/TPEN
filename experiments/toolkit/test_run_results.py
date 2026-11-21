@@ -158,7 +158,8 @@ store.record_successor_admission(fence, request, "b" * 64)
         read(manifest)
 
 
-def test_real_executor_v2_successor_admission_manifest_round_trips(tmp_path: Path) -> None:
+def _write_real_executor_v2_admission_manifest(tmp_path: Path) -> Path:
+    """Generate real producer output without importing executor in this process."""
     manifest = tmp_path / "manifest.json"
     code = '''import json
 import sys
@@ -209,6 +210,11 @@ store.record_successor_admission(fence, request, "b" * 64, predecessor_binding=p
         ROOT / "tests" / "contracts" / "fixtures" / "core-run-evidence-v3-planned-yield.json",
     )
     assert written.returncode == 0, written.stderr
+    return manifest
+
+
+def test_real_executor_v2_successor_admission_manifest_round_trips(tmp_path: Path) -> None:
+    manifest = _write_real_executor_v2_admission_manifest(tmp_path)
 
     result = read(manifest)
     assert not result.chains
@@ -229,6 +235,38 @@ store.record_successor_admission(fence, request, "b" * 64, predecessor_binding=p
     payload["attempts"][0]["successor_admission"]["predecessor"]["task_id"] = "foreign"
     manifest.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ManifestRefusal, match="successor admission predecessor"):
+        read(manifest)
+
+
+def test_review_s6aa_read_preserves_real_successor_admission(tmp_path: Path) -> None:
+    """HI needs the complete admission from the public result, not raw JSON."""
+
+    manifest = _write_real_executor_v2_admission_manifest(tmp_path)
+    expected = json.loads(manifest.read_text())["attempts"][0]["successor_admission"]
+    attempt = read(manifest).preserved_attempts[0]
+    admission = getattr(attempt, "successor_admission", None)
+    assert admission is not None, "read() discarded the successor admission"
+    assert admission == expected
+
+
+@pytest.mark.parametrize("damage", ["none", "group_digest", "group_id"])
+def test_review_s6aa_read_checks_binding_group(tmp_path: Path, damage: str) -> None:
+    """A closed, well-typed binding must still belong to the enclosing group."""
+
+    manifest = _write_real_executor_v2_admission_manifest(tmp_path)
+    if damage == "none":
+        assert len(read(manifest).preserved_attempts) == 1
+        return
+    payload = json.loads(manifest.read_text())
+    binding = payload["attempts"][0]["successor_admission"]["successor_binding"]
+    if damage == "group_digest":
+        binding["group_digest"] = "f" * 64
+        assert binding["group_digest"] != payload["group_digest"]
+    else:
+        binding["allocation_attempt"]["group_id"]["value"] = "foreign-group"
+        assert binding["allocation_attempt"]["group_id"]["value"] != payload["group_id"]
+    manifest.write_text(json.dumps(payload))
+    with pytest.raises(ManifestRefusal):
         read(manifest)
 
 
