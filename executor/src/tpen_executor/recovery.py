@@ -465,6 +465,94 @@ class CoreAdmissionPort(Protocol):
         """Return a typed verdict, or ``None`` when core evidence is absent."""
 
 
+class CoreAdmissionUnavailable(RuntimeError):
+    """Raised when core admission evidence cannot be trusted or decoded."""
+
+
+CORE_ADMISSION_WIRE_SCHEMA = "tpen-core-admission-v1"
+_CORE_ADMISSION_WIRE_FIELDS = frozenset(
+    {"schema", "outcome", "admission", "checkpoint", "quiescence", "profile", "reason"}
+)
+
+
+class MappingCoreAdmissionPort:
+    """Decode core's strict admission mapping at the executor boundary.
+
+    Parameters
+    ----------
+    evaluate : callable
+        In-process callable receiving one :class:`MemberRecoveryInputV2` and
+        returning a core-owned mapping or ``None``.  The callable is invoked
+        exactly once per ``admit`` call.
+
+    Notes
+    -----
+    The wire schema is ``tpen-core-admission-v1`` and has a closed field set.
+    Scalar fields are exact strings, while ``profile`` is either ``None`` or
+    decoded by :meth:`ProfileCheck.from_mapping`.  Core-owned quiescence is
+    deliberately ignored: the executor fills it as ``valid`` only when the
+    member has a settled outcome receipt, and as ``unknown`` otherwise.  An
+    evaluator returning ``None`` is genuine absent evidence and is returned as
+    ``None``.  Evaluator exceptions and malformed or invalid mappings raise
+    :class:`CoreAdmissionUnavailable`, so uncertainty cannot be mistaken for
+    absent evidence by a controller.  The callable is in-process; no timeout
+    machinery is provided.
+    """
+
+    def __init__(self, evaluate: Callable[[MemberRecoveryInputV2], Mapping[str, Any] | None]) -> None:
+        if not callable(evaluate):
+            raise TypeError("evaluate must be callable")
+        self._evaluate = evaluate
+
+    def admit(self, member: MemberRecoveryInputV2) -> CoreAdmissionVerdictV2 | None:
+        """Evaluate and strictly decode one member's core admission mapping."""
+
+        try:
+            payload = self._evaluate(member)
+        except CoreAdmissionUnavailable:
+            raise
+        except Exception as exc:
+            # Failure is typed so controller consumers distinguish uncertainty
+            # from the evaluator's affirmative absent-leaf result.
+            # Evaluator failures are unavailable evidence.
+            raise CoreAdmissionUnavailable("core admission evaluator failed") from exc
+        if payload is None:
+            return None
+        try:
+            if not isinstance(payload, Mapping):
+                raise TypeError("payload must be a mapping")
+            if set(payload) != _CORE_ADMISSION_WIRE_FIELDS:
+                raise ValueError("core admission mapping has an invalid closed field set")
+            if type(payload["schema"]) is not str or payload["schema"] != CORE_ADMISSION_WIRE_SCHEMA:
+                raise ValueError("core admission schema is not tpen-core-admission-v1")
+            if any(
+                type(payload[key]) is not str
+                for key in ("outcome", "admission", "checkpoint", "quiescence", "reason")
+            ):
+                raise TypeError("core admission scalar fields have invalid types")
+            quiescence = (
+                "valid"
+                if member.outcome_receipt is not None
+                and member.outcome_receipt.status not in NON_SETTLED_OPERATIONAL_OUTCOMES
+                else "unknown"
+            )
+            if payload["quiescence"] != "unknown":
+                raise ValueError("core admission quiescence must be unknown")
+            profile = None if payload["profile"] is None else ProfileCheck.from_mapping(payload["profile"])
+            return CoreAdmissionVerdictV2(
+                payload["outcome"],
+                payload["admission"],
+                payload["checkpoint"],
+                quiescence,
+                profile,
+                payload["reason"],
+            )
+        except CoreAdmissionUnavailable:
+            raise
+        except Exception as exc:
+            raise CoreAdmissionUnavailable("core admission payload invalid") from exc
+
+
 def _park(member: MemberRecoveryInputV2, reason_code: str) -> MemberReconciliationV2:
     return MemberReconciliationV2(member.task_id, "park", reason_code, member.attempt_id)
 
@@ -596,7 +684,7 @@ reconcile = reconcile_group
 __all__ = [
     "CORE_ADMISSION_VERDICTS", "CORE_CHECKPOINT_VERDICTS", "CORE_QUIESCENCE_VERDICTS", "CORE_RECOVERY_OUTCOMES",
     "CoreProfileReference",
-    "CoreAdmissionPort", "CoreAdmissionVerdictV2", "GroupReconciliationV2", "MemberReconciliationV2", "MemberRecoveryInputV2",
+    "CoreAdmissionPort", "CoreAdmissionUnavailable", "CoreAdmissionVerdictV2", "CORE_ADMISSION_WIRE_SCHEMA", "GroupReconciliationV2", "MappingCoreAdmissionPort", "MemberReconciliationV2", "MemberRecoveryInputV2",
     "PROFILE_REFUSAL_CODES",
     "ProfileCheck",
     "ProfileUnavailable",
