@@ -322,67 +322,6 @@ def test_launch_calls_injected_runner_with_l1_resolved_config(tmp_path: Path) ->
     assert inspect.signature(launch.launch_train).parameters["runner"].default is run_from_config
 
 
-def test_admitted_continuation_forwards_opaque_operational_objects_by_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Qualified study rows forward opaque restore and destination objects unchanged."""
-
-    cell = _cell(tmp_path)
-    monkeypatch.setattr(
-        launch._TRAIN_CONFIG,
-        "resolve_train_config",
-        lambda source, **_: OmegaConf.create({"runner": {"model": {"_target_": "tests.Model"}}}),
-    )
-    monkeypatch.setattr(
-        import_module("experiments.atomistic.he-importance.mutable_state_inventory"),
-        "validate_hi_continuation_admission",
-        lambda source, config: object(),
-    )
-    restore_request = object()
-    artifact_destination = object()
-    received: list[tuple[object, object]] = []
-
-    def runner(config: object, *, restore_request: object, artifact_destination: object) -> int:
-        del config
-        received.append((restore_request, artifact_destination))
-        return 0
-
-    plan = launch.prepare_train_launch(
-        cell,
-        _topology(),
-        restore_request=restore_request,
-        artifact_destination=artifact_destination,
-    )
-    assert plan.restore_request is restore_request
-    assert plan.artifact_destination is artifact_destination
-    assert launch.launch_train(
-        cell,
-        _topology(),
-        runner=runner,
-        restore_request=restore_request,
-        artifact_destination=artifact_destination,
-    ) == 0
-    assert received == [(restore_request, artifact_destination)]
-
-
-@pytest.mark.parametrize("keyword", ["restore_request", "artifact_destination"])
-def test_nonempty_operational_keyword_requires_custom_runner_capability(
-    tmp_path: Path, keyword: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    cell = _cell(tmp_path)
-    payload = object()
-    calls: list[object] = []
-    value_kwargs = {keyword: payload}
-
-    def runner(config: object) -> int:
-        calls.append(config)
-        return 0
-
-    with pytest.raises(launch.LaunchValidationError, match=f"{keyword}"):
-        launch.launch_train(cell, _topology(), runner=runner, **value_kwargs)
-    assert calls == []
-
-
 def test_launch_override_defaults_match_direct_resolution(tmp_path: Path) -> None:
     cell = _cell(tmp_path)
 
@@ -1979,3 +1918,64 @@ def test_fake_context_run_dir_is_pytest_managed(tmp_path_factory: pytest.TempPat
     assert base in context.run_dir.resolve().parents, (
         f"_FakeContext.run_dir={context.run_dir} is outside pytest's basetemp {base}"
     )
+
+
+def test_admitted_continuation_forwards_opaque_operational_objects_by_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Qualified study rows forward opaque restore and destination objects unchanged."""
+
+    cell = _cell(tmp_path)
+    monkeypatch.setattr(
+        launch._TRAIN_CONFIG,
+        "resolve_train_config",
+        lambda source, **_: OmegaConf.create({"runner": {"model": {"_target_": "tests.Model"}}}),
+    )
+    monkeypatch.setattr(
+        import_module("experiments.atomistic.he-importance.mutable_state_inventory"),
+        "validate_hi_continuation_admission",
+        lambda source, config: object(),
+    )
+    restore_request = object()
+    artifact_destination = object()
+    received: list[tuple[object, object]] = []
+
+    def runner(config: object, *, restore_request: object, artifact_destination: object) -> int:
+        del config
+        received.append((restore_request, artifact_destination))
+        return 0
+
+    plan = launch.prepare_train_launch(
+        cell,
+        _topology(),
+        restore_request=restore_request,
+        artifact_destination=artifact_destination,
+    )
+    assert plan.restore_request is restore_request
+    assert plan.artifact_destination is artifact_destination
+    assert launch.launch_train(
+        cell,
+        _topology(),
+        runner=runner,
+        restore_request=restore_request,
+        artifact_destination=artifact_destination,
+    ) == 0
+    assert received == [(restore_request, artifact_destination)]
+
+
+@pytest.mark.parametrize("keyword", ["restore_request", "artifact_destination"])
+def test_nonempty_operational_keyword_requires_custom_runner_capability(
+    tmp_path: Path, keyword: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _cell(tmp_path)
+    payload = object()
+    calls: list[object] = []
+    value_kwargs = {keyword: payload}
+
+    def runner(config: object) -> int:
+        calls.append(config)
+        return 0
+
+    with pytest.raises(launch.LaunchValidationError, match=f"{keyword}"):
+        launch.launch_train(cell, _topology(), runner=runner, **value_kwargs)
+    assert calls == []
