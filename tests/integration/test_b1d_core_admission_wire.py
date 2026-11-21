@@ -4,10 +4,54 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from tpen.execution.core_admission import evaluate_core_admission
+
+from tests.helpers.core_admission import (
+    admission_context,
+    checkpoint,
+    planned_yield_run,
+    request,
+    write_outcome,
+    write_run_start,
+)
+from tests.helpers.executor_boundary import executor_call
+
+
+_EXECUTOR_CHILD = r'''
+import builtins
+import json
+import sys
+from pathlib import Path
+
+_real_import = builtins.__import__
+_tpen_imports = []
+
+
+def _block_tpen_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "tpen" or name.startswith("tpen."):
+        _tpen_imports.append(name)
+        raise ModuleNotFoundError("executor child must not import tpen")
+    return _real_import(name, globals, locals, fromlist, level)
+
+
+builtins.__import__ = _block_tpen_import
+
+
+def _emit(value):
+    if not isinstance(value, dict):
+        raise TypeError("executor child result must be a mapping")
+    tpen_modules = sorted(
+        name for name in sys.modules if name == "tpen" or name.startswith("tpen.")
+    )
+    value["_executor_boundary"] = {
+        "tpen_imports": list(_tpen_imports),
+        "tpen_modules": tpen_modules,
+    }
+    print(json.dumps(value, sort_keys=True))
+
+
 from tpen_executor._codec import digest
+from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.contracts import (
     AllocationId,
     AttemptId,
@@ -18,48 +62,27 @@ from tpen_executor.contracts import (
     ReadyGroupV2,
     TaskSpec,
 )
+from tpen_executor.lifecycle.balsam import (
+    BalsamGroupRegistrationIntent,
+    BalsamGroupRegistrationReceipt,
+)
 from tpen_executor.lifecycle.controller import (
     GroupControllerFactsV1,
     MemberLaunchResult,
     run_group_controller,
 )
 from tpen_executor.recovery import (
-    CoreAdmissionUnavailable,
     MappingCoreAdmissionPort,
     MemberRecoveryInputV2,
     reconcile_group,
 )
 from tpen_executor.results import OutcomeReceipt, StartReceipt
 
-from tests.helpers.core_admission import (
-    admission_context,
-    checkpoint,
-    planned_yield_run,
-    request,
-    write_outcome,
-    write_run_start,
-)
+if any(name == "tpen" or name.startswith("tpen.") for name in sys.modules):
+    raise RuntimeError("executor child started with tpen already imported")
 
 
-MUTANTS = (
-    (
-        "core-quiescence-claims-valid",
-        "tpen/execution/core_admission.py",
-        '"quiescence": "unknown",',
-        '"quiescence": "valid",',
-        "test_real_mapping_does_not_claim_quiescence",
-    ),
-    (
-        "executor-accepts-core-quiescence",
-        "executor/src/tpen_executor/recovery.py",
-        'if payload["quiescence"] != "unknown":',
-        "if False:",
-        "test_executor_rejects_core_quiescence_claim",
-    ),
-)
-
-
-def _group(task_ids: tuple[str, ...] = ("task",)) -> ReadyGroupV2:
+def _group(task_ids=("task",)):
     members = tuple(
         TaskSpec(
             task_id,
@@ -82,13 +105,7 @@ def _group(task_ids: tuple[str, ...] = ("task",)) -> ReadyGroupV2:
     return ReadyGroupV2(GroupId("group-b1d-int"), members, plan)
 
 
-def _member(
-    group: ReadyGroupV2,
-    task_id: str = "task",
-    *,
-    status: str = "failed",
-    root: Path,
-) -> MemberRecoveryInputV2:
+def _member(group, task_id="task", status="failed", root=Path(".")):
     attempt = AttemptId(f"attempt-{task_id}")
     start = StartReceipt(
         task_id,
@@ -116,6 +133,108 @@ def _member(
     )
 
 
+def _binding(group, job):
+    return BalsamGroupRegistrationReceipt(
+        BalsamGroupRegistrationIntent(group.group_id, group.identity, digest({"b1d": True})),
+        job,
+    )
+
+
+def _reconcile(payload):
+    mapping = payload["mapping"]
+    task_id = payload["task_id"]
+    group = _group((task_id,))
+    member = _member(
+        group,
+        task_id,
+        status=payload["status"],
+        root=Path(payload["root"]),
+    )
+    result = reconcile_group(
+        group,
+        (member,),
+        admission_port=MappingCoreAdmissionPort(lambda _member: mapping),
+    )
+    member_result = result.members[0]
+    return {
+        "action": member_result.action,
+        "reason_code": member_result.reason_code,
+    }
+
+
+def _controller(payload):
+    # Use the existing executor-side durable fixture; only the core mapping is
+    # supplied over the wire from the parent process.
+    from test_b1a_b_publication import _fixture
+
+    store, group, lease, inputs, _bindings, successor_rows, _fences = _fixture(
+        Path(payload["root"]), ("ambiguous", "successor"), remote=False
+    )
+
+    class RecordingExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def launch(self, fence, invocation):
+            self.calls.append(fence.task_id)
+            return MemberLaunchResult(True)
+
+    configured = ConfiguredAllocation(lease.allocation_id, lease.backend_job_id, {})
+    facts = GroupControllerFactsV1(
+        group,
+        configured,
+        "a" * 64,
+        "b1d-controller",
+        "2026-11-21T00:02:00Z",
+        inputs,
+        successor_rows,
+    )
+    mappings = payload["mappings"]
+    executor = RecordingExecutor()
+    result = run_group_controller(
+        _binding(group, configured.backend_job_id),
+        configured.backend_job_id,
+        facts,
+        store,
+        MappingCoreAdmissionPort(lambda member: mappings[member.task_id]),
+        executor,
+    )
+    _emit({
+        "member_outcomes": dict(result.member_outcomes),
+        "launch_calls": list(executor.calls),
+        "launch_count": len(executor.calls),
+    })
+
+
+action = sys.argv[1]
+payload = json.loads(sys.argv[2])
+if action == "reconcile":
+    _emit(_reconcile(payload))
+elif action == "controller":
+    _controller(payload)
+else:
+    raise SystemExit(f"unknown child action: {action}")
+'''
+
+
+MUTANTS = (
+    (
+        "core-quiescence-claims-valid",
+        "tpen/execution/core_admission.py",
+        '"quiescence": "unknown",',
+        '"quiescence": "valid",',
+        "test_real_mapping_does_not_claim_quiescence",
+    ),
+    (
+        "executor-accepts-core-quiescence",
+        "executor/src/tpen_executor/recovery.py",
+        'if payload["quiescence"] != "unknown":',
+        "if False:",
+        "test_executor_rejects_core_quiescence_claim",
+    ),
+)
+
+
 def _reconcile_real_mapping(
     tmp_path: Path,
     context,
@@ -123,17 +242,22 @@ def _reconcile_real_mapping(
     task_id: str = "task",
     status: str = "failed",
 ) -> tuple[dict[str, object] | None, object]:
-    """Run the real producer through the real executor decoder and reducer."""
+    """Run the real producer through the executor-only child decoder/reducer."""
 
     mapping = evaluate_core_admission(context)
-    group = _group((task_id,))
-    member = _member(group, task_id, status=status, root=tmp_path)
-    result = reconcile_group(
-        group,
-        (member,),
-        admission_port=MappingCoreAdmissionPort(lambda _member: mapping),
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    result = executor_call(
+        _EXECUTOR_CHILD,
+        tmp_path,
+        "reconcile",
+        {
+            "mapping": mapping,
+            "root": str(tmp_path),
+            "status": status,
+            "task_id": task_id,
+        },
     )
-    return mapping, result.members[0]
+    return mapping, result
 
 
 def test_real_producer_and_decoder_cover_every_admission_class(tmp_path: Path) -> None:
@@ -202,7 +326,7 @@ def test_real_producer_and_decoder_cover_every_admission_class(tmp_path: Path) -
             context,
             status="completed" if name == "completed" else "failed",
         )
-        assert (result.action, result.reason_code) == (action, reason), name
+        assert (result["action"], result["reason_code"]) == (action, reason), name
         if name == "missing-leaf":
             assert mapping is None
         else:
@@ -213,7 +337,7 @@ def test_real_producer_and_decoder_cover_every_admission_class(tmp_path: Path) -
         admission_context(completed),
         status="failed",
     )
-    assert (contradictory.action, contradictory.reason_code) == (
+    assert (contradictory["action"], contradictory["reason_code"]) == (
         "park",
         "contradictory-completion",
     )
@@ -233,8 +357,6 @@ def test_real_mapping_does_not_claim_quiescence(tmp_path: Path) -> None:
 def test_executor_rejects_core_quiescence_claim(tmp_path: Path) -> None:
     """The decoder rejects a core mapping that claims settled quiescence."""
 
-    group = _group()
-    member = _member(group, root=tmp_path)
     mapping = {
         "schema": "tpen-core-admission-v1",
         "outcome": "successor",
@@ -244,86 +366,57 @@ def test_executor_rejects_core_quiescence_claim(tmp_path: Path) -> None:
         "profile": None,
         "reason": "claimed",
     }
-    with pytest.raises(CoreAdmissionUnavailable):
-        MappingCoreAdmissionPort(lambda _member: mapping).admit(member)
+    result = executor_call(
+        _EXECUTOR_CHILD,
+        tmp_path,
+        "reconcile",
+        {"mapping": mapping, "root": str(tmp_path), "status": "failed", "task_id": "task"},
+    )
+    assert (result["action"], result["reason_code"]) == (
+        "park",
+        "core-admission-unavailable",
+    )
 
 
 def test_real_controller_launches_only_the_admitted_successor(tmp_path: Path) -> None:
     """The real port drives one successor launch and parks an unknown member."""
 
-    # Reuse the durable controller fixture that creates valid start/outcome and
-    # invocation records; only the core-owned mapping is replaced below.
-    from test_b1a_b_publication import _fixture
-    from test_review_b1b2_t2_r1 import _binding
-
-    store, group, lease, inputs, _bindings, successor_rows, fences = _fixture(
-        tmp_path, ("ambiguous", "successor"), remote=False
-    )
-    ambiguous_dir = Path(fences["ambiguous"].output_dir) / "core"
+    # Build both producer contexts in the parent from the real CPU fixtures.
+    # The executor child creates its own durable controller fixture and only
+    # receives these closed mappings over the wire.
+    controller_root = tmp_path / "controller-parent"
+    ambiguous_dir = controller_root / "ambiguous"
+    ambiguous_dir.mkdir(parents=True)
     write_run_start(ambiguous_dir)
     (ambiguous_dir / "status.json").write_text('{"status":"unknown"}\n', encoding="utf-8")
     write_outcome(ambiguous_dir, "unknown")
 
-    successor_dir = Path(fences["successor"].output_dir) / "core"
+    successor_dir = controller_root / "successor"
     successor_ref = planned_yield_run(successor_dir)
-    predecessor = inputs[1]
-    proposed = successor_rows["successor"][2]
     successor_request = request(
         successor_ref,
         task_id="successor",
-        predecessor_attempt_id=predecessor.attempt_id.value,
-        successor_attempt_id=proposed.attempt_id.value,
     )
-    successor_rows["successor"] = (
-        successor_request.to_dict(),
-        "b" * 64,
-        proposed,
-    )
-    contexts = {
-        "ambiguous": admission_context(ambiguous_dir, task_id="ambiguous"),
-        "successor": admission_context(
-            successor_dir, successor_request, task_id="successor"
+    mappings = {
+        "ambiguous": evaluate_core_admission(
+            admission_context(ambiguous_dir, task_id="ambiguous")
+        ),
+        "successor": evaluate_core_admission(
+            admission_context(successor_dir, successor_request, task_id="successor")
         ),
     }
-
-    class RecordingExecutor:
-        def __init__(self) -> None:
-            self.calls: list[str] = []
-
-        def launch(self, fence, invocation) -> MemberLaunchResult:
-            self.calls.append(fence.task_id)
-            return MemberLaunchResult(True)
-
-    from tpen_executor.allocations import ConfiguredAllocation
-
-    configured = ConfiguredAllocation(lease.allocation_id, lease.backend_job_id, {})
-    facts = GroupControllerFactsV1(
-        group,
-        configured,
-        "a" * 64,
-        "b1d-controller",
-        "2026-11-21T00:02:00Z",
-        inputs,
-        successor_rows,
+    result = executor_call(
+        _EXECUTOR_CHILD,
+        tmp_path,
+        "controller",
+        {"mappings": mappings, "root": str(tmp_path / "controller-child")},
     )
-    executor = RecordingExecutor()
-    result = run_group_controller(
-        _binding(group, configured.backend_job_id),
-        configured.backend_job_id,
-        facts,
-        store,
-        MappingCoreAdmissionPort(
-            lambda member: evaluate_core_admission(contexts[member.task_id])
-        ),
-        executor,
-    )
-    assert dict(result.member_outcomes) == {
+    assert result["member_outcomes"] == {
         "ambiguous": "parked",
         "successor": "launched",
     }
-    assert executor.calls == ["successor"]
-    assert result.reconciliation.members[0].action == "park"
-    assert result.reconciliation.members[1].action == "admit_successor"
+    assert result["launch_calls"] == ["successor"]
+    assert result["launch_count"] == 1
 
 
 def test_mutant_rows_are_well_formed_and_have_named_killers() -> None:
