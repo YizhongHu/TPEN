@@ -137,6 +137,84 @@ def test_takeover_requires_terminal_quiescent_budget_and_identity() -> None:
         ).validate(expected={"predecessor_content_id": "content"})
 
 
+@pytest.mark.parametrize(
+    "superseded_attempt_keys",
+    [(), ("attempt-000000.json", "attempt-000000.json"), ("",)],
+)
+def test_takeover_approval_requires_nonempty_unique_nonblank_scope(
+    superseded_attempt_keys: tuple[str, ...],
+) -> None:
+    approval = RestartApproval(
+        predecessor_content_id="initial",
+        terminal_pbs_proof="pbs-terminal",
+        quiescent=True,
+        adopted_budget="budget-1",
+        lineage_id="lineage",
+        config_identity="config",
+        overlay_identity="overlay",
+        target_iterations=100000,
+        superseded_attempt_keys=superseded_attempt_keys,
+    )
+    with pytest.raises(RestartRefusal) as refused:
+        approval.validate(
+            expected={
+                "predecessor_content_id": "initial",
+                "lineage_id": "lineage",
+                "config_identity": "config",
+                "overlay_identity": "overlay",
+                "target_iterations": 100000,
+            }
+        )
+    assert refused.value.cause is RestartCause.TAKEOVER_APPROVAL_SCOPE_MISMATCH
+
+
+def test_execute_restart_refuses_empty_takeover_scope_before_claim_or_driver(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from experiments.atomistic.stage1 import restart
+
+    cfg = _cfg(tmp_path)
+    row = _row(tmp_path)
+    run_dir = resolve_run_dir(row)
+    attempts = run_dir / "attempts"
+    attempts.mkdir(parents=True)
+    before = sorted(path.relative_to(attempts).as_posix() for path in attempts.rglob("*"))
+    calls: list[str] = []
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+    monkeypatch.setattr(restart, "validate_native_recovery_profile", lambda _cfg: None)
+    monkeypatch.setattr(
+        restart,
+        "select_restart",
+        lambda **_kwargs: restart.RestartSelection(
+            StartDecision.FRESH, run_dir, None, None, None
+        ),
+    )
+    approval = RestartApproval(
+        predecessor_content_id="initial",
+        terminal_pbs_proof="pbs-terminal",
+        quiescent=True,
+        adopted_budget="budget-1",
+        lineage_id="he-lineage-0",
+        config_identity="a" * 64,
+        overlay_identity="none",
+        target_iterations=100000,
+        superseded_attempt_keys=(),
+    )
+    with pytest.raises(RestartRefusal) as refused:
+        restart.execute_restart(
+            cfg=cfg,
+            row=row,
+            config_path="train.yaml",
+            run=lambda *_a, **_k: calls.append("driver") or 0,
+            run_dir=run_dir,
+            takeover=approval,
+        )
+    assert refused.value.cause is RestartCause.TAKEOVER_APPROVAL_SCOPE_MISMATCH
+    assert calls == []
+    after = sorted(path.relative_to(attempts).as_posix() for path in attempts.rglob("*"))
+    assert after == before
+
+
 def test_execute_calls_profile_gate_before_driver_and_uses_durable_outcome(
     tmp_path: Path, monkeypatch,
 ) -> None:
