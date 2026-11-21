@@ -44,6 +44,26 @@ def _digest(value: object) -> str:
     return hashlib.sha256(pickle.dumps(value, protocol=5)).hexdigest()
 
 
+def _semantic_digest(value: object) -> str:
+    """Digest state content while ignoring pickle/container metadata."""
+    import torch
+
+    def canonical(item: object) -> object:
+        if isinstance(item, torch.Tensor):
+            tensor = item.detach().cpu().contiguous()
+            return ("torch", str(tensor.dtype), tuple(tensor.shape), tensor.numpy().tobytes())
+        if isinstance(item, np.ndarray):
+            array = np.ascontiguousarray(item)
+            return ("numpy", str(array.dtype), tuple(array.shape), array.tobytes())
+        if isinstance(item, dict):
+            return tuple(sorted((str(key), canonical(val)) for key, val in item.items()))
+        if isinstance(item, (list, tuple)):
+            return tuple(canonical(val) for val in item)
+        return item
+
+    return _digest(canonical(value))
+
+
 def _tensor_digest(value: object) -> str:
     """Hash tensor bytes, independent of device/storage metadata."""
     import torch
@@ -112,13 +132,13 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
             + _tensor_digest(sampler_state["generator_state"])
         )
         return {
-            "model": _digest(model.state_dict()),
+            "model": _semantic_digest(model.state_dict()),
             "observable": float(next(model.parameters()).detach().reshape(-1)[0]),
-            "optimizer": _digest(optimizer.state_dict()),
+            "optimizer": _semantic_digest(optimizer.state_dict()),
             "trainer": {"next_iteration": int(trainer.next_iteration), "completed_updates": int(trainer.completed_updates), "max_steps": int(trainer.max_steps)},
             "sampler": _digest(sampler_state),
             "sampler_cursor": sampler_cursor,
-            "process_rng": _digest(process_rng),
+            "process_rng": _semantic_digest(process_rng),
             "callback_dispositions": [
                 type(callback).__qualname__
                 for callback in getattr(context, "callbacks", ())
@@ -208,8 +228,9 @@ def _assert_equivalent(expected: dict[str, Any], observed: dict[str, Any]) -> No
     np.testing.assert_allclose(expected["observable"], observed["observable"], rtol=RTOL, atol=ATOL)
     for key in ("model", "optimizer", "sampler", "sampler_cursor", "process_rng", "callback_dispositions"):
         assert key in expected and key in observed
-    # These digests are the serialized mutable state at the restore boundary;
-    # presence alone would let a restore-disabled mutant pass undetected.
+    # These semantic digests are the mutable state at the restore boundary;
+    # raw pickle digests include process-local/container metadata. Presence
+    # alone would let a restore-disabled mutant pass undetected.
     for key in ("model", "optimizer", "process_rng", "sampler_cursor", "callback_dispositions"):
         assert expected[key] == observed[key], key
 
