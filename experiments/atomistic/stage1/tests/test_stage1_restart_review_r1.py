@@ -172,6 +172,10 @@ def test_lineage_claim_serializes_stale_and_current_selections(
         return paths
 
     def deterministic_claim(**kwargs):
+        if current_thread().name == "current-contender":
+            assert stale_claimed.wait(timeout=10), (
+                "current contender did not receive the stale claim barrier"
+            )
         claimed = original_claim(**kwargs)
         if current_thread().name == "stale-contender":
             stale_claimed.set()
