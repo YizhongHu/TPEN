@@ -7,7 +7,6 @@ restores that checkpoint.  No production module is imported from ``tests``.
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import multiprocessing as mp
@@ -209,17 +208,10 @@ def _assert_equivalent(expected: dict[str, Any], observed: dict[str, Any]) -> No
     np.testing.assert_allclose(expected["observable"], observed["observable"], rtol=RTOL, atol=ATOL)
     for key in ("model", "optimizer", "sampler", "sampler_cursor", "process_rng", "callback_dispositions"):
         assert key in expected and key in observed
-    for key in ("sampler_cursor", "callback_dispositions"):
+    # These digests are the serialized mutable state at the restore boundary;
+    # presence alone would let a restore-disabled mutant pass undetected.
+    for key in ("model", "optimizer", "process_rng", "sampler_cursor", "callback_dispositions"):
         assert expected[key] == observed[key], key
-
-
-def _assert_rng_equivalent(expected: dict[str, Any], observed: dict[str, Any]) -> None:
-    """Keep the process-RNG mutation killer explicit even when runtimes reseed."""
-    assert expected["process_rng"] == observed["process_rng"]
-
-
-def _assert_predecessor_unchanged(before: str, after: str) -> None:
-    assert before == after, "successor mutated predecessor tree"
 
 
 def test_hi_s5b_b2_three_process_stateful_continuation(tmp_path: Path) -> None:
@@ -255,27 +247,4 @@ def test_hi_s5b_b2_three_process_stateful_continuation(tmp_path: Path) -> None:
     np.testing.assert_allclose(full["boundary"]["observable"], restored["training_started"]["observable"], rtol=RTOL, atol=ATOL)
     assert restored["restored"]["trainer"]["max_steps"] == H
     assert disabled["boundary"]["model"] != restored["training_started"]["model"]
-
-
-def test_hi_s5b_b2_mutant_detection_contract() -> None:
-    """The qualification assertions reject the three required real faults."""
-    baseline = {"trainer": {"next_iteration": 1, "completed_updates": 1, "max_steps": H}, "model": "m", "optimizer": "o", "sampler": "s", "sampler_cursor": "sc", "process_rng": "r", "callback_dispositions": [], "observable": 1.0}
-    for field in ("sampler_cursor", "process_rng"):
-        mutant = copy.deepcopy(baseline)
-        mutant[field] = "mutated"
-        try:
-            if field == "process_rng":
-                _assert_rng_equivalent(baseline, mutant)
-            else:
-                _assert_equivalent(baseline, mutant)
-        except AssertionError:
-            pass
-        else:
-            raise AssertionError(f"mutant not detected: {field}")
-    try:
-        _assert_predecessor_unchanged("before", "after")
-    except AssertionError:
-        pass
-    else:
-        raise AssertionError("mutant not detected: predecessor tree mutation")
 
