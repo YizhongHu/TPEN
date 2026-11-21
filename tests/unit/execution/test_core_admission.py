@@ -276,10 +276,10 @@ def test_canonical_mapping_has_executor_unknown_quiescence(tmp_path: Path) -> No
 def test_mutant_table_has_unique_compile_valid_anchors_and_existing_killers() -> None:
     source = inspect.getsource(core_admission)
     review_source = Path(__file__).with_name("test_review_b1d_core_admission.py").read_text()
-    test_sources = source + review_source
+    test_sources = Path(__file__).read_text() + review_source
     for name, target, before, after, killer in MUTANTS:
         assert target == "tpen/execution/core_admission.py"
         assert source.count(before) == 1, name
         compile(source.replace(before, after), target, "exec")
-        assert killer in test_sources, killer
+        assert f"def {killer}(" in test_sources, killer
 
