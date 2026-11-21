@@ -91,6 +91,7 @@ from .profiles import (
     ProfileCheck,
     REFUSAL_CODES,
     check_profile,
+    configured_load_mode,
 )
 
 __all__ = [
@@ -134,6 +135,7 @@ __all__ = [
     "ProfileCheck",
     "REFUSAL_CODES",
     "check_profile",
+    "configured_load_mode",
     "ModelOnly",
     "TrainResume",
     "MODEL_ONLY_PAYLOAD",
