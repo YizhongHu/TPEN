@@ -54,8 +54,15 @@ MUTANTS = (
         "submit-retries-after-start-error",
         MODULE_NAME,
         "future = self._pool.submit(self._run_leaf, request)",
-        "future = self._pool.submit(self._run_leaf, request)\n            future = self._pool.submit(self._run_leaf, request)",
+        "try:\n                future = self._pool.submit(self._run_leaf, request)\n            except Exception:\n                future = self._pool.submit(self._run_leaf, request)",
         "test_submit_start_exception_is_not_retried",
+    ),
+    (
+        "slot-by-active-count",
+        MODULE_NAME,
+        "slot = self._free_slots.pop() if self._free_slots else None",
+        "slot = self._slots[self._active] if self._active < len(self._slots) else None",
+        "test_reuses_collected_slot_only",
     ),
     (
         "collect-skips-result-validation",
@@ -205,6 +212,36 @@ def test_submit_returns_before_leaf_completion(tmp_path: Path) -> None:
         executor.collect(handle2)
     finally:
         release.set()
+        executor.close()
+
+
+def test_reuses_collected_slot_only(tmp_path: Path) -> None:
+    group = _group(("one", "two", "three"))
+    allocation = _allocation(2)
+    captured: dict[str, LeafRequest] = {}
+    captured_events = {task_id: Event() for task_id in ("one", "two", "three")}
+
+    def runner(payload: bytes) -> bytes:
+        request = LeafRequest.decode(payload)
+        captured[request.task_id] = request
+        captured_events[request.task_id].set()
+        return _failure_result(request).encode()
+
+    executor = _executor(group, allocation, runner)
+    try:
+        fence_a, invocation_a = _invocation(group, allocation, "one", tmp_path)
+        _, handle_a = executor.submit(fence_a, invocation_a)
+        fence_b, invocation_b = _invocation(group, allocation, "two", tmp_path)
+        _, handle_b = executor.submit(fence_b, invocation_b)
+        executor.collect(handle_a)
+        fence_c, invocation_c = _invocation(group, allocation, "three", tmp_path)
+        _, handle_c = executor.submit(fence_c, invocation_c)
+        assert all(event.wait(2) for event in captured_events.values())
+        assert captured["three"].slot_id == captured["one"].slot_id
+        assert captured["three"].slot_id != captured["two"].slot_id
+        executor.collect(handle_b)
+        executor.collect(handle_c)
+    finally:
         executor.close()
 
 
@@ -358,6 +395,7 @@ def test_real_local_run_leaf_subprocess(tmp_path: Path) -> None:
 def test_mutant_rows_are_unique_and_well_formed() -> None:
     source = MODULE.read_text(encoding="utf-8")
     assert len({row[2] for row in MUTANTS}) == len(MUTANTS)
+    assert len(MUTANTS) == 6
     for _name, filename, old, new, _killer in MUTANTS:
         assert filename == MODULE_NAME
         assert source.count(old) == 1

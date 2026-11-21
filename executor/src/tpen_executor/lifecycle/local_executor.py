@@ -86,12 +86,13 @@ class MemberLaunchHandle:
 
     __slots__ = (
         "_future", "_request", "_group_digest", "_task_id", "_lineage_id",
-        "_attempt_id", "_allocation_id", "_backend_job_id", "_invocation_id",
+        "_attempt_id", "_allocation_id", "_backend_job_id", "_invocation_id", "_slot",
     )
 
-    def __init__(self, request: LeafRequest, invocation: MemberInvocationV2, future: Future[Any]) -> None:
+    def __init__(self, request: LeafRequest, invocation: MemberInvocationV2, future: Future[Any], slot: AllocationSlot | None) -> None:
         self._future = future
         self._request = request
+        self._slot = slot
         self._group_digest = request.group_digest
         self._task_id = request.task_id
         self._lineage_id = invocation.lineage_id
@@ -141,6 +142,12 @@ class MemberLaunchHandle:
         """Return the invocation identity bound to this handle."""
 
         return self._invocation_id
+
+    @property
+    def slot_id(self) -> str | None:
+        """Return the exact allocation slot leased to this handle."""
+
+        return None if self._slot is None else self._slot.slot_id
 
 
 EnvironmentFactory = Callable[[TaskSpec, ConfiguredRun, AllocationSlot | None], PreparedPythonEnvironment]
@@ -224,6 +231,7 @@ class LocalLeafExecutor:
         self._pool = ThreadPoolExecutor(max_workers=capacity, thread_name_prefix="tpen-local-leaf")
         self._lock = threading.Lock()
         self._active = 0
+        self._free_slots = list(self._slots)
         self._handles: dict[int, MemberLaunchHandle] = {}
         self._collected: set[int] = set()
 
@@ -281,7 +289,7 @@ class LocalLeafExecutor:
         with self._lock:
             if self._active >= self.capacity:
                 raise CapacityExceededError("local leaf capacity is already admitted")
-            slot = self._slots[self._active] if self._active < len(self._slots) else None
+            slot = self._free_slots.pop() if self._free_slots else None
             self._active += 1
         try:
             configured = self._configured(task)
@@ -293,10 +301,12 @@ class LocalLeafExecutor:
         except Exception as error:
             with self._lock:
                 self._active -= 1
+                if slot is not None:
+                    self._free_slots.append(slot)
             if isinstance(error, (InvocationMismatchError, CapacityExceededError, LeafSubmissionError)):
                 raise
             raise LeafSubmissionError(f"local leaf submission failed: {error}") from error
-        handle = MemberLaunchHandle(request, invocation, future)
+        handle = MemberLaunchHandle(request, invocation, future, slot)
         with self._lock:
             self._handles[id(handle)] = handle
         return MemberLaunchResult(True, status="submitted", detail="local leaf accepted"), handle
@@ -337,6 +347,8 @@ class LocalLeafExecutor:
                     if key not in self._collected:
                         self._collected.add(key)
                         self._active -= 1
+                        if handle._slot is not None:
+                            self._free_slots.append(handle._slot)
 
     def close(self, *, wait: bool = True) -> None:
         """Shut down the local submission pool after outstanding work settles."""
