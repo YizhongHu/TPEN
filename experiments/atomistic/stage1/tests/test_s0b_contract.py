@@ -28,6 +28,9 @@ ROOT = Path(__file__).parents[1]
 CONFIG_ROOT = ROOT / "configs"
 SOURCE_SHA = "a" * 40
 PHYSICAL_ID = "c" * 64
+EXPECTED_HE_H2_EVAL_CHECKPOINTS = (
+    0, 1000, 2000, 4000, 8000, 16000, 25000, 40000, 60000, 80000, 100000,
+)
 
 
 def _phase2_document(tmp_path: Path, system: str = "he") -> dict[str, object]:
@@ -81,6 +84,44 @@ def test_he_h2_eval_configs_bind_burn_in_and_stride() -> None:
         assert cfg.evaluation_sampler.burn_in == 1000
         assert cfg.evaluation_sampler.n_steps == 20
         assert cfg.evaluation_tasks.mcmc_energy.generator.n_draws == 256
+
+
+def test_he_h2_eval_roster_b_is_literal_and_phase2_requires_every_checkpoint(
+    tmp_path: Path,
+) -> None:
+    assert HE_H2_EVAL_CHECKPOINTS == EXPECTED_HE_H2_EVAL_CHECKPOINTS
+
+    document = _phase2_document(tmp_path)
+    phase1_rows = [row for row in document["rows"] if row["kind"] != "eval"]
+    phase1_hash = manifest_hash(phase1_rows)
+    system = "he"
+    config_sha256 = config_identities(config_root=CONFIG_ROOT, systems=(system,))
+    checkpoints = list(EXPECTED_HE_H2_EVAL_CHECKPOINTS)
+    checkpoints.remove(25_000)
+    evidence = {
+        "schema": CHECKPOINT_EVIDENCE_SCHEMA,
+        "phase1_manifest_hash": phase1_hash,
+        "phase1_train_row_hashes": {
+            f"{system}:{row['lineage']}": manifest_hash([row])
+            for row in phase1_rows if row["kind"] == "train"
+        },
+        "checkpoints": {
+            f"{system}:{lineage}:{checkpoint}": PHYSICAL_ID
+            for lineage in range(STAGE1_PROTOCOL.lineages)
+            for checkpoint in checkpoints
+        },
+    }
+    with pytest.raises(ProtocolError, match="roster-B"):
+        bind_evaluation_manifest(
+            phase1_rows=phase1_rows,
+            checkpoints=checkpoints,
+            checkpoint_evidence=evidence,
+            expected_physical_system_id={system: PHYSICAL_ID},
+            source_sha=SOURCE_SHA,
+            config_sha256=config_sha256,
+            protocol=STAGE1_PROTOCOL,
+            phase1_manifest_hash=phase1_hash,
+        )
 
 
 def test_production_phase2_emits_exact_roster_b_grid(tmp_path: Path) -> None:
