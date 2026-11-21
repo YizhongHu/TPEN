@@ -327,7 +327,7 @@ def _run_real_child(payload: dict[str, object]) -> tuple[dict[str, object], Proc
         [
             sys.executable, "-c",
             (
-                "from typeguard.importhook import install_import_hook; "
+                "from typeguard import install_import_hook; "
                 "install_import_hook('tpen'); "
                 "from tests.integration.test_stage1_restartable import _real_chain_child; "
                 "_real_chain_child()"
