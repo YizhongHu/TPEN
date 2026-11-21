@@ -225,9 +225,14 @@ def test_hi_s5b_b2_three_process_stateful_continuation(tmp_path: Path) -> None:
     assert _tree_digest(run_dir) == before_refused
     _spawn("disabled", disabled_cfg, disabled_record)
     full = json.loads(full_record.read_text())
+    prefix = json.loads(prefix_record.read_text())
     restored = json.loads(successor_record.read_text())
     disabled = json.loads(disabled_record.read_text())
-    _assert_equivalent(full["boundary"], restored["training_started"])
+    # The prefix process is the checkpoint producer, so its exact sampler
+    # cursor is the authoritative next-draw witness; the uninterrupted arm
+    # supplies the cross-process float64 observable comparison.
+    _assert_equivalent(prefix["boundary"], restored["training_started"])
+    np.testing.assert_allclose(full["boundary"]["observable"], restored["training_started"]["observable"], rtol=RTOL, atol=ATOL)
     assert restored["restored"]["trainer"]["max_steps"] == H
     assert restored["restored"]["sampler"] == full["boundary"]["sampler"]
     assert disabled["boundary"]["model"] != restored["training_started"]["model"]
