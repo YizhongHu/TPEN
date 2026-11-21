@@ -359,10 +359,9 @@ class LocalLeafExecutor:
                 # A leaf-raised TimeoutError is terminal, but still belongs
                 # to the caller as the exact leaf exception.
                 raise
-            except BaseException:
-                # Any leaf exception, including a leaf-raised TimeoutError
-                # when no finite wait timeout was requested, is terminal.
-                terminal = True
+            except BaseException as error:
+                # Only the future's own exception consumes the handle; caller interrupts must retain its lease.
+                terminal = handle._future.done() and handle._future.exception(timeout=0) is error
                 raise
             terminal = True
             if not isinstance(result, LeafResult):

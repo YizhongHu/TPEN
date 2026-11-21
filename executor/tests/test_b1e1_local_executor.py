@@ -99,6 +99,13 @@ MUTANTS = (
         'if False:\n                raise AssertionError("unreachable")',
         "test_overlapping_collect_returns_result_to_only_one_caller",
     ),
+    (
+        "interrupt-consumes-handle",
+        MODULE_NAME,
+        "terminal = handle._future.done() and handle._future.exception(timeout=0) is error",
+        "terminal = True",
+        "test_interrupted_wait_keeps_live_leaf_handle_and_slot",
+    ),
 )
 
 
@@ -411,13 +418,18 @@ def test_real_local_run_leaf_subprocess(tmp_path: Path) -> None:
 
 def test_mutant_rows_are_unique_and_well_formed() -> None:
     source = MODULE.read_text(encoding="utf-8")
-    review_source = Path(__file__).with_name("test_review_b1e1_r1.py").read_text(encoding="utf-8")
-    test_source = Path(__file__).read_text(encoding="utf-8") + review_source
+    review_sources = "".join(
+        Path(__file__).with_name(name).read_text(encoding="utf-8")
+        for name in ("test_review_b1e1_r1.py", "test_review_b1e1_delta.py")
+    )
+    test_source = Path(__file__).read_text(encoding="utf-8") + review_sources
     assert len({row[2] for row in MUTANTS}) == len(MUTANTS)
-    assert len(MUTANTS) == 8
+    assert len(MUTANTS) == 9
     for _name, filename, old, new, killer in MUTANTS:
         assert filename == MODULE_NAME
         assert source.count(old) == 1
         compile(source.replace(old, new), str(MODULE), "exec")
+        assert ".result()" not in new
+        assert ".wait()" not in new
         assert f"def {killer}(" in test_source
 
