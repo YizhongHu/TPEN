@@ -396,10 +396,19 @@ class SuccessorAdmissionResult:
 
     restore_request: "OperationalRestoreRequest | None" = None
     refusal: SuccessorAdmissionRefusal | None = None
+    unavailable: bool = False
 
     def __post_init__(self) -> None:
         if (self.restore_request is None) == (self.refusal is None):
             raise ValueError("admission result requires exactly one restore request or refusal")
+        if type(self.unavailable) is not bool:
+            raise TypeError("unavailable must be a bool")
+
+    @property
+    def inspection_unavailable(self) -> bool:
+        """Return the process-local transport failure marker."""
+
+        return self.unavailable
 
     @property
     def accepted(self) -> bool:
@@ -1038,10 +1047,17 @@ class OperationalRestoreRequest:
         return dict(self._load)
 
 
-def _admission_refusal(code: AdmissionRefusalCode, message: str) -> SuccessorAdmissionResult:
+def _admission_refusal(
+    code: AdmissionRefusalCode,
+    message: str,
+    *,
+    unavailable: bool = False,
+) -> SuccessorAdmissionResult:
     """Build a refused successor-admission result."""
 
-    return SuccessorAdmissionResult(refusal=SuccessorAdmissionRefusal(code, message))
+    return SuccessorAdmissionResult(
+        refusal=SuccessorAdmissionRefusal(code, message), unavailable=unavailable
+    )
 
 
 def _request_and_intent(
@@ -1191,7 +1207,18 @@ def select_successor_admission(
             )
     try:
         ref.validate()
-    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
+    except FileNotFoundError as exc:
+        return _admission_refusal(
+            AdmissionRefusalCode.STALE_REF,
+            f"checkpoint bytes no longer match checkpoint ref: {exc}",
+        )
+    except OSError as exc:
+        return _admission_refusal(
+            AdmissionRefusalCode.STALE_REF,
+            f"checkpoint bytes could not be read: {exc}",
+            unavailable=True,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
         return _admission_refusal(
             AdmissionRefusalCode.STALE_REF,
             f"checkpoint bytes no longer match checkpoint ref: {exc}",
@@ -1208,7 +1235,18 @@ def select_successor_admission(
     publication_root = ref.checkpoint_dir.parent
     try:
         publications = read_publications(publication_catalog_path(publication_root))
-    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
+    except FileNotFoundError as exc:
+        return _admission_refusal(
+            AdmissionRefusalCode.MISSING_PUBLICATION,
+            f"checkpoint publication catalog is unavailable or invalid: {exc}",
+        )
+    except OSError as exc:
+        return _admission_refusal(
+            AdmissionRefusalCode.MISSING_PUBLICATION,
+            f"checkpoint publication catalog could not be read: {exc}",
+            unavailable=True,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
         return _admission_refusal(
             AdmissionRefusalCode.MISSING_PUBLICATION,
             f"checkpoint publication catalog is unavailable or invalid: {exc}",
@@ -1222,9 +1260,19 @@ def select_successor_admission(
             AdmissionRefusalCode.MISSING_PUBLICATION,
             "checkpoint ref is not present in the publication catalog",
         )
-    if not has_publication_receipt(
-        publication_receipt_path(publication_root), ref.content_id
-    ):
+    try:
+        has_receipt = has_publication_receipt(
+            publication_receipt_path(publication_root), ref.content_id
+        )
+    except FileNotFoundError:
+        has_receipt = False
+    except OSError as exc:
+        return _admission_refusal(
+            AdmissionRefusalCode.MISSING_PUBLICATION,
+            f"checkpoint publication receipt could not be read: {exc}",
+            unavailable=True,
+        )
+    if not has_receipt:
         return _admission_refusal(
             AdmissionRefusalCode.MISSING_PUBLICATION,
             "checkpoint ref has no complete publication receipt",

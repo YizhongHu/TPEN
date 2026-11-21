@@ -21,6 +21,7 @@ from tpen.checkpoint.profiles import ProfileCheck, check_profile
 from tpen.inspection import RUN_EVIDENCE_SCHEMA_V3, RunEvidence, inspect_run
 
 from .recovery import (
+    AdmissionRefusalCode,
     ScienceIntent,
     SuccessorAdmissionDecodeRefusal,
     SuccessorAdmissionRequest,
@@ -296,9 +297,13 @@ def evaluate_core_admission(context: CoreAdmissionContextV1) -> dict[str, Any] |
         result = select_successor_admission(_intent_for(context, request), request)
     except Exception as exc:
         return _unknown(f"admission-error:{type(exc).__name__}")
+    if result.unavailable:
+        return _unknown("admission-unavailable")
     if result.accepted:
         return _mapping("successor", "admitted", "valid", profile, "admitted")
     assert result.refusal is not None
+    if result.refusal.code is AdmissionRefusalCode.IDENTITY_MISMATCH:
+        return _unknown(result.refusal.code.value)
     return _mapping("successor", "refused", "invalid", profile, result.refusal.code.value)
 
 

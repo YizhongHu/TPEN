@@ -73,19 +73,35 @@ MUTANTS = (
         "if False:",
         "test_review_contradictory_terminal_outcome_is_unknown",
     ),
-    (
-        "typed-v3-only-bypass",
-        "tpen/execution/core_admission.py",
-        'if evidence.schema != RUN_EVIDENCE_SCHEMA_V3:',
-        "if False:",
-        "test_review_untyped_terminal_evidence_is_unknown",
-    ),
+    # typed-v3-only-bypass is intentionally omitted: RunEvidence rejects
+    # typed outcomes on non-v3 records, and binding/validity reject the rest.
     (
         "unavailable-to-refusal",
         "tpen/execution/core_admission.py",
         "if evidence.inspection_unavailable:",
         "if False:",
         "test_review_catalog_io_failure_is_unknown",
+    ),
+    (
+        "selector-identity-to-refusal",
+        "tpen/execution/core_admission.py",
+        "if result.refusal.code is AdmissionRefusalCode.IDENTITY_MISMATCH:",
+        "if False:",
+        "test_delta_selector_identity_refusal_is_unknown",
+    ),
+    (
+        "selector-unavailable-to-refusal",
+        "tpen/execution/core_admission.py",
+        "if result.unavailable:",
+        "if False:",
+        "test_delta_selector_catalog_io_failure_is_unknown",
+    ),
+    (
+        "missing-payload-to-unavailable",
+        "tpen/inspection.py",
+        "except FileNotFoundError as exc:  # named checkpoint payload remains typed",
+        "except OSError as exc:  # named checkpoint payload remains typed",
+        "test_delta_missing_model_remains_typed_stale_refusal",
     ),
     (
         "quiescence-not-unknown",
@@ -275,11 +291,16 @@ def test_canonical_mapping_has_executor_unknown_quiescence(tmp_path: Path) -> No
 
 def test_mutant_table_has_unique_compile_valid_anchors_and_existing_killers() -> None:
     source = inspect.getsource(core_admission)
+    target_sources = {
+        "tpen/execution/core_admission.py": source,
+        "tpen/inspection.py": Path(__file__).parents[3].joinpath("tpen/inspection.py").read_text(),
+    }
     review_source = Path(__file__).with_name("test_review_b1d_core_admission.py").read_text()
-    test_sources = Path(__file__).read_text() + review_source
+    delta_source = Path(__file__).with_name("test_review_b1d_core_admission_delta.py").read_text()
+    test_sources = Path(__file__).read_text() + review_source + delta_source
     for name, target, before, after, killer in MUTANTS:
-        assert target == "tpen/execution/core_admission.py"
-        assert source.count(before) == 1, name
-        compile(source.replace(before, after), target, "exec")
+        target_source = target_sources[target]
+        assert target_source.count(before) == 1, name
+        compile(target_source.replace(before, after), target, "exec")
         assert f"def {killer}(" in test_sources, killer
 
