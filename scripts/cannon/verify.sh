@@ -109,11 +109,144 @@ assert_write_path "$RUN_ROOT"; assert_write_path "$WORK_ROOT"
 safe_mkdir "$RUN_ROOT"; safe_mkdir "$RUN_ROOT/evidence"; safe_mkdir "$WORK_ROOT"
 assert_write_path "$RUN_ROOT/evidence/driver.log"
 exec > "$RUN_ROOT/evidence/driver.log" 2>&1
+
+# Full-suite runs are the only runs that retain job-local test artifacts.  The
+# allowlist is intentionally explicit: source checkouts, overlays, dependency
+# caches, and bytecode are never copied into RUN_ROOT.
+artifact_is_excluded() {
+  local rel="$1"
+  case "/$rel/" in
+    */.git/*|*/.git/|*/__pycache__/*|*/__pycache__/|*/.pytest_cache/*|*/.pytest_cache/|\
+      */.mypy_cache/*|*/.mypy_cache/|*/.ruff_cache/*|*/.ruff_cache/|*/.venv/*|*/.venv/)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+artifact_copy_file() {
+  local source="$1" destination_rel="$2" inventory="$3"
+  local source_class="${4:-unknown}" producer="${5:-harness}"
+  local destination hash source_hash size
+  [[ -f "$source" ]] || return 1
+  [[ "${ARTIFACTS_FORCE_FAILURE:-0}" != 1 ]] || return 1
+  artifact_is_excluded "$destination_rel" && return 0
+  destination="$RUN_ROOT/artifacts/$destination_rel"
+  [[ ! -e "$destination" ]] || return 1
+  assert_write_path "$destination" || return 1
+  mkdir -p -- "$(dirname -- "$destination")" || return 1
+  cp -- "$source" "$destination" || return 1
+  hash="$(sha256sum -- "$destination" | awk '{print $1}')" || return 1
+  source_hash="$(sha256sum -- "$source" | awk '{print $1}')" || return 1
+  [[ "$hash" == "$source_hash" ]] || return 1
+  size="$(wc -c < "$destination")" || return 1
+  ARTIFACT_FILE_COUNT=$((ARTIFACT_FILE_COUNT + 1))
+  ARTIFACT_BYTES=$((ARTIFACT_BYTES + size))
+  printf '%s  %s\n' "$hash" "$destination_rel" >> "$inventory" || return 1
+  if [[ -n "${ARTIFACTS_METADATA:-}" ]]; then
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$source_class" "$source" "on" "$destination_rel" "$size" "$hash" "$producer" >> "$ARTIFACTS_METADATA" || return 1
+  fi
+}
+
+artifact_copy_tree() {
+  local source="$1" destination_prefix="$2" inventory="$3" source_class="${4:-unknown}" producer="${5:-harness}" file rel
+  [[ -d "$source" ]] || return 0
+  while IFS= read -r -d '' file; do
+    rel="${file#"$source"/}"
+    artifact_copy_file "$file" "$destination_prefix/$rel" "$inventory" "$source_class" "$producer" || return 1
+  done < <(find "$source" -type f -print0)
+}
+
+artifact_copy_ignored_tree() {
+  local source="$1" destination_prefix="$2" inventory="$3" source_class="${4:-checkout}" producer="${5:-pytest}" file rel
+  [[ -d "$source" ]] || return 0
+  while IFS= read -r -d '' file; do
+    rel="${file#"$source"/}"
+    git -C "$CLONE" check-ignore -q -- "${file#"$CLONE"/}" || continue
+    artifact_copy_file "$file" "$destination_prefix/$rel" "$inventory" "$source_class" "$producer" || return 1
+  done < <(find "$source" -type f -print0)
+}
+
+artifact_copy_clone_deltas() {
+  local inventory="$1" file rel
+  [[ -d "${CLONE:-}" ]] || return 0
+  while IFS= read -r -d '' rel; do
+    [[ -f "$CLONE/$rel" ]] || continue
+    artifact_copy_file "$CLONE/$rel" "checkout/$rel" "$inventory" checkout pytest || return 1
+  done < <(git -C "$CLONE" diff --name-only -z)
+  while IFS= read -r -d '' rel; do
+    artifact_copy_file "$CLONE/$rel" "checkout/$rel" "$inventory" checkout pytest || return 1
+  done < <(git -C "$CLONE" ls-files --others --exclude-standard -z)
+  # Ignored test outputs are not checkout deltas, so retain only the named
+  # output roots. Their contents still pass through the cache exclusions.
+  for rel in outputs results reports slurm; do
+    artifact_copy_ignored_tree "$CLONE/$rel" "checkout/$rel" "$inventory" checkout pytest || return 1
+  done
+}
+
+artifact_copy_work_allowlist() {
+  local inventory="$1" child name
+  [[ -d "${WORK_ROOT:-}" ]] || return 0
+  artifact_copy_tree "$TMPDIR" "tmpdir" "$inventory" tmpdir pytest || return 1
+  for child in "$WORK_ROOT"/basetemp-*; do
+    [[ -d "$child" ]] || continue
+    name="${child##*/}"
+    artifact_copy_tree "$child" "basetemp/$name" "$inventory" basetemp pytest || return 1
+  done
+  # Mutant backups and harness sidecars are the only direct WORK_ROOT files
+  # allowed outside the named temporary roots.
+  while IFS= read -r -d '' child; do
+    name="${child##*/}"
+    case "$name" in
+      clone|overlay|uv-cache|tmp|basetemp-*|pytest-*|pytest-of-*) continue ;;
+      mutant-*|*.log|*.json|*.diff|*.spec|*.compile|*.xml|*.tsv)
+        artifact_copy_file "$child" "harness/$name" "$inventory" harness harness || return 1
+        ;;
+      *)
+        echo "unclassified WORK_ROOT artifact: $name" >&2
+        return 1
+        ;;
+    esac
+  done < <(find "$WORK_ROOT" -mindepth 1 -maxdepth 1 -print0)
+}
+
+collect_full_suite_artifacts() {
+  local inventory="$RUN_ROOT/artifacts/.INVENTORY.sha256.tmp"
+  local metadata="$RUN_ROOT/artifacts/.artifact-inventory.tsv.tmp"
+  local status_file="$RUN_ROOT/evidence/artifacts-status.txt"
+  local size_file="$RUN_ROOT/evidence/artifacts-size.txt"
+  ARTIFACT_FILE_COUNT=0
+  ARTIFACT_BYTES=0
+  [[ ! -e "$RUN_ROOT/artifacts/INVENTORY.sha256" ]] || return 1
+  [[ ! -e "$RUN_ROOT/artifacts/artifact-inventory.tsv" ]] || return 1
+  assert_write_path "$RUN_ROOT/artifacts" || return 1
+  mkdir -p -- "$RUN_ROOT/artifacts" || return 1
+  assert_write_path "$inventory" || return 1
+  assert_write_path "$metadata" || return 1
+  : > "$inventory" || return 1
+  printf 'source_class\tsource_path\tarm\tretained_path\tbytes\tsha256\tproducer\n' > "$metadata" || return 1
+  ARTIFACTS_METADATA="$metadata"
+  artifact_copy_work_allowlist "$inventory" || return 1
+  artifact_copy_clone_deltas "$inventory" || return 1
+  mv -- "$inventory" "$RUN_ROOT/artifacts/INVENTORY.sha256" || return 1
+  mv -- "$metadata" "$RUN_ROOT/artifacts/artifact-inventory.tsv" || return 1
+  assert_write_path "$size_file" || return 1
+  printf 'artifact_file_count=%s artifact_bytes=%s\n' "$ARTIFACT_FILE_COUNT" "$ARTIFACT_BYTES" > "$size_file" || return 1
+  printf 'ARTIFACTS_OK\n' > "$status_file" || return 1
+}
+
 cleanup() {
   local rc=$?
   set +e
   printf 'DRIVER_EXIT=%s\n' "$rc" > "$RUN_ROOT/evidence/driver-exit.txt"
   date -u +%FT%TZ > "$RUN_ROOT/evidence/driver-end-utc.txt"
+  if [[ "$MODE" == measure && "$FULL_SUITE" == 1 ]]; then
+    artifact_error=""
+    collect_full_suite_artifacts || artifact_error="collection failed (rc=$?)"
+    if [[ -n "$artifact_error" ]]; then
+      printf 'ARTIFACTS_FAILED reason=%s\n' "$artifact_error" > "$RUN_ROOT/evidence/artifacts-status.txt"
+    fi
+  fi
   [[ "$WORK_ROOT" == "/scratch/$USER/$SLURM_JOB_ID" ]] && rm -rf -- "$WORK_ROOT"
   exit "$rc"
 }
