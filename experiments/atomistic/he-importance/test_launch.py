@@ -2027,7 +2027,11 @@ def test_launcher_refuses_source_row_mismatch_before_runner_or_write(
 ) -> None:
     """An unqualified restore request is refused at both launcher entry points."""
 
-    source, mismatched_config, _ = _qualified_o1_row_pair(tmp_path)
+    source, _, source_config = _qualified_o1_row_pair(tmp_path)
+    mismatched_config = OmegaConf.create(
+        OmegaConf.to_container(source_config, resolve=False)
+    )
+    mismatched_config["runner"]["optimizer"]["lr"] += 0.01
     monkeypatch.setattr(
         launch._TRAIN_CONFIG,
         "resolve_train_config",
