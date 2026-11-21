@@ -1826,7 +1826,7 @@ class DirectoryStore:
         # ReadyGroupV2 validates that plan member IDs equal the task records.
         members = {member.task_id for member in group.members}
         if isinstance(group, ReadyGroupV2):
-            manifest_group_id = group.identity
+            manifest_group_id = group.group_id.value
         else:
             manifest_group_id = group.group_id
         if not os.path.lexists(self.root):

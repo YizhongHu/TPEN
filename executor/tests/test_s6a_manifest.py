@@ -27,15 +27,15 @@ MUTANTS = (
     (
         "v2-manifest-group-id-projection",
         MODULE_NAME,
-        "manifest_group_id = group.identity",
         "manifest_group_id = group.group_id.value",
+        "manifest_group_id = group.identity",
         "test_v2_manifest_rebuilds_attempts_segments_and_admissions",
     ),
     (
         "v1-routed-through-v2-branch",
         MODULE_NAME,
-        "if isinstance(group, ReadyGroupV2):\n            manifest_group_id = group.identity",
-        "if True:\n            manifest_group_id = group.identity",
+        "if isinstance(group, ReadyGroupV2):\n            manifest_group_id = group.group_id.value",
+        "if True:\n            manifest_group_id = group.group_id.value",
         "test_v1_manifest_path_keeps_legacy_encoding",
     ),
 )
