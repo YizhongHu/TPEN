@@ -64,6 +64,8 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
         self.boundary = boundary
         self.records: dict[str, dict[str, Any]] = {}
         self._last_state: dict[str, Any] | None = None
+        self._runner: Any = None
+        self._optimizer: Any = None
 
     def handle_occurrence(self, occurrence, context, state=None) -> None:
         event = occurrence.event
@@ -81,10 +83,16 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
                 self.records["boundary"] = self._snapshot(state, None, context)
 
     def _snapshot(self, state: TrainerState, report: object | None, context: object) -> dict[str, Any]:
-        model = state.model
-        optimizer = state.optimizer
-        trainer = state.trainer
-        sampler = state.sampler
+        if state is None:
+            model = self._runner.model
+            optimizer = self._optimizer
+            trainer = self._runner.trainer
+            sampler = self._runner.sampler
+        else:
+            model = state.model
+            optimizer = state.optimizer
+            trainer = state.trainer
+            sampler = state.sampler
         process_rng = (random.getstate(), np.random.get_state())
         try:
             import torch
@@ -129,6 +137,20 @@ def _config(path: Path, root: Path, run_id: str) -> None:
 def _child(action: str, config_path: str, record_path: str, checkpoint_path: str | None = None) -> None:
     cfg = OmegaConf.load(config_path)
     observer = _BoundaryReadback(record_path, PREFIX)
+    import tpen.runner.train as train_module
+    original_make_optimizer = train_module.make_optimizer
+    original_train_run = train_module.Train.run
+
+    def capture_optimizer(*args, **kwargs):
+        observer._optimizer = original_make_optimizer(*args, **kwargs)
+        return observer._optimizer
+
+    def capture_runner(runner, context):
+        observer._runner = runner
+        return original_train_run(runner, context)
+
+    train_module.make_optimizer = capture_optimizer
+    train_module.Train.run = capture_runner
     callbacks = [observer]
     request = None
     if action == "prefix":
