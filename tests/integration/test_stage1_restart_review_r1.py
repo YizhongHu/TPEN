@@ -680,8 +680,9 @@ def test_crashed_replacement_requires_fresh_approval_scope(tmp_path: Path) -> No
             run=lambda *_args, **_kwargs: stale_calls.append(True) or 0,
             run_dir=run_dir, takeover=approval,
         )
-    assert stale_error.value.cause is RestartCause.TAKEOVER_APPROVAL_SCOPE_MISMATCH
+    assert "predecessor_content_id" in str(stale_error.value)
     assert stale_calls == []
+    assert not (run_dir / "attempts" / "attempt-000002.json").exists()
 
     replacement = select_restart(
         cfg=_attempt_cfg(row, system), row=row, run_dir=run_dir,
@@ -704,6 +705,87 @@ def test_crashed_replacement_requires_fresh_approval_scope(tmp_path: Path) -> No
         run=lambda _cfg, **_kwargs: (
             fresh_calls.append(True)
             or _publish(run_dir, step=3000)
+            or (run_dir / "status.json").write_text(
+                json.dumps({"status": "planned_yield"}) + "\n", encoding="utf-8"
+            )
+            or 0
+        ),
+        run_dir=run_dir, takeover=fresh_approval,
+    )
+    assert fresh_calls == [True]
+    assert result.outcome == "planned_yield"
+
+
+@pytest.mark.integration
+def test_crashed_unpublished_replacement_requires_fresh_approval_scope(
+    tmp_path: Path,
+) -> None:
+    """A crashed replacement without a publication needs a fresh lease approval."""
+
+    system = "he"
+    row = _row(system, tmp_path)
+    config_path = CONFIG_ROOT / system / "train.yaml"
+    run_dir = resolve_run_dir(row)
+    with pytest.raises(SystemExit):
+        execute_restart(
+            cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
+            run=lambda _cfg, **_kwargs: (
+                _publish(run_dir, step=1000) or (_ for _ in ()).throw(SystemExit(17))
+            ),
+            run_dir=run_dir,
+        )
+
+    selected = select_restart(cfg=_attempt_cfg(row, system), row=row, run_dir=run_dir)
+    assert selected.predecessor is not None
+    approval = RestartApproval(
+        predecessor_content_id=selected.predecessor.content_id,
+        terminal_pbs_proof="pbs-terminal-approval",
+        quiescent=True,
+        adopted_budget="budget-replacement-1",
+        lineage_id=row["row_id"],
+        config_identity=row["config_sha256"],
+        overlay_identity="none",
+        target_iterations=row["updates"],
+        superseded_attempt_keys=("attempt-000000.json",),
+    )
+    with pytest.raises(SystemExit):
+        execute_restart(
+            cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
+            run=lambda *_args, **_kwargs: (_ for _ in ()).throw(SystemExit(18)),
+            run_dir=run_dir, takeover=approval,
+        )
+
+    attempts = run_dir / "attempts"
+    assert (attempts / "attempt-000001.json").is_file()
+    assert not (attempts / "attempt-000001.outcome.json").exists()
+    stale_calls: list[bool] = []
+    with pytest.raises(RestartRefusal) as stale_error:
+        execute_restart(
+            cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
+            run=lambda *_args, **_kwargs: stale_calls.append(True) or 0,
+            run_dir=run_dir, takeover=approval,
+        )
+    assert stale_error.value.cause is RestartCause.TAKEOVER_APPROVAL_SCOPE_MISMATCH
+    assert stale_calls == []
+    assert not (attempts / "attempt-000002.json").exists()
+
+    fresh_approval = RestartApproval(
+        predecessor_content_id=selected.predecessor.content_id,
+        terminal_pbs_proof="pbs-terminal-approval-2",
+        quiescent=True,
+        adopted_budget="budget-replacement-2",
+        lineage_id=row["row_id"],
+        config_identity=row["config_sha256"],
+        overlay_identity="none",
+        target_iterations=row["updates"],
+        superseded_attempt_keys=("attempt-000001.json",),
+    )
+    fresh_calls: list[bool] = []
+    result = execute_restart(
+        cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
+        run=lambda _cfg, **_kwargs: (
+            fresh_calls.append(True)
+            or _publish(run_dir, step=2000)
             or (run_dir / "status.json").write_text(
                 json.dumps({"status": "planned_yield"}) + "\n", encoding="utf-8"
             )
