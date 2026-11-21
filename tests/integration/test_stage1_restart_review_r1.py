@@ -423,6 +423,107 @@ def test_approved_takeover_releases_abandoned_initial_owner_for_successor(
 
 
 @pytest.mark.integration
+def test_reused_takeover_approval_refuses_while_first_driver_is_live(
+    tmp_path: Path,
+) -> None:
+    """One approved takeover cannot admit a concurrent replacement driver."""
+
+    system = "he"
+    row = _row(system, tmp_path)
+    config_path = CONFIG_ROOT / system / "train.yaml"
+    run_dir = resolve_run_dir(row)
+    attempts = run_dir / "attempts"
+
+    # Create the predecessor publication and a real immutable orphan lease by
+    # letting the initial owner terminate outside execute_restart's Exception
+    # handler.  This is the crash state that requires an approved takeover.
+    with pytest.raises(SystemExit):
+        execute_restart(
+            cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
+            run=lambda _cfg, **_kwargs: (
+                _publish(run_dir, step=1000) or (_ for _ in ()).throw(SystemExit(17))
+            ),
+            run_dir=run_dir,
+        )
+    assert (attempts / "attempt-000000.json").is_file()
+    assert not (attempts / "attempt-000000.outcome.json").exists()
+
+    selected = select_restart(
+        cfg=_attempt_cfg(row, system), row=row, run_dir=run_dir,
+    )
+    assert selected.predecessor is not None
+    approval = RestartApproval(
+        predecessor_content_id=selected.predecessor.content_id,
+        terminal_pbs_proof="pbs-terminal-approval",
+        quiescent=True,
+        adopted_budget="budget-replacement-1",
+        lineage_id=row["row_id"],
+        config_identity=row["config_sha256"],
+        overlay_identity="none",
+        target_iterations=row["updates"],
+    )
+
+    first_entered = Event()
+    release_first = Event()
+    first_errors: list[BaseException] = []
+    first_results: list[object] = []
+    second_calls: list[object] = []
+
+    def first_driver(_cfg, **_kwargs):
+        first_entered.set()
+        assert release_first.wait(timeout=10), "first driver was not released"
+        _publish(run_dir, step=2000)
+        (run_dir / "status.json").write_text(
+            json.dumps({"status": "planned_yield"}) + "\n", encoding="utf-8"
+        )
+        return 0
+
+    def first_attempt() -> None:
+        try:
+            first_results.append(execute_restart(
+                cfg=_attempt_cfg(row, system), row=row,
+                config_path=config_path, run=first_driver,
+                run_dir=run_dir, takeover=approval,
+            ))
+        except BaseException as exc:  # pragma: no cover - diagnostic propagation
+            first_errors.append(exc)
+
+    first = Thread(target=first_attempt, name="approved-takeover-owner")
+    first.start()
+    assert first_entered.wait(timeout=10), "first approved driver did not start"
+
+    try:
+        with pytest.raises(
+            RestartRefusal,
+            match="takeover|occupied|lineage|selection",
+        ):
+            execute_restart(
+                cfg=_attempt_cfg(row, system), row=row,
+                config_path=config_path,
+                run=lambda *_args, **_kwargs: second_calls.append(True) or 0,
+                run_dir=run_dir, takeover=approval,
+            )
+        assert second_calls == [], (
+            "reused approval entered a second driver; first_alive="
+            f"{first.is_alive()} first_errors={[repr(error) for error in first_errors]}"
+        )
+        assert first.is_alive(), (
+            "first takeover stopped before the duplicate approval was checked; "
+            f"results={first_results} errors={[repr(error) for error in first_errors]}"
+        )
+    finally:
+        release_first.set()
+        first.join(timeout=10)
+
+    assert not first.is_alive(), (
+        "first takeover thread did not finish; "
+        f"results={first_results} errors={[repr(error) for error in first_errors]}"
+    )
+    assert first_errors == []
+    assert len(first_results) == 1
+
+
+@pytest.mark.integration
 def test_fresh_positional_train_resume_is_refused_before_driver_or_lease(
     tmp_path: Path,
 ) -> None:
