@@ -47,7 +47,7 @@ MUTANTS = (
         "submit-blocks-on-future",
         MODULE_NAME,
         "return MemberLaunchResult(True, status=\"submitted\", detail=\"local leaf accepted\"), handle",
-        "handle._future.result(); return MemberLaunchResult(True, status=\"submitted\", detail=\"local leaf accepted\"), handle",
+        "handle._future.result(timeout=6); return MemberLaunchResult(True, status=\"submitted\", detail=\"local leaf accepted\"), handle",
         "test_submit_returns_before_leaf_completion",
     ),
     (
