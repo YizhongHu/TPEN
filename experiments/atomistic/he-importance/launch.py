@@ -169,6 +169,8 @@ class LaunchPlan:
     cell: Any
     config: DictConfig
     topology: Mapping[str, Any]
+    restore_request: object | None = None
+    artifact_destination: object | None = None
 
 
 def _has_buffer_capability(value: object) -> bool:
@@ -487,6 +489,7 @@ def prepare_train_launch(
     *,
     overrides: Mapping[str, Any] | Sequence[str] | None = None,
     restore_request: object | None = None,
+    artifact_destination: object | None = None,
 ) -> LaunchPlan:
     """Populate topology and resolve one source row through L1.
 
@@ -511,17 +514,49 @@ def prepare_train_launch(
         If the HI inventory cannot be validated while constructing the refusal.
     """
 
-    refuse_hi_continuation(restore_request)
-    facts = execution_topology_facts(topology) if topology is not None else {}
-    cell = populate_execution_topology(source, facts)
+    try:
+        facts = execution_topology_facts(topology) if topology is not None else {}
+        cell = populate_execution_topology(source, facts)
+    except Exception as error:
+        if restore_request is not None:
+            raise HIContinuationRefusal(f"continuation admission failed: {error}") from error
+        raise
     # Preserve the default call shape for existing callers and test doubles.
     if overrides is None:
-        config = _TRAIN_CONFIG.resolve_train_config(cell)
+        try:
+            config = _TRAIN_CONFIG.resolve_train_config(cell)
+        except Exception as error:
+            if restore_request is not None:
+                raise HIContinuationRefusal(
+                    f"continuation admission failed: {error}"
+                ) from error
+            raise
     else:
         override_items = _TRAIN_CONFIG._override_items(overrides)
-        config = _TRAIN_CONFIG.resolve_train_config(cell, overrides=overrides)
+        try:
+            config = _TRAIN_CONFIG.resolve_train_config(cell, overrides=overrides)
+        except Exception as error:
+            if restore_request is not None:
+                raise HIContinuationRefusal(
+                    f"continuation admission failed: {error}"
+                ) from error
+            raise
         _validate_override_topology_agreement(config, facts, override_items)
-    return LaunchPlan(cell=cell, config=config, topology=cell.manifest[_STAGE_API.TOPOLOGY_KEY])
+    if restore_request is not None:
+        inventory = import_module("experiments.atomistic.he-importance.mutable_state_inventory")
+        try:
+            inventory.validate_hi_continuation_admission(cell, config)
+        except Exception as error:
+            raise HIContinuationRefusal(
+                f"continuation admission failed: {error}"
+            ) from error
+    return LaunchPlan(
+        cell=cell,
+        config=config,
+        topology=cell.manifest[_STAGE_API.TOPOLOGY_KEY],
+        restore_request=restore_request,
+        artifact_destination=artifact_destination,
+    )
 
 
 def _exit_code(result: object) -> int:
@@ -540,6 +575,7 @@ def launch_train(
     runtime_callbacks: Sequence[object] = (),
     overrides: Mapping[str, Any] | Sequence[str] | None = None,
     restore_request: object | None = None,
+    artifact_destination: object | None = None,
 ) -> int:
     """Resolve one topology-bound row and execute TPEN's production runner.
 
@@ -582,13 +618,18 @@ def launch_train(
         If ``restore_request`` is not ``None``.
     """
 
-    refuse_hi_continuation(restore_request)
-    facts = execution_topology_facts(topology) if topology is not None else {}
+    try:
+        facts = execution_topology_facts(topology) if topology is not None else {}
+    except Exception as error:
+        if restore_request is not None:
+            raise HIContinuationRefusal(f"continuation admission failed: {error}") from error
+        raise
     plan = prepare_train_launch(
         source,
         facts,
         overrides=overrides,
         restore_request=restore_request,
+        artifact_destination=artifact_destination,
     )
     if topology is not None:
         # Topology is caller-open, so config-only runners retain extra facts.
@@ -604,6 +645,8 @@ def launch_train(
                 plan.config,
                 topology=facts,
                 runtime_callbacks=runtime_callbacks,
+                restore_request=restore_request,
+                artifact_destination=artifact_destination,
             )
         )
 
@@ -627,6 +670,21 @@ def launch_train(
         or parameter.kind is inspect.Parameter.VAR_KEYWORD
         for parameter in parameters
     )
+    def accepts_operational_keyword(name: str) -> bool:
+        return any(
+            parameter.kind
+            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+            and parameter.name == name
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+
+    for name, value in (
+        ("restore_request", restore_request),
+        ("artifact_destination", artifact_destination),
+    ):
+        if value is not None and not accepts_operational_keyword(name):
+            raise LaunchValidationError(f"runner cannot accept non-empty {name}")
     if runtime_callbacks and not accepts_runtime_callbacks:
         raise LaunchValidationError(
             "runner cannot accept non-empty runtime_callbacks"
@@ -646,6 +704,10 @@ def launch_train(
     )
     if has_keyword_runtime_callbacks or (accepts_runtime_callbacks and runtime_callbacks):
         kwargs["runtime_callbacks"] = runtime_callbacks
+    if restore_request is not None:
+        kwargs["restore_request"] = restore_request
+    if artifact_destination is not None:
+        kwargs["artifact_destination"] = artifact_destination
     return _exit_code(runner(plan.config, **kwargs))
 
 
