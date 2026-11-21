@@ -55,6 +55,10 @@ def main() -> int:
     parser.add_argument("--kind", choices=("smoke", "train"), required=True)
     parser.add_argument("--overlay")
     parser.add_argument("--overlay-sha256")
+    parser.add_argument(
+        "--restart", action="store_true",
+        help="run the admitted row through the Stage-1 restart protocol",
+    )
     args = parser.parse_args()
     config_path = resolve_config_path(args.config)
     row = validate_gateway_binding(
@@ -88,6 +92,13 @@ def main() -> int:
             raise ValueError("Hooke science runtime and sampler seeds must be distinct")
     prepare_initial_checkpoint_config(cfg)
     validate_resolved_train_config(cfg, row, base_config=base_cfg)
+    if args.restart:
+        from experiments.atomistic.stage1.restart import execute_restart
+
+        result = execute_restart(
+            cfg=cfg, row=row, config_path=config_path, command="stage1 restart",
+        )
+        return 0 if result.outcome == "completed" else 1
     return run_from_config(cfg, config_path=str(config_path), command="stage1 train")
 
 

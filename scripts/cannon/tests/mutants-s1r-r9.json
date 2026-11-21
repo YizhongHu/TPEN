@@ -1,0 +1,25 @@
+{
+  "mutants": [
+    {
+      "id": "sequence-claim-retries-next",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "raise RestartRefusal(\n            f\"lineage claim lost: occupied lineage attempt sequence {attempt_key}\",\n            cause=RestartCause.LINEAGE_CLAIM_LOST,\n        ) from exc",
+      "new": "attempt_key = f\"attempt-{number + 1:06d}\"\n        lease_path = attempts / f\"{attempt_key}.json\"\n        create_json_receipt(lease_path, lease_payload)\n        return attempt_key, lease_path",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart_review_r1.py::test_lineage_claim_collision_refuses_loser_without_orphan_lease"
+    },
+    {
+      "id": "sequence-claim-collision-raw",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "raise RestartRefusal(\n            f\"lineage claim lost: occupied lineage attempt sequence {attempt_key}\",\n            cause=RestartCause.LINEAGE_CLAIM_LOST,\n        ) from exc",
+      "new": "raise exc",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart_review_r1.py::test_lineage_claim_collision_refuses_loser_without_orphan_lease"
+    },
+    {
+      "id": "sequence-claim-content-key",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "attempt_key = f\"attempt-{number:06d}\"",
+      "new": "attempt_key = selection.content_id",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart_review_r1.py::test_lineage_claim_serializes_stale_and_current_selections"
+    }
+  ]
+}
