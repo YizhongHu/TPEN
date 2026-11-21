@@ -484,7 +484,22 @@ def _validate_override_topology_agreement(
 
 
 def _caller_override_has_interpolation(overrides: object) -> bool:
-    """Detect interpolation syntax without constructing or resolving a config."""
+    """Detect interpolation syntax without constructing or resolving a config.
+
+    Parameters
+    ----------
+    overrides : object
+        Caller-provided mapping, sequence, or scalar override representation.
+
+    Returns
+    -------
+    bool
+        Whether the unresolved override representation contains ``${``.
+    """
+
+    if OmegaConf.is_config(overrides):
+        # DictConfig/ListConfig access resolves values, so inspect a plain unresolved copy.
+        overrides = OmegaConf.to_container(overrides, resolve=False)
 
     if type(overrides) is str:
         return str.__contains__(overrides, "${")

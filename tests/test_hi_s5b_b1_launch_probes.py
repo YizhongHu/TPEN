@@ -296,3 +296,53 @@ def test_default_runner_path_preserves_operational_kwargs_topology_and_callbacks
     assert received[0]["artifact_destination"] is artifact_destination
     assert received[0]["runtime_callbacks"] is runtime_callbacks
     assert received[0]["topology"] == _topology()
+
+
+@pytest.mark.parametrize("api", ["prepare", "launch"])
+@pytest.mark.parametrize("mapping_kind", ["plain", "dictconfig"])
+def test_mapping_override_refuses_before_resolver(
+    tmp_path: Path, api: str, mapping_kind: str
+) -> None:
+    """Ordinary Mapping inputs must be inspected without executing resolvers."""
+
+    cell = _o1_adam_rows(tmp_path)["O-raw"]
+    resolver_calls: list[object] = []
+    runner_calls: list[object] = []
+
+    OmegaConf.register_new_resolver(
+        "delta_b1",
+        lambda: resolver_calls.append(object()) or "float64",
+        replace=True,
+    )
+    overrides: object = {"runtime.dtype": "${delta_b1:}"}
+    if mapping_kind == "dictconfig":
+        overrides = OmegaConf.create(overrides)
+    outcome: BaseException | None = None
+    try:
+        try:
+            if api == "prepare":
+                launch.prepare_train_launch(
+                    cell,
+                    _topology(),
+                    overrides=overrides,
+                    restore_request={"predecessor": tmp_path / "predecessor"},
+                )
+            else:
+                launch.launch_train(
+                    cell,
+                    _topology(),
+                    overrides=overrides,
+                    restore_request={"predecessor": tmp_path / "predecessor"},
+                    runner=lambda config, **kwargs: runner_calls.append(
+                        (config, kwargs)
+                    )
+                    or 0,
+                )
+        except BaseException as error:
+            outcome = error
+    finally:
+        OmegaConf.clear_resolver("delta_b1")
+
+    assert resolver_calls == []
+    assert isinstance(outcome, launch.HIContinuationRefusal)
+    assert runner_calls == []
