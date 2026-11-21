@@ -672,9 +672,11 @@ def launch_train(
     )
     def accepts_operational_keyword(name: str) -> bool:
         return any(
-            parameter.kind
-            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-            and parameter.name == name
+            (
+                parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+                or parameter.kind is inspect.Parameter.KEYWORD_ONLY
+            )
+            and str.__eq__(parameter.name, name) is True
             or parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters
         )
