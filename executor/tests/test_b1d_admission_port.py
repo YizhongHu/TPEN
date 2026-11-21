@@ -245,8 +245,8 @@ MUTANTS = (
     (
         "catch-only-runtime-error",
         "recovery.py",
-        'except Exception:\n            # Any evaluator or decoder failure is unavailable.\n            return None  # unavailable',
-        'except RuntimeError:\n            # Any evaluator or decoder failure is unavailable.\n            return None  # unavailable',
+        'except Exception:\n            # Any evaluator or decoder failure is unavailable evidence.\n            return None  # unavailable',
+        'except RuntimeError:\n            # Any evaluator or decoder failure is unavailable evidence.\n            return None  # unavailable',
         "test_evaluator_exceptions_are_unavailable",
     ),
     (
