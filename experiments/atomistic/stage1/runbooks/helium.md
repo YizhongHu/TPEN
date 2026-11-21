@@ -17,15 +17,16 @@ approves the nonfree GPU run (TO note
 
 For the fixed two-electron helium Hamiltonian (one `Z=2` nucleus at the origin,
 one up and one down electron), what energy and local-energy variance are
-obtained by three independently seeded 50,000-update TPEN lineages when each
-terminal checkpoint is evaluated by four fresh model-only streams?
+obtained by three independently seeded 100,000-update TPEN lineages when the
+roster-B checkpoints are each evaluated by four fresh model-only streams?
 
 The reference is `-2.903724377034119598 Ha`, the infinite-nuclear-mass,
 nonrelativistic value in `experiments/baselines/systems.yaml` (`he_atom`),
 transcribed there from Aznabaev, Bekbaev and Korobov, *Nonrelativistic energy
 levels of helium atom*, arXiv:1810.11288, Table 3.  It is a comparison target,
 not a training input.  The planned statistic for each lineage is the mean of
-the four stream means at update 50,000, with their spread reported.  The
+the four stream means at each selected checkpoint, with the terminal 100,000
+checkpoint as the sole primary and its spread reported.  The
 collector's draw-axis uncertainty assumes retained draws are independent after
 the configured burn-in/stride; it is not a replacement for between-lineage
 variation.
@@ -39,21 +40,30 @@ streams is evidence of an invalid measurement, not a scientific result.
 ## Contract and selection rule
 
 - Train exactly lineages `0,1,2` with frozen lineage seeds `1 2 3` (the
-  planner maps each to a distinct Torch seed), 4,096 walkers, 50,000 updates,
-  and one checkpoint at `50000`.
-- Select only the terminal checkpoint, mechanically: a lineage is selected iff
-  its run `status.json` says `completed` and
-  `checkpoints/step_050000/` is a complete checkpoint (`COMPLETE` marker and
-  `manifest.json`) whose `model.pt` SHA-256 is recorded.  No energy-based or
-  visually chosen checkpoint is allowed.
+  planner maps each to a distinct Torch seed), 4,096 walkers, 100,000 updates,
+  and all 101 checkpoints at 1,000-update cadence.
+- Select roster B mechanically: `0, 1000, 2000, 4000, 8000, 16000, 25000,
+  40000, 60000, 80000, 100000`. A lineage/checkpoint is selected iff its run
+  `status.json` says `completed` and the corresponding checkpoint directory is
+  complete (`COMPLETE` marker and `manifest.json`) whose `model.pt` SHA-256 is
+  recorded. No energy-based or visually chosen checkpoint is allowed.
 - Run streams `0,1,2,3` separately for every selected checkpoint: each is a
-  fresh 4,096-walker, 256-draw strict `model_only` restore.  This is 12 eval
-  rows and 12,582,912 retained local-energy rows across the experiment.
+  fresh 4,096-walker, 256-draw strict `model_only` restore. This is 132 eval
+  rows and 33,554,432 retained local-energy rows across the experiment.
 - Collection rejects any source/config/checkpoint/physical-system identity
   mismatch, non-finite value, incomplete `4096 x 256` grid, non-checkpoint
   provenance, a phase-2 row not bound to its phase-1 train row, or an
-  incomplete four-stream set.  Preserve all logs, manifests, rows, rendered
+  incomplete four-stream set. Preserve all logs, manifests, rows, rendered
   scripts, status/config snapshots, records, and the collection JSON.
+
+Phase-1 retention and phase-2 selection are distinct: the 101 retained train
+checkpoints are the source set, while roster B is the exact phase-2 subset.
+Collection checks all 132 coordinates before reading run output and refuses a
+missing checkpoint group, duplicate/gapped stream, or 128/131-row variant.
+Every row retains strict source/config/checkpoint provenance and its phase-1
+manifest/train join. This semantic contract does not approve paid capacity or
+storage expansion; executable PBS/fan-out command blocks below remain the
+launch-redesign consumer boundary.
 
 ## Identities and paths
 

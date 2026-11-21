@@ -17,7 +17,12 @@ for this override to be accepted by Hydra.
 
 Planning is two-phase: phase 1 may select systems and emits smoke/train rows;
 phase 2 consumes that manifest and binds checkpoint digests to eval rows without
-replanning seeds or source/config identity. `config_sha256` is computed by the
+replanning seeds or source/config identity. For He/H2, phase 1 retains every
+0-to-100,000 update at 1,000-update cadence, while phase 2 selects only roster
+B (`0, 1000, 2000, 4000, 8000, 16000, 25000, 40000, 60000, 80000, 100000`).
+That is 3 lineages x 11 checkpoints x 4 streams = 132 eval rows per system,
+plus one smoke and three train rows (136 total); selection never replaces the
+full phase-1 retention set. `config_sha256` is computed by the
 planner under `stage1-config-v1`: sorted `configs/<system>/{train,eval}.yaml`
 paths and their canonical bytes are hashed. The rule id is recorded in each row;
 GPU intent is recorded as a row `device` only when explicitly requested.
@@ -37,6 +42,16 @@ phase-1 train rows' declared `checkpoint_steps`. Two-phase CLI modes always
 compute config identity from this checkout; a supplied legacy scalar is only a
 comparison value. The one-shot compatibility mode may still consume the old
 scalar/map inputs.
+
+He/H2 roster-B rows carry the versioned selection id `he-h2-b-v1`. Collection
+checks the complete coordinate multiset before opening any evaluation output:
+missing checkpoint groups, duplicate or gapped streams, and 128/131-row
+variants are invalid. Every accepted row retains the phase-1 manifest and
+train-row joins, source/config identity, and checkpoint digest. The terminal
+100,000 checkpoint is the sole primary; the other roster-B checkpoints are
+comparative evaluations. This semantic contract does not approve paid
+capacity, storage expansion, or a release, and the executable launch/PBS
+consumer blocks remain owned by the launch-redesign follow-up.
 
 Each evaluation config builds one `SystemDescriptor` from its instantiated
 `ParticleSpec` and `hamiltonian_terms`, and passes that descriptor plus an
@@ -73,7 +88,8 @@ training updates.
 | Hooke-1e readout | h-v2: Pfaffian readout `trainable: true` | `trainable: false` in train and eval | Deliberate one-electron Stage-1 default; the Gaussian confinement remains the fixed envelope and the train/eval model stays strict-restore compatible. |
 | Hooke-2e envelope and Hamiltonian | `experiments/hooke/tpen-pair-v1/configs/train.yaml`: Gaussian coefficient 0.25, electron-electron cusp, kinetic + harmonic trap + electron-electron interaction | Nucleus-free v2 descriptor with fixed GaussianConfinement coefficient 0.25, fixed-default ElectronElectronCusp, and `omega: 0.5` | Preserve the approved two-electron singlet physics through the current system-context/dispatch route; no legacy atomic placeholder or stale pair launcher is used. |
 | Hooke-1e eval sampler | h-v2: 1024 walkers, burn-in 1000, steps 20 | 4096 walkers, burn-in 100, steps 10 | Use the shared Stage-1 evaluation budget and cadence; this is a protocol default, not a claim that the source burn-in study transfers unchanged. |
-| He eval sampler | he-v1: 4096 walkers, burn-in 100, steps 20 | 4096 walkers, burn-in 100, steps 10 | Keep the shared Stage-1 cadence; the he-v1 stride-20 tie-break is not silently carried into this protocol. |
+| He eval sampler | he-v1: 4096 walkers, burn-in 100, steps 20 | 4096 walkers, burn-in 1000, steps 20 | Bind the approved He/H2 burn-in and stride to the semantic evaluation contract. |
+| H2 eval sampler | h2-v1: 4096 walkers, burn-in 100, steps 20 | 4096 walkers, burn-in 1000, steps 20 | Keep He/H2 evaluation leaves identical for comparable four-stream rows. |
 | H2 model width | h2-v1: 4 output / 16 hidden channels | 4 output / 16 hidden channels | No width change is made; this row documents the retained source value and corrects the prior “width reduction” wording. |
 | H2 train/eval walkers | h2-v1: 128 train / 1024 eval | 256 train / 4096 eval | Use the shared Stage-1 train/eval walker defaults across all four systems. |
 | Hooke-1e train observability | h-v2: `DataIntegrity`/`GradientStats` every 100 updates; JSONL logger | Both callbacks and logger omitted | Keep the science-default config small and portable; Stage-1 collection relies on its run/record provenance contract. |

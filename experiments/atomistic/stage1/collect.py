@@ -18,10 +18,12 @@ from experiments.atomistic.stage1.protocol import (
     LEGACY_CONFIG_IDENTITY_RULE,
     _validate_config_identity_for_row,
     HOOKE_SCIENCE_PROFILE,
+    _is_he_h2_production_phase,
     manifest_hash,
     ProtocolError,
     resolve_config_path,
     resolve_run_dir,
+    validate_he_h2_eval_grid,
     validate_hooke_eval_grid,
 )
 
@@ -131,7 +133,20 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
     expected_systems = tuple(dict.fromkeys(
         str(row["system"]) for row in phase1_hooke_train_rows
     )) if hooke_science else None
+    phase1_he_h2_train_rows = [
+        row for row in phase1_rows
+        if row.get("kind") == "train" and row.get("system") in {"he", "h2"}
+    ]
+    he_h2_science = _is_he_h2_production_phase(phase1_rows)
+    he_h2_systems = tuple(dict.fromkeys(
+        str(row["system"]) for row in phase1_he_h2_train_rows
+    )) if he_h2_science else None
     try:
+        validate_he_h2_eval_grid(
+            eval_rows,
+            expected_systems=he_h2_systems,
+            expected_profile="B" if he_h2_science else None,
+        )
         validate_hooke_eval_grid(
             eval_rows,
             expected_systems=expected_systems,
