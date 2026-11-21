@@ -97,6 +97,13 @@ from .recovery import (
     select_recovery,
     train_resume_load_overlay,
 )
+from .core_admission import (
+    CORE_ADMISSION_SCHEMA,
+    CoreAdmissionContextV1,
+    core_admission_digest,
+    encode_core_admission,
+    evaluate_core_admission,
+)
 from .native_profile import (
     SUPPORTED_CALLBACK_TARGETS,
     SUPPORTED_LOGGER_TARGETS,
