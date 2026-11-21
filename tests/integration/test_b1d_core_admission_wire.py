@@ -234,6 +234,13 @@ MUTANTS = (
         "if False:",
         "test_executor_rejects_core_quiescence_claim",
     ),
+    (
+        "controller-ignores-port",
+        "executor/src/tpen_executor/lifecycle/controller.py",
+        "verdict = admission_port.admit(item)",
+        "verdict = item.core_verdict",
+        "test_controller_unknown_mapping_overrides_prefilled_successor",
+    ),
 )
 
 
@@ -470,6 +477,9 @@ def test_mutant_rows_are_well_formed_and_have_named_killers() -> None:
     target_sources = {
         "tpen/execution/core_admission.py": (root / "tpen/execution/core_admission.py").read_text(),
         "executor/src/tpen_executor/recovery.py": (root / "executor/src/tpen_executor/recovery.py").read_text(),
+        "executor/src/tpen_executor/lifecycle/controller.py": (
+            root / "executor/src/tpen_executor/lifecycle/controller.py"
+        ).read_text(),
     }
     source = Path(__file__).read_text()
     for name, target, before, after, killer in MUTANTS:
