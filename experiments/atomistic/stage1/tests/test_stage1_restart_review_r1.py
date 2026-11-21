@@ -133,6 +133,7 @@ def test_lineage_claim_serializes_stale_and_current_selections(
     first_selected = Event()
     release_first = Event()
     stale_claimed = Event()
+    stale_finished = Event()
     allow_stale_revalidation = Event()
     current_claimed = Event()
     scans = Barrier(2)
@@ -173,8 +174,8 @@ def test_lineage_claim_serializes_stale_and_current_selections(
 
     def deterministic_claim(**kwargs):
         if current_thread().name == "current-contender":
-            assert stale_claimed.wait(timeout=10), (
-                "current contender did not receive the stale claim barrier"
+            assert stale_finished.wait(timeout=10), (
+                "current contender did not receive the stale outcome barrier"
             )
         claimed = original_claim(**kwargs)
         if current_thread().name == "stale-contender":
@@ -215,6 +216,8 @@ def test_lineage_claim_serializes_stale_and_current_selections(
         except BaseException as exc:  # pragma: no cover - diagnostic propagation
             errors.append(exc)
         finally:
+            if name == "stale":
+                stale_finished.set()
             contender_done[name].set()
 
     publisher_done = Event()
@@ -253,11 +256,15 @@ def test_lineage_claim_serializes_stale_and_current_selections(
         "stale contender did not complete its exclusive claim; "
         f"alive={stale.is_alive()}"
     )
+    allow_stale_revalidation.set()
+    assert stale_finished.wait(timeout=10), (
+        "stale contender did not publish its refusal outcome; "
+        f"alive={stale.is_alive()}"
+    )
     assert current_claimed.wait(timeout=10), (
         "current contender did not complete its exclusive claim; "
         f"alive={current.is_alive()}"
     )
-    allow_stale_revalidation.set()
     stale.join(timeout=10)
     current.join(timeout=10)
     assert contender_done["stale"].is_set(), (
