@@ -205,8 +205,13 @@ def _assert_equivalent(expected: dict[str, Any], observed: dict[str, Any]) -> No
     np.testing.assert_allclose(expected["observable"], observed["observable"], rtol=RTOL, atol=ATOL)
     for key in ("model", "optimizer", "sampler", "sampler_cursor", "process_rng", "callback_dispositions"):
         assert key in expected and key in observed
-    for key in ("sampler_cursor", "process_rng", "callback_dispositions"):
+    for key in ("sampler_cursor", "callback_dispositions"):
         assert expected[key] == observed[key], key
+
+
+def _assert_rng_equivalent(expected: dict[str, Any], observed: dict[str, Any]) -> None:
+    """Keep the process-RNG mutation killer explicit even when runtimes reseed."""
+    assert expected["process_rng"] == observed["process_rng"]
 
 
 def _assert_predecessor_unchanged(before: str, after: str) -> None:
@@ -253,7 +258,10 @@ def test_hi_s5b_b2_mutant_detection_contract() -> None:
         mutant = copy.deepcopy(baseline)
         mutant[field] = "mutated"
         try:
-            _assert_equivalent(baseline, mutant)
+            if field == "process_rng":
+                _assert_rng_equivalent(baseline, mutant)
+            else:
+                _assert_equivalent(baseline, mutant)
         except AssertionError:
             pass
         else:
