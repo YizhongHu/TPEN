@@ -481,6 +481,10 @@ def _member_reconciliation(
     if member.start_receipt is None:
         if member.outcome_receipt is None and member.core_verdict is None and member.receipt_digest is None:
             return MemberReconciliationV2(member.task_id, "start_fresh", "no-durable-start", None)
+        if (member.outcome_receipt is None and member.receipt_digest is None
+                and member.core_verdict is not None
+                and member.core_verdict.outcome == "unknown"):
+            return MemberReconciliationV2(member.task_id, "park", "unknown-core-result", None)
         return _park(member, "crossed-or-incomplete-receipt")
     if member.attempt_id is None:
         return _park(member, "missing-attempt-identity")

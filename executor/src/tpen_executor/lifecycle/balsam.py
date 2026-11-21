@@ -238,7 +238,7 @@ class GroupExitContract:
         return cls(data["backend_retry_codes"], data["no_retry_code"])
 
 
-def group_exit_code(outcome: GroupReconciliationV2 | GroupFailure, contract: GroupExitContract) -> int:
+def group_exit_code(outcome: GroupReconciliationV2 | Any, contract: GroupExitContract) -> int:
     """Map authoritative member reconciliation or a failure to process exit.
 
     Success requires *every* member to be preserved completed. Terminal-only
@@ -247,6 +247,9 @@ def group_exit_code(outcome: GroupReconciliationV2 | GroupFailure, contract: Gro
     """
     if not isinstance(contract, GroupExitContract):
         raise TypeError("contract must be GroupExitContract")
+    from .controller import GroupControllerOutcome
+    if isinstance(outcome, GroupControllerOutcome):
+        outcome = outcome.reconciliation
     if isinstance(outcome, GroupReconciliationV2):
         if all(member.action == "preserve_completed" for member in outcome.members):
             return 0
