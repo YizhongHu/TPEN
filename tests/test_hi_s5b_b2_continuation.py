@@ -245,10 +245,13 @@ def test_hi_s5b_b2_three_process_stateful_continuation(tmp_path: Path) -> None:
     prefix = json.loads(prefix_record.read_text())
     restored = json.loads(successor_record.read_text())
     disabled = json.loads(disabled_record.read_text())
-    # The prefix process is the checkpoint producer, so its exact sampler
-    # cursor is the authoritative next-draw witness; the uninterrupted arm
-    # supplies the cross-process float64 observable comparison.
+    # The raw sampler pickle includes non-semantic serialization metadata, so
+    # the exact next-draw witness is the semantic cursor: walker positions and
+    # the sampler-local generator state.  Check both the checkpoint producer
+    # and the uninterrupted arm against the restored successor; comparing only
+    # with the prefix would miss a pre-boundary divergence in the prefix arm.
     _assert_equivalent(prefix["boundary"], restored["training_started"])
+    assert full["boundary"]["sampler_cursor"] == restored["training_started"]["sampler_cursor"]
     np.testing.assert_allclose(full["boundary"]["observable"], restored["training_started"]["observable"], rtol=RTOL, atol=ATOL)
     assert restored["restored"]["trainer"]["max_steps"] == H
     assert disabled["boundary"]["model"] != restored["training_started"]["model"]
