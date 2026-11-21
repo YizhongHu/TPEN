@@ -1,4 +1,4 @@
-"""Cannon-facing restart-chain acceptance for the Stage-1 protocol."""
+"""Restart-chain acceptance for the Stage-1 protocol."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ from tpen.execution.chain_resume import (
 from tpen.run import load_config
 
 
-CONFIG_ROOT = Path(__file__).parents[2] / "experiments" / "atomistic" / "stage1" / "configs"
+CONFIG_ROOT = Path(__file__).parents[1] / "configs"
 
 
 def _row(
@@ -329,12 +329,12 @@ def _run_real_child(payload: dict[str, object]) -> tuple[dict[str, object], Proc
             (
                 "from typeguard import install_import_hook; "
                 "install_import_hook('tpen'); "
-                "from tests.integration.test_stage1_restartable import _real_chain_child; "
+                "from experiments.atomistic.stage1.tests.test_stage1_restartable import _real_chain_child; "
                 "_real_chain_child()"
             ),
             str(argument_path),
         ],
-        cwd=str(Path(__file__).parents[2]),
+        cwd=str(Path(__file__).parents[4]),
         text=True,
         capture_output=True,
         check=False,
@@ -453,7 +453,7 @@ def test_restart_admission_lease_receipt_chain_with_stub_driver(
 
     The checkpoint artifacts are produced by the real core writer so this
     checks publication, typed restore admission, leases, and outcome receipts
-    on Cannon CPU without spending a science budget inside the test harness.
+    on the CPU without spending a science budget inside the test harness.
     The production 100,000-update driver remains the separately authorized
     runbook action; this test never changes that immutable horizon.
     """
@@ -515,7 +515,7 @@ def test_restart_admission_lease_receipt_chain_with_stub_driver(
 @pytest.mark.integration
 @pytest.mark.stage1_real_restart
 @pytest.mark.parametrize("system", ["he", "h2"])
-def test_real_cannon_cpu_restartable_multi_attempt_chain(
+def test_real_multiprocess_cpu_restartable_multi_attempt_chain(
     system: str, tmp_path: Path,
 ) -> None:
     """Run real He/H2 fresh -> published -> distinct-process restore chains.

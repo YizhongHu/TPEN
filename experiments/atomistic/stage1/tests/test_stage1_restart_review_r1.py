@@ -21,7 +21,7 @@ from experiments.atomistic.stage1.protocol import STAGE1_PROTOCOL
 from experiments.toolkit.run_paths import resolve_run_dir
 from tpen.checkpoint import TrainResume, save_checkpoint
 
-from tests.integration.test_stage1_restartable import (
+from experiments.atomistic.stage1.tests.test_stage1_restartable import (
     CONFIG_ROOT,
     _production_cfg,
     _row,

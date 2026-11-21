@@ -5,21 +5,21 @@
       "target": "experiments/atomistic/stage1/restart.py",
       "old": "if active_attempt_keys != approved_attempt_keys:",
       "new": "if False:",
-      "killer": "tests/integration/test_stage1_restart_review_r1.py::test_reused_takeover_approval_refuses_while_first_driver_is_live"
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart_review_r1.py::test_reused_takeover_approval_refuses_while_first_driver_is_live"
     },
     {
       "id": "takeover-post-claim-scope-check-removed",
       "target": "experiments/atomistic/stage1/restart.py",
       "old": "if scope_mismatch:",
       "new": "if False:",
-      "killer": "tests/integration/test_stage1_restart_review_r1.py::test_takeover_approval_scope_revalidated_after_claim"
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart_review_r1.py::test_takeover_approval_scope_revalidated_after_claim"
     },
     {
       "id": "selection-revalidation-skipped",
       "target": "experiments/atomistic/stage1/restart.py",
       "old": "refreshed_selection = select_restart(cfg=cfg, row=row, run_dir=run_dir)",
       "new": "refreshed_selection = selection",
-      "killer": "tests/integration/test_stage1_restart_review_r1.py::test_lineage_claim_serializes_stale_and_current_selections"
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart_review_r1.py::test_lineage_claim_serializes_stale_and_current_selections"
     }
   ]
 }
