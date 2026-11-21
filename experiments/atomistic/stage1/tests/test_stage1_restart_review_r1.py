@@ -133,6 +133,8 @@ def test_lineage_claim_serializes_stale_and_current_selections(
     first_selected = Event()
     release_first = Event()
     stale_claimed = Event()
+    allow_stale_revalidation = Event()
+    current_claimed = Event()
     scans = Barrier(2)
     select_counts: dict[str, int] = {}
     scan_counts: dict[str, int] = {}
@@ -155,6 +157,9 @@ def test_lineage_claim_serializes_stale_and_current_selections(
         elif name == "stale-contender":
             assert selected.predecessor is not None
             assert selected.predecessor.next_iteration == 2000
+            assert allow_stale_revalidation.wait(timeout=10), (
+                "stale contender did not receive the explicit revalidation release"
+            )
             stale_revalidated.set()
         return selected
 
@@ -170,8 +175,11 @@ def test_lineage_claim_serializes_stale_and_current_selections(
         claimed = original_claim(**kwargs)
         if current_thread().name == "stale-contender":
             stale_claimed.set()
+            assert allow_stale_revalidation.wait(timeout=10), (
+                "stale contender did not receive the explicit claim release"
+            )
         elif current_thread().name == "current-contender":
-            assert stale_claimed.wait(timeout=10)
+            current_claimed.set()
         return claimed
 
     monkeypatch.setattr(restart, "select_restart", delayed_select)
@@ -188,6 +196,11 @@ def test_lineage_claim_serializes_stale_and_current_selections(
         )
         return 0
 
+    contender_done: dict[str, Event] = {
+        "stale": Event(),
+        "current": Event(),
+    }
+
     def contender(name: str, cfg: object) -> None:
         try:
             execute_restart(
@@ -197,12 +210,22 @@ def test_lineage_claim_serializes_stale_and_current_selections(
             )
         except BaseException as exc:  # pragma: no cover - diagnostic propagation
             errors.append(exc)
+        finally:
+            contender_done[name].set()
+
+    publisher_done = Event()
+
+    def publish_attempt() -> None:
+        try:
+            execute_restart(
+                cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
+                run=publisher_driver, run_dir=run_dir,
+            )
+        finally:
+            publisher_done.set()
 
     publisher = Thread(
-        target=lambda: execute_restart(
-            cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
-            run=publisher_driver, run_dir=run_dir,
-        ),
+        target=publish_attempt,
         name="publisher",
     )
     publisher.start()
@@ -215,13 +238,32 @@ def test_lineage_claim_serializes_stale_and_current_selections(
     # The publisher completes after the first contender selected step 1000.
     release_publisher.set()
     publisher.join(timeout=10)
-    assert not publisher.is_alive()
+    assert publisher_done.is_set(), (
+        "publisher did not complete after its explicit release; "
+        f"alive={publisher.is_alive()}"
+    )
     current = Thread(target=contender, args=("current", second_cfg), name="current-contender")
     current.start()
     release_first.set()
+    assert stale_claimed.wait(timeout=10), (
+        "stale contender did not complete its exclusive claim; "
+        f"alive={stale.is_alive()}"
+    )
+    assert current_claimed.wait(timeout=10), (
+        "current contender did not complete its exclusive claim; "
+        f"alive={current.is_alive()}"
+    )
+    allow_stale_revalidation.set()
     stale.join(timeout=10)
     current.join(timeout=10)
-    assert not stale.is_alive() and not current.is_alive()
+    assert contender_done["stale"].is_set(), (
+        "stale contender did not report completion; "
+        f"alive={stale.is_alive()}"
+    )
+    assert contender_done["current"].is_set(), (
+        "current contender did not report completion; "
+        f"alive={current.is_alive()}"
+    )
     assert len(driver_calls) <= 1
     assert stale_claimed.is_set()
     assert stale_revalidated.is_set()
