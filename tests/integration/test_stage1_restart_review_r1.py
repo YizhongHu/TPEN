@@ -132,6 +132,7 @@ def test_lineage_claim_serializes_stale_and_current_selections(
     first_selected = Event()
     release_first = Event()
     scans = Barrier(2)
+    scan_counts: dict[str, int] = {}
     driver_calls: list[str] = []
     errors: list[BaseException] = []
     original_select = restart.select_restart
@@ -149,9 +150,9 @@ def test_lineage_claim_serializes_stale_and_current_selections(
 
     def synchronized_scan(attempts: Path):
         paths = original_active(attempts)
-        if current_thread().name in {
-            "stale-contender", "current-contender",
-        }:
+        name = current_thread().name
+        scan_counts[name] = scan_counts.get(name, 0) + 1
+        if name in {"stale-contender", "current-contender"} and scan_counts[name] == 1:
             scans.wait(timeout=10)
         return paths
 

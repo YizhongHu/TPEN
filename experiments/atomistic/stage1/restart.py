@@ -427,7 +427,7 @@ def _reject_configured_restore_on_fresh(cfg: Any) -> None:
         raise RestartRefusal("configured load is not an admitted typed restore") from exc
     if mode != "none":
         raise RestartRefusal(
-            "fresh restart refuses concrete configured load; use the selected "
+            "fresh restart refuses concrete configured restore (runner.load); use the selected "
             "OperationalRestoreRequest"
         )
 
