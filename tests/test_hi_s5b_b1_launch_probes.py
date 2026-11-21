@@ -136,6 +136,24 @@ def test_real_o1_adam_rows_forward_opaque_operational_values(
         assert received[0][2] is artifact_destination, context
 
 
+def test_launcher_admission_failure_is_typed_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The launcher must surface the existing full-tree admission failure."""
+
+    cell = _o1_adam_rows(tmp_path)["O-raw"]
+    inventory = import_module(
+        "experiments.atomistic.he-importance.mutable_state_inventory"
+    )
+
+    def refuse(*args: object, **kwargs: object) -> object:
+        raise ValueError("synthetic admission mismatch")
+
+    monkeypatch.setattr(inventory, "validate_hi_continuation_admission", refuse)
+    with pytest.raises(launch.HIContinuationRefusal, match="synthetic admission mismatch"):
+        launch.prepare_train_launch(cell, _topology(), restore_request=object())
+
+
 @pytest.mark.parametrize("keyword", ["restore_request", "artifact_destination"])
 @pytest.mark.parametrize("shape", ["positional-only", "args-only"])
 def test_nonkeyword_runner_capabilities_refuse_without_call(

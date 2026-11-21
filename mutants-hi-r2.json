@@ -1,0 +1,23 @@
+[
+  {
+    "id": "pre-resolve-interpolation-refusal-bypass",
+    "target": "experiments/atomistic/he-importance/launch.py",
+    "old": "if restore_request is not None and _caller_override_has_interpolation(overrides):",
+    "new": "if False and restore_request is not None and _caller_override_has_interpolation(overrides):",
+    "killer": "tests/test_hi_s5b_b1_launch_probes.py::test_restore_refusal_does_not_resolve_standard_override"
+  },
+  {
+    "id": "admission-gate-bypass",
+    "target": "experiments/atomistic/he-importance/launch.py",
+    "old": "if restore_request is not None:\n        inventory = import_module(\"experiments.atomistic.he-importance.mutable_state_inventory\")",
+    "new": "if False and restore_request is not None:\n        inventory = import_module(\"experiments.atomistic.he-importance.mutable_state_inventory\")",
+    "killer": "tests/test_hi_s5b_b1_launch_probes.py::test_launcher_admission_failure_is_typed_refusal"
+  },
+  {
+    "id": "default-runner-restore-misforward",
+    "target": "experiments/atomistic/he-importance/launch.py",
+    "old": "runtime_callbacks=runtime_callbacks,\n                restore_request=restore_request,",
+    "new": "runtime_callbacks=runtime_callbacks,\n                restore_request=None,",
+    "killer": "tests/test_hi_s5b_b1_launch_probes.py::test_default_runner_path_preserves_operational_kwargs_topology_and_callbacks"
+  }
+]
