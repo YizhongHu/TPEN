@@ -72,6 +72,10 @@ class UnknownLaunchHandleError(LocalExecutorError):
     """Raised when collecting an unknown or already-collected handle."""
 
 
+class HandleCollectionInProgressError(LocalExecutorError):
+    """Raised when another collector already owns a handle's collection."""
+
+
 class LeafSubmissionError(LocalExecutorError):
     """Raised when the local worker cannot accept a leaf submission."""
 
@@ -234,6 +238,7 @@ class LocalLeafExecutor:
         self._free_slots = list(self._slots)
         self._handles: dict[int, MemberLaunchHandle] = {}
         self._collected: set[int] = set()
+        self._collecting: set[int] = set()
 
     def _task(self, task_id: str) -> TaskSpec:
         """Return the one immutable task bound to ``task_id``."""
@@ -331,24 +336,47 @@ class LocalLeafExecutor:
         with self._lock:
             if self._handles.get(key) is not handle or key in self._collected:
                 raise UnknownLaunchHandleError("launch handle is unknown or already collected")
+            if key in self._collecting:
+                raise HandleCollectionInProgressError("launch handle is already being collected")
+            self._collecting.add(key)
+        terminal = False
+        was_done = handle._future.done()
         try:
-            result = handle._future.result(timeout=timeout)
+            try:
+                result = handle._future.result(timeout=timeout)
+            except FutureTimeoutError:
+                # With a finite timeout, a future that was not done when this
+                # attempt started produced a wait timeout.  It may complete
+                # before this handler runs, but that later state is not the
+                # outcome delivered by this collection attempt.  ``timeout``
+                # of None cannot be a wait timeout, so this is a leaf-raised
+                # TimeoutError and is terminal.
+                terminal = timeout is None or was_done
+                if not terminal:
+                    # Preserve the handle and its slot lease for a later
+                    # collection attempt.
+                    raise
+                # A leaf-raised TimeoutError is terminal, but still belongs
+                # to the caller as the exact leaf exception.
+                raise
+            except BaseException:
+                # Any leaf exception, including a leaf-raised TimeoutError
+                # when no finite wait timeout was requested, is terminal.
+                terminal = True
+                raise
+            terminal = True
             if not isinstance(result, LeafResult):
                 raise LeafResultRejected("leaf runner returned a non-LeafResult")
             result = validate_leaf_result(handle._request, result)
             return result
-        except FutureTimeoutError:
-            # A timeout is not collection: retain the handle and its capacity
-            # lease so the controller may make one later bounded wait.
-            raise
         finally:
-            if handle._future.done():
-                with self._lock:
-                    if key not in self._collected:
-                        self._collected.add(key)
-                        self._active -= 1
-                        if handle._slot is not None:
-                            self._free_slots.append(handle._slot)
+            with self._lock:
+                self._collecting.discard(key)
+                if terminal and key not in self._collected:
+                    self._collected.add(key)
+                    self._active -= 1
+                    if handle._slot is not None:
+                        self._free_slots.append(handle._slot)
 
     def close(self, *, wait: bool = True) -> None:
         """Shut down the local submission pool after outstanding work settles."""
@@ -358,6 +386,7 @@ class LocalLeafExecutor:
 
 __all__ = [
     "CapacityExceededError",
+    "HandleCollectionInProgressError",
     "InvocationMismatchError",
     "LeafSubmissionError",
     "LocalExecutorError",

@@ -85,6 +85,20 @@ MUTANTS = (
         "if False:",
         "test_capacity_refuses_without_launch",
     ),
+    (
+        "consume-on-later-done",
+        MODULE_NAME,
+        "if not terminal:\n                    # Preserve the handle and its slot lease for a later\n                    # collection attempt.\n                    raise",
+        "if not terminal:\n                    # Preserve the handle and its slot lease for a later\n                    # collection attempt.\n                    terminal = handle._future.done()\n                    raise",
+        "test_timeout_completion_race_preserves_uncollected_result",
+    ),
+    (
+        "no-collect-reservation",
+        MODULE_NAME,
+        'if key in self._collecting:\n                raise HandleCollectionInProgressError("launch handle is already being collected")',
+        'if False:\n                raise AssertionError("unreachable")',
+        "test_overlapping_collect_returns_result_to_only_one_caller",
+    ),
 )
 
 
@@ -306,12 +320,14 @@ def test_collect_rejects_crossed_result(tmp_path: Path) -> None:
 def test_capacity_refuses_without_launch(tmp_path: Path) -> None:
     group = _group(("one", "two"))
     allocation = _allocation(1)
+    started = Event()
     release = Event()
     calls: list[str] = []
 
     def runner(payload: bytes) -> bytes:
         request = LeafRequest.decode(payload)
         calls.append(request.task_id)
+        started.set()
         release.wait(5)
         return _failure_result(request).encode()
 
@@ -319,6 +335,7 @@ def test_capacity_refuses_without_launch(tmp_path: Path) -> None:
     try:
         fence, invocation = _invocation(group, allocation, "one", tmp_path)
         _, handle = executor.submit(fence, invocation)
+        assert started.wait(2)
         assert calls == ["one"]
         fence2, invocation2 = _invocation(group, allocation, "two", tmp_path)
         with pytest.raises(CapacityExceededError):
@@ -394,10 +411,13 @@ def test_real_local_run_leaf_subprocess(tmp_path: Path) -> None:
 
 def test_mutant_rows_are_unique_and_well_formed() -> None:
     source = MODULE.read_text(encoding="utf-8")
+    review_source = Path(__file__).with_name("test_review_b1e1_r1.py").read_text(encoding="utf-8")
+    test_source = Path(__file__).read_text(encoding="utf-8") + review_source
     assert len({row[2] for row in MUTANTS}) == len(MUTANTS)
-    assert len(MUTANTS) == 6
-    for _name, filename, old, new, _killer in MUTANTS:
+    assert len(MUTANTS) == 8
+    for _name, filename, old, new, killer in MUTANTS:
         assert filename == MODULE_NAME
         assert source.count(old) == 1
         compile(source.replace(old, new), str(MODULE), "exec")
+        assert f"def {killer}(" in test_source
 
