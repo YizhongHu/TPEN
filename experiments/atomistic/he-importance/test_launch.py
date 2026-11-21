@@ -22,12 +22,6 @@ from tpen.runner import Runner
 
 
 stage_coordinate = import_module("experiments.atomistic.he-importance.stage_coordinate")
-optimizer_grid = import_module(
-    "experiments.atomistic.he-importance.optimizer_grid"
-)
-train_config = import_module(
-    "experiments.atomistic.he-importance.train_config"
-)
 launch = import_module("experiments.atomistic.he-importance.launch")
 
 _EXECUTION_FACT_KEY_PROBES = (
@@ -1990,6 +1984,12 @@ def test_nonempty_operational_keyword_requires_custom_runner_capability(
 def _qualified_o1_row_pair(tmp_path: Path) -> tuple[object, object, object]:
     """Return one O-raw cell and a distinct resolved row for refusal controls."""
 
+    optimizer_grid = import_module(
+        "experiments.atomistic.he-importance.optimizer_grid"
+    )
+    train_config = import_module(
+        "experiments.atomistic.he-importance.train_config"
+    )
     cells = stage_coordinate.materialize_intended_configurations(
         tmp_path / "o1",
         availability=optimizer_grid.roster_availability(),
@@ -2001,9 +2001,13 @@ def _qualified_o1_row_pair(tmp_path: Path) -> tuple[object, object, object]:
         if cell.manifest["scientific_identity"]["context"]["name"] == "O-raw"
         and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
     ]
-    assert len(rows) >= 2
-    source = rows[0]
-    observed = train_config.resolve_train_config(rows[1])
+    by_coordinate: dict[tuple[tuple[str, object], ...], object] = {}
+    for cell in rows:
+        levels = cell.manifest["scientific_identity"]["optimizer"]["levels"]
+        by_coordinate.setdefault(tuple(sorted(levels.items())), cell)
+    assert len(by_coordinate) >= 2
+    source, mismatched_source = list(by_coordinate.values())[:2]
+    observed = train_config.resolve_train_config(mismatched_source)
     return source, observed, train_config.resolve_train_config(source)
 
 
