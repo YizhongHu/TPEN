@@ -506,6 +506,9 @@ def test_reused_takeover_approval_refuses_while_first_driver_is_live(
     first = Thread(target=first_attempt, name="approved-takeover-owner")
     first.start()
     assert first_entered.wait(timeout=10), "first approved driver did not start"
+    before_reuse = sorted(
+        path.relative_to(attempts).as_posix() for path in attempts.rglob("*")
+    )
 
     try:
         second_error: BaseException | None = None
@@ -519,10 +522,18 @@ def test_reused_takeover_approval_refuses_while_first_driver_is_live(
         except BaseException as exc:  # pragma: no cover - diagnostic capture
             second_error = exc
         assert isinstance(second_error, RestartRefusal), repr(second_error)
+        assert second_error.cause is RestartCause.TAKEOVER_APPROVAL_SCOPE_MISMATCH
         assert "takeover" in str(second_error) or "occupied" in str(second_error)
         assert second_calls == [], (
             "reused approval entered a second driver; first_alive="
             f"{first.is_alive()} first_errors={[repr(error) for error in first_errors]}"
+        )
+        after_reuse = sorted(
+            path.relative_to(attempts).as_posix() for path in attempts.rglob("*")
+        )
+        assert after_reuse == before_reuse, (
+            "reused approval created a lease or outcome: "
+            f"before={before_reuse} after={after_reuse}"
         )
         assert first.is_alive(), (
             "first takeover stopped before the duplicate approval was checked; "
