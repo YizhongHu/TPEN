@@ -108,7 +108,7 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
             pass
         sampler_state = sampler.mcmc_state_dict()
         sampler_cursor = (
-            _tensor_digest(sampler_state["walkers"])
+            _tensor_digest(sampler_state["walkers"].positions)
             + ":"
             + _tensor_digest(sampler_state["generator_state"])
         )
