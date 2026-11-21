@@ -1,0 +1,46 @@
+{
+  "mutants": [
+    {
+      "id": "sequence-claim-collision-raw",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "raise RestartRefusal(\n            f\"lineage claim lost: occupied lineage attempt sequence {attempt_key}\",\n            cause=RestartCause.LINEAGE_CLAIM_LOST,\n        ) from exc",
+      "new": "raise exc",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart_review_r1.py::test_lineage_claim_serializes_stale_and_current_selections"
+    },
+    {
+      "id": "sequence-claim-content-key",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "attempt_key = f\"attempt-{number:06d}\"",
+      "new": "attempt_key = selection.content_id",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart_review_r1.py::test_lineage_claim_serializes_stale_and_current_selections"
+    },
+    {
+      "id": "takeover-supersession-ignored",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "if lease_path.name in superseded:",
+      "new": "if False:",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart_review_r1.py::test_approved_takeover_releases_abandoned_initial_owner_for_successor"
+    },
+    {
+      "id": "positional-load-not-inspected",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "mode = configured_load_mode(cfg)",
+      "new": "mode = \"none\"",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart_review_r1.py::test_fresh_positional_train_resume_is_refused_before_driver_or_lease"
+    },
+    {
+      "id": "inactive-load-refused",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "if mode != \"none\":",
+      "new": "if mode != \"none\" or OmegaConf.select(cfg, \"runner.load\", default=None) is not None:",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart_review_r1.py::test_inactive_named_load_does_not_block_fresh_driver[configured_load2]"
+    },
+    {
+      "id": "restore-request-omitted",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "restore_request=selection.restore_request,",
+      "new": "# restore_request intentionally omitted,",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restartable.py::test_real_multiprocess_cpu_restartable_multi_attempt_chain"
+    }
+  ]
+}
