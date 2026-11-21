@@ -12,7 +12,11 @@ import sys
 import textwrap
 from pathlib import Path
 
-from experiments.atomistic.stage1.protocol import CHECKPOINT_EVIDENCE_SCHEMA, manifest_hash
+from experiments.atomistic.stage1.protocol import (
+    CHECKPOINT_EVIDENCE_SCHEMA,
+    HE_H2_EVAL_CHECKPOINTS,
+    manifest_hash,
+)
 
 
 HERE = Path(__file__).resolve().parent
@@ -792,8 +796,9 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
             for row in phase1["rows"] if row["kind"] == "train"
         },
         "checkpoints": {
-            f"{row['system']}:{row['lineage']}:100000": "0" * 64
+            f"{row['system']}:{row['lineage']}:{checkpoint}": "0" * 64
             for row in phase1["rows"] if row["kind"] == "train"
+            for checkpoint in HE_H2_EVAL_CHECKPOINTS
         },
     }
     evidence_path = results_root / "plan" / "evidence.json"
@@ -803,7 +808,8 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
         sys.executable, "-m", "experiments.atomistic.stage1.plan", "--output", str(phase2_path),
         "--source-sha", source_sha, "--results-root", str(results_root), "--phase", "2",
         "--phase1-manifest", str(plan_path), "--checkpoint-bindings", str(evidence_path),
-        "--checkpoints", "100000", "--lineage-seeds", "1", "2", "3",
+        "--checkpoints", *[str(checkpoint) for checkpoint in HE_H2_EVAL_CHECKPOINTS],
+        "--lineage-seeds", "1", "2", "3",
     ], cwd=checkout, check=True)
     env.update({"MODE": "eval", "PLAN_MANIFEST": str(phase2_path)})
     evaluated = _run("eval", env)
@@ -811,7 +817,7 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
     env["FAIL_DRIVER"] = "all"
     evaluated_fail = _run("eval", env)
     assert evaluated_fail.returncode != 0
-    assert len(list(results_root.glob("logs/*.status"))) >= 12
+    assert len(list(results_root.glob("logs/*.status"))) >= 132
     assert set(Path(env["TASKSET_RECORD"]).read_text().splitlines()) == {
         "0,1,2,3,4,5,6,7,8,9",
         "10,11,12,13,14,15,16,17,18,19",
