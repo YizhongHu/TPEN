@@ -18,7 +18,13 @@ import sys
 
 import pytest
 
-from experiments.toolkit.run_results import ManifestRefusal, OUTCOME_STATUSES, _core_outcome, read
+from experiments.toolkit.run_results import (
+    ManifestRefusal,
+    OUTCOME_STATUSES,
+    _core_outcome,
+    _successor_admission,
+    read,
+)
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "run-manifest-v2.json"
@@ -224,6 +230,76 @@ store.record_successor_admission(fence, request, "b" * 64, predecessor_binding=p
     manifest.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ManifestRefusal, match="successor admission predecessor"):
         read(manifest)
+
+
+def _successor_admission_fixture() -> tuple[dict[str, object], dict[str, str]]:
+    """Return a minimal closed v2 admission and its containing attempt."""
+
+    successor = {"task_id": "successor-task", "attempt_id": "successor-attempt"}
+    binding = {
+        "schema": "tpen-executor/member-invocation-v2",
+        "allocation_attempt": {
+            "schema": "tpen-executor/allocation-attempt-v2",
+            "group_id": {"schema": "tpen-executor/group-id-v2", "value": "g"},
+            "allocation_attempt_id": {"schema": "tpen-executor/allocation-attempt-id-v2", "value": "lease"},
+            "allocation_id": {"schema": "tpen-executor/allocation-id-v1", "value": "allocation"},
+            "backend_job_id": {"schema": "tpen-executor/backend-job-id-v1", "value": "job"},
+            "controller_generation": "controller",
+            "observed_at_utc": "2026-11-14T00:02:00Z",
+        },
+        "group_digest": "c" * 64,
+        "task_id": successor["task_id"],
+        "lineage_id": "lineage",
+        "attempt_id": {"schema": "tpen-executor/attempt-id-v1", "value": successor["attempt_id"]},
+        "invocation_id": {"schema": "tpen-executor/invocation-id-v2", "value": "invocation"},
+    }
+    return {
+        "schema": "tpen-executor/successor-admission-v2",
+        "predecessor": {"task_id": "predecessor-task", "attempt_id": "predecessor-attempt", "content_id": "a" * 64},
+        "successor": successor,
+        "request_digest": "b" * 64,
+        "core_acceptance_digest": "d" * 64,
+        "successor_binding": binding,
+    }, {"task_id": "predecessor-task", "attempt_id": "predecessor-attempt"}
+
+
+def test_successor_admission_schema_and_binding_validation() -> None:
+    admission, attempt = _successor_admission_fixture()
+
+    record = _successor_admission(admission, {"task_id": "predecessor-task", "attempt_id": "predecessor-attempt"})
+    assert record["successor_binding"]["task_id"] == "successor-task"
+    assert record["successor_binding"]["attempt_id"]["value"] == "successor-attempt"
+
+    unknown = dict(admission, schema="tpen-executor/successor-admission-v3")
+    with pytest.raises(ManifestRefusal, match="schema is unsupported"):
+        _successor_admission(unknown, attempt)
+
+    v1_with_binding = dict(admission, schema="tpen-executor/successor-admission-v1")
+    with pytest.raises(ManifestRefusal, match="keys differ"):
+        _successor_admission(v1_with_binding, attempt)
+
+    v2_without_binding = dict(admission)
+    v2_without_binding.pop("successor_binding")
+    with pytest.raises(ManifestRefusal, match="keys differ"):
+        _successor_admission(v2_without_binding, attempt)
+
+    binding_extra = dict(admission)
+    binding_extra["successor_binding"] = dict(admission["successor_binding"], extra="refuse")
+    with pytest.raises(ManifestRefusal, match="keys differ"):
+        _successor_admission(binding_extra, attempt)
+
+    binding_task_mismatch = dict(admission)
+    binding_task_mismatch["successor_binding"] = dict(admission["successor_binding"], task_id="foreign-task")
+    with pytest.raises(ManifestRefusal, match="disagrees with successor task"):
+        _successor_admission(binding_task_mismatch, attempt)
+
+    binding_attempt_mismatch = dict(admission)
+    binding_attempt_mismatch["successor_binding"] = dict(
+        admission["successor_binding"],
+        attempt_id={"schema": "tpen-executor/attempt-id-v1", "value": "foreign-attempt"},
+    )
+    with pytest.raises(ManifestRefusal, match="disagrees with successor attempt"):
+        _successor_admission(binding_attempt_mismatch, attempt)
 
 
 def test_real_executor_v2_segment_manifest_reads_as_committed_chain(tmp_path: Path) -> None:

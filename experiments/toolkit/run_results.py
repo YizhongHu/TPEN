@@ -1194,15 +1194,72 @@ def _core_outcome(value: Any, attempt: Mapping[str, Any]) -> dict[str, Any]:
     return record
 
 
+def _successor_binding(value: Any, successor: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the closed v2 MemberInvocationV2 binding projection."""
+
+    binding = dict(_fields(
+        value,
+        {"schema", "allocation_attempt", "group_digest", "task_id", "lineage_id", "attempt_id", "invocation_id"},
+        "successor admission successor_binding",
+    ))
+    if binding["schema"] != "tpen-executor/member-invocation-v2":
+        raise ManifestRefusal("unknown-schema", "successor admission binding schema is unsupported")
+    allocation_attempt = dict(_fields(
+        binding["allocation_attempt"],
+        {"schema", "group_id", "allocation_attempt_id", "allocation_id", "backend_job_id", "controller_generation", "observed_at_utc"},
+        "successor admission binding allocation_attempt",
+    ))
+    if allocation_attempt["schema"] != "tpen-executor/allocation-attempt-v2":
+        raise ManifestRefusal("unknown-schema", "successor admission allocation attempt schema is unsupported")
+    identity_schemas = {
+        "group_id": "tpen-executor/group-id-v2",
+        "allocation_attempt_id": "tpen-executor/allocation-attempt-id-v2",
+        "allocation_id": "tpen-executor/allocation-id-v1",
+        "backend_job_id": "tpen-executor/backend-job-id-v1",
+    }
+    for key, schema in identity_schemas.items():
+        identity = dict(_fields(
+            allocation_attempt[key],
+            {"schema", "value"},
+            f"successor admission binding allocation_attempt.{key}",
+        ))
+        if identity["schema"] != schema:
+            raise ManifestRefusal("unknown-schema", f"successor admission {key} schema is unsupported")
+        _text(identity["value"], f"successor_admission.successor_binding.allocation_attempt.{key}.value")
+    for key in ("controller_generation", "observed_at_utc"):
+        _text(allocation_attempt[key], f"successor_admission.successor_binding.allocation_attempt.{key}")
+    _sha256(binding["group_digest"], "successor_admission.successor_binding.group_digest")
+    _text(binding["task_id"], "successor_admission.successor_binding.task_id")
+    _text(binding["lineage_id"], "successor_admission.successor_binding.lineage_id")
+    for key, schema in (
+        ("attempt_id", "tpen-executor/attempt-id-v1"),
+        ("invocation_id", "tpen-executor/invocation-id-v2"),
+    ):
+        identity = dict(_fields(
+            binding[key],
+            {"schema", "value"},
+            f"successor admission successor_binding.{key}",
+        ))
+        if identity["schema"] != schema:
+            raise ManifestRefusal("unknown-schema", f"successor admission binding {key} schema is unsupported")
+        _text(identity["value"], f"successor_admission.successor_binding.{key}.value")
+    if binding["task_id"] != successor["task_id"]:
+        raise ManifestRefusal("attempt-receipt-mismatch", "successor admission binding disagrees with successor task")
+    if binding["attempt_id"]["value"] != successor["attempt_id"]:
+        raise ManifestRefusal("attempt-receipt-mismatch", "successor admission binding disagrees with successor attempt")
+    return binding
+
+
 def _successor_admission(value: Any, attempt: Mapping[str, Any]) -> dict[str, Any]:
     """Validate one executor successor-admission manifest projection."""
 
-    record = dict(_fields(
-        value,
-        {"schema", "predecessor", "successor", "request_digest", "core_acceptance_digest"},
-        "successor admission record",
-    ))
-    if record["schema"] != "tpen-executor/successor-admission-v1":
+    base_fields = {"schema", "predecessor", "successor", "request_digest", "core_acceptance_digest"}
+    schema = value.get("schema") if isinstance(value, Mapping) else None
+    if schema == "tpen-executor/successor-admission-v1":
+        record = dict(_fields(value, base_fields, "successor admission record"))
+    elif schema == "tpen-executor/successor-admission-v2":
+        record = dict(_fields(value, base_fields | {"successor_binding"}, "successor admission record"))
+    else:
         raise ManifestRefusal("unknown-schema", "successor admission schema is unsupported")
     predecessor = dict(_fields(
         record["predecessor"],
@@ -1227,6 +1284,8 @@ def _successor_admission(value: Any, attempt: Mapping[str, Any]) -> dict[str, An
         )
     record["predecessor"] = predecessor
     record["successor"] = successor
+    if schema == "tpen-executor/successor-admission-v2":
+        record["successor_binding"] = _successor_binding(record["successor_binding"], successor)
     return record
 
 
