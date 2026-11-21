@@ -99,12 +99,21 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
             self._last_state = self._snapshot(state, event.report, context)
             self.records["restored"] = self._last_state
         elif isinstance(event, TrainingStarted):
-            # Train emits TrainingStarted without TrainerState.  The restore
-            # boundary is immediately adjacent, so retain that exact state
-            # rather than inventing a second observation or changing core.
-            if self._last_state is not None:
-                self.records["training_started"] = dict(self._last_state)
+            # Train emits TrainingStarted without TrainerState.  For a restore
+            # this is adjacent to CheckpointRestored; the disabled control has
+            # no restore event, so take a genuine fresh-start snapshot here.
+            self.records["training_started"] = (
+                dict(self._last_state)
+                if self._last_state is not None
+                else self._snapshot(None, None, context)
+            )
         elif isinstance(event, TrainingIterationCompleted) and state is not None:
+            iteration = int(state.trainer.next_iteration)
+            samples = state.samples
+            self.records.setdefault("iterations", {})[str(iteration)] = {
+                "samples": _tensor_digest(samples.positions),
+                "local_energy": state.local_energy.detach().cpu().tolist(),
+            }
             if int(state.trainer.next_iteration) == self.boundary:
                 self.records["boundary"] = self._snapshot(state, None, context)
 
@@ -126,10 +135,28 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
         except ImportError:  # pragma: no cover - TPEN requires torch on Cannon
             pass
         sampler_state = sampler.mcmc_state_dict()
-        sampler_cursor = (
-            _tensor_digest(sampler_state["walkers"].positions)
+        walkers = sampler_state["walkers"]
+        sampler_cursor = None if walkers is None else (
+            _tensor_digest(walkers.positions)
             + ":"
             + _tensor_digest(sampler_state["generator_state"])
+        )
+        sampler_semantic = {
+            "cursor": sampler_cursor,
+            "has_burned_in": bool(sampler_state["has_burned_in"]),
+            "generator_state": _tensor_digest(sampler_state["generator_state"]),
+        }
+        if walkers is not None:
+            sampler_semantic["walkers"] = _tensor_digest(walkers.positions)
+        cadence = next(
+            (
+                int(callback.schedule.every_n)
+                for callback in getattr(context, "callbacks", ())
+                if type(callback).__qualname__ == "Checkpoint"
+                and hasattr(callback, "schedule")
+                and hasattr(callback.schedule, "every_n")
+            ),
+            CHECKPOINT_EVERY,
         )
         return {
             "model": _semantic_digest(model.state_dict()),
@@ -138,6 +165,7 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
             "trainer": {"next_iteration": int(trainer.next_iteration), "completed_updates": int(trainer.completed_updates), "max_steps": int(trainer.max_steps)},
             "sampler": _digest(sampler_state),
             "sampler_cursor": sampler_cursor,
+            "sampler_semantic": sampler_semantic,
             "process_rng": _semantic_digest(process_rng),
             "callback_dispositions": [
                 type(callback).__qualname__
@@ -145,6 +173,8 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
                 if type(callback).__qualname__ != "PlannedYield"
             ],
             "report": None if report is None else repr(report),
+            "horizon": int(trainer.max_steps),
+            "checkpoint_cadence": cadence,
         }
 
     def finish(self) -> None:
@@ -158,9 +188,6 @@ def _config(path: Path, root: Path, run_id: str) -> None:
     cfg.runtime.device = "cpu"
     cfg.runtime.dtype = "float64"
     cfg.trainer.max_steps = H
-    if run_id == "disabled":
-        # Give the no-restore control a genuine divergence, not pickle metadata.
-        cfg.runtime.seed = 1
     cfg.sampler.n_walkers = 4
     cfg.sampler.burn_in = 1
     cfg.sampler.n_steps = 1
@@ -194,6 +221,18 @@ def _child(action: str, config_path: str, record_path: str, checkpoint_path: str
 
     def capture_runner(runner, context):
         observer._runner = runner
+        if action == "disabled":
+            # Preserve the effective H/cadence while stopping exactly at the
+            # fresh TrainingStarted boundary, before any update or sampling.
+            def fresh_start(**_kwargs):
+                return TrainerState(
+                    model=runner.model,
+                    optimizer=observer._optimizer,
+                    trainer=runner.trainer,
+                    sampler=runner.sampler,
+                )
+
+            runner.trainer.fit = fresh_start
         return original_train_run(runner, context)
 
     train_module.make_optimizer = capture_optimizer
@@ -236,23 +275,25 @@ def _spawn(action: str, config: Path, record: Path, checkpoint: Path | None = No
 
 def _assert_equivalent(expected: dict[str, Any], observed: dict[str, Any]) -> None:
     assert expected["trainer"] == observed["trainer"]
+    assert expected["horizon"] == observed["horizon"] == H
+    assert expected["checkpoint_cadence"] == observed["checkpoint_cadence"] == CHECKPOINT_EVERY
     np.testing.assert_allclose(expected["observable"], observed["observable"], rtol=RTOL, atol=ATOL)
-    for key in ("model", "optimizer", "sampler", "sampler_cursor", "process_rng", "callback_dispositions"):
+    for key in ("model", "optimizer", "sampler", "sampler_cursor", "sampler_semantic", "process_rng", "callback_dispositions"):
         assert key in expected and key in observed
     # These semantic digests are the mutable state at the restore boundary;
     # raw pickle digests include process-local/container metadata. Presence
     # alone would let a restore-disabled mutant pass undetected.
-    for key in ("model", "optimizer", "process_rng", "sampler_cursor", "callback_dispositions"):
+    for key in ("model", "optimizer", "sampler_semantic", "process_rng", "callback_dispositions"):
         assert expected[key] == observed[key], key
 
 
 def test_hi_s5b_b2_three_process_stateful_continuation(tmp_path: Path) -> None:
     """Qualify exact state, sampler cursor, H, cadence, and non-mutating restore."""
-    full_cfg, prefix_cfg, successor_cfg, disabled_cfg = [tmp_path / f"{name}.yaml" for name in ("full", "prefix", "successor", "disabled")]
-    roots = {name: tmp_path / name for name in ("full", "prefix", "successor", "disabled")}
-    for path, name in ((full_cfg, "full"), (prefix_cfg, "prefix"), (successor_cfg, "successor"), (disabled_cfg, "disabled")):
+    full_cfg, prefix_cfg, successor_cfg, disabled_cfg, refused_cfg = [tmp_path / f"{name}.yaml" for name in ("full", "prefix", "successor", "disabled", "refused")]
+    roots = {name: tmp_path / name for name in ("full", "prefix", "successor", "disabled", "refused")}
+    for path, name in ((full_cfg, "full"), (prefix_cfg, "prefix"), (successor_cfg, "successor"), (disabled_cfg, "disabled"), (refused_cfg, "refused")):
         _config(path, roots[name], name)
-    full_record, prefix_record, successor_record, disabled_record = [tmp_path / f"{name}.json" for name in ("full", "prefix", "successor", "disabled")]
+    full_record, prefix_record, successor_record, disabled_record, refused_record = [tmp_path / f"{name}.json" for name in ("full", "prefix", "successor", "disabled", "refused")]
     _spawn("full", full_cfg, full_record)
     _spawn("prefix", prefix_cfg, prefix_record)
     run_dir = roots["prefix"] / "tpen_he_importance" / "atomistic" / "prefix"
@@ -262,21 +303,33 @@ def test_hi_s5b_b2_three_process_stateful_continuation(tmp_path: Path) -> None:
     _spawn("successor", successor_cfg, successor_record, checkpoint)
     assert _tree_digest(run_dir) == before
     before_refused = _tree_digest(run_dir)
-    _spawn("refused", successor_cfg, tmp_path / "refused.json", checkpoint)
+    _spawn("refused", refused_cfg, refused_record, checkpoint)
     assert _tree_digest(run_dir) == before_refused
     _spawn("disabled", disabled_cfg, disabled_record)
     full = json.loads(full_record.read_text())
     prefix = json.loads(prefix_record.read_text())
     restored = json.loads(successor_record.read_text())
     disabled = json.loads(disabled_record.read_text())
+    refused = json.loads(refused_record.read_text())
     # The raw sampler pickle includes non-semantic serialization metadata, so
     # the exact next-draw witness is the semantic cursor: walker positions and
     # the sampler-local generator state.  Check both the checkpoint producer
     # and the uninterrupted arm against the restored successor; comparing only
     # with the prefix would miss a pre-boundary divergence in the prefix arm.
     _assert_equivalent(prefix["boundary"], restored["training_started"])
-    assert full["boundary"]["sampler_cursor"] == restored["training_started"]["sampler_cursor"]
-    np.testing.assert_allclose(full["boundary"]["observable"], restored["training_started"]["observable"], rtol=RTOL, atol=ATOL)
+    _assert_equivalent(full["boundary"], restored["training_started"])
+    full_iteration = full["iterations"][str(PREFIX + 1)]
+    restored_iteration = restored["iterations"][str(PREFIX + 1)]
+    assert full_iteration["samples"] == restored_iteration["samples"]
+    np.testing.assert_allclose(full_iteration["local_energy"], restored_iteration["local_energy"], rtol=RTOL, atol=ATOL)
     assert restored["restored"]["trainer"]["max_steps"] == H
-    assert disabled["boundary"]["model"] != restored["training_started"]["model"]
+    assert disabled["training_started"]["model"] != restored["training_started"]["model"]
+    assert disabled["training_started"]["trainer"] == {"next_iteration": 0, "completed_updates": 0, "max_steps": H}
+    assert disabled["training_started"]["optimizer"] != restored["training_started"]["optimizer"]
+    assert "restored" not in disabled and "boundary" not in disabled
+    assert refused == {}
+    refused_error = roots["refused"] / "tpen_he_importance" / "atomistic" / "refused" / "error.json"
+    error = json.loads(refused_error.read_text(encoding="utf-8"))
+    assert "target_iterations=3" in error["exception_message"]
+    assert "max_steps=4" in error["exception_message"]
 
