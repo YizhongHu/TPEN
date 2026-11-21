@@ -127,7 +127,7 @@ artifact_is_excluded() {
 artifact_copy_file() {
   local source="$1" destination_rel="$2" inventory="$3"
   local source_class="${4:-unknown}" producer="${5:-harness}"
-  local destination hash source_hash size
+  local destination hash source_hash size escaped_destination escaped_source
   [[ -f "$source" ]] || return 1
   [[ "${ARTIFACTS_FORCE_FAILURE:-0}" != 1 ]] || return 1
   artifact_is_excluded "$destination_rel" && return 0
@@ -140,11 +140,13 @@ artifact_copy_file() {
   source_hash="$(sha256sum -- "$source" | awk '{print $1}')" || return 1
   [[ "$hash" == "$source_hash" ]] || return 1
   size="$(wc -c < "$destination")" || return 1
+  escaped_destination="$(printf '%q' "$destination_rel")"
+  escaped_source="$(printf '%q' "$source")"
   ARTIFACT_FILE_COUNT=$((ARTIFACT_FILE_COUNT + 1))
   ARTIFACT_BYTES=$((ARTIFACT_BYTES + size))
-  printf '%s  %s\n' "$hash" "$destination_rel" >> "$inventory" || return 1
+  printf '%s  %s\n' "$hash" "$escaped_destination" >> "$inventory" || return 1
   if [[ -n "${ARTIFACTS_METADATA:-}" ]]; then
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$source_class" "$source" "on" "$destination_rel" "$size" "$hash" "$producer" >> "$ARTIFACTS_METADATA" || return 1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$source_class" "$escaped_source" "on" "$escaped_destination" "$size" "$hash" "$producer" >> "$ARTIFACTS_METADATA" || return 1
   fi
 }
 

@@ -48,6 +48,7 @@ def _make_clone(tmp_path: Path) -> Path:
     (clone / "untracked.txt").write_text("untracked\n")
     (clone / "outputs").mkdir()
     (clone / "outputs" / "ignored.txt").write_text("ignored output\n")
+    (clone / "outputs" / "newline\nname.txt").write_text("newline output\n")
     (clone / "__pycache__").mkdir()
     (clone / "__pycache__" / "skip.pyc").write_bytes(b"cache")
     return clone
@@ -78,22 +79,24 @@ def test_full_suite_collector_copies_allowlist_and_writes_inventory(tmp_path: Pa
     assert (artifacts / "checkout/tracked.txt").read_text() == "after\n"
     assert (artifacts / "checkout/untracked.txt").read_text() == "untracked\n"
     assert (artifacts / "checkout/outputs/ignored.txt").read_text() == "ignored output\n"
+    assert (artifacts / "checkout/outputs/newline\nname.txt").read_text() == "newline output\n"
     assert (artifacts / "harness/mutant-one.diff").read_text() == "diff\n"
     assert not (artifacts / "tmpdir/__pycache__").exists()
     assert not (artifacts / "checkout/__pycache__").exists()
     assert not (artifacts / "checkout/.git").exists()
 
     inventory = (artifacts / "INVENTORY.sha256").read_text().splitlines()
-    assert len(inventory) == 5
-    for line in inventory:
+    assert len(inventory) == 6
+    for line in inventory[:5]:
         digest, relative = line.split("  ", 1)
         assert digest == hashlib.sha256((artifacts / relative).read_bytes()).hexdigest()
+    assert any("checkout/outputs/newline$'\\n'name.txt" in line for line in inventory)
     size_line = (run_root / "evidence/artifacts-size.txt").read_text().strip()
     expected_bytes = sum(
         len(content)
-        for content in (b"pytest\n", b"after\n", b"untracked\n", b"ignored output\n", b"diff\n")
+        for content in (b"pytest\n", b"after\n", b"untracked\n", b"ignored output\n", b"newline output\n", b"diff\n")
     )
-    assert size_line == f"artifact_file_count=5 artifact_bytes={expected_bytes}"
+    assert size_line == f"artifact_file_count=6 artifact_bytes={expected_bytes}"
     assert (run_root / "evidence/artifacts-status.txt").read_text() == "ARTIFACTS_OK\n"
 
 
