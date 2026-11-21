@@ -157,7 +157,11 @@ def test_collection_budget_writes_partial_without_touching_verdict_or_scratch(tm
         check=False,
         capture_output=True,
         text=True,
-        env={**os.environ, "ARTIFACT_COLLECTION_BUDGET_SECONDS": "0"},
+        env={
+            **os.environ,
+            "ARTIFACT_COLLECTION_BUDGET_SECONDS": "0.01",
+            "ARTIFACT_TEST_ENUM_DELAY_SECONDS": "0.02",
+        },
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert (run_root / "evidence/artifacts-status.txt").read_text().startswith("ARTIFACTS_PARTIAL reason=")

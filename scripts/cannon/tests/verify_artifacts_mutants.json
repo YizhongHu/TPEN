@@ -2,15 +2,15 @@
   {
     "id": "exclusion-disabled",
     "target": "scripts/cannon/verify.sh",
-    "old": "artifact_is_excluded \"$destination_rel\" && return 0",
-    "new": ": # exclusion disabled",
+    "old": "if excluded(destination_rel):",
+    "new": "if False:",
     "killer": "test_verify_artifacts.py::test_full_suite_collector_copies_allowlist_and_writes_inventory"
   },
   {
     "id": "work-copy-disabled",
     "target": "scripts/cannon/verify.sh",
-    "old": "artifact_copy_work_allowlist \"$inventory\" || return 1",
-    "new": ":",
+    "old": "if not walk_tree(Path(tmpdir), \"tmpdir\", \"tmpdir\", \"pytest\", inventory, metadata):",
+    "new": "if False:",
     "killer": "test_verify_artifacts.py::test_full_suite_collector_copies_allowlist_and_writes_inventory"
   },
   {
