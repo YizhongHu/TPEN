@@ -18,7 +18,13 @@ import sys
 
 import pytest
 
-from experiments.toolkit.run_results import ManifestRefusal, OUTCOME_STATUSES, _core_outcome, read
+from experiments.toolkit.run_results import (
+    ManifestRefusal,
+    OUTCOME_STATUSES,
+    _core_outcome,
+    _successor_admission,
+    read,
+)
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "run-manifest-v2.json"
@@ -150,6 +156,255 @@ store.record_successor_admission(fence, request, "b" * 64)
     manifest.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ManifestRefusal, match="successor admission predecessor"):
         read(manifest)
+
+
+def _write_real_executor_v2_admission_manifest(tmp_path: Path) -> Path:
+    """Generate real producer output without importing executor in this process."""
+    manifest = tmp_path / "manifest.json"
+    code = '''import json
+import sys
+from pathlib import Path
+from tpen_executor._codec import digest
+from tpen_executor.allocations import AllocationAttemptV2, ConfiguredAllocation, MemberInvocationV2
+from tpen_executor.contracts import AllocationAttemptId, AllocationId, AttemptId, BackendJobId, ExecutionPlanV2, GroupId, InvocationId, ProgramSpecRef, ReadyGroupV2, TaskSpec
+from tpen_executor.runners import CoreRunEvidence
+from tpen_executor.storage import DirectoryStore
+
+destination = Path(sys.argv[1])
+fixture = Path(sys.argv[2])
+program = ProgramSpecRef({}, digest({}))
+task = TaskSpec("task", "task", program, digest("task"), 1, "steps")
+plan_ref = {"members": ["task"], "plan": "s6a"}
+plan = ExecutionPlanV2(plan_ref, digest(plan_ref), ("task",), "native-recovery/v2", "preserve-or-park/v1")
+group = ReadyGroupV2(GroupId("g"), (task,), plan)
+store = DirectoryStore(destination / "store")
+allocation = ConfiguredAllocation(AllocationId("allocation"), BackendJobId("job"), {})
+lease = AllocationAttemptV2(group.group_id, AllocationAttemptId("lease"), allocation.allocation_id, allocation.backend_job_id, "controller", "2026-11-14T00:00:00Z")
+fence = store.begin_attempt(
+    group,
+    "task",
+    allocation,
+    "2026-11-14T00:00:00Z",
+    allocation_attempt=lease,
+    invocation_id=InvocationId("invocation"),
+)
+core_dir = Path(fence.output_dir) / "core"
+core_dir.mkdir()
+payload = json.loads(fixture.read_text(encoding="utf-8"))
+payload["run_dir"] = str(core_dir)
+checkpoint_dir = str(core_dir / "checkpoints" / "step_000002")
+payload["checkpoint"]["checkpoint_dir"] = checkpoint_dir
+payload["checkpoint_ref"]["checkpoint_dir"] = checkpoint_dir
+store.finish_attempt(fence, "failed", "2026-11-14T00:01:00Z")
+store.record_core_outcome(fence, CoreRunEvidence.from_mapping(payload))
+request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+predecessor_binding = MemberInvocationV2.decode((Path(fence.output_dir) / "invocation.json").read_bytes())
+successor_lease = AllocationAttemptV2(group.group_id, AllocationAttemptId("successor-lease"), allocation.allocation_id, allocation.backend_job_id, "controller", "2026-11-14T00:02:00Z")
+successor_binding = MemberInvocationV2(successor_lease, group.identity, "task", task.lineage_id, AttemptId("successor-1"), InvocationId("successor-invocation"))
+store.record_successor_admission(fence, request, "b" * 64, predecessor_binding=predecessor_binding, successor_binding=successor_binding)
+(destination / "manifest.json").write_bytes(store.manifest(group).encode())
+'''
+    written = _executor(
+        code,
+        tmp_path,
+        ROOT / "tests" / "contracts" / "fixtures" / "core-run-evidence-v3-planned-yield.json",
+    )
+    assert written.returncode == 0, written.stderr
+    return manifest
+
+
+def test_real_executor_v2_successor_admission_manifest_round_trips(tmp_path: Path) -> None:
+    manifest = _write_real_executor_v2_admission_manifest(tmp_path)
+
+    result = read(manifest)
+    assert not result.chains
+    assert len(result.preserved_attempts) == 1
+    assert result.preserved_attempts[0].core_outcome is not None
+
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    original_core_outcome = payload["attempts"][0]["core_outcome"]
+    admission = payload["attempts"][0]["successor_admission"]
+    assert admission["core_acceptance_digest"] == "b" * 64
+
+    payload["attempts"][0].pop("core_outcome")
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ManifestRefusal, match="^successor_admission requires core_outcome$"):
+        read(manifest)
+
+    payload["attempts"][0]["core_outcome"] = original_core_outcome
+    payload["attempts"][0]["successor_admission"]["predecessor"]["task_id"] = "foreign"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ManifestRefusal, match="successor admission predecessor"):
+        read(manifest)
+
+
+def test_review_s6aa_read_preserves_real_successor_admission(tmp_path: Path) -> None:
+    """HI needs the complete admission from the public result, not raw JSON."""
+
+    manifest = _write_real_executor_v2_admission_manifest(tmp_path)
+    expected = json.loads(manifest.read_text())["attempts"][0]["successor_admission"]
+    attempt = read(manifest).preserved_attempts[0]
+    admission = getattr(attempt, "successor_admission", None)
+    assert admission is not None, "read() discarded the successor admission"
+    assert admission == expected
+
+
+@pytest.mark.parametrize("damage", ["none", "group_digest", "group_id"])
+def test_review_s6aa_read_checks_binding_group(tmp_path: Path, damage: str) -> None:
+    """A closed, well-typed binding must still belong to the enclosing group."""
+
+    manifest = _write_real_executor_v2_admission_manifest(tmp_path)
+    if damage == "none":
+        assert len(read(manifest).preserved_attempts) == 1
+        return
+    payload = json.loads(manifest.read_text())
+    binding = payload["attempts"][0]["successor_admission"]["successor_binding"]
+    if damage == "group_digest":
+        binding["group_digest"] = "f" * 64
+        assert binding["group_digest"] != payload["group_digest"]
+    else:
+        binding["allocation_attempt"]["group_id"]["value"] = "foreign-group"
+        assert binding["allocation_attempt"]["group_id"]["value"] != payload["group_id"]
+    manifest.write_text(json.dumps(payload))
+    with pytest.raises(ManifestRefusal):
+        read(manifest)
+
+
+def _successor_admission_fixture() -> tuple[dict[str, object], dict[str, str]]:
+    """Return a minimal closed v2 admission and its containing attempt."""
+
+    successor = {"task_id": "successor-task", "attempt_id": "successor-attempt"}
+    binding = {
+        "schema": "tpen-executor/member-invocation-v2",
+        "allocation_attempt": {
+            "schema": "tpen-executor/allocation-attempt-v2",
+            "group_id": {"schema": "tpen-executor/group-id-v2", "value": "g"},
+            "allocation_attempt_id": {"schema": "tpen-executor/allocation-attempt-id-v2", "value": "lease"},
+            "allocation_id": {"schema": "tpen-executor/allocation-id-v1", "value": "allocation"},
+            "backend_job_id": {"schema": "tpen-executor/backend-job-id-v1", "value": "job"},
+            "controller_generation": "controller",
+            "observed_at_utc": "2026-11-14T00:02:00Z",
+        },
+        "group_digest": "c" * 64,
+        "task_id": successor["task_id"],
+        "lineage_id": "lineage",
+        "attempt_id": {"schema": "tpen-executor/attempt-id-v1", "value": successor["attempt_id"]},
+        "invocation_id": {"schema": "tpen-executor/invocation-id-v2", "value": "invocation"},
+    }
+    return {
+        "schema": "tpen-executor/successor-admission-v2",
+        "predecessor": {"task_id": "predecessor-task", "attempt_id": "predecessor-attempt", "content_id": "a" * 64},
+        "successor": successor,
+        "request_digest": "b" * 64,
+        "core_acceptance_digest": "d" * 64,
+        "successor_binding": binding,
+    }, {"task_id": "predecessor-task", "attempt_id": "predecessor-attempt"}
+
+
+def test_successor_admission_schema_and_binding_validation() -> None:
+    admission, attempt = _successor_admission_fixture()
+
+    record = _successor_admission(admission, {"task_id": "predecessor-task", "attempt_id": "predecessor-attempt"})
+    assert record["successor_binding"]["task_id"] == "successor-task"
+    assert record["successor_binding"]["attempt_id"]["value"] == "successor-attempt"
+
+    unknown = dict(admission, schema="tpen-executor/successor-admission-v3")
+    with pytest.raises(ManifestRefusal, match="schema is unsupported"):
+        _successor_admission(unknown, attempt)
+
+    v1_with_binding = dict(admission, schema="tpen-executor/successor-admission-v1")
+    with pytest.raises(ManifestRefusal, match="keys differ"):
+        _successor_admission(v1_with_binding, attempt)
+
+    v2_without_binding = dict(admission)
+    v2_without_binding.pop("successor_binding")
+    with pytest.raises(ManifestRefusal, match="keys differ"):
+        _successor_admission(v2_without_binding, attempt)
+
+    binding_extra = dict(admission)
+    binding_extra["successor_binding"] = dict(admission["successor_binding"], extra="refuse")
+    with pytest.raises(ManifestRefusal, match="keys differ"):
+        _successor_admission(binding_extra, attempt)
+
+    binding_task_mismatch = dict(admission)
+    binding_task_mismatch["successor_binding"] = dict(admission["successor_binding"], task_id="foreign-task")
+    with pytest.raises(ManifestRefusal, match="disagrees with successor task"):
+        _successor_admission(binding_task_mismatch, attempt)
+
+    binding_attempt_mismatch = dict(admission)
+    binding_attempt_mismatch["successor_binding"] = dict(
+        admission["successor_binding"],
+        attempt_id={"schema": "tpen-executor/attempt-id-v1", "value": "foreign-attempt"},
+    )
+    with pytest.raises(ManifestRefusal, match="disagrees with successor attempt"):
+        _successor_admission(binding_attempt_mismatch, attempt)
+
+
+def test_real_executor_v2_segment_manifest_reads_as_committed_chain(tmp_path: Path) -> None:
+    """The toolkit reader consumes a DirectoryStore v2 segment end to end."""
+
+    manifest = tmp_path / "manifest.json"
+    code = '''import sys
+from pathlib import Path
+from tpen_executor._codec import digest
+from tpen_executor.allocations import AllocationAttemptV2, ConfiguredAllocation
+from tpen_executor.contracts import AllocationAttemptId, AllocationId, BackendJobId, ExecutionPlanV2, GroupId, InvocationId, ProgramSpecRef, ReadyGroupV2, TaskSpec
+from tpen_executor.runners import CoreRunEvidence
+from tpen_executor.storage import DirectoryStore
+
+destination = Path(sys.argv[1])
+program = ProgramSpecRef({}, digest({}))
+task = TaskSpec("task", "task", program, digest("task"), 1, "steps")
+plan_ref = {"members": ["task"], "plan": "s6a"}
+plan = ExecutionPlanV2(plan_ref, digest(plan_ref), ("task",), "native-recovery/v2", "preserve-or-park/v1")
+group = ReadyGroupV2(GroupId("g"), (task,), plan)
+store = DirectoryStore(destination / "store")
+allocation = ConfiguredAllocation(AllocationId("allocation"), BackendJobId("job"), {})
+lease = AllocationAttemptV2(group.group_id, AllocationAttemptId("lease"), allocation.allocation_id, allocation.backend_job_id, "controller", "2026-11-14T00:00:00Z")
+fence = store.begin_attempt(group, "task", allocation, "2026-11-14T00:00:00Z", allocation_attempt=lease, invocation_id=InvocationId("invocation"))
+store.finish_attempt(fence, "completed", "2026-11-14T00:01:00Z")
+core_dir = Path(fence.output_dir) / "core"
+checkpoint_dir = core_dir / "checkpoints" / "step_000001"
+checkpoint_dir.mkdir(parents=True)
+evidence = CoreRunEvidence.from_mapping({
+    "schema": "tpen.run-evidence/v2",
+    "run_dir": str(core_dir),
+    "verdict": "completed",
+    "run_status": "completed",
+    "checkpoint": {
+        "checkpoint_dir": str(checkpoint_dir),
+        "schema_version": 1,
+        "next_iteration": 1,
+        "completed_updates": 1,
+    },
+    "refusal": None,
+    "resolved_config_identity": {"schema": "tpen-config-identity-v1", "sha256": "a" * 64},
+})
+store.accept_segment(fence, evidence)
+(destination / "manifest.json").write_bytes(store.manifest(group).encode())
+'''
+    written = _executor(code, tmp_path)
+    assert written.returncode == 0, written.stderr
+
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    checkpoint_dir = payload["segments"][0]["checkpoint_dir"]
+
+    def inspect(run_dir: str | Path) -> dict[str, object]:
+        return {
+            "verdict": "completed",
+            "checkpoint": {
+                "checkpoint_dir": checkpoint_dir,
+                "schema_version": 1,
+                "next_iteration": 1,
+                "completed_updates": 1,
+            },
+            "resolved_config_identity": {"schema": "tpen-config-identity-v1", "sha256": "a" * 64},
+        }
+
+    result = read(manifest, inspect)
+    assert len(result.chains) == 1
+    assert result.chains[0].task_id == "task"
+    assert result.chains[0].segments[0].checkpoint_dir == checkpoint_dir
 
 
 def _placement_receipt(output_dir: str = "/runs/group-1/task-a/attempt-1") -> dict[str, object]:

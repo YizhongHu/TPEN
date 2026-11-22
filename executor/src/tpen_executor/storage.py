@@ -1782,12 +1782,12 @@ class DirectoryStore:
             raise FenceRejected("stale attempt fence")
         return self._validate_fence_immutable(fence, task_dir)
 
-    def manifest(self, group: ReadyGroup) -> RunManifest:
+    def manifest(self, group: ReadyGroup | ReadyGroupV2) -> RunManifest:
         """Rebuild a strict manifest only from durable receipts on disk.
 
         Parameters
         ----------
-        group : ReadyGroup
+        group : ReadyGroup or ReadyGroupV2
             Group whose expected digest and member task namespace are read.
 
         Returns
@@ -1800,7 +1800,7 @@ class DirectoryStore:
         Raises
         ------
         TypeError
-            If ``group`` is not a :class:`ReadyGroup`.
+            If ``group`` is not a :class:`ReadyGroup` or :class:`ReadyGroupV2`.
         ValueError, OSError
             If any store component, receipt, or directory entry is malformed,
             foreign, truncated, or a symlink.
@@ -1810,23 +1810,34 @@ class DirectoryStore:
         The store requires POSIX directories and advisory locking for its
         writer protocol.  Symlink swapping during a call is outside this
         contract; pre-existing symlinks are always refused.
+
+        For a :class:`ReadyGroupV2`, ``RunManifest.group_id`` is the opaque
+        ``GroupId.value`` string and ``RunManifest.group_digest`` remains the
+        order-sensitive ``ReadyGroupV2.identity`` digest.  This is the only
+        v2 projection; receipt and segment fields retain their existing wire
+        schemas.
         """
-        if not isinstance(group, ReadyGroup):
-            raise TypeError("group must be ReadyGroup")
+        if not isinstance(group, (ReadyGroup, ReadyGroupV2)):
+            raise TypeError("group must be ReadyGroup or ReadyGroupV2")
         group_dir = self._group_dir(group)
         attempts: list[ManifestAttempt] = []
         segments: list[AcceptedSegment] = []
         admissions: dict[tuple[str, AttemptId], SuccessorAdmissionRecord] = {}
+        # ReadyGroupV2 validates that plan member IDs equal the task records.
         members = {member.task_id for member in group.members}
+        if isinstance(group, ReadyGroupV2):
+            manifest_group_id = group.group_id.value
+        else:
+            manifest_group_id = group.group_id
         if not os.path.lexists(self.root):
-            return RunManifest(group.group_id, group.identity, ())
+            return RunManifest(manifest_group_id, group.identity, ())
         _require_directory(self.root, "store root", ValueError)
         groups_dir = _lexical(os.path.join(self.root, "groups"))
         if not os.path.lexists(groups_dir):
-            return RunManifest(group.group_id, group.identity, ())
+            return RunManifest(manifest_group_id, group.identity, ())
         _require_directory(groups_dir, "groups directory", ValueError)
         if not os.path.lexists(group_dir):
-            return RunManifest(group.group_id, group.identity, ())
+            return RunManifest(manifest_group_id, group.identity, ())
         _require_directory(group_dir, "group directory", ValueError)
         for task_id in sorted(os.listdir(group_dir)):
             task_dir = _lexical(os.path.join(group_dir, task_id))
@@ -1900,6 +1911,16 @@ class DirectoryStore:
                     segments.append(segment)
                 attempts.append(ManifestAttempt(task_id, start.attempt_id, start, outcome, start.output_dir, placement, core_outcome))
             for admission in self._admission_records_for_task(task_dir, task_id):
+                if isinstance(group, ReadyGroupV2):
+                    binding = admission.successor_binding
+                    member = next(member for member in group.members if member.task_id == task_id)
+                    if (
+                        binding is None
+                        or binding.allocation_attempt.group_id != group.group_id
+                        or binding.group_digest != group.identity
+                        or binding.lineage_id != member.lineage_id
+                    ):
+                        raise ValueError("successor admission binding is foreign to v2 group")
                 key = (task_id, admission.predecessor_attempt_id)
                 if key in admissions:
                     raise ValueError("successor admission ledger contains a predecessor fork")
@@ -1929,7 +1950,7 @@ class DirectoryStore:
             for attempt in attempts
         ]
         segments.sort(key=lambda item: (item.task_id, item.next_iteration, item.completed_updates))
-        return RunManifest(group.group_id, group.identity, tuple(projected_attempts), tuple(segments))
+        return RunManifest(manifest_group_id, group.identity, tuple(projected_attempts), tuple(segments))
 
 
 def _write_pointer(path: str, attempt_id: str) -> None:
