@@ -546,6 +546,7 @@ def test_manifest_producer_consumers_preserve_selection_and_verdict(monkeypatch,
     (output / "checkpoints" / "step_002000" / "manifest.json").write_text(json.dumps({"completed_updates": 2000, "next_iteration": 2000}))
     (output / "checkpoints" / "step_002000" / "trainer.json").write_text(json.dumps({"completed_updates": 2000, "next_iteration": 2000}))
     (output / "checkpoints" / "step_002000" / "COMPLETE").write_text("done\n")
+    (output / "final-tensors.json").write_text("{}\n")
     producer_path = run_root / "producer.json"
     producer_path.write_text(json.dumps(producer))
     no_cell_path = run_root / "without-cell.json"
