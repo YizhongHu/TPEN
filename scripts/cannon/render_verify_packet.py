@@ -7,8 +7,6 @@ specification, and executes the rendered shell body in a dry environment before
 reporting the command an operator may submit.
 """
 
-from __future__ import annotations
-
 import argparse
 import hashlib
 import json
@@ -19,7 +17,7 @@ import shlex
 import subprocess
 import sys
 import tarfile
-from typing import Sequence
+from typing import Dict, List, Optional, Sequence
 
 
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -76,7 +74,7 @@ def _validate_rel_path(value: str, label: str) -> None:
         raise RenderError(f"{label} must be a relative path without '..': {value!r}")
 
 
-def _load_mutants(path: Path) -> list[dict[str, str]]:
+def _load_mutants(path: Path) -> List[Dict[str, str]]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -84,7 +82,7 @@ def _load_mutants(path: Path) -> list[dict[str, str]]:
     rows = payload if isinstance(payload, list) else payload.get("mutants") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
         raise RenderError("malformed mutant spec: expected a list or {mutants: list}")
-    result: list[dict[str, str]] = []
+    result: List[Dict[str, str]] = []
     for row in rows:
         if isinstance(row, dict):
             result.append({key: str(row.get(key, "")) for key in ("id", "target", "old", "new", "killer")})
@@ -157,7 +155,7 @@ def _render_body(
     uv_bin: str,
     shared_env_prefix: str,
     tests: Sequence[str],
-    mutant_spec: Path | None,
+    mutant_spec: Optional[Path],
     account: str,
     wall_time: str,
 ) -> str:
@@ -238,7 +236,7 @@ def _render_body(
     return "\n".join(lines) + "\n"
 
 
-def _dry_execute(body_path: Path, task_root: Path, run_root: Path, mutant_spec: Path | None) -> None:
+def _dry_execute(body_path: Path, task_root: Path, run_root: Path, mutant_spec: Optional[Path]) -> None:
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "USER": "packet-renderer",
@@ -262,7 +260,7 @@ def _dry_execute(body_path: Path, task_root: Path, run_root: Path, mutant_spec: 
         raise RenderError("mutant spec disappeared before dry-execute")
 
 
-def _validate_body(body: str, body_path: Path, task_root: Path, run_root: Path, mutant_spec: Path | None) -> None:
+def _validate_body(body: str, body_path: Path, task_root: Path, run_root: Path, mutant_spec: Optional[Path]) -> None:
     if r"\$" in body:
         raise RenderError("rendered body contains a literal backslash-dollar")
     if "DRY_RUN=1" in body:
@@ -290,12 +288,12 @@ def render_packet(
     tests: Sequence[str],
     run_root: str,
     packet_dir: str,
-    repo_root: str | None = None,
-    mutants: str | None = None,
+    repo_root: Optional[str] = None,
+    mutants: Optional[str] = None,
     job_name: str = "verify",
     wall_time: str = "00:45:00",
-    facility_run_prefix: str | None = None,
-    shared_env_prefix: str | None = None,
+    facility_run_prefix: Optional[str] = None,
+    shared_env_prefix: Optional[str] = None,
     uv_bin: str = "/n/home10/rhu/.local/bin/uv",
     repo_url: str = "https://github.com/YizhongHu/TPEN.git",
     account: str = "kozinsky_lab",
@@ -335,8 +333,8 @@ def render_packet(
     stage.mkdir()
     _stage_scripts(repo, sha, stage)
     staged_helper = stage / "scripts/cannon/mutants.py"
-    spec_dest: Path | None = None
-    rows: list[dict[str, str]] = []
+    spec_dest: Optional[Path] = None
+    rows: List[Dict[str, str]] = []
     if mutants is not None:
         if not Path(mutants).is_absolute():
             raise RenderError("mutant spec path must be absolute")
@@ -406,7 +404,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         args = _parser().parse_args(argv)
         render_packet(
