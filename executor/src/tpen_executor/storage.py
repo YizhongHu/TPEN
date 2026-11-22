@@ -72,6 +72,14 @@ class AdmissionIntentMismatch(SuccessorAdmissionReadError):
     """Raised when caller intent does not match the admitted request digest."""
 
 
+class _AdmissionLedgerIdentityMismatch(ValueError):
+    """Internal marker for a ledger record crossed with its task."""
+
+
+class _AdmissionCoreIdentityMismatch(FenceRejected):
+    """Internal marker for predecessor core evidence crossed with its fence."""
+
+
 @frozen_record
 class AttemptFence:
     """Opaque identity binding for one store-owned attempt.
@@ -1410,10 +1418,10 @@ class DirectoryStore:
         return request
 
     def _continuation_predecessor_locked(
-        self, fence: AttemptFence, task_dir: str,
+        self, fence: AttemptFence, task_dir: str, *, current: bool = True,
     ) -> tuple[StartReceipt, CoreOutcomeRecord]:
         """Read the complete continuation predicate while the task is locked."""
-        start = self._validate_fence(fence, task_dir)
+        start = self._validate_fence(fence, task_dir) if current else self._validate_fence_immutable(fence, task_dir)
         output_dir = _lexical(fence.output_dir)
         core_path = _lexical(os.path.join(output_dir, "core"))
         _require_directory(core_path, "core evidence directory")
@@ -1480,7 +1488,7 @@ class DirectoryStore:
             or record.attempt_id != start.attempt_id
             or record_core_dir != expected_core_dir
         ):
-            raise FenceRejected("core outcome record crosses the attempt fence")
+            raise _AdmissionCoreIdentityMismatch("core outcome record crosses the attempt fence")
         if not record.continuation_eligible or record.outcome != "planned_yield":
             raise FenceRejected("core outcome is not a continuation-eligible planned yield")
         checkpoint_ref = record.evidence.get("checkpoint_ref")
@@ -1664,7 +1672,7 @@ class DirectoryStore:
             if encoded != record.encode():
                 raise ValueError("successor admission record is not canonical")
             if record.predecessor_task_id != task_id or record.predecessor_attempt_id.value != predecessor_attempt_id:
-                raise ValueError("foreign successor admission record in task store")
+                raise _AdmissionLedgerIdentityMismatch("foreign successor admission record in task store")
             if record.predecessor_attempt_id in seen:
                 raise ValueError("successor admission ledger contains a predecessor fork")
             seen.add(record.predecessor_attempt_id)
@@ -2083,9 +2091,9 @@ def read_successor_admission(
         with _task_lock(os.path.join(task_dir, _TASK_LOCK)):
             try:
                 records = store._admission_records_for_task(task_dir, task_id)
+            except _AdmissionLedgerIdentityMismatch as error:
+                raise AdmissionIdentityMismatch("successor admission crosses task identity") from error
             except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-                if "foreign" in str(error) or "cross" in str(error):
-                    raise AdmissionIdentityMismatch("successor admission crosses task identity") from error
                 raise AdmissionUnreadable("successor admission ledger is unreadable") from error
             if any(record.successor_task_id != task_id for record in records):
                 raise AdmissionIdentityMismatch("successor admission crosses task identity")
@@ -2121,13 +2129,9 @@ def read_successor_admission(
                 predecessor_dir,
             )
             try:
-                _, core_record = store._continuation_predecessor_locked(predecessor, task_dir)
-            except AdmissionIdentityMismatch:
-                raise
-            except FenceRejected as error:
-                if "cross" in str(error):
-                    raise AdmissionIdentityMismatch("predecessor core outcome crosses admission identity") from error
-                raise AdmissionUnreadable("predecessor core outcome is unreadable") from error
+                _, core_record = store._continuation_predecessor_locked(predecessor, task_dir, current=False)
+            except _AdmissionCoreIdentityMismatch as error:
+                raise AdmissionIdentityMismatch("predecessor core outcome crosses admission identity") from error
             except (OSError, TypeError, ValueError, FenceRejected, json.JSONDecodeError) as error:
                 raise AdmissionUnreadable("predecessor core outcome is unreadable") from error
             request = store._successor_request_from_record(
