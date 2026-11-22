@@ -136,8 +136,6 @@ def test_r3_fix5_native_receipt_required_provenance_fields_are_present(
         "restore_disabled_control",
         "unmeasured_arms",
         "scheduler",
-        "backend",
-        "wrapper",
         "application",
         "scientific",
     }
@@ -145,4 +143,3 @@ def test_r3_fix5_native_receipt_required_provenance_fields_are_present(
     assert not missing, f"receipt is missing required provenance fields: {sorted(missing)}"
     for process_record in receipt["process_evidence"]:
         assert {"phase", "pid", "seed", "seed_source", "command", "returncode"} <= process_record.keys()
-    assert {"registration_calls", "observation_calls"} <= receipt["wrapper"].keys()

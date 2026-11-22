@@ -330,6 +330,13 @@ def test_r5_qualification_receipt_records_checkpoint_faults(r5_qualification_rec
 
 
 @pytest.mark.integration
+# PREDICTED: GREEN at CR (issue 4 control)
+def test_r5_qualification_receipt_records_scheduler_layer(r5_qualification_receipt):
+    layers = {entry.get("layer") for entry in r5_qualification_receipt["raw_fault_evidence"]}
+    assert "scheduler" in layers, f"observed raw_fault_evidence layers={layers!r}"
+
+
+@pytest.mark.integration
 # PREDICTED: RED at CR (issue 5)
 def test_r5_native_worker_refuses_config_not_bound_to_intent(tmp_path):
     changed = tmp_path / "changed.yaml"
