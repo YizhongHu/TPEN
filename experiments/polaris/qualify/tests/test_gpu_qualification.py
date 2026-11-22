@@ -125,12 +125,8 @@ def test_qualification_job_name_uses_cell_and_commit_sha() -> None:
         pass
     else:
         raise AssertionError("accepted an over-long qualification job name")
-    try:
-        stage.qualification_job_name("bad_name", "a" * 40)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("accepted an invalid generated qualification job name")
+    assert stage.qualification_job_name("q_o1.w2048", "a" * 40) == "hiq-o1-w20-gate-hi-aaaaaaaa"
+    assert stage.qualification_job_name("___...", "a" * 40) == "hi-gate-hi-aaaaaaaa"
 
 
 def test_only_current_q_surface_is_admitted() -> None:
@@ -428,13 +424,13 @@ def test_stage_real_clone_and_qsub_fakes(monkeypatch, tmp_path: Path) -> None:
 
     root = tmp_path / "runs"
     try:
-        assert stage.stage(args("green", root)) == 0
+        assert stage.stage(args("q_o1.w2048", root)) == 0
     except Exception as error:
         raise AssertionError(f"stage raised before qsub: {error}") from error
-    run_root = root / "green"
+    run_root = root / "q_o1.w2048"
     run_root = run_root.resolve()
     manifest = json.loads((run_root / "manifest.json").read_text())
-    expected = ["qsub", "-N", "higreen-gate-hi-" + target_sha[:8], "-V", "-A", "HetRxnEnergy", "-q", "debug", "-l", "select=1:system=polaris", "-l", "walltime=00:20:00", "-l", "filesystems=home:eagle", "-o", str(run_root / "pbs") + "/", "-e", str(run_root / "pbs") + "/", "-v", "RUN_ENV_PATH=" + str(run_root / "run.env"), str(run_root / "harness" / "job.pbs")]
+    expected = ["qsub", "-N", "hiq-o1-w20-gate-hi-" + target_sha[:8], "-V", "-A", "HetRxnEnergy", "-q", "debug", "-l", "select=1:system=polaris", "-l", "walltime=00:20:00", "-l", "filesystems=home:eagle", "-o", str(run_root / "pbs") + "/", "-e", str(run_root / "pbs") + "/", "-v", "RUN_ENV_PATH=" + str(run_root / "run.env"), str(run_root / "harness" / "job.pbs")]
     assert qsub_calls[-1] == expected and manifest["extra"] == "cu126", repr(qsub_calls[-1]) + " != " + repr(expected)
     run_env_text = (run_root / "run.env").read_text()
     for key, value in (("RUN_CACHE_DIR", manifest["cache_dir"]), ("RUN_PROJECT", manifest["target_repo"])):

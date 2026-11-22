@@ -94,8 +94,15 @@ def validate_job_name(name: str) -> str:
 
 
 def qualification_job_name(cell_id: str, target_sha: str) -> str:
-    """Build and validate the operator name from the manifest cell identifier."""
-    return validate_job_name(f"hi{cell_id[:8]}-gate-hi-{target_sha[:8]}")
+    """Build a validated name, sanitizing the cell-id fragment for PBS.
+
+    Non-alphanumeric cell-id characters become hyphens; repeated, leading, and
+    trailing hyphens are removed. An empty fragment is omitted.
+    """
+    fragment = re.sub(r"[^A-Za-z0-9]", "-", cell_id[:8])
+    fragment = re.sub(r"-+", "-", fragment).strip("-")
+    subject = f"hi{fragment}"
+    return validate_job_name(f"{subject}-gate-hi-{target_sha[:8]}")
 
 
 def _validate(args: argparse.Namespace) -> None:
