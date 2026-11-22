@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Rendered by submit_devsuite.sh for one exact dev SHA.
+# The submitted root arm is intentionally serial and CPU-only.
+#SBATCH --partition=test
+#SBATCH --account=kozinsky_lab
+#SBATCH --job-name=__ROOT_JOB_NAME__
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=16G
+#SBATCH --time=02:00:00
+#SBATCH --output=__ROOT_RUN_ROOT__/slurm-%j.out
+#SBATCH --error=__ROOT_RUN_ROOT__/slurm-%j.err
+
+set -Eeuo pipefail
+
+fail_precheck() {
+  printf 'PRECHECK_FAILED %s\n' "$*" >&2
+  exit 2
+}
+
+HEAD_SHA="${HEAD_SHA:-__HEAD_SHA__}"
+JOB_NAME="${JOB_NAME:-__ROOT_JOB_NAME__}"
+TASK_ROOT="${TASK_ROOT:-__ROOT_TASK_ROOT__}"
+RUN_ROOT="${RUN_ROOT:-__ROOT_RUN_ROOT__}"
+REPO_URL="${REPO_URL:-__REPO_URL_DEFAULT__}"
+FACILITY_RUN_PREFIX="/n/netscratch/kozinsky_lab/Lab/rhu"
+SHARED_ENV_PREFIX="/n/holystore01/LABS/kozinsky_lab/Lab/User/rhu/envs"
+UV_BIN="/n/home10/rhu/.local/bin/uv"
+
+precheck() {
+  [[ "${SLURM_JOB_PARTITION:-}" == test ]] || fail_precheck "partition must be test, got ${SLURM_JOB_PARTITION:-unset}"
+  [[ "${HEAD_SHA}" =~ ^[0-9a-fA-F]{40}$ ]] || fail_precheck "HEAD_SHA must be full 40-hex"
+  [[ "${JOB_NAME}" =~ ^[A-Za-z0-9_.-]+$ ]] || fail_precheck "JOB_NAME contains unsafe characters"
+  [[ "${JOB_NAME}" == *"${HEAD_SHA:0:12}"* ]] || fail_precheck "JOB_NAME must contain SHA[:12]"
+  [[ "${RUN_ROOT}" == "${FACILITY_RUN_PREFIX}"/* ]] || fail_precheck "RUN_ROOT escapes facility prefix"
+  [[ "${RUN_ROOT}" == /* ]] || fail_precheck "RUN_ROOT must be absolute"
+  [[ -n "${REPO_URL}" ]] || fail_precheck "REPO_URL is empty"
+  if [[ -n "${SLURM_JOB_NAME:-}" ]]; then
+    [[ "${SLURM_JOB_NAME}" == "${JOB_NAME}" ]] || fail_precheck "SLURM_JOB_NAME differs from JOB_NAME"
+  fi
+  [[ -f "${TASK_ROOT}/scripts/cannon/verify.sh" ]] || fail_precheck "staged verify.sh missing"
+  [[ -f "${TASK_ROOT}/scripts/cannon/shared-env-policy.json" ]] || fail_precheck "staged scripts/cannon sidecar missing"
+  [[ -d "${TASK_ROOT}/scripts/cannon/tests" ]] || fail_precheck "staged Cannon test preflight directory missing"
+  bash -n "${TASK_ROOT}/scripts/cannon/verify.sh" || fail_precheck "staged verify.sh has shell syntax errors"
+}
+
+# The typo below is deliberately not used; keep the check explicit without a
+# false environment dependency on the login node's uv installation.
+precheck
+if [[ "${DEVSUITE_PRECHECK:-0}" == 1 ]]; then
+  printf 'ROOT_PRECHECK PASS sha=%s job=%s partition=%s run_root=%s\n' \
+    "$HEAD_SHA" "$JOB_NAME" "$SLURM_JOB_PARTITION" "$RUN_ROOT"
+  exit 0
+fi
+
+export USER="${USER:?USER required}"
+export WORK_ROOT="/scratch/${USER}/${SLURM_JOB_ID:?SLURM_JOB_ID required}"
+export FACILITY_RUN_PREFIX SHARED_ENV_PREFIX UV_BIN RUN_ROOT REPO_URL
+export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:-} --durations=60"
+
+# verify.sh is staged byte-for-byte from the exact SHA and invoked through its
+# full-suite interface. No test or mutation command is duplicated here.
+exec "${TASK_ROOT}/scripts/cannon/verify.sh" \
+  --sha "$HEAD_SHA" \
+  --run-root "$RUN_ROOT" \
+  --mode measure \
+  --typecheck on \
+  --parallel serial \
+  --full-suite \
+  --test scripts/cannon/tests
