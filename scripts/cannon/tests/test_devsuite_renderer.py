@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -20,11 +21,80 @@ def render(*, scheduled: bool) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, cwd=REPO_ROOT, text=True, capture_output=True, check=False)
 
 
+def git_bytes(repo: Path, *args: str) -> bytes:
+    """Return bytes from a git command without decoding harness content."""
+
+    return subprocess.check_output(["git", *args], cwd=repo)
+
+
+def git_text(repo: Path, *args: str) -> str:
+    """Return a stripped text value from a git command."""
+
+    return git_bytes(repo, *args).decode().strip()
+
+
 def test_local_render_uses_exact_sha_harness() -> None:
     result = render(scheduled=False)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "harness_source=scripts/cannon/executor-harness" in result.stdout
     assert f"harness_source_sha={SHA}" in result.stdout
+
+
+def test_local_render_stages_harness_from_sha_not_any_other_ref(tmp_path: Path) -> None:
+    """Inspect staged bytes when the SHA is neither HEAD nor the worktree."""
+
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "--no-hardlinks", str(REPO_ROOT), str(clone)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(["git", "-C", str(clone), "config", "user.name", "renderer-test"], check=True)
+    subprocess.run(
+        ["git", "-C", str(clone), "config", "user.email", "renderer-test@example.invalid"],
+        check=True,
+    )
+
+    harness_rel = Path("scripts/cannon/executor-harness/helpers/validate_inputs.sh")
+    harness_path = clone / harness_rel
+    original = harness_path.read_bytes()
+    base_head = git_text(clone, "rev-parse", "HEAD")
+
+    harness_path.write_bytes(original + b"\n# target SHA marker\n")
+    subprocess.run(["git", "-C", str(clone), "add", str(harness_rel)], check=True)
+    subprocess.run(["git", "-C", str(clone), "commit", "-m", "test target harness bytes"], check=True, capture_output=True)
+    target_sha = git_text(clone, "rev-parse", "HEAD")
+
+    subprocess.run(["git", "-C", str(clone), "reset", "--hard", base_head], check=True, capture_output=True)
+    harness_path.write_bytes(original + b"\n# origin dev marker\n")
+    subprocess.run(["git", "-C", str(clone), "add", str(harness_rel)], check=True)
+    subprocess.run(["git", "-C", str(clone), "commit", "-m", "test origin dev harness bytes"], check=True, capture_output=True)
+    origin_dev_sha = git_text(clone, "rev-parse", "HEAD")
+    subprocess.run(["git", "-C", str(clone), "reset", "--hard", base_head], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(clone), "update-ref", "refs/remotes/origin/dev", origin_dev_sha],
+        check=True,
+    )
+    harness_path.write_bytes(original + b"\n# working tree marker\n")
+
+    assert target_sha not in {base_head, origin_dev_sha}
+    stage_export = tmp_path / "staged"
+    result = subprocess.run(
+        [str(clone / "scripts/cannon/devsuite/submit_devsuite.sh"), "--local-dry-run", target_sha],
+        cwd=clone,
+        env={**os.environ, "DEVSUITE_LOCAL_STAGE_DIR": str(stage_export)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    staged = (stage_export / "root" / harness_rel).read_bytes()
+    assert staged == git_bytes(clone, "show", f"{target_sha}:{harness_rel}")
+    assert staged != git_bytes(clone, "show", f"{base_head}:{harness_rel}")
+    assert staged != git_bytes(clone, "show", f"{origin_dev_sha}:{harness_rel}")
+    assert staged != harness_path.read_bytes()
 
 
 def test_scheduled_render_carries_marker() -> None:

@@ -16,6 +16,7 @@ EXECUTOR_ONLY=0
 LOCAL_DRY_RUN=0
 SCHEDULED=0
 STAGE_BASE="${DEVSUITE_STAGE_BASE:-$VERIFY_PREFIX}"
+LOCAL_STAGE_EXPORT="${DEVSUITE_LOCAL_STAGE_DIR:-}"
 BUNDLE_HEAD_REF=""
 BUNDLE_REQUIRED_REF=""
 
@@ -67,6 +68,12 @@ REPO_URL="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null)" || fail "ori
 
 [[ "$STAGE_BASE" == "$VERIFY_PREFIX" || "$STAGE_BASE" == "$VERIFY_PREFIX"/* ]] || fail "stage base escapes Cannon verify prefix"
 [[ "$STAGE_BASE" != */ ]] || fail "stage base must not have a trailing slash"
+if [[ -n "$LOCAL_STAGE_EXPORT" ]]; then
+  [[ "$LOCAL_DRY_RUN" == 1 ]] || fail "DEVSUITE_LOCAL_STAGE_DIR requires --local-dry-run"
+  [[ "$LOCAL_STAGE_EXPORT" == /* ]] || fail "local stage export must be an absolute path"
+  [[ ! -e "$LOCAL_STAGE_EXPORT" ]] || fail "local stage export already exists: $LOCAL_STAGE_EXPORT"
+  mkdir -p -- "$LOCAL_STAGE_EXPORT"
+fi
 if [[ -n "$EXECUTOR_MUTANTS" ]]; then
   [[ "$EXECUTOR_MUTANTS" == /* ]] || fail "executor mutant spec path must be absolute"
   [[ -f "$EXECUTOR_MUTANTS" ]] || fail "executor mutant spec does not exist"
@@ -188,6 +195,14 @@ write_local_manifest "$ROOT_LOCAL" "$TMP_ROOT/root.sha256"
 write_local_manifest "$EXECUTOR_LOCAL" "$TMP_ROOT/executor.sha256"
 if [[ -n "$EXECUTOR_MUTANTS" ]]; then
   printf 'EXECUTOR_MUTANTS_SHA256 PASS spec=%s sha256=%s\n' "$EXECUTOR_MUTANTS" "$(hash_local "$EXECUTOR_MUTANTS")"
+fi
+
+if [[ -n "$LOCAL_STAGE_EXPORT" ]]; then
+  # The local-only export lets contract tests inspect the bytes that were
+  # staged from the requested SHA without exposing a remote staging path.
+  mkdir -p -- "$LOCAL_STAGE_EXPORT/root" "$LOCAL_STAGE_EXPORT/executor"
+  tar -C "$ROOT_LOCAL" -cf - . | tar -C "$LOCAL_STAGE_EXPORT/root" -xf -
+  tar -C "$EXECUTOR_LOCAL" -cf - . | tar -C "$LOCAL_STAGE_EXPORT/executor" -xf -
 fi
 
 if [[ "$LOCAL_DRY_RUN" == 1 ]]; then

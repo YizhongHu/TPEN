@@ -16,12 +16,12 @@ committed SHA-256 values must match:
 
 ## Known local paths in imported text
 
-These local-path documentation lines are intentionally retained for the
-byte-identical T0 import. PR-B will replace them when it renders the executor
-harness from `scripts/cannon/executor-harness/` at the SHA under test:
+These local-path documentation lines were intentionally retained for the
+byte-identical T0 import. PR-B removed the private literals while preserving
+the history of what the imported text documented:
 
-- `README.md:29`: `HARNESS=/Users/yizhonghu/tpen-manager-receipts/executor-harness-v3-release-rc2-ca0f93b3-20261111T092513Z`
-- `README.md:112`: `Template: /Users/yizhonghu/.paseo/stage1-evidence/devsuite-template/`
+- `README.md:29`: an external laptop-local executor-harness directory (removed by PR-B)
+- `README.md:112`: an external local devsuite-template directory (removed by PR-B)
 
 ## PR-B intentional divergence
 

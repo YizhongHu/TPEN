@@ -20,6 +20,13 @@
       "old": "SCHEDULED_PREFIX=\"\"\nif [[ \"$SCHEDULED\" == 1 ]]; then",
       "new": "SCHEDULED_PREFIX=\"scheduled-\"\nif [[ \"$SCHEDULED\" == 1 ]]; then",
       "killer": "test_devsuite_renderer.py::test_manual_render_has_no_marker"
+    },
+    {
+      "id": "staged-tree-from-origin-dev",
+      "target": "scripts/cannon/devsuite/submit_devsuite.sh",
+      "old": "git -C \"$REPO_ROOT\" archive \"$HEAD_SHA\" scripts/cannon | tar -x -C \"$ROOT_LOCAL\"",
+      "new": "git -C \"$REPO_ROOT\" archive origin/dev scripts/cannon | tar -x -C \"$ROOT_LOCAL\"",
+      "killer": "test_devsuite_renderer.py::test_local_render_stages_harness_from_sha_not_any_other_ref"
     }
   ]
 }
