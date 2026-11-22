@@ -55,12 +55,6 @@ def test_local_render_stages_harness_from_sha_not_any_other_ref(tmp_path: Path) 
         ["git", "-C", str(clone), "config", "user.email", "renderer-test@example.invalid"],
         check=True,
     )
-    # Mutation arms edit the source checkout after its committed HEAD is set.
-    # Copy that current launcher into the throwaway clone so this test really
-    # exercises the deliberate edit instead of a clean committed launcher.
-    clone_launcher = clone / "scripts" / "cannon" / "devsuite" / "submit_devsuite.sh"
-    clone_launcher.write_bytes(LAUNCHER.read_bytes())
-
     harness_rel = Path("scripts/cannon/executor-harness/helpers/validate_inputs.sh")
     harness_path = clone / harness_rel
     original = harness_path.read_bytes()
@@ -81,10 +75,16 @@ def test_local_render_stages_harness_from_sha_not_any_other_ref(tmp_path: Path) 
         ["git", "-C", str(clone), "update-ref", "refs/remotes/origin/dev", origin_dev_sha],
         check=True,
     )
+    # Mutation arms edit the source checkout after its committed HEAD is set.
+    # Copy that current launcher after the final reset so the throwaway clone
+    # really exercises the deliberate edit instead of a clean committed launcher.
+    clone_launcher = clone / "scripts" / "cannon" / "devsuite" / "submit_devsuite.sh"
+    clone_launcher.write_bytes(LAUNCHER.read_bytes())
     harness_path.write_bytes(original + b"\n# working tree marker\n")
 
     assert target_sha not in {base_head, origin_dev_sha}
     stage_export = tmp_path / "staged"
+    assert clone_launcher.read_bytes() == LAUNCHER.read_bytes()
     result = subprocess.run(
         [str(clone / "scripts/cannon/devsuite/submit_devsuite.sh"), "--local-dry-run", target_sha],
         cwd=clone,
