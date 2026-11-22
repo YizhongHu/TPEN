@@ -224,13 +224,26 @@ def mark_partial(message):
     reason = reason or message
 
 
-def escaped(value):
-    return repr(str(value))[1:-1]
+def escape_tsv(value):
+    """Escape exactly the four TSV control characters used by MANIFEST.tsv.
+
+    The contract is deliberately small and symmetric: backslash, TAB, LF, and
+    CR are written as ``\\\\``, ``\\t``, ``\\n``, and ``\\r`` respectively;
+    every other character is literal.  Consumers must apply the inverse map.
+    """
+
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("\t", "\\t")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
 
 
 def record_skipped_symlink(source, destination_rel, source_class, producer, inventory, metadata):
     metadata.write(
-        f"{source_class}\t{escaped(source)}\tskipped_symlink\t{escaped(destination_rel)}\t0\t-\t{producer}\n"
+        f"{source_class}\t{escape_tsv(source)}\tskipped_symlink\t{escape_tsv(destination_rel)}\t0\t-\t{producer}\n"
     )
     return True
 
@@ -309,10 +322,15 @@ def copy_file(source, destination_rel, source_class, producer, manifest, metadat
         raise RuntimeError(f"non-regular artifact: {source}")
     info = tarfile.TarInfo(destination_rel)
     info.mode = stat.S_IMODE(source_stat.st_mode)
-    info.size = source_stat.st_size
+    header_size = source_stat.st_size
+    info.size = header_size
     info.mtime = 0
     try:
         archive.write(info.tobuf(format=tarfile.PAX_FORMAT))
+        # Test-only synchronization hook; unset on Cannon production runs.
+        copy_start_marker = os.environ.get("ARTIFACT_TEST_COPY_START_MARKER")
+        if copy_start_marker:
+            Path(copy_start_marker).touch()
         with os.fdopen(source_fd, "rb") as src:
             while True:
                 chunk = src.read(1024 * 1024)
@@ -323,13 +341,17 @@ def copy_file(source, destination_rel, source_class, producer, manifest, metadat
                 size += len(chunk)
                 if delay:
                     time.sleep(delay)
-        archive.write(b"\0" * ((-size) % 512))
+            current_size = os.fstat(src.fileno()).st_size
+        if size != header_size or current_size != header_size:
+            mark_partial(f"source size changed during copy: {source}")
+            return False
+        archive.write(b"\0" * ((-header_size) % 512))
     except BudgetExpired:
         mark_partial("collection budget exceeded")
         return False
     digest = hasher.hexdigest()
-    escaped_destination = repr(destination_rel)[1:-1]
-    escaped_source = repr(str(source))[1:-1]
+    escaped_destination = escape_tsv(destination_rel)
+    escaped_source = escape_tsv(source)
     manifest.write(f"{escaped_destination}\t{size}\t{digest}\n")
     metadata.write(f"{source_class}\t{escaped_source}\ton\t{escaped_destination}\t{size}\t{digest}\t{producer}\n")
     count += 1
@@ -401,6 +423,7 @@ if os.environ.get("ARTIFACTS_FORCE_FAILURE") == "1":
 archive = ArchiveWriter(archive_path)
 try:
   with Path(manifest_path).open("w", encoding="utf-8") as manifest, Path(metadata_path).open("w", encoding="utf-8") as metadata:
+    manifest.write(r"# MANIFEST.tsv: path fields use backslash escapes \\ \\t \\n \\r; other characters are literal." + "\n")
     metadata.write("source_class\tsource_path\tarm\tretained_path\tbytes\tsha256\tproducer\n")
     if not walk_tree(Path(tmpdir), "tmpdir", "tmpdir", "pytest", manifest, metadata, archive):
         partial = True

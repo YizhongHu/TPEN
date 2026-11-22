@@ -10,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 
 
@@ -20,6 +21,25 @@ def _decode_inventory_path(value: str) -> str:
     """Decode the collector's one-line escaped path representation."""
 
     return ast.literal_eval(f"'{value}'")
+
+
+def _decode_manifest_path(value: str) -> str:
+    """Decode the MANIFEST.tsv four-character backslash escape contract."""
+
+    decoded: list[str] = []
+    index = 0
+    escapes = {"\\": "\\", "t": "\t", "n": "\n", "r": "\r"}
+    while index < len(value):
+        character = value[index]
+        if character != "\\":
+            decoded.append(character)
+            index += 1
+            continue
+        if index + 1 >= len(value) or value[index + 1] not in escapes:
+            raise ValueError(f"invalid MANIFEST.tsv escape at offset {index}")
+        decoded.append(escapes[value[index + 1]])
+        index += 2
+    return "".join(decoded)
 
 
 def _inventory_entry(line: str) -> tuple[str, str]:
@@ -35,7 +55,15 @@ def _manifest_entry(line: str) -> tuple[str, int, str]:
     """Split one escaped manifest row into path, byte count, and digest."""
 
     relative, size, digest = line.split("\t")
-    return _decode_inventory_path(relative), int(size), digest
+    return _decode_manifest_path(relative), int(size), digest
+
+
+def _manifest_entries(path: Path) -> list[tuple[str, int, str]]:
+    """Read MANIFEST.tsv rows after validating its documented header."""
+
+    lines = path.read_text().splitlines()
+    assert lines and lines[0].startswith("# MANIFEST.tsv: path fields use backslash escapes")
+    return [_manifest_entry(line) for line in lines[1:] if line]
 
 
 def _read_archive(path: Path) -> dict[str, bytes]:
@@ -152,7 +180,7 @@ def test_full_suite_collector_archives_allowlist_and_writes_manifest(tmp_path: P
     assert members["harness/mutant-one.diff"] == b"diff\n"
     assert not any("__pycache__" in path or ".git" in path for path in members)
 
-    manifest = [_manifest_entry(line) for line in (artifacts / "MANIFEST.tsv").read_text().splitlines()]
+    manifest = _manifest_entries(artifacts / "MANIFEST.tsv")
     assert len(manifest) == 6
     assert {path for path, _, _ in manifest} == set(members)
     for path, size, digest in manifest:
@@ -170,6 +198,89 @@ def test_full_suite_collector_archives_allowlist_and_writes_manifest(tmp_path: P
     assert "member_count=6" in status
     assert "elapsed_seconds=" in status
     assert (run_root / "evidence/artifacts-timing.txt").read_text().startswith("artifact_collection_seconds=")
+
+
+def test_manifest_round_trips_literal_apostrophe_and_shell_metacharacters(tmp_path: Path) -> None:
+    """The producer's real MANIFEST.tsv must remain parseable for odd paths."""
+
+    run_root = tmp_path / "run"
+    (run_root / "evidence").mkdir(parents=True)
+    work_root = tmp_path / "work"
+    (work_root / "tmp").mkdir(parents=True)
+    clone = _make_clone(tmp_path)
+    relative = "outputs/run with spaces ' \" \\ \tline\n$(touch INJECTED)/payload.log"
+    target = clone / relative
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"literal apostrophe\n")
+
+    result = subprocess.run(
+        ["bash", "-c", _collector_harness(VERIFY.read_text(), run_root, work_root, clone)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ["PATH"]},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (tmp_path / "INJECTED").exists()
+    members = _read_archive(run_root / "artifacts/artifacts.tar.zst")
+    assert f"checkout/{relative}" in members
+    manifest = _manifest_entries(run_root / "artifacts/MANIFEST.tsv")
+    expected = (
+        f"checkout/{relative}",
+        len(members[f"checkout/{relative}"]),
+        hashlib.sha256(members[f"checkout/{relative}"]).hexdigest(),
+    )
+    assert expected in manifest
+    assert {path for path, _, _ in manifest} == set(members)
+
+
+def test_source_mutation_during_stream_is_valid_or_fails_closed(tmp_path: Path) -> None:
+    """Growth and shrinkage during streaming must both produce PARTIAL."""
+
+    for mutation in ("grow", "shrink"):
+        case_root = tmp_path / mutation
+        run_root = case_root / "run"
+        (run_root / "evidence").mkdir(parents=True)
+        (run_root / "evidence/verdict.txt").write_text("FAIL\n")
+        (run_root / "evidence/driver-exit.txt").write_text("DRIVER_EXIT=7\n")
+        work_root = case_root / "work"
+        target = work_root / "tmp" / "pytest-basetemp" / "toctou.bin"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"A" * (64 * 1024 * 1024))
+        clone = _make_clone(case_root)
+
+        marker = case_root / "copy-started"
+        result_process = subprocess.Popen(
+            ["bash", "-c", _collector_harness(VERIFY.read_text(), run_root, work_root, clone)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={
+                **os.environ,
+                "ARTIFACT_TEST_COPY_DELAY_SECONDS": "0.01",
+                "ARTIFACT_TEST_COPY_START_MARKER": str(marker),
+            },
+        )
+        marker_deadline = time.monotonic() + 5
+        while not marker.exists() and time.monotonic() < marker_deadline:
+            time.sleep(0.005)
+        assert marker.exists()
+        time.sleep(0.02)
+        if mutation == "grow":
+            with target.open("ab") as source:
+                source.write(b"B" * (1024 * 1024))
+        else:
+            target.write_bytes(b"mutated-after-open")
+        stdout, stderr = result_process.communicate(timeout=10)
+        assert result_process.returncode == 0, stdout + stderr
+
+        status = (run_root / "evidence/artifacts-status.txt").read_text()
+        assert status.startswith("ARTIFACTS_PARTIAL reason=source size changed during copy:")
+        assert (run_root / "evidence/verdict.txt").read_text() == "FAIL\n"
+        assert (run_root / "evidence/driver-exit.txt").read_text() == "DRIVER_EXIT=7\n"
+        assert f"tmpdir/pytest-basetemp/toctou.bin" not in {
+            path for path, _, _ in _manifest_entries(run_root / "artifacts/MANIFEST.tsv")
+        }
 
 
 def test_collector_failure_preserves_verdict_and_cleans_scratch(tmp_path: Path) -> None:
@@ -258,6 +369,37 @@ def test_collection_budget_writes_partial_without_touching_verdict_or_scratch(tm
     assert (run_root / "evidence/artifacts-timing.txt").read_text().startswith("artifact_collection_seconds=")
     assert (run_root / "evidence/driver-exit.txt").read_text() == "DRIVER_EXIT=7\n"
     assert work_root.exists()
+
+
+def test_collection_budget_expiry_during_member_body_is_partial(tmp_path: Path) -> None:
+    """Budget expiry between member chunks cannot yield a complete-looking tar."""
+
+    run_root = tmp_path / "run"
+    (run_root / "evidence").mkdir(parents=True)
+    (run_root / "evidence/verdict.txt").write_text("FAIL\n")
+    (run_root / "evidence/driver-exit.txt").write_text("DRIVER_EXIT=7\n")
+    work_root = tmp_path / "work"
+    target = work_root / "tmp" / "pytest-basetemp" / "body.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"A" * (8 * 1024 * 1024))
+    clone = _make_clone(tmp_path)
+
+    result = subprocess.run(
+        ["bash", "-c", _collector_harness(VERIFY.read_text(), run_root, work_root, clone)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "ARTIFACT_COLLECTION_BUDGET_SECONDS": "0.05",
+            "ARTIFACT_TEST_COPY_DELAY_SECONDS": "0.02",
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    status = (run_root / "evidence/artifacts-status.txt").read_text()
+    assert status.startswith("ARTIFACTS_PARTIAL reason=collection budget exceeded")
+    assert (run_root / "evidence/verdict.txt").read_text() == "FAIL\n"
+    assert (run_root / "evidence/driver-exit.txt").read_text() == "DRIVER_EXIT=7\n"
 
 
 def test_changed_or_untracked_symlink_cannot_copy_outside_clone(tmp_path: Path) -> None:
