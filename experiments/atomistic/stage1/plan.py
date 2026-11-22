@@ -14,8 +14,9 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from experiments.atomistic.stage1.protocol import (
-    HOOKE_SYSTEMS, SYSTEMS, STAGE1_PROTOCOL, bind_evaluation_manifest, build_manifest,
-    config_identities, manifest_hash, overlay_sha256,
+    HOOKE_SYSTEMS, QHO_Q21, SYSTEMS, STAGE1_PROTOCOL,
+    bind_evaluation_manifest, build_manifest, config_identities, manifest_hash,
+    overlay_sha256,
 )
 
 
@@ -42,14 +43,18 @@ def main() -> int:
     parser.add_argument("--evaluation-selection")
     args = parser.parse_args()
     if args.checkpoints is None:
-        if args.phase != 1 or STAGE1_PROTOCOL.retention_cadence is None:
+        if (args.phase == 2 and args.science_profile == "hooke-hv2-v1"
+                and tuple(args.systems or ()) == ("qho2e",)):
+            args.checkpoints = list(QHO_Q21)
+        elif args.phase != 1 or STAGE1_PROTOCOL.retention_cadence is None:
             parser.error(
                 "--checkpoints is required for phase 2 or protocols without retention_cadence"
             )
-        args.checkpoints = list(range(
-            0, STAGE1_PROTOCOL.lineage_updates + 1,
-            STAGE1_PROTOCOL.retention_cadence,
-        ))
+        else:
+            args.checkpoints = list(range(
+                0, STAGE1_PROTOCOL.lineage_updates + 1,
+                STAGE1_PROTOCOL.retention_cadence,
+            ))
     systems = tuple(args.systems) if args.systems else None
     selected_for_profile = set(systems or SYSTEMS)
     if (args.phase == 1 and selected_for_profile & HOOKE_SYSTEMS
