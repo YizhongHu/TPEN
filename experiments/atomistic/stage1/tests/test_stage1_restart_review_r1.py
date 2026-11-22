@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from threading import Barrier, Event, Thread, current_thread
+from threading import Barrier, BrokenBarrierError, Event, Thread, current_thread
 from types import SimpleNamespace
 
 import pytest
@@ -133,15 +133,26 @@ def test_lineage_claim_serializes_stale_and_current_selections(
     first_selected = Event()
     release_first = Event()
     stale_claimed = Event()
+    stale_outcome_written = Event()
+    allow_stale_revalidation = Event()
+    current_claimed = Event()
     scans = Barrier(2)
     select_counts: dict[str, int] = {}
     scan_counts: dict[str, int] = {}
     driver_calls: list[str] = []
-    errors: list[BaseException] = []
+    errors: list[tuple[str, BaseException]] = []
     stale_revalidated = Event()
+    stale_attempt_key: str | None = None
+    stale_lease_path: Path | None = None
+    stale_outcome_path: Path | None = None
     original_select = restart.select_restart
     original_active = restart._active_attempt_lease_paths
     original_claim = restart._claim_attempt
+
+    def wait_for(event: Event, *, participant: str, phase: str) -> None:
+        assert event.wait(timeout=10), (
+            f"{participant} did not reach {phase} within 10s"
+        )
 
     def delayed_select(**kwargs):
         selected = original_select(**kwargs)
@@ -151,10 +162,19 @@ def test_lineage_claim_serializes_stale_and_current_selections(
             assert selected.predecessor is not None
             assert selected.predecessor.next_iteration == 1000
             first_selected.set()
-            assert release_first.wait(timeout=10)
+            wait_for(
+                release_first,
+                participant="stale contender",
+                phase="initial selection release",
+            )
         elif name == "stale-contender":
             assert selected.predecessor is not None
             assert selected.predecessor.next_iteration == 2000
+            wait_for(
+                allow_stale_revalidation,
+                participant="stale contender",
+                phase="post-claim revalidation release",
+            )
             stale_revalidated.set()
         return selected
 
@@ -163,15 +183,37 @@ def test_lineage_claim_serializes_stale_and_current_selections(
         name = current_thread().name
         scan_counts[name] = scan_counts.get(name, 0) + 1
         if name in {"stale-contender", "current-contender"} and scan_counts[name] == 1:
-            scans.wait(timeout=10)
+            try:
+                scans.wait(timeout=10)
+            except BrokenBarrierError as exc:
+                raise AssertionError(
+                    f"{name} timed out at initial active-lease scan barrier"
+                ) from exc
         return paths
 
     def deterministic_claim(**kwargs):
+        nonlocal stale_attempt_key, stale_lease_path, stale_outcome_path
+        name = current_thread().name
+        if name == "current-contender":
+            wait_for(
+                stale_outcome_written,
+                participant="current contender",
+                phase="stale outcome publication barrier",
+            )
         claimed = original_claim(**kwargs)
-        if current_thread().name == "stale-contender":
+        if name == "stale-contender":
+            stale_attempt_key, stale_lease_path = claimed
+            stale_outcome_path = (
+                stale_lease_path.parent / f"{stale_attempt_key}.outcome.json"
+            )
             stale_claimed.set()
-        elif current_thread().name == "current-contender":
-            assert stale_claimed.wait(timeout=10)
+            wait_for(
+                allow_stale_revalidation,
+                participant="stale contender",
+                phase="post-claim claim release",
+            )
+        elif name == "current-contender":
+            current_claimed.set()
         return claimed
 
     monkeypatch.setattr(restart, "select_restart", delayed_select)
@@ -181,12 +223,21 @@ def test_lineage_claim_serializes_stale_and_current_selections(
     def publisher_driver(_cfg, **_kwargs):
         _publish(run_dir, step=1000)
         publisher_at_1000.set()
-        assert release_publisher.wait(timeout=10)
+        wait_for(
+            release_publisher,
+            participant="publisher",
+            phase="initial publication release",
+        )
         _publish(run_dir, step=2000)
         (run_dir / "status.json").write_text(
             json.dumps({"status": "planned_yield"}) + "\n", encoding="utf-8"
         )
         return 0
+
+    contender_done: dict[str, Event] = {
+        "stale": Event(),
+        "current": Event(),
+    }
 
     def contender(name: str, cfg: object) -> None:
         try:
@@ -196,41 +247,108 @@ def test_lineage_claim_serializes_stale_and_current_selections(
                 run_dir=run_dir,
             )
         except BaseException as exc:  # pragma: no cover - diagnostic propagation
-            errors.append(exc)
+            errors.append((name, exc))
+            if name == "stale":
+                # execute_restart writes the refusal receipt before raising;
+                # only this post-catch path may release the current contender.
+                if stale_outcome_path is not None and stale_outcome_path.is_file():
+                    json.loads(stale_outcome_path.read_text(encoding="utf-8"))
+                    stale_outcome_written.set()
+        finally:
+            contender_done[name].set()
+
+    publisher_done = Event()
+
+    def publish_attempt() -> None:
+        try:
+            execute_restart(
+                cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
+                run=publisher_driver, run_dir=run_dir,
+            )
+        finally:
+            publisher_done.set()
 
     publisher = Thread(
-        target=lambda: execute_restart(
-            cfg=_attempt_cfg(row, system), row=row, config_path=config_path,
-            run=publisher_driver, run_dir=run_dir,
-        ),
+        target=publish_attempt,
         name="publisher",
     )
     publisher.start()
-    assert publisher_at_1000.wait(timeout=10)
+    wait_for(
+        publisher_at_1000,
+        participant="publisher",
+        phase="initial checkpoint publication",
+    )
 
     stale = Thread(target=contender, args=("stale", first_cfg), name="stale-contender")
     stale.start()
-    assert first_selected.wait(timeout=10)
+    wait_for(
+        first_selected,
+        participant="stale contender",
+        phase="initial selection",
+    )
 
     # The publisher completes after the first contender selected step 1000.
     release_publisher.set()
     publisher.join(timeout=10)
-    assert not publisher.is_alive()
+    assert publisher_done.is_set(), (
+        "publisher did not complete after initial publication release; "
+        f"alive={publisher.is_alive()}"
+    )
     current = Thread(target=contender, args=("current", second_cfg), name="current-contender")
     current.start()
     release_first.set()
+    wait_for(
+        stale_claimed,
+        participant="stale contender",
+        phase="exclusive claim",
+    )
+    allow_stale_revalidation.set()
+    wait_for(
+        stale_outcome_written,
+        participant="stale contender",
+        phase="durable refusal outcome publication",
+    )
+    wait_for(
+        current_claimed,
+        participant="current contender",
+        phase="exclusive claim",
+    )
     stale.join(timeout=10)
     current.join(timeout=10)
-    assert not stale.is_alive() and not current.is_alive()
+    assert contender_done["stale"].is_set(), (
+        "stale contender did not report completion; "
+        f"alive={stale.is_alive()}"
+    )
+    assert contender_done["current"].is_set(), (
+        "current contender did not report completion; "
+        f"alive={current.is_alive()}"
+    )
     assert len(driver_calls) <= 1
     assert stale_claimed.is_set()
     assert stale_revalidated.is_set()
-    assert all(
-        isinstance(error, RestartRefusal)
-        and error.cause.value
-        in {"lineage_claim_lost", "selection_stale_after_claim"}
-        for error in errors
-    ), [repr(error) for error in errors]
+    stale_errors = [error for name, error in errors if name == "stale"]
+    current_errors = [error for name, error in errors if name == "current"]
+    assert len(stale_errors) == 1, [repr(error) for error in errors]
+    assert not current_errors, [repr(error) for error in current_errors]
+    stale_error = stale_errors[0]
+    assert isinstance(stale_error, RestartRefusal)
+    assert stale_error.cause is RestartCause.SELECTION_STALE_AFTER_CLAIM
+    assert stale_attempt_key is not None
+    assert stale_lease_path is not None
+    assert stale_outcome_path is not None
+    assert stale_outcome_path.is_file()
+    stale_outcome = json.loads(stale_outcome_path.read_text(encoding="utf-8"))
+    assert stale_outcome["attempt"] == stale_attempt_key
+    assert stale_outcome["lease"] == str(stale_lease_path)
+    assert stale_outcome["cause"] == RestartCause.SELECTION_STALE_AFTER_CLAIM.value
+    matching_stale_outcomes = [
+        path for path in run_dir.joinpath("attempts").glob("attempt-*.outcome.json")
+        if json.loads(path.read_text(encoding="utf-8")).get("cause")
+        == RestartCause.SELECTION_STALE_AFTER_CLAIM.value
+        and json.loads(path.read_text(encoding="utf-8")).get("lease")
+        == str(stale_lease_path)
+    ]
+    assert len(matching_stale_outcomes) == 1
 
 
 @pytest.mark.integration
