@@ -26,7 +26,7 @@ import yaml
 from experiments.baselines.systems import load_registry
 from experiments.toolkit.run_paths import resolve_run_dir
 
-SYSTEMS = ("hooke1", "hooke2", "hooke2noint", "he", "h2")
+SYSTEMS = ("hooke1", "hooke2", "qho2e", "he", "h2")
 KINDS = ("smoke", "train", "eval")
 CONFIG_IDENTITY_RULE = "stage1-config-v1"
 LEGACY_CONFIG_IDENTITY_RULE = "legacy-config-sha256"
@@ -40,7 +40,7 @@ HE_H2_EVAL_SELECTION_ID = "he-h2-b-v1"
 HE_H2_EVAL_CHECKPOINTS = (0, 1_000, 2_000, 4_000, 8_000, 16_000,
                           25_000, 40_000, 60_000, 80_000, 100_000)
 HE_H2_SYSTEMS = frozenset({"he", "h2"})
-HOOKE_SYSTEMS = frozenset({"hooke1", "hooke2", "hooke2noint"})
+HOOKE_SYSTEMS = frozenset({"hooke1", "hooke2", "qho2e"})
 OVERLAY_RELATIVE_PATH = "configs/overlays/diagnostics-v1.yaml"
 HOOKE_OVERLAY_RELATIVE_PATH = "configs/overlays/hooke-diagnostics-v1.yaml"
 OVERLAY_SYSTEMS = frozenset({"he", "h2"})
@@ -117,7 +117,7 @@ STAGE1_PROTOCOL = Protocol(1000, 256, 100000, 4096, 3, 4, 4096, 256, 1000)
 SYSTEM_SPECS = tuple(SystemSpec(name, system_id) for name, system_id in (
     ("hooke1", "hooke_one_electron_omega0.5"),
     ("hooke2", "hooke_pair_singlet_omega0.5"),
-    ("hooke2noint", "hooke_pair_noninteracting_singlet_omega0.5"),
+    ("qho2e", "qho_pair_noninteracting_singlet_omega0.5"),
     ("he", "he_atom"),
     ("h2", "h2_molecule"),
 ))

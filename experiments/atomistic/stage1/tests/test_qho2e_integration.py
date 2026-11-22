@@ -28,7 +28,7 @@ from tpen.physics.potential import HarmonicTrap
 
 ROOT = Path(__file__).parents[1]
 CONFIG_ROOT = ROOT / "configs"
-NOINT = CONFIG_ROOT / "hooke2noint"
+QHO2E = CONFIG_ROOT / "qho2e"
 HOOKE_OVERLAY = CONFIG_ROOT / "overlays" / "hooke-diagnostics-v1.yaml"
 
 
@@ -40,7 +40,7 @@ class _ExactNoninteractingGaussian(torch.nn.Module):
         return WavefunctionOutput(logabs=logabs, sign=torch.ones_like(logabs))
 
 
-def test_hooke2noint_has_the_analytic_constant_local_energy() -> None:
+def test_qho2e_has_the_analytic_constant_local_energy() -> None:
     """The product Gaussian is exact away from and near electron coalescence."""
 
     positions = torch.tensor(
@@ -59,17 +59,17 @@ def test_hooke2noint_has_the_analytic_constant_local_energy() -> None:
     assert torch.allclose(energy, torch.full_like(energy, 1.5), atol=1.0e-10, rtol=0.0)
 
 
-def test_hooke2noint_identity_and_registry_reference_are_distinct() -> None:
+def test_qho2e_identity_and_registry_reference_are_distinct() -> None:
     """The new physics hash and 1.5 Ha registry reference are not inherited."""
 
-    noint_id = physical_system_id_from_config(
-        NOINT / "eval.yaml", train_config_path=NOINT / "train.yaml", system_name="hooke2noint"
+    qho2e_id = physical_system_id_from_config(
+        QHO2E / "eval.yaml", train_config_path=QHO2E / "train.yaml", system_name="qho2e"
     )
     hooke1_id = physical_system_id_from_config(CONFIG_ROOT / "hooke1" / "eval.yaml")
     hooke2_id = physical_system_id_from_config(CONFIG_ROOT / "hooke2" / "eval.yaml")
-    assert noint_id not in {hooke1_id, hooke2_id}
+    assert qho2e_id not in {hooke1_id, hooke2_id}
 
-    entry = next(item for item in load_registry()["systems"] if item["id"] == "hooke_pair_noninteracting_singlet_omega0.5")
+    entry = next(item for item in load_registry()["systems"] if item["id"] == "qho_pair_noninteracting_singlet_omega0.5")
     assert entry["reference_energy_hartree"] == 1.5
     assert "3*omega" in entry["reference_source"]
     assert {term["term"] for term in entry["hamiltonian"]["terms"]} == {
@@ -77,10 +77,10 @@ def test_hooke2noint_identity_and_registry_reference_are_distinct() -> None:
     }
 
 
-def test_hooke2noint_admits_the_complete_three_system_a37_grid() -> None:
+def test_qho2e_admits_the_complete_three_system_a37_grid() -> None:
     """The new label participates in the same 444-row Hooke admission."""
 
-    systems = ("hooke1", "hooke2", "hooke2noint")
+    systems = ("hooke1", "hooke2", "qho2e")
     config_sha256 = config_identities(config_root=CONFIG_ROOT, systems=systems)
     physical_ids = {
         system: physical_system_id_from_config(

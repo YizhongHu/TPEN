@@ -84,9 +84,9 @@ systems:
       Exact, not variational-best-estimate: at the Taut omegas the two-electron
       relative-motion problem is solvable in closed form.
 
-  - id: hooke_pair_noninteracting_singlet_omega0.5
+  - id: qho_pair_noninteracting_singlet_omega0.5
     description: >-
-      Two-electron non-interacting Hooke control in a 3D isotropic harmonic
+      QHO-2e non-interacting control in a 3D isotropic harmonic
       trap at omega = 1/2, with kinetic and harmonic-trap terms only and the
       opposite-spin singlet occupancy sector.
     n_up: 1

@@ -48,7 +48,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 EXPECTED_REGISTRY = {
     "hooke1": ("hooke_one_electron_omega0.5", 0.75, "transcribed"),
     "hooke2": ("hooke_pair_singlet_omega0.5", 2.0, "transcribed"),
-    "hooke2noint": ("hooke_pair_noninteracting_singlet_omega0.5", 1.5, "transcribed"),
+    "qho2e": ("qho_pair_noninteracting_singlet_omega0.5", 1.5, "transcribed"),
     "he": ("he_atom", -2.903724377034119598, "transcribed"),
     "h2": ("h2_molecule", -1.17447, "transcribed"),
 }

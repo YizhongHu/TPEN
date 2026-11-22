@@ -37,7 +37,7 @@ ROOT = Path(__file__).parents[1]
 HOOKE_OVERLAY = ROOT / "configs" / "overlays" / "hooke-diagnostics-v1.yaml"
 
 
-@pytest.mark.parametrize("system", ["hooke1", "hooke2", "hooke2noint"])
+@pytest.mark.parametrize("system", ["hooke1", "hooke2", "qho2e"])
 def test_hooke_train_eval_shape_and_physics_are_explicit(system: str) -> None:
     train = OmegaConf.load(ROOT / "configs" / system / "train.yaml")
     evaluation = OmegaConf.load(ROOT / "configs" / system / "eval.yaml")

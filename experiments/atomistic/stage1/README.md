@@ -1,8 +1,8 @@
 # Stage 1 shared protocol and launch surface
 
 This directory owns the Stage 1 manifest, guarded Cannon launcher, and the
-science-default Hooke-1e, Hooke-2e, the non-interacting Hooke-2e control,
-He, and H2 train/eval configs.
+science-default Hooke-1e, Hooke-2e, the QHO-2e non-interacting control, He,
+and H2 train/eval configs.
 
 Every manifest row carries the exact source SHA, the planned config SHA256, an
 external results root, and the TPEN run identity (`experiment_name`, `sector`,

@@ -188,7 +188,7 @@ def test_width32_model_is_identical_between_train_and_eval(system: str) -> None:
         assert model.readout.channels == 32
 
 
-@pytest.mark.parametrize("system", ["hooke1", "hooke2", "hooke2noint", "he"])
+@pytest.mark.parametrize("system", ["hooke1", "hooke2", "qho2e", "he"])
 def test_accepted_variational_settings_match_train_and_eval(system: str) -> None:
     train = load_config(str(ROOT / system / "train.yaml"))
     eval_cfg = load_config(str(ROOT / system / "eval.yaml"))
@@ -211,7 +211,7 @@ def test_accepted_variational_settings_match_train_and_eval(system: str) -> None
         assert "atoms" not in train
         assert "atoms" not in eval_cfg
         assert instantiate(eval_cfg.system_descriptor).resources == {}
-    elif system == "hooke2noint":
+    elif system == "qho2e":
         assert [factor._target_ for factor in train.model.factors] == [
             "tpen.nn.GaussianConfinement",
         ]
@@ -242,8 +242,8 @@ def test_hooke2_is_the_nucleus_free_two_electron_pair() -> None:
     assert descriptor.resources == {}
 
 
-def test_hooke2noint_is_a_two_electron_gaussian_only_control() -> None:
-    cfg = load_config(str(ROOT / "hooke2noint" / "eval.yaml"))
+def test_qho2e_is_a_two_electron_gaussian_only_control() -> None:
+    cfg = load_config(str(ROOT / "qho2e" / "eval.yaml"))
     descriptor = instantiate(cfg.system_descriptor)
     assert descriptor.particle.n_electrons == 2
     assert descriptor.particle.n_spin_up == 1

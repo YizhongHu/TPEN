@@ -120,7 +120,7 @@ def test_hooke_overlay_is_system_qualified_and_has_amplitude_risk() -> None:
     assert protocol_module.overlay_path_for_system("hooke2") == (
         "configs/overlays/hooke-diagnostics-v1.yaml"
     )
-    assert protocol_module.overlay_path_for_system("hooke2noint") == (
+    assert protocol_module.overlay_path_for_system("qho2e") == (
         "configs/overlays/hooke-diagnostics-v1.yaml"
     )
     amplitude = [entry for entry in cfg.callbacks

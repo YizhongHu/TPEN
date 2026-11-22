@@ -57,7 +57,7 @@ def test_protocol_has_no_implicit_partial_defaults() -> None:
 
 
 def test_stage1_system_roster_includes_the_hooke_pair() -> None:
-    assert SYSTEMS == ("hooke1", "hooke2", "hooke2noint", "he", "h2")
+    assert SYSTEMS == ("hooke1", "hooke2", "qho2e", "he", "h2")
 
 
 def test_seed_and_row_identity_are_injective_for_non_default_coordinates() -> None:
