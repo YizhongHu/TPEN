@@ -23,14 +23,16 @@ def _config(path: Path, run_dir: Path):
     )
 
 
-def _snapshot(root: Path) -> dict[str, str]:
-    """Hash every pre-existing file below a run root."""
+def _snapshot(root: Path) -> tuple[set[str], dict[str, str]]:
+    """Record every path and hash every file below a run root."""
 
-    return {
+    paths = {str(path.relative_to(root)) for path in root.rglob("*")}
+    files = {
         str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in root.rglob("*")
         if path.is_file()
     }
+    return paths, files
 
 
 def _invoke_eval(
@@ -100,10 +102,9 @@ def test_existing_eval_run_refuses_without_side_effects(
         _invoke_eval(monkeypatch, tmp_path, _config(results_root, run_dir), run_calls)
 
     assert run_calls == []
-    assert _snapshot(run_dir) == before
-    assert {path.relative_to(run_dir) for path in run_dir.rglob("*")} == {
-        Path(name) for name in before
-    }
+    after = _snapshot(run_dir)
+    assert after[0] == before[0]
+    assert after[1] == before[1]
 
 
 def test_fresh_eval_row_reaches_runner_unchanged(
