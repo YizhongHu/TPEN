@@ -5,21 +5,21 @@
       "target": "scripts/cannon/devsuite/submit_devsuite.sh",
       "old": "EXECUTOR_HARNESS=\"$ROOT_LOCAL/scripts/cannon/executor-harness\"",
       "new": "EXECUTOR_HARNESS=\"$REPO_ROOT/executor-harness\"",
-      "killer": "scripts/cannon/tests/test_devsuite_renderer.py::test_local_render_uses_exact_sha_harness"
+      "killer": "test_devsuite_renderer.py::test_local_render_uses_exact_sha_harness"
     },
     {
       "id": "scheduled-marker-removed",
       "target": "scripts/cannon/devsuite/submit_devsuite.sh",
       "old": "SCHEDULED_PREFIX=\"scheduled-\"",
       "new": "SCHEDULED_PREFIX=\"\"",
-      "killer": "scripts/cannon/tests/test_devsuite_renderer.py::test_scheduled_render_carries_marker"
+      "killer": "test_devsuite_renderer.py::test_scheduled_render_carries_marker"
     },
     {
       "id": "manual-marker-added",
       "target": "scripts/cannon/devsuite/submit_devsuite.sh",
       "old": "SCHEDULED_PREFIX=\"\"\nif [[ \"$SCHEDULED\" == 1 ]]; then",
       "new": "SCHEDULED_PREFIX=\"scheduled-\"\nif [[ \"$SCHEDULED\" == 1 ]]; then",
-      "killer": "scripts/cannon/tests/test_devsuite_renderer.py::test_manual_render_has_no_marker"
+      "killer": "test_devsuite_renderer.py::test_manual_render_has_no_marker"
     }
   ]
 }
