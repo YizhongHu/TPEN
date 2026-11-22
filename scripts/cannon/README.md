@@ -42,8 +42,9 @@ execution of the rendered body, and refuses to overwrite an existing packet.
 It never calls `sbatch`; review the printed `HEADROOM_GATE` and
 `SBATCH_COMMAND` before submitting.
 
-Facility paths are intentionally supplied by the caller.  A typical invocation
-from a clean exact-head checkout is:
+The renderer enforces the approved Cannon run-root prefix
+`/n/netscratch/kozinsky_lab/Lab/rhu/`; there is no CLI override for that
+policy.  A typical invocation from a clean exact-head checkout is:
 
 ```
 SHA=$(git rev-parse HEAD)
@@ -52,7 +53,6 @@ python3 scripts/cannon/render_verify_packet.py \
   --test scripts/cannon/tests/test_render_verify_packet.py \
   --run-root <facility-run-root>/<unique-run> \
   --packet-dir <facility-run-root>/<unique-run>/packet \
-  --facility-run-prefix <facility-run-root> \
   --shared-env-prefix <shared-reuse-only-env-root> \
   --mutants "$(pwd)/scripts/cannon/tests/render_verify_packet_mutants.json" \
   --job-name verify-renderer \

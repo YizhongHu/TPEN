@@ -28,6 +28,7 @@ KILLER_RE = re.compile(
     r"[A-Za-z_][A-Za-z0-9_]*(?:\[.*\])?$"
 )
 ESCAPED_NEWLINE = chr(92) + "n"
+APPROVED_FACILITY_RUN_PREFIX = Path("/n/netscratch/kozinsky_lab/Lab/rhu")
 
 
 class RenderError(ValueError):
@@ -234,7 +235,8 @@ def _render_body(
             "",
             'mkdir -p -- "${WORK_ROOT}"',
             'cd "${TASK_ROOT}"',
-            "export USER WORK_ROOT FACILITY_RUN_PREFIX SHARED_ENV_PREFIX UV_BIN RUN_ROOT REPO_URL",
+            "export HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT DRY_RUN PYTHON USER WORK_ROOT "
+            "FACILITY_RUN_PREFIX SHARED_ENV_PREFIX UV_BIN REPO_URL",
             'exec "${TASK_ROOT}/scripts/cannon/verify.sh" \\',
             '  --sha "$HEAD_SHA" \\',
             '  --run-root "$RUN_ROOT"',
@@ -316,7 +318,7 @@ def render_packet(
     mutants: Optional[str] = None,
     job_name: str = "verify",
     wall_time: str = "00:45:00",
-    facility_run_prefix: Optional[str] = None,
+    test_facility_run_prefix: Optional[str] = None,
     shared_env_prefix: Optional[str] = None,
     uv_bin: str = "/n/home10/rhu/.local/bin/uv",
     repo_url: str = "https://github.com/YizhongHu/TPEN.git",
@@ -337,15 +339,21 @@ def render_packet(
         job_name = f"{job_name}-{sha[:12]}"
     if not JOB_NAME_RE.fullmatch(account):
         raise RenderError("--account contains unsupported characters")
-    if facility_run_prefix is None:
-        raise RenderError("--facility-run-prefix is required")
     if shared_env_prefix is None:
         raise RenderError("--shared-env-prefix is required")
-    facility = _require_absolute("facility run prefix", facility_run_prefix)
+    # The CLI always uses the approved Cannon root.  The explicit test-only
+    # override keeps unit tests hermetic without making policy a CLI knob.
+    facility = (
+        _require_absolute("test facility run prefix", test_facility_run_prefix)
+        if test_facility_run_prefix is not None
+        else APPROVED_FACILITY_RUN_PREFIX
+    )
     run = _require_absolute("run root", run_root)
     packet = _require_absolute("packet directory", packet_dir)
     _validate_run_root(run, facility)
     shared = _require_absolute("shared env prefix", shared_env_prefix)
+    if not _inside(packet, run):
+        raise RenderError(f"packet directory must be inside run root: {packet}")
     if packet.exists() or packet.is_symlink():
         raise RenderError(f"refusing existing packet directory: {packet}")
     if packet == Path(packet.anchor):
@@ -416,7 +424,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--test", action="append", dest="tests", required=True)
     parser.add_argument("--run-root", required=True)
     parser.add_argument("--packet-dir", required=True)
-    parser.add_argument("--facility-run-prefix", required=True)
     parser.add_argument("--shared-env-prefix", required=True)
     parser.add_argument("--mutants")
     parser.add_argument("--repo-root")
@@ -440,7 +447,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             mutants=args.mutants,
             job_name=args.job_name,
             wall_time=args.wall_time,
-            facility_run_prefix=args.facility_run_prefix,
             shared_env_prefix=args.shared_env_prefix,
             uv_bin=args.uv_bin,
             repo_url=args.repo_url,
