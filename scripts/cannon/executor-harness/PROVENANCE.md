@@ -18,7 +18,7 @@ f36cdf4ea5717e2f3cd6a5f7cbdb2ba6ecd1f67f5192a57b062e753557b83cf8  submission-lin
 fbba9fd47dc4d1b5a541420b69d5cd3290c79277a45804465d5cfbca86a15ce0  helpers/env_audit.py
 bf93fca396cfe7db8036a54661d7b75cf2cbd5089c20cfcf12de486b8aa571b0  helpers/negative_storage_checks.py
 878324d30ceee5d4ead0447859d6b06461d7af9140489c94891ed255332fd3bb  helpers/path_guard.py
-bd86f84c7f00775d047a3c5665834a33f4d2c8de4588ddbbf94d2fef1c61d02b  helpers/reconcile_counts.py
+a77793bb816d69be2c08a13a9f8a4fcc55612c6234c05fee15687413788e8c63  helpers/reconcile_counts.py
 91f11506dd0d55b18d3b42120b43f0af3f3b39814fddb782265d1cc57bdc49f0  helpers/rehearse_submit_line.py
 d9ef0c0ae39fa1f9e151eb2573671ab1ac3790a304dcc68a0bb8c885edcaa903  helpers/validate_inputs.sh
 ```
@@ -36,3 +36,7 @@ d9ef0c0ae39fa1f9e151eb2573671ab1ac3790a304dcc68a0bb8c885edcaa903  helpers/valida
   source provenance.
 - `job.sbatch.pre-hv2env-20261111`: historical backup, recorded by SHA in the
   source provenance.
+
+## Post-import changes
+
+- `helpers/reconcile_counts.py`: imported the xfail/xpass summary-folding fix from `/Users/yizhonghu/tpen-manager-receipts/execution-lane/b1e1-verify-fbcd332a-20261121T162644Z/helpers/reconcile_counts.py`; this PR preserves that harness behavior.
