@@ -13,6 +13,7 @@ import base64
 import binascii
 import copy
 import math
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,11 @@ HOOKE_TRAINING_SEED_RULE = "stage1-training-seeds-v1"
 HOOKE_EVAL_SELECTION = "A37"
 HOOKE_EVAL_SELECTION_ID = "hooke-hv2-a37-v1"
 HOOKE_A37 = tuple(range(0, 21_000, 1_000)) + tuple(range(25_000, 100_001, 5_000))
+HE_H2_EVAL_SELECTION = "B"
+HE_H2_EVAL_SELECTION_ID = "he-h2-b-v1"
+HE_H2_EVAL_CHECKPOINTS = (0, 1_000, 2_000, 4_000, 8_000, 16_000,
+                          25_000, 40_000, 60_000, 80_000, 100_000)
+HE_H2_SYSTEMS = frozenset({"he", "h2"})
 OVERLAY_RELATIVE_PATH = "configs/overlays/diagnostics-v1.yaml"
 HOOKE_OVERLAY_RELATIVE_PATH = "configs/overlays/hooke-diagnostics-v1.yaml"
 OVERLAY_SYSTEMS = frozenset({"he", "h2"})
@@ -582,6 +588,102 @@ def _is_hooke_science_row(row: Mapping[str, Any]) -> bool:
     """Return whether a row opts into the versioned Hooke science profile."""
 
     return row.get("science_profile") == HOOKE_SCIENCE_PROFILE
+
+
+def _is_he_h2_production_protocol(protocol: Protocol) -> bool:
+    """Return whether a protocol carries the released He/H2 production shape."""
+
+    return (
+        protocol.lineage_updates == STAGE1_PROTOCOL.lineage_updates
+        and protocol.lineage_walkers == STAGE1_PROTOCOL.lineage_walkers
+        and protocol.lineages == STAGE1_PROTOCOL.lineages
+        and protocol.eval_streams == STAGE1_PROTOCOL.eval_streams
+        and protocol.eval_walkers == STAGE1_PROTOCOL.eval_walkers
+        and protocol.eval_draws == STAGE1_PROTOCOL.eval_draws
+        and protocol.retention_cadence == STAGE1_PROTOCOL.retention_cadence
+    )
+
+
+def _is_he_h2_production_train_row(row: Mapping[str, Any]) -> bool:
+    """Return whether a phase-1 row is the canonical He/H2 retention row."""
+
+    return (
+        row.get("system") in HE_H2_SYSTEMS
+        and row.get("kind") == "train"
+        and row.get("updates") == STAGE1_PROTOCOL.lineage_updates
+        and row.get("walkers") == STAGE1_PROTOCOL.lineage_walkers
+        and list(row.get("checkpoint_steps", ())) == list(
+            range(0, STAGE1_PROTOCOL.lineage_updates + 1,
+                  STAGE1_PROTOCOL.retention_cadence)
+        )
+    )
+
+
+def _is_he_h2_production_phase(phase1_rows: list[Mapping[str, Any]]) -> bool:
+    """Return whether all phase-1 train rows are canonical He/H2 rows."""
+
+    train_rows = [row for row in phase1_rows if row.get("kind") == "train"]
+    systems = {row.get("system") for row in train_rows}
+    return bool(train_rows) and systems.issubset(HE_H2_SYSTEMS) and all(
+        _is_he_h2_production_train_row(row) for row in train_rows
+    )
+
+
+def validate_he_h2_eval_grid(
+    rows: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+    *,
+    expected_systems: tuple[str, ...] | list[str] | None = None,
+    expected_profile: str | None = None,
+) -> None:
+    """Require the exact He/H2 roster-B x lineage x stream evaluation multiset.
+
+    The coordinate comparison happens before collection opens any run output,
+    so a missing checkpoint group or stream cannot look like a partial result.
+    """
+
+    he_h2_rows = [row for row in rows if row.get("system") in HE_H2_SYSTEMS]
+    declared_systems = tuple(expected_systems) if expected_systems is not None else ()
+    if any(system not in HE_H2_SYSTEMS for system in declared_systems):
+        raise ProtocolError("He/H2 evaluation grid has an invalid expected system")
+    if len(set(declared_systems)) != len(declared_systems):
+        raise ProtocolError("He/H2 evaluation grid has duplicate expected systems")
+    if not he_h2_rows and not declared_systems:
+        return
+    if expected_profile is None and not any(
+        row.get("evaluation_selection") == HE_H2_EVAL_SELECTION for row in he_h2_rows
+    ):
+        return
+    profile = expected_profile or HE_H2_EVAL_SELECTION
+    systems = declared_systems or tuple(dict.fromkeys(str(row["system"]) for row in he_h2_rows))
+    expected = [
+        (system, lineage, checkpoint, stream)
+        for system in systems
+        for lineage in range(STAGE1_PROTOCOL.lineages)
+        for checkpoint in HE_H2_EVAL_CHECKPOINTS
+        for stream in range(STAGE1_PROTOCOL.eval_streams)
+    ]
+    actual: list[tuple[str, int, int, int]] = []
+    for row in he_h2_rows:
+        if row.get("kind") != "eval":
+            raise ProtocolError("He/H2 roster-B grid contains a non-eval row")
+        if row.get("evaluation_selection") != profile:
+            raise ProtocolError("He/H2 eval row does not bind roster B")
+        if row.get("evaluation_selection_id") != HE_H2_EVAL_SELECTION_ID:
+            raise ProtocolError("He/H2 eval row has an invalid roster-B selection id")
+        coordinates = (row.get("system"), row.get("lineage"),
+                       row.get("checkpoint"), row.get("stream"))
+        if any(type(value) is not int for value in coordinates[1:]):
+            raise ProtocolError("He/H2 roster-B grid coordinates must be integers")
+        actual.append(coordinates)  # type: ignore[arg-type]
+    expected_counts = Counter(expected)
+    actual_counts = Counter(actual)
+    if actual_counts != expected_counts:
+        missing = sorted((expected_counts - actual_counts).elements())
+        extra = sorted((actual_counts - expected_counts).elements())
+        raise ProtocolError(
+            f"He/H2 roster-B grid mismatch: expected {len(expected)} rows, got {len(actual)}; "
+            f"missing={missing!r}; extra={extra!r}"
+        )
 
 
 def _validate_hooke_science_train_row(row: Mapping[str, Any]) -> None:
@@ -1239,6 +1341,12 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
             raise ProtocolError("Hooke science phase 2 requires the exact A37 roster")
     elif evaluation_selection is not None:
         raise ProtocolError("evaluation_selection requires the Hooke science profile")
+    he_h2_selection = (
+        phase == 2 and set(selected).issubset(HE_H2_SYSTEMS)
+        and _is_he_h2_production_protocol(protocol)
+    )
+    if he_h2_selection and list(checkpoints) != list(HE_H2_EVAL_CHECKPOINTS):
+        raise ProtocolError("He/H2 production phase 2 requires the exact roster-B checkpoints")
     if (overlay is None) != (overlay_sha256 is None):
         raise ProtocolError("overlay and overlay_sha256 must be supplied together")
     overlay_name: str | None = None
@@ -1427,7 +1535,11 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                             "evaluation_selection": HOOKE_EVAL_SELECTION,
                             "evaluation_selection_id": HOOKE_EVAL_SELECTION_ID,
                             "selection_id": HOOKE_EVAL_SELECTION_ID,
-                        } if science_profile == HOOKE_SCIENCE_PROFILE else {}),
+                        } if science_profile == HOOKE_SCIENCE_PROFILE else {
+                            "evaluation_selection": HE_H2_EVAL_SELECTION,
+                            "evaluation_selection_id": HE_H2_EVAL_SELECTION_ID,
+                            "selection_id": HE_H2_EVAL_SELECTION_ID,
+                        } if he_h2_selection else {}),
                     })
     for row in rows:
         _validate_run_identity(row)
@@ -1438,6 +1550,12 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
             row["device"] = device
     if science_profile == HOOKE_SCIENCE_PROFILE and phase == 2:
         validate_hooke_eval_grid([row for row in rows if row["kind"] == "eval"])
+    if he_h2_selection:
+        validate_he_h2_eval_grid(
+            [row for row in rows if row["kind"] == "eval"],
+            expected_systems=selected,
+            expected_profile=HE_H2_EVAL_SELECTION,
+        )
     return rows
 
 
@@ -1480,6 +1598,7 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         raise ProtocolError("phase-1 manifest contains duplicate seed")
     train_rows = [row for row in phase1_rows if row.get("kind") == "train"]
     systems = tuple(dict.fromkeys(str(row["system"]) for row in train_rows))
+    he_h2_selection = _is_he_h2_production_phase(phase1_rows)
     hooke_science = any(_is_hooke_science_row(row) for row in train_rows)
     if hooke_science:
         if not set(systems).issubset({"hooke1", "hooke2"}):
@@ -1489,6 +1608,8 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
                 _validate_hooke_science_train_row(row)
         if list(checkpoints) != list(HOOKE_A37):
             raise ProtocolError("Hooke science phase 2 requires the exact A37 roster")
+    if he_h2_selection and list(checkpoints) != list(HE_H2_EVAL_CHECKPOINTS):
+        raise ProtocolError("He/H2 production phase 2 requires the exact roster-B checkpoints")
     train_identity_keys = [f"{row.get('system')}:{row.get('lineage')}" for row in train_rows]
     if len(set(train_identity_keys)) != len(train_identity_keys):
         raise ProtocolError("phase-1 manifest contains duplicate train identity")
@@ -1549,6 +1670,15 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         bindings[key] = _require_sha(
             raw_digest, length=64, field=f"checkpoint evidence checkpoints[{raw_key!r}]"
         )
+    if he_h2_selection:
+        expected_bindings = {
+            (system, lineage, checkpoint)
+            for system in systems
+            for lineage in range(STAGE1_PROTOCOL.lineages)
+            for checkpoint in HE_H2_EVAL_CHECKPOINTS
+        }
+        if set(bindings) != expected_bindings:
+            raise ProtocolError("He/H2 roster-B checkpoint evidence is incomplete or out of scope")
     if protocol is not None:
         eval_streams, eval_walkers, eval_draws = protocol.eval_streams, protocol.eval_walkers, protocol.eval_draws
     if eval_streams <= 0 or eval_walkers <= 0 or eval_draws <= 0:
@@ -1627,7 +1757,11 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
                         "evaluation_selection": HOOKE_EVAL_SELECTION,
                         "evaluation_selection_id": HOOKE_EVAL_SELECTION_ID,
                         "selection_id": HOOKE_EVAL_SELECTION_ID,
-                    } if hooke_science else {}),
+                    } if hooke_science else {
+                        "evaluation_selection": HE_H2_EVAL_SELECTION,
+                        "evaluation_selection_id": HE_H2_EVAL_SELECTION_ID,
+                        "selection_id": HE_H2_EVAL_SELECTION_ID,
+                    } if he_h2_selection else {}),
                 }
                 if row["row_id"] in combined_row_ids or row["seed"] in combined_seeds:
                     raise ProtocolError("phase-1 and phase-2 rows are not jointly unique")
@@ -1644,6 +1778,12 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
             rows,
             expected_systems=tuple(systems),
             expected_profile=HOOKE_SCIENCE_PROFILE,
+        )
+    if he_h2_selection:
+        validate_he_h2_eval_grid(
+            rows,
+            expected_systems=systems,
+            expected_profile=HE_H2_EVAL_SELECTION,
         )
     return rows
 

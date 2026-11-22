@@ -142,8 +142,8 @@ document = json.loads(manifest_path.read_text(encoding="utf-8"))
 rows = [row for row in document.get("rows", []) if row.get("kind") == kind]
 if kind == "train" and [int(row["lineage"]) for row in sorted(rows, key=lambda row: int(row["lineage"]))] != [0, 1, 2]:
     raise SystemExit("expected train lineages 0,1,2")
-if kind == "eval" and len(rows) != 12:
-    raise SystemExit(f"expected 12 eval rows, got {len(rows)}")
+if kind == "eval" and len(rows) != 132:
+    raise SystemExit(f"expected 132 eval rows, got {len(rows)}")
 for row in rows:
     row_root = Path(str(row.get("results_root", "")))
     if row.get("source_sha") != source_sha:
@@ -471,8 +471,8 @@ if kind == "train":
         raise SystemExit("expected train lineages 0,1,2")
 else:
     rows.sort(key=lambda row: (int(row["lineage"]), int(row["stream"])))
-    if len(rows) != 12:
-        raise SystemExit(f"expected 12 eval rows, got {len(rows)}")
+    if len(rows) != 132:
+        raise SystemExit(f"expected 132 eval rows, got {len(rows)}")
 root = Path(results_root)
 for row in rows:
     if row.get("source_sha") != source_sha:
