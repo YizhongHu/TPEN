@@ -313,6 +313,8 @@ def walk_tree(source, destination_prefix, source_class, producer, inventory, met
                             return False
                     elif entry.is_file(follow_symlinks=False) and not copy_file(Path(entry.path), relative, source_class, producer, inventory, metadata, allow_duplicates):
                         return False
+        except OSError as exc:
+            raise RuntimeError(f"cannot enumerate {current}: {exc}") from exc
     return True
 
 

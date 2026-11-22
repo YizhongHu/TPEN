@@ -347,8 +347,8 @@ def test_final_walk_deadline_check_records_partial(tmp_path: Path) -> None:
         text=True,
         env={
             **os.environ,
-            "ARTIFACT_COLLECTION_BUDGET_SECONDS": "0.01",
-            "ARTIFACT_TEST_FINAL_WALK_DELAY_SECONDS": "0.02",
+            "ARTIFACT_COLLECTION_BUDGET_SECONDS": "1",
+            "ARTIFACT_TEST_FINAL_WALK_DELAY_SECONDS": "1.2",
         },
     )
     assert result.returncode == 0, result.stdout + result.stderr
