@@ -13,7 +13,7 @@ import pytest
 
 from experiments.atomistic.stage1 import eval as stage1_eval
 from experiments.atomistic.stage1 import train as stage1_train
-from experiments.atomistic.stage1.launch import command_for_row, render
+from experiments.atomistic.stage1.launch import command_for_row, render, row_overrides
 from experiments.atomistic.stage1.protocol import (
     HOOKE_SCIENCE_PROFILE,
     STAGE1_PROTOCOL,
@@ -172,6 +172,16 @@ def _run_rendered_row(
     assert module.main() == 0
     assert len(captured) == 1
     return captured[0]
+
+
+def _contradictory_root_overrides(row: dict[str, object]) -> list[str]:
+    """Replace the compatibility root override with a contradictory path."""
+
+    return [
+        "run.root=/contradictory/compatibility-root"
+        if override.startswith("run.root=") else override
+        for override in row_overrides(row)
+    ]
 
 
 def _rendered_argv(
@@ -372,6 +382,34 @@ def test_production_eval_rows_bind_output_before_resolution(
     root = tmp_path / system
     row = _production_eval_row(system, root)
     cfg = _run_rendered_row(row, monkeypatch=monkeypatch, results_env=results_env)
+    assert cfg.run.root == str(root)
+
+
+@pytest.mark.parametrize("system", ["hooke1", "hooke2", "qho2e", "he"])
+def test_train_builder_rebinds_output_after_compatibility_override(
+    system: str, tmp_path: Path,
+) -> None:
+    """A legacy override cannot redirect the final train output root."""
+
+    root = tmp_path / system
+    row = _production_train_row(system, root)
+    cfg = stage1_train.build_train_config(
+        row, overrides=_contradictory_root_overrides(row),
+    )
+    assert cfg.run.root == str(root)
+
+
+@pytest.mark.parametrize("system", ["hooke1", "hooke2", "qho2e", "he"])
+def test_eval_builder_rebinds_output_after_compatibility_override(
+    system: str, tmp_path: Path,
+) -> None:
+    """A legacy override cannot redirect the final eval output root."""
+
+    root = tmp_path / system
+    row = _production_eval_row(system, root)
+    cfg = stage1_eval.build_eval_config(
+        row, overrides=_contradictory_root_overrides(row),
+    )
     assert cfg.run.root == str(root)
 
 
