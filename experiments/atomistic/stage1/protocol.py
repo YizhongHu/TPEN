@@ -793,8 +793,13 @@ def validate_hooke_eval_grid(
             raise ProtocolError("Hooke eval row does not bind its frozen selection")
         actual.append(coordinates)  # type: ignore[arg-type]
     if sorted(actual) != sorted(expected):
+        selection_labels = {
+            hooke_evaluation_selection(system)[0] for system in systems
+        }
+        selection_label = next(iter(selection_labels)) if len(selection_labels) == 1 else "frozen"
         raise ProtocolError(
-            f"Hooke evaluation grid mismatch: expected {len(expected)} rows, got {len(actual)}"
+            f"Hooke {selection_label} grid mismatch: "
+            f"expected {len(expected)} rows, got {len(actual)}"
         )
 
 
