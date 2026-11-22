@@ -117,6 +117,16 @@ def test_invalid_queue_is_rejected_before_work(monkeypatch, tmp_path: Path) -> N
         raise AssertionError("accepted an unprofiled queue")
 
 
+def test_qualification_job_name_uses_cell_and_commit_sha() -> None:
+    assert stage.qualification_job_name("cell-123456", "a" * 40) == "hicell-12-gate-hi-aaaaaaaa"
+    try:
+        stage.validate_job_name("x" * 41)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("accepted an over-long qualification job name")
+
+
 def test_only_current_q_surface_is_admitted() -> None:
     for walkers in (2048, 4096):
         args = type("Args", (), {"target_sha": "a" * 40, "walkers": walkers, "updates": 2000,
@@ -418,7 +428,7 @@ def test_stage_real_clone_and_qsub_fakes(monkeypatch, tmp_path: Path) -> None:
     run_root = root / "green"
     run_root = run_root.resolve()
     manifest = json.loads((run_root / "manifest.json").read_text())
-    expected = ["qsub", "-V", "-A", "HetRxnEnergy", "-q", "debug", "-l", "select=1:system=polaris", "-l", "walltime=00:20:00", "-l", "filesystems=home:eagle", "-o", str(run_root / "pbs") + "/", "-e", str(run_root / "pbs") + "/", "-v", "RUN_ENV_PATH=" + str(run_root / "run.env"), str(run_root / "harness" / "job.pbs")]
+    expected = ["qsub", "-N", "higreen-gate-hi-" + target_sha[:8], "-V", "-A", "HetRxnEnergy", "-q", "debug", "-l", "select=1:system=polaris", "-l", "walltime=00:20:00", "-l", "filesystems=home:eagle", "-o", str(run_root / "pbs") + "/", "-e", str(run_root / "pbs") + "/", "-v", "RUN_ENV_PATH=" + str(run_root / "run.env"), str(run_root / "harness" / "job.pbs")]
     assert qsub_calls[-1] == expected and manifest["extra"] == "cu126", repr(qsub_calls[-1]) + " != " + repr(expected)
     run_env_text = (run_root / "run.env").read_text()
     for key, value in (("RUN_CACHE_DIR", manifest["cache_dir"]), ("RUN_PROJECT", manifest["target_repo"])):
