@@ -543,6 +543,7 @@ def test_manifest_producer_consumers_preserve_selection_and_verdict(monkeypatch,
     (output / "checkpoints" / "step_002000").mkdir(parents=True)
     (output / "selection_receipt.json").write_text(json.dumps({"selection": {"selected": {"context": "O-composite"}}, "walkers": 2048}))
     (output / "resolved_config.yaml").write_text("context: O-composite\n")
+    (output / "COMPLETE").write_text("done\n")
     (output / "checkpoints" / "step_002000" / "manifest.json").write_text(json.dumps({"completed_updates": 2000, "next_iteration": 2000}))
     (output / "checkpoints" / "step_002000" / "trainer.json").write_text(json.dumps({"completed_updates": 2000, "next_iteration": 2000}))
     (output / "checkpoints" / "step_002000" / "COMPLETE").write_text("done\n")
