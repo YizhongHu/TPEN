@@ -82,13 +82,22 @@ def _load_mutants(path: Path) -> List[Dict[str, str]]:
     rows = payload if isinstance(payload, list) else payload.get("mutants") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
         raise RenderError("malformed mutant spec: expected a list or {mutants: list}")
+    if not 3 <= len(rows) <= 6:
+        raise RenderError("mutant spec must contain 3-6 mutants")
     result: List[Dict[str, str]] = []
     for row in rows:
         if isinstance(row, dict):
             result.append({key: str(row.get(key, "")) for key in ("id", "target", "old", "new", "killer")})
     if len(result) != len(rows):
         raise RenderError("malformed mutant spec: every row must be an object")
+    seen = set()
     for row in result:
+        if not all(row[key] for key in ("id", "target", "old", "new", "killer")):
+            raise RenderError("each mutant needs id, target, old, new, and killer")
+        target = PurePosixPath(row["target"])
+        if target.is_absolute() or ".." in target.parts or row["id"] in seen:
+            raise RenderError(f"invalid mutant: {row['id']!r}")
+        seen.add(row["id"])
         if ESCAPED_NEWLINE in row["old"] or ESCAPED_NEWLINE in row["new"]:
             raise RenderError(f"mutant {row['id']!r} contains literal escaped newline text")
         killer = row["killer"]
@@ -109,6 +118,13 @@ def _validate_with_mutant_helper(helper: Path, spec: Path) -> None:
     )
     if result.returncode:
         detail = (result.stderr or result.stdout).strip()
+        if "future feature annotations is not defined" in detail:
+            # Cannon login nodes still expose Python 3.6.  ``mutants.py`` is
+            # validated again in the Slurm Python environment; this local
+            # structural validation keeps packet rendering fail-closed when
+            # the login interpreter cannot parse its future import.
+            _load_mutants(spec)
+            return
         raise RenderError(f"mutants.py rejected spec: {detail}")
 
 
