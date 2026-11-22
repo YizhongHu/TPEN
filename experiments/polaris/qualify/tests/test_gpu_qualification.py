@@ -167,7 +167,9 @@ def test_actual_run_stage_q_parser_rejects_unsupported_argument() -> None:
 
 
 def test_verifier_writes_pass_and_copy_controls_fail(tmp_path: Path) -> None:
-    output = tmp_path / "output" / "owner"
+    output_root = tmp_path / "output"
+    row_id = "fixture-row"
+    output = output_root / "Q" / row_id
     output.mkdir(parents=True)
     model = torch.nn.Linear(2, 1)
     context = SimpleNamespace(cfg=OmegaConf.create({}), run_dir=output,
@@ -176,11 +178,13 @@ def test_verifier_writes_pass_and_copy_controls_fail(tmp_path: Path) -> None:
     for step in (1000, 2000):
         trainer.state_dict = lambda step=step: {"completed_updates": step, "next_iteration": step}
         save_checkpoint(output_dir=output / "checkpoints", next_iteration=step, completed_updates=step, model=model, context=context, trainer=trainer, save_optimizer=False, save_sampler=False, save_rng=False, save_trainer=True)
-    (output / "selection_receipt.json").write_text(json.dumps({"selection": {"selected": {"context": "O-composite"}}, "walkers": 2048}) + "\n")
+    receipt = output_root / "cells" / row_id / "selection_receipt.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(json.dumps({"selection": {"selected": {"context": "O-composite"}}, "walkers": 2048}) + "\n")
     (output / "resolved_config.yaml").write_text("context: O-composite\n")
     (output / "COMPLETE").write_text("completed\n")
     manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({"runtime_kind": stage.RUNTIME_KIND, "cell": {"context": "O-composite", "walkers": 2048, "updates": 2000, "checkpoint_every": 1000}, "output_root": str(tmp_path / "output"), "evidence_dir": str(tmp_path / "evidence")}) + "\n")
+    manifest.write_text(json.dumps({"runtime_kind": stage.RUNTIME_KIND, "cell": {"context": "O-composite", "walkers": 2048, "updates": 2000, "checkpoint_every": 1000}, "output_root": str(output_root), "evidence_dir": str(tmp_path / "evidence")}) + "\n")
     assert qualification.qualify(manifest, tmp_path / "evidence") == 0
 
     def control(name: str) -> Path:
@@ -191,26 +195,43 @@ def test_verifier_writes_pass_and_copy_controls_fail(tmp_path: Path) -> None:
 
     bad = control("counters")
     for filename in ("manifest.json", "trainer.json"):
-        path = bad / "owner" / "checkpoints" / "step_002000" / filename
+        path = bad / "Q" / row_id / "checkpoints" / "step_002000" / filename
         value = json.loads(path.read_text()); value["completed_updates"] = 1999; value["next_iteration"] = 1999; path.write_text(json.dumps(value))
     evidence = tmp_path / "evidence-counters"
     assert qualification.qualify(manifest, evidence, artifact_root=bad) != 0
     assert next(row for row in json.loads((evidence / "qualification.json").read_text())["predicates"] if row["name"] == "completed_updates")["status"] == "FAIL"
     missing = control("missing-complete")
-    (missing / "owner" / "checkpoints" / "step_002000" / "COMPLETE").unlink()
+    (missing / "Q" / row_id / "COMPLETE").unlink()
     evidence = tmp_path / "evidence-complete"
     assert qualification.qualify(manifest, evidence, artifact_root=missing) != 0
     assert next(row for row in json.loads((evidence / "qualification.json").read_text())["predicates"] if row["name"] == "checkpoint_complete")["status"] == "FAIL"
     nan = control("nan")
-    torch.save({"weight": torch.tensor([float("nan")])}, nan / "owner" / "checkpoints" / "step_002000" / "model.pt")
+    torch.save({"weight": torch.tensor([float("nan")])}, nan / "Q" / row_id / "checkpoints" / "step_002000" / "model.pt")
     evidence = tmp_path / "evidence-nan"
     assert qualification.qualify(manifest, evidence, artifact_root=nan) != 0
     assert next(row for row in json.loads((evidence / "qualification.json").read_text())["predicates"] if row["name"] == "final_tensors_finite")["status"] == "FAIL"
     wrong = control("wrong-cell")
-    (wrong / "owner" / "selection_receipt.json").write_text(json.dumps({"selection": {"selected": {"context": "O-raw"}}, "walkers": 2048}))
+    (wrong / "cells" / row_id / "selection_receipt.json").write_text(json.dumps({"selection": {"selected": {"context": "O-raw"}}, "walkers": 2048}))
     evidence = tmp_path / "evidence-cell"
     assert qualification.qualify(manifest, evidence, artifact_root=wrong) != 0
     assert next(row for row in json.loads((evidence / "qualification.json").read_text())["predicates"] if row["name"] == "resolved_cell_identity")["status"] == "FAIL"
+
+
+def test_cell_completion_matches_receipt_row_not_decoy(tmp_path: Path) -> None:
+    """A COMPLETE for another row must not satisfy the discovered C."""
+    root = tmp_path / "output"
+    row_id = "selected-row"
+    receipt = root / "cells" / row_id / "selection_receipt.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(json.dumps({"selection": {"selected": {"context": "O-composite"}}, "walkers": 2048}) + "\n")
+    (root / "Q" / "decoy-row").mkdir(parents=True)
+    (root / "Q" / "decoy-row" / "COMPLETE").write_text("completed\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"runtime_kind": stage.RUNTIME_KIND, "cell": {"context": "O-composite", "walkers": 2048, "updates": 2000, "checkpoint_every": 1000}, "output_root": str(root)}) + "\n")
+    evidence = tmp_path / "evidence"
+    qualification.qualify(manifest, evidence)
+    verdict = json.loads((evidence / "qualification.json").read_text())
+    assert next(row for row in verdict["predicates"] if row["name"] == "cell_complete")["status"] == "FAIL"
 
 
 def test_job_main_green_and_seam_controls(monkeypatch, tmp_path: Path) -> None:

@@ -22,6 +22,7 @@ stage_coordinate = importlib.import_module("experiments.atomistic.he-importance.
 optimizer_grid = importlib.import_module("experiments.atomistic.he-importance.optimizer_grid")
 runner = importlib.import_module("experiments.atomistic.he-importance.run_stage_q")
 stage = stage_coordinate
+qualification = importlib.import_module("experiments.polaris.qualify.qualification")
 
 
 def _fake_adam(
@@ -882,6 +883,68 @@ def test_cell_selection_receipt_is_write_once_and_canonical(tmp_path: Path) -> N
                 occupant,
                 report | {"train_packet": {"content_hash": occupant}},
             )
+
+
+def _execute_real_stage_q_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, dict[str, object], object]:
+    """Capture the real execute-produced report and selected cell for consumers."""
+
+    facts = {
+        "global_rank": 0, "global_size": 1, "local_rank": 0, "local_size": 1,
+        "node_rank": 0, "node_size": 1, "host": "consumer-probe-host", "pid": 123,
+        "device": "cuda:consumer-probe", "job_id": "consumer-probe-job",
+        "device_identity": {"kind": "cuda", "index": 0, "uuid": "GPU-consumer-probe"},
+    }
+    monkeypatch.setattr(runner, "_execution_facts", lambda: dict(facts))
+    captured: dict[str, object] = {}
+    real_writer = runner._write_cell_selection_receipt
+
+    def capture_writer(campaign_root: Path, row_id: str, report: dict[str, object]) -> Path:
+        captured["campaign_root"], captured["row_id"], captured["report"] = campaign_root, row_id, report
+        return real_writer(campaign_root, row_id, report)
+
+    monkeypatch.setattr(runner, "_write_cell_selection_receipt", capture_writer)
+    original_launch = runner.launch.launch_train
+
+    def launch_wrapper(source: object, topology: object, **kwargs: object) -> int:
+        guarded_runner = kwargs["runner"]
+
+        def recording_run_from_config(config: object, *, topology: object) -> int:
+            output = Path(config.run.dir) / "resolved_config.yaml"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("horizon: 2000\n", encoding="utf-8")
+            return 0
+
+        monkeypatch.setattr(runner.launch, "run_from_config", recording_run_from_config)
+        return original_launch(source, topology, runner=guarded_runner)
+
+    monkeypatch.setattr(runner.launch, "launch_train", launch_wrapper)
+    assert runner.execute(_args(tmp_path, dry_run=False)) == 0
+    report = captured["report"]
+    row_id = captured["row_id"]
+    assert isinstance(report, dict) and isinstance(row_id, str)
+    selected = next(cell for cell in _cells(tmp_path) if cell.content_hash == row_id)
+    return tmp_path, report, selected
+
+
+def test_real_execute_report_round_trips_through_successor_validator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The validator must accept C captured from the real execute producer."""
+    campaign_root, report, selected = _execute_real_stage_q_output(tmp_path, monkeypatch)
+    assert runner._validate_cell_selection_receipt(campaign_root, selected.content_hash, report)
+
+
+def test_qualification_reads_real_stage_q_cell_completion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Qualification must mark cell_complete PASS for real Stage-Q output."""
+    campaign_root, report, selected = _execute_real_stage_q_output(tmp_path, monkeypatch)
+    manifest = tmp_path / "qualification-manifest.json"
+    manifest.write_text(json.dumps({"runtime_kind": "polaris-gpu-qualification", "output_root": str(campaign_root), "cell": {"context": report["selection"]["selected"]["context"], "walkers": report["walkers"], "updates": 2000, "checkpoint_every": 1000}}) + "\n", encoding="utf-8")
+    evidence = tmp_path / "qualification-evidence"
+    qualification.qualify(manifest, evidence)
+    verdict = json.loads((evidence / "qualification.json").read_text(encoding="utf-8"))
+    cell_complete = next(row for row in verdict["predicates"] if row["name"] == "cell_complete")
+    assert cell_complete["status"] == "PASS", (selected.output_path, cell_complete)
 
 
 @pytest.mark.parametrize("mutation", ["missing", "altered", "row", "noncanonical"])

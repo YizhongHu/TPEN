@@ -204,7 +204,7 @@ def test_t3_family_launch_route_agrees_selection_and_launch_views(
     assert observed["topology"] == _FACTS
     run_dir = Path(observed["config"].run.dir)
     assert (run_dir / "COMPLETE").read_text(encoding="utf-8") == "completed\n"
-    assert (run_dir / "selection_receipt.json").is_file()
+    assert (tmp_path / "cells" / report["train_packet"]["content_hash"] / "selection_receipt.json").is_file()
     assert run_dir.parent.name == "A"
 
 

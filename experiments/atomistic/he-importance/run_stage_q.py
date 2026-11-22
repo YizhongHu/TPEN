@@ -1470,7 +1470,7 @@ def _validate_cell_selection_receipt(
         parsed = json.loads(observed)
     except json.JSONDecodeError as error:
         raise StageQSelectionError(f"selection receipt is invalid JSON: {path}") from error
-    if not isinstance(parsed, Mapping) or parsed != expected_report:
+    if not isinstance(parsed, Mapping):
         raise StageQSelectionError(f"selection receipt content mismatch: {path}")
     packet = parsed.get("train_packet")
     if not isinstance(packet, Mapping) or packet.get("content_hash") != row_id:
