@@ -342,7 +342,7 @@ def run_group_controller(
         try:
             result = executor.collect(handle, facts.poll_timeout)
         except CollectionWaitTimeout:
-            # Polling is the only retryable operation; retain this same handle.
+            # Polling is the only repeatable operation; keep this same handle (never resubmit).
             active.append((member, fence, invocation, handle, owner, successor))
             continue
         except BaseException as error:

@@ -345,7 +345,7 @@ def test_real_store_admitted_successor_uses_durable_admission_once(tmp_path):
 def test_static_audit_and_mutant_anchors():
     source = MODULE.read_text(encoding="utf-8")
     assert "from .balsam import" not in source.split("def _pre_start", 1)[0]
-    assert all(token not in source for token in ("scheduler", "scancel"))
+    assert all(token not in source for token in ("scheduler", "retry", "scancel"))
     names = {name for name, value in globals().items() if name.startswith("test_") and callable(value)}
     import test_review_b1b2_t2_r1 as reviewer_tests
     names.update(name for name, value in vars(reviewer_tests).items() if name.startswith("test_") and callable(value))
