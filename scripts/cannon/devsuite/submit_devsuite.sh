@@ -10,17 +10,19 @@ VERIFY_PREFIX="${FACILITY_PREFIX}/verify"
 EXECUTOR_REQUIRED_COMMIT="dc99163e15bdb7f2b4cb482e570ff0e9a0e9a8ec"
 DRY_RUN=0
 SUBMIT=0
-EXECUTOR_HARNESS="${EXECUTOR_HARNESS_DIR:-}"
 EXECUTOR_MUTANTS=""
 ALLOW_EXECUTOR_MUTANTS=0
 EXECUTOR_ONLY=0
+LOCAL_DRY_RUN=0
+SCHEDULED=0
 STAGE_BASE="${DEVSUITE_STAGE_BASE:-$VERIFY_PREFIX}"
+LOCAL_STAGE_EXPORT="${DEVSUITE_LOCAL_STAGE_DIR:-}"
 BUNDLE_HEAD_REF=""
 BUNDLE_REQUIRED_REF=""
 
 usage() {
   cat <<'USAGE'
-usage: submit_devsuite.sh [--dry-run|--submit] [--executor-harness DIR] [--executor-mutants SPEC.json] [--executor-only] SHA
+usage: submit_devsuite.sh [--dry-run|--submit|--local-dry-run] [--scheduled] [--executor-mutants SPEC.json] [--executor-only] SHA
 
 The SHA must be a full 40-hex commit present in the current checkout.  The
 dry-run stages both arms, reads back every staged-file sha256, runs bash -n and
@@ -39,7 +41,8 @@ while (($#)); do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
     --submit) SUBMIT=1; shift ;;
-    --executor-harness) EXECUTOR_HARNESS="${2:?missing harness directory}"; shift 2 ;;
+    --local-dry-run) LOCAL_DRY_RUN=1; shift ;;
+    --scheduled) SCHEDULED=1; shift ;;
     --executor-mutants) EXECUTOR_MUTANTS="${2:?missing mutant spec}"; ALLOW_EXECUTOR_MUTANTS=1; shift 2 ;;
     --executor-only) EXECUTOR_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -51,8 +54,8 @@ done
 [[ $# == 1 ]] || { usage >&2; fail "exactly one SHA is required"; }
 HEAD_SHA="$1"
 [[ "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || fail "SHA must be a full 40-hex commit"
-[[ "$DRY_RUN" == 1 || "$SUBMIT" == 1 ]] || fail "choose --dry-run or --submit"
-[[ "$DRY_RUN" == 0 || "$SUBMIT" == 0 ]] || fail "--dry-run and --submit are mutually exclusive"
+[[ "$DRY_RUN" == 1 || "$SUBMIT" == 1 || "$LOCAL_DRY_RUN" == 1 ]] || fail "choose --dry-run, --submit, or --local-dry-run"
+(( DRY_RUN + SUBMIT + LOCAL_DRY_RUN <= 1 )) || fail "dry-run, submit, and local-dry-run are mutually exclusive"
 if [[ "$SUBMIT" == 1 && "${DEVSUITE_ALLOW_SUBMIT:-0}" != 1 ]]; then
   fail "real submission is safety-gated; set DEVSUITE_ALLOW_SUBMIT=1 explicitly"
 fi
@@ -65,22 +68,16 @@ REPO_URL="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null)" || fail "ori
 
 [[ "$STAGE_BASE" == "$VERIFY_PREFIX" || "$STAGE_BASE" == "$VERIFY_PREFIX"/* ]] || fail "stage base escapes Cannon verify prefix"
 [[ "$STAGE_BASE" != */ ]] || fail "stage base must not have a trailing slash"
-[[ -n "$EXECUTOR_HARNESS" ]] || fail "--executor-harness or EXECUTOR_HARNESS_DIR is required"
-[[ "$EXECUTOR_HARNESS" == /* ]] || fail "executor harness path must be absolute"
-[[ -d "$EXECUTOR_HARNESS" ]] || fail "executor harness directory does not exist"
+if [[ -n "$LOCAL_STAGE_EXPORT" ]]; then
+  [[ "$LOCAL_DRY_RUN" == 1 ]] || fail "DEVSUITE_LOCAL_STAGE_DIR requires --local-dry-run"
+  [[ "$LOCAL_STAGE_EXPORT" == /* ]] || fail "local stage export must be an absolute path"
+  [[ ! -e "$LOCAL_STAGE_EXPORT" ]] || fail "local stage export already exists: $LOCAL_STAGE_EXPORT"
+  mkdir -p -- "$LOCAL_STAGE_EXPORT"
+fi
 if [[ -n "$EXECUTOR_MUTANTS" ]]; then
   [[ "$EXECUTOR_MUTANTS" == /* ]] || fail "executor mutant spec path must be absolute"
   [[ -f "$EXECUTOR_MUTANTS" ]] || fail "executor mutant spec does not exist"
 fi
-for required in job.sbatch mutants.json repo.bundle helpers/validate_inputs.sh helpers/env_audit.py; do
-  [[ -f "$EXECUTOR_HARNESS/$required" ]] || fail "executor harness missing $required"
-done
-grep -q 'H_V2_SCIENCE_PYTHON' "$EXECUTOR_HARNESS/job.sbatch" || fail "executor harness lacks H_V2_SCIENCE_PYTHON"
-grep -q 'H_V2_EXECUTOR_PYTHON' "$EXECUTOR_HARNESS/job.sbatch" || fail "executor harness lacks H_V2_EXECUTOR_PYTHON"
-if [[ "$ALLOW_EXECUTOR_MUTANTS" == 0 ]]; then
-  grep -Eq '"mutants"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]' "$EXECUTOR_HARNESS/mutants.json" || fail "executor harness mutant spec is not empty"
-fi
-[[ -s "$EXECUTOR_HARNESS/repo.bundle" ]] || fail "executor harness repo.bundle is empty"
 [[ "$(git -C "$REPO_ROOT" cat-file -t "$EXECUTOR_REQUIRED_COMMIT" 2>/dev/null || true)" == commit ]] ||
   fail "checkout lacks required executor historical commit $EXECUTOR_REQUIRED_COMMIT"
 
@@ -112,7 +109,11 @@ trap cleanup EXIT
 SHA8="${HEAD_SHA:0:8}"
 SHA12="${HEAD_SHA:0:12}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-REMOTE_STAGE="${STAGE_BASE}/dev-fullsuite-${SHA8}-${STAMP}"
+SCHEDULED_PREFIX=""
+if [[ "$SCHEDULED" == 1 ]]; then
+  SCHEDULED_PREFIX="scheduled-"
+fi
+REMOTE_STAGE="${STAGE_BASE}/dev-fullsuite-${SCHEDULED_PREFIX}${SHA8}-${STAMP}"
 ROOT_RUN_ROOT="${REMOTE_STAGE}/root-run"
 ROOT_TASK_ROOT="${REMOTE_STAGE}/root"
 EXECUTOR_TASK_ROOT="${REMOTE_STAGE}/executor-harness"
@@ -128,11 +129,20 @@ mkdir -p "$ROOT_LOCAL" "$EXECUTOR_LOCAL"
 # SHA; verify.sh is intentionally not edited by this launcher.
 git -C "$REPO_ROOT" archive "$HEAD_SHA" scripts/cannon | tar -x -C "$ROOT_LOCAL"
 
-# Copy the approved versioned executor harness as data, then replace only its
-# repo.bundle with an exact-head bundle. No harness source is edited here.
+# Copy the executor harness from the exact-SHA scripts/cannon tree staged above,
+# then replace only its repo.bundle with an exact-head bundle. No external
+# harness path is accepted or consulted.
+EXECUTOR_HARNESS="$ROOT_LOCAL/scripts/cannon/executor-harness"
+for required in job.sbatch helpers/validate_inputs.sh helpers/env_audit.py; do
+  [[ -f "$EXECUTOR_HARNESS/$required" ]] || fail "in-repo executor harness missing $required"
+done
+grep -q 'H_V2_SCIENCE_PYTHON' "$EXECUTOR_HARNESS/job.sbatch" || fail "in-repo executor harness lacks H_V2_SCIENCE_PYTHON"
+grep -q 'H_V2_EXECUTOR_PYTHON' "$EXECUTOR_HARNESS/job.sbatch" || fail "in-repo executor harness lacks H_V2_EXECUTOR_PYTHON"
 tar -C "$EXECUTOR_HARNESS" -cf - . | tar -C "$EXECUTOR_LOCAL" -xf -
 if [[ -n "$EXECUTOR_MUTANTS" ]]; then
   cp -- "$EXECUTOR_MUTANTS" "$EXECUTOR_LOCAL/mutants.json"
+else
+  printf '{"mutants": []}\n' > "$EXECUTOR_LOCAL/mutants.json"
 fi
 chmod 0755 "$EXECUTOR_LOCAL/job.sbatch"
 # Bundle refs must be branch refs so `git clone bundle` has a default head;
@@ -185,6 +195,21 @@ write_local_manifest "$ROOT_LOCAL" "$TMP_ROOT/root.sha256"
 write_local_manifest "$EXECUTOR_LOCAL" "$TMP_ROOT/executor.sha256"
 if [[ -n "$EXECUTOR_MUTANTS" ]]; then
   printf 'EXECUTOR_MUTANTS_SHA256 PASS spec=%s sha256=%s\n' "$EXECUTOR_MUTANTS" "$(hash_local "$EXECUTOR_MUTANTS")"
+fi
+
+if [[ -n "$LOCAL_STAGE_EXPORT" ]]; then
+  # The local-only export lets contract tests inspect the bytes that were
+  # staged from the requested SHA without exposing a remote staging path.
+  mkdir -p -- "$LOCAL_STAGE_EXPORT/root" "$LOCAL_STAGE_EXPORT/executor"
+  tar -C "$ROOT_LOCAL" -cf - . | tar -C "$LOCAL_STAGE_EXPORT/root" -xf -
+  tar -C "$EXECUTOR_LOCAL" -cf - . | tar -C "$LOCAL_STAGE_EXPORT/executor" -xf -
+fi
+
+if [[ "$LOCAL_DRY_RUN" == 1 ]]; then
+  printf 'LOCAL_RENDER PASS sha=%s harness_source=scripts/cannon/executor-harness harness_source_sha=%s scheduled=%s stage=%s root_files=%s executor_files=%s\n' \
+    "$HEAD_SHA" "$HEAD_SHA" "$SCHEDULED" "$REMOTE_STAGE" \
+    "$(wc -l < "$TMP_ROOT/root.sha256" | tr -d ' ')" "$(wc -l < "$TMP_ROOT/executor.sha256" | tr -d ' ')"
+  exit 0
 fi
 
 ssh_mux_check() {
