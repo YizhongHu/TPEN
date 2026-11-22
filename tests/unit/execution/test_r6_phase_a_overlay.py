@@ -62,9 +62,10 @@ def test_r6_e4_configured_overlay_reaches_core_and_start_receipt(monkeypatch, tm
     )
     assert seen == [1]
     assert observed_start[0]["declared_overlays"] == {"trainer.max_steps": 1}
-    start = result.invocation.start
+    start = result.start
     assert start.declared_overlays == {"trainer.max_steps": 1}
-    assert result.outcome.outcome.value == "unknown"
+    assert result.outcome.outcome.value == "parked"
+    assert result.outcome.status.value == "unknown"
 
 
 def test_r6_e4_no_overlay_is_a_distinct_green_control(monkeypatch, tmp_path):
@@ -87,10 +88,11 @@ def test_r6_e4_no_overlay_is_a_distinct_green_control(monkeypatch, tmp_path):
         cfg=OmegaConf.create({**source, "run": {"root": "unused"}}),
         batch=batch, intent=intent, phase=RecoveryPhase.INITIAL,
     )
-    assert result.outcome.outcome.value == "unknown"
+    assert result.outcome.outcome.value == "parked"
+    assert result.outcome.status.value == "unknown"
     assert seen == [2]
     assert observed_start[0]["declared_overlays"] == {}
-    assert result.invocation.start.declared_overlays == {}
+    assert result.start.declared_overlays == {}
 
 
 def test_r6_e3_direct_configured_overlay_is_a_green_control(monkeypatch, tmp_path):

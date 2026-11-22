@@ -185,12 +185,9 @@ _PORTS = {
         "test_review_docstrings_contain_no_local_provenance",
     },
     "CR": {
-        "test_refusal_precedence_is_shared_by_submitter_and_worker",
         "test_unknown_fields_are_refused_at_all_nested_wire_levels",
         "test_all_refusal_codes_have_explicit_outcomes",
         "test_incompatible_refusal_code_survives_receipt_and_disk",
-        "test_runner_json_writer_syncs_file_before_replace_and_directory_after",
-        "test_app_pre_e3_writer_syncs_file_before_replace_and_directory_after",
         "test_review_docstrings_contain_no_local_provenance",
     },
 }

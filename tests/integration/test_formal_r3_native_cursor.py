@@ -22,6 +22,7 @@ from tests.integration.test_native_checkpoint_recovery import (
     _batch,
     _launch,
     _trace,
+    _worker_diagnostics,
     _write_inputs,
 )
 
@@ -46,7 +47,7 @@ def _wait_for_two_prefix_checkpoints(outputs: Path, *, target: int, process) -> 
         if process.poll() is not None:
             raise AssertionError(
                 f"prefix worker exited (rc={process.returncode}) before two "
-                "committed prefix checkpoints"
+                f"committed prefix checkpoints\n{_worker_diagnostics(process)}"
             )
         time.sleep(0.05)
     raise AssertionError("no two committed prefix checkpoints before deadline")
@@ -136,7 +137,7 @@ def cursor_evidence(tmp_path_factory: pytest.TempPathFactory) -> dict:
             disable_limb=spec["disable"],
         )
         worker.wait(timeout=240)
-        assert worker.returncode == 0, label
+        native._assert_worker_returncode(worker, 0, label)
         traces[label] = _trace(trace_path)
         trace_paths[label] = trace_path
 

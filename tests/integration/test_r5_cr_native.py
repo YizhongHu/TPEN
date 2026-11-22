@@ -115,8 +115,8 @@ def r5_traces(tmp_path_factory):
         if label == "disabled-trainer_cursor":
             cursor_leaf_before = _snapshot_leaf(run_dir)
         process = lane.launch(label=f"r5-{label}", trace=trace_path, **options)
-        returncode = process.wait(timeout=180)
-        assert returncode == 0, f"native worker {label} returned {returncode!r}"
+        process.wait(timeout=180)
+        native._assert_worker_returncode(process, 0, label)
         if label == "disabled-trainer_cursor":
             cursor_leaf_after = _snapshot_leaf(run_dir)
         traces[label] = native._trace(trace_path)
@@ -280,8 +280,7 @@ def test_r5_before_commit_replica_reaches_e3_before_kill(tmp_path):
     # disconnected replica of the old Popen/immediate-kill timing.
     process = lane.launch(phase="initial", label="r5-before-commit-replica", pause_before_science=True)
     native._kill_before_first_commit(process, lane.outputs)
-    returncode = process.returncode
-    assert returncode == -signal.SIGKILL, f"replica returncode={returncode!r}"
+    native._assert_worker_returncode(process, -signal.SIGKILL, "r5-before-commit-replica")
     starts = list(lane.outputs.rglob("start.json"))
     log_bytes = sum(path.stat().st_size for path in lane.root.glob("worker-r5-before-commit-replica-*.log"))
     assert starts, f"observed {len(starts)} start.json files; worker log bytes={log_bytes}"
@@ -299,7 +298,10 @@ def test_r5_real_before_commit_kill_reconciles_parked(tmp_path):
         if starts:
             break
         if process.poll() is not None:
-            pytest.fail(f"worker exited (rc={process.returncode}) before publishing a start receipt")
+            pytest.fail(
+                f"worker exited (rc={process.returncode}) before publishing a start receipt\n"
+                f"{native._worker_diagnostics(process)}"
+            )
         time.sleep(0.05)
     assert starts, "start receipt was not observed before the deadline"
     _kill(process)

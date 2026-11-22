@@ -159,7 +159,11 @@ def _launch(
         command.append("--pause-before-science")
     if suppress_channel is not None:
         command.extend(("--suppress-channel", suppress_channel))
-    log = (root / f"worker-{label or phase}-{time.monotonic_ns()}.log").open("w+")
+    launch_id = time.monotonic_ns()
+    log_path = root / f"worker-{label or phase}-{launch_id}.log"
+    stderr_path = root / f"worker-{label or phase}-{launch_id}.stderr"
+    log = log_path.open("w+")
+    stderr = stderr_path.open("w+")
     environment = os.environ.copy()
     # Executing a helper by absolute path makes Python place tests/helpers,
     # rather than the checkout root, first on sys.path.  Keep the fixture's
@@ -167,8 +171,35 @@ def _launch(
     checkout_root = str(Path(__file__).parents[2])
     environment["PYTHONPATH"] = checkout_root + os.pathsep + environment.get("PYTHONPATH", "")
     environment["TPEN_NATIVE_LAUNCH_ARGV"] = json.dumps(command)
-    return subprocess.Popen(
-        command, stdout=log, stderr=subprocess.STDOUT, text=True, env=environment
+    process = subprocess.Popen(command, stdout=log, stderr=stderr, text=True, env=environment)
+    # Keep exact child streams attached to the process so every caller can
+    # include them when a worker exits unexpectedly.
+    process._tpen_stdout_path = log_path
+    process._tpen_stderr_path = stderr_path
+    log.close()
+    stderr.close()
+    return process
+
+
+def _worker_diagnostics(process: subprocess.Popen[str]) -> str:
+    """Return captured child stdout/stderr for a failed launch."""
+
+    stdout_path = getattr(process, "_tpen_stdout_path", None)
+    stderr_path = getattr(process, "_tpen_stderr_path", None)
+    stdout = "<unavailable>" if stdout_path is None else Path(stdout_path).read_text()
+    stderr = "<unavailable>" if stderr_path is None else Path(stderr_path).read_text()
+    return f"stdout:\n{stdout}\nstderr:\n{stderr}"
+
+
+def _assert_worker_returncode(
+    process: subprocess.Popen[str], expected: int, label: str
+) -> None:
+    """Assert a child exit code and include both captured streams on failure."""
+
+    actual = process.returncode
+    assert actual == expected, (
+        f"native worker {label} returned {actual!r}, expected {expected!r}\n"
+        f"{_worker_diagnostics(process)}"
     )
 
 
@@ -209,9 +240,10 @@ def _wait_for_prefix_checkpoints(
         if len(refs) >= minimum:
             return refs[-1].checkpoint_dir.parent.parent, refs
         if process is not None and process.poll() is not None:
-            logs = sorted(outputs.parent.glob("worker-*.log"))
-            detail = "\n".join(path.read_text() for path in logs)
-            raise AssertionError(f"worker exited before a prefix checkpoint (rc={process.returncode})\n{detail}")
+            raise AssertionError(
+                f"worker exited before a prefix checkpoint (rc={process.returncode})\n"
+                f"{_worker_diagnostics(process)}"
+            )
         time.sleep(0.1)
     raise AssertionError(
         f"worker wrote fewer than {minimum} distinct committed periodic checkpoints before the target"
@@ -241,10 +273,9 @@ def _wait_for_checkpoint(
                 if int(checkpoint.name.split("_")[-1]) < target:
                     return root.parent
         if process is not None and process.poll() is not None:
-            logs = sorted(outputs.parent.glob("worker-*.log"))
-            detail = "\n".join(path.read_text() for path in logs)
             raise AssertionError(
-                f"worker exited before a prefix checkpoint (rc={process.returncode})\n{detail}"
+                f"worker exited before a prefix checkpoint (rc={process.returncode})\n"
+                f"{_worker_diagnostics(process)}"
             )
         time.sleep(0.1)
     raise AssertionError("worker wrote no committed periodic checkpoint before the target")
@@ -331,7 +362,10 @@ def _kill_before_first_commit(process: subprocess.Popen[str], outputs: Path) -> 
             assert "no durable core outcome" in parked.reason
             return starts[0]
         if process.poll() is not None:
-            raise AssertionError(f"worker exited before E3 start: {process.returncode}")
+            raise AssertionError(
+                f"worker exited before E3 start: {process.returncode}\n"
+                f"{_worker_diagnostics(process)}"
+            )
         time.sleep(0.05)
     raise AssertionError("worker did not publish E3 start before the deadline")
 
@@ -388,7 +422,7 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
     prefix_checkpoint = _committed_checkpoint(prefix_run_dir)
     assert prefix_checkpoint is not None
     assert prefix_checkpoint.next_iteration < batch.target_iterations
-    assert prefix.returncode == -signal.SIGKILL
+    _assert_worker_returncode(prefix, -signal.SIGKILL, "prefix")
     assert prefix_checkpoint.checkpoint_dir.exists()
 
     evidence = CheckpointEvidence.from_ref(
@@ -410,7 +444,7 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
         resume_step=prefix_checkpoint.next_iteration,
     )
     successor.wait(timeout=180)
-    assert successor.returncode == 0
+    _assert_worker_returncode(successor, 0, "successor")
     successor_result = _result_from_log(tmp_path, "recovery")
     assert successor_result["status"] == "started"
     assert successor_result["invocation"]["outcome"] == "completed"
@@ -429,7 +463,7 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
         trace=tmp_path / "trace-reference.json",
     )
     reference.wait(timeout=180)
-    assert reference.returncode == 0
+    _assert_worker_returncode(reference, 0, "reference")
     reference_result = _result_from_log(tmp_path, "reference")
     assert reference_result["invocation"]["outcome"] == "completed"
     assert successor_result["invocation"]["completed_updates"] == reference_result["invocation"]["completed_updates"]
@@ -495,7 +529,7 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
         partial_restore=True,
     )
     partial.wait(timeout=180)
-    assert partial.returncode == 0
+    _assert_worker_returncode(partial, 0, "partial")
     partial_result = _result_from_log(tmp_path, "partial")
     assert partial_result["invocation"]["outcome"] == "completed"
     partial_output = Path(partial_result["invocation"]["output_path"])
@@ -667,7 +701,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         resume_step=0,
     )
     reference.wait(timeout=180)
-    assert reference.returncode == 0
+    _assert_worker_returncode(reference, 0, "channel-reference")
     reference_trace = _trace(tmp_path / "channel-reference.trace.json")
 
     resume_cursor = prefix_checkpoint.next_iteration
@@ -685,7 +719,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         resume_step=resume_cursor,
     )
     full.wait(timeout=180)
-    assert full.returncode == 0
+    _assert_worker_returncode(full, 0, "channel-full")
     full_trace = _trace(full_trace_path)
     compare_channel_parity(
         reference_trace,
@@ -719,7 +753,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         resume_step=lower_refs[0].next_iteration,
     )
     cursor_control.wait(timeout=180)
-    assert cursor_control.returncode == 0
+    _assert_worker_returncode(cursor_control, 0, "channel-cursor-control")
     cursor_control_trace = _trace(cursor_control_path)
     results: dict[str, dict[str, bool]] = {}
     refusals: dict[str, dict] = {}
@@ -742,7 +776,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
             disable_limb=limb,
         )
         worker.wait(timeout=180)
-        assert worker.returncode == 0, label
+        _assert_worker_returncode(worker, 0, label)
         disabled_trace = _trace(trace_path)
         disabled_traces[limb] = disabled_trace
         assert disabled_trace.pid != reference_trace.pid
@@ -859,7 +893,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
             suppress_channel=spec.channel,
         )
         suppressed.wait(timeout=180)
-        assert suppressed.returncode == 0
+        _assert_worker_returncode(suppressed, 0, f"channel-suppressed-{spec.channel}")
         suppressed_trace = _trace(suppressed_trace_path)
         with pytest.raises(UnmeasuredArmError, match=spec.channel):
             first_subsequent_event(
@@ -930,7 +964,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         disable_limbs=non_cursor_limbs,
     )
     all_disabled.wait(timeout=180)
-    assert all_disabled.returncode == 0
+    _assert_worker_returncode(all_disabled, 0, "channel-all-disabled")
     compare_channel_parity(
         reference_trace, _trace(all_disabled_path), resume_step=resume_cursor - 1,
         disabled_limbs=non_cursor_limbs,
@@ -1009,7 +1043,7 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
         label="fault-no-checkpoint",
     )
     no_checkpoint.wait(timeout=60)
-    assert no_checkpoint.returncode == 0
+    _assert_worker_returncode(no_checkpoint, 0, "fault-no-checkpoint")
     no_checkpoint_result = _result_from_log(tmp_path, "fault-no-checkpoint")
     assert no_checkpoint_result["status"] == "started"
     assert no_checkpoint_result["invocation"]["outcome"] == "parked"
@@ -1032,7 +1066,7 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
     )
     before_start = _kill_before_first_commit(before, before_root)
     assert before_start.is_file()
-    assert before.returncode == -signal.SIGKILL
+    _assert_worker_returncode(before, -signal.SIGKILL, "fault-before-commit")
     assert not any(
         list_complete_checkpoints(root)
         for root in before_root.rglob("checkpoints")
@@ -1048,7 +1082,7 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
         label="fault-before-commit-successor",
     )
     before_successor.wait(timeout=60)
-    assert before_successor.returncode == 0
+    _assert_worker_returncode(before_successor, 0, "fault-before-commit-successor")
     before_result = _result_from_log(tmp_path, "fault-before-commit-successor")
     assert before_result["status"] == "started"
     assert before_result["invocation"]["outcome"] == "parked"
@@ -1093,7 +1127,7 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
         evidence=evidence_path,
     )
     corrupt.wait(timeout=60)
-    assert corrupt.returncode == 0
+    _assert_worker_returncode(corrupt, 0, "fault-corrupt-committed")
     corrupt_result = _result_from_log(tmp_path, "fault-corrupt-committed")
     assert corrupt_result["status"] == "started"
     assert corrupt_result["invocation"]["outcome"] == "terminal"

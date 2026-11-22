@@ -80,8 +80,8 @@ def _build_lane(tmp_path_factory):
         if label == "disabled-trainer_cursor":
             predecessor_leaf_before = _snapshot_leaf(run_dir)
         worker = lane.launch(label=f"r9-{label}", trace=trace, **options)
-        rc_worker = worker.wait(timeout=180)
-        assert rc_worker == 0, f"native worker {label} returned {rc_worker!r}"
+        worker.wait(timeout=180)
+        native._assert_worker_returncode(worker, 0, label)
         if label == "disabled-trainer_cursor":
             predecessor_leaf_after = _snapshot_leaf(run_dir)
         traces[label] = native._trace(trace)

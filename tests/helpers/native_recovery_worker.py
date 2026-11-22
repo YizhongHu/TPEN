@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import time
+import traceback
 from dataclasses import replace
 from pathlib import Path
 
@@ -118,7 +119,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    """Run one actual worker process and print its typed adapter result."""
+    """Run one actual worker process and print its typed gateway result."""
 
     args = _parser().parse_args()
     batch = decode_ready_batch(args.batch.read_bytes())
@@ -229,7 +230,11 @@ def main() -> int:
                 trace_stack.close()
             if trace is not None:
                 trace.write(args.trace)
-    invocation = result.invocation
+    # WorkerStartGateway returns the WorkerInvocation directly.  The old
+    # Balsam adapter wrapped it in a result object, but native workers have no
+    # backend layer to reproduce; the gateway itself owns the start/outcome
+    # receipt and its fresh per-launch output namespace.
+    invocation = result
     output = {
         "status": "started",
         "reason": result.outcome.reason,
@@ -252,4 +257,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception:
+        # Keep the structured worker result on stdout, while making a failed
+        # child diagnosable by its parent test through the separate stderr log.
+        traceback.print_exc()
+        raise
