@@ -22,7 +22,7 @@ from .results import (
     SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3, StartReceipt,
     SuccessorAdmissionRecord, MemberPublicationV2, ReconciliationPublicationV2, decode_placement_receipt,
 )
-from .runners import CoreRunEvidence
+from .runners import CoreRunEvidence, EvidenceUnavailable
 from ._records import frozen_record
 
 
@@ -129,6 +129,8 @@ def _layout_for_output_dir(output_dir: str) -> tuple[str, str, str, str, str]:
     """Parse ``<root>/groups/<digest>/<task>/<attempt>`` lexically."""
     if type(output_dir) is not str:
         raise TypeError("output_dir must be a string")
+    if not os.path.isabs(output_dir):
+        raise AdmissionIdentityMismatch("output_dir must be absolute")
     output = _lexical(output_dir)
     attempt = os.path.basename(output)
     task_dir = os.path.dirname(output)
@@ -2132,6 +2134,8 @@ def read_successor_admission(
                 _, core_record = store._continuation_predecessor_locked(predecessor, task_dir, current=False)
             except _AdmissionCoreIdentityMismatch as error:
                 raise AdmissionIdentityMismatch("predecessor core outcome crosses admission identity") from error
+            except EvidenceUnavailable as error:
+                raise AdmissionUnreadable("predecessor core outcome is unreadable") from error
             except (OSError, TypeError, ValueError, FenceRejected, json.JSONDecodeError) as error:
                 raise AdmissionUnreadable("predecessor core outcome is unreadable") from error
             request = store._successor_request_from_record(
@@ -2145,6 +2149,8 @@ def read_successor_admission(
             return {"record": thaw(record.to_dict()), "request": thaw(request)}
     except SuccessorAdmissionReadError:
         raise
+    except FenceRejected as error:
+        raise AdmissionUnreadable("successor admission is unreadable") from error
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise AdmissionUnreadable("successor admission is unreadable") from error
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +19,7 @@ from tpen_executor import (
 from tpen_executor._codec import canonical_bytes, digest
 from tpen_executor.contracts import AttemptId
 from tpen_executor.results import SuccessorAdmissionRecord
+from tpen_executor.runners import EvidenceUnavailable
 
 from test_continuation_admission import _planned_attempt
 
@@ -28,6 +31,8 @@ MUTANTS = (
     {"id": "d", "target": "executor/src/tpen_executor/storage.py", "old": "raise AdmissionUnreadable(\"successor admission ledger is unreadable\") from error", "new": "raise AdmissionAbsent(\"successor admission ledger is unreadable\") from error", "killer": "test_mutant_d_corrupt_ledger_is_unreadable"},
     {"id": "e", "target": "executor/src/tpen_executor/storage.py", "old": "if digest(request) != record.request_digest:", "new": "if False:", "killer": "test_mutant_e_intent_digest_is_checked"},
     {"id": "f", "target": "executor/src/tpen_executor/storage.py", "old": "core_record,\n                record.successor_attempt_id,\n                science_input_digest", "new": "core_record,\n                record.predecessor_attempt_id,\n                science_input_digest", "killer": "test_mutant_f_rebuild_uses_successor_id"},
+    {"id": "g", "target": "executor/src/tpen_executor/storage.py", "old": "except EvidenceUnavailable as error:\n                raise AdmissionUnreadable(\"predecessor core outcome is unreadable\") from error", "new": "except EvidenceUnavailable as error:\n                raise", "killer": "test_reader_translates_evidence_unavailable"},
+    {"id": "h", "target": "executor/src/tpen_executor/storage.py", "old": "except FenceRejected as error:\n        raise AdmissionUnreadable(\"successor admission is unreadable\") from error", "new": "except FenceRejected as error:\n        raise", "killer": "test_reader_translates_bad_task_lock"},
 )
 
 
@@ -38,6 +43,14 @@ def _snapshot(root: Path) -> dict[str, str]:
         name = str(path.relative_to(root))
         result[name + "/" if path.is_dir() else name] = "<directory>" if path.is_dir() else hashlib.sha256(path.read_bytes()).hexdigest()
     return result
+
+
+def _entry_inventory(root: Path) -> dict[str, tuple[int, int]]:
+    """Inventory entries without opening regular files or special files."""
+    return {
+        str(path.relative_to(root)): (stat.S_IFMT(path.lstat().st_mode), path.lstat().st_size)
+        for path in sorted(root.rglob("*"))
+    }
 
 
 def _make_admitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -124,6 +137,63 @@ def test_reader_rejects_noncanonical_predecessor_core_outcome(tmp_path: Path, mo
         _read(successor)
 
 
+def test_reader_translates_evidence_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _store, _group, predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
+    _read(successor)
+    path = Path(predecessor.output_dir, "core-outcome.json")
+    payload = json.loads(path.read_text())
+    payload["evidence"]["run_status"] = "completed"
+    path.write_bytes(canonical_bytes(payload))
+    after_corruption = _snapshot(Path(successor.output_dir).parent)
+    with pytest.raises(AdmissionUnreadable) as caught:
+        _read(successor)
+    cause = caught.value.__cause__
+    causes = []
+    while cause is not None:
+        causes.append(cause)
+        cause = cause.__cause__
+    assert any(isinstance(error, EvidenceUnavailable) for error in causes)
+    assert _snapshot(Path(successor.output_dir).parent) == after_corruption
+
+
+def test_reader_translates_bad_task_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _store, _group, _predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
+    _read(successor)
+    task_dir = Path(successor.output_dir).parent
+    lock = task_dir / ".task.lock"
+    lock.unlink()
+    os.mkfifo(lock)
+    before = _entry_inventory(task_dir)
+    with pytest.raises(AdmissionUnreadable) as caught:
+        _read(successor)
+    assert isinstance(caught.value.__cause__, storage.FenceRejected)
+    assert _entry_inventory(task_dir) == before
+
+
+@pytest.mark.parametrize("case", ["relative", "trailing", "symlink", "predecessor"])
+def test_reader_path_cases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str) -> None:
+    _store, _group, predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
+    if case == "relative":
+        with pytest.raises(AdmissionIdentityMismatch):
+            read_successor_admission(os.path.relpath(successor.output_dir), task_id=successor.task_id, attempt_id=successor.attempt_id.value, group_digest=successor.group_digest, science_input_digest="a" * 64, target_iterations=10)
+    elif case == "trailing":
+        assert _read(successor, output_dir=successor.output_dir + "/")
+    elif case == "predecessor":
+        with pytest.raises(AdmissionIdentityMismatch):
+            read_successor_admission(predecessor.output_dir, task_id=successor.task_id, attempt_id=successor.attempt_id.value, group_digest=successor.group_digest, science_input_digest="a" * 64, target_iterations=10)
+    else:
+        group_dir = Path(successor.output_dir).parents[1]
+        moved = group_dir.with_name(group_dir.name + "-real")
+        group_dir.rename(moved)
+        os.symlink(moved, group_dir)
+        try:
+            with pytest.raises(AdmissionUnreadable):
+                _read(successor)
+        finally:
+            group_dir.unlink()
+            moved.rename(group_dir)
+
+
 def test_reader_rejects_truncated_and_noncanonical_ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _store, _group, _allocation, predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
     ledger = _ledger_path(predecessor)
@@ -185,3 +255,11 @@ def test_mutant_e_intent_digest_is_checked(tmp_path: Path, monkeypatch: pytest.M
 
 def test_mutant_f_rebuild_uses_successor_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     test_reader_returns_fresh_record_and_rebuilt_request(tmp_path, monkeypatch)
+
+
+def test_mutant_g_evidence_error_is_translated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    test_reader_translates_evidence_unavailable(tmp_path, monkeypatch)
+
+
+def test_mutant_h_lock_error_is_translated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    test_reader_translates_bad_task_lock(tmp_path, monkeypatch)
