@@ -211,20 +211,29 @@ def run_group_controller(
     # and avoids an import cycle through the local executor's handle type.
     from .attached import AttachedAllocation
     from ..dispatch.completion import complete_leaf_result
-    from ..dispatch.transport import LeafResult, LeafResultRejected
-    from .local_executor import CollectionWaitTimeout
+    from ..dispatch.transport import LeafResultRejected
+    from .local_executor import CollectionWaitTimeout, LeafCompletionContext
 
-    class _NoSuccessorSegmentStore:
-        """Delegate durable writes while withholding a successor segment."""
+    class _SuccessorSegmentStore:
+        """Explicit completion-store seam that withholds successor segments."""
 
         def __init__(self, wrapped: Any) -> None:
             self._wrapped = wrapped
 
+        def finish_attempt(self, *args: Any, **kwargs: Any) -> Any:
+            return self._wrapped.finish_attempt(*args, **kwargs)
+
+        def publish_placement(self, *args: Any, **kwargs: Any) -> Any:
+            return self._wrapped.publish_placement(*args, **kwargs)
+
+        def record_core_outcome(self, *args: Any, **kwargs: Any) -> Any:
+            return self._wrapped.record_core_outcome(*args, **kwargs)
+
+        def manifest(self, *args: Any, **kwargs: Any) -> Any:
+            return self._wrapped.manifest(*args, **kwargs)
+
         def accept_segment(self, *_args: Any, **_kwargs: Any) -> None:
             return None
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(self._wrapped, name)
 
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -278,17 +287,6 @@ def run_group_controller(
                 continue
             store.create_launch_intent(fence, controller, invocation)
             store.require_current_controller(group, controller.generation, controller.claimant_nonce)
-            if not hasattr(executor, "submit"):
-                # Compatibility for pre-submit fakes; new executors always use
-                # the bounded submit/collect path below.
-                launched = executor.launch(fence, invocation)
-                if not isinstance(launched, MemberLaunchResult) or not launched.acknowledged:
-                    store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "invalid-submit-ack")
-                    _park_member(member.task_id, "submit-ack")
-                    continue
-                store.record_controller_outcome(fence, controller, invocation, "launched", launched.detail or "acknowledged")
-                outcomes.append((member.task_id, "launched"))
-                continue
             try:
                 launched, handle = executor.submit(fence, invocation)
             except Exception as error:
@@ -311,8 +309,16 @@ def run_group_controller(
             except Exception as error:
                 reasons[member.task_id] = _reason("outcome-receipt", error)
             active.append((member, fence, invocation, handle, controller, member.action == "admit_successor"))
-        except BaseException as error:
+        except Exception as error:
             _park_member(member.task_id, "member-transition", error)
+        except BaseException:
+            try:
+                AttachedAllocation(allocation, store, invocation.allocation_attempt).finish(
+                    fence, "failed", _now(), None,
+                )
+            except Exception:
+                pass
+            raise
 
     while active:
         member, fence, invocation, handle, owner, successor = active.pop(0)
@@ -331,9 +337,16 @@ def run_group_controller(
                 pass
             _park_member(member.task_id, "collection", error)
             if not isinstance(error, Exception):
+                for _, pending_fence, pending_invocation, _, _, _ in active:
+                    try:
+                        AttachedAllocation(allocation, store, pending_invocation.allocation_attempt).finish(
+                            pending_fence, "remote-quiescence-unconfirmed", _now(), None,
+                        )
+                    except Exception:
+                        pass
                 raise
             continue
-        if not isinstance(result, LeafResult):
+        if not isinstance(result, LeafCompletionContext):
             error = LeafResultRejected("collector returned a non-LeafResult")
             try:
                 AttachedAllocation(allocation, store, invocation.allocation_attempt).finish(
@@ -345,13 +358,11 @@ def run_group_controller(
             continue
         try:
             task = next(task for task in group.members if task.task_id == member.task_id)
-            configured = handle.configured
-            environment = handle.environment
-            lifecycle_store: Any = _NoSuccessorSegmentStore(store) if successor else store
+            lifecycle_store: Any = _SuccessorSegmentStore(store) if successor else store
             error = complete_leaf_result(
                 AttachedAllocation(allocation, lifecycle_store, invocation.allocation_attempt),
-                fence, handle.request, result, group=group, member=task,
-                configured=configured, environment=environment,
+                fence, result.request, result.result, group=group, member=task,
+                configured=result.configured, environment=result.environment,
             )
             if error is not None:
                 raise error
@@ -359,6 +370,19 @@ def run_group_controller(
         except BaseException as error:
             _park_member(member.task_id, "completion", error)
             if not isinstance(error, Exception):
+                try:
+                    AttachedAllocation(allocation, store, invocation.allocation_attempt).finish(
+                        fence, "failed", _now(), None,
+                    )
+                except Exception:
+                    pass
+                for _, pending_fence, pending_invocation, _, _, _ in active:
+                    try:
+                        AttachedAllocation(allocation, store, pending_invocation.allocation_attempt).finish(
+                            pending_fence, "remote-quiescence-unconfirmed", _now(), None,
+                        )
+                    except Exception:
+                        pass
                 raise
 
     # Rebuild the exact member inputs from the durable manifest and ask the

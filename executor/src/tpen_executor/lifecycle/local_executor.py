@@ -42,6 +42,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from dataclasses import dataclass
 import threading
 from typing import Any
 
@@ -82,6 +83,21 @@ class LeafSubmissionError(LocalExecutorError):
 
 class CollectionWaitTimeout(FutureTimeoutError, LocalExecutorError):
     """Raised when a nonterminal leaf has not completed within one poll."""
+
+
+@dataclass(frozen=True)
+class LeafCompletionContext:
+    """Opaque executor-owned completion facts returned by ``collect``."""
+
+    result: LeafResult
+    request: LeafRequest
+    configured: ConfiguredRun
+    environment: PreparedPythonEnvironment
+
+    def __getattr__(self, name: str) -> Any:
+        """Preserve result-like access for callers migrating from ``collect``."""
+
+        return getattr(self.result, name)
 
 
 class MemberLaunchHandle:
@@ -353,7 +369,7 @@ class LocalLeafExecutor:
         except (TypeError, ValueError) as error:
             raise LeafResultRejected(f"leaf runner returned an invalid LeafResult: {error}") from error
 
-    def collect(self, handle: MemberLaunchHandle, timeout: float | None = None) -> LeafResult:
+    def collect(self, handle: MemberLaunchHandle, timeout: float | None = None) -> LeafCompletionContext:
         """Wait for and validate one issued handle exactly once."""
 
         if not isinstance(handle, MemberLaunchHandle):
@@ -394,7 +410,7 @@ class LocalLeafExecutor:
             if not isinstance(result, LeafResult):
                 raise LeafResultRejected("leaf runner returned a non-LeafResult")
             result = validate_leaf_result(handle._request, result)
-            return result
+            return LeafCompletionContext(result, handle._request, handle._configured, handle._environment)
         finally:
             with self._lock:
                 self._collecting.discard(key)
@@ -413,6 +429,7 @@ class LocalLeafExecutor:
 __all__ = [
     "CapacityExceededError",
     "CollectionWaitTimeout",
+    "LeafCompletionContext",
     "HandleCollectionInProgressError",
     "InvocationMismatchError",
     "LeafSubmissionError",
