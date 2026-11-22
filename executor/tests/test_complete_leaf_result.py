@@ -194,7 +194,8 @@ def test_complete_member_delegates_to_shared_writer(tmp_path: Path, monkeypatch:
 
     monkeypatch.setattr(contract.DispatcherContract, "_publish_completion", staticmethod(stub))
     result = contract.DispatcherContract._complete_member(
-        object(), group, group.members[0], configured, lifecycle, fence, {}, None, None,
+        contract.DispatcherContract.__new__(contract.DispatcherContract),
+        group, group.members[0], configured, lifecycle, fence, {}, None, None,
         timeout=None, error=RuntimeError("launch"),
     )
     assert result.name == "delegated"
