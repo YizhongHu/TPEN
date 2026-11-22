@@ -184,13 +184,12 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
         }
 
     def finish(self) -> None:
-        assert self._checkpoint_output_dir is not None
-        checkpoint_steps = sorted(
-            int(path.name.removeprefix("step_"))
-            for path in self._checkpoint_output_dir.glob("step_*")
-            if path.is_dir()
-        )
-        self.records["checkpoint_steps"] = checkpoint_steps
+        if self._checkpoint_output_dir is not None:
+            self.records["checkpoint_steps"] = sorted(
+                int(path.name.removeprefix("step_"))
+                for path in self._checkpoint_output_dir.glob("step_*")
+                if path.is_dir()
+            )
         self.output.write_text(json.dumps(self.records, sort_keys=True), encoding="utf-8")
 
 
