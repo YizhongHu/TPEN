@@ -1506,7 +1506,7 @@ def _cooperative_execute_race(
             state["reserved"] = True
 
     monkeypatch.setattr(runner, "_refuse_occupied_output_path", check_and_optionally_reserve)
-    original_write = runner._write_json
+    original_write = runner._write_cell_selection_receipt
 
     def output_bytes(path: Path) -> dict[str, bytes | None]:
         return {
@@ -1514,7 +1514,9 @@ def _cooperative_execute_race(
             for name in ("selection_receipt.json", "resolved_config.yaml", "COMPLETE")
         }
 
-    def interleave_before_first_write(path: Path, payload: object) -> None:
+    def interleave_before_first_write(
+        campaign_root: Path, row_id: str, payload: object
+    ) -> Path:
         if not state["reentered"]:
             state["reentered"] = True
             try:
@@ -1525,9 +1527,11 @@ def _cooperative_execute_race(
                 state["after_second"] = output_bytes(selected_output)
             finally:
                 state["reentered"] = False
-        original_write(path, payload)
+        return original_write(campaign_root, row_id, payload)
 
-    monkeypatch.setattr(runner, "_write_json", interleave_before_first_write)
+    monkeypatch.setattr(
+        runner, "_write_cell_selection_receipt", interleave_before_first_write
+    )
     try:
         state["first_status"] = "success" if runner.execute(args) == 0 else "nonzero"
     except runner.StageQSelectionError:
