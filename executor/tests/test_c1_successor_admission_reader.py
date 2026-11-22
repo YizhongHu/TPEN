@@ -138,7 +138,7 @@ def test_reader_rejects_noncanonical_predecessor_core_outcome(tmp_path: Path, mo
 
 
 def test_reader_translates_evidence_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _store, _group, predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
+    _store, _group, _allocation, predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
     _read(successor)
     path = Path(predecessor.output_dir, "core-outcome.json")
     payload = json.loads(path.read_text())
@@ -157,7 +157,7 @@ def test_reader_translates_evidence_unavailable(tmp_path: Path, monkeypatch: pyt
 
 
 def test_reader_translates_bad_task_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _store, _group, _predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
+    _store, _group, _allocation, _predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
     _read(successor)
     task_dir = Path(successor.output_dir).parent
     lock = task_dir / ".task.lock"
@@ -172,7 +172,7 @@ def test_reader_translates_bad_task_lock(tmp_path: Path, monkeypatch: pytest.Mon
 
 @pytest.mark.parametrize("case", ["relative", "trailing", "symlink", "predecessor"])
 def test_reader_path_cases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str) -> None:
-    _store, _group, predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
+    _store, _group, _allocation, predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
     if case == "relative":
         with pytest.raises(AdmissionIdentityMismatch):
             read_successor_admission(os.path.relpath(successor.output_dir), task_id=successor.task_id, attempt_id=successor.attempt_id.value, group_digest=successor.group_digest, science_input_digest="a" * 64, target_iterations=10)
