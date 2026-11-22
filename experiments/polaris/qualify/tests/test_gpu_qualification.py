@@ -504,7 +504,6 @@ def test_manifest_producer_consumers_preserve_selection_and_verdict(monkeypatch,
     })()
     producer = stage.build_manifest(args, run_root, target, profile, [])
     producer["expected_torch"] = "2.12.0+cu126"
-    producer["verify_profile"] = {"uv_version": "0.8.23"}
     receipt = Path(producer["staging_receipt"])
     receipt.write_text(json.dumps({"runtime_kind": job.RUNTIME_KIND, "target_sha": target_sha,
                                    "cache_dir": producer["cache_dir"], "extra": producer["extra"]}))
