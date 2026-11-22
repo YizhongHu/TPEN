@@ -55,6 +55,11 @@ def test_local_render_stages_harness_from_sha_not_any_other_ref(tmp_path: Path) 
         ["git", "-C", str(clone), "config", "user.email", "renderer-test@example.invalid"],
         check=True,
     )
+    # Mutation arms edit the source checkout after its committed HEAD is set.
+    # Copy that current launcher into the throwaway clone so this test really
+    # exercises the deliberate edit instead of a clean committed launcher.
+    clone_launcher = clone / "scripts" / "cannon" / "devsuite" / "submit_devsuite.sh"
+    clone_launcher.write_bytes(LAUNCHER.read_bytes())
 
     harness_rel = Path("scripts/cannon/executor-harness/helpers/validate_inputs.sh")
     harness_path = clone / harness_rel
