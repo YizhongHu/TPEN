@@ -1,9 +1,4 @@
-"""E5a native CPU qualification through the E1-E4 operational path.
-
-This test deliberately launches actual worker subprocesses.  The parent is the
-submitter/reconciler: it registers one fake persistent Job, observes an injected
-allocation loss, and never supplies a live backend object to a worker.
-"""
+"""E5a native CPU qualification through the core worker-start gateway."""
 
 from __future__ import annotations
 
@@ -26,9 +21,6 @@ from tpen.checkpoint.catalog import (
     PUBLICATION_CATALOG_FILENAME, IncompletePublicationRecordError, read_publications,
 )
 from tpen.execution import (
-    BalsamAdapter,
-    BalsamJobObservation,
-    BalsamJobState,
     ExecutionConfig,
     ReadyBatch,
     ReadyItem,
@@ -62,24 +54,6 @@ WORKER = Path(__file__).parents[1] / "helpers" / "native_recovery_worker.py"
 # update in the float64 fixture.
 PARAMETER_CHANGE_THRESHOLD = 1.0e-10
 
-class QualificationClient:
-    """Fake submitter-side client with explicit allocation-loss observation."""
-
-    def __init__(self) -> None:
-        self.register_calls = 0
-        self.observe_calls = 0
-        self.state = BalsamJobState.ACTIVE
-
-    def register_job(self, *, lineage_id, batch, backend_options):
-        del lineage_id, batch, backend_options
-        self.register_calls += 1
-        return {"id": 730013}
-
-    def observe_job(self, job_id):
-        self.observe_calls += 1
-        return BalsamJobObservation(job_id=job_id, state=self.state)
-
-
 def _batch() -> tuple[ReadyBatch, object, dict]:
     config = OmegaConf.load(FIXTURE)
     source = OmegaConf.to_container(config, resolve=False)
@@ -101,11 +75,10 @@ def _batch() -> tuple[ReadyBatch, object, dict]:
     payload_hash = payload_digest(payload)
     execution = ExecutionConfig(
         lineage_id="e5-native-lineage",
-        backend="balsam",
+        backend="direct",
         recovery="checkpoint",
         source_config_digest=source_config_digest(source),
         payload_digest=payload_hash,
-        backend_options={"site": "fake-cannon"},
     )
     batch = ReadyBatch(
         lineage_id="e5-native-lineage",
@@ -144,7 +117,6 @@ def _launch(
     batch_path: Path,
     intent_path: Path,
     config_path: Path,
-    receipts: Path,
     outputs: Path,
     phase: str,
     label: str | None = None,
@@ -166,12 +138,8 @@ def _launch(
         str(config_path),
         "--intent",
         str(intent_path),
-        "--receipts",
-        str(receipts),
         "--outputs",
         str(outputs),
-        "--job-id",
-        "730013",
         "--phase",
         phase,
         "--label",
@@ -394,23 +362,14 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
         for name, value in TrainableHookeSingletAnsatz().state_dict().items()
     }
     batch_path, intent_path = _write_inputs(tmp_path, batch, intent)
-    receipts = tmp_path / "receipts"
     outputs = tmp_path / "outputs"
     outputs.mkdir()
-    client = QualificationClient()
-    adapter = BalsamAdapter(
-        batch.execution, client, WorkerStartGateway(outputs), receipts
-    )
-    registration = adapter.register_lineage(batch)
-    assert registration is not None and registration.job_id == "730013"
-    assert client.register_calls == 1
 
     prefix = _launch(
         root=tmp_path,
         batch_path=batch_path,
         intent_path=intent_path,
         config_path=FIXTURE,
-        receipts=receipts,
         outputs=outputs,
         phase="initial",
         label="prefix",
@@ -432,11 +391,6 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
     assert prefix.returncode == -signal.SIGKILL
     assert prefix_checkpoint.checkpoint_dir.exists()
 
-    client.state = BalsamJobState.ALLOCATION_LOST
-    observation = adapter.observe_lineage(batch)
-    assert observation is not None and observation.state is BalsamJobState.ALLOCATION_LOST
-    assert client.observe_calls == 1
-
     evidence = CheckpointEvidence.from_ref(
         prefix_checkpoint,
         science_input_digest=intent.science_input_digest,
@@ -449,7 +403,6 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
         batch_path=batch_path,
         intent_path=intent_path,
         config_path=FIXTURE,
-        receipts=receipts,
         outputs=outputs,
         phase="recovery",
         evidence=evidence_path,
@@ -464,14 +417,12 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
     assert successor_result["invocation"]["next_iteration"] == batch.target_iterations
     assert successor_result["invocation"]["completed_updates"] <= batch.target_iterations
 
-    # An uninterrupted worker uses the same E4 registration and configured
-    # route.  It is the scientific reference, not a scheduler-success proxy.
+    # An uninterrupted worker uses the same configured route as the reference.
     reference = _launch(
         root=tmp_path,
         batch_path=batch_path,
         intent_path=intent_path,
         config_path=FIXTURE,
-        receipts=receipts,
         outputs=outputs,
         phase="initial",
         label="reference",
@@ -537,7 +488,6 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
         batch_path=batch_path,
         intent_path=intent_path,
         config_path=FIXTURE,
-        receipts=receipts,
         outputs=outputs,
         phase="recovery",
         label="partial",
@@ -606,7 +556,6 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
         ),
         raw_fault_evidence=(
             {"layer": "scheduler", "prefix_signal": -signal.SIGKILL},
-            {"layer": "backend", "allocation_state": observation.state.value},
         ),
         restore_disabled_control={
             "mode": "test-only model_only overlay; E1 model_only refusal bypassed",
@@ -621,15 +570,6 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
             "scheduler": {
                 "kind": "slurm",
                 "partition": os.environ.get("SLURM_JOB_PARTITION", "unknown"),
-            },
-            "backend": {
-                "kind": "fake-balsam-client",
-                "job_id": registration.job_id,
-                "allocation_state": observation.state.value,
-            },
-            "wrapper": {
-                "registration_calls": client.register_calls,
-                "observation_calls": client.observe_calls,
             },
             "application": {
                 "prefix_exit": prefix.returncode,
@@ -667,7 +607,7 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
 
 @pytest.mark.integration
 def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
-    """Exercise each E5 restore owner against real E3/native executions.
+    """Exercise each restore owner against real native executions.
 
     The disabled-owner runs use a test-only hook in the checkpoint restore
     module.  Production validation still runs; only one component loader is
@@ -678,22 +618,14 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
 
     batch, intent, _source = _batch()
     batch_path, intent_path = _write_inputs(tmp_path, batch, intent)
-    receipts = tmp_path / "receipts"
     outputs = tmp_path / "outputs"
     outputs.mkdir()
-    client = QualificationClient()
-    adapter = BalsamAdapter(
-        batch.execution, client, WorkerStartGateway(outputs), receipts
-    )
-    registration = adapter.register_lineage(batch)
-    assert registration is not None
 
     prefix = _launch(
         root=tmp_path,
         batch_path=batch_path,
         intent_path=intent_path,
         config_path=FIXTURE,
-        receipts=receipts,
         outputs=outputs,
         phase="initial",
         label="channel-prefix",
@@ -728,7 +660,6 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         batch_path=batch_path,
         intent_path=intent_path,
         config_path=FIXTURE,
-        receipts=receipts,
         outputs=outputs,
         phase="initial",
         label="channel-reference",
@@ -746,7 +677,6 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         batch_path=batch_path,
         intent_path=intent_path,
         config_path=FIXTURE,
-        receipts=receipts,
         outputs=outputs,
         phase="recovery",
         label="channel-full",
@@ -781,7 +711,6 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         batch_path=batch_path,
         intent_path=intent_path,
         config_path=FIXTURE,
-        receipts=receipts,
         outputs=outputs,
         phase="recovery",
         label="channel-cursor-control",
@@ -804,7 +733,6 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
             batch_path=batch_path,
             intent_path=intent_path,
             config_path=FIXTURE,
-            receipts=receipts,
             outputs=outputs,
             phase="recovery",
             label=label,
@@ -922,7 +850,6 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
             batch_path=batch_path,
             intent_path=intent_path,
             config_path=FIXTURE,
-            receipts=receipts,
             outputs=outputs,
             phase="recovery",
             label=f"channel-suppressed-{spec.channel}",
@@ -994,7 +921,6 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         batch_path=batch_path,
         intent_path=intent_path,
         config_path=FIXTURE,
-        receipts=receipts,
         outputs=outputs,
         phase="recovery",
         label="channel-all-disabled",
@@ -1060,7 +986,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
 def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
     """Exercise no-checkpoint, before-commit, after-commit, and corruption.
 
-    Every arm enters through the E4 worker seam and E3 configured-run gateway.
+    Every arm enters through the core worker-start and configured-run gateways.
     The scheduler/process signal is retained separately from the typed
     checkpoint/application result; a killed prefix is never treated as a
     successful science outcome.
@@ -1069,14 +995,8 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
     tmp_path.mkdir(parents=True, exist_ok=True)
     batch, intent, _source = _batch()
     batch_path, intent_path = _write_inputs(tmp_path, batch, intent)
-    receipts = tmp_path / "receipts"
     outputs = tmp_path / "outputs"
     outputs.mkdir()
-    client = QualificationClient()
-    adapter = BalsamAdapter(
-        batch.execution, client, WorkerStartGateway(outputs), receipts
-    )
-    assert adapter.register_lineage(batch) is not None
 
     # No evidence is an explicit E1 park through the real worker process.
     no_checkpoint = _launch(
@@ -1084,7 +1004,6 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
         batch_path=batch_path,
         intent_path=intent_path,
         config_path=FIXTURE,
-        receipts=receipts,
         outputs=outputs,
         phase="recovery",
         label="fault-no-checkpoint",
@@ -1106,7 +1025,6 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
         batch_path=batch_path,
         intent_path=intent_path,
         config_path=FIXTURE,
-        receipts=receipts,
         outputs=before_root,
         phase="initial",
         label="fault-before-commit",
@@ -1125,7 +1043,6 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
         batch_path=batch_path,
         intent_path=intent_path,
         config_path=FIXTURE,
-        receipts=receipts,
         outputs=before_root,
         phase="recovery",
         label="fault-before-commit-successor",
@@ -1148,7 +1065,6 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
         batch_path=batch_path,
         intent_path=intent_path,
         config_path=FIXTURE,
-        receipts=receipts,
         outputs=outputs,
         phase="initial",
         label="fault-after-commit",
@@ -1171,7 +1087,6 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
         batch_path=batch_path,
         intent_path=intent_path,
         config_path=FIXTURE,
-        receipts=receipts,
         outputs=outputs,
         phase="recovery",
         label="fault-corrupt-committed",

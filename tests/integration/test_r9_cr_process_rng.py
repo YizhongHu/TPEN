@@ -10,7 +10,6 @@ from pathlib import Path
 import pytest
 
 from tests.integration import test_native_checkpoint_recovery as native
-from tpen.execution import BalsamAdapter, WorkerStartGateway
 from tpen.execution.chain_resume import (
     E5_CHANNEL_MAP,
     E5_NATIVE_EXPECTED_MISMATCHES,
@@ -25,25 +24,20 @@ LIMBS = tuple(sorted({spec.limb for spec in E5_CHANNEL_MAP}))
 
 
 class _Lane:
-    """One isolated fake-Balsam lineage."""
+    """One isolated native worker-start lineage."""
 
     def __init__(self, root: Path) -> None:
         root.mkdir(parents=True, exist_ok=True)
         self.root = root
         self.batch, self.intent, _source = native._batch()
         self.batch_path, self.intent_path = native._write_inputs(root, self.batch, self.intent)
-        self.receipts = root / "receipts"
         self.outputs = root / "outputs"
         self.outputs.mkdir()
-        adapter = BalsamAdapter(
-            self.batch.execution, native.QualificationClient(), WorkerStartGateway(self.outputs), self.receipts
-        )
-        assert adapter.register_lineage(self.batch) is not None
 
     def launch(self, **kwargs):
         return native._launch(
             root=self.root, batch_path=self.batch_path, intent_path=self.intent_path,
-            config_path=native.FIXTURE, receipts=self.receipts, outputs=self.outputs, **kwargs,
+            config_path=native.FIXTURE, outputs=self.outputs, **kwargs,
         )
 
     def evidence(self, ref) -> Path:

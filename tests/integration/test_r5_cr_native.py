@@ -1,8 +1,7 @@
-"""Formal review round 5 reviewer tests (CR native): issues 2, 3, 4, 5 and 11.
+"""Native checkpoint-recovery reviewer tests: issues 2, 3, 4, 5 and 11.
 
-Every worker here is a real fresh OS process launched through the CR native
-helper ``tests.integration.test_native_checkpoint_recovery._launch``.  The
-parent registers one fake persistent Job; workers never call a backend.
+Every worker here is a real fresh OS process launched through the native helper
+``tests.integration.test_native_checkpoint_recovery._launch``.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ from omegaconf import OmegaConf
 
 from tests.integration import test_native_checkpoint_recovery as native
 from tpen.checkpoint import list_complete_checkpoints
-from tpen.execution import BalsamAdapter, InvocationOutcome, WorkerStartGateway
+from tpen.execution import InvocationOutcome, WorkerStartGateway
 from tpen.execution.chain_resume import E5_NATIVE_EXPECTED_MISMATCHES, E5_CHANNEL_MAP, assert_fresh_processes, compare_channel_parity
 from tpen.execution.invocation import _committed_checkpoint
 from tpen.execution.recovery import CheckpointEvidence
@@ -29,21 +28,16 @@ LIMBS = tuple(sorted({spec.limb for spec in E5_CHANNEL_MAP}))
 
 
 class _Lane:
-    """One registered fake-Balsam lineage rooted at ``root``."""
+    """One native worker-start lineage rooted at ``root``."""
 
     def __init__(self, root: Path, *, config_path: Path | None = None) -> None:
         root.mkdir(parents=True, exist_ok=True)
         self.root = root
         self.batch, self.intent, _source = native._batch()
         self.batch_path, self.intent_path = native._write_inputs(root, self.batch, self.intent)
-        self.receipts = root / "receipts"
         self.outputs = root / "outputs"
         self.outputs.mkdir(exist_ok=True)
         self.config_path = native.FIXTURE if config_path is None else config_path
-        adapter = BalsamAdapter(
-            self.batch.execution, native.QualificationClient(), WorkerStartGateway(self.outputs), self.receipts
-        )
-        assert adapter.register_lineage(self.batch) is not None, "fake registration was not acknowledged"
 
     def launch(self, **kwargs):
         return native._launch(
@@ -51,7 +45,6 @@ class _Lane:
             batch_path=self.batch_path,
             intent_path=self.intent_path,
             config_path=self.config_path,
-            receipts=self.receipts,
             outputs=self.outputs,
             **kwargs,
         )
@@ -332,13 +325,6 @@ def test_r5_qualification_receipt_records_checkpoint_faults(r5_qualification_rec
     assert {"no_checkpoint", "before_commit", "after_commit", "corrupt_committed"} <= kinds, (
         f"observed checkpoint_faults={faults!r}"
     )
-
-
-@pytest.mark.integration
-# PREDICTED: GREEN at CR (issue 4 control)
-def test_r5_qualification_receipt_records_scheduler_and_backend_layers(r5_qualification_receipt):
-    layers = {entry.get("layer") for entry in r5_qualification_receipt["raw_fault_evidence"]}
-    assert {"scheduler", "backend"} <= layers, f"observed raw_fault_evidence layers={layers!r}"
 
 
 @pytest.mark.integration
