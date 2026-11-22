@@ -69,6 +69,7 @@ def test_reconcile_counts_folds_pytest_summary(
             "DRY_RUN": "1",
             "LOCAL_FAKE_ROOT": str(tmp_path),
             "NODE_TMP": str(tmp_path),
+            "DRY_NODE_TMP": str(tmp_path),
             "RUN_ROOT": str(tmp_path),
             "TASK_ROOT": str(tmp_path),
             "HARNESS_ROOT": str(tmp_path),
