@@ -916,6 +916,24 @@ def test_cell_selection_receipt_successor_validation_refuses_mutations(
             runner._validate_cell_selection_receipt(tmp_path, "row-b", report)
 
 
+def test_cell_selection_receipt_successor_validation_refuses_read_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = {
+        "selection": {"selected": {"stage": "Q"}},
+        "train_packet": {"content_hash": "row-read-error"},
+    }
+    path = runner._write_cell_selection_receipt(tmp_path, "row-read-error", report)
+    assert path.is_file()
+
+    def raise_read_error(_path: Path) -> bytes:
+        raise OSError("injected read failure")
+
+    monkeypatch.setattr(Path, "read_bytes", raise_read_error)
+    with pytest.raises(runner.StageQSelectionError, match="unreadable"):
+        runner._validate_cell_selection_receipt(tmp_path, "row-read-error", report)
+
+
 def test_execution_facts_cross_launch_boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeCUDA:
         @staticmethod
