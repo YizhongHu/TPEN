@@ -17,7 +17,7 @@ import json
 import math
 import os
 import re
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from .._codec import digest
 from ..contracts import AttemptId, ReadyGroup
@@ -60,12 +60,6 @@ from ..runners import (
 )
 from ..storage import AttemptFence
 from ..tasks import ConfiguredRun
-from ..workers import ProcessOutcome
-
-if TYPE_CHECKING:
-    from .transport import LeafRequest, LeafResult
-
-
 _ACTIVE_DISPATCH: ContextVar[bool] = ContextVar("tpen_executor_dispatch", default=False)
 
 
@@ -933,242 +927,6 @@ def _ensure_placement_refusal_environment(
     return PreparedPythonEnvironment(environment.python, environment.setup, values)
 
 
-class _LegacyCompletionResult:
-    """Adapt the pre-LeafResult local facts to the shared completion seam."""
-
-    __slots__ = ("_status", "_result_digest", "_evidence")
-
-    def __init__(self, status: str, result_digest: str | None, evidence: CoreRunEvidence | None) -> None:
-        self._status = status
-        self._result_digest = result_digest
-        self._evidence = evidence
-
-    def status(self) -> str:
-        return self._status
-
-    def result_digest(self) -> str | None:
-        return self._result_digest
-
-    def core_evidence(self) -> CoreRunEvidence | None:
-        return self._evidence
-
-
-def _process_outcome_from_leaf_result(result: Any) -> ProcessOutcome | None:
-    """Adapt validated LeafResult science facts for placement generation checks."""
-
-    science = result.science
-    if science is None:
-        return None
-    return ProcessOutcome(
-        tuple(science["argv"]),
-        science["returncode"],
-        science["stdout_path"],
-        science["stderr_path"],
-        science["timed_out"],
-        science["pid"],
-        science["proc_start_ticks"],
-    )
-
-
-def _publish_completion(
-    lifecycle_or_store: Any,
-    fence: Any,
-    *,
-    allocation: Any,
-    group: ReadyGroup,
-    member: Any,
-    configured: ConfiguredRun,
-    environment: Any,
-    outcome: Any,
-    status: str,
-    result_digest: str | None,
-    segment_evidence: CoreRunEvidence | None,
-    inspection_error: BaseException | None,
-    placement_error: PlacementRefusal | None = None,
-    child_refusal: PlacementRefusal | None = None,
-) -> Exception | None:
-    """Write one completion's records in the established order."""
-
-    lifecycle = lifecycle_or_store if hasattr(lifecycle_or_store, "store") else None
-    store = lifecycle.store if lifecycle is not None else lifecycle_or_store
-    finish = lifecycle.finish if lifecycle is not None else store.finish_attempt
-    try:
-        finish(fence, status, _utc_now(), result_digest)
-    except Exception as finish_error:
-        if inspection_error is None:
-            return finish_error
-        try:
-            inspection_error.add_note(f"finish error during inspection cancellation: {finish_error!r}")
-        except BaseException:
-            pass
-    if placement_error is not None and lifecycle is not None:
-        environment = _ensure_placement_refusal_environment(
-            environment,
-            allocation,
-            fence,
-            group,
-            member,
-            configured,
-            placement_error,
-        )
-    placement_path = None
-    if isinstance(environment, PreparedPythonEnvironment):
-        placement_path = environment.env.get(PLACEMENT_OUTPUT_ENV)
-    receipt = None
-    if child_refusal is not None and child_refusal.code == "placement-receipt-invalid":
-        receipt = _placement_refusal_receipt(
-            child_refusal,
-            allocation,
-            fence,
-            group,
-            member,
-            configured,
-            environment,
-            outcome,
-        )
-    elif placement_path is not None:
-        try:
-            requested_refusal = _placement_refusal_from_environment(environment)
-            if requested_refusal is not None:
-                raise requested_refusal
-            observation = read_child_placement(placement_path)
-            receipt_builder = _placement_receipt_v3 if environment.env.get(PLACEMENT_RECEIPT_VERSION_ENV) == "2" else _placement_receipt
-            receipt = receipt_builder(
-                observation, allocation, fence, group, member, configured, environment, outcome,
-            )
-        except PlacementRefusal as placement_failure:
-            receipt = _placement_refusal_receipt(
-                placement_failure,
-                allocation,
-                fence,
-                group,
-                member,
-                configured,
-                environment,
-                outcome,
-            )
-        except (TypeError, ValueError) as placement_failure:
-            receipt = _placement_refusal_receipt(
-                PlacementRefusal("placement-receipt-invalid", str(placement_failure)),
-                allocation,
-                fence,
-                group,
-                member,
-                configured,
-                environment,
-                outcome,
-            )
-    if receipt is not None:
-        try:
-            store.publish_placement(fence, receipt)
-        except Exception as placement_failure:
-            return placement_failure
-    if segment_evidence is not None and segment_evidence.schema == "tpen.run-evidence/v3":
-        try:
-            store.record_core_outcome(fence, segment_evidence)
-        except Exception as outcome_failure:
-            return outcome_failure
-    if inspection_error is not None:
-        raise inspection_error
-    if (
-        status == "completed"
-        and segment_evidence is not None
-        and segment_evidence.verdict in {"completed", "incomplete"}
-        and segment_evidence.checkpoint is not None
-        and (segment_evidence.schema != "tpen.run-evidence/v3" or segment_evidence.outcome == "completed")
-    ):
-        existing_segments = store.manifest(group).segments
-        if not any(segment.task_id == fence.task_id for segment in existing_segments):
-            try:
-                store.accept_segment(fence, segment_evidence, None)
-            except Exception as error:
-                return error
-    return None
-
-
-def complete_leaf_result(
-    lifecycle_or_store: Any,
-    fence: AttemptFence,
-    request: LeafRequest | None,
-    result: LeafResult | _LegacyCompletionResult,
-    *,
-    group: ReadyGroup,
-    member: Any,
-    configured: ConfiguredRun,
-    environment: Any | None = None,
-    allocation: Any | None = None,
-    binding: Any = None,
-    outcome: Any = None,
-    status: str | None = None,
-    result_digest: str | None = None,
-    segment_evidence: CoreRunEvidence | None = None,
-    inspection_error: BaseException | None = None,
-    placement_error: PlacementRefusal | None = None,
-    child_refusal: PlacementRefusal | None = None,
-) -> Exception | None:
-    """Publish one validated leaf result through the controller-owned store.
-
-    ``request`` and ``result`` are the validated :class:`LeafRequest` and
-    :class:`LeafResult` returned by a local or remote leaf executor.  The
-    ``group``, ``member`` and ``configured`` arguments are the existing
-    placement/segment context held by the dispatcher.  The legacy adapter
-    passes a private result-shaped object with ``request=None`` so its
-    controller-side inspection semantics remain unchanged.
-    """
-
-    del binding
-    if request is None:
-        completion = result
-        if completion is None:
-            raise TypeError("completion result is required")
-        if status is None:
-            status = completion.status()
-        if result_digest is None:
-            result_digest = completion.result_digest()
-        if segment_evidence is None:
-            segment_evidence = completion.core_evidence()
-    else:
-        from .transport import LeafRequest, LeafResult
-
-        if type(request) is not LeafRequest or type(result) is not LeafResult:
-            raise TypeError("complete_leaf_result requires a LeafRequest and LeafResult")
-        if environment is None:
-            environment = request.environment
-        status = result.status()
-        result_digest = result.result_digest()
-        segment_evidence = result.core_evidence()
-        outcome = _process_outcome_from_leaf_result(result)
-        if result.child_refusal is not None and placement_error is None:
-            refusal = result.child_refusal
-            child_refusal = PlacementRefusal(refusal["code"], refusal["reason"])
-        else:
-            child_refusal = None
-    if environment is None:
-        environment = getattr(request, "environment", None)
-    if allocation is None:
-        allocation = getattr(lifecycle_or_store, "allocation", None)
-    if allocation is None:
-        raise TypeError("complete_leaf_result requires allocation when given a store")
-    if status is None:
-        raise TypeError("completion status is required")
-    return _publish_completion(
-        lifecycle_or_store,
-        fence,
-        allocation=allocation,
-        group=group,
-        member=member,
-        configured=configured,
-        environment=environment,
-        outcome=outcome,
-        status=status,
-        result_digest=result_digest,
-        segment_evidence=segment_evidence,
-        inspection_error=inspection_error,
-        placement_error=placement_error,
-        child_refusal=child_refusal,
-    )
-
-
 class DispatcherContract:
     """Implement admission, fencing, outcome, evidence, and segment semantics.
 
@@ -1445,6 +1203,120 @@ class DispatcherContract:
             raise finish_error
         return lifecycle.store.manifest(group)
 
+    @staticmethod
+    def _publish_completion(
+        lifecycle: AttachedAllocation,
+        fence: Any,
+        group: ReadyGroup,
+        member: Any,
+        configured: ConfiguredRun,
+        environment: Any,
+        outcome: Any,
+        status: str,
+        result_digest: str | None,
+        segment_evidence: CoreRunEvidence | None,
+        inspection_error: BaseException | None,
+        *,
+        error: BaseException | None = None,
+        child_refusal: PlacementRefusal | None = None,
+    ) -> Exception | None:
+        """Write one completion's records in the established order."""
+
+        try:
+            lifecycle.finish(fence, status, _utc_now(), result_digest)
+        except Exception as finish_error:
+            if inspection_error is None:
+                return finish_error
+            try:
+                inspection_error.add_note(f"finish error during inspection cancellation: {finish_error!r}")
+            except BaseException:
+                pass
+        if isinstance(error, PlacementRefusal):
+            environment = _ensure_placement_refusal_environment(
+                environment,
+                lifecycle.allocation,
+                fence,
+                group,
+                member,
+                configured,
+                error,
+            )
+        placement_path = None
+        if isinstance(environment, PreparedPythonEnvironment):
+            placement_path = environment.env.get("TPEN_PLACEMENT_OUTPUT")
+        receipt = None
+        if child_refusal is not None and child_refusal.code == "placement-receipt-invalid":
+            receipt = _placement_refusal_receipt(
+                child_refusal,
+                lifecycle.allocation,
+                fence,
+                group,
+                member,
+                configured,
+                environment,
+                outcome,
+            )
+        elif placement_path is not None:
+            try:
+                requested_refusal = _placement_refusal_from_environment(environment)
+                if requested_refusal is not None:
+                    raise requested_refusal
+                observation = read_child_placement(placement_path)
+                # v2 placement gets the sampler-bearing v3 receipt; legacy
+                # placement keeps the v1 receipt.
+                receipt_builder = _placement_receipt_v3 if environment.env.get(PLACEMENT_RECEIPT_VERSION_ENV) == "2" else _placement_receipt
+                receipt = receipt_builder(
+                    observation, lifecycle.allocation, fence, group, member, configured, environment, outcome,
+                )
+            except PlacementRefusal as placement_error:
+                receipt = _placement_refusal_receipt(
+                    placement_error,
+                    lifecycle.allocation,
+                    fence,
+                    group,
+                    member,
+                    configured,
+                    environment,
+                    outcome,
+                )
+            except (TypeError, ValueError) as placement_error:
+                receipt = _placement_refusal_receipt(
+                    PlacementRefusal("placement-receipt-invalid", str(placement_error)),
+                    lifecycle.allocation,
+                    fence,
+                    group,
+                    member,
+                    configured,
+                    environment,
+                    outcome,
+                )
+        if receipt is not None:
+            try:
+                lifecycle.store.publish_placement(fence, receipt)
+            except Exception as placement_error:
+                return placement_error
+        if segment_evidence is not None and segment_evidence.schema == "tpen.run-evidence/v3":
+            try:
+                lifecycle.store.record_core_outcome(fence, segment_evidence)
+            except Exception as outcome_error:
+                return outcome_error
+        if inspection_error is not None:
+            raise inspection_error
+        if (
+            status == "completed"
+            and segment_evidence is not None
+            and segment_evidence.verdict in {"completed", "incomplete"}
+            and segment_evidence.checkpoint is not None
+            and (segment_evidence.schema != "tpen.run-evidence/v3" or segment_evidence.outcome == "completed")
+        ):
+            existing_segments = lifecycle.store.manifest(group).segments
+            if not any(segment.task_id == fence.task_id for segment in existing_segments):
+                try:
+                    lifecycle.store.accept_segment(fence, segment_evidence, None)
+                except Exception as error:
+                    return error
+        return None
+
     def _complete_member(
         self,
         group: ReadyGroup,
@@ -1517,21 +1389,19 @@ class DispatcherContract:
                 if status != "timed_out":
                     status = "failed"
                 inspection_error = caught
-        completion = _LegacyCompletionResult(status, result_digest, segment_evidence)
-        return complete_leaf_result(
+        return self._publish_completion(
             lifecycle,
             fence,
-            None,
-            completion,
-            group=group,
-            member=member,
-            configured=configured,
-            environment=environment,
-            outcome=outcome,
-            inspection_error=inspection_error,
-            placement_error=error if isinstance(error, PlacementRefusal) else None,
-            # A malformed child refusal is already a typed placement fact;
-            # preserve the old direct-refusal receipt branch exactly.
+            group,
+            member,
+            configured,
+            environment,
+            outcome,
+            status,
+            result_digest,
+            segment_evidence,
+            inspection_error,
+            error=error,
             child_refusal=child_refusal,
         )
 

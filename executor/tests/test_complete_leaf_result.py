@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from tpen_executor.dispatch import contract
-from tpen_executor.dispatch.contract import complete_leaf_result
+from tpen_executor.dispatch.completion import complete_leaf_result
 from tpen_executor.dispatch.transport import LeafResult
 from tpen_executor.placement import PLACEMENT_OUTPUT_ENV, PlacementRefusal
 
@@ -23,34 +23,38 @@ CONTRACT_SOURCE = Path(__file__).parents[1] / "src" / "tpen_executor" / "dispatc
 COMPLETE_LEAF_RESULT_MUTANTS = (
     {
         "id": "skip-placement-write",
-        "old": "            store.publish_placement(fence, receipt)\n",
-        "new": "            pass\n",
+        "source": CONTRACT_SOURCE,
+        "old": "                lifecycle.store.publish_placement(fence, receipt)\n",
+        "new": "                pass\n",
         "killer": "test_complete_leaf_result_publishes_placement",
     },
     {
         "id": "accept-noncompleted-outcome",
-        "old": '        status == "completed"\n',
-        "new": "        True\n",
+        "source": CONTRACT_SOURCE,
+        "old": '            status == "completed"\n',
+        "new": "            True\n",
         "killer": "test_complete_leaf_result_does_not_accept_noneligible_segment",
     },
     {
         "id": "duplicate-outcome-receipt",
-        "old": "        finish(fence, status, _utc_now(), result_digest)\n",
-        "new": "        finish(fence, status, _utc_now(), result_digest)\n        finish(fence, status, _utc_now(), result_digest)\n",
+        "source": CONTRACT_SOURCE,
+        "old": "            lifecycle.finish(fence, status, _utc_now(), result_digest)\n",
+        "new": "            lifecycle.finish(fence, status, _utc_now(), result_digest)\n            lifecycle.finish(fence, status, _utc_now(), result_digest)\n",
         "killer": "test_complete_leaf_result_writes_one_outcome_receipt",
     },
     {
         "id": "adapter-stops-delegating",
-        "old": "        return complete_leaf_result(\n            lifecycle,\n            fence,\n            None,\n            completion,\n            group=group,\n            member=member,\n            configured=configured,\n            environment=environment,\n            outcome=outcome,\n            inspection_error=inspection_error,\n            placement_error=error if isinstance(error, PlacementRefusal) else None,\n            # A malformed child refusal is already a typed placement fact;\n            # preserve the old direct-refusal receipt branch exactly.\n            child_refusal=child_refusal,\n        )\n",
+        "source": CONTRACT_SOURCE,
+        "old": "        return self._publish_completion(\n            lifecycle,\n            fence,\n            group,\n            member,\n            configured,\n            environment,\n            outcome,\n            status,\n            result_digest,\n            segment_evidence,\n            inspection_error,\n            error=error,\n            child_refusal=child_refusal,\n        )\n",
         "new": "        return None\n",
-        "killer": "test_complete_member_delegates_to_public_helper",
+        "killer": "test_complete_member_delegates_to_shared_writer",
     },
 )
 
 
 def test_complete_leaf_result_mutants_are_unique_and_compile() -> None:
-    source = CONTRACT_SOURCE.read_text(encoding="utf-8")
     for mutant in COMPLETE_LEAF_RESULT_MUTANTS:
+        source = mutant["source"].read_text(encoding="utf-8")
         assert source.count(mutant["old"]) == 1, mutant["id"]
         ast.parse(source.replace(mutant["old"], mutant["new"], 1))
 
@@ -179,7 +183,7 @@ def test_complete_leaf_result_writes_one_outcome_receipt(tmp_path: Path) -> None
     assert sorted(path.name for path in output.glob("outcome.json")) == ["outcome.json"]
 
 
-def test_complete_member_delegates_to_public_helper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_complete_member_delegates_to_shared_writer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     request, parts = _request(tmp_path)
     group, _allocation_value, lifecycle, configured, fence = parts
     called: list[tuple] = []
@@ -188,9 +192,10 @@ def test_complete_member_delegates_to_public_helper(tmp_path: Path, monkeypatch:
         called.append((args, kwargs))
         return SimpleNamespace(name="delegated")
 
-    monkeypatch.setattr(contract, "complete_leaf_result", stub)
+    monkeypatch.setattr(contract.DispatcherContract, "_publish_completion", staticmethod(stub))
     result = contract.DispatcherContract._complete_member(
-        object(), group, group.members[0], configured, lifecycle, fence, {}, None, None, error=RuntimeError("launch"),
+        object(), group, group.members[0], configured, lifecycle, fence, {}, None, None,
+        timeout=None, error=RuntimeError("launch"),
     )
     assert result.name == "delegated"
     assert called and called[0][0][0] is lifecycle and called[0][0][1] is fence
