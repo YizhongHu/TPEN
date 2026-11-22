@@ -8,6 +8,8 @@ launch.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
+import math
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 from uuid import uuid4
@@ -33,6 +35,7 @@ class GroupControllerFactsV1:
     successor_requests: Mapping[str, tuple[Mapping[str, Any], str, MemberInvocationV2]] = ()
     controller_generation: int = 1
     predecessor_record_digest: str | None = None
+    poll_timeout: float = 1.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.group, ReadyGroupV2):
@@ -43,6 +46,8 @@ class GroupControllerFactsV1:
             raise TypeError("member_inputs must be a sequence")
         object.__setattr__(self, "member_inputs", tuple(self.member_inputs))
         object.__setattr__(self, "successor_requests", dict(self.successor_requests))
+        if type(self.poll_timeout) not in (int, float) or not math.isfinite(self.poll_timeout) or self.poll_timeout <= 0:
+            raise ValueError("poll_timeout must be a positive finite number")
 
 
 @frozen_record
@@ -61,8 +66,11 @@ class MemberLaunchResult:
 class AllocationLocalExecutor(Protocol):
     """Fake-friendly seam for one already-fenced local launch."""
 
-    def launch(self, fence: AttemptFence, invocation: MemberInvocationV2) -> MemberLaunchResult:
-        """Launch exactly once for the supplied durable fence and invocation."""
+    def submit(self, fence: AttemptFence, invocation: MemberInvocationV2) -> tuple[MemberLaunchResult, Any]:
+        """Submit exactly once and return an acknowledgement plus opaque handle."""
+
+    def collect(self, handle: Any, timeout: float) -> Any:
+        """Collect one submitted handle with a finite poll timeout."""
 
 
 @frozen_record
@@ -199,11 +207,42 @@ def run_group_controller(
             return _park(group, "reconciliation-publication-unavailable")
     except Exception:
         return _park(group, "publication-failed")
-    outcomes = []
-    reasons = {}
+    # Importing these adapters here keeps the controller protocol backend-neutral
+    # and avoids an import cycle through the local executor's handle type.
+    from .attached import AttachedAllocation
+    from ..dispatch.completion import complete_leaf_result
+    from ..dispatch.transport import LeafResult, LeafResultRejected
+    from .local_executor import CollectionWaitTimeout
+
+    class _NoSuccessorSegmentStore:
+        """Delegate durable writes while withholding a successor segment."""
+
+        def __init__(self, wrapped: Any) -> None:
+            self._wrapped = wrapped
+
+        def accept_segment(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._wrapped, name)
+
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    outcomes: list[tuple[str, str]] = []
+    reasons: dict[str, str] = {}
+    active: list[tuple[Any, Any, Any, Any, Any, bool]] = []
+
+    def _park_member(task_id: str, phase: str, error: BaseException | None = None) -> None:
+        outcomes.append((task_id, "parked"))
+        reasons[task_id] = _reason(phase, error)
+
     for member in published.members:
-        if member.action == "preserve_completed" or member.action == "preserve_terminal":
+        if member.action in {"preserve_completed", "preserve_terminal"}:
             outcomes.append((member.task_id, member.action))
+            continue
+        if member.action not in {"start_fresh", "admit_successor"}:
+            _park_member(member.task_id, "reconcile-action")
             continue
         try:
             if member.action == "start_fresh":
@@ -217,7 +256,7 @@ def run_group_controller(
                     next(task.lineage_id for task in group.members if task.task_id == member.task_id),
                     fence.attempt_id, invocation_id,
                 )
-            elif member.action == "admit_successor":
+            else:
                 record = next((item.admission for item in durable_publication.members if item.evidence.task_id == member.task_id), None)
                 if not isinstance(record, SuccessorAdmissionRecord) or record.successor_binding is None:
                     raise LaunchIntentRejected("successor admission unavailable")
@@ -227,69 +266,127 @@ def run_group_controller(
                     controller_record=controller,
                 )
                 invocation = record.successor_binding
-            else:
-                outcomes.append((member.task_id, "parked"))
-                reasons[member.task_id] = _reason("reconcile-action")
-                continue
             try:
                 existing = store.read_launch_intent(fence)
             except LaunchIntentAbsent:
                 existing = None
             except Exception as error:
-                outcomes.append((member.task_id, "parked"))
-                reasons[member.task_id] = _reason("intent-read", error)
+                _park_member(member.task_id, "intent-read", error)
                 continue
             if existing is not None:
-                outcomes.append((member.task_id, "parked"))
-                reasons[member.task_id] = _reason("intent-recovered")
+                _park_member(member.task_id, "intent-recovered")
                 continue
             store.create_launch_intent(fence, controller, invocation)
             store.require_current_controller(group, controller.generation, controller.claimant_nonce)
-            try:
+            if not hasattr(executor, "submit"):
+                # Compatibility for pre-submit fakes; new executors always use
+                # the bounded submit/collect path below.
                 launched = executor.launch(fence, invocation)
+                if not isinstance(launched, MemberLaunchResult) or not launched.acknowledged:
+                    store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "invalid-submit-ack")
+                    _park_member(member.task_id, "submit-ack")
+                    continue
+                store.record_controller_outcome(fence, controller, invocation, "launched", launched.detail or "acknowledged")
+                outcomes.append((member.task_id, "launched"))
+                continue
+            try:
+                launched, handle = executor.submit(fence, invocation)
             except Exception as error:
-                receipt_error = None
                 try:
-                    store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "executor-failed")
-                except Exception as record_error:
-                    receipt_error = record_error
-                outcomes.append((member.task_id, "parked"))
-                reason = _reason("executor-launch", error)
-                if receipt_error is not None:
-                    reason += ";" + _reason("outcome-receipt", receipt_error)
-                reasons[member.task_id] = reason
+                    store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "submit-failed")
+                except Exception:
+                    pass
+                _park_member(member.task_id, "executor-submit", error)
                 continue
             if not isinstance(launched, MemberLaunchResult) or not launched.acknowledged:
-                receipt_error = None
                 try:
-                    store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "invalid-launch-ack")
-                except Exception as record_error:
-                    receipt_error = record_error
-                outcomes.append((member.task_id, "parked"))
-                reason = _reason("launch-ack", None if isinstance(launched, MemberLaunchResult) else TypeError("invalid MemberLaunchResult"))
-                if receipt_error is not None:
-                    reason += ";" + _reason("outcome-receipt", receipt_error)
-                reasons[member.task_id] = reason
+                    store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "invalid-submit-ack")
+                except Exception:
+                    pass
+                _park_member(member.task_id, "submit-ack")
                 continue
+            # The handle is retained even if this acknowledgement write fails.
             try:
                 store.record_controller_outcome(fence, controller, invocation, "launched", launched.detail or "acknowledged")
             except Exception as error:
-                outcomes.append((member.task_id, "launched-outcome-unrecorded"))
                 reasons[member.task_id] = _reason("outcome-receipt", error)
-                continue
-            outcomes.append((member.task_id, "launched"))
-        except Exception as error:
-            outcomes.append((member.task_id, "parked"))
-            reasons[member.task_id] = _reason("member-transition", error)
-    parked = {task_id for task_id, status in outcomes if status == "parked"}
-    final = published if not parked else replace(
-        published,
-        members=tuple(
-            replace(member, action="park", reason_code=reasons.get(member.task_id, "controller-uncertainty")) if member.task_id in parked else member
-            for member in published.members
-        ),
-    )
-    reason_records = tuple((task_id, reasons.get(task_id, "launch-acknowledged" if status == "launched" else "controller-uncertainty"))
+            active.append((member, fence, invocation, handle, controller, member.action == "admit_successor"))
+        except BaseException as error:
+            _park_member(member.task_id, "member-transition", error)
+
+    while active:
+        member, fence, invocation, handle, owner, successor = active.pop(0)
+        try:
+            result = executor.collect(handle, facts.poll_timeout)
+        except CollectionWaitTimeout:
+            # Polling is the only retryable operation; retain this same handle.
+            active.append((member, fence, invocation, handle, owner, successor))
+            continue
+        except BaseException as error:
+            try:
+                AttachedAllocation(allocation, store, invocation.allocation_attempt).finish(
+                    fence, "remote-quiescence-unconfirmed", _now(), None,
+                )
+            except Exception:
+                pass
+            _park_member(member.task_id, "collection", error)
+            if not isinstance(error, Exception):
+                raise
+            continue
+        if not isinstance(result, LeafResult):
+            error = LeafResultRejected("collector returned a non-LeafResult")
+            try:
+                AttachedAllocation(allocation, store, invocation.allocation_attempt).finish(
+                    fence, "remote-quiescence-unconfirmed", _now(), None,
+                )
+            except Exception:
+                pass
+            _park_member(member.task_id, "validation", error)
+            continue
+        try:
+            task = next(task for task in group.members if task.task_id == member.task_id)
+            configured = handle.configured
+            environment = handle.environment
+            lifecycle_store: Any = _NoSuccessorSegmentStore(store) if successor else store
+            error = complete_leaf_result(
+                AttachedAllocation(allocation, lifecycle_store, invocation.allocation_attempt),
+                fence, handle.request, result, group=group, member=task,
+                configured=configured, environment=environment,
+            )
+            if error is not None:
+                raise error
+            outcomes.append((member.task_id, "collected"))
+        except BaseException as error:
+            _park_member(member.task_id, "completion", error)
+            if not isinstance(error, Exception):
+                raise
+
+    # Rebuild the exact member inputs from the durable manifest and ask the
+    # admission port again before deriving the authoritative final action.
+    try:
+        manifest = store.manifest(group)
+        latest: dict[str, Any] = {}
+        for record in manifest.attempts:
+            latest[record.task_id] = record
+        final_inputs = []
+        for item in facts.member_inputs:
+            record = latest.get(item.task_id)
+            rebuilt = item
+            if record is not None:
+                rebuilt = replace(item, attempt_id=record.attempt_id, start_receipt=record.start_receipt,
+                                  outcome_receipt=record.outcome_receipt)
+            try:
+                verdict = admission_port.admit(rebuilt)
+                if verdict is not None and not isinstance(verdict, CoreAdmissionVerdictV2):
+                    verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "malformed-core-admission")
+            except Exception:
+                verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "core-admission-unavailable")
+            final_inputs.append(replace(rebuilt, core_verdict=verdict))
+        final = reconcile_group(group, tuple(final_inputs))
+    except Exception as error:
+        final = replace(published, members=tuple(replace(member, action="park", reason_code=_reason("final-reconciliation", error)) for member in published.members))
+        reasons.setdefault("<group>", _reason("final-reconciliation", error))
+    reason_records = tuple((task_id, reasons.get(task_id, "collected" if status == "collected" else "controller-uncertainty"))
                            for task_id, status in outcomes)
     return GroupControllerOutcome(final, tuple(outcomes), 0 if all(member.action == "preserve_completed" for member in final.members) else 2, reason_records)
 
