@@ -69,7 +69,7 @@ def test_delta_failed_successor_admission_does_not_park_fresh_peer(tmp_path):
 
     class Admission:
         def admit(self, member):
-            calls.append(member.task_id)
+            calls.append(member)
             if member.task_id == "successor":
                 raise RuntimeError("successor unavailable")
             return member.core_verdict
@@ -77,7 +77,7 @@ def test_delta_failed_successor_admission_does_not_park_fresh_peer(tmp_path):
     executor = RecordingExecutor()
     result = run_group_controller(_binding(group, facts.allocation.backend_job_id), facts.allocation.backend_job_id,
                                   facts, store, Admission(), executor)
-    assert calls[:2] == list(facts.member_inputs)
+    assert [item.task_id for item in calls[:2]] == [item.task_id for item in facts.member_inputs]
     assert [member.task_id for member in calls[2:]] == ["fresh"]
     assert calls[2].start_receipt is not None and calls[2].outcome_receipt is not None
     assert [f.task_id for f, _ in executor.calls] == ["fresh"]

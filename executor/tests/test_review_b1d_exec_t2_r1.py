@@ -12,6 +12,7 @@ import pytest
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.lifecycle.controller import GroupControllerFactsV1, GroupControllerOutcome, run_group_controller
 from tpen_executor.recovery import MappingCoreAdmissionPort
+from tpen_executor.results import ReconciliationPublicationV2
 
 from test_b1a_b_publication import _fixture
 from test_b1d_admission_port import _wire

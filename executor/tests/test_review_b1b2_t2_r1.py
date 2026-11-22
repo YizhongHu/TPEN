@@ -138,7 +138,7 @@ def test_t2_admission_failure_is_local_to_member(tmp_path, failure):
 
     class SelectiveAdmission:
         def admit(self, member):
-            calls.append(member.task_id)
+            calls.append(member)
             if member.task_id == "bad":
                 if failure == "exception":
                     raise RuntimeError("one member unavailable")
@@ -148,7 +148,7 @@ def test_t2_admission_failure_is_local_to_member(tmp_path, failure):
     executor = RecordingExecutor()
     result = run_group_controller(_binding(group, allocation.backend_job_id), allocation.backend_job_id,
                                   facts, store, SelectiveAdmission(), executor)
-    assert calls[:2] == list(facts.member_inputs)
+    assert [item.task_id for item in calls[:2]] == [item.task_id for item in facts.member_inputs]
     assert [member.task_id for member in calls[2:]] == ["good"]
     assert calls[2].start_receipt is not None and calls[2].outcome_receipt is not None
     assert [fence.task_id for fence, _ in executor.calls] == ["good"]
