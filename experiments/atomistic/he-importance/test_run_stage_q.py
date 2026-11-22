@@ -855,6 +855,67 @@ def test_selection_receipt_contains_selected_and_discarded_cells(tmp_path: Path)
     json.dumps(receipt)
 
 
+def test_cell_selection_receipt_is_write_once_and_canonical(tmp_path: Path) -> None:
+    report = {
+        "selection": {"selected": {"stage": "Q"}},
+        "train_packet": {"content_hash": "row-a"},
+    }
+    path = runner._write_cell_selection_receipt(tmp_path, "row-a", report)
+    assert path == tmp_path / "cells" / "row-a" / "selection_receipt.json"
+    assert path.read_bytes() == runner._canonical_selection_receipt_bytes(report)
+    with pytest.raises(runner.StageQSelectionError, match="occupied"):
+        runner._write_cell_selection_receipt(tmp_path, "row-a", report)
+
+    for occupant in ("file", "directory", "dangling symlink"):
+        row = tmp_path / "cells" / occupant
+        row.mkdir(parents=True)
+        target = row / "selection_receipt.json"
+        if occupant == "file":
+            target.write_bytes(b"existing")
+        elif occupant == "directory":
+            target.mkdir()
+        else:
+            target.symlink_to(row / "missing.json")
+        with pytest.raises(runner.StageQSelectionError, match="occupied"):
+            runner._write_cell_selection_receipt(
+                tmp_path,
+                occupant,
+                report | {"train_packet": {"content_hash": occupant}},
+            )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "altered", "row", "noncanonical"])
+def test_cell_selection_receipt_successor_validation_refuses_mutations(
+    tmp_path: Path, mutation: str
+) -> None:
+    report = {
+        "selection": {"selected": {"stage": "Q"}},
+        "train_packet": {"content_hash": "row-b"},
+    }
+    path = runner._write_cell_selection_receipt(tmp_path, "row-b", report)
+    assert runner._validate_cell_selection_receipt(tmp_path, "row-b", report) == path
+    if mutation == "missing":
+        path.unlink()
+    elif mutation == "altered":
+        path.write_bytes(
+            runner._canonical_selection_receipt_bytes({**report, "selection": {}})
+        )
+    elif mutation == "row":
+        path.write_bytes(
+            runner._canonical_selection_receipt_bytes(
+                {**report, "train_packet": {"content_hash": "row-c"}}
+            )
+        )
+    elif mutation == "noncanonical":
+        path.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
+    if mutation == "missing":
+        with pytest.raises(runner.StageQSelectionError, match="regular file|unreadable"):
+            runner._validate_cell_selection_receipt(tmp_path, "row-b", report)
+    else:
+        with pytest.raises(runner.StageQSelectionError):
+            runner._validate_cell_selection_receipt(tmp_path, "row-b", report)
+
+
 def test_execution_facts_cross_launch_boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeCUDA:
         @staticmethod
@@ -1132,8 +1193,9 @@ def test_g4_execute_forwards_exact_facts_and_emits_completion_only_after_snapsho
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
     )
-    expected_filenames = {"selection_receipt.json", "resolved_config.yaml", "COMPLETE"}
+    expected_filenames = {"resolved_config.yaml", "COMPLETE"}
     assert {path.name for path in selected.output_path.iterdir()} == expected_filenames
+    assert (tmp_path / "cells" / selected.content_hash / "selection_receipt.json").is_file()
     resolved = selected.output_path / "resolved_config.yaml"
     assert resolved.read_text(encoding="utf-8") == "horizon: 2000\n"
     assert not list(tmp_path.rglob("ranking_packet.json"))
@@ -3204,10 +3266,9 @@ def test_o1_execute_launches_under_the_o1_path_with_the_o1_horizon(
     assert observed["n_walkers"] == 4_096
     run_dir = observed["run_dir"]
     assert run_dir.parent == tmp_path.resolve() / "O1"
-    assert {path.name for path in run_dir.iterdir()} == {
-        "selection_receipt.json", "resolved_config.yaml", "COMPLETE"
-    }
-    receipt = json.loads((run_dir / "selection_receipt.json").read_text(encoding="utf-8"))
+    assert {path.name for path in run_dir.iterdir()} == {"resolved_config.yaml", "COMPLETE"}
+    receipt_path = tmp_path / "cells" / run_dir.name / "selection_receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["selection"]["selected"]["stage"] == "O1"
     assert receipt["selection"]["selected"]["seed_label"] == 820_002
     assert receipt["train_packet"]["content_hash"] == run_dir.name
