@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import stat
-import subprocess
-import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -36,6 +33,7 @@ from tpen.execution.recovery import (
 from tpen.inspection import inspect_run
 from tpen.run import PLANNED_YIELD_EXIT_CODE, run_from_config
 from tpen.training.events import TrainingIterationCompleted
+from tests.helpers.executor_boundary import executor_call
 
 
 _FIXTURE = Path("tests/integration/artifacts/training/vmc_smoke.yaml")
@@ -213,81 +211,10 @@ def _child_payload(fence: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _executor_environment() -> dict[str, str]:
-    """Build an executor-only environment without Python startup overrides."""
-
-    environment = os.environ.copy()
-    for variable in (
-        "PYTHONHOME",
-        "PYTHONOPTIMIZE",
-        "PYTHONNOUSERSITE",
-        "PYTHONUSERBASE",
-        "PYTHONSTARTUP",
-        "PYTHONINSPECT",
-        "PYTHONWARNINGS",
-    ):
-        environment.pop(variable, None)
-    executor_src = Path(__file__).resolve().parents[2] / "executor" / "src"
-    environment["PYTHONPATH"] = str(executor_src)
-    return environment
-
-
 def _executor_call(tmp_path: Path, action: str, payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Run one executor-only child operation and decode its JSON result.
+    """Run the boundary child defined by this integration module."""
 
-    Parameters
-    ----------
-    tmp_path : pathlib.Path
-        Per-test root used as the child working directory.
-    action : str
-        Child operation name.
-    payload : mapping
-        JSON-safe operation input.
-
-    Returns
-    -------
-    dict
-        JSON result emitted by the child.
-    """
-
-    try:
-        completed = subprocess.run(
-            [sys.executable, "-c", _EXECUTOR_CHILD, action, json.dumps(dict(payload), sort_keys=True)],
-            cwd=tmp_path,
-            env=_executor_environment(),
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise AssertionError(
-            f"executor child timed out ({action}, timeout=120s):\n"
-            f"stdout={error.stdout}\nstderr={error.stderr}"
-        ) from error
-    if completed.returncode != 0:
-        raise AssertionError(
-            f"executor child failed ({action}, rc={completed.returncode}):\n"
-            f"stdout={completed.stdout}\nstderr={completed.stderr}"
-        )
-    if completed.stderr:
-        raise AssertionError(f"executor child wrote stderr ({action}): {completed.stderr}")
-    result = json.loads(completed.stdout)
-    if not isinstance(result, dict):
-        raise AssertionError(f"executor child result is not a mapping ({action}): {result!r}")
-    boundary = result.get("_executor_boundary")
-    if not isinstance(boundary, dict):
-        raise AssertionError(f"executor child boundary is not a mapping ({action}): {boundary!r}")
-    if boundary.get("tpen_imports") != []:
-        raise AssertionError(
-            f"executor child crossed tpen import boundary ({action}): {boundary!r}"
-        )
-    if boundary.get("tpen_modules") != []:
-        raise AssertionError(
-            f"executor child loaded tpen modules ({action}): {boundary!r}"
-        )
-    result.pop("_executor_boundary", None)
-    return result
+    return executor_call(_EXECUTOR_CHILD, tmp_path, action, payload)
 
 
 def _canonical_json(value: Mapping[str, Any]) -> bytes:

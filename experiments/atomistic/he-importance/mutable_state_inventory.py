@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -231,6 +233,69 @@ class MutableStateEntry:
     source: str
 
 
+class HIContinuationAdmissionRefusal(ValueError):
+    """A sealed HI continuation row does not satisfy the study contract."""
+
+    code = "hi-continuation-admission-refused"
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"{self.code}: {reason}")
+
+
+class HIContinuationRowIdentityRefusal(HIContinuationAdmissionRefusal):
+    """A supplied config is not the producer-resolved row being admitted."""
+
+
+@dataclass(frozen=True, slots=True)
+class SealedHIContinuationIdentity:
+    """Stable identity for one inventory- and context-qualified HI row."""
+
+    schema: str
+    stage: str
+    context: str
+    content_hash: str
+    constructor_hash: str
+
+    def as_dict(self) -> dict[str, str]:
+        """Return the identity in a JSON-shaped, deterministic form."""
+
+        return {
+            "schema": self.schema,
+            "stage": self.stage,
+            "context": self.context,
+            "content_hash": self.content_hash,
+            "constructor_hash": self.constructor_hash,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class HIContinuationAdmission:
+    """Validated study-side admission facts for a future continuation."""
+
+    identity: SealedHIContinuationIdentity
+    inventory: tuple[MutableStateEntry, ...]
+
+
+_ADMISSION_SCHEMA = "he-importance/continuation-admission/v1"
+_O_CONTEXTS = {
+    "O-raw": {"name": "O-raw", "overrides": {"input_features": "B00", "feature_update": "residual"}},
+    "O-composite": {
+        "name": "O-composite",
+        "overrides": {
+            "producer_policy": "hybrid/coordinate-neighbor",
+            "aggregation_activation": "channel-MLP at both activation sites",
+            "input_features": "B11",
+            "feature_update": "residual",
+        },
+    },
+}
+
+# S5b-A admits no operational overlays.  S5b-B may extend this only under its
+# own contract; restore_request and artifact_destination are outside this tree.
+_SCIENTIFIC_CONTEXT_OVERLAY_ALLOWLIST: frozenset[str] = frozenset()
+
+
 def _source_ref(path: str, target: str) -> str:
     """Return a stable train.yaml line reference for a config path."""
 
@@ -418,9 +483,207 @@ def refused_inventory_entries(config: Any | None = None) -> tuple[MutableStateEn
     )
 
 
+def _canonical_inventory(entries: Sequence[MutableStateEntry]) -> tuple[dict[str, str], ...]:
+    """Return the path, target, and disposition fields used for sealing."""
+
+    return tuple(
+        {
+            "path": entry.path,
+            "target": entry.target,
+            "classification": entry.classification,
+        }
+        for entry in sorted(entries, key=lambda item: (item.path, item.target, item.classification))
+    )
+
+
+_ROW_IDENTITY_REFUSAL = (
+    "resolved-row context identity does not match the sealed O1 row"
+)
+
+
+def _contains_residual_interpolation(value: Any) -> bool:
+    """Return whether a detached config tree still contains interpolation syntax."""
+
+    if isinstance(value, str):
+        return "${" in value
+    if isinstance(value, Mapping):
+        return any(
+            _contains_residual_interpolation(key)
+            or _contains_residual_interpolation(nested)
+            for key, nested in value.items()
+        )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return any(_contains_residual_interpolation(nested) for nested in value)
+    return False
+
+
+def _canonical_scientific_context_tree(
+    config: Any, *, resolve: bool = True, refuse_residual_interpolation: bool = False
+) -> bytes:
+    """Serialize the complete scientific/context config tree.
+
+    The overlay allowlist is intentionally empty for S5b-A, so every value in
+    the producer-resolved tree is identity-significant.  JSON encoding keeps
+    booleans, integers, and other JSON scalar types distinct during equality.
+    """
+
+    if isinstance(config, DictConfig) or OmegaConf.is_config(config):
+        config = OmegaConf.to_container(config, resolve=resolve)
+    if not isinstance(config, Mapping):
+        raise TypeError("HI continuation config must be a mapping")
+    if refuse_residual_interpolation and _contains_residual_interpolation(config):
+        raise HIContinuationRowIdentityRefusal(
+            _ROW_IDENTITY_REFUSAL
+        )
+    tree = dict(config)
+    for path in _SCIENTIFIC_CONTEXT_OVERLAY_ALLOWLIST:
+        cursor: Any = tree
+        segments = path.split(".")
+        for segment in segments[:-1]:
+            if not isinstance(cursor, dict) or segment not in cursor:
+                break
+            cursor = cursor[segment]
+        else:
+            if isinstance(cursor, dict):
+                cursor.pop(segments[-1], None)
+    return json.dumps(
+        tree,
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
+def _admission_context(source: Any) -> tuple[str, str]:
+    """Read and validate the O1 context identity from a materialized row."""
+
+    manifest = getattr(source, "manifest", None)
+    if not isinstance(manifest, Mapping):
+        raise HIContinuationAdmissionRefusal("source is not a materialized HI row")
+    if manifest.get("stage") != "O1":
+        raise HIContinuationAdmissionRefusal(
+            f"continuation admission requires stage 'O1', got {manifest.get('stage')!r}"
+        )
+    identity = manifest.get("scientific_identity")
+    if not isinstance(identity, Mapping):
+        raise HIContinuationAdmissionRefusal("resolved row is missing scientific_identity")
+    optimizer = identity.get("optimizer")
+    if not isinstance(optimizer, Mapping) or optimizer.get("method") != "adam":
+        raise HIContinuationAdmissionRefusal("continuation admission requires an O1 Adam row")
+    context = identity.get("context")
+    if not isinstance(context, Mapping):
+        raise HIContinuationAdmissionRefusal("resolved row is missing context identity")
+    content_hash = getattr(source, "content_hash", None)
+    if type(content_hash) is not str or not content_hash:
+        raise HIContinuationAdmissionRefusal("materialized row has no exact content hash")
+    for name, expected in _O_CONTEXTS.items():
+        if dict(context) == expected:
+            return name, content_hash
+    raise HIContinuationAdmissionRefusal(
+        "resolved row context is not the sealed O-raw or O-composite literal"
+    )
+
+
+def validate_hi_continuation_admission(
+    source: Any,
+    config: Any,
+) -> HIContinuationAdmission:
+    """Validate a sealed O1 row before a future HI continuation is admitted.
+
+    The helper is intentionally study-local and does not open the continuation
+    route.  It reconstructs the expected resolved row from the materialized
+    source and requires the supplied config's complete canonical tree to equal
+    that producer-resolved tree before sealing its constructor census.  The
+    empty S5b-A overlay allowlist therefore catches row drift, raw
+    composite/basis injections, and noncanonical ``runner.*`` aliases without
+    maintaining a second context allowlist here.
+
+    Parameters
+    ----------
+    source : object
+        Materialized O1 Adam row whose context identity is sealed by its
+        manifest and content hash.
+    config : mapping
+        The resolved Hydra configuration that would be handed to the runner.
+
+    Returns
+    -------
+    HIContinuationAdmission
+        Deterministic identity and the closed inventory for the qualified row.
+
+    Raises
+    ------
+    HIContinuationAdmissionRefusal
+        If the row, config tree, inventory, or context identity is not exactly
+        qualified.
+    """
+
+    context, content_hash = _admission_context(source)
+
+    try:
+        from . import train_config
+
+        expected_config = train_config.resolve_train_config(source)
+    except Exception as error:
+        raise HIContinuationAdmissionRefusal(
+            f"sealed O1 row cannot be resolved: {error}"
+        ) from error
+
+    try:
+        expected_tree = _canonical_scientific_context_tree(expected_config)
+        observed_tree = _canonical_scientific_context_tree(
+            config, resolve=False, refuse_residual_interpolation=True
+        )
+    except Exception as error:
+        if isinstance(error, HIContinuationRowIdentityRefusal):
+            raise
+        raise HIContinuationAdmissionRefusal(
+            f"resolved-row config tree cannot be canonicalized: {error}"
+        ) from error
+    if observed_tree != expected_tree:
+        raise HIContinuationRowIdentityRefusal(
+            _ROW_IDENTITY_REFUSAL
+        )
+
+    try:
+        expected_entries = validate_mutable_state_inventory(expected_config)
+        observed_entries = validate_mutable_state_inventory(config)
+    except Exception as error:
+        raise HIContinuationAdmissionRefusal(
+            f"sealed constructor inventory refused: {error}"
+        ) from error
+
+    expected_signature = _canonical_inventory(expected_entries)
+    observed_signature = _canonical_inventory(observed_entries)
+    if observed_signature != expected_signature:
+        raise HIContinuationAdmissionRefusal(
+            _ROW_IDENTITY_REFUSAL
+        )
+
+    identity = SealedHIContinuationIdentity(
+        schema=_ADMISSION_SCHEMA,
+        stage="O1",
+        context=context,
+        content_hash=content_hash,
+        constructor_hash=hashlib.sha256(
+            json.dumps(expected_signature, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    )
+    return HIContinuationAdmission(
+        identity=identity,
+        inventory=observed_entries,
+    )
+
+
 __all__ = [
+    "HIContinuationAdmission",
+    "HIContinuationAdmissionRefusal",
+    "HIContinuationRowIdentityRefusal",
     "MutableStateEntry",
+    "SealedHIContinuationIdentity",
     "build_mutable_state_inventory",
     "refused_inventory_entries",
+    "validate_hi_continuation_admission",
     "validate_mutable_state_inventory",
 ]

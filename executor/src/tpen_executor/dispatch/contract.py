@@ -60,8 +60,6 @@ from ..runners import (
 )
 from ..storage import AttemptFence
 from ..tasks import ConfiguredRun
-
-
 _ACTIVE_DISPATCH: ContextVar[bool] = ContextVar("tpen_executor_dispatch", default=False)
 
 
@@ -1205,78 +1203,25 @@ class DispatcherContract:
             raise finish_error
         return lifecycle.store.manifest(group)
 
-    def _complete_member(
-        self,
+    @staticmethod
+    def _publish_completion(
+        lifecycle: AttachedAllocation,
+        fence: Any,
         group: ReadyGroup,
         member: Any,
         configured: ConfiguredRun,
-        lifecycle: AttachedAllocation,
-        fence: Any,
-        materialized: Any,
         environment: Any,
         outcome: Any,
-        timeout: float | None,
+        status: str,
+        result_digest: str | None,
+        segment_evidence: CoreRunEvidence | None,
+        inspection_error: BaseException | None,
         *,
         error: BaseException | None = None,
+        child_refusal: PlacementRefusal | None = None,
     ) -> Exception | None:
-        """Inspect and publish one quiescent child from the controller.
+        """Write one completion's records in the established order."""
 
-        Backend workers return only a plain process outcome.  This method is
-        deliberately called by the owner/controller thread after the backend
-        future and child process have both quiesced; it is the only shared
-        completion path that writes finish and accepted-segment receipts.
-        """
-
-        invalid_outcome = False
-        child_refusal = _child_precore_refusal(environment, outcome) if error is None else None
-        if error is None:
-            try:
-                status = _status(outcome)
-            except Exception:
-                status = "launch_failed"
-                invalid_outcome = True
-        else:
-            # Ordinary launch/worker errors are durable launch failures; a
-            # BaseException is a cancellation and remains an operational
-            # failure while its original exception propagates.
-            status = "launch_failed" if isinstance(error, Exception) else "failed"
-        if child_refusal is not None:
-            # The sidecar is the typed source of truth for a RUN_SHIM refusal;
-            # classify it before finish so return code 2 cannot become failed.
-            status = "launch_failed"
-        result_digest: str | None = None
-        segment_evidence: CoreRunEvidence | None = None
-        inspection_error: BaseException | None = None
-        if error is None and not invalid_outcome and child_refusal is None:
-            try:
-                evidence = materialized["evidence"]
-                process = materialized["process"]
-                output_dir, core_dir, _stdout, _stderr, evidence_stdout, evidence_stderr = _member_paths(fence)
-                if not callable(getattr(evidence, "read", None)):
-                    raise TypeError("materialized worker evidence reader lacks read()")
-                # The reader itself launches with LaunchPurpose.INSPECTION; the
-                # environment only drops the worker-only sampling keys.
-                decoded = evidence.read(
-                    process,
-                    _without_gpu_sampler(environment),
-                    core_dir,
-                    cwd=output_dir,
-                    stdout_path=evidence_stdout,
-                    stderr_path=evidence_stderr,
-                    timeout=timeout,
-                )
-                result_digest = digest(_evidence_payload(decoded))
-                segment_evidence = decoded
-            except EvidenceUnavailable:
-                pass
-            except Exception:
-                status = "launch_failed"
-            except BaseException as caught:
-                # Preserve a known process timeout while still terminalizing
-                # the begun fence before propagating owner cancellation.
-                if status != "timed_out":
-                    status = "failed"
-                inspection_error = caught
         try:
             lifecycle.finish(fence, status, _utc_now(), result_digest)
         except Exception as finish_error:
@@ -1371,6 +1316,94 @@ class DispatcherContract:
                 except Exception as error:
                     return error
         return None
+
+    def _complete_member(
+        self,
+        group: ReadyGroup,
+        member: Any,
+        configured: ConfiguredRun,
+        lifecycle: AttachedAllocation,
+        fence: Any,
+        materialized: Any,
+        environment: Any,
+        outcome: Any,
+        timeout: float | None,
+        *,
+        error: BaseException | None = None,
+    ) -> Exception | None:
+        """Inspect and publish one quiescent child from the controller.
+
+        Backend workers return only a plain process outcome.  This method is
+        deliberately called by the owner/controller thread after the backend
+        future and child process have both quiesced; it is the only shared
+        completion path that writes finish and accepted-segment receipts.
+        """
+
+        invalid_outcome = False
+        child_refusal = _child_precore_refusal(environment, outcome) if error is None else None
+        if error is None:
+            try:
+                status = _status(outcome)
+            except Exception:
+                status = "launch_failed"
+                invalid_outcome = True
+        else:
+            # Ordinary launch/worker errors are durable launch failures; a
+            # BaseException is a cancellation and remains an operational
+            # failure while its original exception propagates.
+            status = "launch_failed" if isinstance(error, Exception) else "failed"
+        if child_refusal is not None:
+            # The sidecar is the typed source of truth for a RUN_SHIM refusal;
+            # classify it before finish so return code 2 cannot become failed.
+            status = "launch_failed"
+        result_digest: str | None = None
+        segment_evidence: CoreRunEvidence | None = None
+        inspection_error: BaseException | None = None
+        if error is None and not invalid_outcome and child_refusal is None:
+            try:
+                evidence = materialized["evidence"]
+                process = materialized["process"]
+                output_dir, core_dir, _stdout, _stderr, evidence_stdout, evidence_stderr = _member_paths(fence)
+                if not callable(getattr(evidence, "read", None)):
+                    raise TypeError("materialized worker evidence reader lacks read()")
+                # The reader itself launches with LaunchPurpose.INSPECTION; the
+                # environment only drops the worker-only sampling keys.
+                decoded = evidence.read(
+                    process,
+                    _without_gpu_sampler(environment),
+                    core_dir,
+                    cwd=output_dir,
+                    stdout_path=evidence_stdout,
+                    stderr_path=evidence_stderr,
+                    timeout=timeout,
+                )
+                result_digest = digest(_evidence_payload(decoded))
+                segment_evidence = decoded
+            except EvidenceUnavailable:
+                pass
+            except Exception:
+                status = "launch_failed"
+            except BaseException as caught:
+                # Preserve a known process timeout while still terminalizing
+                # the begun fence before propagating owner cancellation.
+                if status != "timed_out":
+                    status = "failed"
+                inspection_error = caught
+        return self._publish_completion(
+            lifecycle,
+            fence,
+            group,
+            member,
+            configured,
+            environment,
+            outcome,
+            status,
+            result_digest,
+            segment_evidence,
+            inspection_error,
+            error=error,
+            child_refusal=child_refusal,
+        )
 
     @staticmethod
     def _validate_inputs(

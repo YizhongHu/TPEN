@@ -7,6 +7,6 @@
 def test_r5_production_package_exports_execution_gateways():
     import tpen.execution as ex
 
-    expected = {"WorkerStartGateway", "BalsamAdapter", "select_recovery"}
+    expected = {"WorkerStartGateway", "select_recovery"}
     missing = expected - set(ex.__all__)
     assert not missing, f"production gateway exports missing: {missing!r}"

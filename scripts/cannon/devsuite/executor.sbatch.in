@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Rendered by submit_devsuite.sh for one exact dev SHA and one approved
+# in-repo scripts/cannon/executor-harness directory from the exact SHA under test.
+#SBATCH --partition=test
+#SBATCH --account=kozinsky_lab
+#SBATCH --job-name=__EXECUTOR_JOB_NAME__
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=32G
+#SBATCH --time=08:00:00
+#SBATCH --output=__EXECUTOR_RUN_ROOT__/slurm-%j.out
+#SBATCH --error=__EXECUTOR_RUN_ROOT__/slurm-%j.err
+
+set -Eeuo pipefail
+
+fail_precheck() {
+  printf 'PRECHECK_FAILED %s\n' "$*" >&2
+  exit 2
+}
+
+HEAD_SHA="${HEAD_SHA:-__HEAD_SHA__}"
+JOB_NAME="${JOB_NAME:-__EXECUTOR_JOB_NAME__}"
+TASK_ROOT="${TASK_ROOT:-__EXECUTOR_TASK_ROOT__}"
+RUN_ROOT="${RUN_ROOT:-__EXECUTOR_RUN_ROOT__}"
+MUTANT_SPEC="${MUTANT_SPEC:-${TASK_ROOT}/mutants.json}"
+HARNESS_SOURCE="${HARNESS_SOURCE:-scripts/cannon/executor-harness}"
+HARNESS_SOURCE_SHA="${HARNESS_SOURCE_SHA:-__HEAD_SHA__}"
+
+precheck() {
+  [[ "${SLURM_JOB_PARTITION:-}" == test ]] || fail_precheck "partition must be test, got ${SLURM_JOB_PARTITION:-unset}"
+  [[ "${HEAD_SHA}" =~ ^[0-9a-fA-F]{40}$ ]] || fail_precheck "HEAD_SHA must be full 40-hex"
+  [[ "${JOB_NAME}" =~ ^[A-Za-z0-9_.-]+$ ]] || fail_precheck "JOB_NAME contains unsafe characters"
+  [[ "${JOB_NAME}" == *"${HEAD_SHA:0:12}"* ]] || fail_precheck "JOB_NAME must contain SHA[:12]"
+  [[ "${RUN_ROOT}" == /n/netscratch/kozinsky_lab/Lab/rhu/* ]] || fail_precheck "RUN_ROOT escapes facility prefix"
+  [[ "${TASK_ROOT}" == /n/netscratch/kozinsky_lab/Lab/rhu/* ]] || fail_precheck "TASK_ROOT escapes facility prefix"
+  [[ "${HARNESS_SOURCE}" == scripts/cannon/executor-harness ]] || fail_precheck "executor harness source is not in-repo"
+  [[ "${HARNESS_SOURCE_SHA}" == "${HEAD_SHA}" ]] || fail_precheck "executor harness source SHA differs from HEAD_SHA"
+  [[ -f "${TASK_ROOT}/job.sbatch" ]] || fail_precheck "executor harness job.sbatch missing"
+  [[ -f "${TASK_ROOT}/mutants.json" ]] || fail_precheck "executor mutants.json missing"
+  [[ -s "${TASK_ROOT}/repo.bundle" ]] || fail_precheck "executor repo.bundle missing or empty"
+  grep -q 'H_V2_SCIENCE_PYTHON' "${TASK_ROOT}/job.sbatch" || fail_precheck "executor harness lacks H_V2 binding"
+  grep -q 'H_V2_EXECUTOR_PYTHON' "${TASK_ROOT}/job.sbatch" || fail_precheck "executor harness lacks H_V2 binding"
+  if [[ "__ALLOW_EXECUTOR_MUTANTS__" != 1 ]]; then
+    grep -Eq '"mutants"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]' "${TASK_ROOT}/mutants.json" || fail_precheck "executor mutant spec is not empty"
+  fi
+  bash -n "${TASK_ROOT}/job.sbatch" || fail_precheck "executor harness job.sbatch has shell syntax errors"
+}
+
+precheck
+if [[ "${DEVSUITE_PRECHECK:-0}" == 1 ]]; then
+  printf 'EXECUTOR_PRECHECK PASS sha=%s job=%s partition=%s task_root=%s run_root=%s mutants_mode=%s\n' \
+    "$HEAD_SHA" "$JOB_NAME" "$SLURM_JOB_PARTITION" "$TASK_ROOT" "$RUN_ROOT" "__ALLOW_EXECUTOR_MUTANTS__"
+  exit 0
+fi
+
+export USER="${USER:?USER required}"
+export TASK_ROOT RUN_ROOT HEAD_SHA JOB_NAME MUTANT_SPEC
+export NODE_TMP="/scratch/${USER}/${SLURM_JOB_ID:?SLURM_JOB_ID required}"
+export DRY_RUN=0 DRY_NODE_TMP= LOCAL_FAKE=0 LOCAL_FAKE_ROOT=
+export COPYFILE_DISABLE=1 PYTHONPATH= UV="/n/home10/rhu/.local/bin/uv"
+export SLURM_JOB_NAME="${SLURM_JOB_NAME:-$JOB_NAME}"
+
+# The outer wrapper owns the real Slurm submission and its absolute log paths;
+# the versioned harness owns all setup, matrix execution, and reconciliation.
+exec "${TASK_ROOT}/job.sbatch"

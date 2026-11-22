@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.integration import test_native_checkpoint_recovery as native
 from tpen.checkpoint import CheckpointRef, list_complete_checkpoints
-from tpen.execution import BalsamAdapter, WorkerStartGateway
 from tpen.execution.chain_resume import (
     UnmeasuredArmError,
     compare_channel_parity,
@@ -20,10 +20,10 @@ from tpen.execution.recovery import CheckpointEvidence
 from tests.helpers.native_chain_resume_trace import _snapshot_leaf, _trace_refusal
 from tests.integration.test_native_checkpoint_recovery import (
     FIXTURE,
-    QualificationClient,
     _batch,
     _launch,
     _trace,
+    _worker_diagnostics,
     _write_inputs,
 )
 
@@ -48,7 +48,7 @@ def _wait_for_two_prefix_checkpoints(outputs: Path, *, target: int, process) -> 
         if process.poll() is not None:
             raise AssertionError(
                 f"prefix worker exited (rc={process.returncode}) before two "
-                "committed prefix checkpoints"
+                f"committed prefix checkpoints\n{_worker_diagnostics(process)}"
             )
         time.sleep(0.05)
     raise AssertionError("no two committed prefix checkpoints before deadline")
@@ -61,20 +61,14 @@ def cursor_evidence(tmp_path_factory: pytest.TempPathFactory) -> dict:
     root = tmp_path_factory.mktemp("r3-native-cursor")
     batch, intent, _source = _batch()
     batch_path, intent_path = _write_inputs(root, batch, intent)
-    receipts = root / "receipts"
     outputs = root / "outputs"
     outputs.mkdir()
-    adapter = BalsamAdapter(
-        batch.execution, QualificationClient(), WorkerStartGateway(outputs), receipts
-    )
-    assert adapter.register_lineage(batch) is not None
 
     prefix = _launch(
         root=root,
         batch_path=batch_path,
         intent_path=intent_path,
         config_path=FIXTURE,
-        receipts=receipts,
         outputs=outputs,
         phase="initial",
         label="r3-cursor-prefix",
@@ -135,7 +129,6 @@ def cursor_evidence(tmp_path_factory: pytest.TempPathFactory) -> dict:
             batch_path=batch_path,
             intent_path=intent_path,
             config_path=FIXTURE,
-            receipts=receipts,
             outputs=outputs,
             phase=spec["phase"],
             label=f"r3-{label}",
@@ -145,7 +138,7 @@ def cursor_evidence(tmp_path_factory: pytest.TempPathFactory) -> dict:
             disable_limb=spec["disable"],
         )
         worker.wait(timeout=240)
-        assert worker.returncode == 0, label
+        native._assert_worker_returncode(worker, 0, label)
         traces[label] = _trace(trace_path)
         trace_paths[label] = trace_path
 

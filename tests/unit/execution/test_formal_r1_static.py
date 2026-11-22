@@ -9,11 +9,7 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).parents[3]
-DOC_FILES = (
-    Path("tpen/execution/balsam.py"),
-    Path("tools/e5b_polaris_app.py"),
-    Path("tools/e5b_polaris_pilot.py"),
-)
+DOC_FILES = ()
 FORBIDDEN_LOCAL_PROVENANCE = ("/Users/yizhonghu", "/home/rhu")
 
 

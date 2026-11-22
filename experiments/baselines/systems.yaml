@@ -84,6 +84,34 @@ systems:
       Exact, not variational-best-estimate: at the Taut omegas the two-electron
       relative-motion problem is solvable in closed form.
 
+  - id: qho_pair_noninteracting_singlet_omega0.5
+    description: >-
+      QHO-2e non-interacting control in a 3D isotropic harmonic
+      trap at omega = 1/2, with kinetic and harmonic-trap terms only and the
+      opposite-spin singlet occupancy sector.
+    n_up: 1
+    n_down: 1
+    spatial_dim: 3
+    hamiltonian:
+      terms:
+        - term: kinetic
+        - term: harmonic_trap
+          omega: 0.5
+    reference_energy_hartree: 1.5
+    reference_source: >-
+      Analytic product of two three-dimensional harmonic-oscillator ground
+      states in atomic units, psi(r1,r2) = exp(-omega(|r1|^2 + |r2|^2)/2).
+      Each opposite-spin electron contributes 3*omega/2, so the exact local
+      and total energy is 3*omega = 1.5 Ha at omega = 0.5. There is no
+      electron-electron Coulomb term and no electron-electron cusp. This is
+      the non-interacting control derivation, not Taut's interacting Hooke
+      reference and not OneElectronHookeExact.
+    confidence: transcribed
+    notes: >-
+      Exact two-electron control reference for the kinetic-plus-trap
+      Hamiltonian; its physical identity is distinct from both interacting
+      Hooke-2e and one-electron Hooke systems.
+
   - id: h_atom
     description: One-electron hydrogen atom with the nucleus at the origin.
     n_up: 1

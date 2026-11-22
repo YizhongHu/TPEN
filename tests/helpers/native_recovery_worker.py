@@ -1,10 +1,4 @@
-"""Subprocess worker for the native E5 qualification.
-
-The parent process owns fake registration and allocation-loss observation.  A
-worker receives only the durable batch, intent, Job identity, and (for a
-successor) serialized checkpoint evidence.  It therefore exercises the same
-E4 worker seam and E3 configured-run call that an actual launcher would use.
-"""
+"""Subprocess worker for the native checkpoint-recovery qualification."""
 
 from __future__ import annotations
 
@@ -12,13 +6,13 @@ import argparse
 import json
 import os
 import time
+import traceback
 from dataclasses import replace
 from pathlib import Path
 
 from omegaconf import OmegaConf
 
 from tpen.execution import (
-    BalsamAdapter,
     ReadyBatch,
     RecoveryPhase,
     ScienceIntent,
@@ -41,16 +35,6 @@ from tests.helpers.native_chain_resume_trace import (
     install_native_trace,
     skip_restore_owners,
 )
-
-
-class NoLiveBackendClient:
-    """Client-shaped object proving worker start does not need a live API."""
-
-    def register_job(self, **_kwargs):  # pragma: no cover - a worker must not call this
-        raise AssertionError("worker attempted backend registration")
-
-    def observe_job(self, _job_id):  # pragma: no cover - a worker must not call this
-        raise AssertionError("worker attempted backend observation")
 
 
 class PartialRestoreTrain(Train):
@@ -117,9 +101,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--intent", type=Path, required=True)
-    parser.add_argument("--receipts", type=Path, required=True)
     parser.add_argument("--outputs", type=Path, required=True)
-    parser.add_argument("--job-id", required=True)
     parser.add_argument("--phase", choices=("initial", "recovery"), required=True)
     parser.add_argument("--label", default="worker")
     parser.add_argument("--evidence", type=Path)
@@ -137,7 +119,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    """Run one actual worker process and print its typed adapter result."""
+    """Run one actual worker process and print its typed gateway result."""
 
     args = _parser().parse_args()
     batch = decode_ready_batch(args.batch.read_bytes())
@@ -153,12 +135,7 @@ def main() -> int:
     if args.evidence is not None:
         evidence = json.loads(args.evidence.read_text(encoding="utf-8"))
 
-    adapter = BalsamAdapter(
-        batch.execution,
-        NoLiveBackendClient(),
-        WorkerStartGateway(args.outputs),
-        args.receipts,
-    )
+    gateway = WorkerStartGateway(args.outputs)
 
     run_cfg = cfg
     selected_decision = None
@@ -223,9 +200,9 @@ def main() -> int:
     if args.partial_restore:
         # Only this explicit negative control bypasses full-state restore;
         # it still uses E3's materialization before the injected omission.
-        result = adapter.start(
+        result = gateway.start(
             batch=batch, intent=intent, phase=RecoveryPhase(args.phase),
-            run_once=run_once, job_id=args.job_id, evidence=evidence,
+            run_once=run_once, evidence=evidence,
         )
     else:
         # CR instrumentation surrounds the configured entry; it must not be
@@ -240,21 +217,28 @@ def main() -> int:
             core.run_from_config = paused_run
         try:
             with skip_restore_owners(args.disable_limb or ()):
-                result = adapter.start_configured(
+                result = gateway.start_configured(
                     cfg=cfg, batch=batch, intent=intent, phase=RecoveryPhase(args.phase),
-                    job_id=args.job_id, evidence=evidence,
-                    config_path=str(args.config), command="e5-native-worker",
+                    evidence=evidence,
+                    run_kwargs={
+                        "config_path": str(args.config),
+                        "command": "e5-native-worker",
+                    },
                 )
         finally:
             if trace_stack is not None:
                 trace_stack.close()
             if trace is not None:
                 trace.write(args.trace)
-    invocation = result.invocation
+    # WorkerStartGateway returns the WorkerInvocation directly.  The old
+    # Balsam adapter wrapped it in a result object, but native workers have no
+    # backend layer to reproduce; the gateway itself owns the start/outcome
+    # receipt and its fresh per-launch output namespace.
+    invocation = result
     output = {
-        "status": result.status.value,
-        "reason": result.reason,
-        "job_id": None if result.registration is None else result.registration.job_id,
+        "status": "started",
+        "reason": result.outcome.reason,
+        "job_id": None,
         "invocation": None
         if invocation is None
         else {
@@ -268,8 +252,15 @@ def main() -> int:
         },
     }
     print(json.dumps(output, sort_keys=True))
-    return 0 if result.status.value == "started" else 2
+    # A typed refusal/park is a measured worker outcome, not a process error.
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception:
+        # Keep the structured worker result on stdout, while making a failed
+        # child diagnosable by its parent test through the separate stderr log.
+        traceback.print_exc()
+        raise

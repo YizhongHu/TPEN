@@ -46,29 +46,6 @@ from .invocation import (
     run_configured_once,
     validate_start_receipt,
 )
-from .balsam import (
-    BALSAM_INTENT_SCHEMA,
-    BALSAM_OBSERVATION_SCHEMA,
-    BALSAM_OBSERVATION_PARK_SCHEMA,
-    BALSAM_PARK_SCHEMA,
-    BALSAM_REGISTRATION_SCHEMA,
-    BALSAM_REFUSAL_SCHEMA,
-    BALSAM_WORKER_PARK_SCHEMA,
-    BalsamAcknowledgementUnknown,
-    BalsamAdapter,
-    BalsamAdapterError,
-    BalsamAdapterStatus,
-    BalsamBindingError,
-    BalsamClient,
-    BalsamJobObservation,
-    BalsamJobState,
-    BalsamPermanentRefusal,
-    BalsamRegistrationIntent,
-    BalsamRegistrationReceipt,
-    BalsamStartResult,
-    load_balsam_api,
-)
-
 from .recovery import (
     AdmissionRefusalCode,
     CheckpointEvidence,
@@ -96,6 +73,13 @@ from .recovery import (
     select_successor_admission,
     select_recovery,
     train_resume_load_overlay,
+)
+from .core_admission import (
+    CORE_ADMISSION_SCHEMA,
+    CoreAdmissionContextV1,
+    core_admission_digest,
+    encode_core_admission,
+    evaluate_core_admission,
 )
 from .native_profile import (
     SUPPORTED_CALLBACK_TARGETS,
@@ -215,24 +199,4 @@ __all__ = [
     "run_bound_configured_once",
     "run_configured_once",
     "validate_start_receipt",
-    "BALSAM_INTENT_SCHEMA",
-    "BALSAM_OBSERVATION_SCHEMA",
-    "BALSAM_OBSERVATION_PARK_SCHEMA",
-    "BALSAM_PARK_SCHEMA",
-    "BALSAM_REGISTRATION_SCHEMA",
-    "BALSAM_REFUSAL_SCHEMA",
-    "BALSAM_WORKER_PARK_SCHEMA",
-    "BalsamAcknowledgementUnknown",
-    "BalsamAdapter",
-    "BalsamAdapterError",
-    "BalsamAdapterStatus",
-    "BalsamBindingError",
-    "BalsamClient",
-    "BalsamJobObservation",
-    "BalsamJobState",
-    "BalsamPermanentRefusal",
-    "BalsamRegistrationIntent",
-    "BalsamRegistrationReceipt",
-    "BalsamStartResult",
-    "load_balsam_api",
 ]

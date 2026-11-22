@@ -17,11 +17,10 @@ def _batch():
     source_digest = source_config_digest(source)
     execution = ExecutionConfig(
         lineage_id="r6-overlay-lineage",
-        backend="balsam",
+        backend="direct",
         recovery="checkpoint",
         source_config_digest=source_digest,
         payload_digest=payload_digest(payload),
-        backend_options={"site": "r6-test"},
     )
     batch = ReadyBatch(
         lineage_id=execution.lineage_id,
@@ -37,35 +36,13 @@ def _batch():
     return batch, intent, source
 
 
-class _Client:
-    def __init__(self):
-        self.register_calls = 0
-        self.observe_calls = 0
-
-    def register_job(self, *, lineage_id, batch, backend_options):
-        self.register_calls += 1
-        return {"job_id": "r6-job"}
-
-    def observe_job(self, job_id):
-        self.observe_calls += 1
-        raise AssertionError("worker start must not observe the backend")
-
-
 def test_r6_e4_configured_overlay_reaches_core_and_start_receipt(monkeypatch, tmp_path):
     from omegaconf import OmegaConf
     from tpen import run as run_module
-    from tpen.execution import BalsamAdapter, BalsamAdapterStatus, RecoveryPhase, WorkerStartGateway
+    from tpen.execution import RecoveryPhase, WorkerStartGateway
 
     batch, intent, source = _batch()
-    client = _Client()
-    adapter = BalsamAdapter(
-        batch.execution,
-        client,
-        WorkerStartGateway(tmp_path / "outputs"),
-        tmp_path / "receipts",
-    )
-    registration = adapter.register_lineage(batch)
-    assert registration is not None
+    gateway = WorkerStartGateway(tmp_path / "outputs")
     seen = []
     observed_start = []
 
@@ -76,32 +53,28 @@ def test_r6_e4_configured_overlay_reaches_core_and_start_receipt(monkeypatch, tm
         return 0
 
     monkeypatch.setattr(run_module, "run_from_config", core)
-    result = adapter.start_configured(
+    result = gateway.start_configured(
         cfg=OmegaConf.create({**source, "run": {"root": "unused"}}),
         batch=batch,
         intent=intent,
         phase=RecoveryPhase.INITIAL,
-        job_id=registration.job_id,
         declared_overlays={"trainer.max_steps": 1},
     )
-    assert result.status is BalsamAdapterStatus.STARTED
     assert seen == [1]
     assert observed_start[0]["declared_overlays"] == {"trainer.max_steps": 1}
-    start = result.invocation.start
+    start = result.start
     assert start.declared_overlays == {"trainer.max_steps": 1}
-    assert client.register_calls == 1
-    assert client.observe_calls == 0
+    assert result.outcome.outcome.value == "parked"
+    assert result.outcome.status.value == "unknown"
 
 
 def test_r6_e4_no_overlay_is_a_distinct_green_control(monkeypatch, tmp_path):
     from omegaconf import OmegaConf
     from tpen import run as run_module
-    from tpen.execution import BalsamAdapter, BalsamAdapterStatus, RecoveryPhase, WorkerStartGateway
+    from tpen.execution import RecoveryPhase, WorkerStartGateway
 
     batch, intent, source = _batch()
-    client = _Client()
-    adapter = BalsamAdapter(batch.execution, client, WorkerStartGateway(tmp_path / "outputs"), tmp_path / "receipts")
-    registration = adapter.register_lineage(batch)
+    gateway = WorkerStartGateway(tmp_path / "outputs")
     seen = []
     observed_start = []
 
@@ -111,15 +84,15 @@ def test_r6_e4_no_overlay_is_a_distinct_green_control(monkeypatch, tmp_path):
         return 0
 
     monkeypatch.setattr(run_module, "run_from_config", core)
-    result = adapter.start_configured(
+    result = gateway.start_configured(
         cfg=OmegaConf.create({**source, "run": {"root": "unused"}}),
-        batch=batch, intent=intent, phase=RecoveryPhase.INITIAL, job_id=registration.job_id,
+        batch=batch, intent=intent, phase=RecoveryPhase.INITIAL,
     )
-    assert result.status is BalsamAdapterStatus.STARTED
+    assert result.outcome.outcome.value == "parked"
+    assert result.outcome.status.value == "unknown"
     assert seen == [2]
     assert observed_start[0]["declared_overlays"] == {}
-    assert result.invocation.start.declared_overlays == {}
-    assert client.observe_calls == 0
+    assert result.start.declared_overlays == {}
 
 
 def test_r6_e3_direct_configured_overlay_is_a_green_control(monkeypatch, tmp_path):

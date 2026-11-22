@@ -1918,3 +1918,207 @@ def test_fake_context_run_dir_is_pytest_managed(tmp_path_factory: pytest.TempPat
     assert base in context.run_dir.resolve().parents, (
         f"_FakeContext.run_dir={context.run_dir} is outside pytest's basetemp {base}"
     )
+
+
+def test_admitted_continuation_forwards_opaque_operational_objects_by_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Qualified study rows forward opaque restore and destination objects unchanged."""
+
+    cell = _cell(tmp_path)
+    monkeypatch.setattr(
+        launch._TRAIN_CONFIG,
+        "resolve_train_config",
+        lambda source, **_: OmegaConf.create({"runner": {"model": {"_target_": "tests.Model"}}}),
+    )
+    monkeypatch.setattr(
+        import_module("experiments.atomistic.he-importance.mutable_state_inventory"),
+        "validate_hi_continuation_admission",
+        lambda source, config: object(),
+    )
+    restore_request = object()
+    artifact_destination = object()
+    received: list[tuple[object, object]] = []
+
+    def runner(config: object, *, restore_request: object, artifact_destination: object) -> int:
+        del config
+        received.append((restore_request, artifact_destination))
+        return 0
+
+    plan = launch.prepare_train_launch(
+        cell,
+        _topology(),
+        restore_request=restore_request,
+        artifact_destination=artifact_destination,
+    )
+    assert plan.restore_request is restore_request
+    assert plan.artifact_destination is artifact_destination
+    assert launch.launch_train(
+        cell,
+        _topology(),
+        runner=runner,
+        restore_request=restore_request,
+        artifact_destination=artifact_destination,
+    ) == 0
+    assert received == [(restore_request, artifact_destination)]
+
+
+@pytest.mark.parametrize("keyword", ["restore_request", "artifact_destination"])
+def test_nonempty_operational_keyword_requires_custom_runner_capability(
+    tmp_path: Path, keyword: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _cell(tmp_path)
+    payload = object()
+    calls: list[object] = []
+    value_kwargs = {keyword: payload}
+
+    def runner(config: object) -> int:
+        calls.append(config)
+        return 0
+
+    with pytest.raises(launch.LaunchValidationError, match=f"{keyword}"):
+        launch.launch_train(cell, _topology(), runner=runner, **value_kwargs)
+    assert calls == []
+
+
+def _qualified_o1_row_pair(tmp_path: Path) -> tuple[object, object, object]:
+    """Return one O-raw cell and a distinct resolved row for refusal controls."""
+
+    optimizer_grid = import_module(
+        "experiments.atomistic.he-importance.optimizer_grid"
+    )
+    train_config = import_module(
+        "experiments.atomistic.he-importance.train_config"
+    )
+    cells = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "o1",
+        availability=optimizer_grid.roster_availability(),
+        stages=("O1",),
+    )
+    rows = [
+        cell
+        for cell in cells
+        if cell.manifest["scientific_identity"]["context"]["name"] == "O-raw"
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+    ]
+    by_coordinate: dict[tuple[tuple[str, object], ...], object] = {}
+    for cell in rows:
+        levels = cell.manifest["scientific_identity"]["optimizer"]["levels"]
+        by_coordinate.setdefault(tuple(sorted(levels.items())), cell)
+    assert len(by_coordinate) >= 2
+    source, mismatched_source = list(by_coordinate.values())[:2]
+    observed = train_config.resolve_train_config(mismatched_source)
+    return source, observed, train_config.resolve_train_config(source)
+
+
+def _tmp_tree_snapshot(root: Path) -> dict[Path, bytes]:
+    """Capture the complete temporary fixture tree without following links."""
+
+    return {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+@pytest.mark.parametrize("api", ["prepare", "launch"])
+def test_launcher_refuses_source_row_mismatch_before_runner_or_write(
+    tmp_path: Path, api: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unqualified restore request is refused at both launcher entry points."""
+
+    source, _, source_config = _qualified_o1_row_pair(tmp_path)
+    mismatched_config = OmegaConf.create(
+        OmegaConf.to_container(source_config, resolve=False)
+    )
+    mismatched_config["runner"]["optimizer"]["lr"] += 0.01
+    monkeypatch.setattr(
+        launch._TRAIN_CONFIG,
+        "resolve_train_config",
+        lambda cell, **_: mismatched_config,
+    )
+    inventory = import_module(
+        "experiments.atomistic.he-importance.mutable_state_inventory"
+    )
+
+    def refuse_mismatched_row(cell: object, config: object) -> object:
+        del cell
+        assert config["runner"]["optimizer"]["lr"] != source_config["runner"]["optimizer"]["lr"]
+        raise inventory.HIContinuationRowIdentityRefusal(
+            "hi-continuation-admission-refused: resolved-row context identity mismatch"
+        )
+
+    monkeypatch.setattr(
+        inventory,
+        "validate_hi_continuation_admission",
+        refuse_mismatched_row,
+    )
+    calls: list[object] = []
+
+    def runner(config: object, **_: object) -> int:
+        calls.append(config)
+        return 0
+
+    before = _tmp_tree_snapshot(tmp_path)
+    with pytest.raises(
+        launch.HIContinuationRefusal,
+        match="hi-continuation-admission-refused",
+    ):
+        if api == "prepare":
+            launch.prepare_train_launch(source, _topology(), restore_request=object())
+        else:
+            launch.launch_train(
+                source,
+                _topology(),
+                runner=runner,
+                restore_request=object(),
+            )
+    assert calls == []
+    assert _tmp_tree_snapshot(tmp_path) == before
+    assert source.content_hash == stage_coordinate.content_hash(source.manifest)
+
+
+@pytest.mark.parametrize("api", ["prepare", "launch"])
+def test_launcher_refuses_residual_interpolation_before_runner_or_write(
+    tmp_path: Path, api: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A residual ``${...}`` config is refused before continuation dispatch."""
+
+    source, _, resolved_config = _qualified_o1_row_pair(tmp_path)
+    residual_config = OmegaConf.create(
+        OmegaConf.to_container(resolved_config, resolve=False)
+    )
+    OmegaConf.update(
+        residual_config,
+        "runner.optimizer.lr",
+        "${hi_s5b_b1_unresolved:}",
+        merge=False,
+    )
+    monkeypatch.setattr(
+        launch._TRAIN_CONFIG,
+        "resolve_train_config",
+        lambda cell, **_: residual_config,
+    )
+    calls: list[object] = []
+
+    def runner(config: object, **_: object) -> int:
+        calls.append(config)
+        return 0
+
+    before = _tmp_tree_snapshot(tmp_path)
+    with pytest.raises(
+        launch.HIContinuationRefusal,
+        match="hi-continuation-admission-refused",
+    ):
+        if api == "prepare":
+            launch.prepare_train_launch(source, _topology(), restore_request=object())
+        else:
+            launch.launch_train(
+                source,
+                _topology(),
+                runner=runner,
+                restore_request=object(),
+            )
+    assert calls == []
+    assert _tmp_tree_snapshot(tmp_path) == before
+    assert source.content_hash == stage_coordinate.content_hash(source.manifest)

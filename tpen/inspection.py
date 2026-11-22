@@ -79,6 +79,10 @@ class RunEvidence:
         Selected checkpoint facts, including both independent progress counters.
     refusal : dict or None
         Stable refusal code and human-readable reason, when inspection refused.
+    inspection_unavailable : bool, optional
+        Internal transport marker for an ``OSError`` while reading evidence.
+        It is not serialized; callers may distinguish unavailable evidence from
+        a genuine typed refusal without changing the public wire shape.
     """
 
     schema: str
@@ -90,10 +94,13 @@ class RunEvidence:
     resolved_config_identity: dict[str, str] | None = None
     outcome: str | None = None
     checkpoint_ref: dict[str, Any] | None = None
+    inspection_unavailable: bool = False
 
     def __post_init__(self) -> None:
         if self.schema not in {RUN_EVIDENCE_SCHEMA, RUN_EVIDENCE_SCHEMA_V2, RUN_EVIDENCE_SCHEMA_V3}:
             raise ValueError(f"unsupported run-evidence schema {self.schema!r}")
+        if type(self.inspection_unavailable) is not bool:
+            raise TypeError("inspection_unavailable must be a bool")
         if self.verdict not in {"completed", "incomplete", "failed", "refused"}:
             raise ValueError(f"unsupported run-evidence verdict {self.verdict!r}")
         if not isinstance(self.run_dir, str):
@@ -406,10 +413,11 @@ def _validate_checkpoint_ref_mapping(data: Mapping[str, Any]) -> None:
 class _InspectionRefusal(ValueError):
     """Internal typed refusal used to keep the public result total."""
 
-    def __init__(self, code: str, reason: str) -> None:
+    def __init__(self, code: str, reason: str, *, unavailable: bool = False) -> None:
         super().__init__(reason)
         self.code = code
         self.reason = reason
+        self.unavailable = unavailable
 
 
 class _TrainResumeModeGate(ValueError):
@@ -538,6 +546,7 @@ def inspect_run(path: str | Path) -> RunEvidence:
                     run_status,
                     None,
                     {"code": exc.code, "reason": exc.reason},
+                    inspection_unavailable=exc.unavailable,
                 )
             return RunEvidence(
                 RUN_EVIDENCE_SCHEMA_V3,
@@ -549,6 +558,7 @@ def inspect_run(path: str | Path) -> RunEvidence:
                 identity,
                 "unknown" if outcome is None else outcome.status,
                 None if outcome is None else _safe_public_checkpoint_ref(outcome.checkpoint_ref),
+                exc.unavailable,
             )
         return RunEvidence(
             _evidence_schema(None),
@@ -557,6 +567,7 @@ def inspect_run(path: str | Path) -> RunEvidence:
             run_status,
             None,
             {"code": exc.code, "reason": exc.reason},
+            inspection_unavailable=exc.unavailable,
         )
 
 
@@ -734,7 +745,15 @@ def _validate_typed_outcome_ref(run_dir: Path, outcome: RunOutcome) -> None:
         return
     try:
         ref.validate()
-    except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
+    except FileNotFoundError as exc:
+        raise _InspectionRefusal(
+            "stale-checkpoint-ref", f"checkpoint ref no longer matches its bytes: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise _InspectionRefusal(
+            "stale-checkpoint-ref", f"checkpoint ref no longer matches its bytes: {exc}", unavailable=True
+        ) from exc
+    except (ValueError, TypeError, KeyError, OverflowError) as exc:
         raise _InspectionRefusal("stale-checkpoint-ref", f"checkpoint ref no longer matches its bytes: {exc}") from exc
     binding = _public_checkpoint_ref(ref)
     assert binding is not None
@@ -755,7 +774,15 @@ def _validate_typed_outcome_ref(run_dir: Path, outcome: RunOutcome) -> None:
         catalog_path = run_dir / "checkpoints" / PUBLICATION_CATALOG_FILENAME
         try:
             publications = read_publications(catalog_path)
-        except (OSError, ValueError, TypeError, KeyError, OverflowError, IncompletePublicationRecordError) as exc:
+        except FileNotFoundError as exc:
+            raise _InspectionRefusal(
+                "corrupt-publication-catalog", f"cannot read {catalog_path}: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise _InspectionRefusal(
+                "corrupt-publication-catalog", f"cannot read {catalog_path}: {exc}", unavailable=True
+            ) from exc
+        except (ValueError, TypeError, KeyError, OverflowError, IncompletePublicationRecordError) as exc:
             raise _InspectionRefusal(
                 "corrupt-publication-catalog",
                 f"cannot read {catalog_path}: {exc}",
@@ -822,8 +849,10 @@ def _read_checkpoint(run_dir: Path) -> dict[str, Any]:
     catalog_path = root / PUBLICATION_CATALOG_FILENAME
     try:
         publications = read_publications(catalog_path) if catalog_path.is_file() else ()
+    except FileNotFoundError as exc:
+        raise _InspectionRefusal("corrupt-publication-catalog", f"cannot read {catalog_path}: {exc}") from exc
     except OSError as exc:
-        raise _InspectionRefusal("checkpoint-io-error", f"cannot read {catalog_path}: {exc}") from exc
+        raise _InspectionRefusal("checkpoint-io-error", f"cannot read {catalog_path}: {exc}", unavailable=True) from exc
     except IncompletePublicationRecordError as exc:
         raise _InspectionRefusal("torn-publication-catalog", f"cannot read {catalog_path}: {exc}") from exc
     except (ValueError, TypeError, KeyError, OverflowError) as exc:
@@ -837,8 +866,14 @@ def _read_checkpoint(run_dir: Path) -> dict[str, Any]:
             refs.append(validated_ref)
         except _TrainResumeModeGate:
             continue
+        except FileNotFoundError as exc:  # named checkpoint payload remains typed
+            raise _InspectionRefusal(
+                "stale-checkpoint-ref", f"published checkpoint cannot be read: {exc}"
+            ) from exc
         except OSError as exc:
-            raise _InspectionRefusal("checkpoint-io-error", f"published checkpoint cannot be read: {exc}") from exc
+            raise _InspectionRefusal(
+                "checkpoint-io-error", f"published checkpoint cannot be read: {exc}", unavailable=True
+            ) from exc
         except (ValueError, TypeError, KeyError, OverflowError) as exc:
             raise _InspectionRefusal("corrupt-checkpoint", f"published checkpoint is invalid: {exc}") from exc
 
@@ -854,8 +889,14 @@ def _read_checkpoint(run_dir: Path) -> dict[str, Any]:
             refs.append(ref)
         except _TrainResumeModeGate:
             continue
+        except FileNotFoundError as exc:
+            raise _InspectionRefusal(
+                "stale-checkpoint-ref", f"checkpoint cannot be read: {exc}"
+            ) from exc
         except OSError as exc:
-            raise _InspectionRefusal("checkpoint-io-error", f"checkpoint cannot be read: {exc}") from exc
+            raise _InspectionRefusal(
+                "checkpoint-io-error", f"checkpoint cannot be read: {exc}", unavailable=True
+            ) from exc
         except (ValueError, TypeError, KeyError, OverflowError) as exc:
             raise _InspectionRefusal("corrupt-checkpoint", f"checkpoint is invalid: {exc}") from exc
 

@@ -188,7 +188,7 @@ def test_width32_model_is_identical_between_train_and_eval(system: str) -> None:
         assert model.readout.channels == 32
 
 
-@pytest.mark.parametrize("system", ["hooke1", "hooke2", "he"])
+@pytest.mark.parametrize("system", ["hooke1", "hooke2", "qho2e", "he"])
 def test_accepted_variational_settings_match_train_and_eval(system: str) -> None:
     train = load_config(str(ROOT / system / "train.yaml"))
     eval_cfg = load_config(str(ROOT / system / "eval.yaml"))
@@ -211,6 +211,17 @@ def test_accepted_variational_settings_match_train_and_eval(system: str) -> None
         assert "atoms" not in train
         assert "atoms" not in eval_cfg
         assert instantiate(eval_cfg.system_descriptor).resources == {}
+    elif system == "qho2e":
+        assert [factor._target_ for factor in train.model.factors] == [
+            "tpen.nn.GaussianConfinement",
+        ]
+        assert train.model.factors[0].coefficient == 0.25
+        assert train.model.factors[0].trainable is False
+        assert set(train.hamiltonian_terms) == {"kinetic", "harmonic_trap"}
+        assert train.hamiltonian_terms.harmonic_trap.omega == 0.5
+        assert "atoms" not in train
+        assert "atoms" not in eval_cfg
+        assert instantiate(eval_cfg.system_descriptor).resources == {}
     else:
         assert train.model.factors[0].trainable_range is True
         assert train.model.factors[1].law.curvature_coefficient == 0.01
@@ -229,6 +240,18 @@ def test_hooke2_is_the_nucleus_free_two_electron_pair() -> None:
         "kinetic", "harmonic_trap", "electron_electron",
     }
     assert descriptor.resources == {}
+
+
+def test_qho2e_is_a_two_electron_gaussian_only_control() -> None:
+    cfg = load_config(str(ROOT / "qho2e" / "eval.yaml"))
+    descriptor = instantiate(cfg.system_descriptor)
+    assert descriptor.particle.n_electrons == 2
+    assert descriptor.particle.n_spin_up == 1
+    assert descriptor.particle.n_spin_down == 1
+    assert {term.slot for term in descriptor.terms} == {"kinetic", "harmonic_trap"}
+    assert descriptor.resources == {}
+    assert list(cfg.model.factors) and len(cfg.model.factors) == 1
+    assert cfg.model.factors[0]._target_ == "tpen.nn.GaussianConfinement"
 
 
 def test_train_launch_binds_declared_checkpoint_steps() -> None:

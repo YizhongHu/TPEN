@@ -54,7 +54,7 @@ from .._codec import _freeze, canonical_bytes, decode_json, digest, fields, thaw
 from .._records import frozen_record
 from ..environments import PreparedPythonEnvironment, SourceScript
 from ..gpu_sampler import GPU_SAMPLER_OUTPUT_ENV, SLOT_QUARANTINE_ENV, slot_quarantine_dir
-from ..placement import PLACEMENT_REFUSAL_ENV, parse_cpu_set
+from ..placement import PLACEMENT_REFUSAL_ENV, PlacementRefusal, parse_cpu_set
 from ..runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
 from ..workers import SubprocessWorker
 from .contract import (
@@ -133,6 +133,26 @@ class LeafPlacementRefused(LeafRefused):
         self.code = code
         self.reason = reason
         super().__init__(f"{code}: {reason}")
+
+
+def placement_refusal_from_launch_error(
+    error: Mapping[str, str] | None,
+) -> PlacementRefusal | None:
+    """Recover a closed typed placement refusal from a leaf launch error.
+
+    Only the worker-affinity refusal type and its two closed codes are
+    promoted. All other launch-error facts remain ordinary launch failures.
+    """
+
+    if error is None or error.get("type") != LeafPlacementRefused.__name__:
+        return None
+    message = error.get("message")
+    if type(message) is not str:
+        return None
+    code, _, reason = message.partition(": ")
+    if code not in WORKER_AFFINITY_REFUSAL_CODES or not reason:
+        return None
+    return PlacementRefusal(code, reason)
 
 
 class LeafResultRejected(ValueError):
@@ -1199,6 +1219,7 @@ __all__ = [
     "LeafResult",
     "LeafResultRejected",
     "LeafTeardownReceipt",
+    "placement_refusal_from_launch_error",
     "run_leaf",
     "validate_leaf_result",
     "WORKER_AFFINITY_REFUSAL_CODES",
