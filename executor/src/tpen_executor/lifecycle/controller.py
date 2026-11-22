@@ -118,6 +118,40 @@ def _reason(phase: str, error: BaseException | None = None) -> str:
     return f"{phase}:{type(error).__name__}:{detail}"
 
 
+def _merge_final_reconciliation(
+    published: GroupReconciliationV2,
+    receipt_reconciliation: GroupReconciliationV2 | None,
+    parked_this_run: Mapping[str, str],
+    collected_members: set[str],
+    fallback_reason: str = "final-reconciliation-unavailable",
+) -> GroupReconciliationV2:
+    """Merge receipt-derived actions with this run's controller decisions.
+
+    Only members that were submitted and collected may be replaced by the
+    receipt-derived reconciliation.  A park recorded during this invocation
+    remains authoritative even when its absent receipts would otherwise make
+    ``reconcile_group`` derive a fresh launch or successor admission.
+    """
+
+    receipt_members = {} if receipt_reconciliation is None else {
+        member.task_id: member for member in receipt_reconciliation.members
+    }
+    members = []
+    for member in published.members:
+        if member.task_id in parked_this_run:
+            members.append(replace(
+                member, action="park", reason_code=parked_this_run[member.task_id],
+            ))
+        elif member.task_id in collected_members:
+            members.append(receipt_members.get(
+                member.task_id,
+                replace(member, action="park", reason_code=fallback_reason),
+            ))
+        else:
+            members.append(member)
+    return replace(published, members=tuple(members))
+
+
 def _require_current_controller(store: DirectoryStore, group: ReadyGroupV2, controller: ControllerGenerationV1) -> None:
     """Apply one durable authority check at a controller boundary."""
     store.require_current_controller(group, generation=controller.generation, nonce=controller.claimant_nonce)
@@ -219,11 +253,15 @@ def run_group_controller(
 
     outcomes: list[tuple[str, str]] = []
     reasons: dict[str, str] = {}
+    parked_this_run: dict[str, str] = {}
+    collected_members: set[str] = set()
     active: list[tuple[Any, Any, Any, Any, Any, bool]] = []
 
     def _park_member(task_id: str, phase: str, error: BaseException | None = None) -> None:
         outcomes.append((task_id, "parked"))
-        reasons[task_id] = _reason(phase, error)
+        reason = _reason(phase, error)
+        reasons[task_id] = reason
+        parked_this_run[task_id] = reason
 
     for member in published.members:
         if member.action in {"preserve_completed", "preserve_terminal"}:
@@ -273,14 +311,14 @@ def run_group_controller(
                     store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "submit-failed")
                 except Exception:
                     pass
-                _park_member(member.task_id, "executor-submit", error)
+                _park_member(member.task_id, "executor-launch", error)
                 continue
             if not isinstance(launched, MemberLaunchResult) or not launched.acknowledged:
                 try:
                     store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "invalid-submit-ack")
                 except Exception:
                     pass
-                _park_member(member.task_id, "submit-ack")
+                _park_member(member.task_id, "launch-ack")
                 continue
             # The handle is retained even if this acknowledgement write fails.
             try:
@@ -357,6 +395,7 @@ def run_group_controller(
             if error is not None:
                 raise error
             outcomes.append((member.task_id, "collected"))
+            collected_members.add(member.task_id)
         except BaseException as error:
             _park_member(member.task_id, "completion", error)
             if not isinstance(error, Exception):
@@ -384,6 +423,8 @@ def run_group_controller(
             latest[record.task_id] = record
         final_inputs = []
         for item in facts.member_inputs:
+            if item.task_id not in collected_members:
+                continue
             record = latest.get(item.task_id)
             rebuilt = item
             if record is not None:
@@ -396,9 +437,15 @@ def run_group_controller(
             except Exception:
                 verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "core-admission-unavailable")
             final_inputs.append(replace(rebuilt, core_verdict=verdict))
-        final = reconcile_group(group, tuple(final_inputs))
+        final = _merge_final_reconciliation(
+            published, reconcile_group(group, tuple(final_inputs)),
+            parked_this_run, collected_members,
+        )
     except Exception as error:
-        final = replace(published, members=tuple(replace(member, action="park", reason_code=_reason("final-reconciliation", error)) for member in published.members))
+        final = _merge_final_reconciliation(
+            published, None, parked_this_run, collected_members,
+            _reason("final-reconciliation", error),
+        )
         reasons.setdefault("<group>", _reason("final-reconciliation", error))
     reason_records = tuple((task_id, reasons.get(task_id, "collected" if status == "collected" else "controller-uncertainty"))
                            for task_id, status in outcomes)

@@ -46,7 +46,7 @@ def test_mapping_failure_cannot_authorize_fresh_launch(tmp_path, failure):
         MappingCoreAdmissionPort(evaluate), executor,
     )
 
-    assert calls == list(facts.member_inputs) * 2
+    assert calls == list(facts.member_inputs)
     assert isinstance(result, GroupControllerOutcome)
     # Unavailable evidence is not the producer's affirmative absent-leaf None.
     assert executor.calls == [], "adapter failure was converted into a fresh launch"
@@ -78,8 +78,18 @@ def test_controller_distinguishes_absence_from_uncertainty(tmp_path, evidence):
         binding, allocation.backend_job_id, facts, store, port, executor,
     )
 
-    assert calls == list(facts.member_inputs) * 2
+    assert calls[0] == facts.member_inputs[0]
+    if evidence == "absent":
+        assert len(calls) == 2
+        assert calls[1].task_id == facts.member_inputs[0].task_id
+        assert calls[1].start_receipt is not None and calls[1].outcome_receipt is not None
+    else:
+        assert calls == list(facts.member_inputs)
     assert isinstance(result, GroupControllerOutcome)
+    publication_path = next(Path(store.root).rglob(".reconciliation-publications/*.json"))
+    publication = ReconciliationPublicationV2.decode(publication_path.read_bytes())
+    expected_initial = "start_fresh" if evidence == "absent" else "park"
+    assert publication.reconciliation.members[0].action == expected_initial
     # Final reconciliation is receipt-driven: a fresh leaf without core
     # admission evidence is parked even though the initial action was fresh.
     expected_action = "park"
@@ -123,7 +133,10 @@ def test_mapping_successor_reaches_real_controller_once(tmp_path):
         facts, store, MappingCoreAdmissionPort(evaluate), executor,
     )
 
-    assert calls == list(inputs) * 2
+    assert calls[0] == inputs[0]
+    assert len(calls) == 2
+    assert calls[1].task_id == inputs[0].task_id
+    assert calls[1].start_receipt is not None and calls[1].outcome_receipt is not None
     assert isinstance(result, GroupControllerOutcome)
     assert result.reconciliation.members[0].action == "admit_successor"
     assert result.member_outcomes == (("successor", "collected"),)

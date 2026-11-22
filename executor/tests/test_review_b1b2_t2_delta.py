@@ -77,7 +77,9 @@ def test_delta_failed_successor_admission_does_not_park_fresh_peer(tmp_path):
     executor = RecordingExecutor()
     result = run_group_controller(_binding(group, facts.allocation.backend_job_id), facts.allocation.backend_job_id,
                                   facts, store, Admission(), executor)
-    assert calls == ["successor", "fresh", "successor", "fresh"]
+    assert calls[:2] == list(facts.member_inputs)
+    assert [member.task_id for member in calls[2:]] == ["fresh"]
+    assert calls[2].start_receipt is not None and calls[2].outcome_receipt is not None
     assert [f.task_id for f, _ in executor.calls] == ["fresh"]
     assert len(executor.collected) == 1
     assert dict(result.member_outcomes) == {"successor": "parked", "fresh": "collected"}

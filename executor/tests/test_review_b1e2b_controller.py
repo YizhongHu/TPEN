@@ -9,7 +9,7 @@ from threading import Event
 
 import pytest
 
-from tpen_executor._codec import decode_json, digest
+from tpen_executor._codec import digest
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.contracts import AllocationId, BackendJobId
 from tpen_executor.dispatch.completion import complete_leaf_result
@@ -25,7 +25,7 @@ from test_b1a_b_publication import _fixture as _successor_fixture
 from test_b1a_reconciliation import _core, _group
 from test_b1e1_local_executor import _environment as _local_environment
 from test_b1e1_local_executor import _materializer as _local_materializer
-from test_core_evidence_v3 import _typed_evidence
+from test_core_evidence_v3 import _typed_evidence_payload
 from test_review_b1b2_controller import _real_fresh
 from test_s3_transport_wire import _request, _synthetic_result
 
@@ -57,9 +57,16 @@ MUTANTS = (
     {
         "id": "skip-final-reconcile",
         "target": CONTROLLER,
-        "old": "        final = reconcile_group(group, tuple(final_inputs))",
-        "new": "        final = published",
+        "old": "        final = _merge_final_reconciliation(\n            published, reconcile_group(group, tuple(final_inputs)),\n            parked_this_run, collected_members,\n        )\n    except Exception as error:",
+        "new": "        final = published\n    except Exception as error:",
         "killer": "test_final_reconciliation_feeds_exit",
+    },
+    {
+        "id": "drop-controller-park-merge",
+        "target": CONTROLLER,
+        "old": "        final = _merge_final_reconciliation(\n            published, reconcile_group(group, tuple(final_inputs)),\n            parked_this_run, collected_members,\n        )",
+        "new": "        final = reconcile_group(group, tuple(final_inputs))",
+        "killer": "test_final_reconciliation_preserves_controller_park",
     },
     {
         "id": "reject-invalid-context",
@@ -136,7 +143,7 @@ class EventExecutor:
         request = LeafRequest.for_attempt(fence, self.allocation, configured, environment)
         core_dir = Path(fence.output_dir) / "core"
         core_dir.mkdir(parents=True, exist_ok=True)
-        evidence = decode_json(_typed_evidence(core_dir, "completed").encode())
+        evidence = _typed_evidence_payload(core_dir, "completed")
         result = replace(_synthetic_result(request), evidence=evidence)
         self.contexts[task.task_id] = LeafCompletionContext(result, request, configured, environment)
         handle = (task.task_id, len(self.submits))

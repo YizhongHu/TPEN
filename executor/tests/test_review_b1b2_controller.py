@@ -217,6 +217,15 @@ def test_superseded_after_intent_does_not_launch(tmp_path):
     assert result.member_outcomes[0][1] == "parked"
     assert result.reconciliation.members[0].action == "park" and not executor.calls
 
+
+def test_final_reconciliation_preserves_controller_park(tmp_path):
+    result, _store, executor = _run(tmp_path, supersede=True)
+    member = result.reconciliation.members[0]
+    assert not executor.calls
+    assert member.action == "park"
+    assert member.reason_code.startswith("member-transition:RuntimeError:superseded")
+
+
 def test_recovered_intent_never_relaunches(tmp_path):
     result, store, executor = _run(tmp_path, recovered=True)
     assert result.member_outcomes[0][1] == "parked" and not executor.calls

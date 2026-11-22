@@ -32,6 +32,12 @@ def _planned_evidence(core_dir: Path) -> CoreRunEvidence:
 
 
 def _typed_evidence(core_dir: Path, outcome: str) -> CoreRunEvidence:
+    return CoreRunEvidence.from_mapping(_typed_evidence_payload(core_dir, outcome))
+
+
+def _typed_evidence_payload(core_dir: Path, outcome: str) -> dict[str, object]:
+    """Return and validate the canonical v3 evidence mapping used by tests."""
+
     core_dir.mkdir(parents=True, exist_ok=True)
     payload = json.loads(PLANNED_FIXTURE.read_text(encoding="utf-8"))
     checkpoint_dir = str(core_dir / "checkpoints" / "step_000002")
@@ -41,7 +47,8 @@ def _typed_evidence(core_dir: Path, outcome: str) -> CoreRunEvidence:
     payload["outcome"] = outcome
     payload["run_status"] = outcome
     payload["verdict"] = "completed" if outcome == "completed" else "incomplete"
-    return CoreRunEvidence.from_mapping(payload)
+    CoreRunEvidence.from_mapping(payload)
+    return payload
 
 
 def test_storage_refuses_planned_yield_as_completed_segment(tmp_path: Path) -> None:
