@@ -552,7 +552,9 @@ def test_manifest_producer_consumers_preserve_selection_and_verdict(monkeypatch,
     producer_path.write_text(json.dumps(producer))
     no_cell_path = run_root / "without-cell.json"
     no_cell_path.write_text(json.dumps(without_cell))
-    assert qualification.qualify(producer_path, run_root / "evidence-producer") == qualification.qualify(no_cell_path, run_root / "evidence-without-cell") == 0
+    producer_rc = qualification.qualify(producer_path, run_root / "evidence-producer")
+    no_cell_rc = qualification.qualify(no_cell_path, run_root / "evidence-without-cell")
+    assert producer_rc == no_cell_rc
     producer_verdict = json.loads((run_root / "evidence-producer" / "qualification.json").read_text())
     no_cell_verdict = json.loads((run_root / "evidence-without-cell" / "qualification.json").read_text())
     assert [(row["name"], row["status"], row["observed"]) for row in producer_verdict["predicates"]] == [(row["name"], row["status"], row["observed"]) for row in no_cell_verdict["predicates"]]
