@@ -23,8 +23,8 @@ SHA = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=
 def _base(tmp_path: Path) -> dict[str, str | list[str]]:
     facility = tmp_path / "facility"
     shared = tmp_path / "shared-env"
-    facility.mkdir()
-    shared.mkdir()
+    facility.mkdir(exist_ok=True)
+    shared.mkdir(exist_ok=True)
     return {
         "sha": SHA,
         "tests": ["scripts/cannon/tests/test_render_verify_packet.py"],
@@ -52,7 +52,7 @@ def _render(tmp_path: Path, **overrides: object) -> subprocess.CompletedProcess[
     values.update(overrides)
     args = [sys.executable, str(RENDERER_PATH)]
     for key, value in values.items():
-        flag = "--" + key.replace("_", "-")
+        flag = "--test" if key == "tests" else "--" + key.replace("_", "-")
         if key == "tests":
             for test_path in value:  # type: ignore[union-attr]
                 args.extend([flag, str(test_path)])
