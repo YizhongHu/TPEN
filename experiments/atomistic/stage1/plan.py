@@ -14,7 +14,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from experiments.atomistic.stage1.protocol import (
-    SYSTEMS, STAGE1_PROTOCOL, bind_evaluation_manifest, build_manifest,
+    HOOKE_SYSTEMS, SYSTEMS, STAGE1_PROTOCOL, bind_evaluation_manifest, build_manifest,
     config_identities, manifest_hash, overlay_sha256,
 )
 
@@ -52,7 +52,7 @@ def main() -> int:
         ))
     systems = tuple(args.systems) if args.systems else None
     selected_for_profile = set(systems or SYSTEMS)
-    if (args.phase == 1 and selected_for_profile & {"hooke1", "hooke2"}
+    if (args.phase == 1 and selected_for_profile & HOOKE_SYSTEMS
             and args.science_profile != "hooke-hv2-v1"):
         parser.error("Hooke production phase 1 requires --science-profile hooke-hv2-v1")
     if args.overlay_sha256 is not None and args.overlay is None:

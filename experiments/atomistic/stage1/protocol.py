@@ -26,7 +26,7 @@ import yaml
 from experiments.baselines.systems import load_registry
 from experiments.toolkit.run_paths import resolve_run_dir
 
-SYSTEMS = ("hooke1", "hooke2", "he", "h2")
+SYSTEMS = ("hooke1", "hooke2", "hooke2noint", "he", "h2")
 KINDS = ("smoke", "train", "eval")
 CONFIG_IDENTITY_RULE = "stage1-config-v1"
 LEGACY_CONFIG_IDENTITY_RULE = "legacy-config-sha256"
@@ -40,10 +40,11 @@ HE_H2_EVAL_SELECTION_ID = "he-h2-b-v1"
 HE_H2_EVAL_CHECKPOINTS = (0, 1_000, 2_000, 4_000, 8_000, 16_000,
                           25_000, 40_000, 60_000, 80_000, 100_000)
 HE_H2_SYSTEMS = frozenset({"he", "h2"})
+HOOKE_SYSTEMS = frozenset({"hooke1", "hooke2", "hooke2noint"})
 OVERLAY_RELATIVE_PATH = "configs/overlays/diagnostics-v1.yaml"
 HOOKE_OVERLAY_RELATIVE_PATH = "configs/overlays/hooke-diagnostics-v1.yaml"
 OVERLAY_SYSTEMS = frozenset({"he", "h2"})
-HOOKE_OVERLAY_SYSTEMS = frozenset({"hooke1", "hooke2"})
+HOOKE_OVERLAY_SYSTEMS = HOOKE_SYSTEMS
 OVERLAY_PATH_BY_SYSTEM = {
     **{system: OVERLAY_RELATIVE_PATH for system in OVERLAY_SYSTEMS},
     **{system: HOOKE_OVERLAY_RELATIVE_PATH for system in HOOKE_OVERLAY_SYSTEMS},
@@ -116,6 +117,7 @@ STAGE1_PROTOCOL = Protocol(1000, 256, 100000, 4096, 3, 4, 4096, 256, 1000)
 SYSTEM_SPECS = tuple(SystemSpec(name, system_id) for name, system_id in (
     ("hooke1", "hooke_one_electron_omega0.5"),
     ("hooke2", "hooke_pair_singlet_omega0.5"),
+    ("hooke2noint", "hooke_pair_noninteracting_singlet_omega0.5"),
     ("he", "he_atom"),
     ("h2", "h2_molecule"),
 ))
@@ -689,7 +691,7 @@ def validate_he_h2_eval_grid(
 def _validate_hooke_science_train_row(row: Mapping[str, Any]) -> None:
     """Validate the complete provenance and seed binding for a Hooke row."""
 
-    if row.get("system") not in {"hooke1", "hooke2"}:
+    if row.get("system") not in HOOKE_SYSTEMS:
         raise ProtocolError("Hooke science profile is only valid for Hooke systems")
     if row.get("kind") != "train":
         raise ProtocolError("Hooke science profile is only valid for train rows")
@@ -737,9 +739,9 @@ def validate_hooke_eval_grid(
     complete.
     """
 
-    hooke_rows = [row for row in rows if row.get("system") in {"hooke1", "hooke2"}]
+    hooke_rows = [row for row in rows if row.get("system") in HOOKE_SYSTEMS]
     declared_systems = tuple(expected_systems) if expected_systems is not None else ()
-    if any(system not in {"hooke1", "hooke2"} for system in declared_systems):
+    if any(system not in HOOKE_SYSTEMS for system in declared_systems):
         raise ProtocolError("Hooke evaluation grid has an invalid expected system")
     if len(set(declared_systems)) != len(declared_systems):
         raise ProtocolError("Hooke evaluation grid has duplicate expected systems")
@@ -1332,7 +1334,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
     if science_profile not in {None, HOOKE_SCIENCE_PROFILE}:
         raise ProtocolError("unknown science profile")
     if science_profile == HOOKE_SCIENCE_PROFILE:
-        if not set(selected).issubset({"hooke1", "hooke2"}):
+        if not set(selected).issubset(HOOKE_SYSTEMS):
             raise ProtocolError("Hooke science profile cannot mix in He/H2 systems")
         if evaluation_selection not in {None, HOOKE_EVAL_SELECTION}:
             raise ProtocolError("unknown Hooke evaluation selection")
@@ -1423,7 +1425,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
             training_seed(system=spec.name, lineage=lineage, lineage_seed=seed)
             for lineage, seed in enumerate(lineage_seeds)
         )
-        if science_profile == HOOKE_SCIENCE_PROFILE and spec.name in {"hooke1", "hooke2"}:
+        if science_profile == HOOKE_SCIENCE_PROFILE and spec.name in HOOKE_SYSTEMS:
             candidate_seeds.extend(
                 sampler_seed(system=spec.name, lineage=lineage, lineage_seed=seed)
                 for lineage, seed in enumerate(lineage_seeds)
@@ -1601,10 +1603,10 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
     he_h2_selection = _is_he_h2_production_phase(phase1_rows)
     hooke_science = any(_is_hooke_science_row(row) for row in train_rows)
     if hooke_science:
-        if not set(systems).issubset({"hooke1", "hooke2"}):
+        if not set(systems).issubset(HOOKE_SYSTEMS):
             raise ProtocolError("Hooke science phase cannot mix in He/H2 rows")
         for row in train_rows:
-            if row.get("system") in {"hooke1", "hooke2"}:
+            if row.get("system") in HOOKE_SYSTEMS:
                 _validate_hooke_science_train_row(row)
         if list(checkpoints) != list(HOOKE_A37):
             raise ProtocolError("Hooke science phase 2 requires the exact A37 roster")
