@@ -1,0 +1,25 @@
+{
+  "mutants": [
+    {
+      "id": "check-after-first-write",
+      "target": "experiments/atomistic/stage1/eval.py",
+      "old": "    _refuse_existing_eval_run(cfg)\n    # The config/launcher supplies the strict model-only restore policy; this\n    # driver does not import checkpoint internals or silently alter identity.\n    return run_from_config(cfg, config_path=str(config_path), command=\"stage1 eval\")",
+      "new": "    # The config/launcher supplies the strict model-only restore policy; this\n    # driver does not import checkpoint internals or silently alter identity.\n    result = run_from_config(cfg, config_path=str(config_path), command=\"stage1 eval\")\n    _refuse_existing_eval_run(cfg)\n    return result",
+      "killer": "experiments/atomistic/stage1/tests/test_eval_check_before_write.py::test_existing_eval_run_refuses_without_side_effects"
+    },
+    {
+      "id": "check-removed",
+      "target": "experiments/atomistic/stage1/eval.py",
+      "old": "    _refuse_existing_eval_run(cfg)",
+      "new": "    # mutation: existing eval rows are accepted",
+      "killer": "experiments/atomistic/stage1/tests/test_eval_check_before_write.py::test_existing_eval_run_refuses_without_side_effects"
+    },
+    {
+      "id": "check-final-csv-only",
+      "target": "experiments/atomistic/stage1/eval.py",
+      "old": "    if run_dir.exists() or run_dir.is_symlink():",
+      "new": "    if (run_dir / \"mcmc_energy\" / \"sampled_eval_table.csv\").exists():",
+      "killer": "experiments/atomistic/stage1/tests/test_eval_check_before_write.py::test_existing_eval_run_refuses_without_side_effects"
+    }
+  ]
+}
