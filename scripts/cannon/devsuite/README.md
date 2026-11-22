@@ -8,12 +8,16 @@ root arm uses the exact SHA's complete `scripts/cannon/` tree and invokes
 measure mode also runs four targeted combinations before its full-suite arm,
 the wrapper supplies only the small staged `scripts/cannon/tests` directory as
 that preflight; it does not accidentally repeat the whole repository four
-times. The executor arm uses an explicitly supplied,
-versioned `executor-harness-v3` directory with an empty mutant list by
-default; the variant must contain both H-v2 interpreter bindings. An explicit
+times. The executor arm copies `scripts/cannon/executor-harness/` from the
+same exact-SHA tree, with an empty mutant list by default; the harness must
+contain both H-v2 interpreter bindings. An explicit
 `--executor-mutants /absolute/spec.json` enables the harness's supported
 non-empty mutant path and stages that spec without modifying the source
 harness.
+
+Use `--scheduled` only for the manager-dispatched 12-hourly run. It gives the
+run folder the explicit `dev-fullsuite-scheduled-` prefix required by the
+operator scope; manual and ad-hoc runs omit that prefix.
 
 The current expected wall times are approximately 31 minutes for the root
 suite and 12–50 minutes for the executor matrix. The root wrapper requests one
@@ -26,14 +30,21 @@ Run the safe rehearsal from a TPEN checkout. The SHA is always a full 40-hex
 commit, normally `git rev-parse origin/dev`:
 
 ```bash
-HARNESS=/Users/yizhonghu/tpen-manager-receipts/executor-harness-v3-release-rc2-ca0f93b3-20261111T092513Z
-./submit_devsuite.sh --dry-run --executor-harness "$HARNESS" "$(git rev-parse origin/dev)"
+./submit_devsuite.sh --dry-run --scheduled "$(git rev-parse origin/dev)"
+```
+
+For the no-SSH renderer contract test, use the local seam (it stages and
+renders both packets, then exits before any Cannon operation):
+
+```bash
+./submit_devsuite.sh --local-dry-run "$(git rev-parse HEAD)"
+./submit_devsuite.sh --local-dry-run --scheduled "$(git rev-parse HEAD)"
 ```
 
 For an executor mutation rehearsal, pass the approved spec explicitly:
 
 ```bash
-./submit_devsuite.sh --dry-run --executor-harness "$HARNESS" \
+./submit_devsuite.sh --dry-run --scheduled \
   --executor-mutants /absolute/path/to/mutants.json "$(git rev-parse origin/dev)"
 ```
 
@@ -41,15 +52,15 @@ Use `--executor-only` when a root arm is already running and only an executor
 baseline is authorized for submission:
 
 ```bash
-DEVSUITE_ALLOW_SUBMIT=1 ./submit_devsuite.sh --submit --executor-only \
-  --executor-harness "$HARNESS" "$(git rev-parse origin/dev)"
+DEVSUITE_ALLOW_SUBMIT=1 ./submit_devsuite.sh --submit --scheduled --executor-only \
+  "$(git rev-parse origin/dev)"
 ```
 
 The dry run performs all of the following on Cannon's login node, without
 running tests or allocating compute:
 
-- stages the exact-SHA `scripts/cannon/` tree and the versioned executor
-  harness under `/n/netscratch/kozinsky_lab/Lab/rhu/verify/…`;
+- stages the exact-SHA `scripts/cannon/` tree, including the in-repo executor
+  harness, under `/n/netscratch/kozinsky_lab/Lab/rhu/verify/…`;
 - reads back and compares a SHA-256 for every staged file;
 - runs `bash -n` on both generated wrappers and the executor harness;
 - derives the synthetic precheck `SLURM_JOB_NAME` from each wrapper's rendered
@@ -73,9 +84,7 @@ launcher never uses `cannon-login` or `cannon-keeper`.
 The real branch is deliberately double-gated for later operator use:
 
 ```bash
-DEVSUITE_ALLOW_SUBMIT=1 ./submit_devsuite.sh --submit \
-  --executor-harness /absolute/path/to/approved/executor-harness-v3 \
-  "$SHA"
+DEVSUITE_ALLOW_SUBMIT=1 ./submit_devsuite.sh --submit --scheduled "$SHA"
 ```
 
 Do not use that branch during rehearsal. The current task permits only
@@ -90,9 +99,12 @@ Do not use that branch during rehearsal. The current task permits only
 - The root arm stages the whole `scripts/cannon/` tree because the current
   `verify.sh` depends on sidecars such as `shared-env-manifest.sh` and
   `shared-env-policy.json`.
-- The executor harness is copied as an immutable input. The launcher replaces
-  only `repo.bundle` with a bundle containing the target SHA and the required
+- The executor harness is copied as an immutable input from the staged
+  `scripts/cannon/executor-harness/` tree. The launcher replaces only
+  `repo.bundle` with a bundle containing the target SHA and the required
   historical commit used by the executor's bit-identity test.
+- `--scheduled` is the only way to add the `dev-fullsuite-scheduled-` folder
+  prefix; manual runs never carry the scheduled marker.
 - `mutants.json` must contain `"mutants": []` for the default full-suite
   packet. The explicit `--executor-mutants` path records the supplied spec's
   SHA-256 and permits a non-empty mutation run. With `--submit` plus this
@@ -109,9 +121,9 @@ and reading it back non-empty:
 
 ```text
 DEVSUITE TEMPLATE RECEIPT
-Template: /Users/yizhonghu/.paseo/stage1-evidence/devsuite-template/
+Template: scripts/cannon/devsuite/
 SHA: <full 40-hex>
-Executor harness: <absolute versioned path>
+Executor harness: scripts/cannon/executor-harness/ at the exact SHA
 Files + sha256:
   <relative path> <sha256>
 Dry-run UTC: <timestamp>

@@ -22,3 +22,19 @@ harness from `scripts/cannon/executor-harness/` at the SHA under test:
 
 - `README.md:29`: `HARNESS=/Users/yizhonghu/tpen-manager-receipts/executor-harness-v3-release-rc2-ca0f93b3-20261111T092513Z`
 - `README.md:112`: `Template: /Users/yizhonghu/.paseo/stage1-evidence/devsuite-template/`
+
+## PR-B intentional divergence
+
+PR-B intentionally diverges from the imported template bytes. The launcher now
+copies the executor harness from the exact-SHA staged tree at
+`scripts/cannon/executor-harness/`; it no longer accepts or defaults to a
+private absolute harness path. The manager-dispatched 12-hourly invocation
+uses the explicit `--scheduled` flag and the `dev-fullsuite-scheduled-` folder
+prefix; manual invocations do not carry that marker. The changed files are:
+
+- `scripts/cannon/devsuite/submit_devsuite.sh`
+- `scripts/cannon/devsuite/executor.sbatch.in`
+- `scripts/cannon/devsuite/README.md`
+- `scripts/cannon/devsuite/PROVENANCE.md`
+- `scripts/cannon/tests/test_devsuite_renderer.py`
+- `scripts/cannon/tests/mutants-devsuite-renderer.json`

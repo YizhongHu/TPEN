@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Rendered by submit_devsuite.sh for one exact dev SHA and one approved
-# versioned executor-harness-v3 full-mode directory.
+# in-repo scripts/cannon/executor-harness directory from the exact SHA under test.
 #SBATCH --partition=test
 #SBATCH --account=kozinsky_lab
 #SBATCH --job-name=__EXECUTOR_JOB_NAME__
@@ -24,6 +24,8 @@ JOB_NAME="${JOB_NAME:-__EXECUTOR_JOB_NAME__}"
 TASK_ROOT="${TASK_ROOT:-__EXECUTOR_TASK_ROOT__}"
 RUN_ROOT="${RUN_ROOT:-__EXECUTOR_RUN_ROOT__}"
 MUTANT_SPEC="${MUTANT_SPEC:-${TASK_ROOT}/mutants.json}"
+HARNESS_SOURCE="${HARNESS_SOURCE:-scripts/cannon/executor-harness}"
+HARNESS_SOURCE_SHA="${HARNESS_SOURCE_SHA:-__HEAD_SHA__}"
 
 precheck() {
   [[ "${SLURM_JOB_PARTITION:-}" == test ]] || fail_precheck "partition must be test, got ${SLURM_JOB_PARTITION:-unset}"
@@ -32,6 +34,8 @@ precheck() {
   [[ "${JOB_NAME}" == *"${HEAD_SHA:0:12}"* ]] || fail_precheck "JOB_NAME must contain SHA[:12]"
   [[ "${RUN_ROOT}" == /n/netscratch/kozinsky_lab/Lab/rhu/* ]] || fail_precheck "RUN_ROOT escapes facility prefix"
   [[ "${TASK_ROOT}" == /n/netscratch/kozinsky_lab/Lab/rhu/* ]] || fail_precheck "TASK_ROOT escapes facility prefix"
+  [[ "${HARNESS_SOURCE}" == scripts/cannon/executor-harness ]] || fail_precheck "executor harness source is not in-repo"
+  [[ "${HARNESS_SOURCE_SHA}" == "${HEAD_SHA}" ]] || fail_precheck "executor harness source SHA differs from HEAD_SHA"
   [[ -f "${TASK_ROOT}/job.sbatch" ]] || fail_precheck "executor harness job.sbatch missing"
   [[ -f "${TASK_ROOT}/mutants.json" ]] || fail_precheck "executor mutants.json missing"
   [[ -s "${TASK_ROOT}/repo.bundle" ]] || fail_precheck "executor repo.bundle missing or empty"
