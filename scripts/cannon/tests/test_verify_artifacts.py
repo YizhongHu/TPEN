@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import ast
+import io
 import os
 import shlex
 import shutil
 import subprocess
+import tarfile
 from pathlib import Path
 
 
@@ -27,6 +29,25 @@ def _inventory_entry(line: str) -> tuple[str, str]:
         line = line[1:]
     digest, relative = line.split("  ", 1)
     return digest, relative
+
+
+def _manifest_entry(line: str) -> tuple[str, int, str]:
+    """Split one escaped manifest row into path, byte count, and digest."""
+
+    relative, size, digest = line.split("\t")
+    return _decode_inventory_path(relative), int(size), digest
+
+
+def _read_archive(path: Path) -> dict[str, bytes]:
+    """Decompress the zstd stream and return regular tar members."""
+
+    decompressed = subprocess.run(["zstd", "-q", "-d", "-c", str(path)], check=True, capture_output=True).stdout
+    with tarfile.open(fileobj=io.BytesIO(decompressed), mode="r:") as archive:
+        return {
+            member.name: archive.extractfile(member).read()
+            for member in archive.getmembers()
+            if member.isfile()
+        }
 
 
 def _collector_harness(source: str, run_root: Path, work_root: Path, clone: Path) -> str:
@@ -99,7 +120,7 @@ def _make_clone(tmp_path: Path) -> Path:
     return clone
 
 
-def test_full_suite_collector_copies_allowlist_and_writes_inventory(tmp_path: Path) -> None:
+def test_full_suite_collector_archives_allowlist_and_writes_manifest(tmp_path: Path) -> None:
     run_root = tmp_path / "run"
     (run_root / "evidence").mkdir(parents=True)
     work_root = tmp_path / "work"
@@ -122,33 +143,32 @@ def test_full_suite_collector_copies_allowlist_and_writes_inventory(tmp_path: Pa
     assert result.returncode == 0, result.stdout + result.stderr
 
     artifacts = run_root / "artifacts"
-    assert (artifacts / "tmpdir/pytest-basetemp/test.log").read_text() == "pytest\n"
-    assert (artifacts / "checkout/tracked.txt").read_text() == "after\n"
-    assert (artifacts / "checkout/untracked.txt").read_text() == "untracked\n"
-    assert (artifacts / "checkout/outputs/ignored.txt").read_text() == "ignored output\n"
-    assert (artifacts / "checkout/outputs/newline\nname.txt").read_text() == "newline output\n"
-    assert (artifacts / "harness/mutant-one.diff").read_text() == "diff\n"
-    assert not (artifacts / "tmpdir/__pycache__").exists()
-    assert not (artifacts / "checkout/__pycache__").exists()
-    assert not (artifacts / "checkout/.git").exists()
+    members = _read_archive(artifacts / "artifacts.tar.zst")
+    assert members["tmpdir/pytest-basetemp/test.log"] == b"pytest\n"
+    assert members["checkout/tracked.txt"] == b"after\n"
+    assert members["checkout/untracked.txt"] == b"untracked\n"
+    assert members["checkout/outputs/ignored.txt"] == b"ignored output\n"
+    assert members["checkout/outputs/newline\nname.txt"] == b"newline output\n"
+    assert members["harness/mutant-one.diff"] == b"diff\n"
+    assert not any("__pycache__" in path or ".git" in path for path in members)
 
-    inventory = (artifacts / "INVENTORY.sha256").read_text().splitlines()
-    assert len(inventory) == 6
-    for line in inventory[:5]:
-        digest, relative = _inventory_entry(line)
-        assert digest == hashlib.sha256((artifacts / _decode_inventory_path(relative)).read_bytes()).hexdigest()
-    decoded_paths = [_decode_inventory_path(_inventory_entry(line)[1]) for line in inventory]
-    assert decoded_paths.count("checkout/outputs/newline\nname.txt") == 1
-    assert subprocess.run(
-        ["sha256sum", "-c", "INVENTORY.sha256"], cwd=artifacts, check=False, capture_output=True, text=True
-    ).returncode == 0
+    manifest = [_manifest_entry(line) for line in (artifacts / "MANIFEST.tsv").read_text().splitlines()]
+    assert len(manifest) == 6
+    assert {path for path, _, _ in manifest} == set(members)
+    for path, size, digest in manifest:
+        assert size == len(members[path])
+        assert digest == hashlib.sha256(members[path]).hexdigest()
+    assert "checkout/outputs/newline\nname.txt" in members
     size_line = (run_root / "evidence/artifacts-size.txt").read_text().strip()
     expected_bytes = sum(
         len(content)
         for content in (b"pytest\n", b"after\n", b"untracked\n", b"ignored output\n", b"newline output\n", b"diff\n")
     )
-    assert size_line == f"artifact_file_count=6 artifact_bytes={expected_bytes}"
-    assert (run_root / "evidence/artifacts-status.txt").read_text() == "ARTIFACTS_OK\n"
+    assert size_line.startswith(f"artifact_file_count=6 artifact_bytes={expected_bytes} artifact_tar_bytes=")
+    status = (run_root / "evidence/artifacts-status.txt").read_text()
+    assert status.startswith("ARTIFACTS_OK tar_bytes=")
+    assert "member_count=6" in status
+    assert "elapsed_seconds=" in status
     assert (run_root / "evidence/artifacts-timing.txt").read_text().startswith("artifact_collection_seconds=")
 
 
