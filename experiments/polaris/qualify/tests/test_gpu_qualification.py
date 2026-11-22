@@ -125,6 +125,12 @@ def test_qualification_job_name_uses_cell_and_commit_sha() -> None:
         pass
     else:
         raise AssertionError("accepted an over-long qualification job name")
+    try:
+        stage.qualification_job_name("bad_name", "a" * 40)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("accepted an invalid generated qualification job name")
 
 
 def test_only_current_q_surface_is_admitted() -> None:
