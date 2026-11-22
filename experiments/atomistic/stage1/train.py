@@ -83,6 +83,13 @@ def build_train_config(
         cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(selected_overrides))
     # A caller-supplied compatibility override must not redirect artifacts.
     _bind_output_identity(cfg, row)
+    if row.get("science_profile") == "hooke-hv2-v1":
+        # Preserve the producer-boundary guard while keeping composition in
+        # this shared builder for both fresh and restart gateways.
+        if cfg.runtime.seed != row["seed"] or cfg.sampler.seed != row["sampler_seed"]:
+            raise ValueError("Hooke science runtime and sampler seeds are not bound")
+        if cfg.runtime.seed == cfg.sampler.seed:
+            raise ValueError("Hooke science runtime and sampler seeds must be distinct")
     prepare_initial_checkpoint_config(cfg)
     validate_resolved_train_config(cfg, row, base_config=base_cfg)
     return cfg
