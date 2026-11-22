@@ -92,6 +92,7 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
         self._last_state: dict[str, Any] | None = None
         self._runner: Any = None
         self._optimizer: Any = None
+        self._checkpoint_output_dir: Path | None = None
 
     def handle_occurrence(self, occurrence, context, state=None) -> None:
         event = occurrence.event
@@ -113,6 +114,8 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
             self.records.setdefault("iterations", {})[str(iteration)] = {
                 "samples": _tensor_digest(samples.positions),
                 "local_energy": state.local_energy.detach().cpu().tolist(),
+                "next_iteration": int(state.trainer.next_iteration),
+                "completed_updates": int(state.trainer.completed_updates),
             }
             if int(state.trainer.next_iteration) == self.boundary:
                 self.records["boundary"] = self._snapshot(state, None, context)
@@ -154,6 +157,7 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
             if type(callback).__qualname__ == "Checkpoint"
         ]
         assert len(checkpoint_callbacks) == 1, "expected exactly one live Checkpoint callback"
+        self._checkpoint_output_dir = Path(checkpoint_callbacks[0].output_dir)
         schedule = getattr(checkpoint_callbacks[0], "schedule", None)
         every_n = getattr(schedule, "every_n", None)
         assert isinstance(every_n, int) and not isinstance(every_n, bool) and every_n > 0, (
@@ -180,6 +184,12 @@ class _BoundaryReadback(StatefulCallback[TrainerState]):
         }
 
     def finish(self) -> None:
+        if self._checkpoint_output_dir is not None:
+            self.records["checkpoint_steps"] = sorted(
+                int(path.name.removeprefix("step_"))
+                for path in self._checkpoint_output_dir.glob("step_*")
+                if path.is_dir()
+            )
         self.output.write_text(json.dumps(self.records, sort_keys=True), encoding="utf-8")
 
 
@@ -322,6 +332,15 @@ def test_hi_s5b_b2_three_process_stateful_continuation(tmp_path: Path) -> None:
     _assert_equivalent(full["boundary"], restored["training_started"])
     full_iteration = full["iterations"][str(PREFIX + 1)]
     restored_iteration = restored["iterations"][str(PREFIX + 1)]
+    assert len(restored["iterations"]) == H - PREFIX
+    assert restored_iteration["completed_updates"] == PREFIX + 1
+    assert restored_iteration["next_iteration"] == PREFIX + 1
+    final_restored_iteration = restored["iterations"][str(H)]
+    assert final_restored_iteration["completed_updates"] == H
+    assert final_restored_iteration["next_iteration"] == H
+    full_post_prefix_checkpoints = [step for step in full["checkpoint_steps"] if step > PREFIX]
+    restored_checkpoints = [step for step in restored["checkpoint_steps"] if step > PREFIX]
+    assert restored_checkpoints == full_post_prefix_checkpoints
     assert full_iteration["samples"] == restored_iteration["samples"]
     np.testing.assert_allclose(full_iteration["local_energy"], restored_iteration["local_energy"], rtol=RTOL, atol=ATOL)
     assert restored["restored"]["trainer"]["max_steps"] == H
