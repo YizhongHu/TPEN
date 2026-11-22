@@ -23,7 +23,7 @@ from experiments.atomistic.stage1.protocol import (
     validate_resolved_train_config,
 )
 from experiments.atomistic.stage1.launch import _binding_token, row_overrides
-from experiments.atomistic.stage1.restart import execute_restart
+from experiments.atomistic.stage1.restart import execute_restart, restart_train_from_row
 from experiments.atomistic.stage1.train import prepare_initial_checkpoint_config
 from experiments.toolkit.run_paths import resolve_run_dir
 from tpen.checkpoint import TrainResume, save_checkpoint
@@ -93,6 +93,35 @@ def _production_cfg(row: dict[str, object], config_path: Path) -> Any:
     prepare_initial_checkpoint_config(cfg)
     validate_resolved_train_config(cfg, admitted_row)
     return cfg
+
+
+def test_restart_gateway_reuses_shared_train_builder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The restart convenience path must compose through build_train_config."""
+
+    from experiments.atomistic.stage1 import restart as restart_module
+
+    row = _row("he", tmp_path, protocol=_bounded_protocol())
+    overrides = row_overrides(row)
+    calls: list[dict[str, object]] = []
+    sentinel_cfg = object()
+    monkeypatch.setattr(
+        restart_module,
+        "build_train_config",
+        lambda admitted, **kwargs: (calls.append({"row": admitted, **kwargs}) or sentinel_cfg),
+    )
+    monkeypatch.setattr(
+        restart_module,
+        "execute_restart",
+        lambda **kwargs: kwargs,
+    )
+    result = restart_train_from_row(
+        row=row, config_path=Path(str(row["config"])), overrides=overrides,
+        binding=_binding_token(row),
+    )
+    assert calls and calls[0]["row"] == row
+    assert result["cfg"] is sentinel_cfg
 
 
 class _Stage1Trace:

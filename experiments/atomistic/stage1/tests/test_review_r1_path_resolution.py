@@ -117,6 +117,15 @@ def _make_probe_checkout(source: Path, destination: Path, marker: str) -> Path:
     return destination
 
 
+@pytest.mark.parametrize("system", ["hooke1", "hooke2", "qho2e", "he", "h2"])
+@pytest.mark.parametrize("kind", ["train", "eval"])
+def test_every_stage1_output_slot_is_mandatory(system: str, kind: str) -> None:
+    """Every train/eval recipe requires the row builder to bind its root."""
+
+    config = REPO_ROOT / "experiments/atomistic/stage1/configs" / system / f"{kind}.yaml"
+    assert 'run: {root: "???"' in config.read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize(
     ("kind", "driver"),
     [
