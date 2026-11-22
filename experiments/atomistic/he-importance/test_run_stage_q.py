@@ -897,9 +897,9 @@ def test_cell_selection_receipt_successor_validation_refuses_mutations(
     if mutation == "missing":
         path.unlink()
     elif mutation == "altered":
-        path.write_bytes(
-            runner._canonical_selection_receipt_bytes({**report, "selection": {}})
-        )
+        # Keep the parsed report unchanged so this specifically exercises C's
+        # exact canonical-byte comparison rather than semantic mapping equality.
+        path.write_text(json.dumps(report, separators=(",", ":")) + "\n", encoding="utf-8")
     elif mutation == "row":
         path.write_bytes(
             runner._canonical_selection_receipt_bytes(
