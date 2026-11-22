@@ -204,7 +204,7 @@ def test_verifier_writes_pass_and_copy_controls_fail(tmp_path: Path) -> None:
     (missing / "Q" / row_id / "COMPLETE").unlink()
     evidence = tmp_path / "evidence-complete"
     assert qualification.qualify(manifest, evidence, artifact_root=missing) != 0
-    assert next(row for row in json.loads((evidence / "qualification.json").read_text())["predicates"] if row["name"] == "checkpoint_complete")["status"] == "FAIL"
+    assert next(row for row in json.loads((evidence / "qualification.json").read_text())["predicates"] if row["name"] == "cell_complete")["status"] == "FAIL"
     nan = control("nan")
     torch.save({"weight": torch.tensor([float("nan")])}, nan / "Q" / row_id / "checkpoints" / "step_002000" / "model.pt")
     evidence = tmp_path / "evidence-nan"

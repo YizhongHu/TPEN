@@ -22,7 +22,6 @@ stage_coordinate = importlib.import_module("experiments.atomistic.he-importance.
 optimizer_grid = importlib.import_module("experiments.atomistic.he-importance.optimizer_grid")
 runner = importlib.import_module("experiments.atomistic.he-importance.run_stage_q")
 stage = stage_coordinate
-qualification = importlib.import_module("experiments.polaris.qualify.qualification")
 
 
 def _fake_adam(
@@ -937,6 +936,7 @@ def test_real_execute_report_round_trips_through_successor_validator(tmp_path: P
 
 def test_qualification_reads_real_stage_q_cell_completion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Qualification must mark cell_complete PASS for real Stage-Q output."""
+    qualification = importlib.import_module("experiments.polaris.qualify.qualification")
     campaign_root, report, selected = _execute_real_stage_q_output(tmp_path, monkeypatch)
     manifest = tmp_path / "qualification-manifest.json"
     manifest.write_text(json.dumps({"runtime_kind": "polaris-gpu-qualification", "output_root": str(campaign_root), "cell": {"context": report["selection"]["selected"]["context"], "walkers": report["walkers"], "updates": 2000, "checkpoint_every": 1000}}) + "\n", encoding="utf-8")
