@@ -136,6 +136,30 @@ def test_packet_dir_outside_run_root_is_rejected(tmp_path: Path) -> None:
     assert not outside.exists()
 
 
+def test_packet_dir_with_dotdot_is_rejected_before_writes(tmp_path: Path) -> None:
+    values = _base(tmp_path)
+    packet = Path(values["run_root"]) / ".." / "escape-packet"
+    result = _render(tmp_path, packet_dir=str(packet))
+    assert result.returncode != 0
+    assert "canonical" in result.stderr
+    assert not Path(values["run_root"]).exists()
+    assert not packet.resolve(strict=False).exists()
+
+
+def test_packet_dir_symlink_outside_run_root_is_rejected_before_writes(tmp_path: Path) -> None:
+    values = _base(tmp_path)
+    run_root = Path(values["run_root"])
+    run_root.mkdir(parents=True)
+    outside = tmp_path / "outside-packet"
+    packet_link = run_root / "packet-link"
+    packet_link.symlink_to(outside, target_is_directory=True)
+    result = _render(tmp_path, packet_dir=str(packet_link))
+    assert result.returncode != 0
+    assert "inside run root" in result.stderr
+    assert packet_link.is_symlink()
+    assert not outside.exists()
+
+
 def test_cli_rejects_run_root_outside_approved_prefix(tmp_path: Path) -> None:
     values = _base(tmp_path)
     values.pop("test_facility_run_prefix")
@@ -151,35 +175,23 @@ def test_relative_spec_path_is_rejected(tmp_path: Path, monkeypatch: pytest.Monk
     assert "absolute" in result.stderr
 
 
-def test_rendered_body_consumes_verify_interface(tmp_path: Path) -> None:
+def test_rendered_body_consumes_real_verify_interface(tmp_path: Path) -> None:
     values = _base(tmp_path)
+    values["uv_bin"] = str(tmp_path / "missing-uv")
     packet = renderer.render_packet(**values)
     task_root = packet / "stage"
     verify = task_root / "scripts" / "cannon" / "verify.sh"
-    verify.write_text(
-        "#!/usr/bin/env bash\n"
-        "set -Eeuo pipefail\n"
-        "printf 'cwd=%s\\n' \"$PWD\" > \"$STUB_LOG\"\n"
-        "for name in HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT DRY_RUN PYTHON USER WORK_ROOT "
-        "FACILITY_RUN_PREFIX SHARED_ENV_PREFIX UV_BIN REPO_URL; do\n"
-        "  printf '%s=%s\\n' \"$name\" \"${!name:?missing $name}\" >> \"$STUB_LOG\"\n"
-        "done\n"
-        "for arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\" >> \"$STUB_LOG\"; done\n",
-        encoding="utf-8",
-    )
-    verify.chmod(0o750)
+    assert verify.is_file() and verify.stat().st_mode & 0o111
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "mkdir").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     (bin_dir / "mkdir").chmod(0o750)
-    log = tmp_path / "consumer.log"
     env = {
         "PATH": f"{bin_dir}:/usr/bin:/bin",
         "USER": "packet-consumer",
         "SLURM_JOB_ID": "consumer-job",
         "SLURM_JOB_PARTITION": "test",
         "DRY_RUN": "0",
-        "STUB_LOG": str(log),
     }
     result = subprocess.run(
         ["/bin/bash", str(packet / "verify.sbatch")],
@@ -189,39 +201,11 @@ def test_rendered_body_consumes_verify_interface(tmp_path: Path) -> None:
         capture_output=True,
         check=False,
     )
-    assert result.returncode == 0, result.stdout + result.stderr
-    observed = log.read_text(encoding="utf-8").splitlines()
-    assert observed[0] == f"cwd={task_root}"
-    expected_env = {
-        "HEAD_SHA": SHA,
-        "JOB_NAME": "verify-" + SHA[:12],
-        "TASK_ROOT": str(task_root),
-        "RUN_ROOT": str(Path(values["run_root"])),
-        "DRY_RUN": "0",
-        "PYTHON": "/usr/bin/python3",
-        "USER": "packet-consumer",
-        "WORK_ROOT": "/scratch/packet-consumer/consumer-job",
-        "FACILITY_RUN_PREFIX": str(Path(values["test_facility_run_prefix"])),
-        "SHARED_ENV_PREFIX": str(Path(values["shared_env_prefix"])),
-        "UV_BIN": "/usr/bin/python3",
-        "REPO_URL": "https://github.com/YizhongHu/TPEN.git",
-    }
-    assert observed[1 : 1 + len(expected_env)] == [f"{key}={value}" for key, value in expected_env.items()]
-    args = [line.removeprefix("arg=") for line in observed[1 + len(expected_env) :]]
-    assert args == [
-        "--sha",
-        SHA,
-        "--run-root",
-        str(Path(values["run_root"])),
-        "--test",
-        "scripts/cannon/tests/test_render_verify_packet.py",
-        "--mode",
-        "quick",
-        "--typecheck",
-        "on",
-        "--parallel",
-        "serial",
-    ]
+    detail = result.stdout + result.stderr
+    assert result.returncode == 2, detail
+    assert "UV_BIN must be executable absolute path" in detail
+    assert "unknown argument" not in detail
+    assert "missing" not in detail
 
 
 def test_existing_packet_dir_is_rejected(tmp_path: Path) -> None:

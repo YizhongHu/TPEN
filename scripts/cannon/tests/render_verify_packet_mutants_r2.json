@@ -25,6 +25,13 @@
     "target": "scripts/cannon/render_verify_packet.py",
     "old": "            \"export HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT DRY_RUN PYTHON USER WORK_ROOT \"\n            \"FACILITY_RUN_PREFIX SHARED_ENV_PREFIX UV_BIN REPO_URL\",",
     "new": "            \"export HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT DRY_RUN PYTHON USER WORK_ROOT \"\n            \"FACILITY_RUN_PREFIX SHARED_ENV_PREFIX UV_BIN\",",
-    "killer": "test_render_verify_packet.py::test_rendered_body_consumes_verify_interface"
+    "killer": "test_render_verify_packet.py::test_rendered_body_consumes_real_verify_interface"
+  },
+  {
+    "id": "consumer-run-root-option-renamed",
+    "target": "scripts/cannon/render_verify_packet.py",
+    "old": "            '  --run-root \"$RUN_ROOT\"',",
+    "new": "            '  --runroot \"$RUN_ROOT\"',",
+    "killer": "test_render_verify_packet.py::test_rendered_body_consumes_real_verify_interface"
   }
 ]
