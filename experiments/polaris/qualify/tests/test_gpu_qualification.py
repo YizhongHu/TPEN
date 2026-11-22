@@ -126,6 +126,7 @@ def test_qualification_job_name_uses_cell_and_commit_sha() -> None:
     else:
         raise AssertionError("accepted an over-long qualification job name")
     assert stage.qualification_job_name("q_o1.w2048", "a" * 40) == "hiq-o1-w20-gate-hi-aaaaaaaa"
+    assert stage.qualification_job_name("Q_O1.w2048", "a" * 40) == "hiq-o1-w20-gate-hi-aaaaaaaa"
     assert stage.qualification_job_name("___...", "a" * 40) == "hi-gate-hi-aaaaaaaa"
 
 
@@ -473,3 +474,84 @@ def test_stage_real_clone_and_qsub_fakes(monkeypatch, tmp_path: Path) -> None:
     assert len(qsub_calls) == before and (gate_root / "gate" / "staging-receipt.json").is_file()
     decisions = list(gate_root.glob("**/*qstat-decision.json"))
     assert decisions and json.loads(decisions[-1].read_text())["allowed"] is False
+
+
+def test_manifest_producer_consumers_preserve_selection_and_verdict(monkeypatch, tmp_path: Path) -> None:
+    """The manifest producer's extra cell key is accepted by both consumers."""
+    target = tmp_path / "target"
+    route = target / job.CANONICAL_STAGE
+    route.parent.mkdir(parents=True)
+    route.write_text("# route\n")
+    (target / "uv.lock").write_text(
+        "version = 1\nrevision = 1\n\n[[package]]\nname = 'tpen'\nsource = { editable = '.' }\n"
+        "optional-dependencies = { cu126 = [{ name = 'torch', version = '2.12.0+cu126' }] }\n"
+    )
+    subprocess.run(["git", "init", "-q", str(target)], check=True)
+    subprocess.run(["git", "-C", str(target), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(target), "config", "user.name", "test"], check=True)
+    subprocess.run(["git", "-C", str(target), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(target), "commit", "-q", "-m", "target"], check=True)
+    target_sha = subprocess.check_output(["git", "-C", str(target), "rev-parse", "HEAD"], text=True).strip()
+
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    profile = {"runtime_kind": stage.RUNTIME_KIND, "extra": "cu126"}
+    args = type("Args", (), {
+        "target_sha": target_sha, "required_ancestor": [], "cell_id": "Q_O1.w2048", "stage": "Q",
+        "context": "O-composite", "optimizer": "adam", "lr": 0.005, "beta2": 0.999,
+        "seed_label": 810001, "walkers": 2048, "updates": 2000, "checkpoint_every": 1000,
+        "nodes": 1, "account": "HetRxnEnergy", "queue": "debug", "walltime": "00:20:00",
+    })()
+    producer = stage.build_manifest(args, run_root, target, profile, [])
+    producer["expected_torch"] = "2.12.0+cu126"
+    producer["verify_profile"] = {"uv_version": "0.8.23"}
+    receipt = Path(producer["staging_receipt"])
+    receipt.write_text(json.dumps({"runtime_kind": job.RUNTIME_KIND, "target_sha": target_sha,
+                                   "cache_dir": producer["cache_dir"], "extra": producer["extra"]}))
+    manifest_path = run_root / "manifest.json"
+    manifest_path.write_text(json.dumps(producer))
+    run_env = run_root / "run.env"
+    run_env.write_text("RUN_MANIFEST=" + str(manifest_path) + "\nRUN_PYTHON=/fake/python\n"
+                       "RUN_JOB_PY=/fake/gpu_job.py\nRUN_PROJECT=" + str(target) + "\n"
+                       "RUN_CACHE_DIR=" + str(run_root / "cache") + "\n")
+    monkeypatch.setenv("JOB_ENV", str(run_root / "env"))
+    monkeypatch.setenv("PBS_JOBID", "job")
+    monkeypatch.setattr(sys, "argv", ["gpu_job.py", str(run_env)])
+    monkeypatch.setattr(job, "hostname", lambda: "nid001")
+    monkeypatch.setattr(job, "nodefile_entries", lambda: ["nid001.fqdn"])
+    monkeypatch.setattr(job, "git_head", lambda repo: target_sha)
+    monkeypatch.setattr(job, "appledoubles", lambda repo: [])
+    monkeypatch.setattr(job, "_uv_version", lambda uv: "uv 0.8.23")
+    monkeypatch.setattr(job, "_venv_identity", lambda python: {"prefix": str(run_root / "env"), "executable": str(run_root / "env" / "bin" / "python")})
+    monkeypatch.setattr(job, "_package_versions", lambda python: {"torch": "2.12.0+cu126"})
+    monkeypatch.setattr(job, "torch_probe", lambda python, env: {"torch": "2.12.0+cu126", "available": True, "count": 1, "name": "A100", "op": 2.0, "visible": "0", "file": str(run_root / "env" / "lib" / "torch.py")})
+    monkeypatch.setattr(job.subprocess, "check_output", lambda *args, **kwargs: "route-blob\n")
+    monkeypatch.setattr(job.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0))
+    observed = []
+    monkeypatch.setattr(job, "run_route", lambda argv, *rest: observed.append(argv) or 0)
+    monkeypatch.setattr(job, "run_qualification", lambda *args: 0)
+
+    assert job.main() == 0
+    with_cell = json.loads((run_root / "evidence" / "job" / "selection-argv.json").read_text())["argv"]
+    without_cell = copy.deepcopy(producer)
+    without_cell["cell"].pop("cell_id")
+    manifest_path.write_text(json.dumps(without_cell))
+    assert job.main() == 0
+    without_cell_argv = json.loads((run_root / "evidence" / "job" / "selection-argv.json").read_text())["argv"]
+    assert with_cell == without_cell_argv == observed[-1]
+
+    output = Path(producer["output_root"]) / "owner"
+    (output / "checkpoints" / "step_002000").mkdir(parents=True)
+    (output / "selection_receipt.json").write_text(json.dumps({"selection": {"selected": {"context": "O-composite"}}, "walkers": 2048}))
+    (output / "resolved_config.yaml").write_text("context: O-composite\n")
+    (output / "checkpoints" / "step_002000" / "manifest.json").write_text(json.dumps({"completed_updates": 2000, "next_iteration": 2000}))
+    (output / "checkpoints" / "step_002000" / "trainer.json").write_text(json.dumps({"completed_updates": 2000, "next_iteration": 2000}))
+    (output / "checkpoints" / "step_002000" / "COMPLETE").write_text("done\n")
+    producer_path = run_root / "producer.json"
+    producer_path.write_text(json.dumps(producer))
+    no_cell_path = run_root / "without-cell.json"
+    no_cell_path.write_text(json.dumps(without_cell))
+    assert qualification.qualify(producer_path, run_root / "evidence-producer") == qualification.qualify(no_cell_path, run_root / "evidence-without-cell") == 0
+    producer_verdict = json.loads((run_root / "evidence-producer" / "qualification.json").read_text())
+    no_cell_verdict = json.loads((run_root / "evidence-without-cell" / "qualification.json").read_text())
+    assert [(row["name"], row["status"], row["observed"]) for row in producer_verdict["predicates"]] == [(row["name"], row["status"], row["observed"]) for row in no_cell_verdict["predicates"]]

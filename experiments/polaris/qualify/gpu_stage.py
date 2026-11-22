@@ -99,7 +99,7 @@ def qualification_job_name(cell_id: str, target_sha: str) -> str:
     Non-alphanumeric cell-id characters become hyphens; repeated, leading, and
     trailing hyphens are removed. An empty fragment is omitted.
     """
-    fragment = re.sub(r"[^A-Za-z0-9]", "-", cell_id[:8])
+    fragment = re.sub(r"[^A-Za-z0-9]", "-", cell_id[:8]).lower()
     fragment = re.sub(r"-+", "-", fragment).strip("-")
     subject = f"hi{fragment}"
     return validate_job_name(f"{subject}-gate-hi-{target_sha[:8]}")
