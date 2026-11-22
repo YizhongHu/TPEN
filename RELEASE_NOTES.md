@@ -26,6 +26,49 @@
 - Make the Stage 1 lineage-claim race deterministic and wire core admission through the executor (#814, #815).
 - Extract public leaf completion and qualify the HI continuation state (#820, #812).
 
+## v0.5.5 - Stage 1 Hooke science shape, 100k overlays, and executor/cache fixes
+
+36 commits since `v0.5.4` (`7272dca6`), merged into `dev` through PRs
+#740, #752, #753, #755, #756, #758, #759, #760, #761, #762, #763, #764,
+#765, #766, #767, #768, #771, #772, #773, #774, #775, #776, #778, #780,
+#781, #782, #783, #784, #785, #786, #788, #789, #790, #791, #792, #793,
+#796, #797.
+
+### Added
+
+- **Core restart primitives (CX-08)**: expose read-only published checkpoint
+  discovery and atomic exclusive JSON receipt creation through `tpen.execution`.
+  Discovery uses checkpoint publication records only; receipts never overwrite
+  an existing path. Restore and takeover policies are unchanged.
+- **Hooke-1e/2e science shape and 100k overlays** (#776, #790): bind the H-v2-matched Hooke systems and add diagnostic and identity overlays for 100k runs.
+- **Executor lifecycle and transport** (#740, #753, #758, #764, #765, #775, #778): add attached transport, typed continuation refusal, routed leaves, allocation-group reconciliation, durable publication, and Balsam lifecycle support.
+- **Stage 1 and recovery capabilities** (#755, #756, #763, #768, #771, #772, #773, #774): add native recovery guards, He/H2 runbook support, the Stage 1 checkpoint, diagnostics, width and retention bindings, baseline reporting, restart primitives, and recovery-profile admission.
+- **Executor successor publication** (#788, #796, #793, #797): add admitted-successor startup, multi-generation publication, launch intents, and the controller-generation authority ledger; #796 and #797 re-land #788 and #793.
+- **He-importance state handling** (#753): add the HI-S5 mutable-state inventory and typed continuation refusal.
+
+### Fixed
+
+- **Native restore guard [CX-09]**: all `run_from_config` train-resume loads,
+  including operational requests and direct configured loads, check the existing
+  native recovery profile before construction or state mutation. Unsupported
+  callbacks/loggers/cadence now refuse with `UnsupportedMutableStateError` and
+  the existing profile code. Positional Train loads are covered; admission
+  precedes HI resolver evaluation. Indeterminate load syntax refuses with
+  `malformed-config`, including indeterminate runner targets with a possible
+  positional load (sixth argument or indeterminate `_args_`). Syntactically
+  determined fresh and model-only loads skip profile admission.
+- **Persistent Metropolis cache** (#780): invalidate the sampler cache when its persistent state changes.
+- **He-importance evaluator guards** (#762, #783, #785, #786, #791): enforce identity horizons, typed loader errors, duplicate-id refusal, argument screening, and rank-artifact identifier screening.
+- **Evaluation and launch paths** (#761, #766, #767): scale trajectory reconciliation, surface roster-unavailable reasons, and bootstrap planning scripts by path.
+- **Core resume admission** (#774): refuse unsupported mutable state before construction or state mutation, including indeterminate load syntax.
+
+### Tests and documentation
+
+- **HI horizon coverage** (#792): add refusal coverage for the HI #762 horizon boundary.
+- **HI policy boundary guard** (#789): test the fail-closed HI policy boundary.
+- **GPU guard coverage** (#759): prove the Stage 1 GPU guard reaches the driver.
+- **Cannon runbooks and documentation** (#752, #781, #782, #784): add He/H2 science runbooks, document test purposes and stop conditions, update Netscratch retention guidance, and expose testing skills to Claude.
+
 ## v0.5.4 - Stage 1 production GPU launch, reconciled collector statistics, two-phase manifest identity
 
 5 commits since `v0.5.3` (`0cc1de6d`), merged into `dev` through PRs #744,
