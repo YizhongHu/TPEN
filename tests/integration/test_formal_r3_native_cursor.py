@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.integration import test_native_checkpoint_recovery as native
 from tpen.checkpoint import CheckpointRef, list_complete_checkpoints
 from tpen.execution.chain_resume import (
     UnmeasuredArmError,
