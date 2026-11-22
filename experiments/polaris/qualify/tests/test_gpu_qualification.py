@@ -118,7 +118,7 @@ def test_invalid_queue_is_rejected_before_work(monkeypatch, tmp_path: Path) -> N
 
 
 def test_qualification_job_name_uses_cell_and_commit_sha() -> None:
-    assert stage.qualification_job_name("cell-123456", "a" * 40) == "hicell-12-gate-hi-aaaaaaaa"
+    assert stage.qualification_job_name("cell-123456", "a" * 40) == "hicell-123-gate-hi-aaaaaaaa"
     try:
         stage.validate_job_name("x" * 41)
     except ValueError:
