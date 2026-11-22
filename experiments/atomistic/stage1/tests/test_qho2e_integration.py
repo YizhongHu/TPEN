@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from hydra.utils import instantiate
 
 from experiments.atomistic.stage1.protocol import (
     CHECKPOINT_EVIDENCE_SCHEMA,
@@ -15,6 +16,7 @@ from experiments.atomistic.stage1.protocol import (
     ProtocolError,
     QHO_EVAL_SELECTION,
     QHO_Q21,
+    SYSTEM_SPECS,
     STAGE1_PROTOCOL,
     bind_evaluation_manifest,
     build_manifest,
@@ -28,6 +30,7 @@ from tpen.data.batch import ElectronBatch, WavefunctionOutput
 from tpen.physics.hamiltonian import local_energy
 from tpen.physics.kinetic import KineticEnergy
 from tpen.physics.potential import HarmonicTrap
+from tpen.run import load_config
 
 
 ROOT = Path(__file__).parents[1]
@@ -66,14 +69,29 @@ def test_qho2e_has_the_analytic_constant_local_energy() -> None:
 def test_qho2e_identity_and_registry_reference_are_distinct() -> None:
     """The new physics hash and 1.5 Ha registry reference are not inherited."""
 
-    qho2e_id = physical_system_id_from_config(
+    expected_registry_id = "qho_pair_noninteracting_singlet_omega0.5"
+    specs = {spec.name: spec.system_id for spec in SYSTEM_SPECS}
+    assert specs["qho2e"] == expected_registry_id
+    assert specs["qho2e"] not in {specs["hooke1"], specs["hooke2"]}
+
+    train_cfg = load_config(str(QHO2E / "train.yaml"))
+    eval_cfg = load_config(str(QHO2E / "eval.yaml"))
+    assert str(train_cfg.system.id) == expected_registry_id
+    assert str(eval_cfg.system.id) == expected_registry_id
+
+    train_descriptor_id = physical_system_id_from_config(QHO2E / "train.yaml")
+    eval_descriptor_id = physical_system_id_from_config(
         QHO2E / "eval.yaml", train_config_path=QHO2E / "train.yaml", system_name="qho2e"
     )
+    assert train_descriptor_id == instantiate(train_cfg.system_descriptor).system_id()
+    assert eval_descriptor_id == instantiate(eval_cfg.system_descriptor).system_id()
+    assert train_descriptor_id == eval_descriptor_id
     hooke1_id = physical_system_id_from_config(CONFIG_ROOT / "hooke1" / "eval.yaml")
     hooke2_id = physical_system_id_from_config(CONFIG_ROOT / "hooke2" / "eval.yaml")
-    assert qho2e_id not in {hooke1_id, hooke2_id}
+    assert eval_descriptor_id not in {hooke1_id, hooke2_id}
 
-    entry = next(item for item in load_registry()["systems"] if item["id"] == "qho_pair_noninteracting_singlet_omega0.5")
+    entry = next(item for item in load_registry()["systems"] if item["id"] == expected_registry_id)
+    assert specs["qho2e"] == entry["id"]
     assert entry["reference_energy_hartree"] == 1.5
     assert "3*omega" in entry["reference_source"]
     assert {term["term"] for term in entry["hamiltonian"]["terms"]} == {
