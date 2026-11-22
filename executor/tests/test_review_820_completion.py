@@ -7,6 +7,7 @@ No leaf process or scheduler is needed by these tests.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 from pathlib import Path
 
@@ -22,6 +23,32 @@ from tpen_executor.dispatch.transport import (
 from tpen_executor.placement import PLACEMENT_OUTPUT_ENV, PlacementRefusal
 
 from test_s3_transport_wire import _request, _synthetic_result
+
+
+COMPLETION_SOURCE = Path(__file__).parents[1] / "src" / "tpen_executor" / "dispatch" / "completion.py"
+MUTANTS = (
+    {
+        "id": "completion-ignores-launch-error",
+        "source": COMPLETION_SOURCE,
+        "old": """    launch_refusal = placement_refusal_from_launch_error(result.launch_error)\n    if error is None and launch_refusal is not None:\n        environment = _with_placement_refusal(environment, launch_refusal)\n        error = launch_refusal\n""",
+        "new": """    launch_refusal = None\n""",
+        "killer": "test_leaf_launch_refusal_preserves_remote_completion_semantics",
+        "bounded": True,
+    },
+)
+
+
+def test_mutant_table_targets_unique_bounded_behavior_killers() -> None:
+    """Every review mutant has one compilable, named, bounded behavior change."""
+
+    module = Path(__file__).read_text(encoding="utf-8")
+    assert [row["id"] for row in MUTANTS] == ["completion-ignores-launch-error"]
+    for row in MUTANTS:
+        source = row["source"].read_text(encoding="utf-8")
+        assert source.count(row["old"]) == 1, row
+        assert row["old"] != row["new"] and row["bounded"] is True
+        ast.parse(source.replace(row["old"], row["new"], 1))
+        assert f"def {row['killer']}(" in module, row
 
 
 @pytest.mark.parametrize("route", ["legacy", "public"])

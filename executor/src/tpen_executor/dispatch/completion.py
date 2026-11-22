@@ -9,8 +9,8 @@ from ..placement import PlacementRefusal
 from ..storage import AttemptFence
 from ..tasks import ConfiguredRun
 from ..workers import ProcessOutcome
-from .contract import DispatcherContract
-from .transport import LeafRequest, LeafResult
+from .contract import DispatcherContract, _with_placement_refusal
+from .transport import LeafRequest, LeafResult, placement_refusal_from_launch_error
 
 
 def _process_outcome_from_leaf_result(result: LeafResult) -> ProcessOutcome | None:
@@ -65,6 +65,11 @@ def complete_leaf_result(
     if result.child_refusal is not None and placement_error is None:
         refusal = result.child_refusal
         child_refusal = PlacementRefusal(refusal["code"], refusal["reason"])
+    error = placement_error
+    launch_refusal = placement_refusal_from_launch_error(result.launch_error)
+    if error is None and launch_refusal is not None:
+        environment = _with_placement_refusal(environment, launch_refusal)
+        error = launch_refusal
     return DispatcherContract._publish_completion(
         lifecycle_or_store,
         fence,
@@ -77,7 +82,7 @@ def complete_leaf_result(
         result_digest,
         segment_evidence,
         inspection_error,
-        error=placement_error,
+        error=error,
         child_refusal=child_refusal,
     )
 

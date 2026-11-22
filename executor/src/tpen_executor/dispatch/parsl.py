@@ -58,10 +58,9 @@ from .contract import (
     _with_placement_refusal,
 )
 from .transport import (
-    WORKER_AFFINITY_REFUSAL_CODES,
-    LeafPlacementRefused,
     LeafRequest,
     LeafResult,
+    placement_refusal_from_launch_error,
     run_leaf,
     validate_leaf_result,
 )
@@ -620,12 +619,9 @@ class _RemoteLeaf:
         self.validated_result = result
         if result.science is None:
             error = result.launch_error or {"type": "unknown", "message": ""}
-            if error["type"] == LeafPlacementRefused.__name__:
-                # Only the closed worker-affinity codes become typed
-                # placement refusals; any other text stays a launch error.
-                code, _, reason = error["message"].partition(": ")
-                if code in WORKER_AFFINITY_REFUSAL_CODES and reason:
-                    raise PlacementRefusal(code, reason)
+            refusal = placement_refusal_from_launch_error(error)
+            if refusal is not None:
+                raise refusal
             raise RemoteLeafLaunchError(f"{error['type']}: {error['message']}")
         science = result.science
         outcome = ProcessOutcome(
