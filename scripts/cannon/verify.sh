@@ -109,11 +109,342 @@ assert_write_path "$RUN_ROOT"; assert_write_path "$WORK_ROOT"
 safe_mkdir "$RUN_ROOT"; safe_mkdir "$RUN_ROOT/evidence"; safe_mkdir "$WORK_ROOT"
 assert_write_path "$RUN_ROOT/evidence/driver.log"
 exec > "$RUN_ROOT/evidence/driver.log" 2>&1
+
+# Full-suite runs are the only runs that retain job-local test artifacts.  The
+# allowlist is intentionally explicit: source checkouts, overlays, dependency
+# caches, and bytecode are never copied into RUN_ROOT.
+artifact_is_excluded() {
+  local rel="$1"
+  case "/$rel/" in
+    */.git/*|*/.git/|*/__pycache__/*|*/__pycache__/|*/.pytest_cache/*|*/.pytest_cache/|\
+      */.mypy_cache/*|*/.mypy_cache/|*/.ruff_cache/*|*/.ruff_cache/|*/.venv/*|*/.venv/)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+collect_full_suite_artifacts() {
+  local inventory="$RUN_ROOT/artifacts/.INVENTORY.sha256.tmp"
+  local metadata="$RUN_ROOT/artifacts/.artifact-inventory.tsv.tmp"
+  local status_file="$RUN_ROOT/evidence/artifacts-status.txt"
+  local size_file="$RUN_ROOT/evidence/artifacts-size.txt"
+  local collector_summary collector_rc collector_status collector_count collector_bytes collector_reason
+  ARTIFACT_FILE_COUNT=0
+  ARTIFACT_BYTES=0
+  [[ ! -e "$RUN_ROOT/artifacts" && ! -L "$RUN_ROOT/artifacts" ]] || return 1
+  [[ ! -e "$RUN_ROOT/artifacts/INVENTORY.sha256" ]] || return 1
+  [[ ! -e "$RUN_ROOT/artifacts/artifact-inventory.tsv" ]] || return 1
+  assert_write_path "$RUN_ROOT/artifacts" || return 1
+  mkdir -p -- "$RUN_ROOT/artifacts" || return 1
+  assert_write_path "$inventory" || return 1
+  assert_write_path "$metadata" || return 1
+  if collector_summary="$(${PYTHON:-python3} - "$RUN_ROOT/artifacts" "$inventory" "$metadata" "$WORK_ROOT" "$TMPDIR" "$CLONE" "${ARTIFACT_COLLECTION_BUDGET_SECONDS:-900}" <<'PY'
+import hashlib
+import os
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+artifacts, inventory_path, metadata_path, work_root, tmpdir, clone, budget = sys.argv[1:]
+started = time.monotonic()
+deadline = time.monotonic() + float(budget)
+delay = float(os.environ.get("ARTIFACT_TEST_COPY_DELAY_SECONDS", "0"))
+enum_delay = float(os.environ.get("ARTIFACT_TEST_ENUM_DELAY_SECONDS", "0"))
+seen = set()
+count = 0
+total = 0
+partial = False
+reason = ""
+artifacts_root = Path(artifacts)
+artifacts_root_resolved = artifacts_root.resolve(strict=True)
+clone_root = Path(clone)
+
+
+def mark_partial(message):
+    global partial, reason
+    partial = True
+    reason = reason or message
+
+
+def escaped(value):
+    return repr(str(value))[1:-1]
+
+
+def record_skipped_symlink(source, destination_rel, source_class, producer, inventory, metadata):
+    metadata.write(
+        f"{source_class}\t{escaped(source)}\tskipped_symlink\t{escaped(destination_rel)}\t0\t-\t{producer}\n"
+    )
+    return True
+
+
+def source_is_safe(source, allowed_root):
+    source = Path(source)
+    if source.is_symlink():
+        return False
+    try:
+        source.resolve(strict=False).relative_to(Path(allowed_root).resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
+def safe_destination(destination_rel):
+    destination = artifacts_root / destination_rel
+    try:
+        destination.resolve(strict=False).relative_to(artifacts_root_resolved)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(f"destination escapes artifact root: {destination_rel}") from exc
+    current = artifacts_root
+    for part in Path(destination_rel).parts:
+        current /= part
+        try:
+            if stat.S_ISLNK(current.lstat().st_mode):
+                raise RuntimeError(f"destination symlink refused: {current}")
+        except FileNotFoundError:
+            pass
+    return destination
+
+def budget_exceeded():
+    return time.monotonic() >= deadline
+
+
+def checksum_line(digest, value):
+    """Render one checksum line in the escaped form accepted by ``sha256sum -c``."""
+
+    text = str(value)
+    escaped_text = (
+        text.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+    prefix = "\\" if escaped_text != text else ""
+    return f"{prefix}{digest}  {escaped_text}\n"
+
+
+def excluded(relative):
+    parts = Path(relative).parts
+    return any(part in {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv"} for part in parts)
+
+
+def copy_file(source, destination_rel, source_class, producer, inventory, metadata, allow_duplicate=False):
+    global count, total, partial, reason
+    if budget_exceeded():
+        mark_partial("collection budget exceeded")
+        return False
+    if excluded(destination_rel):
+        return True
+    if destination_rel in seen:
+        if allow_duplicate:
+            return True
+        raise RuntimeError(f"duplicate retained path: {destination_rel}")
+    if budget_exceeded():
+        mark_partial("collection budget exceeded")
+        return False
+    seen.add(destination_rel)
+    destination = safe_destination(destination_rel)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination = safe_destination(destination_rel)
+    hasher = hashlib.sha256()
+    size = 0
+    source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    destination_fd = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(source_fd, "rb") as src, os.fdopen(destination_fd, "wb") as dst:
+        while True:
+            chunk = src.read(1024 * 1024)
+            if not chunk:
+                break
+            dst.write(chunk)
+            hasher.update(chunk)
+            size += len(chunk)
+            if delay:
+                time.sleep(delay)
+    digest = hasher.hexdigest()
+    escaped_destination = repr(destination_rel)[1:-1]
+    escaped_source = repr(str(source))[1:-1]
+    inventory.write(checksum_line(digest, destination_rel))
+    metadata.write(f"{source_class}\t{escaped_source}\ton\t{escaped_destination}\t{size}\t{digest}\t{producer}\n")
+    count += 1
+    total += size
+    if budget_exceeded():
+        mark_partial("collection budget exceeded")
+        return False
+    return True
+
+
+def walk_tree(source, destination_prefix, source_class, producer, inventory, metadata, allow_duplicates=False):
+    allowed_root = clone_root if source_class == "checkout" else Path(work_root)
+    if source.is_symlink() or not source_is_safe(source, allowed_root):
+        return record_skipped_symlink(source, destination_prefix, source_class, producer, inventory, metadata)
+    if not source.is_dir():
+        return True
+    stack = [(source, destination_prefix)]
+    while stack:
+        current, prefix = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    if enum_delay:
+                        time.sleep(enum_delay)
+                    if budget_exceeded():
+                        mark_partial("collection budget exceeded")
+                        return False
+                    relative = f"{prefix}/{entry.name}"
+                    if entry.is_symlink():
+                        if not record_skipped_symlink(entry.path, relative, source_class, producer, inventory, metadata):
+                            return False
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if not source_is_safe(entry.path, allowed_root):
+                            if not record_skipped_symlink(entry.path, relative, source_class, producer, inventory, metadata):
+                                return False
+                            continue
+                        stack.append((Path(entry.path), relative))
+                    elif entry.is_file(follow_symlinks=False) and not source_is_safe(entry.path, allowed_root):
+                        if not record_skipped_symlink(entry.path, relative, source_class, producer, inventory, metadata):
+                            return False
+                    elif entry.is_file(follow_symlinks=False) and not copy_file(Path(entry.path), relative, source_class, producer, inventory, metadata, allow_duplicates):
+                        return False
+        except OSError as exc:
+            raise RuntimeError(f"cannot enumerate {current}: {exc}") from exc
+    return True
+
+
+def git_paths(*args):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        mark_partial("collection budget exceeded during git listing")
+        return []
+    try:
+        result = subprocess.run(
+            ["git", "-C", clone, *args], check=True, capture_output=True, timeout=remaining
+        )
+    except subprocess.TimeoutExpired:
+        mark_partial("collection budget exceeded during git listing")
+        return []
+    if budget_exceeded():
+        mark_partial("collection budget exceeded during git listing")
+    return [os.fsdecode(item) for item in result.stdout.split(b"\0") if item]
+
+
+if os.environ.get("ARTIFACTS_FORCE_FAILURE") == "1":
+    raise RuntimeError("forced artifact collection failure")
+
+with Path(inventory_path).open("w", encoding="utf-8") as inventory, Path(metadata_path).open("w", encoding="utf-8") as metadata:
+    metadata.write("source_class\tsource_path\tarm\tretained_path\tbytes\tsha256\tproducer\n")
+    if not walk_tree(Path(tmpdir), "tmpdir", "tmpdir", "pytest", inventory, metadata):
+        partial = True
+        reason = reason or "collection budget exceeded"
+    if not partial:
+        for entry in os.scandir(work_root):
+            if budget_exceeded():
+                mark_partial("collection budget exceeded")
+                break
+            name = entry.name
+            if entry.is_symlink():
+                destination_rel = f"basetemp/{name}" if name.startswith("basetemp-") else f"harness/{name}"
+                source_class = "basetemp" if name.startswith("basetemp-") else "harness"
+                producer = "pytest" if name.startswith("basetemp-") else "harness"
+                if not record_skipped_symlink(entry.path, destination_rel, source_class, producer, inventory, metadata):
+                    mark_partial("collection budget exceeded")
+                    break
+                continue
+            if name.startswith("basetemp-") and entry.is_dir(follow_symlinks=False):
+                if not walk_tree(Path(entry.path), f"basetemp/{name}", "basetemp", "pytest", inventory, metadata):
+                    partial = True
+                    reason = reason or "collection budget exceeded"
+                    break
+            elif name in {"clone", "overlay", "uv-cache", "tmp"} or name.startswith(("pytest-", "pytest-of-")):
+                continue
+            elif entry.is_file(follow_symlinks=False):
+                if not (name.startswith("mutant-") or name.endswith((".log", ".json", ".diff", ".spec", ".compile", ".xml", ".tsv"))):
+                    raise RuntimeError(f"unclassified WORK_ROOT artifact: {name}")
+                if not copy_file(Path(entry.path), f"harness/{name}", "harness", "harness", inventory, metadata):
+                    partial = True
+                    reason = reason or "collection budget exceeded"
+                    break
+            elif not entry.is_symlink():
+                raise RuntimeError(f"unclassified WORK_ROOT artifact: {name}")
+        if not partial and budget_exceeded():
+            mark_partial("collection budget exceeded")
+    if not partial:
+        paths = []
+        for git_args in (("diff", "--name-only", "-z"), ("ls-files", "--others", "--exclude-standard", "-z")):
+            paths.extend(git_paths(*git_args))
+            if partial:
+                break
+        for relative in paths:
+            if budget_exceeded():
+                mark_partial("collection budget exceeded")
+                break
+            source = Path(clone, relative)
+            destination_rel = f"checkout/{relative}"
+            if source.is_symlink() or not source_is_safe(source, clone_root):
+                if not record_skipped_symlink(source, destination_rel, "checkout", "pytest", inventory, metadata):
+                    break
+            elif source.is_file() and not copy_file(source, destination_rel, "checkout", "pytest", inventory, metadata):
+                break
+    if not partial:
+        for root in ("outputs", "results", "reports", "slurm"):
+            if not walk_tree(Path(clone, root), f"checkout/{root}", "checkout", "pytest", inventory, metadata, True):
+                partial = True
+                reason = reason or "collection budget exceeded"
+                break
+    if not partial:
+        final_delay = float(os.environ.get("ARTIFACT_TEST_FINAL_WALK_DELAY_SECONDS", "0"))
+        if final_delay:
+            time.sleep(final_delay)
+        if budget_exceeded():
+            mark_partial("collection budget exceeded")
+
+if partial:
+    print(f"PARTIAL\t{count}\t{total}\t{time.monotonic() - started:.3f}\t{reason}")
+else:
+    print(f"OK\t{count}\t{total}\t{time.monotonic() - started:.3f}")
+PY
+  )"; then
+    collector_rc=0
+  else
+    collector_rc=$?
+  fi
+  ((collector_rc == 0)) || return "$collector_rc"
+  IFS=$'\t' read -r collector_status collector_count collector_bytes collector_elapsed collector_reason <<< "$collector_summary"
+  ARTIFACT_FILE_COUNT="$collector_count"
+  ARTIFACT_BYTES="$collector_bytes"
+  mv -- "$inventory" "$RUN_ROOT/artifacts/INVENTORY.sha256" || return 1
+  mv -- "$metadata" "$RUN_ROOT/artifacts/artifact-inventory.tsv" || return 1
+  assert_write_path "$RUN_ROOT/evidence/artifacts-timing.txt" || return 1
+  printf 'artifact_collection_seconds=%s\n' "$collector_elapsed" > "$RUN_ROOT/evidence/artifacts-timing.txt" || return 1
+  assert_write_path "$size_file" || return 1
+  printf 'artifact_file_count=%s artifact_bytes=%s\n' "$ARTIFACT_FILE_COUNT" "$ARTIFACT_BYTES" > "$size_file" || return 1
+  if [[ "$collector_status" == PARTIAL ]]; then
+    printf 'ARTIFACTS_PARTIAL reason=%s artifact_file_count=%s artifact_bytes=%s\n' \
+      "$collector_reason" "$ARTIFACT_FILE_COUNT" "$ARTIFACT_BYTES" > "$status_file" || return 1
+  else
+    printf 'ARTIFACTS_OK\n' > "$status_file" || return 1
+  fi
+}
+
 cleanup() {
   local rc=$?
   set +e
   printf 'DRIVER_EXIT=%s\n' "$rc" > "$RUN_ROOT/evidence/driver-exit.txt"
   date -u +%FT%TZ > "$RUN_ROOT/evidence/driver-end-utc.txt"
+  if [[ "$MODE" == measure && "$FULL_SUITE" == 1 ]]; then
+    artifact_error=""
+    collect_full_suite_artifacts || artifact_error="collection failed (rc=$?)"
+    if [[ -n "$artifact_error" ]]; then
+      printf 'ARTIFACTS_FAILED reason=%s\n' "$artifact_error" > "$RUN_ROOT/evidence/artifacts-status.txt"
+    fi
+  fi
   [[ "$WORK_ROOT" == "/scratch/$USER/$SLURM_JOB_ID" ]] && rm -rf -- "$WORK_ROOT"
   exit "$rc"
 }
