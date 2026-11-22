@@ -211,29 +211,8 @@ def run_group_controller(
     # and avoids an import cycle through the local executor's handle type.
     from .attached import AttachedAllocation
     from ..dispatch.completion import complete_leaf_result
-    from ..dispatch.transport import LeafResultRejected
+    from ..dispatch.transport import LeafResultRejected, validate_leaf_result
     from .local_executor import CollectionWaitTimeout, LeafCompletionContext
-
-    class _SuccessorSegmentStore:
-        """Explicit completion-store seam that withholds successor segments."""
-
-        def __init__(self, wrapped: Any) -> None:
-            self._wrapped = wrapped
-
-        def finish_attempt(self, *args: Any, **kwargs: Any) -> Any:
-            return self._wrapped.finish_attempt(*args, **kwargs)
-
-        def publish_placement(self, *args: Any, **kwargs: Any) -> Any:
-            return self._wrapped.publish_placement(*args, **kwargs)
-
-        def record_core_outcome(self, *args: Any, **kwargs: Any) -> Any:
-            return self._wrapped.record_core_outcome(*args, **kwargs)
-
-        def manifest(self, *args: Any, **kwargs: Any) -> Any:
-            return self._wrapped.manifest(*args, **kwargs)
-
-        def accept_segment(self, *_args: Any, **_kwargs: Any) -> None:
-            return None
 
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -358,11 +337,22 @@ def run_group_controller(
             continue
         try:
             task = next(task for task in group.members if task.task_id == member.task_id)
-            lifecycle_store: Any = _SuccessorSegmentStore(store) if successor else store
+            try:
+                validated = validate_leaf_result(result.request, result.result)
+            except (TypeError, LeafResultRejected) as error:
+                try:
+                    AttachedAllocation(allocation, store, invocation.allocation_attempt).finish(
+                        fence, "remote-quiescence-unconfirmed", _now(), None,
+                    )
+                except Exception:
+                    pass
+                _park_member(member.task_id, "validation", error)
+                continue
             error = complete_leaf_result(
-                AttachedAllocation(allocation, lifecycle_store, invocation.allocation_attempt),
-                fence, result.request, result.result, group=group, member=task,
+                AttachedAllocation(allocation, store, invocation.allocation_attempt),
+                fence, result.request, validated, group=group, member=task,
                 configured=result.configured, environment=result.environment,
+                accept_segment=not successor,
             )
             if error is not None:
                 raise error
