@@ -1,44 +1,30 @@
 [
   {
-    "id": "exclusion-disabled",
+    "id": "per-entry-deadline-removed",
     "target": "scripts/cannon/verify.sh",
-    "old": "if excluded(destination_rel):",
-    "new": "if False:",
+    "old": "                    if enum_delay:\n                        time.sleep(enum_delay)\n                    if budget_exceeded():\n                        mark_partial(\"collection budget exceeded\")\n                        return False",
+    "new": "                    if enum_delay:\n                        time.sleep(enum_delay)",
+    "killer": "test_verify_artifacts.py::test_collection_budget_checks_each_scandir_entry"
+  },
+  {
+    "id": "final-deadline-check-removed",
+    "target": "scripts/cannon/verify.sh",
+    "old": "    if not partial:\n        final_delay = float(os.environ.get(\"ARTIFACT_TEST_FINAL_WALK_DELAY_SECONDS\", \"0\"))\n        if final_delay:\n            time.sleep(final_delay)\n        if budget_exceeded():\n            mark_partial(\"collection budget exceeded\")",
+    "new": "    if not partial:\n        pass",
+    "killer": "test_verify_artifacts.py::test_final_walk_deadline_check_records_partial"
+  },
+  {
+    "id": "skipped-record-written-into-inventory",
+    "target": "scripts/cannon/verify.sh",
+    "old": "    metadata.write(\n        f\"{source_class}\\t{escaped(source)}\\tskipped_symlink\\t{escaped(destination_rel)}\\t0\\t-\\t{producer}\\n\"\n    )",
+    "new": "    inventory.write(f\"# SKIPPED_SYMLINK  {escaped(destination_rel)}\\n\")\n    metadata.write(\n        f\"{source_class}\\t{escaped(source)}\\tskipped_symlink\\t{escaped(destination_rel)}\\t0\\t-\\t{producer}\\n\"\n    )",
     "killer": "test_verify_artifacts.py::test_full_suite_collector_copies_allowlist_and_writes_inventory"
   },
   {
-    "id": "work-copy-disabled",
+    "id": "direct-work-root-symlink-dropped",
     "target": "scripts/cannon/verify.sh",
-    "old": "if not walk_tree(Path(tmpdir), \"tmpdir\", \"tmpdir\", \"pytest\", inventory, metadata):",
-    "new": "if False:",
-    "killer": "test_verify_artifacts.py::test_full_suite_collector_copies_allowlist_and_writes_inventory"
-  },
-  {
-    "id": "verdict-overwritten",
-    "target": "scripts/cannon/verify.sh",
-    "old": "printf 'DRIVER_EXIT=%s\\n' \"$rc\" > \"$RUN_ROOT/evidence/driver-exit.txt\"",
-    "new": "printf 'DRIVER_EXIT=0\\n' \"$rc\" > \"$RUN_ROOT/evidence/driver-exit.txt\"",
-    "killer": "test_verify_artifacts.py::test_collector_failure_preserves_verdict_and_cleans_scratch"
-  },
-  {
-    "id": "symlink-follow-reenabled",
-    "target": "scripts/cannon/verify.sh",
-    "old": "if source.is_symlink() or not source_is_safe(source, clone_root):",
-    "new": "if False:",
-    "killer": "test_verify_artifacts.py::test_changed_or_untracked_symlink_cannot_copy_outside_clone"
-  },
-  {
-    "id": "git-listing-deadline-removed",
-    "target": "scripts/cannon/verify.sh",
-    "old": "result = subprocess.run(\n            [\"git\", \"-C\", clone, *args], check=True, capture_output=True, timeout=remaining\n        )\n    except subprocess.TimeoutExpired:\n        mark_partial(\"collection budget exceeded during git listing\")\n        return []\n    if budget_exceeded():\n        mark_partial(\"collection budget exceeded during git listing\")",
-    "new": "result = subprocess.run(\n            [\"git\", \"-C\", clone, *args], check=True, capture_output=True\n        )\n    except subprocess.TimeoutExpired:\n        mark_partial(\"collection budget exceeded during git listing\")\n        return []",
-    "killer": "test_verify_artifacts.py::test_collection_budget_covers_git_listing_time"
-  },
-  {
-    "id": "destination-exists-check-removed",
-    "target": "scripts/cannon/verify.sh",
-    "old": "[[ ! -e \"$RUN_ROOT/artifacts\" && ! -L \"$RUN_ROOT/artifacts\" ]] || return 1",
-    "new": ":",
-    "killer": "test_verify_artifacts.py::test_full_suite_does_not_overwrite_an_existing_inventory"
+    "old": "            if entry.is_symlink():\n                destination_rel = f\"basetemp/{name}\" if name.startswith(\"basetemp-\") else f\"harness/{name}\"\n                source_class = \"basetemp\" if name.startswith(\"basetemp-\") else \"harness\"\n                producer = \"pytest\" if name.startswith(\"basetemp-\") else \"harness\"\n                if not record_skipped_symlink(entry.path, destination_rel, source_class, producer, inventory, metadata):\n                    mark_partial(\"collection budget exceeded\")\n                    break\n                continue",
+    "new": "            if False:\n                destination_rel = f\"basetemp/{name}\" if name.startswith(\"basetemp-\") else f\"harness/{name}\"\n                source_class = \"basetemp\" if name.startswith(\"basetemp-\") else \"harness\"\n                producer = \"pytest\" if name.startswith(\"basetemp-\") else \"harness\"\n                if not record_skipped_symlink(entry.path, destination_rel, source_class, producer, inventory, metadata):\n                    mark_partial(\"collection budget exceeded\")\n                    break\n                continue",
+    "killer": "test_verify_artifacts.py::test_direct_work_root_symlink_is_recorded_as_skipped"
   }
 ]

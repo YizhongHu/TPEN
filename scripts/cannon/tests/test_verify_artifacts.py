@@ -20,6 +20,15 @@ def _decode_inventory_path(value: str) -> str:
     return ast.literal_eval(f"'{value}'")
 
 
+def _inventory_entry(line: str) -> tuple[str, str]:
+    """Split one GNU checksum line, including its special-path prefix."""
+
+    if line.startswith("\\"):
+        line = line[1:]
+    digest, relative = line.split("  ", 1)
+    return digest, relative
+
+
 def _collector_harness(source: str, run_root: Path, work_root: Path, clone: Path) -> str:
     """Return a shell fixture containing the collector without the Slurm runner."""
 
@@ -96,6 +105,8 @@ def test_full_suite_collector_copies_allowlist_and_writes_inventory(tmp_path: Pa
     work_root = tmp_path / "work"
     (work_root / "tmp" / "pytest-basetemp").mkdir(parents=True)
     (work_root / "tmp" / "pytest-basetemp" / "test.log").write_text("pytest\n")
+    (work_root / "tmp" / "pytest-basetemp" / "skipped-link").symlink_to(tmp_path / "outside")
+    (tmp_path / "outside").write_text("outside\n")
     (work_root / "tmp" / "__pycache__").mkdir()
     (work_root / "tmp" / "__pycache__" / "ignored.pyc").write_bytes(b"cache")
     (work_root / "mutant-one.diff").write_text("diff\n")
@@ -124,10 +135,13 @@ def test_full_suite_collector_copies_allowlist_and_writes_inventory(tmp_path: Pa
     inventory = (artifacts / "INVENTORY.sha256").read_text().splitlines()
     assert len(inventory) == 6
     for line in inventory[:5]:
-        digest, relative = line.split("  ", 1)
+        digest, relative = _inventory_entry(line)
         assert digest == hashlib.sha256((artifacts / _decode_inventory_path(relative)).read_bytes()).hexdigest()
-    decoded_paths = [_decode_inventory_path(line.split("  ", 1)[1]) for line in inventory]
+    decoded_paths = [_decode_inventory_path(_inventory_entry(line)[1]) for line in inventory]
     assert decoded_paths.count("checkout/outputs/newline\nname.txt") == 1
+    assert subprocess.run(
+        ["sha256sum", "-c", "INVENTORY.sha256"], cwd=artifacts, check=False, capture_output=True, text=True
+    ).returncode == 0
     size_line = (run_root / "evidence/artifacts-size.txt").read_text().strip()
     expected_bytes = sum(
         len(content)
@@ -288,3 +302,78 @@ def test_collection_budget_covers_git_listing_time(tmp_path: Path) -> None:
     assert (run_root / "evidence/artifacts-size.txt").read_text().startswith("artifact_file_count=0 artifact_bytes=0")
     elapsed = float((run_root / "evidence/artifacts-timing.txt").read_text().split("=", 1)[1])
     assert elapsed < 3
+
+
+def test_collection_budget_checks_each_scandir_entry(tmp_path: Path) -> None:
+    """An entry that arrives after the budget is not recorded or copied."""
+
+    run_root = tmp_path / "run"
+    (run_root / "evidence").mkdir(parents=True)
+    work_root = tmp_path / "work"
+    (work_root / "tmp").mkdir(parents=True)
+    (work_root / "tmp/late-link").symlink_to(tmp_path / "outside")
+    (tmp_path / "outside").write_text("outside\n")
+    clone = _make_clone(tmp_path)
+
+    result = subprocess.run(
+        ["bash", "-c", _collector_harness(VERIFY.read_text(), run_root, work_root, clone)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "ARTIFACT_COLLECTION_BUDGET_SECONDS": "0.01",
+            "ARTIFACT_TEST_ENUM_DELAY_SECONDS": "0.02",
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (run_root / "evidence/artifacts-status.txt").read_text().startswith("ARTIFACTS_PARTIAL reason=")
+    assert "late-link" not in (run_root / "artifacts/artifact-inventory.tsv").read_text()
+
+
+def test_final_walk_deadline_check_records_partial(tmp_path: Path) -> None:
+    """Expiry after the final walk must not be reported as ARTIFACTS_OK."""
+
+    run_root = tmp_path / "run"
+    (run_root / "evidence").mkdir(parents=True)
+    work_root = tmp_path / "work"
+    (work_root / "tmp").mkdir(parents=True)
+    clone = _make_clone(tmp_path)
+
+    result = subprocess.run(
+        ["bash", "-c", _collector_harness(VERIFY.read_text(), run_root, work_root, clone)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "ARTIFACT_COLLECTION_BUDGET_SECONDS": "0.01",
+            "ARTIFACT_TEST_FINAL_WALK_DELAY_SECONDS": "0.02",
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (run_root / "evidence/artifacts-status.txt").read_text().startswith("ARTIFACTS_PARTIAL reason=")
+
+
+def test_direct_work_root_symlink_is_recorded_as_skipped(tmp_path: Path) -> None:
+    """A symlink directly under WORK_ROOT is retained in skip metadata."""
+
+    run_root = tmp_path / "run"
+    (run_root / "evidence").mkdir(parents=True)
+    work_root = tmp_path / "work"
+    (work_root / "tmp").mkdir(parents=True)
+    (work_root / "direct-link").symlink_to(tmp_path / "outside")
+    (tmp_path / "outside").write_text("outside\n")
+    clone = _make_clone(tmp_path)
+
+    result = subprocess.run(
+        ["bash", "-c", _collector_harness(VERIFY.read_text(), run_root, work_root, clone)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={"PATH": os.environ["PATH"]},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    metadata = (run_root / "artifacts/artifact-inventory.tsv").read_text()
+    assert "skipped_symlink" in metadata
+    assert "harness/direct-link" in metadata

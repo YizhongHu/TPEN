@@ -175,10 +175,6 @@ def escaped(value):
 
 
 def record_skipped_symlink(source, destination_rel, source_class, producer, inventory, metadata):
-    if budget_exceeded():
-        mark_partial("collection budget exceeded")
-        return False
-    inventory.write(f"# SKIPPED_SYMLINK  {escaped(destination_rel)}\n")
     metadata.write(
         f"{source_class}\t{escaped(source)}\tskipped_symlink\t{escaped(destination_rel)}\t0\t-\t{producer}\n"
     )
@@ -214,6 +210,20 @@ def safe_destination(destination_rel):
 
 def budget_exceeded():
     return time.monotonic() >= deadline
+
+
+def checksum_line(digest, value):
+    """Render one checksum line in the escaped form accepted by ``sha256sum -c``."""
+
+    text = str(value)
+    escaped_text = (
+        text.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+    prefix = "\\" if escaped_text != text else ""
+    return f"{prefix}{digest}  {escaped_text}\n"
 
 
 def excluded(relative):
@@ -260,7 +270,7 @@ def copy_file(source, destination_rel, source_class, producer, inventory, metada
     digest = hasher.hexdigest()
     escaped_destination = repr(destination_rel)[1:-1]
     escaped_source = repr(str(source))[1:-1]
-    inventory.write(f"{digest}  {escaped_destination}\n")
+    inventory.write(checksum_line(digest, destination_rel))
     metadata.write(f"{source_class}\t{escaped_source}\ton\t{escaped_destination}\t{size}\t{digest}\t{producer}\n")
     count += 1
     total += size
@@ -280,33 +290,29 @@ def walk_tree(source, destination_prefix, source_class, producer, inventory, met
     while stack:
         current, prefix = stack.pop()
         try:
-            entries = list(os.scandir(current))
-        except OSError as exc:
-            raise RuntimeError(f"cannot enumerate {current}: {exc}") from exc
-        for entry in entries:
-            if budget_exceeded():
-                mark_partial("collection budget exceeded")
-                return False
-            if enum_delay:
-                time.sleep(enum_delay)
-            if budget_exceeded():
-                return False
-            relative = f"{prefix}/{entry.name}"
-            if entry.is_symlink():
-                if not record_skipped_symlink(entry.path, relative, source_class, producer, inventory, metadata):
-                    return False
-                continue
-            if entry.is_dir(follow_symlinks=False):
-                if not source_is_safe(entry.path, allowed_root):
-                    if not record_skipped_symlink(entry.path, relative, source_class, producer, inventory, metadata):
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    if enum_delay:
+                        time.sleep(enum_delay)
+                    if budget_exceeded():
+                        mark_partial("collection budget exceeded")
                         return False
-                    continue
-                stack.append((Path(entry.path), relative))
-            elif entry.is_file(follow_symlinks=False) and not source_is_safe(entry.path, allowed_root):
-                if not record_skipped_symlink(entry.path, relative, source_class, producer, inventory, metadata):
-                    return False
-            elif entry.is_file(follow_symlinks=False) and not copy_file(Path(entry.path), relative, source_class, producer, inventory, metadata, allow_duplicates):
-                return False
+                    relative = f"{prefix}/{entry.name}"
+                    if entry.is_symlink():
+                        if not record_skipped_symlink(entry.path, relative, source_class, producer, inventory, metadata):
+                            return False
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if not source_is_safe(entry.path, allowed_root):
+                            if not record_skipped_symlink(entry.path, relative, source_class, producer, inventory, metadata):
+                                return False
+                            continue
+                        stack.append((Path(entry.path), relative))
+                    elif entry.is_file(follow_symlinks=False) and not source_is_safe(entry.path, allowed_root):
+                        if not record_skipped_symlink(entry.path, relative, source_class, producer, inventory, metadata):
+                            return False
+                    elif entry.is_file(follow_symlinks=False) and not copy_file(Path(entry.path), relative, source_class, producer, inventory, metadata, allow_duplicates):
+                        return False
     return True
 
 
@@ -342,10 +348,12 @@ with Path(inventory_path).open("w", encoding="utf-8") as inventory, Path(metadat
                 break
             name = entry.name
             if entry.is_symlink():
-                if name.startswith("basetemp-"):
-                    if not record_skipped_symlink(entry.path, f"basetemp/{name}", "basetemp", "pytest", inventory, metadata):
-                        mark_partial("collection budget exceeded")
-                        break
+                destination_rel = f"basetemp/{name}" if name.startswith("basetemp-") else f"harness/{name}"
+                source_class = "basetemp" if name.startswith("basetemp-") else "harness"
+                producer = "pytest" if name.startswith("basetemp-") else "harness"
+                if not record_skipped_symlink(entry.path, destination_rel, source_class, producer, inventory, metadata):
+                    mark_partial("collection budget exceeded")
+                    break
                 continue
             if name.startswith("basetemp-") and entry.is_dir(follow_symlinks=False):
                 if not walk_tree(Path(entry.path), f"basetemp/{name}", "basetemp", "pytest", inventory, metadata):
@@ -388,6 +396,12 @@ with Path(inventory_path).open("w", encoding="utf-8") as inventory, Path(metadat
                 partial = True
                 reason = reason or "collection budget exceeded"
                 break
+    if not partial:
+        final_delay = float(os.environ.get("ARTIFACT_TEST_FINAL_WALK_DELAY_SECONDS", "0"))
+        if final_delay:
+            time.sleep(final_delay)
+        if budget_exceeded():
+            mark_partial("collection budget exceeded")
 
 if partial:
     print(f"PARTIAL\t{count}\t{total}\t{time.monotonic() - started:.3f}\t{reason}")
