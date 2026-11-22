@@ -129,6 +129,19 @@ def test_qualification_job_name_uses_cell_and_commit_sha() -> None:
     assert stage.qualification_job_name("___...", "a" * 40) == "hi-gate-hi-aaaaaaaa"
 
 
+def test_qualification_job_name_uses_validation_backstop(monkeypatch) -> None:
+    def reject(name: str) -> str:
+        raise ValueError("rejected by validation backstop")
+
+    monkeypatch.setattr(stage, "validate_job_name", reject)
+    try:
+        stage.qualification_job_name("cell", "a" * 40)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("qualification name bypassed validation backstop")
+
+
 def test_only_current_q_surface_is_admitted() -> None:
     for walkers in (2048, 4096):
         args = type("Args", (), {"target_sha": "a" * 40, "walkers": walkers, "updates": 2000,
