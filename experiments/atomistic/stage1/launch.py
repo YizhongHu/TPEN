@@ -178,11 +178,14 @@ def command_for_row(row: Mapping[str, Any], *, python: str, driver: str) -> str:
               "row_id": row.get("row_id", "")}
     for field, value in values.items():
         _require_safe_value(value, field=field)
-    args = [python, driver, "--config", str(row["config"]), "--kind", str(row["kind"])]
-    for override in row_overrides(row):
-        _require_safe_value(override, field="override")
-        args.append(override)
-    args.extend(["--binding", _binding_token(row)])
+    # Keep positional overrides after all named gateway options.  Argparse's
+    # ``nargs='*'`` otherwise treats a later binding/kind flag as an
+    # unrecognized positional tail, so the rendered command cannot be driven
+    # through the real gateway main.
+    args = [
+        python, driver, "--config", str(row["config"]), "--kind", str(row["kind"]),
+        "--binding", _binding_token(row),
+    ]
     if row.get("overlay") is not None or row.get("overlay_sha256") is not None:
         if row.get("kind") != "train":
             raise ValueError("only train rows may declare an overlay")
@@ -196,6 +199,9 @@ def command_for_row(row: Mapping[str, Any], *, python: str, driver: str) -> str:
         args.extend([
             "--expected-checkpoint-sha256", str(row["checkpoint_sha256"]),
         ])
+    for override in row_overrides(row):
+        _require_safe_value(override, field="override")
+        args.append(override)
     return shlex.join(args)
 
 

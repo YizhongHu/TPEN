@@ -22,7 +22,7 @@ from experiments.atomistic.stage1.protocol import (
     validate_gateway_binding,
     validate_resolved_train_config,
 )
-from experiments.atomistic.stage1.train import prepare_initial_checkpoint_config
+from experiments.atomistic.stage1.train import build_train_config, prepare_initial_checkpoint_config
 from experiments.toolkit.run_paths import resolve_run_dir
 from tpen.checkpoint import CheckpointRef, configured_load_mode, list_complete_checkpoints
 from tpen.execution import (
@@ -784,13 +784,10 @@ def restart_train_from_row(
         binding=binding, config=str(config_path), overrides=overrides, kind="train",
         overlay=overlay, overlay_sha256=overlay_sha256,
     )
-    cfg = load_config(str(config_path), overrides)
-    if overlay is not None:
-        from experiments.atomistic.stage1.protocol import compose_train_overlay
-
-        compose_train_overlay(cfg, overlay=overlay, expected_sha256=overlay_sha256)
-    cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(overrides)))
-    prepare_initial_checkpoint_config(cfg)
+    cfg = build_train_config(
+        resolved, config_path=config_path, overrides=overrides,
+        overlay=overlay, overlay_sha256=overlay_sha256,
+    )
     return execute_restart(
         cfg=cfg, row=resolved, config_path=config_path, command=command,
     )

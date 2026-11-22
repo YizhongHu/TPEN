@@ -1,6 +1,6 @@
 defaults: []
 experiment: {name: stage1_h2, sector: atomistic, run_name: h2_eval}
-run: {root: "${oc.env:TPEN_STAGE1_RESULTS_ROOT}", run_id: null, dir: null, timezone: America/New_York, layout: nested}
+run: {root: "???", run_id: null, dir: null, timezone: America/New_York, layout: nested}
 runtime: {seed: 0, device: cpu, dtype: float64}
 system: {id: h2_molecule, n_particles: 2, spatial_dim: 3, spin: {n_up: 1, n_down: 1}, nuclei: {positions: [[-0.7, 0.0, 0.0], [0.7, 0.0, 0.0]], charges: [1.0, 1.0]}}
 atoms: {_target_: tpen.data.atomic_configuration.AtomicConfiguration, positions: {_target_: torch.tensor, data: "${system.nuclei.positions}"}, charges: {_target_: torch.tensor, data: "${system.nuclei.charges}"}}
