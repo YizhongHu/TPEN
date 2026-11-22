@@ -1305,6 +1305,29 @@ def test_reused_complete_snapshot_refuses_before_launch_and_preserves_evidence(
     assert {path: path.read_bytes() for path in sentinels} == before
 
 
+def test_execute_refuses_occupied_output_before_writing_cell_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cells = _cells(tmp_path)
+    selected = next(
+        cell
+        for cell in cells
+        if cell.manifest["seed_identity"]["label"] == 810001
+        and cell.manifest["scientific_identity"]["context"]["name"] == "O-raw"
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    )
+    selected.output_path.mkdir(parents=True, exist_ok=True)
+    (selected.output_path / "COMPLETE").write_text("old-complete\n", encoding="utf-8")
+    monkeypatch.setattr(runner.launch, "launch_train", lambda *_args, **_kwargs: pytest.fail("launch reached"))
+
+    with pytest.raises(runner.StageQSelectionError):
+        runner.execute(_args(tmp_path, dry_run=False))
+
+    assert not list((tmp_path / "cells" / selected.content_hash).glob("selection_receipt.json"))
+
+
 def _r2_facts() -> dict[str, object]:
     """Return deterministic execution facts for R2 boundary probes."""
 
