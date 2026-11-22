@@ -394,6 +394,14 @@ class LocalLeafExecutor:
                 # of None cannot be a wait timeout, so this is a leaf-raised
                 # TimeoutError and is terminal.
                 terminal = timeout is None or was_done
+                if not terminal and handle._future.done():
+                    # A leaf TimeoutError can complete during the bounded
+                    # wait.  Re-raise it now, but retain the handle so the
+                    # next collect observes the terminal future and consumes
+                    # the lease exactly once.
+                    leaf_error = handle._future.exception(timeout=0)
+                    if leaf_error is not None:
+                        raise leaf_error
                 if not terminal:
                     # Preserve the handle and its slot lease for a later
                     # collection attempt.  This is the only retryable wait

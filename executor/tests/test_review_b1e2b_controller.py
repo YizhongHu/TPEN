@@ -9,7 +9,7 @@ from threading import Event
 
 import pytest
 
-from tpen_executor._codec import digest
+from tpen_executor._codec import decode_json, digest
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.contracts import AllocationId, BackendJobId
 from tpen_executor.dispatch.completion import complete_leaf_result
@@ -136,7 +136,8 @@ class EventExecutor:
         request = LeafRequest.for_attempt(fence, self.allocation, configured, environment)
         core_dir = Path(fence.output_dir) / "core"
         core_dir.mkdir(parents=True, exist_ok=True)
-        result = replace(_synthetic_result(request), evidence=_typed_evidence(core_dir, "completed").to_dict())
+        evidence = decode_json(_typed_evidence(core_dir, "completed").encode())
+        result = replace(_synthetic_result(request), evidence=evidence)
         self.contexts[task.task_id] = LeafCompletionContext(result, request, configured, environment)
         handle = (task.task_id, len(self.submits))
         self.submits.append((fence, invocation, handle))

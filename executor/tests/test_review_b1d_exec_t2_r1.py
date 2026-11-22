@@ -10,27 +10,13 @@ from pathlib import Path
 import pytest
 
 from tpen_executor.allocations import ConfiguredAllocation
-from tpen_executor.lifecycle.controller import (
-    GroupControllerFactsV1,
-    GroupControllerOutcome,
-    MemberLaunchResult,
-    run_group_controller,
-)
+from tpen_executor.lifecycle.controller import GroupControllerFactsV1, GroupControllerOutcome, run_group_controller
 from tpen_executor.recovery import MappingCoreAdmissionPort
 
 from test_b1a_b_publication import _fixture
 from test_b1d_admission_port import _wire
 from test_review_b1b2_controller import _real_fresh
-from test_review_b1b2_t2_r1 import _binding
-
-
-class RecordingExecutor:
-    def __init__(self):
-        self.calls = []
-
-    def launch(self, fence, invocation):
-        self.calls.append((fence, invocation))
-        return MemberLaunchResult(True)
+from test_review_b1b2_t2_r1 import RecordingExecutor, _binding
 
 
 @pytest.mark.parametrize(
@@ -60,7 +46,7 @@ def test_mapping_failure_cannot_authorize_fresh_launch(tmp_path, failure):
         MappingCoreAdmissionPort(evaluate), executor,
     )
 
-    assert calls == list(facts.member_inputs)
+    assert calls == list(facts.member_inputs) * 2
     assert isinstance(result, GroupControllerOutcome)
     # Unavailable evidence is not the producer's affirmative absent-leaf None.
     assert executor.calls == [], "adapter failure was converted into a fresh launch"
@@ -92,9 +78,11 @@ def test_controller_distinguishes_absence_from_uncertainty(tmp_path, evidence):
         binding, allocation.backend_job_id, facts, store, port, executor,
     )
 
-    assert calls == list(facts.member_inputs)
+    assert calls == list(facts.member_inputs) * 2
     assert isinstance(result, GroupControllerOutcome)
-    expected_action = "start_fresh" if evidence == "absent" else "park"
+    # Final reconciliation is receipt-driven: a fresh leaf without core
+    # admission evidence is parked even though the initial action was fresh.
+    expected_action = "park"
     assert result.reconciliation.members[0].action == expected_action
     assert len(executor.calls) == (1 if evidence == "absent" else 0)
     assert len(list(Path(store.root).rglob("launch-intent.json"))) == len(executor.calls)
@@ -135,10 +123,11 @@ def test_mapping_successor_reaches_real_controller_once(tmp_path):
         facts, store, MappingCoreAdmissionPort(evaluate), executor,
     )
 
-    assert calls == list(inputs)
+    assert calls == list(inputs) * 2
     assert isinstance(result, GroupControllerOutcome)
     assert result.reconciliation.members[0].action == "admit_successor"
-    assert result.member_outcomes == (("successor", "launched"),)
+    assert result.member_outcomes == (("successor", "collected"),)
+    assert len(executor.collected) == 1
     assert len(executor.calls) == 1
     assert executor.calls[0][1].attempt_id == proposed.attempt_id
     assert len(list(Path(store.root).rglob("launch-intent.json"))) == 1

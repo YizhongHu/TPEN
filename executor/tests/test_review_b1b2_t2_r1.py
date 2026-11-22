@@ -7,12 +7,15 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 import json
+import sys
 
 import pytest
 
 from tpen_executor._codec import digest
 from tpen_executor.allocations import AllocationAttemptV2, ConfiguredAllocation, ControllerGenerationV1
 from tpen_executor.contracts import AllocationAttemptId, AllocationId, BackendJobId, InvocationId
+from tpen_executor.dispatch.transport import LeafRequest
+from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.lifecycle.balsam import (
     BalsamGroupRegistrationIntent, BalsamGroupRegistrationReceipt,
     GroupExitContract, make_group_application,
@@ -23,10 +26,13 @@ from tpen_executor.lifecycle.controller import (
 from tpen_executor.recovery import MemberRecoveryInputV2
 from tpen_executor.results import ReconciliationPublicationV2, StartReceipt
 from tpen_executor.storage import DirectoryStore
+from tpen_executor.tasks import ConfiguredRun
+from tpen_executor.lifecycle.local_executor import LeafCompletionContext
 
 from test_b1a_b_publication import _fixture
 from test_b1a_reconciliation import _group
 from test_review_b1b2_controller import _real_fresh
+from test_s3_transport_wire import _synthetic_result
 
 
 class EchoAdmission:
@@ -37,14 +43,30 @@ class EchoAdmission:
 class RecordingExecutor:
     def __init__(self, *, error=None, result=None):
         self.calls = []
+        self.collected = []
         self.error = error
         self.result = MemberLaunchResult(True) if result is None else result
 
-    def launch(self, fence, invocation):
+    def submit(self, fence, invocation):
         self.calls.append((fence, invocation))
         if self.error is not None:
             raise self.error
-        return self.result
+        allocation = ConfiguredAllocation(
+            AllocationId(fence.allocation_id),
+            invocation.allocation_attempt.backend_job_id,
+            {},
+        )
+        configured = ConfiguredRun(invocation.task_id, "/tmp/fake.yaml", ())
+        environment = PreparedPythonEnvironment(sys.executable)
+        request = LeafRequest.for_attempt(fence, allocation, configured, environment)
+        Path(fence.output_dir, "core").mkdir(parents=True, exist_ok=True)
+        context = LeafCompletionContext(_synthetic_result(request), request, configured, environment)
+        return self.result, context
+
+    def collect(self, handle, timeout):
+        assert 0 < timeout <= 6
+        self.collected.append(handle)
+        return handle
 
 
 def _binding(group, job):
@@ -62,7 +84,7 @@ def test_t2_successor_is_bound_to_current_controller_attempt(tmp_path):
     executor = RecordingExecutor()
     outcome = run_group_controller(_binding(group, allocation.backend_job_id), allocation.backend_job_id,
                                    facts, store, EchoAdmission(), executor)
-    assert len(executor.calls) == 1
+    assert len(executor.calls) == 1 and len(executor.collected) == 1
     fence, invocation = executor.calls[0]
     publications = list(Path(store.root).rglob(".reconciliation-publications/*.json"))
     assert len(publications) == 1
@@ -73,7 +95,7 @@ def test_t2_successor_is_bound_to_current_controller_attempt(tmp_path):
     assert invocation.invocation_id != old_proposal.invocation_id
     assert invocation.attempt_id == old_proposal.attempt_id == fence.attempt_id
     assert publication.members[0].admission.successor_binding == invocation
-    assert outcome.member_outcomes == (("successor", "launched"),)
+    assert outcome.member_outcomes == (("successor", "collected"),)
 
 
 def test_t2_supersession_after_publication_preserves_newer_start(tmp_path, monkeypatch):
@@ -126,9 +148,9 @@ def test_t2_admission_failure_is_local_to_member(tmp_path, failure):
     executor = RecordingExecutor()
     result = run_group_controller(_binding(group, allocation.backend_job_id), allocation.backend_job_id,
                                   facts, store, SelectiveAdmission(), executor)
-    assert calls == ["bad", "good"]
+    assert calls == ["bad", "good", "bad", "good"]
     assert [fence.task_id for fence, _ in executor.calls] == ["good"]
-    assert dict(result.member_outcomes) == {"bad": "parked", "good": "launched"}
+    assert dict(result.member_outcomes) == {"bad": "parked", "good": "collected"}
 
 
 def test_t2_completed_controller_result_reaches_balsam_success(tmp_path):
@@ -178,18 +200,20 @@ def test_t2_typed_ack_launches_with_durable_intent(tmp_path):
     group, allocation, facts, binding, store = _real_fresh(tmp_path)
     calls = []
 
-    class CheckingExecutor:
-        def launch(self, fence, invocation):
+    class CheckingExecutor(RecordingExecutor):
+        def submit(self, fence, invocation):
             current = store.require_current_controller(group, 1, facts.claimant_nonce)
             intent = store.read_launch_intent(fence)
             assert intent.controller_generation == current.generation
             assert intent.invocation_id == invocation.invocation_id
             assert Path(fence.output_dir, "start.json").is_file()
+            result = super().submit(fence, invocation)
             calls.append(fence)
-            return MemberLaunchResult(True)
+            return result
 
-    result = run_group_controller(binding, allocation.backend_job_id, facts, store, EchoAdmission(), CheckingExecutor())
-    assert len(calls) == 1 and result.member_outcomes == (("real-task", "launched"),)
+    checking = CheckingExecutor()
+    result = run_group_controller(binding, allocation.backend_job_id, facts, store, EchoAdmission(), checking)
+    assert len(calls) == 1 and len(checking.collected) == 1 and result.member_outcomes == (("real-task", "collected"),)
 
 
 def test_t2_new_generation_recovery_never_relaunches(tmp_path):

@@ -88,8 +88,8 @@ MUTANTS = (
     (
         "consume-on-later-done",
         MODULE_NAME,
-        "if not terminal:\n                    # Preserve the handle and its slot lease for a later\n                    # collection attempt.\n                    raise",
-        "if not terminal:\n                    # Preserve the handle and its slot lease for a later\n                    # collection attempt.\n                    terminal = handle._future.done()\n                    raise",
+        "if not terminal and handle._future.done():\n                    # A leaf TimeoutError can complete during the bounded\n                    # wait.  Re-raise it now, but retain the handle so the\n                    # next collect observes the terminal future and consumes\n                    # the lease exactly once.\n                    leaf_error = handle._future.exception(timeout=0)\n                    if leaf_error is not None:\n                        raise leaf_error",
+        "if not terminal and handle._future.done():\n                    terminal = True\n                    leaf_error = handle._future.exception(timeout=0)\n                    if leaf_error is not None:\n                        raise leaf_error",
         "test_timeout_completion_race_preserves_uncollected_result",
     ),
     (

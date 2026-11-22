@@ -48,15 +48,16 @@ def test_delta_failed_fresh_admission_still_requires_publication(tmp_path):
     observed_publications = []
 
     class Executor(RecordingExecutor):
-        def launch(self, fence, invocation):
+        def submit(self, fence, invocation):
             observed_publications.append(list(Path(store.root).rglob(".reconciliation-publications/*.json")))
-            return super().launch(fence, invocation)
+            return super().submit(fence, invocation)
 
     executor = Executor()
     result = run_group_controller(_binding(group, allocation.backend_job_id), allocation.backend_job_id,
                                   facts, store, Admission(), executor)
     assert [f.task_id for f, _ in executor.calls] == ["good"]
-    assert dict(result.member_outcomes) == {"bad": "parked", "good": "launched"}
+    assert len(executor.collected) == 1
+    assert dict(result.member_outcomes) == {"bad": "parked", "good": "collected"}
     assert len(observed_publications) == 1 and len(observed_publications[0]) == 1
 
 
@@ -76,9 +77,10 @@ def test_delta_failed_successor_admission_does_not_park_fresh_peer(tmp_path):
     executor = RecordingExecutor()
     result = run_group_controller(_binding(group, facts.allocation.backend_job_id), facts.allocation.backend_job_id,
                                   facts, store, Admission(), executor)
-    assert calls == ["successor", "fresh"]
+    assert calls == ["successor", "fresh", "successor", "fresh"]
     assert [f.task_id for f, _ in executor.calls] == ["fresh"]
-    assert dict(result.member_outcomes) == {"successor": "parked", "fresh": "launched"}
+    assert len(executor.collected) == 1
+    assert dict(result.member_outcomes) == {"successor": "parked", "fresh": "collected"}
     assert not list(Path(store.root).rglob("successor-admission.json"))
 
 
@@ -193,7 +195,8 @@ def test_delta_controller_outcome_round_trip_replay_and_conflict(tmp_path):
     group, allocation, facts, binding, store = _real_fresh(tmp_path)
     executor = RecordingExecutor()
     result = run_group_controller(binding, allocation.backend_job_id, facts, store, EchoAdmission(), executor)
-    assert result.member_outcomes == (("real-task", "launched"),)
+    assert result.member_outcomes == (("real-task", "collected"),)
+    assert len(executor.collected) == 1
     fence, invocation = executor.calls[0]
     reopened = DirectoryStore(store.root)
     intent = reopened.read_launch_intent(fence)
