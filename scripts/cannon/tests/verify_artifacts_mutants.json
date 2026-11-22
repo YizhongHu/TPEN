@@ -35,7 +35,7 @@
     "killer": "test_verify_artifacts.py::test_source_mutation_during_stream_is_valid_or_fails_closed"
   },
   {
-    "id": "size-mismatch-reported-as-ok",
+    "id": "size-mismatch-continues-collection",
     "target": "scripts/cannon/verify.sh",
     "old": "        if size != header_size or current_size != header_size:\n            mark_partial(f\"source size changed during copy: {source}\")\n            return False",
     "new": "        if size != header_size or current_size != header_size:\n            return True",

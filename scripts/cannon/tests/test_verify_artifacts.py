@@ -78,6 +78,30 @@ def _read_archive(path: Path) -> dict[str, bytes]:
         }
 
 
+def _read_truncated_archive_member_names(path: Path) -> set[str]:
+    """Read complete member headers from a tar stream without end blocks."""
+
+    decompressed = subprocess.run(["zstd", "-q", "-d", "-c", str(path)], check=True, capture_output=True).stdout
+    names: set[str] = set()
+    offset = 0
+    while offset + 512 <= len(decompressed):
+        header = decompressed[offset : offset + 512]
+        if not any(header):
+            break
+        name = header[:100].split(b"\0", 1)[0].decode()
+        size_field = header[124:136].rstrip(b"\0 ")
+        try:
+            size = int(size_field or b"0", 8)
+        except ValueError:
+            break
+        body_end = offset + 512 + size
+        if body_end > len(decompressed):
+            break
+        names.add(name)
+        offset = body_end + ((-size) % 512)
+    return names
+
+
 def _collector_harness(source: str, run_root: Path, work_root: Path, clone: Path) -> str:
     """Return a shell fixture containing the collector without the Slurm runner."""
 
@@ -244,9 +268,12 @@ def test_source_mutation_during_stream_is_valid_or_fails_closed(tmp_path: Path) 
         (run_root / "evidence/verdict.txt").write_text("FAIL\n")
         (run_root / "evidence/driver-exit.txt").write_text("DRIVER_EXIT=7\n")
         work_root = case_root / "work"
-        target = work_root / "tmp" / "pytest-basetemp" / "toctou.bin"
+        target = work_root / "tmp" / "pytest-basetemp" / "aaa-toctou.bin"
         target.parent.mkdir(parents=True)
         target.write_bytes(b"A" * (64 * 1024 * 1024))
+        later = target.parent / "zzz-later-dir" / "later-member.log"
+        later.parent.mkdir()
+        later.write_bytes(b"later member\n")
         clone = _make_clone(case_root)
 
         marker = case_root / "copy-started"
@@ -278,9 +305,13 @@ def test_source_mutation_during_stream_is_valid_or_fails_closed(tmp_path: Path) 
         assert status.startswith("ARTIFACTS_PARTIAL reason=source size changed during copy:")
         assert (run_root / "evidence/verdict.txt").read_text() == "FAIL\n"
         assert (run_root / "evidence/driver-exit.txt").read_text() == "DRIVER_EXIT=7\n"
-        assert f"tmpdir/pytest-basetemp/toctou.bin" not in {
+        archive_members = _read_truncated_archive_member_names(run_root / "artifacts/artifacts.tar.zst")
+        assert "tmpdir/pytest-basetemp/zzz-later-dir/later-member.log" not in archive_members
+        manifest_members = {
             path for path, _, _ in _manifest_entries(run_root / "artifacts/MANIFEST.tsv")
         }
+        assert "tmpdir/pytest-basetemp/aaa-toctou.bin" not in manifest_members
+        assert "tmpdir/pytest-basetemp/zzz-later-dir/later-member.log" not in manifest_members
 
 
 def test_collector_failure_preserves_verdict_and_cleans_scratch(tmp_path: Path) -> None:
