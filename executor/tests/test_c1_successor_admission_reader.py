@@ -53,7 +53,7 @@ def _make_admitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     record = store.record_successor_admission(predecessor, request, "b" * 64)
     monkeypatch.setattr(storage, "uuid4", lambda: SimpleNamespace(hex="successor-1"))
     successor = store.begin_attempt(group, "a", allocation, "2026-11-14T00:02:00Z")
-    return store, group, predecessor, successor, request, record
+    return store, group, allocation, predecessor, successor, request, record
 
 
 def _read(successor, **extra):
@@ -62,8 +62,13 @@ def _read(successor, **extra):
     return read_successor_admission(**args)
 
 
+def _ledger_path(predecessor) -> Path:
+    """Return the ledger path keyed by the predecessor attempt identity."""
+    return Path(predecessor.output_dir).parent / "successor-admissions" / predecessor.attempt_id.value / "successor-admission.json"
+
+
 def test_reader_returns_fresh_record_and_rebuilt_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _store, _group, _predecessor, successor, request, record = _make_admitted(tmp_path, monkeypatch)
+    _store, _group, _allocation, _predecessor, successor, request, record = _make_admitted(tmp_path, monkeypatch)
     result = _read(successor)
     assert result["record"] == record.to_dict()
     assert result["request"] == request
@@ -73,9 +78,12 @@ def test_reader_returns_fresh_record_and_rebuilt_request(tmp_path: Path, monkeyp
 
 
 def test_reader_rejects_absent_and_wrong_task_or_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _store, _group, _predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
+    store, group, allocation, _predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
+    # A second public begin_attempt has no admission record; its own identity reaches AdmissionAbsent.
+    monkeypatch.setattr(storage, "uuid4", lambda: SimpleNamespace(hex="unadmitted-1"))
+    absent = store.begin_attempt(group, "a", allocation, "2026-11-14T00:03:00Z")
     with pytest.raises(AdmissionAbsent):
-        _read(successor, attempt_id="missing")
+        _read(absent)
     with pytest.raises(AdmissionIdentityMismatch):
         _read(successor, task_id="wrong-task")
     with pytest.raises(AdmissionIdentityMismatch):
@@ -83,7 +91,7 @@ def test_reader_rejects_absent_and_wrong_task_or_attempt(tmp_path: Path, monkeyp
 
 
 def test_reader_rejects_crossed_group_and_outside_layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _store, _group, _predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
+    _store, _group, _allocation, _predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
     with pytest.raises(AdmissionIdentityMismatch):
         _read(successor, group_digest="c" * 64)
     outside = tmp_path / "store" / "not-groups" / successor.group_digest / successor.task_id / successor.attempt_id.value
@@ -92,8 +100,8 @@ def test_reader_rejects_crossed_group_and_outside_layout(tmp_path: Path, monkeyp
 
 
 def test_reader_rejects_foreign_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _store, _group, _predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
-    ledger = Path(successor.output_dir).parent / "successor-admissions" / successor.attempt_id.value / "successor-admission.json"
+    _store, _group, _allocation, predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
+    ledger = _ledger_path(predecessor)
     payload = json.loads(ledger.read_text())
     payload["predecessor"]["task_id"] = "foreign-task"
     ledger.write_bytes(canonical_bytes(payload))
@@ -103,13 +111,13 @@ def test_reader_rejects_foreign_record(tmp_path: Path, monkeypatch: pytest.Monke
 
 @pytest.mark.parametrize("science_input_digest,target_iterations", [("a" * 64, 11), ("c" * 64, 10)])
 def test_reader_rejects_wrong_intent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, science_input_digest: str, target_iterations: int) -> None:
-    _store, _group, _predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
+    _store, _group, _allocation, _predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
     with pytest.raises(AdmissionIntentMismatch):
         _read(successor, science_input_digest=science_input_digest, target_iterations=target_iterations)
 
 
 def test_reader_rejects_noncanonical_predecessor_core_outcome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _store, _group, predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
+    _store, _group, _allocation, predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
     path = Path(predecessor.output_dir, "core-outcome.json")
     path.write_bytes(path.read_bytes() + b" ")
     with pytest.raises(AdmissionUnreadable):
@@ -117,8 +125,8 @@ def test_reader_rejects_noncanonical_predecessor_core_outcome(tmp_path: Path, mo
 
 
 def test_reader_rejects_truncated_and_noncanonical_ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _store, _group, _predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
-    ledger = Path(successor.output_dir).parent / "successor-admissions" / successor.attempt_id.value / "successor-admission.json"
+    _store, _group, _allocation, predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
+    ledger = _ledger_path(predecessor)
     original = ledger.read_bytes()
     for payload in (b"{", original + b" "):
         ledger.write_bytes(payload)
@@ -127,7 +135,7 @@ def test_reader_rejects_truncated_and_noncanonical_ledger(tmp_path: Path, monkey
 
 
 def test_reader_rejects_ambiguous_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _store, _group, _predecessor, successor, _request, record = _make_admitted(tmp_path, monkeypatch)
+    _store, _group, _allocation, predecessor, successor, _request, record = _make_admitted(tmp_path, monkeypatch)
     # Public APIs reject predecessor forks, so this minimal fixture covers ambiguity reachability.
     second = Path(successor.output_dir).parent / "successor-admissions" / "other-predecessor"
     second.mkdir()
@@ -138,7 +146,7 @@ def test_reader_rejects_ambiguous_fixture(tmp_path: Path, monkeypatch: pytest.Mo
 
 
 def test_reader_snapshot_is_read_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _store, _group, _predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
+    _store, _group, _allocation, _predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
     task_dir = Path(successor.output_dir).parent
     before = _snapshot(task_dir)
     _read(successor)
