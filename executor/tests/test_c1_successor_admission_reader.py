@@ -23,7 +23,7 @@ from test_continuation_admission import _planned_attempt
 
 MUTANTS = (
     {"id": "a", "target": "executor/src/tpen_executor/storage.py", "old": "matches = [record for record in records if record.successor_attempt_id.value == attempt_id]", "new": "matches = list(records)", "killer": "test_mutant_a_successor_filter"},
-    {"id": "b", "target": "executor/src/tpen_executor/storage.py", "old": "if len(matches) > 1:\n                raise AdmissionAmbiguous", "new": "if len(matches) > 0:\n                raise AdmissionAmbiguous", "killer": "test_mutant_b_ambiguous_is_rejected"},
+    {"id": "b", "target": "executor/src/tpen_executor/storage.py", "old": "if len(matches) > 1:\n                raise AdmissionAmbiguous", "new": "if False:\n                raise AdmissionAmbiguous", "killer": "test_mutant_b_ambiguous_is_rejected"},
     {"id": "c", "target": "executor/src/tpen_executor/storage.py", "old": "if path_digest != group_digest or path_task != task_id or os.path.basename(output) != attempt_id:", "new": "if False:", "killer": "test_mutant_c_group_digest_is_checked"},
     {"id": "d", "target": "executor/src/tpen_executor/storage.py", "old": "raise AdmissionUnreadable(\"successor admission ledger is unreadable\") from error", "new": "raise AdmissionAbsent(\"successor admission ledger is unreadable\") from error", "killer": "test_mutant_d_corrupt_ledger_is_unreadable"},
     {"id": "e", "target": "executor/src/tpen_executor/storage.py", "old": "if digest(request) != record.request_digest:", "new": "if False:", "killer": "test_mutant_e_intent_digest_is_checked"},
