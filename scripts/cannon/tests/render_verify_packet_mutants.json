@@ -1,0 +1,44 @@
+[
+  {
+    "id": "escaped-newline-check-removed",
+    "target": "scripts/cannon/render_verify_packet.py",
+    "old": "        if ESCAPED_NEWLINE in row[\"old\"] or ESCAPED_NEWLINE in row[\"new\"]:\n            raise RenderError(f\"mutant {row['id']!r} contains literal escaped newline text\")",
+    "new": "        if False:  # mutant: accept escaped newline text\n            raise RenderError(f\"mutant {row['id']!r} contains literal escaped newline text\")",
+    "killer": "test_render_verify_packet.py::test_escaped_newline_mutant_is_rejected"
+  },
+  {
+    "id": "killer-shape-check-removed",
+    "target": "scripts/cannon/render_verify_packet.py",
+    "old": "        if not KILLER_RE.fullmatch(killer) or Path(killer.split(\"::\", 1)[0]).is_absolute():",
+    "new": "        if False:  # mutant: accept full-path killer",
+    "killer": "test_render_verify_packet.py::test_full_path_killer_is_rejected"
+  },
+  {
+    "id": "escaped-dollar-check-removed",
+    "target": "scripts/cannon/render_verify_packet.py",
+    "old": "    if r\"\\$\" in body:",
+    "new": "    if False:  # mutant: accept escaped dollar",
+    "killer": "test_render_verify_packet.py::test_escaped_dollar_is_rejected"
+  },
+  {
+    "id": "dry-run-check-removed",
+    "target": "scripts/cannon/render_verify_packet.py",
+    "old": "    if \"DRY_RUN=1\" in body:",
+    "new": "    if False:  # mutant: leave DRY_RUN enabled",
+    "killer": "test_render_verify_packet.py::test_dry_run_left_on_is_rejected"
+  },
+  {
+    "id": "existing-packet-check-removed",
+    "target": "scripts/cannon/render_verify_packet.py",
+    "old": "    if packet.exists() or packet.is_symlink():",
+    "new": "    if False:  # mutant: overwrite an existing packet",
+    "killer": "test_render_verify_packet.py::test_existing_packet_dir_is_rejected"
+  },
+  {
+    "id": "dry-execute-check-removed",
+    "target": "scripts/cannon/render_verify_packet.py",
+    "old": "    _dry_execute(body_path, task_root, run_root, mutant_spec)",
+    "new": "    pass  # mutant: skip env -i dry execution",
+    "killer": "test_render_verify_packet.py::test_single_quoted_work_root_is_rejected"
+  }
+]
