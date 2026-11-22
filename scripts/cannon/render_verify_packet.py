@@ -102,8 +102,9 @@ def _load_mutants(path: Path) -> List[Dict[str, str]]:
 def _validate_with_mutant_helper(helper: Path, spec: Path) -> None:
     result = subprocess.run(
         [sys.executable, str(helper), "validate", "--spec", str(spec)],
-        text=True,
-        capture_output=True,
+        universal_newlines=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         check=False,
     )
     if result.returncode:
@@ -246,8 +247,9 @@ def _dry_execute(body_path: Path, task_root: Path, run_root: Path, mutant_spec: 
     }
     result = subprocess.run(
         ["/usr/bin/env", "-i", *[f"{key}={value}" for key, value in env.items()], "/bin/bash", str(body_path)],
-        text=True,
-        capture_output=True,
+        universal_newlines=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         check=False,
     )
     if result.returncode:
@@ -265,7 +267,13 @@ def _validate_body(body: str, body_path: Path, task_root: Path, run_root: Path, 
         raise RenderError("rendered body contains a literal backslash-dollar")
     if "DRY_RUN=1" in body:
         raise RenderError("rendered body leaves DRY_RUN enabled")
-    result = subprocess.run(["/bin/bash", "-n", str(body_path)], text=True, capture_output=True, check=False)
+    result = subprocess.run(
+        ["/bin/bash", "-n", str(body_path)],
+        universal_newlines=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
     if result.returncode:
         raise RenderError(f"bash -n rejected rendered body: {result.stderr.strip()}")
     _dry_execute(body_path, task_root, run_root, mutant_spec)
