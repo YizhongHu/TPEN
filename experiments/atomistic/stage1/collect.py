@@ -18,6 +18,7 @@ from experiments.atomistic.stage1.protocol import (
     LEGACY_CONFIG_IDENTITY_RULE,
     _validate_config_identity_for_row,
     HOOKE_SCIENCE_PROFILE,
+    HOOKE_SYSTEMS,
     _is_he_h2_production_phase,
     manifest_hash,
     ProtocolError,
@@ -111,7 +112,7 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
     phase1_rows = [row for row in rows if row.get("kind") != "eval"]
     phase1_hooke_train_rows = [
         row for row in phase1_rows
-        if row.get("kind") == "train" and row.get("system") in {"hooke1", "hooke2"}
+        if row.get("kind") == "train" and row.get("system") in HOOKE_SYSTEMS
     ]
     phase1_train_profiles = {
         row.get("science_profile") for row in phase1_hooke_train_rows

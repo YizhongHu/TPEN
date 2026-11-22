@@ -26,7 +26,7 @@ import yaml
 from experiments.baselines.systems import load_registry
 from experiments.toolkit.run_paths import resolve_run_dir
 
-SYSTEMS = ("hooke1", "hooke2", "he", "h2")
+SYSTEMS = ("hooke1", "hooke2", "qho2e", "he", "h2")
 KINDS = ("smoke", "train", "eval")
 CONFIG_IDENTITY_RULE = "stage1-config-v1"
 LEGACY_CONFIG_IDENTITY_RULE = "legacy-config-sha256"
@@ -35,15 +35,21 @@ HOOKE_TRAINING_SEED_RULE = "stage1-training-seeds-v1"
 HOOKE_EVAL_SELECTION = "A37"
 HOOKE_EVAL_SELECTION_ID = "hooke-hv2-a37-v1"
 HOOKE_A37 = tuple(range(0, 21_000, 1_000)) + tuple(range(25_000, 100_001, 5_000))
+QHO_EVAL_SELECTION = "Q21"
+QHO_EVAL_SELECTION_ID = "qho2e-q21-v1"
+QHO_Q21 = (0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000,
+           9_000, 10_000, 15_000, 20_000, 30_000, 40_000, 50_000,
+           60_000, 70_000, 80_000, 90_000, 100_000)
 HE_H2_EVAL_SELECTION = "B"
 HE_H2_EVAL_SELECTION_ID = "he-h2-b-v1"
 HE_H2_EVAL_CHECKPOINTS = (0, 1_000, 2_000, 4_000, 8_000, 16_000,
                           25_000, 40_000, 60_000, 80_000, 100_000)
 HE_H2_SYSTEMS = frozenset({"he", "h2"})
+HOOKE_SYSTEMS = frozenset({"hooke1", "hooke2", "qho2e"})
 OVERLAY_RELATIVE_PATH = "configs/overlays/diagnostics-v1.yaml"
 HOOKE_OVERLAY_RELATIVE_PATH = "configs/overlays/hooke-diagnostics-v1.yaml"
 OVERLAY_SYSTEMS = frozenset({"he", "h2"})
-HOOKE_OVERLAY_SYSTEMS = frozenset({"hooke1", "hooke2"})
+HOOKE_OVERLAY_SYSTEMS = HOOKE_SYSTEMS
 OVERLAY_PATH_BY_SYSTEM = {
     **{system: OVERLAY_RELATIVE_PATH for system in OVERLAY_SYSTEMS},
     **{system: HOOKE_OVERLAY_RELATIVE_PATH for system in HOOKE_OVERLAY_SYSTEMS},
@@ -116,9 +122,20 @@ STAGE1_PROTOCOL = Protocol(1000, 256, 100000, 4096, 3, 4, 4096, 256, 1000)
 SYSTEM_SPECS = tuple(SystemSpec(name, system_id) for name, system_id in (
     ("hooke1", "hooke_one_electron_omega0.5"),
     ("hooke2", "hooke_pair_singlet_omega0.5"),
+    ("qho2e", "qho_pair_noninteracting_singlet_omega0.5"),
     ("he", "he_atom"),
     ("h2", "h2_molecule"),
 ))
+
+
+def hooke_evaluation_selection(system: str) -> tuple[str, str, tuple[int, ...]]:
+    """Return the frozen evaluation selection for one Hooke-family system."""
+
+    if system == "qho2e":
+        return QHO_EVAL_SELECTION, QHO_EVAL_SELECTION_ID, QHO_Q21
+    if system in {"hooke1", "hooke2"}:
+        return HOOKE_EVAL_SELECTION, HOOKE_EVAL_SELECTION_ID, HOOKE_A37
+    raise ProtocolError(f"not a Hooke-family system: {system!r}")
 
 
 def resolve_config_path(config: str | Path) -> Path:
@@ -689,7 +706,7 @@ def validate_he_h2_eval_grid(
 def _validate_hooke_science_train_row(row: Mapping[str, Any]) -> None:
     """Validate the complete provenance and seed binding for a Hooke row."""
 
-    if row.get("system") not in {"hooke1", "hooke2"}:
+    if row.get("system") not in HOOKE_SYSTEMS:
         raise ProtocolError("Hooke science profile is only valid for Hooke systems")
     if row.get("kind") != "train":
         raise ProtocolError("Hooke science profile is only valid for train rows")
@@ -701,9 +718,10 @@ def _validate_hooke_science_train_row(row: Mapping[str, Any]) -> None:
         raise ProtocolError("Hooke science profile requires 101 production checkpoints")
     if row.get("training_seed_rule") != HOOKE_TRAINING_SEED_RULE:
         raise ProtocolError("unknown Hooke training seed rule")
-    if row.get("evaluation_selection") != HOOKE_EVAL_SELECTION:
-        raise ProtocolError("Hooke science row must bind the A37 evaluation selection")
-    if row.get("evaluation_selection_id", row.get("selection_id")) != HOOKE_EVAL_SELECTION_ID:
+    selection, selection_id, _ = hooke_evaluation_selection(str(row["system"]))
+    if row.get("evaluation_selection") != selection:
+        raise ProtocolError("Hooke science row has an invalid evaluation selection")
+    if row.get("evaluation_selection_id", row.get("selection_id")) != selection_id:
         raise ProtocolError("Hooke science row has an invalid evaluation selection id")
     lineage = row.get("lineage")
     lineage_seed = row.get("lineage_seed")
@@ -729,7 +747,7 @@ def validate_hooke_eval_grid(
     expected_systems: tuple[str, ...] | list[str] | None = None,
     expected_profile: str | None = None,
 ) -> None:
-    """Require the exact Hooke A37 x lineage x stream evaluation multiset.
+    """Require each Hooke system's frozen selection x lineage x stream multiset.
 
     The check is intentionally a multiset comparison.  Row counts and
     per-coordinate stream checks cannot detect a balanced deletion/replacement
@@ -737,9 +755,9 @@ def validate_hooke_eval_grid(
     complete.
     """
 
-    hooke_rows = [row for row in rows if row.get("system") in {"hooke1", "hooke2"}]
+    hooke_rows = [row for row in rows if row.get("system") in HOOKE_SYSTEMS]
     declared_systems = tuple(expected_systems) if expected_systems is not None else ()
-    if any(system not in {"hooke1", "hooke2"} for system in declared_systems):
+    if any(system not in HOOKE_SYSTEMS for system in declared_systems):
         raise ProtocolError("Hooke evaluation grid has an invalid expected system")
     if len(set(declared_systems)) != len(declared_systems):
         raise ProtocolError("Hooke evaluation grid has duplicate expected systems")
@@ -758,24 +776,30 @@ def validate_hooke_eval_grid(
         (system, lineage, checkpoint, stream)
         for system in systems
         for lineage in range(STAGE1_PROTOCOL.lineages)
-        for checkpoint in HOOKE_A37
+        for checkpoint in hooke_evaluation_selection(system)[2]
         for stream in range(STAGE1_PROTOCOL.eval_streams)
     ]
     actual: list[tuple[str, int, int, int]] = []
     for row in hooke_rows:
         if row.get("kind") != "eval":
-            raise ProtocolError("Hooke A37 grid contains a non-eval row")
+            raise ProtocolError("Hooke evaluation grid contains a non-eval row")
         coordinates = (row.get("system"), row.get("lineage"),
                        row.get("checkpoint"), row.get("stream"))
         if (type(coordinates[1]) is not int or type(coordinates[2]) is not int
                 or type(coordinates[3]) is not int):
-            raise ProtocolError("Hooke A37 grid coordinates must be integers")
-        if row.get("evaluation_selection") != HOOKE_EVAL_SELECTION:
-            raise ProtocolError("Hooke eval row does not bind A37")
+            raise ProtocolError("Hooke evaluation grid coordinates must be integers")
+        expected_selection, _, _ = hooke_evaluation_selection(str(row.get("system")))
+        if row.get("evaluation_selection") != expected_selection:
+            raise ProtocolError("Hooke eval row does not bind its frozen selection")
         actual.append(coordinates)  # type: ignore[arg-type]
     if sorted(actual) != sorted(expected):
+        selection_labels = {
+            hooke_evaluation_selection(system)[0] for system in systems
+        }
+        selection_label = next(iter(selection_labels)) if len(selection_labels) == 1 else "frozen"
         raise ProtocolError(
-            f"Hooke A37 grid mismatch: expected {len(expected)} rows, got {len(actual)}"
+            f"Hooke {selection_label} grid mismatch: "
+            f"expected {len(expected)} rows, got {len(actual)}"
         )
 
 
@@ -1332,13 +1356,24 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
     if science_profile not in {None, HOOKE_SCIENCE_PROFILE}:
         raise ProtocolError("unknown science profile")
     if science_profile == HOOKE_SCIENCE_PROFILE:
-        if not set(selected).issubset({"hooke1", "hooke2"}):
+        if not set(selected).issubset(HOOKE_SYSTEMS):
             raise ProtocolError("Hooke science profile cannot mix in He/H2 systems")
-        if evaluation_selection not in {None, HOOKE_EVAL_SELECTION}:
+        if evaluation_selection not in {None, HOOKE_EVAL_SELECTION, QHO_EVAL_SELECTION}:
             raise ProtocolError("unknown Hooke evaluation selection")
-        evaluation_selection = HOOKE_EVAL_SELECTION
-        if phase == 2 and list(checkpoints) != list(HOOKE_A37):
-            raise ProtocolError("Hooke science phase 2 requires the exact A37 roster")
+        if set(selected) == {"qho2e"}:
+            if evaluation_selection not in {None, QHO_EVAL_SELECTION}:
+                raise ProtocolError("QHO-2e requires the exact Q21 selection")
+            evaluation_selection = QHO_EVAL_SELECTION
+            expected_phase2_checkpoints = QHO_Q21
+        else:
+            if evaluation_selection not in {None, HOOKE_EVAL_SELECTION}:
+                raise ProtocolError("mixed Hooke science requires the A37 selection")
+            evaluation_selection = HOOKE_EVAL_SELECTION
+            expected_phase2_checkpoints = HOOKE_A37
+        if phase == 2 and list(checkpoints) != list(expected_phase2_checkpoints):
+            raise ProtocolError(
+                f"Hooke science phase 2 requires the exact {evaluation_selection} roster"
+            )
     elif evaluation_selection is not None:
         raise ProtocolError("evaluation_selection requires the Hooke science profile")
     he_h2_selection = (
@@ -1379,7 +1414,9 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         raise ProtocolError("checkpoints must be a non-empty list of non-negative updates")
     if len(set(checkpoints)) != len(checkpoints):
         raise ProtocolError("checkpoints must not contain duplicates")
-    if protocol.retention_cadence is not None:
+    if protocol.retention_cadence is not None and (
+        phase == 1 or science_profile != HOOKE_SCIENCE_PROFILE
+    ):
         expected_checkpoints = list(range(
             0, protocol.lineage_updates + 1, protocol.retention_cadence
         ))
@@ -1423,16 +1460,21 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
             training_seed(system=spec.name, lineage=lineage, lineage_seed=seed)
             for lineage, seed in enumerate(lineage_seeds)
         )
-        if science_profile == HOOKE_SCIENCE_PROFILE and spec.name in {"hooke1", "hooke2"}:
+        if science_profile == HOOKE_SCIENCE_PROFILE and spec.name in HOOKE_SYSTEMS:
             candidate_seeds.extend(
                 sampler_seed(system=spec.name, lineage=lineage, lineage_seed=seed)
                 for lineage, seed in enumerate(lineage_seeds)
             )
+        candidate_checkpoints = (
+            hooke_evaluation_selection(spec.name)[2]
+            if science_profile == HOOKE_SCIENCE_PROFILE and spec.name in HOOKE_SYSTEMS
+            else checkpoints
+        )
         candidate_seeds.extend(
             evaluation_seed(system=spec.name, lineage=lineage,
                             checkpoint=checkpoint, stream=stream)
             for lineage in range(protocol.lineages)
-            for checkpoint in checkpoints
+            for checkpoint in candidate_checkpoints
             for stream in range(protocol.eval_streams)
         )
         for candidate in candidate_seeds:
@@ -1441,6 +1483,12 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
             protocol_seeds.add(candidate)
     rows: list[dict[str, Any]] = []
     seen_seeds: set[int] = set()
+    training_checkpoints = (
+        list(range(0, protocol.lineage_updates + 1, protocol.retention_cadence))
+        if science_profile == HOOKE_SCIENCE_PROFILE
+        and protocol.retention_cadence is not None
+        else list(checkpoints)
+    )
     for spec in SYSTEM_SPECS:
         if spec.name not in selected:
             continue
@@ -1479,16 +1527,16 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                 "run_id": f"train-lineage-{lineage}",
                 "updates": protocol.lineage_updates,
                 "walkers": protocol.lineage_walkers,
-                "checkpoint_steps": list(checkpoints),
+                "checkpoint_steps": training_checkpoints,
             }
             if science_profile == HOOKE_SCIENCE_PROFILE:
                 row.update({
                     "science_profile": HOOKE_SCIENCE_PROFILE,
                     "training_seed_rule": HOOKE_TRAINING_SEED_RULE,
                     "lineage_seed": seed,
-                    "evaluation_selection": HOOKE_EVAL_SELECTION,
-                    "evaluation_selection_id": HOOKE_EVAL_SELECTION_ID,
-                    "selection_id": HOOKE_EVAL_SELECTION_ID,
+                    "evaluation_selection": hooke_evaluation_selection(spec.name)[0],
+                    "evaluation_selection_id": hooke_evaluation_selection(spec.name)[1],
+                    "selection_id": hooke_evaluation_selection(spec.name)[1],
                     "sampler_seed": sampler_seed(
                         system=spec.name, lineage=lineage, lineage_seed=seed,
                     ),
@@ -1501,7 +1549,12 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
             train_row = rows[-1]
             if phase == 1:
                 continue
-            for checkpoint in checkpoints:
+            eval_checkpoints = (
+                hooke_evaluation_selection(spec.name)[2]
+                if science_profile == HOOKE_SCIENCE_PROFILE and spec.name in HOOKE_SYSTEMS
+                else tuple(checkpoints)
+            )
+            for checkpoint in eval_checkpoints:
                 for stream in range(protocol.eval_streams):
                     key = (spec.name, lineage, checkpoint)
                     checkpoint_digest = _require_sha(
@@ -1532,9 +1585,9 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                         "checkpoint_sha256": checkpoint_digest, "depends_on": train_id,
                         **({
                             "science_profile": HOOKE_SCIENCE_PROFILE,
-                            "evaluation_selection": HOOKE_EVAL_SELECTION,
-                            "evaluation_selection_id": HOOKE_EVAL_SELECTION_ID,
-                            "selection_id": HOOKE_EVAL_SELECTION_ID,
+                            "evaluation_selection": hooke_evaluation_selection(spec.name)[0],
+                            "evaluation_selection_id": hooke_evaluation_selection(spec.name)[1],
+                            "selection_id": hooke_evaluation_selection(spec.name)[1],
                         } if science_profile == HOOKE_SCIENCE_PROFILE else {
                             "evaluation_selection": HE_H2_EVAL_SELECTION,
                             "evaluation_selection_id": HE_H2_EVAL_SELECTION_ID,
@@ -1601,13 +1654,17 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
     he_h2_selection = _is_he_h2_production_phase(phase1_rows)
     hooke_science = any(_is_hooke_science_row(row) for row in train_rows)
     if hooke_science:
-        if not set(systems).issubset({"hooke1", "hooke2"}):
+        if not set(systems).issubset(HOOKE_SYSTEMS):
             raise ProtocolError("Hooke science phase cannot mix in He/H2 rows")
         for row in train_rows:
-            if row.get("system") in {"hooke1", "hooke2"}:
+            if row.get("system") in HOOKE_SYSTEMS:
                 _validate_hooke_science_train_row(row)
-        if list(checkpoints) != list(HOOKE_A37):
-            raise ProtocolError("Hooke science phase 2 requires the exact A37 roster")
+        expected_checkpoints = QHO_Q21 if set(systems) == {"qho2e"} else HOOKE_A37
+        if list(checkpoints) != list(expected_checkpoints):
+            selection = QHO_EVAL_SELECTION if set(systems) == {"qho2e"} else HOOKE_EVAL_SELECTION
+            raise ProtocolError(
+                f"Hooke science phase 2 requires the exact {selection} roster"
+            )
     if he_h2_selection and list(checkpoints) != list(HE_H2_EVAL_CHECKPOINTS):
         raise ProtocolError("He/H2 production phase 2 requires the exact roster-B checkpoints")
     train_identity_keys = [f"{row.get('system')}:{row.get('lineage')}" for row in train_rows]
@@ -1679,6 +1736,15 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         }
         if set(bindings) != expected_bindings:
             raise ProtocolError("He/H2 roster-B checkpoint evidence is incomplete or out of scope")
+    if hooke_science:
+        expected_bindings = {
+            (system, lineage, checkpoint)
+            for system in systems
+            for lineage in range(STAGE1_PROTOCOL.lineages)
+            for checkpoint in hooke_evaluation_selection(system)[2]
+        }
+        if set(bindings) != expected_bindings:
+            raise ProtocolError("Hooke checkpoint evidence is incomplete or out of scope")
     if protocol is not None:
         eval_streams, eval_walkers, eval_draws = protocol.eval_streams, protocol.eval_walkers, protocol.eval_draws
     if eval_streams <= 0 or eval_walkers <= 0 or eval_draws <= 0:
@@ -1726,7 +1792,12 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
     for train_row in train_rows:
         system = str(train_row["system"])
         lineage = int(train_row["lineage"])
-        for checkpoint in checkpoints:
+        eval_checkpoints = (
+            hooke_evaluation_selection(system)[2]
+            if hooke_science and system in HOOKE_SYSTEMS
+            else tuple(checkpoints)
+        )
+        for checkpoint in eval_checkpoints:
             key = (system, lineage, checkpoint)
             digest = bindings.get(key)
             if digest is None:
@@ -1754,9 +1825,9 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
                     "checkpoint_sha256": digest, "depends_on": train_row["row_id"],
                     **({
                         "science_profile": HOOKE_SCIENCE_PROFILE,
-                        "evaluation_selection": HOOKE_EVAL_SELECTION,
-                        "evaluation_selection_id": HOOKE_EVAL_SELECTION_ID,
-                        "selection_id": HOOKE_EVAL_SELECTION_ID,
+                        "evaluation_selection": hooke_evaluation_selection(system)[0],
+                        "evaluation_selection_id": hooke_evaluation_selection(system)[1],
+                        "selection_id": hooke_evaluation_selection(system)[1],
                     } if hooke_science else {
                         "evaluation_selection": HE_H2_EVAL_SELECTION,
                         "evaluation_selection_id": HE_H2_EVAL_SELECTION_ID,

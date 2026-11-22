@@ -9,7 +9,7 @@ import pytest
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
-from experiments.atomistic.stage1.protocol import SYSTEMS, ProtocolError, physical_system_id_from_config
+from experiments.atomistic.stage1.protocol import HOOKE_SYSTEMS, SYSTEMS, ProtocolError, physical_system_id_from_config
 from tpen.run import load_config
 
 
@@ -186,7 +186,7 @@ def test_physical_id_ignores_run_and_evaluation_budget_changes(
     assert physical_system_id_from_config(changed) == expected
 
     def change_physics(cfg) -> None:
-        if system in {"hooke1", "hooke2"}:
+        if system in HOOKE_SYSTEMS:
             cfg.hamiltonian_terms.harmonic_trap.omega = 0.6
         else:
             cfg.system_descriptor.particle.n_spin_up = 2

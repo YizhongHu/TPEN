@@ -37,7 +37,7 @@ ROOT = Path(__file__).parents[1]
 HOOKE_OVERLAY = ROOT / "configs" / "overlays" / "hooke-diagnostics-v1.yaml"
 
 
-@pytest.mark.parametrize("system", ["hooke1", "hooke2"])
+@pytest.mark.parametrize("system", ["hooke1", "hooke2", "qho2e"])
 def test_hooke_train_eval_shape_and_physics_are_explicit(system: str) -> None:
     train = OmegaConf.load(ROOT / "configs" / system / "train.yaml")
     evaluation = OmegaConf.load(ROOT / "configs" / system / "eval.yaml")
@@ -56,6 +56,9 @@ def test_hooke_train_eval_shape_and_physics_are_explicit(system: str) -> None:
         assert factor.opposite_spin_coefficient == 0.5
         assert factor.range_parameter == 1.0
         assert factor.trainable_range is False
+    else:
+        assert len(train.model.factors) == 1
+        assert train.model.factors[0]._target_ == "tpen.nn.GaussianConfinement"
     assert evaluation.evaluation_sampler.burn_in == 1000
     assert evaluation.evaluation_sampler.n_steps == 20
 
