@@ -171,10 +171,12 @@ def test_rendered_driver_imports_experiments_outside_checkout(
     ],
 )
 @pytest.mark.parametrize("submission_cwd", ["repo", "unrelated"])
+@pytest.mark.parametrize("results_env", [None, "/contradictory/stage1-root"])
 def test_rendered_driver_resolves_config_from_any_submission_cwd(
     kind: str,
     driver: str,
     submission_cwd: str,
+    results_env: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -211,6 +213,10 @@ def test_rendered_driver_resolves_config_from_any_submission_cwd(
         "run_from_config",
         lambda cfg, **kwargs: (run_calls.append((cfg, kwargs)) or 0),
     )
+    if results_env is None:
+        monkeypatch.delenv("TPEN_STAGE1_RESULTS_ROOT", raising=False)
+    else:
+        monkeypatch.setenv("TPEN_STAGE1_RESULTS_ROOT", results_env)
     monkeypatch.chdir(REPO_ROOT if submission_cwd == "repo" else tmp_path)
     monkeypatch.setattr(sys, "argv", [argv[1], *argv[2:]])
 
@@ -228,6 +234,7 @@ def test_rendered_driver_resolves_config_from_any_submission_cwd(
         assert cfg.sampler.n_walkers == row["walkers"]
         assert cfg.trainer.max_steps == row["updates"]
         assert list(cfg.checkpoint_steps) == list(row["checkpoint_steps"])
+    assert cfg.run.root == row["results_root"]
 
 
 @pytest.mark.parametrize("submission_cwd", ["repo", "unrelated"])
