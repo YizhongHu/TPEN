@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import errno
+import fcntl
 import hashlib
 import json
 import multiprocessing
@@ -20,10 +22,12 @@ from tpen_executor import (
     AdmissionIntentMismatch, AdmissionUnreadable, read_successor_admission,
 )
 from tpen_executor._codec import canonical_bytes, digest
+from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.contracts import AttemptId
 from tpen_executor.results import RemoteTeardownReceipt, SuccessorAdmissionRecord
 from tpen_executor.runners import EvidenceUnavailable
 
+from test_b1a_b_publication import _fixture
 from test_continuation_admission import _planned_attempt
 
 
@@ -91,46 +95,69 @@ def _read_arguments(successor) -> dict[str, object]:
     )
 
 
-def _make_remote_admitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Create a remote predecessor with a real teardown proof and admission."""
-    store, group, allocation = __import__("test_review_p8_executor_r1", fromlist=["setup_store"]).setup_store(tmp_path)
-    predecessor = store.begin_attempt(
-        group, "a", allocation, "2026-11-14T00:00:00Z", transport_kind="remote"
+def _make_remote_admitted(tmp_path: Path):
+    """Create a v2 remote predecessor and consume its bound successor."""
+    store, group, _lease, _inputs, bindings, successors, fences = _fixture(
+        tmp_path, names=("successor",), remote=True
     )
-    core_dir = Path(predecessor.output_dir) / "core"
-    core_dir.mkdir()
-    store.finish_remote_attempt(
+    request, acceptance, successor_binding = successors["successor"]
+    predecessor = fences["successor"]
+    admission = store.record_successor_admission(
         predecessor,
-        {
-            "schema": "tpen-executor/leaf-teardown-v1",
-            "group_digest": predecessor.group_digest,
-            "task_id": predecessor.task_id,
-            "attempt_id": predecessor.attempt_id.value,
-            "allocation_id": predecessor.allocation_id,
-            "backend_job_id": allocation.backend_job_id.value,
-            "child_group_reaped": True,
-            "inspection": "complete",
-        },
-        "c" * 64,
-        "failed",
-        "2026-11-14T00:01:00Z",
+        request,
+        acceptance,
+        predecessor_binding=bindings["successor"],
+        successor_binding=successor_binding,
     )
-    store.record_core_outcome(predecessor, __import__("test_core_evidence_v3", fromlist=["_planned_evidence"])._planned_evidence(core_dir))
+    allocation = ConfiguredAllocation(
+        successor_binding.allocation_attempt.allocation_id,
+        successor_binding.allocation_attempt.backend_job_id,
+        {},
+    )
+    successor = store.begin_admitted_successor(
+        group,
+        "successor",
+        allocation,
+        "successor-start",
+        "remote",
+        allocation_attempt=successor_binding.allocation_attempt,
+        admission=admission,
+    )
     receipt_path = Path(predecessor.output_dir) / "remote-teardown.json"
     receipt = RemoteTeardownReceipt.decode(receipt_path.read_bytes())
     assert receipt_path.read_bytes() == receipt.encode()
     assert receipt.child_group_reaped is True and receipt.inspection == "complete"
-    request = store.build_successor_admission_request(
-        predecessor, AttemptId("successor-1"), "a" * 64, 10
-    )
-    record = store.record_successor_admission(predecessor, request, "b" * 64)
-    monkeypatch.setattr(storage, "uuid4", lambda: SimpleNamespace(hex="successor-1"))
-    successor = store.begin_attempt(group, "a", allocation, "2026-11-14T00:02:00Z")
-    return store, group, allocation, predecessor, successor, request, record
+    return store, group, allocation, predecessor, successor, request, admission
 
 
-def _read_successor_in_child(arguments, ready, returned, results) -> None:
+def _read_successor_in_child(arguments, lock_path, ready, begin_read, events, returned, results) -> None:
+    original_lock = storage._task_lock
+
+    @contextmanager
+    def observing_lock(path: str):
+        if Path(path) == Path(lock_path):
+            fd = os.open(path, os.O_RDWR | os.O_CREAT)
+            try:
+                try:
+                    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (BlockingIOError, OSError) as error:
+                    if not isinstance(error, BlockingIOError) and error.errno not in {
+                        errno.EACCES,
+                        errno.EAGAIN,
+                    }:
+                        raise
+                    events.put(("contended", type(error).__name__))
+                else:
+                    fcntl.lockf(fd, fcntl.LOCK_UN)
+                    events.put(("uncontended", None))
+            finally:
+                os.close(fd)
+        with original_lock(path):
+            yield
+
+    storage._task_lock = observing_lock
     ready.set()
+    begin_read.wait(timeout=5)
     try:
         results.put(("ok", read_successor_admission(**arguments)))
     except BaseException as error:  # pragma: no cover - reported to parent
@@ -234,8 +261,8 @@ def test_reader_translates_bad_task_lock(tmp_path: Path, monkeypatch: pytest.Mon
     assert _entry_inventory(task_dir) == before
 
 
-def test_reader_rejects_remote_admission_without_teardown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _store, _group, _allocation, predecessor, successor, request, record = _make_remote_admitted(tmp_path, monkeypatch)
+def test_reader_rejects_remote_admission_without_teardown(tmp_path: Path) -> None:
+    _store, _group, _allocation, predecessor, successor, request, record = _make_remote_admitted(tmp_path)
     result = _read(successor)
     assert result["record"] == record.to_dict()
     assert result["request"] == request
@@ -246,12 +273,14 @@ def test_reader_rejects_remote_admission_without_teardown(tmp_path: Path, monkey
 
 
 def test_reader_waits_for_task_writer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    store, _group, _allocation, predecessor, successor, _request, _record = _make_remote_admitted(tmp_path, monkeypatch)
+    store, _group, _allocation, predecessor, successor, _request, _record = _make_remote_admitted(tmp_path)
     task_dir = Path(successor.output_dir).parent
     ledger = _ledger_path(predecessor)
     before = ledger.read_bytes()
     lock_acquired = threading.Event()
     release = threading.Event()
+    context = multiprocessing.get_context("spawn")
+    begin_read = context.Event()
     original_lock = storage._task_lock
     lock_path = task_dir / ".task.lock"
 
@@ -276,31 +305,52 @@ def test_reader_waits_for_task_writer(tmp_path: Path, monkeypatch: pytest.Monkey
         except BaseException as error:  # expected after the lock is released
             writer_error.append(error)
 
-    writer = threading.Thread(target=public_writer)
-    writer.start()
-    assert lock_acquired.wait(timeout=5)
-
-    context = multiprocessing.get_context("spawn")
     ready = context.Event()
     returned = context.Event()
+    events = context.Queue()
     results = context.Queue()
     reader = context.Process(
         target=_read_successor_in_child,
-        args=(_read_arguments(successor), ready, returned, results),
+        args=(_read_arguments(successor), str(lock_path), ready, begin_read, events, returned, results),
     )
-    reader.start()
-    assert ready.wait(timeout=5)
-    assert not returned.wait(timeout=0.5)
+    writer: threading.Thread | None = None
+    reader_started = False
+    try:
+        reader.start()
+        reader_started = True
+        assert ready.wait(timeout=5)
 
-    release.set()
-    writer.join(timeout=5)
-    reader.join(timeout=5)
-    assert not writer.is_alive()
-    assert not reader.is_alive()
-    assert writer_error and isinstance(writer_error[0], storage.FenceRejected)
-    result = results.get(timeout=5)
-    assert result[0] == "ok"
-    assert ledger.read_bytes() == before
+        writer = threading.Thread(target=public_writer)
+        writer.start()
+        assert lock_acquired.wait(timeout=5)
+        begin_read.set()
+        contention = events.get(timeout=5)
+        assert contention[0] == "contended"
+        release.set()
+
+        writer.join(timeout=5)
+        assert not writer.is_alive()
+        assert writer_error and isinstance(writer_error[0], storage.FenceRejected)
+        result = results.get(timeout=5)
+        assert result[0] == "ok"
+        reader.join(timeout=5)
+        assert not reader.is_alive()
+        assert ledger.read_bytes() == before
+    finally:
+        release.set()
+        begin_read.set()
+        if writer is not None:
+            writer.join(timeout=5)
+        if reader_started and reader.is_alive():
+            reader.terminate()
+            reader.join(timeout=5)
+            if reader.is_alive():
+                reader.kill()
+                reader.join(timeout=5)
+        events.close()
+        events.join_thread()
+        results.close()
+        results.join_thread()
 
 
 @pytest.mark.parametrize("case", ["relative", "trailing", "symlink", "predecessor"])
