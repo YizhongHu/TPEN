@@ -9,6 +9,7 @@ reporting the command an operator may submit.
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -22,8 +23,24 @@ from typing import Dict, List, Optional, Sequence
 try:
     from experiments.toolkit.job_names import build_job_name, validate_job_name
 except ModuleNotFoundError:  # Direct execution from outside the repository root.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from experiments.toolkit.job_names import build_job_name, validate_job_name
+    repo_root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repo_root))
+    try:
+        from experiments.toolkit.job_names import build_job_name, validate_job_name
+    except SyntaxError:
+        # Cannon login nodes still expose Python 3.6, while the toolkit
+        # package itself targets the project runtime.  Load this stdlib-only
+        # helper without executing the toolkit package initializer.
+        helper_path = repo_root / "experiments" / "toolkit" / "job_names.py"
+        helper_spec = importlib.util.spec_from_file_location(
+            "experiments.toolkit.job_names", helper_path
+        )
+        if helper_spec is None or helper_spec.loader is None:
+            raise
+        helper_module = importlib.util.module_from_spec(helper_spec)
+        helper_spec.loader.exec_module(helper_module)
+        build_job_name = helper_module.build_job_name
+        validate_job_name = helper_module.validate_job_name
 
 
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
