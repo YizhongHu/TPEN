@@ -99,19 +99,31 @@ def test_crossed_or_relative_input_refuses_before_spawn(changes: dict[str, str],
     assert spawned == []
 
 
+def test_allowlisted_entry_rejects_existing_script_with_wrong_suffix_before_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The suffix guard itself is exercised after all earlier path checks pass."""
+
+    spawned = []
+    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: spawned.append((args, kwargs)))
+    wrong_script = ROOT / "experiments" / "atomistic" / "he-importance" / "test_stage_coordinate.py"
+    assert wrong_script.is_file()
+    with pytest.raises(ValueError, match="allowlist"):
+        _program(script_path=str(wrong_script))
+    assert spawned == []
+
+
 # Required T2 mutation map.  Each ``old`` fragment occurs exactly once in its
 # target source, and every killer is a test above.
 MUTANTS = (
     {
         "id": "allowlist-bypass",
-        "target": "executor/src/tpen_executor/programs.py",
+        "target": "executor/src/tpen_executor/configured_program.py",
         "old": "if type(self.entrypoint) is not str or self.entrypoint not in CONFIGURED_PROGRAM_ALLOWLIST:",
         "new": "if type(self.entrypoint) is not str:",
         "killer": "test_unknown_or_dotted_entrypoint_refuses_before_spawn",
     },
     {
         "id": "digest-drops-field",
-        "target": "executor/src/tpen_executor/programs.py",
+        "target": "executor/src/tpen_executor/configured_program.py",
         "old": 'return digest(self.to_dict(include_schema=False))',
         "new": 'return digest({"entrypoint": self.entrypoint})',
         "killer": "test_program_digest_changes_for_every_bound_field",
@@ -125,10 +137,10 @@ MUTANTS = (
     },
     {
         "id": "skip-path-validation",
-        "target": "executor/src/tpen_executor/programs.py",
+        "target": "executor/src/tpen_executor/configured_program.py",
         "old": 'if tuple(Path(script_path).parts[-len(Path(expected).parts):]) != tuple(Path(expected).parts):',
         "new": 'if False:',
-        "killer": "test_crossed_or_relative_input_refuses_before_spawn",
+        "killer": "test_allowlisted_entry_rejects_existing_script_with_wrong_suffix_before_spawn",
     },
 )
 

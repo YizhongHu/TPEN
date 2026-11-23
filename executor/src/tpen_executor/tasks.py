@@ -6,7 +6,7 @@ import os
 from typing import Any, ClassVar, Sequence
 
 from ._codec import decode_json, digest, sha256_text
-from .programs import ConfiguredProgram
+from .configured_program import ConfiguredProgram
 from .runners import ConfiguredProgramCommand, TPENCommand
 from ._records import frozen_record
 
