@@ -40,9 +40,10 @@ directory cannot receive run artifacts.
 ## Parameters
 
 - `HEAD_SHA` is the exact 40-character commit checked out from `repo.bundle`.
-- `JOB_NAME` is supplied with `--job-name`; it must contain the first 12 SHA
-  characters. The Slurm job name and evidence directory therefore identify the
-  exact head.
+- `JOB_NAME` is supplied with `--job-name`; it must follow the operator rule
+  `operator-rule-job-names-20261122` (`<subject>-<purpose>[-<variant>]-<lane>[-<sha8>]`)
+  and contain the first 8 SHA characters. The Slurm job name and evidence
+  directory therefore identify the exact head.
 - `MUTANT_SPEC` names the JSON file defining the mutants. Executor killer
   selectors are rooted at `executor/tests/...` in the spec and are normalized
   to `tests/...` when pytest runs from the executor directory. Root selectors
