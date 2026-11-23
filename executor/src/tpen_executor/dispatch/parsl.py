@@ -45,7 +45,7 @@ from .._codec import canonical_bytes, digest
 from ..results import RunManifest
 from ..contracts import ReadyGroup
 from ..lifecycle.attached import AttachedAllocation
-from ..runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
+from ..runners import ConfiguredProgramCommand, CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
 from ..tasks import ConfiguredRun
 from ..workers import ProcessOutcome, SubprocessWorker
 from .contract import (
@@ -380,7 +380,7 @@ def _require_standard_worker(materialized: Any) -> None:
     expected = {
         "environment": PreparedPythonEnvironment,
         "process": SubprocessWorker,
-        "runner": TPENCommand,
+        "runner": (TPENCommand, ConfiguredProgramCommand),
         "evidence": TPENEvidence,
     }
     for name, kind in expected.items():
@@ -388,9 +388,15 @@ def _require_standard_worker(materialized: Any) -> None:
             value = materialized[name]
         except (KeyError, TypeError) as error:
             raise UnsupportedTransportError(f"remote worker program lacks its {name} slot") from error
-        if type(value) is not kind:
+        if type(kind) is tuple:
+            valid = type(value) in kind
+            expected_name = " or ".join(item.__name__ for item in kind)
+        else:
+            valid = type(value) is kind
+            expected_name = kind.__name__
+        if not valid:
             raise UnsupportedTransportError(
-                f"remote worker program {name} must be exactly {kind.__name__}, got {type(value).__name__}"
+                f"remote worker program {name} must be exactly {expected_name}, got {type(value).__name__}"
             )
     if materialized["environment"].setup is not None and type(materialized["environment"].setup) is not SourceScript:
         raise UnsupportedTransportError("remote worker program setup must be exactly SourceScript")

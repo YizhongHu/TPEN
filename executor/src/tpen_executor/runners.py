@@ -106,6 +106,25 @@ RUN_SHIM = (
     "from tpen.run import main\n"
     "raise SystemExit(main(sys.argv[1:]))"
 )
+
+# Keep RUN_SHIM byte-identical for legacy TPENCommand callers.  The configured
+# leaf gets the same placement/observation prelude plus a closed script-path
+# handoff, derived once here rather than maintaining a second copy.
+CONFIGURED_RUN_SHIM = RUN_SHIM.replace(
+    "from tpen.run import main\n"
+    "raise SystemExit(main(sys.argv[1:]))",
+    "if '--tpen-executor-script' in sys.argv[1:]:\n"
+    "    import runpy\n"
+    "    script_index = sys.argv.index('--tpen-executor-script')\n"
+    "    script = sys.argv[script_index + 1]\n"
+    "    script_args = sys.argv[script_index + 2:]\n"
+    "    script_args = [arg for arg in script_args if not arg.startswith('run.root=') and not arg.startswith('run.layout=') and not arg.startswith('run.run_id=')]\n"
+    "    sys.argv = [script, *script_args]\n"
+    "    runpy.run_path(script, run_name='__main__')\n"
+    "    raise SystemExit(0)\n"
+    "from tpen.run import main\n"
+    "raise SystemExit(main(sys.argv[1:]))",
+)
 class EvidenceUnavailable(RuntimeError):
     """Raised when a child cannot provide trustworthy public evidence."""
 
@@ -381,6 +400,32 @@ class TPENCommand:
 
 
 @frozen_record
+class ConfiguredProgramCommand:
+    """Command for a validated :class:`ConfiguredProgram` leaf entry."""
+
+    program: Any
+
+    def __post_init__(self) -> None:
+        # Keep the dependency one-way: programs owns the data model, while the
+        # command owns the fixed shim invocation.
+        from .programs import ConfiguredProgram
+
+        if type(self.program) is not ConfiguredProgram:
+            raise TypeError("program must be ConfiguredProgram")
+
+    @property
+    def args(self) -> tuple[str, ...]:
+        """Return generated argv for the allowlisted script."""
+
+        return (
+            "-c", CONFIGURED_RUN_SHIM,
+            "--tpen-executor-entry", self.program.entrypoint,
+            "--tpen-executor-script", self.program.script_path,
+            *self.program.argv(),
+        )
+
+
+@frozen_record
 class TPENEvidence:
     """Read public run evidence through a child inspection process.
 
@@ -473,4 +518,4 @@ class TPENEvidence:
         return CoreRunEvidence.from_mapping(decoded)
 
 
-__all__ = ["CHILD_CONTEXT_KEYS_ENV", "CHILD_OBSERVATION_FILENAME", "CONTEXT_ENV_KEY_PATTERN", "CoreRunEvidence", "EvidenceUnavailable", "RUN_EVIDENCE_SCHEMA", "RUN_EVIDENCE_SCHEMA_V2", "RUN_EVIDENCE_SCHEMA_V3", "TPENCommand", "TPENEvidence"]
+__all__ = ["CHILD_CONTEXT_KEYS_ENV", "CHILD_OBSERVATION_FILENAME", "CONFIGURED_RUN_SHIM", "CONTEXT_ENV_KEY_PATTERN", "ConfiguredProgramCommand", "CoreRunEvidence", "EvidenceUnavailable", "RUN_EVIDENCE_SCHEMA", "RUN_EVIDENCE_SCHEMA_V2", "RUN_EVIDENCE_SCHEMA_V3", "RUN_SHIM", "TPENCommand", "TPENEvidence"]
