@@ -289,7 +289,7 @@ def run_group_controller(
         entries = ([] if extra is None else [extra]) + active
         seen = set()
         for entry in entries:
-            key = entry[1].attempt_id
+            key = (entry[1].task_id, entry[1].attempt_id)
             if key in seen:
                 continue
             seen.add(key)

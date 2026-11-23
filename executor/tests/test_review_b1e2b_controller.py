@@ -12,7 +12,7 @@ import pytest
 
 from tpen_executor._codec import digest
 from tpen_executor.allocations import ConfiguredAllocation, ControllerOutcomeReceiptV1
-from tpen_executor.contracts import AllocationId, BackendJobId, InvocationId
+from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId, InvocationId
 from tpen_executor.dispatch.completion import complete_leaf_result
 from tpen_executor.dispatch.transport import LeafRequest
 from tpen_executor.lifecycle.balsam import BalsamGroupRegistrationIntent, BalsamGroupRegistrationReceipt
@@ -140,6 +140,13 @@ MUTANTS = (
         "old": '"invalid-launch-ack"',
         "new": '"invalid-submit-ack"',
         "killer": "test_controller_outcome_reason_codes_persist",
+    },
+    {
+        "id": "shared-attempt-dedup",
+        "target": CONTROLLER,
+        "old": "            key = (entry[1].task_id, entry[1].attempt_id)\n",
+        "new": "            key = entry[1].attempt_id\n",
+        "killer": "test_shared_successor_attempt_ids_cleanup",
     },
 )
 
@@ -496,15 +503,120 @@ def test_two_member_collect_base_exception_unconfirms_each_acknowledged_fence(tm
 
 
 def test_final_manifest_failure_parks_after_completed_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    original = DirectoryStore.manifest
+    import tpen_executor.dispatch.completion as completion_module
+
+    original_completion = completion_module.complete_leaf_result
+    completion_succeeded = False
+
+    def wrapped_completion(*args, **kwargs):
+        nonlocal completion_succeeded
+        result = original_completion(*args, **kwargs)
+        completion_succeeded = True
+        return result
+
+    monkeypatch.setattr(completion_module, "complete_leaf_result", wrapped_completion)
+    original_manifest = DirectoryStore.manifest
+
     def fail_final(self, group):
-        if list(Path(self.root).rglob("outcome.json")):
+        if completion_succeeded:
             raise OSError("manifest unavailable")
-        return original(self, group)
+        return original_manifest(self, group)
+
     monkeypatch.setattr(DirectoryStore, "manifest", fail_final)
+    initial_publication: dict[str, bytes] = {}
+    original_collect = EventExecutor.collect
+
+    # The real store root is deterministic for this helper; capture its
+    # publication bytes at the first collection, before completion/final read.
+    def capture_publication(self, handle, timeout):
+        if not initial_publication:
+            root = tmp_path / "real-store"
+            for path in (root / "groups" / ".reconciliation-publications").glob("*.json"):
+                initial_publication[str(path.relative_to(root))] = path.read_bytes()
+        return original_collect(self, handle, timeout)
+
+    monkeypatch.setattr(EventExecutor, "collect", capture_publication)
     result, executor, store = _run_fresh(tmp_path)
-    assert result.exit_code == 2 and result.reconciliation.members[0].action == "park"
+    fence = executor.fences["real-task"]
+    output = Path(fence.output_dir)
+    assert len(executor.submits) == 1 and len(executor.collects) == 1
+    assert (output / "outcome.json").is_file()
+    assert (output / "core-outcome.json").is_file()
+    assert (output / "segment.json").is_file()
+    assert result.member_outcomes == (("real-task", "collected"),)
+    assert result.reconciliation.members[0].action == "park"
+    assert result.reconciliation.members[0].reason_code.startswith("final-reconciliation:")
+    assert result.exit_code == 2
+    final_publication = {
+        str(path.relative_to(Path(store.root))): path.read_bytes()
+        for path in (Path(store.root) / "groups" / ".reconciliation-publications").glob("*.json")
+    }
+    assert final_publication == initial_publication
     assert len(_outcomes(Path(store.root))) == 1
+
+
+@pytest.mark.parametrize(
+    "successor_ids",
+    [("successor-shared", "successor-shared"), ("successor-a-next", "successor-b-next")],
+)
+def test_shared_successor_attempt_ids_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, successor_ids: tuple[str, str],
+) -> None:
+    names = ("successor-a", "successor-b")
+    store, group, _lease, inputs, _bindings, successors, fences = _successor_fixture(
+        tmp_path, names, remote=False,
+    )
+    rewritten_successors = {}
+    for name, successor_id in zip(names, successor_ids):
+        request, acceptance, proposed = successors[name]
+        successor_attempt = AttemptId(successor_id)
+        request = store.build_successor_admission_request(
+            fences[name], successor_attempt, request["science_input_digest"], request["target_iterations"],
+        )
+        rewritten_successors[name] = (
+            request,
+            acceptance,
+            replace(proposed, attempt_id=successor_attempt, invocation_id=InvocationId(name + "-next")),
+        )
+    successors = rewritten_successors
+    allocation = ConfiguredAllocation(
+        successors[names[0]][2].allocation_attempt.allocation_id,
+        successors[names[0]][2].allocation_attempt.backend_job_id,
+        {},
+    )
+    facts = GroupControllerFactsV1(
+        group, allocation, "a" * 64, "shared-successor-controller", "2026-11-22T00:00:00Z",
+        inputs, successors,
+    )
+    binding = BalsamGroupRegistrationReceipt(
+        BalsamGroupRegistrationIntent(group.group_id, group.identity, digest({"shared-successors": True})),
+        allocation.backend_job_id,
+    )
+    executor = EventExecutor(group, allocation, capacity=2)
+
+    class StopNow(BaseException):
+        pass
+
+    original_record = DirectoryStore.record_controller_outcome
+
+    def interrupt_second_ack(self, fence, controller, invocation, status, reason=""):
+        if invocation.task_id == names[1] and status == "launched":
+            raise StopNow("second acknowledgement interruption")
+        return original_record(self, fence, controller, invocation, status, reason)
+
+    monkeypatch.setattr(DirectoryStore, "record_controller_outcome", interrupt_second_ack)
+    with pytest.raises(StopNow):
+        run_group_controller(binding, allocation.backend_job_id, facts, store, DurableAdmission(), executor)
+
+    receipts = _outcomes(Path(store.root))
+    expected = {(name, AttemptId(successor_id)) for name, successor_id in zip(names, successor_ids)}
+    matching = [receipt for receipt in receipts if (receipt.task_id, receipt.attempt_id) in expected]
+    assert {(receipt.task_id, receipt.attempt_id) for receipt in matching} == expected
+    assert len(matching) == len(expected)
+    assert all(receipt.status == "remote-quiescence-unconfirmed" for receipt in matching)
+    assert all(receipt.status != "failed" for receipt in receipts)
+    assert [task_id for kind, task_id in executor.calls if kind == "submit"] == list(names)
+    assert len(executor.submits) == 2
 
 
 def test_crossed_result_parks(tmp_path: Path) -> None:
