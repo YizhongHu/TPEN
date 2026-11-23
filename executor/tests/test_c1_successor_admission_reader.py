@@ -246,9 +246,9 @@ def test_reader_rejects_remote_admission_without_teardown(tmp_path: Path, monkey
 
 
 def test_reader_waits_for_task_writer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    store, _group, _allocation, _predecessor, successor, _request, _record = _make_remote_admitted(tmp_path, monkeypatch)
+    store, _group, _allocation, predecessor, successor, _request, _record = _make_remote_admitted(tmp_path, monkeypatch)
     task_dir = Path(successor.output_dir).parent
-    ledger = task_dir / "successor-admissions" / "successor-1" / "successor-admission.json"
+    ledger = _ledger_path(predecessor)
     before = ledger.read_bytes()
     lock_acquired = threading.Event()
     release = threading.Event()
@@ -340,7 +340,7 @@ def test_reader_rejects_truncated_and_noncanonical_ledger(tmp_path: Path, monkey
 def test_reader_rejects_ambiguous_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _store, _group, _allocation, predecessor, successor, _request, record = _make_admitted(tmp_path, monkeypatch)
     # Public APIs reject predecessor forks, so this minimal fixture covers ambiguity reachability.
-    second = Path(successor.output_dir).parent / "successor-admissions" / "other-predecessor"
+    second = _ledger_path(predecessor).parent.parent / "other-predecessor"
     second.mkdir()
     duplicate = SuccessorAdmissionRecord("a", AttemptId("other-predecessor"), record.predecessor_content_id, "a", record.successor_attempt_id, record.request_digest, record.core_acceptance_digest)
     (second / "successor-admission.json").write_bytes(duplicate.encode())
