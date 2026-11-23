@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import shlex
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +18,7 @@ from experiments.atomistic.stage1.launch import (
     render as _render,
     row_overrides,
 )
+from experiments.toolkit.job_names import stage1_row_job_name
 from experiments.atomistic.stage1.protocol import (
     CONFIG_IDENTITY_RULE,
     ProtocolError,
@@ -81,8 +85,51 @@ def test_render_contains_fail_closed_identity_and_cleanup_guards(tmp_path: Path)
     assert "STAGE1_GUARD results root outside" in script
     assert '[[ "$JOB_ROOT" == "$SCRATCH_BASE/$USER/$SLURM_JOB_ID" ]]' in script
     assert "trap 'rm -rf -- \"$JOB_ROOT\"' EXIT" in script
+    assert "#SBATCH --job-name=he-train-l0-s1-cccccccc" in script
     assert "exec " not in script
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def test_stage1_job_names_use_lineage_index_and_eval_identity() -> None:
+    assert stage1_row_job_name({**ROW, "system": "qho2e", "lineage": 0}) == (
+        "qho2e-train-l0-s1-cccccccc"
+    )
+    assert stage1_row_job_name({
+        **ROW, "system": "hooke2", "kind": "eval", "lineage": 0,
+        "checkpoint": 100000, "stream": 0,
+    }) == "hooke2-eval-l0-c100000-s0-s1-cccccccc"
+    with pytest.raises(ValueError, match="lineage index"):
+        stage1_row_job_name({**ROW, "lineage_seed": 11})
+
+
+def test_launch_imports_from_experiments_only_checkout(tmp_path: Path) -> None:
+    """Keep exact-source experiment checkouts independent of ``scripts/``."""
+
+    checkout = tmp_path / "checkout"
+    shutil.copytree(REPO_ROOT / "experiments", checkout / "experiments")
+    assert not (checkout / "scripts").exists()
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from experiments.atomistic.stage1.launch import render; "
+            "render(row={'kind': 'train', 'config': 'configs/he/train.yaml', "
+            "'row_id': 'he-train-0', 'seed': 123, 'updates': 50000, "
+            "'walkers': 4096, 'source_sha': 'c' * 40, "
+            "'config_sha256': 'b' * 64, "
+            "'results_root': '/n/netscratch/kozinsky_lab/Lab/rhu/stage1', "
+            "'experiment_name': 'stage1', 'sector': 'he', "
+            "'run_id': 'train-lineage-0', 'lineage': 0}, "
+            "driver='/bin/true', python='/usr/bin/true', head_sha='c' * 40, "
+            "results_root='/n/netscratch/kozinsky_lab/Lab/rhu/stage1', "
+            f"checkout_root={str(checkout)!r}, scratch_base={str(tmp_path)!r})",
+        ],
+        cwd=checkout,
+        env={**os.environ, "PYTHONPATH": str(checkout)},
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_render_fails_for_unapproved_partition_or_results_root() -> None:

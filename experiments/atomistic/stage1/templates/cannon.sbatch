@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Canonical generated Stage-1 script template; launch.py fills the markers.
 #SBATCH --partition=__PARTITION__
+#SBATCH --job-name=__JOB_NAME__
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1

@@ -32,7 +32,7 @@ precheck() {
   [[ "${SLURM_JOB_PARTITION:-}" == test ]] || fail_precheck "partition must be test, got ${SLURM_JOB_PARTITION:-unset}"
   [[ "${HEAD_SHA}" =~ ^[0-9a-fA-F]{40}$ ]] || fail_precheck "HEAD_SHA must be full 40-hex"
   [[ "${JOB_NAME}" =~ ^[A-Za-z0-9_.-]+$ ]] || fail_precheck "JOB_NAME contains unsafe characters"
-  [[ "${JOB_NAME}" == *"${HEAD_SHA:0:12}"* ]] || fail_precheck "JOB_NAME must contain SHA[:12]"
+  [[ "${JOB_NAME}" == *"${HEAD_SHA:0:8}"* ]] || fail_precheck "JOB_NAME must contain SHA[:8]"
   [[ "${RUN_ROOT}" == "${FACILITY_RUN_PREFIX}"/* ]] || fail_precheck "RUN_ROOT escapes facility prefix"
   [[ "${RUN_ROOT}" == /* ]] || fail_precheck "RUN_ROOT must be absolute"
   [[ -n "${REPO_URL}" ]] || fail_precheck "REPO_URL is empty"

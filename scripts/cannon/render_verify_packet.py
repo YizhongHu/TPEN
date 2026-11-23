@@ -9,6 +9,7 @@ reporting the command an operator may submit.
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -18,6 +19,28 @@ import subprocess
 import sys
 import tarfile
 from typing import Dict, List, Optional, Sequence
+
+try:
+    from experiments.toolkit.job_names import build_job_name, validate_job_name
+except ModuleNotFoundError:  # Direct execution from outside the repository root.
+    repo_root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repo_root))
+    try:
+        from experiments.toolkit.job_names import build_job_name, validate_job_name
+    except SyntaxError:
+        # Cannon login nodes still expose Python 3.6, while the toolkit
+        # package itself targets the project runtime.  Load this stdlib-only
+        # helper without executing the toolkit package initializer.
+        helper_path = repo_root / "experiments" / "toolkit" / "job_names.py"
+        helper_spec = importlib.util.spec_from_file_location(
+            "experiments.toolkit.job_names", helper_path
+        )
+        if helper_spec is None or helper_spec.loader is None:
+            raise
+        helper_module = importlib.util.module_from_spec(helper_spec)
+        helper_spec.loader.exec_module(helper_module)
+        build_job_name = helper_module.build_job_name
+        validate_job_name = helper_module.validate_job_name
 
 
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -218,7 +241,7 @@ def _render_body(
         "",
         '[[ "${SLURM_JOB_PARTITION:-}" == test ]] || { echo "PRECHECK_FAILED wrong partition" >&2; exit 2; }',
         '[[ "${HEAD_SHA}" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "PRECHECK_FAILED bad head" >&2; exit 2; }',
-        '[[ "${JOB_NAME}" == *"${HEAD_SHA:0:12}"* ]] || { echo "PRECHECK_FAILED job name missing head" >&2; exit 2; }',
+        '[[ "${JOB_NAME}" == *"${HEAD_SHA:0:8}"* ]] || { echo "PRECHECK_FAILED job name missing head" >&2; exit 2; }',
         '[[ -x "${TASK_ROOT}/scripts/cannon/verify.sh" ]] || { echo "PRECHECK_FAILED verify.sh missing" >&2; exit 2; }',
         '[[ -f "${TASK_ROOT}/scripts/cannon/shared-env-policy.json" ]] || { echo "PRECHECK_FAILED sidecar missing" >&2; exit 2; }',
         '[[ "${RUN_ROOT}" == "${FACILITY_RUN_PREFIX}" || "${RUN_ROOT}" == "${FACILITY_RUN_PREFIX}"/* ]] || { echo "PRECHECK_FAILED run root escape" >&2; exit 2; }',
@@ -316,7 +339,7 @@ def render_packet(
     packet_dir: str,
     repo_root: Optional[str] = None,
     mutants: Optional[str] = None,
-    job_name: str = "verify",
+    job_name: Optional[str] = None,
     wall_time: str = "00:45:00",
     test_facility_run_prefix: Optional[str] = None,
     shared_env_prefix: Optional[str] = None,
@@ -333,10 +356,14 @@ def render_packet(
         _validate_rel_path(test_path, "test path")
     if not TIME_RE.fullmatch(wall_time):
         raise RenderError(f"invalid --time: {wall_time!r}")
-    if not JOB_NAME_RE.fullmatch(job_name):
-        raise RenderError("--job-name may contain only letters, digits, '.', '_' and '-'")
-    if sha[:12] not in job_name:
-        job_name = f"{job_name}-{sha[:12]}"
+    try:
+        default_job_name = build_job_name("tpen", "verify", lane="s1", sha=sha)
+        explicit_job_name = job_name
+        job_name = default_job_name if explicit_job_name is None else validate_job_name(explicit_job_name)
+        if explicit_job_name is not None and sha[:8] not in job_name:
+            job_name = validate_job_name(f"{job_name}-{sha[:8]}")
+    except ValueError as exc:
+        raise RenderError(str(exc)) from exc
     if not JOB_NAME_RE.fullmatch(account):
         raise RenderError("--account contains unsupported characters")
     if shared_env_prefix is None:
@@ -427,7 +454,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--shared-env-prefix", required=True)
     parser.add_argument("--mutants")
     parser.add_argument("--repo-root")
-    parser.add_argument("--job-name", default="verify")
+    parser.add_argument("--job-name")
     parser.add_argument("--time", dest="wall_time", default="00:45:00")
     parser.add_argument("--uv-bin", default="/n/home10/rhu/.local/bin/uv")
     parser.add_argument("--repo-url", default="https://github.com/YizhongHu/TPEN.git")

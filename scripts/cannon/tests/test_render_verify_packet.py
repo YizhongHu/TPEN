@@ -68,6 +68,7 @@ def test_golden_render(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     packet = Path(_line(result.stdout, "READY packet="))
     body = (packet / "verify.sbatch").read_text(encoding="utf-8")
+    assert f"#SBATCH --job-name=verify-renderer-{SHA[:8]}" in body
     assert "#SBATCH --output=" in body and "#SBATCH --error=" in body
     assert 'WORK_ROOT="/scratch/${USER:?USER required}/${SLURM_JOB_ID:?SLURM_JOB_ID required}"' in body
     assert 'cd "${TASK_ROOT}"' in body
@@ -76,6 +77,20 @@ def test_golden_render(tmp_path: Path) -> None:
     assert (packet / "packet-manifest.sha256").is_file()
     assert "SBATCH_COMMAND=sbatch " in result.stdout
     assert 'HEADROOM_GATE=squeue -u "$USER" -h -p test | wc -l' in result.stdout
+
+
+def test_default_job_name_uses_stage_lane_and_sha8(tmp_path: Path) -> None:
+    result = _render(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    packet = Path(_line(result.stdout, "READY packet="))
+    body = (packet / "verify.sbatch").read_text(encoding="utf-8")
+    assert f"#SBATCH --job-name=tpen-verify-s1-{SHA[:8]}" in body
+
+
+def test_job_name_length_is_rejected(tmp_path: Path) -> None:
+    result = _render(tmp_path, job_name="x" * 41)
+    assert result.returncode != 0
+    assert "too long" in result.stderr
 
 
 def test_missing_work_root_or_unexpanded_path_is_rejected(tmp_path: Path) -> None:

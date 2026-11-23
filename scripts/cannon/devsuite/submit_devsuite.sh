@@ -107,7 +107,6 @@ cleanup() {
 trap cleanup EXIT
 
 SHA8="${HEAD_SHA:0:8}"
-SHA12="${HEAD_SHA:0:12}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 SCHEDULED_PREFIX=""
 if [[ "$SCHEDULED" == 1 ]]; then
@@ -118,8 +117,10 @@ ROOT_RUN_ROOT="${REMOTE_STAGE}/root-run"
 ROOT_TASK_ROOT="${REMOTE_STAGE}/root"
 EXECUTOR_TASK_ROOT="${REMOTE_STAGE}/executor-harness"
 EXECUTOR_RUN_ROOT="${REMOTE_STAGE}/executor-run"
-ROOT_JOB_NAME="dev-root-${SHA12}-${STAMP}"
-EXECUTOR_JOB_NAME="dev-executor-${SHA12}-${STAMP}"
+JOB_NAME_TOOL="$REPO_ROOT/experiments/toolkit/job_names.py"
+[[ -f "$JOB_NAME_TOOL" ]] || fail "shared job-name helper is missing: $JOB_NAME_TOOL"
+ROOT_JOB_NAME="$(python3 "$JOB_NAME_TOOL" --subject devsuite --purpose root --lane s1 --sha "$HEAD_SHA")"
+EXECUTOR_JOB_NAME="$(python3 "$JOB_NAME_TOOL" --subject devsuite --purpose exec --lane s1 --sha "$HEAD_SHA")"
 
 ROOT_LOCAL="$TMP_ROOT/root"
 EXECUTOR_LOCAL="$TMP_ROOT/executor"
