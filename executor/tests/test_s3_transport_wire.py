@@ -158,7 +158,7 @@ def _runs(tmp_path: Path, *task_ids: str, modes: dict[str, str] | None = None) -
     return result
 
 
-def _make_fake_core(tmp_path: Path) -> Path:
+def _make_fake_core(tmp_path: Path, *, sleep_seconds: float = 4) -> Path:
     """Write a fake ``tpen`` with ``run.main`` and ``inspection``.
 
     Like real core, ``tpen/run.py`` has no ``__main__`` guard, so
@@ -188,7 +188,7 @@ def _make_fake_core(tmp_path: Path) -> Path:
                 overrides = dict(item.split("=", 1) for item in argv if "=" in item)
                 run_dir = Path(overrides["run.root"]) / overrides["run.run_id"]
                 if mode == "sleep":
-                    time.sleep({OUTCOME_PARITY_LATE_SLEEP})
+                    time.sleep({sleep_seconds})
                 if mode == "fail":
                     return 7
                 run_dir.mkdir(parents=True)
@@ -225,8 +225,8 @@ def _make_fake_core(tmp_path: Path) -> Path:
     return package.parent
 
 
-def _environment(tmp_path: Path) -> PreparedPythonEnvironment:
-    package = _make_fake_core(tmp_path)
+def _environment(tmp_path: Path, *, sleep_seconds: float = 4) -> PreparedPythonEnvironment:
+    package = _make_fake_core(tmp_path, sleep_seconds=sleep_seconds)
     return PreparedPythonEnvironment(
         sys.executable,
         env={"PYTHONPATH": str(package), "S3A_EVENT_LOG": str(tmp_path / "events.jsonl")},
@@ -771,7 +771,7 @@ def _worker_spec(environment: PreparedPythonEnvironment) -> WorkerProgram:
 def test_leaf_outcomes_match_local_dispatch(tmp_path: Path) -> None:
     """Completed, failed and timed-out members publish as local dispatch does."""
 
-    environment = _environment(tmp_path)
+    environment = _environment(tmp_path, sleep_seconds=OUTCOME_PARITY_LATE_SLEEP)
     group = _group("ok", "bad", "late")
     runs = _runs(tmp_path, "ok", "bad", "late", modes={"bad": "fail", "late": "sleep"})
     local = LocalDispatcher(_worker_spec(environment)).run(
