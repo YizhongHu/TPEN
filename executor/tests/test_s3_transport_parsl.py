@@ -68,6 +68,10 @@ WORKERS_MODULE = "executor/src/tpen_executor/workers.py"
 HAS_PARSL = importlib.util.find_spec("parsl") is not None
 WORKER_MARK = "S3B_WORKER_MARK"
 LABEL = "s3b-htex"
+# Item 6f249ad4: leave child startup ample margin while making ``late``
+# deterministically exceed the per-member timeout.
+OUTCOME_PARITY_TIMEOUT = 5
+OUTCOME_PARITY_LATE_SLEEP = OUTCOME_PARITY_TIMEOUT * 4
 
 
 S3B_MUTANT_TABLE = (
@@ -318,7 +322,7 @@ def _make_fake_core(tmp_path: Path) -> Path:
                 overrides = dict(item.split("=", 1) for item in argv if "=" in item)
                 run_dir = Path(overrides["run.root"]) / overrides["run.run_id"]
                 if mode == "sleep":
-                    time.sleep(4)
+                    time.sleep({OUTCOME_PARITY_LATE_SLEEP})
                 if mode == "fail":
                     return 7
                 run_dir.mkdir(parents=True)
@@ -1048,9 +1052,11 @@ def test_attached_outcomes_match_local_dispatch(tmp_path: Path, fake_parsl: _Par
     group = _group("s3b-parity", "ok", "bad", "late")
     runs = _runs(tmp_path, "ok", "bad", "late", modes={"bad": "fail", "late": "sleep"})
     worker = _worker(tmp_path)
-    local = LocalDispatcher(worker).run(group, runs, _lifecycle(tmp_path, "local"), timeout=1)
+    local = LocalDispatcher(worker).run(
+        group, runs, _lifecycle(tmp_path, "local"), timeout=OUTCOME_PARITY_TIMEOUT,
+    )
     attached = parsl_dispatch.ParslDispatcher(worker, binding=BINDING, transport=_transport()).run(
-        group, runs, _lifecycle(tmp_path, "attached"), timeout=1,
+        group, runs, _lifecycle(tmp_path, "attached"), timeout=OUTCOME_PARITY_TIMEOUT,
     )
     assert _summary(attached) == _summary(local) == {"ok": ("completed", False), "bad": ("failed", True), "late": ("timed_out", True)}
     assert {segment.task_id for segment in attached.segments} == {segment.task_id for segment in local.segments} == {"ok"}
