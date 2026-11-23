@@ -62,6 +62,10 @@ from tpen_executor.tasks import ConfiguredRun
 EXECUTOR_ROOT = Path(__file__).parents[1]
 TRANSPORT = "executor/src/tpen_executor/dispatch/transport.py"
 WORKER_MARK = "S3A_WORKER_MARK"
+# Item 6f249ad4: leave child startup ample margin while making ``late``
+# deterministically exceed the per-member timeout.
+OUTCOME_PARITY_TIMEOUT = 5
+OUTCOME_PARITY_LATE_SLEEP = OUTCOME_PARITY_TIMEOUT * 4
 # The leaf host is a fresh Python process that sees only the request bytes on
 # stdin and writes only the result bytes to stdout.
 LEAF_HOST = (
@@ -184,7 +188,7 @@ def _make_fake_core(tmp_path: Path) -> Path:
                 overrides = dict(item.split("=", 1) for item in argv if "=" in item)
                 run_dir = Path(overrides["run.root"]) / overrides["run.run_id"]
                 if mode == "sleep":
-                    time.sleep(4)
+                    time.sleep({OUTCOME_PARITY_LATE_SLEEP})
                 if mode == "fail":
                     return 7
                 run_dir.mkdir(parents=True)
@@ -771,13 +775,16 @@ def test_leaf_outcomes_match_local_dispatch(tmp_path: Path) -> None:
     group = _group("ok", "bad", "late")
     runs = _runs(tmp_path, "ok", "bad", "late", modes={"bad": "fail", "late": "sleep"})
     local = LocalDispatcher(_worker_spec(environment)).run(
-        group, runs, AttachedAllocation(_allocation(), DirectoryStore(tmp_path / "local")), timeout=1,
+        group, runs, AttachedAllocation(_allocation(), DirectoryStore(tmp_path / "local")),
+        timeout=OUTCOME_PARITY_TIMEOUT,
     )
 
     lifecycle = AttachedAllocation(_allocation(), DirectoryStore(tmp_path / "leaf"))
     for member in group.members:
         fence = lifecycle.begin(group, member.task_id, "2026-11-11T00:00:00+00:00")
-        request = LeafRequest.for_attempt(fence, lifecycle.allocation, runs[member.task_id], environment, 1)
+        request = LeafRequest.for_attempt(
+            fence, lifecycle.allocation, runs[member.task_id], environment, OUTCOME_PARITY_TIMEOUT,
+        )
         _publish(lifecycle, fence, validate_leaf_result(request, LeafResult.decode(run_leaf(request.encode()))))
     leaf = lifecycle.store.manifest(group)
 
