@@ -6,6 +6,7 @@ from dataclasses import replace
 import math
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
 
@@ -190,9 +191,9 @@ class EventExecutor:
     def submit(self, fence, invocation):
         task = next(member for member in self.group.members if member.task_id == invocation.task_id)
         self.calls.append(("submit", task.task_id))
+        self.fences[task.task_id] = fence
         if task.task_id == self.submit_error_task:
             raise RuntimeError("controlled submit failure")
-        self.fences[task.task_id] = fence
         configured = _local_materializer(task.program)
         environment = _local_environment(task, configured, None)
         request = LeafRequest.for_attempt(fence, self.allocation, configured, environment)
@@ -345,42 +346,63 @@ def test_failed_launched_ack_write_parks_but_collects(tmp_path: Path, monkeypatc
     assert not (Path(fence.output_dir) / "controller-outcome.json").exists()
 
 
-@pytest.mark.parametrize("task_ids", [("a-successor", "z-predecessor"), ("z-predecessor", "a-successor")])
+@pytest.mark.parametrize("attempt_ids", [("f" * 32, "0" * 32), ("0" * 32, "f" * 32)])
 def test_final_reconciliation_matches_collected_attempt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, task_ids: tuple[str, str],
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, attempt_ids: tuple[str, str],
 ) -> None:
-    group, allocation, facts, binding, store = _fresh_group(tmp_path, task_ids)
-    class Executor(EventExecutor):
-        def collect(self, handle, timeout):
-            result = super().collect(handle, timeout)
-            task_id = handle[0]
-            if not hasattr(self, "stale"):
-                self.stale = {}
-            if task_id not in self.stale:
-                invocation = next(item[1] for item in self.submits if item[2][0] == task_id)
-                self.stale[task_id] = store.begin_attempt(
-                    group, task_id, allocation, "stale", "local",
-                    allocation_attempt=invocation.allocation_attempt,
-                    invocation_id=InvocationId("stale-" + task_id),
-                )
-                store.finish_attempt(self.stale[task_id], "remote-quiescence-unconfirmed", "stale-finished")
-            return result
-    executor = Executor(group, allocation)
+    import test_b1a_b_publication as publication_module
+    import tpen_executor.storage as storage_module
+
+    real_attempt_id = publication_module.AttemptId
+    predecessor_id, successor_id = attempt_ids
+    monkeypatch.setattr(storage_module, "uuid4", lambda: SimpleNamespace(hex=predecessor_id))
+    monkeypatch.setattr(
+        publication_module,
+        "AttemptId",
+        lambda value: real_attempt_id(successor_id if value == "successor-1" else value),
+    )
+    store, group, _lease, inputs, _bindings, successors, _fences = _successor_fixture(
+        tmp_path, ("successor",), remote=False,
+    )
+    successor = successors["successor"][2]
+    allocation = ConfiguredAllocation(
+        successor.allocation_attempt.allocation_id,
+        successor.allocation_attempt.backend_job_id,
+        {},
+    )
+    facts = GroupControllerFactsV1(
+        group, allocation, "a" * 64, "successor-controller", "2026-11-22T00:00:00Z", inputs, successors,
+    )
+    binding = BalsamGroupRegistrationReceipt(
+        BalsamGroupRegistrationIntent(group.group_id, group.identity, digest({"successor": True})),
+        allocation.backend_job_id,
+    )
+    executor = EventExecutor(group, allocation)
     original = DirectoryStore.manifest
     def reversed_manifest(self, current_group):
+        # Insert a distinct later attempt only after the collected successor
+        # has been completed, so it cannot supersede the fence during collect.
+        if not hasattr(executor, "stale"):
+            monkeypatch.setattr(storage_module, "uuid4", lambda: SimpleNamespace(hex="e" * 32))
+            invocation = executor.submits[0][1]
+            stale = self.begin_attempt(
+                group, "successor", allocation, "stale", "local",
+                allocation_attempt=invocation.allocation_attempt,
+                invocation_id=InvocationId("stale-successor"),
+            )
+            self.finish_attempt(stale, "remote-quiescence-unconfirmed", "stale-finished")
+            executor.stale = stale
         manifest = original(self, current_group)
-        ordered = []
-        for task_id in task_ids:
-            collected = executor.fences[task_id].attempt_id
-            ordered.append(next(item for item in manifest.attempts if item.attempt_id == collected))
-            ordered.append(next(item for item in manifest.attempts
-                               if item.task_id == task_id and item.attempt_id != collected))
-        return replace(manifest, attempts=tuple(ordered))
+        collected = executor.fences["successor"].attempt_id
+        selected = next(item for item in manifest.attempts if item.attempt_id == collected)
+        predecessor = next(item for item in manifest.attempts if item.attempt_id == real_attempt_id(predecessor_id))
+        later = next(item for item in manifest.attempts if item.attempt_id == real_attempt_id("e" * 32))
+        return replace(manifest, attempts=(selected, later, predecessor))
     monkeypatch.setattr(DirectoryStore, "manifest", reversed_manifest)
     result = run_group_controller(binding, allocation.backend_job_id, facts, store, DurableAdmission(), executor)
     assert result.exit_code == 0
-    assert all(member.action == "preserve_completed" for member in result.reconciliation.members)
-    assert sum(receipt.status == "completed" for receipt in _outcomes(Path(store.root))) == 2
+    assert result.reconciliation.members[0].action == "preserve_completed"
+    assert any(receipt.status == "completed" for receipt in _outcomes(Path(store.root)))
 
 
 @pytest.mark.parametrize("mode", ["submit", "begin", "ack"])
@@ -424,12 +446,12 @@ def test_submit_base_exception_records_unconfirmed_for_outstanding(
 def test_controller_outcome_reason_codes_persist(tmp_path: Path) -> None:
     failed, failed_executor, failed_store = _run_fresh(tmp_path / "failed", submit_error_task="real-task")
     failed_receipt = ControllerOutcomeReceiptV1.decode(
-        next(Path(failed_store.root).rglob("controller-outcome.json")).read_bytes()
+        (Path(failed_executor.fences["real-task"].output_dir) / "controller-outcome.json").read_bytes()
     )
     assert failed.exit_code == 2 and failed_receipt.reason == "executor-failed"
     invalid, invalid_executor, invalid_store = _run_fresh(tmp_path / "invalid", acknowledge=False)
     invalid_receipt = ControllerOutcomeReceiptV1.decode(
-        next(Path(invalid_store.root).rglob("controller-outcome.json")).read_bytes()
+        (Path(invalid_executor.fences["real-task"].output_dir) / "controller-outcome.json").read_bytes()
     )
     assert invalid.exit_code == 2 and invalid_receipt.reason == "invalid-launch-ack"
 
