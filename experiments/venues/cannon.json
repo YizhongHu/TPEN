@@ -1,0 +1,15 @@
+{
+  "schema": "tpen-executor/venue-profile-v1",
+  "venue": "cannon",
+  "scheduler": "slurm",
+  "queues": ["test", "gpu_test", "seas_gpu", "kozinsky_gpu", "gpu"],
+  "gpu_strata": [
+    {
+      "name": "a100",
+      "accelerator": "cuda",
+      "gpu_name_contains": ["A100"],
+      "memory_mib": 81920,
+      "mig_mode": "disabled"
+    }
+  ]
+}
