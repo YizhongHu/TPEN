@@ -16,7 +16,9 @@ from tpen_executor.contracts import AllocationId, BackendJobId, InvocationId
 from tpen_executor.dispatch.completion import complete_leaf_result
 from tpen_executor.dispatch.transport import LeafRequest
 from tpen_executor.lifecycle.balsam import BalsamGroupRegistrationIntent, BalsamGroupRegistrationReceipt
-from tpen_executor.lifecycle.controller import GroupControllerFactsV1, MemberLaunchResult, run_group_controller
+from tpen_executor.lifecycle.controller import (
+    GroupControllerFactsV1, MemberLaunchResult, _collected_attempt_record, run_group_controller,
+)
 from tpen_executor.lifecycle.local_executor import CollectionWaitTimeout, LeafCompletionContext
 from tpen_executor.recovery import CoreAdmissionVerdictV2, MemberRecoveryInputV2
 from tpen_executor.results import OutcomeReceipt
@@ -114,9 +116,9 @@ MUTANTS = (
     {
         "id": "manifest-uses-last-attempt",
         "target": CONTROLLER,
-        "old": "            record = next((candidate for candidate in manifest.attempts\n                           if candidate.task_id == item.task_id\n                           and candidate.attempt_id == attempt_id), None)",
-        "new": "            record = next((candidate for candidate in manifest.attempts\n                           if candidate.task_id == item.task_id), None)",
-        "killer": "test_final_reconciliation_matches_collected_attempt",
+        "old": "    return next((record for record in attempts\n                 if record.task_id == task_id and record.attempt_id == attempt_id), None)",
+        "new": "    return next((record for record in attempts if record.task_id == task_id), None)",
+        "killer": "test_collected_attempt_record_selects_exact_identity",
     },
     {
         "id": "interrupt-settles-failed",
@@ -190,8 +192,8 @@ class EventExecutor:
 
     def submit(self, fence, invocation):
         task = next(member for member in self.group.members if member.task_id == invocation.task_id)
-        self.calls.append(("submit", task.task_id))
         self.fences[task.task_id] = fence
+        self.calls.append(("submit", task.task_id))
         if task.task_id == self.submit_error_task:
             raise RuntimeError("controlled submit failure")
         configured = _local_materializer(task.program)
@@ -344,6 +346,17 @@ def test_failed_launched_ack_write_parks_but_collects(tmp_path: Path, monkeypatc
     receipts = _outcomes(Path(store.root))
     assert len(receipts) == 1 and receipts[0].status == "completed"
     assert not (Path(fence.output_dir) / "controller-outcome.json").exists()
+
+
+def test_collected_attempt_record_selects_exact_identity() -> None:
+    previous = SimpleNamespace(task_id="member", attempt_id="previous")
+    collected = SimpleNamespace(task_id="member", attempt_id="collected")
+    unrelated = SimpleNamespace(task_id="other", attempt_id="collected")
+    for attempts in (
+        (collected, previous, unrelated),
+        (previous, unrelated, collected),
+    ):
+        assert _collected_attempt_record(attempts, "member", "collected") is collected
 
 
 @pytest.mark.parametrize("attempt_ids", [("f" * 32, "0" * 32), ("0" * 32, "f" * 32)])

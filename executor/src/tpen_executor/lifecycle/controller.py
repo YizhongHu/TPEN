@@ -120,6 +120,14 @@ def _reason(phase: str, error: BaseException | None = None) -> str:
     return f"{phase}:{type(error).__name__}:{detail}"
 
 
+def _collected_attempt_record(
+    attempts: Sequence[Any], task_id: str, attempt_id: Any,
+) -> Any | None:
+    """Select the manifest record for one exact collected fence."""
+    return next((record for record in attempts
+                 if record.task_id == task_id and record.attempt_id == attempt_id), None)
+
+
 def _merge_final_reconciliation(
     published: GroupReconciliationV2,
     receipt_reconciliation: GroupReconciliationV2 | None,
@@ -433,9 +441,7 @@ def run_group_controller(
             if item.task_id not in collected_members:
                 continue
             attempt_id = collected_fences[item.task_id]
-            record = next((candidate for candidate in manifest.attempts
-                           if candidate.task_id == item.task_id
-                           and candidate.attempt_id == attempt_id), None)
+            record = _collected_attempt_record(manifest.attempts, item.task_id, attempt_id)
             if record is None:
                 raise ValueError("collected attempt is absent from durable manifest")
             rebuilt = item
