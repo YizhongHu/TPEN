@@ -107,7 +107,6 @@ cleanup() {
 trap cleanup EXIT
 
 SHA8="${HEAD_SHA:0:8}"
-SHA12="${HEAD_SHA:0:12}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 SCHEDULED_PREFIX=""
 if [[ "$SCHEDULED" == 1 ]]; then

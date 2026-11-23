@@ -26,5 +26,12 @@
     "old": "from experiments.toolkit.job_names import stage1_row_job_name",
     "new": "from scripts.cannon.job_names import stage1_row_job_name",
     "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_launch_imports_from_experiments_only_checkout"
+  },
+  {
+    "id": "executor-harness-sha12-precheck",
+    "target": "scripts/cannon/executor-harness/job.sbatch",
+    "old": "  [[ \"$JOB_NAME\" == *\"${HEAD_SHA:0:8}\"* ]] || { echo \"PRECHECK_FAILED JOB_NAME must contain ${HEAD_SHA:0:8}: $JOB_NAME\" >&2; return 1; }",
+    "new": "  [[ \"$JOB_NAME\" == *\"${HEAD_SHA:0:12}\"* ]] || { echo \"PRECHECK_FAILED JOB_NAME must contain ${HEAD_SHA:0:12}: $JOB_NAME\" >&2; return 1; }",
+    "killer": "scripts/cannon/tests/test_devsuite_renderer.py::test_executor_harness_dry_run_accepts_sha8_job_name"
   }
 ]
