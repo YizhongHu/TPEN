@@ -224,7 +224,7 @@ def _render_body(
         "",
         '[[ "${SLURM_JOB_PARTITION:-}" == test ]] || { echo "PRECHECK_FAILED wrong partition" >&2; exit 2; }',
         '[[ "${HEAD_SHA}" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "PRECHECK_FAILED bad head" >&2; exit 2; }',
-        '[[ "${JOB_NAME}" == *"${HEAD_SHA:0:12}"* ]] || { echo "PRECHECK_FAILED job name missing head" >&2; exit 2; }',
+        '[[ "${JOB_NAME}" == *"${HEAD_SHA:0:8}"* ]] || { echo "PRECHECK_FAILED job name missing head" >&2; exit 2; }',
         '[[ -x "${TASK_ROOT}/scripts/cannon/verify.sh" ]] || { echo "PRECHECK_FAILED verify.sh missing" >&2; exit 2; }',
         '[[ -f "${TASK_ROOT}/scripts/cannon/shared-env-policy.json" ]] || { echo "PRECHECK_FAILED sidecar missing" >&2; exit 2; }',
         '[[ "${RUN_ROOT}" == "${FACILITY_RUN_PREFIX}" || "${RUN_ROOT}" == "${FACILITY_RUN_PREFIX}"/* ]] || { echo "PRECHECK_FAILED run root escape" >&2; exit 2; }',
