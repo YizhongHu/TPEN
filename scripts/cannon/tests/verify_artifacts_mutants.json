@@ -1,30 +1,44 @@
 [
   {
-    "id": "per-entry-deadline-removed",
+    "id": "manifest-hashed-from-source-read",
     "target": "scripts/cannon/verify.sh",
-    "old": "                    if enum_delay:\n                        time.sleep(enum_delay)\n                    if budget_exceeded():\n                        mark_partial(\"collection budget exceeded\")\n                        return False",
-    "new": "                    if enum_delay:\n                        time.sleep(enum_delay)",
-    "killer": "test_verify_artifacts.py::test_collection_budget_checks_each_scandir_entry"
+    "old": "                archive.write(chunk)\n                hasher.update(chunk)",
+    "new": "                hasher.update(src.read())\n                archive.write(chunk)",
+    "killer": "test_verify_artifacts.py::test_full_suite_collector_archives_allowlist_and_writes_manifest"
   },
   {
-    "id": "final-deadline-check-removed",
+    "id": "partial-status-reported-as-ok",
     "target": "scripts/cannon/verify.sh",
-    "old": "    if not partial:\n        final_delay = float(os.environ.get(\"ARTIFACT_TEST_FINAL_WALK_DELAY_SECONDS\", \"0\"))\n        if final_delay:\n            time.sleep(final_delay)\n        if budget_exceeded():\n            mark_partial(\"collection budget exceeded\")",
-    "new": "    if not partial:\n        pass",
-    "killer": "test_verify_artifacts.py::test_final_walk_deadline_check_records_partial"
+    "old": "    printf 'ARTIFACTS_PARTIAL reason=%s artifact_file_count=%s artifact_bytes=%s tar_bytes=%s member_count=%s elapsed_seconds=%s\\n' \\\n      \"$collector_reason\" \"$ARTIFACT_FILE_COUNT\" \"$ARTIFACT_BYTES\" \"$ARTIFACT_TAR_BYTES\" \"$ARTIFACT_FILE_COUNT\" \"$collector_elapsed\" > \"$status_file\" || return 1",
+    "new": "    printf 'ARTIFACTS_OK tar_bytes=%s member_count=%s elapsed_seconds=%s\\n' \\\n      \"$ARTIFACT_TAR_BYTES\" \"$ARTIFACT_FILE_COUNT\" \"$collector_elapsed\" > \"$status_file\" || return 1",
+    "killer": "test_verify_artifacts.py::test_collection_budget_writes_partial_without_touching_verdict_or_scratch"
   },
   {
-    "id": "skipped-record-written-into-inventory",
+    "id": "collection-failure-reported-as-ok",
     "target": "scripts/cannon/verify.sh",
-    "old": "    metadata.write(\n        f\"{source_class}\\t{escaped(source)}\\tskipped_symlink\\t{escaped(destination_rel)}\\t0\\t-\\t{producer}\\n\"\n    )",
-    "new": "    inventory.write(f\"# SKIPPED_SYMLINK  {escaped(destination_rel)}\\n\")\n    metadata.write(\n        f\"{source_class}\\t{escaped(source)}\\tskipped_symlink\\t{escaped(destination_rel)}\\t0\\t-\\t{producer}\\n\"\n    )",
-    "killer": "test_verify_artifacts.py::test_full_suite_collector_copies_allowlist_and_writes_inventory"
+    "old": "      printf 'ARTIFACTS_FAILED reason=%s\\n' \"$artifact_error\" > \"$RUN_ROOT/evidence/artifacts-status.txt\"",
+    "new": "      printf 'ARTIFACTS_OK\\n' > \"$RUN_ROOT/evidence/artifacts-status.txt\"",
+    "killer": "test_verify_artifacts.py::test_collector_failure_preserves_verdict_and_cleans_scratch"
   },
   {
-    "id": "direct-work-root-symlink-dropped",
+    "id": "legacy-repr-manifest-encoding",
     "target": "scripts/cannon/verify.sh",
-    "old": "            if entry.is_symlink():\n                destination_rel = f\"basetemp/{name}\" if name.startswith(\"basetemp-\") else f\"harness/{name}\"\n                source_class = \"basetemp\" if name.startswith(\"basetemp-\") else \"harness\"\n                producer = \"pytest\" if name.startswith(\"basetemp-\") else \"harness\"\n                if not record_skipped_symlink(entry.path, destination_rel, source_class, producer, inventory, metadata):\n                    mark_partial(\"collection budget exceeded\")\n                    break\n                continue",
-    "new": "            if False:\n                destination_rel = f\"basetemp/{name}\" if name.startswith(\"basetemp-\") else f\"harness/{name}\"\n                source_class = \"basetemp\" if name.startswith(\"basetemp-\") else \"harness\"\n                producer = \"pytest\" if name.startswith(\"basetemp-\") else \"harness\"\n                if not record_skipped_symlink(entry.path, destination_rel, source_class, producer, inventory, metadata):\n                    mark_partial(\"collection budget exceeded\")\n                    break\n                continue",
-    "killer": "test_verify_artifacts.py::test_direct_work_root_symlink_is_recorded_as_skipped"
+    "old": "    escaped_destination = escape_tsv(destination_rel)",
+    "new": "    escaped_destination = repr(destination_rel)[1:-1]",
+    "killer": "test_verify_artifacts.py::test_manifest_round_trips_literal_apostrophe_and_shell_metacharacters"
+  },
+  {
+    "id": "stream-size-check-removed",
+    "target": "scripts/cannon/verify.sh",
+    "old": "        if size != header_size or current_size != header_size:\n            mark_partial(f\"source size changed during copy: {source}\")\n            return False",
+    "new": "        pass",
+    "killer": "test_verify_artifacts.py::test_source_mutation_during_stream_is_valid_or_fails_closed"
+  },
+  {
+    "id": "size-mismatch-continues-collection",
+    "target": "scripts/cannon/verify.sh",
+    "old": "        if size != header_size or current_size != header_size:\n            mark_partial(f\"source size changed during copy: {source}\")\n            return False",
+    "new": "        if size != header_size or current_size != header_size:\n            return True",
+    "killer": "test_verify_artifacts.py::test_source_mutation_during_stream_is_valid_or_fails_closed"
   }
 ]
