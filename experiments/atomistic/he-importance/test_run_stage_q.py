@@ -855,6 +855,148 @@ def test_selection_receipt_contains_selected_and_discarded_cells(tmp_path: Path)
     json.dumps(receipt)
 
 
+def test_cell_selection_receipt_is_write_once_and_canonical(tmp_path: Path) -> None:
+    report = {
+        "selection": {"selected": {"stage": "Q"}},
+        "train_packet": {"content_hash": "row-a"},
+    }
+    path = runner._write_cell_selection_receipt(tmp_path, "row-a", report)
+    assert path == tmp_path / "cells" / "row-a" / "selection_receipt.json"
+    assert path.read_bytes() == runner._canonical_selection_receipt_bytes(report)
+    with pytest.raises(runner.StageQSelectionError, match="occupied"):
+        runner._write_cell_selection_receipt(tmp_path, "row-a", report)
+
+    for occupant in ("file", "directory", "dangling symlink"):
+        row = tmp_path / "cells" / occupant
+        row.mkdir(parents=True)
+        target = row / "selection_receipt.json"
+        if occupant == "file":
+            target.write_bytes(b"existing")
+        elif occupant == "directory":
+            target.mkdir()
+        else:
+            target.symlink_to(row / "missing.json")
+        with pytest.raises(runner.StageQSelectionError, match="occupied"):
+            runner._write_cell_selection_receipt(
+                tmp_path,
+                occupant,
+                report | {"train_packet": {"content_hash": occupant}},
+            )
+
+
+def _execute_real_stage_q_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, dict[str, object], object]:
+    """Capture the real execute-produced report and selected cell for consumers."""
+
+    facts = {
+        "global_rank": 0, "global_size": 1, "local_rank": 0, "local_size": 1,
+        "node_rank": 0, "node_size": 1, "host": "consumer-probe-host", "pid": 123,
+        "device": "cuda:consumer-probe", "job_id": "consumer-probe-job",
+        "device_identity": {"kind": "cuda", "index": 0, "uuid": "GPU-consumer-probe"},
+    }
+    monkeypatch.setattr(runner, "_execution_facts", lambda: dict(facts))
+    captured: dict[str, object] = {}
+    real_writer = runner._write_cell_selection_receipt
+
+    def capture_writer(campaign_root: Path, row_id: str, report: dict[str, object]) -> Path:
+        captured["campaign_root"], captured["row_id"], captured["report"] = campaign_root, row_id, report
+        return real_writer(campaign_root, row_id, report)
+
+    monkeypatch.setattr(runner, "_write_cell_selection_receipt", capture_writer)
+    original_launch = runner.launch.launch_train
+
+    def launch_wrapper(source: object, topology: object, **kwargs: object) -> int:
+        guarded_runner = kwargs["runner"]
+
+        def recording_run_from_config(config: object, *, topology: object) -> int:
+            output = Path(config.run.dir) / "resolved_config.yaml"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("horizon: 2000\n", encoding="utf-8")
+            return 0
+
+        monkeypatch.setattr(runner.launch, "run_from_config", recording_run_from_config)
+        return original_launch(source, topology, runner=guarded_runner)
+
+    monkeypatch.setattr(runner.launch, "launch_train", launch_wrapper)
+    assert runner.execute(_args(tmp_path, dry_run=False)) == 0
+    report = captured["report"]
+    row_id = captured["row_id"]
+    assert isinstance(report, dict) and isinstance(row_id, str)
+    selected = next(cell for cell in _cells(tmp_path) if cell.content_hash == row_id)
+    return tmp_path, report, selected
+
+
+def test_real_execute_report_round_trips_through_successor_validator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The validator must accept C captured from the real execute producer."""
+    campaign_root, report, selected = _execute_real_stage_q_output(tmp_path, monkeypatch)
+    assert runner._validate_cell_selection_receipt(campaign_root, selected.content_hash, report)
+
+
+def test_qualification_reads_real_stage_q_cell_completion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Qualification must mark cell_complete PASS for real Stage-Q output."""
+    qualification = importlib.import_module("experiments.polaris.qualify.qualification")
+    campaign_root, report, selected = _execute_real_stage_q_output(tmp_path, monkeypatch)
+    manifest = tmp_path / "qualification-manifest.json"
+    manifest.write_text(json.dumps({"runtime_kind": "polaris-gpu-qualification", "output_root": str(campaign_root), "cell": {"context": report["selection"]["selected"]["context"], "walkers": report["walkers"], "updates": 2000, "checkpoint_every": 1000}}) + "\n", encoding="utf-8")
+    evidence = tmp_path / "qualification-evidence"
+    qualification.qualify(manifest, evidence)
+    verdict = json.loads((evidence / "qualification.json").read_text(encoding="utf-8"))
+    cell_complete = next(row for row in verdict["predicates"] if row["name"] == "cell_complete")
+    assert cell_complete["status"] == "PASS", (selected.output_path, cell_complete)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "altered", "row", "noncanonical"])
+def test_cell_selection_receipt_successor_validation_refuses_mutations(
+    tmp_path: Path, mutation: str
+) -> None:
+    report = {
+        "selection": {"selected": {"stage": "Q"}},
+        "train_packet": {"content_hash": "row-b"},
+    }
+    path = runner._write_cell_selection_receipt(tmp_path, "row-b", report)
+    assert runner._validate_cell_selection_receipt(tmp_path, "row-b", report) == path
+    if mutation == "missing":
+        path.unlink()
+    elif mutation == "altered":
+        # Keep the parsed report unchanged so this specifically exercises C's
+        # exact canonical-byte comparison rather than semantic mapping equality.
+        path.write_text(json.dumps(report, separators=(",", ":")) + "\n", encoding="utf-8")
+    elif mutation == "row":
+        path.write_bytes(
+            runner._canonical_selection_receipt_bytes(
+                {**report, "train_packet": {"content_hash": "row-c"}}
+            )
+        )
+    elif mutation == "noncanonical":
+        path.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
+    if mutation == "missing":
+        with pytest.raises(runner.StageQSelectionError, match="regular file|unreadable"):
+            runner._validate_cell_selection_receipt(tmp_path, "row-b", report)
+    else:
+        with pytest.raises(runner.StageQSelectionError):
+            runner._validate_cell_selection_receipt(tmp_path, "row-b", report)
+
+
+def test_cell_selection_receipt_successor_validation_refuses_read_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = {
+        "selection": {"selected": {"stage": "Q"}},
+        "train_packet": {"content_hash": "row-read-error"},
+    }
+    path = runner._write_cell_selection_receipt(tmp_path, "row-read-error", report)
+    assert path.is_file()
+
+    def raise_read_error(_path: Path) -> bytes:
+        raise OSError("injected read failure")
+
+    monkeypatch.setattr(Path, "read_bytes", raise_read_error)
+    with pytest.raises(runner.StageQSelectionError, match="unreadable"):
+        runner._validate_cell_selection_receipt(tmp_path, "row-read-error", report)
+
+
 def test_execution_facts_cross_launch_boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeCUDA:
         @staticmethod
@@ -1132,8 +1274,9 @@ def test_g4_execute_forwards_exact_facts_and_emits_completion_only_after_snapsho
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
     )
-    expected_filenames = {"selection_receipt.json", "resolved_config.yaml", "COMPLETE"}
+    expected_filenames = {"resolved_config.yaml", "COMPLETE"}
     assert {path.name for path in selected.output_path.iterdir()} == expected_filenames
+    assert (tmp_path / "cells" / selected.content_hash / "selection_receipt.json").is_file()
     resolved = selected.output_path / "resolved_config.yaml"
     assert resolved.read_text(encoding="utf-8") == "horizon: 2000\n"
     assert not list(tmp_path.rglob("ranking_packet.json"))
@@ -1223,6 +1366,29 @@ def test_reused_complete_snapshot_refuses_before_launch_and_preserves_evidence(
             f"unexpected reuse refusal: {refusal!r}"
         )
     assert {path: path.read_bytes() for path in sentinels} == before
+
+
+def test_execute_refuses_occupied_output_before_writing_cell_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cells = _cells(tmp_path)
+    selected = next(
+        cell
+        for cell in cells
+        if cell.manifest["seed_identity"]["label"] == 810001
+        and cell.manifest["scientific_identity"]["context"]["name"] == "O-raw"
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    )
+    selected.output_path.mkdir(parents=True, exist_ok=True)
+    (selected.output_path / "COMPLETE").write_text("old-complete\n", encoding="utf-8")
+    monkeypatch.setattr(runner.launch, "launch_train", lambda *_args, **_kwargs: pytest.fail("launch reached"))
+
+    with pytest.raises(runner.StageQSelectionError):
+        runner.execute(_args(tmp_path, dry_run=False))
+
+    assert not list((tmp_path / "cells" / selected.content_hash).glob("selection_receipt.json"))
 
 
 def _r2_facts() -> dict[str, object]:
@@ -1444,7 +1610,7 @@ def _cooperative_execute_race(
             state["reserved"] = True
 
     monkeypatch.setattr(runner, "_refuse_occupied_output_path", check_and_optionally_reserve)
-    original_write = runner._write_json
+    original_write = runner._write_cell_selection_receipt
 
     def output_bytes(path: Path) -> dict[str, bytes | None]:
         return {
@@ -1452,7 +1618,9 @@ def _cooperative_execute_race(
             for name in ("selection_receipt.json", "resolved_config.yaml", "COMPLETE")
         }
 
-    def interleave_before_first_write(path: Path, payload: object) -> None:
+    def interleave_before_first_write(
+        campaign_root: Path, row_id: str, payload: object
+    ) -> Path:
         if not state["reentered"]:
             state["reentered"] = True
             try:
@@ -1463,9 +1631,11 @@ def _cooperative_execute_race(
                 state["after_second"] = output_bytes(selected_output)
             finally:
                 state["reentered"] = False
-        original_write(path, payload)
+        return original_write(campaign_root, row_id, payload)
 
-    monkeypatch.setattr(runner, "_write_json", interleave_before_first_write)
+    monkeypatch.setattr(
+        runner, "_write_cell_selection_receipt", interleave_before_first_write
+    )
     try:
         state["first_status"] = "success" if runner.execute(args) == 0 else "nonzero"
     except runner.StageQSelectionError:
@@ -3204,10 +3374,9 @@ def test_o1_execute_launches_under_the_o1_path_with_the_o1_horizon(
     assert observed["n_walkers"] == 4_096
     run_dir = observed["run_dir"]
     assert run_dir.parent == tmp_path.resolve() / "O1"
-    assert {path.name for path in run_dir.iterdir()} == {
-        "selection_receipt.json", "resolved_config.yaml", "COMPLETE"
-    }
-    receipt = json.loads((run_dir / "selection_receipt.json").read_text(encoding="utf-8"))
+    assert {path.name for path in run_dir.iterdir()} == {"resolved_config.yaml", "COMPLETE"}
+    receipt_path = tmp_path / "cells" / run_dir.name / "selection_receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["selection"]["selected"]["stage"] == "O1"
     assert receipt["selection"]["selected"]["seed_label"] == 820_002
     assert receipt["train_packet"]["content_hash"] == run_dir.name

@@ -59,7 +59,19 @@ def qualify(manifest_path: Path, evidence: Path, *, artifact_root: Path | None =
     predicates: list[dict] = []
     selection = _find(root, ("selection_receipt.json",))
     resolved = _find(root, ("resolved_config.yaml",))
-    predicates.append(_predicate("cell_complete", True, any(path.parent.joinpath("COMPLETE").is_file() for path in selection)))
+    # C is campaign-owned; completion belongs to the selected artifact leaf
+    # for the same row, never to an unrelated COMPLETE under the campaign.
+    cell_complete = False
+    for path in selection:
+        if path.parent.parent.name != "cells":
+            continue
+        row_id = path.parent.name
+        cell_complete = cell_complete or any(
+            (stage / row_id / "COMPLETE").is_file()
+            for stage in root.iterdir()
+            if stage.is_dir() and stage.name != "cells"
+        )
+    predicates.append(_predicate("cell_complete", True, cell_complete))
     predicates.append(_predicate("selection_receipt", True, bool(selection)))
     predicates.append(_predicate("resolved_config", True, bool(resolved)))
     checkpoint_manifests = _find(root, ("manifest.json", "checkpoint-manifest.json"))

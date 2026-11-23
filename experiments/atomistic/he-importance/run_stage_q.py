@@ -1418,6 +1418,66 @@ def _write_json(path: Path, payload: Mapping[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _canonical_selection_receipt_bytes(report: Mapping[str, object]) -> bytes:
+    """Serialize a cell-selection receipt in its stable, newline-terminated form."""
+
+    return (json.dumps(report, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _selection_receipt_path(campaign_root: Path, row_id: str) -> Path:
+    """Return the cell-owned C path for one selected materialized row."""
+
+    if not row_id or Path(row_id).name != row_id:
+        raise StageQSelectionError(f"invalid selection receipt row id: {row_id!r}")
+    return campaign_root / "cells" / row_id / "selection_receipt.json"
+
+
+def _write_cell_selection_receipt(
+    campaign_root: Path, row_id: str, report: Mapping[str, object]
+) -> Path:
+    """Create C once, refusing every existing file, directory, or symlink occupant."""
+
+    path = _selection_receipt_path(campaign_root, row_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("xb") as stream:
+            stream.write(_canonical_selection_receipt_bytes(report))
+    except (FileExistsError, IsADirectoryError, PermissionError) as error:
+        raise StageQSelectionError(
+            f"selection receipt path is already occupied: {path}"
+        ) from error
+    return path
+
+
+def _validate_cell_selection_receipt(
+    campaign_root: Path,
+    row_id: str,
+    expected_report: Mapping[str, object],
+) -> Path:
+    """Validate unchanged canonical C before a prospective successor launch."""
+
+    path = _selection_receipt_path(campaign_root, row_id)
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise StageQSelectionError(f"selection receipt is not a regular file: {path}")
+        observed = path.read_bytes()
+    except OSError as error:
+        raise StageQSelectionError(f"selection receipt is unreadable: {path}") from error
+    expected = _canonical_selection_receipt_bytes(expected_report)
+    if observed != expected:
+        raise StageQSelectionError(f"selection receipt is not canonical expected C: {path}")
+    try:
+        parsed = json.loads(observed)
+    except json.JSONDecodeError as error:
+        raise StageQSelectionError(f"selection receipt is invalid JSON: {path}") from error
+    if not isinstance(parsed, Mapping):
+        raise StageQSelectionError(f"selection receipt content mismatch: {path}")
+    packet = parsed.get("train_packet")
+    if not isinstance(packet, Mapping) or packet.get("content_hash") != row_id:
+        raise StageQSelectionError(f"selection receipt row mismatch: {path}")
+    return path
+
+
 def _refuse_occupied_output_path(path: Path) -> None:
     """Atomically claim an unoccupied cell leaf before writing evidence.
 
@@ -1598,7 +1658,7 @@ def execute(
 
     output_path = Path(packet.cell.output_path)
     _refuse_occupied_output_path(output_path)
-    _write_json(output_path / "selection_receipt.json", report)
+    _write_cell_selection_receipt(output_root, packet.cell.content_hash, report)
 
     def _guarded_runner(
         config: Any,
