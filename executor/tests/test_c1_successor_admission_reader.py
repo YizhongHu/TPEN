@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import errno
+import fcntl
 import hashlib
 import json
+import multiprocessing
 import os
 import stat
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,10 +22,12 @@ from tpen_executor import (
     AdmissionIntentMismatch, AdmissionUnreadable, read_successor_admission,
 )
 from tpen_executor._codec import canonical_bytes, digest
+from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.contracts import AttemptId
-from tpen_executor.results import SuccessorAdmissionRecord
+from tpen_executor.results import RemoteTeardownReceipt, SuccessorAdmissionRecord
 from tpen_executor.runners import EvidenceUnavailable
 
+from test_b1a_b_publication import _fixture
 from test_continuation_admission import _planned_attempt
 
 
@@ -33,6 +40,8 @@ MUTANTS = (
     {"id": "f", "target": "executor/src/tpen_executor/storage.py", "old": "core_record,\n                record.successor_attempt_id,\n                science_input_digest", "new": "core_record,\n                record.predecessor_attempt_id,\n                science_input_digest", "killer": "test_mutant_f_rebuild_uses_successor_id"},
     {"id": "g", "target": "executor/src/tpen_executor/storage.py", "old": "except EvidenceUnavailable as error:\n                raise AdmissionUnreadable(\"predecessor core outcome is unreadable\") from error", "new": "except EvidenceUnavailable as error:\n                raise", "killer": "test_reader_translates_evidence_unavailable"},
     {"id": "h", "target": "executor/src/tpen_executor/storage.py", "old": "except FenceRejected as error:\n        raise AdmissionUnreadable(\"successor admission is unreadable\") from error", "new": "except FenceRejected as error:\n        raise", "killer": "test_reader_translates_bad_task_lock"},
+    {"id": "i", "target": "executor/src/tpen_executor/storage.py", "old": "if start.transport_kind != \"local\":", "new": "if False:", "killer": "test_reader_rejects_remote_admission_without_teardown"},
+    {"id": "j", "target": "executor/src/tpen_executor/storage.py", "old": "        with _task_lock(os.path.join(task_dir, _TASK_LOCK)):\n            try:\n                records = store._admission_records_for_task(task_dir, task_id)", "new": "        if True:\n            try:\n                records = store._admission_records_for_task(task_dir, task_id)", "killer": "test_reader_waits_for_task_writer"},
 )
 
 
@@ -70,9 +79,91 @@ def _make_admitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def _read(successor, **extra):
-    args = dict(output_dir=successor.output_dir, task_id=successor.task_id, attempt_id=successor.attempt_id.value, group_digest=successor.group_digest, science_input_digest="a" * 64, target_iterations=10)
+    args = _read_arguments(successor)
     args.update(extra)
     return read_successor_admission(**args)
+
+
+def _read_arguments(successor) -> dict[str, object]:
+    return dict(
+        output_dir=successor.output_dir,
+        task_id=successor.task_id,
+        attempt_id=successor.attempt_id.value,
+        group_digest=successor.group_digest,
+        science_input_digest="a" * 64,
+        target_iterations=10,
+    )
+
+
+def _make_remote_admitted(tmp_path: Path):
+    """Create a v2 remote predecessor and consume its bound successor."""
+    store, group, _lease, _inputs, bindings, successors, fences = _fixture(
+        tmp_path, names=("successor",), remote=True
+    )
+    request, acceptance, successor_binding = successors["successor"]
+    predecessor = fences["successor"]
+    admission = store.record_successor_admission(
+        predecessor,
+        request,
+        acceptance,
+        predecessor_binding=bindings["successor"],
+        successor_binding=successor_binding,
+    )
+    allocation = ConfiguredAllocation(
+        successor_binding.allocation_attempt.allocation_id,
+        successor_binding.allocation_attempt.backend_job_id,
+        {},
+    )
+    successor = store.begin_admitted_successor(
+        group,
+        "successor",
+        allocation,
+        "successor-start",
+        "remote",
+        allocation_attempt=successor_binding.allocation_attempt,
+        admission=admission,
+    )
+    receipt_path = Path(predecessor.output_dir) / "remote-teardown.json"
+    receipt = RemoteTeardownReceipt.decode(receipt_path.read_bytes())
+    assert receipt_path.read_bytes() == receipt.encode()
+    assert receipt.child_group_reaped is True and receipt.inspection == "complete"
+    return store, group, allocation, predecessor, successor, request, admission
+
+
+def _read_successor_in_child(arguments, lock_path, ready, begin_read, events, returned, results) -> None:
+    original_lock = storage._task_lock
+
+    @contextmanager
+    def observing_lock(path: str):
+        if Path(path) == Path(lock_path):
+            fd = os.open(path, os.O_RDWR | os.O_CREAT)
+            try:
+                try:
+                    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (BlockingIOError, OSError) as error:
+                    if not isinstance(error, BlockingIOError) and error.errno not in {
+                        errno.EACCES,
+                        errno.EAGAIN,
+                    }:
+                        raise
+                    events.put(("contended", type(error).__name__))
+                else:
+                    fcntl.lockf(fd, fcntl.LOCK_UN)
+                    events.put(("uncontended", None))
+            finally:
+                os.close(fd)
+        with original_lock(path):
+            yield
+
+    storage._task_lock = observing_lock
+    ready.set()
+    begin_read.wait(timeout=5)
+    try:
+        results.put(("ok", read_successor_admission(**arguments)))
+    except BaseException as error:  # pragma: no cover - reported to parent
+        results.put(("error", type(error).__name__, str(error)))
+    finally:
+        returned.set()
 
 
 def _ledger_path(predecessor) -> Path:
@@ -170,6 +261,98 @@ def test_reader_translates_bad_task_lock(tmp_path: Path, monkeypatch: pytest.Mon
     assert _entry_inventory(task_dir) == before
 
 
+def test_reader_rejects_remote_admission_without_teardown(tmp_path: Path) -> None:
+    _store, _group, _allocation, predecessor, successor, request, record = _make_remote_admitted(tmp_path)
+    result = _read(successor)
+    assert result["record"] == record.to_dict()
+    assert result["request"] == request
+    assert digest(result["request"]) == result["record"]["request_digest"]
+    Path(predecessor.output_dir, "remote-teardown.json").unlink()
+    with pytest.raises(AdmissionUnreadable):
+        _read(successor)
+
+
+def test_reader_waits_for_task_writer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store, _group, _allocation, predecessor, successor, _request, _record = _make_remote_admitted(tmp_path)
+    task_dir = Path(successor.output_dir).parent
+    ledger = _ledger_path(predecessor)
+    before = ledger.read_bytes()
+    lock_acquired = threading.Event()
+    release = threading.Event()
+    context = multiprocessing.get_context("spawn")
+    begin_read = context.Event()
+    original_lock = storage._task_lock
+    lock_path = task_dir / ".task.lock"
+
+    @contextmanager
+    def hold_writer_lock(path: str):
+        with original_lock(path):
+            if Path(path) == lock_path:
+                lock_acquired.set()
+                assert release.wait(timeout=5)
+            yield
+
+    monkeypatch.setattr(storage, "_task_lock", hold_writer_lock)
+    writer_error: list[BaseException] = []
+
+    def public_writer() -> None:
+        try:
+            # This public path takes the task lock and then fails read-only
+            # because the fresh successor has no predecessor outcome.
+            store.build_successor_admission_request(
+                successor, AttemptId("lock-probe"), "a" * 64, 10
+            )
+        except BaseException as error:  # expected after the lock is released
+            writer_error.append(error)
+
+    ready = context.Event()
+    returned = context.Event()
+    events = context.Queue()
+    results = context.Queue()
+    reader = context.Process(
+        target=_read_successor_in_child,
+        args=(_read_arguments(successor), str(lock_path), ready, begin_read, events, returned, results),
+    )
+    writer: threading.Thread | None = None
+    reader_started = False
+    try:
+        reader.start()
+        reader_started = True
+        assert ready.wait(timeout=5)
+
+        writer = threading.Thread(target=public_writer)
+        writer.start()
+        assert lock_acquired.wait(timeout=5)
+        begin_read.set()
+        contention = events.get(timeout=5)
+        assert contention[0] == "contended"
+        release.set()
+
+        writer.join(timeout=5)
+        assert not writer.is_alive()
+        assert writer_error and isinstance(writer_error[0], storage.FenceRejected)
+        result = results.get(timeout=5)
+        assert result[0] == "ok"
+        reader.join(timeout=5)
+        assert not reader.is_alive()
+        assert ledger.read_bytes() == before
+    finally:
+        release.set()
+        begin_read.set()
+        if writer is not None:
+            writer.join(timeout=5)
+        if reader_started and reader.is_alive():
+            reader.terminate()
+            reader.join(timeout=5)
+            if reader.is_alive():
+                reader.kill()
+                reader.join(timeout=5)
+        events.close()
+        events.join_thread()
+        results.close()
+        results.join_thread()
+
+
 @pytest.mark.parametrize("case", ["relative", "trailing", "symlink", "predecessor"])
 def test_reader_path_cases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str) -> None:
     _store, _group, _allocation, predecessor, successor, _request, _record = _make_admitted(tmp_path, monkeypatch)
@@ -207,7 +390,7 @@ def test_reader_rejects_truncated_and_noncanonical_ledger(tmp_path: Path, monkey
 def test_reader_rejects_ambiguous_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _store, _group, _allocation, predecessor, successor, _request, record = _make_admitted(tmp_path, monkeypatch)
     # Public APIs reject predecessor forks, so this minimal fixture covers ambiguity reachability.
-    second = Path(successor.output_dir).parent / "successor-admissions" / "other-predecessor"
+    second = _ledger_path(predecessor).parent.parent / "other-predecessor"
     second.mkdir()
     duplicate = SuccessorAdmissionRecord("a", AttemptId("other-predecessor"), record.predecessor_content_id, "a", record.successor_attempt_id, record.request_digest, record.core_acceptance_digest)
     (second / "successor-admission.json").write_bytes(duplicate.encode())
