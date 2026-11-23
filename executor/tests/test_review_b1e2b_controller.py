@@ -457,12 +457,16 @@ def test_submit_base_exception_records_unconfirmed_for_outstanding(
 
 
 def test_controller_outcome_reason_codes_persist(tmp_path: Path) -> None:
+    (tmp_path / "failed").mkdir()
     failed, failed_executor, failed_store = _run_fresh(tmp_path / "failed", submit_error_task="real-task")
+    assert "real-task" in failed_executor.fences, failed.member_reasons
     failed_receipt = ControllerOutcomeReceiptV1.decode(
         (Path(failed_executor.fences["real-task"].output_dir) / "controller-outcome.json").read_bytes()
     )
     assert failed.exit_code == 2 and failed_receipt.reason == "executor-failed"
+    (tmp_path / "invalid").mkdir()
     invalid, invalid_executor, invalid_store = _run_fresh(tmp_path / "invalid", acknowledge=False)
+    assert "real-task" in invalid_executor.fences, invalid.member_reasons
     invalid_receipt = ControllerOutcomeReceiptV1.decode(
         (Path(invalid_executor.fences["real-task"].output_dir) / "controller-outcome.json").read_bytes()
     )
