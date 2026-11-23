@@ -606,6 +606,7 @@ def test_final_guard_rejects_post_composition_health_drift(
     monkeypatch.setenv("TPEN_STAGE1_RESULTS_ROOT", str(tmp_path))
     row = _overlay_row()
     cfg = load_config(str(CONFIG_ROOT / "he" / "train.yaml"))
+    OmegaConf.update(cfg, "run.root", row["results_root"], merge=False)
     compose_train_overlay(cfg, overlay=str(OVERLAY), expected_sha256=overlay_sha256(OVERLAY))
     cfg.callbacks[-len(protocol_module._expected_overlay_callbacks(protocol_module.OVERLAY_RELATIVE_PATH))]["fail_fast"] = False
     with pytest.raises(ProtocolError, match="resolved diagnostics callback profile drifted"):

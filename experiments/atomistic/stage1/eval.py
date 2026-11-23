@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from omegaconf import DictConfig, OmegaConf
@@ -21,6 +22,49 @@ from experiments.toolkit.run_paths import resolve_run_dir
 
 class EvalRunRefusal(ValueError):
     """Raised when a Stage-1 eval would reuse an existing result directory."""
+
+
+def _bind_output_identity(cfg: DictConfig, row: Mapping[str, object]) -> None:
+    """Bind the row-owned eval output identity before config resolution."""
+
+    for path, key in (
+        ("run.root", "results_root"),
+        ("experiment.name", "experiment_name"),
+        ("experiment.sector", "sector"),
+        ("run.run_id", "run_id"),
+        ("run.layout", "layout"),
+    ):
+        value = row.get(key, "nested" if key == "layout" else None)
+        if value is None:
+            raise ValueError(f"manifest row is missing {key}")
+        OmegaConf.update(cfg, path, value, merge=False)
+
+
+def build_eval_config(
+    row: Mapping[str, object], *, config_path: str | Path | None = None,
+    overrides: Sequence[str] | None = None,
+) -> DictConfig:
+    """Compose one eval row with its output slot filled from the row."""
+
+    selected_config = resolve_config_path(config_path or str(row.get("config", "")))
+    if not selected_config.is_file():
+        raise FileNotFoundError(f"Stage-1 config path does not exist: {selected_config}")
+    from tpen.run import load_config
+
+    cfg = load_config(str(selected_config))
+    _bind_output_identity(cfg, row)
+    if overrides is None:
+        from experiments.atomistic.stage1.launch import row_overrides
+
+        selected_overrides = row_overrides(row)
+    else:
+        selected_overrides = list(overrides)
+    if selected_overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(selected_overrides))
+    # Keep the row authoritative for artifact placement if a compatibility
+    # caller supplied a contradictory run.root override.
+    _bind_output_identity(cfg, row)
+    return cfg
 
 
 def _config_run_dir(cfg: DictConfig) -> Path:
@@ -58,16 +102,15 @@ def main() -> int:
     parser.add_argument("--binding", required=True)
     parser.add_argument("--kind", choices=("eval",), required=True)
     parser.add_argument("--expected-checkpoint-sha256", required=True)
-    args = parser.parse_args()
+    # The existing compatibility CLI keeps free-form OmegaConf overrides;
+    # allow rendered commands to place named gateway flags around that list.
+    args = parser.parse_intermixed_args()
     config_path = resolve_config_path(args.config)
-    validate_gateway_binding(
+    row = validate_gateway_binding(
         binding=args.binding, config=str(config_path), overrides=args.overrides, kind=args.kind,
         expected_checkpoint_sha256=args.expected_checkpoint_sha256,
     )
-    if not config_path.is_file():
-        raise FileNotFoundError(f"Stage-1 config path does not exist: {config_path}")
-    from tpen.run import load_config
-    cfg = load_config(str(config_path), args.overrides)
+    cfg = build_eval_config(row, config_path=config_path, overrides=args.overrides)
     _refuse_existing_eval_run(cfg)
     # The config/launcher supplies the strict model-only restore policy; this
     # driver does not import checkpoint internals or silently alter identity.

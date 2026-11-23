@@ -156,7 +156,7 @@ def test_hooke_train_gateway_rechecks_resolved_seed_binding(
         isolated.setattr(
             stage1_train,
             "run_from_config",
-            lambda **_: pytest.fail("seed-tampered config reached execution"),
+            lambda *_args, **_: pytest.fail("seed-tampered config reached execution"),
         )
         isolated.setattr(
             sys,

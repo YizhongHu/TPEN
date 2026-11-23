@@ -13,8 +13,14 @@ import pytest
 
 from experiments.atomistic.stage1 import eval as stage1_eval
 from experiments.atomistic.stage1 import train as stage1_train
-from experiments.atomistic.stage1.launch import render
+from experiments.atomistic.stage1.launch import command_for_row, render, row_overrides
 from experiments.atomistic.stage1.protocol import (
+    HOOKE_SCIENCE_PROFILE,
+    STAGE1_PROTOCOL,
+    build_manifest,
+    config_identities,
+    hooke_evaluation_selection,
+    overlay_sha256,
     resolve_config_path,
 )
 
@@ -77,6 +83,107 @@ def _row(kind: str) -> dict[str, object]:
     return row
 
 
+def _production_train_row(system: str, root: Path) -> dict[str, object]:
+    """Build one production-shaped train row with an isolated output root."""
+
+    config_root = REPO_ROOT / "experiments/atomistic/stage1/configs"
+    if system in {"hooke1", "hooke2", "qho2e"}:
+        overlay = "configs/overlays/hooke-diagnostics-v1.yaml"
+        selection = hooke_evaluation_selection(system)[0]
+        profile = HOOKE_SCIENCE_PROFILE
+    else:
+        overlay = "configs/overlays/diagnostics-v1.yaml"
+        selection = None
+        profile = None
+    rows = build_manifest(
+        protocol=STAGE1_PROTOCOL,
+        source_sha="a" * 40,
+        config_sha256=config_identities(config_root=config_root, systems=(system,)),
+        checkpoints=list(range(0, STAGE1_PROTOCOL.lineage_updates + 1,
+                              STAGE1_PROTOCOL.retention_cadence or 1)),
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root=str(root),
+        systems=(system,),
+        phase=1,
+        science_profile=profile,
+        evaluation_selection=selection,
+        overlay=overlay,
+        overlay_sha256=overlay_sha256(overlay),
+    )
+    return next(row for row in rows if row["kind"] == "train")
+
+
+def _production_eval_row(system: str, root: Path) -> dict[str, object]:
+    """Adapt a production train identity into one isolated eval row."""
+
+    row = dict(_production_train_row(system, root))
+    checkpoint_dir = (root / "checkpoint").resolve()
+    row.update(
+        kind="eval",
+        config=f"configs/{system}/eval.yaml",
+        row_id=f"{system}-eval-0",
+        run_id=f"eval-{system}-0",
+        draws=STAGE1_PROTOCOL.eval_draws,
+        walkers=STAGE1_PROTOCOL.eval_walkers,
+        checkpoint_dir=str(checkpoint_dir),
+        checkpoint_file=str(checkpoint_dir / "model.pt"),
+        checkpoint_sha256="d" * 64,
+    )
+    for key in ("checkpoint_steps", "overlay", "overlay_sha256"):
+        row.pop(key, None)
+    return row
+
+
+def _run_rendered_row(
+    row: dict[str, object], *, monkeypatch: pytest.MonkeyPatch,
+    results_env: str | None,
+) -> object:
+    """Drive command_for_row's actual argv through the selected gateway main."""
+
+    driver = (
+        "experiments/atomistic/stage1/eval.py"
+        if row["kind"] == "eval"
+        else "experiments/atomistic/stage1/train.py"
+    )
+    argv = shlex.split(command_for_row(row, python=sys.executable, driver=driver))
+    module = stage1_eval if row["kind"] == "eval" else stage1_train
+    captured: list[object] = []
+    monkeypatch.setattr(
+        module, "run_from_config",
+        lambda cfg, **_kwargs: (captured.append(cfg) or 0),
+    )
+    original_merge = module.OmegaConf.merge
+
+    def spy_merge(*configs: object) -> object:
+        """Require the row root to be bound before any composition merge."""
+
+        assert configs
+        assert module.OmegaConf.select(configs[0], "run.root") == str(row["results_root"])
+        return original_merge(*configs)
+
+    monkeypatch.setattr(module.OmegaConf, "merge", spy_merge)
+    if results_env is None:
+        monkeypatch.delenv("TPEN_STAGE1_RESULTS_ROOT", raising=False)
+    else:
+        monkeypatch.setenv("TPEN_STAGE1_RESULTS_ROOT", results_env)
+    monkeypatch.chdir(REPO_ROOT)
+    monkeypatch.setattr(sys, "argv", [argv[1], *argv[2:]])
+    assert module.main() == 0
+    assert len(captured) == 1
+    return captured[0]
+
+
+def _contradictory_root_overrides(row: dict[str, object]) -> list[str]:
+    """Replace the compatibility root override with a contradictory path."""
+
+    return [
+        "run.root=/contradictory/compatibility-root"
+        if override.startswith("run.root=") else override
+        for override in row_overrides(row)
+    ]
+
+
 def _rendered_argv(
     row: dict[str, object], driver: str, tmp_path: Path, checkout_root: Path,
 ) -> list[str]:
@@ -115,6 +222,15 @@ def _make_probe_checkout(source: Path, destination: Path, marker: str) -> Path:
         + f"\nprint('STAGE1_PROTOCOL_ORIGIN={marker}:' + __file__)\n"
     )
     return destination
+
+
+@pytest.mark.parametrize("system", ["hooke1", "hooke2", "qho2e", "he", "h2"])
+@pytest.mark.parametrize("kind", ["train", "eval"])
+def test_every_stage1_output_slot_is_mandatory(system: str, kind: str) -> None:
+    """Every train/eval recipe requires the row builder to bind its root."""
+
+    config = REPO_ROOT / "experiments/atomistic/stage1/configs" / system / f"{kind}.yaml"
+    assert 'run: {root: "???"' in config.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
@@ -171,10 +287,12 @@ def test_rendered_driver_imports_experiments_outside_checkout(
     ],
 )
 @pytest.mark.parametrize("submission_cwd", ["repo", "unrelated"])
+@pytest.mark.parametrize("results_env", [None, "/contradictory/stage1-root"])
 def test_rendered_driver_resolves_config_from_any_submission_cwd(
     kind: str,
     driver: str,
     submission_cwd: str,
+    results_env: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -211,6 +329,10 @@ def test_rendered_driver_resolves_config_from_any_submission_cwd(
         "run_from_config",
         lambda cfg, **kwargs: (run_calls.append((cfg, kwargs)) or 0),
     )
+    if results_env is None:
+        monkeypatch.delenv("TPEN_STAGE1_RESULTS_ROOT", raising=False)
+    else:
+        monkeypatch.setenv("TPEN_STAGE1_RESULTS_ROOT", results_env)
     monkeypatch.chdir(REPO_ROOT if submission_cwd == "repo" else tmp_path)
     monkeypatch.setattr(sys, "argv", [argv[1], *argv[2:]])
 
@@ -228,6 +350,67 @@ def test_rendered_driver_resolves_config_from_any_submission_cwd(
         assert cfg.sampler.n_walkers == row["walkers"]
         assert cfg.trainer.max_steps == row["updates"]
         assert list(cfg.checkpoint_steps) == list(row["checkpoint_steps"])
+    assert cfg.run.root == row["results_root"]
+
+
+@pytest.mark.parametrize("system", ["hooke1", "hooke2", "qho2e", "he", "h2"])
+@pytest.mark.parametrize("results_env", [None, "/contradictory/stage1-root"])
+def test_production_train_rows_bind_output_before_resolution(
+    system: str,
+    results_env: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rendered production train rows use their own root regardless of env state."""
+
+    root = tmp_path / system
+    row = _production_train_row(system, root)
+    cfg = _run_rendered_row(row, monkeypatch=monkeypatch, results_env=results_env)
+    assert cfg.run.root == str(root)
+
+
+@pytest.mark.parametrize("system", ["hooke1", "hooke2", "qho2e", "he", "h2"])
+@pytest.mark.parametrize("results_env", [None, "/contradictory/stage1-root"])
+def test_production_eval_rows_bind_output_before_resolution(
+    system: str,
+    results_env: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rendered production eval rows use their own root regardless of env state."""
+
+    root = tmp_path / system
+    row = _production_eval_row(system, root)
+    cfg = _run_rendered_row(row, monkeypatch=monkeypatch, results_env=results_env)
+    assert cfg.run.root == str(root)
+
+
+@pytest.mark.parametrize("system", ["hooke1", "hooke2", "qho2e", "he"])
+def test_train_builder_rebinds_output_after_compatibility_override(
+    system: str, tmp_path: Path,
+) -> None:
+    """A legacy override cannot redirect the final train output root."""
+
+    root = tmp_path / system
+    row = _production_train_row(system, root)
+    cfg = stage1_train.build_train_config(
+        row, overrides=_contradictory_root_overrides(row),
+    )
+    assert cfg.run.root == str(root)
+
+
+@pytest.mark.parametrize("system", ["hooke1", "hooke2", "qho2e", "he"])
+def test_eval_builder_rebinds_output_after_compatibility_override(
+    system: str, tmp_path: Path,
+) -> None:
+    """A legacy override cannot redirect the final eval output root."""
+
+    root = tmp_path / system
+    row = _production_eval_row(system, root)
+    cfg = stage1_eval.build_eval_config(
+        row, overrides=_contradictory_root_overrides(row),
+    )
+    assert cfg.run.root == str(root)
 
 
 @pytest.mark.parametrize("submission_cwd", ["repo", "unrelated"])

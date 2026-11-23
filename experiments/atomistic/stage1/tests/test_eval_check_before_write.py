@@ -48,7 +48,13 @@ def _invoke_eval(
     monkeypatch.setattr(
         stage1_eval,
         "validate_gateway_binding",
-        lambda **_: {},
+        lambda **_: {
+            "results_root": str(cfg.run.root),
+            "experiment_name": str(cfg.experiment.name),
+            "sector": str(cfg.experiment.sector),
+            "run_id": str(cfg.run.run_id),
+            "layout": str(cfg.run.layout),
+        },
     )
     import tpen.run
 
