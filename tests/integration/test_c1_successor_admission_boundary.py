@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -90,6 +91,28 @@ else:
 '''
 
 
+def _canonical_json(value: dict[str, object]) -> bytes:
+    """Encode a closed core acceptance mapping canonically."""
+
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+
+
+def _restore_request_bytes(request) -> bytes:
+    """Use the core boundary's acceptance-digest convention."""
+
+    return _canonical_json({
+        "schema": request.SCHEMA,
+        "decision": request.decision.to_dict(),
+        "ref": request.ref.to_dict(),
+        "target_iterations": request.target_iterations,
+        "next_iteration": request.next_iteration,
+        "completed_updates": request.completed_updates,
+        "load": request.load,
+    })
+
+
 def test_c1_reader_preserves_real_core_restore_boundary(tmp_path: Path) -> None:
     """Core admits the child-produced request; executor returns its closed request."""
     store_root = tmp_path / "executor-store"
@@ -104,7 +127,12 @@ def test_c1_reader_preserves_real_core_restore_boundary(tmp_path: Path) -> None:
     request = executor_call(_EXECUTOR_CHILD, tmp_path, "build-request", {**initialized, "successor_attempt_id": "c1-successor", "science_input_digest": intent.science_input_digest, "target_iterations": intent.target_iterations})
     accepted = select_successor_admission(intent, request)
     assert accepted.accepted
-    result = executor_call(_EXECUTOR_CHILD, tmp_path, "record-read", {**initialized, "request": request, "core_acceptance_digest": "b" * 64, "successor_attempt_id": "c1-successor", "science_input_digest": intent.science_input_digest, "target_iterations": intent.target_iterations})
+    assert accepted.restore_request is not None
+    core_acceptance_digest = hashlib.sha256(
+        _restore_request_bytes(accepted.restore_request)
+    ).hexdigest()
+    result = executor_call(_EXECUTOR_CHILD, tmp_path, "record-read", {**initialized, "request": request, "core_acceptance_digest": core_acceptance_digest, "successor_attempt_id": "c1-successor", "science_input_digest": intent.science_input_digest, "target_iterations": intent.target_iterations})
+    assert result["result"]["record"]["core_acceptance_digest"] == core_acceptance_digest
     restore = operational_restore_request_from_admission(intent, result["result"]["request"])
     assert restore.ref.content_id == ref.content_id
     assert restore.next_iteration == ref.next_iteration
