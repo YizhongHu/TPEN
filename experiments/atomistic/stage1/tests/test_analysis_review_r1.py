@@ -98,7 +98,7 @@ def test_figures_have_signed_absolute_variance_panels_and_all_lineage_spreads(
     # Current PR returns only error_vs_step and variance_vs_step: expected
     # semantic red, not HARNESS_INVALID, because all inputs are synthetic and
     # the plotting spy is a complete deterministic test double.
-    assert set(paths) == {"signed_error_vs_step", "absolute_error_vs_step", "variance_vs_step"}
+    assert set(paths) == {"error_vs_step", "absolute_error_vs_step", "variance_vs_step"}
     assert len([call for call in calls if call["kind"] == "plot"]) == 6
     assert len([call for call in calls if call["kind"] == "spread"]) == 6
     assert all(Path(path).is_file() for path in paths.values())
