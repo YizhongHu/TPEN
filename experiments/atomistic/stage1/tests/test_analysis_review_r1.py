@@ -71,7 +71,7 @@ def test_figures_have_signed_absolute_variance_panels_and_all_lineage_spreads(
         def set_ylabel(self, _value):
             pass
 
-        def grid(self, **_kwargs):
+        def grid(self, *_args, **_kwargs):
             pass
 
         def legend(self, **_kwargs):
