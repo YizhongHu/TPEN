@@ -82,6 +82,7 @@ def _summarize_group(key: tuple[str, int, int], rows: list[Mapping[str, Any]]) -
                           for variance, stream_mean in zip(variances, means)) / 4
     mean_range = _range(means)
     error_range = _range(errors)
+    absolute_error_range = _range([row["absolute_error"] for row in stream_rows])
     variance_range = _range(variances)
     return {
         "system_id": key[0], "lineage": key[1], "checkpoint": key[2],
@@ -92,6 +93,9 @@ def _summarize_group(key: tuple[str, int, int], rows: list[Mapping[str, Any]]) -
         "stream_mean_range": mean_range["range"],
         "stream_error_min": error_range["min"], "stream_error_max": error_range["max"],
         "stream_error_range": error_range["range"],
+        "stream_absolute_error_min": absolute_error_range["min"],
+        "stream_absolute_error_max": absolute_error_range["max"],
+        "stream_absolute_error_range": absolute_error_range["range"],
         "stream_variance_min": variance_range["min"], "stream_variance_max": variance_range["max"],
         "stream_variance_range": variance_range["range"],
         "stream_mean_rms_spread": math.sqrt(sum((value - mean) ** 2 for value in means) / 4),
@@ -253,10 +257,11 @@ def join_training_history(analysis: Mapping[str, Any],
 
 
 def write_trajectory_figures(analysis: Mapping[str, Any], output_dir: str | Path) -> dict[str, str]:
-    """Write deterministic error-vs-step and variance-vs-step PNG figures.
+    """Write deterministic signed-error, absolute-error, and variance figures.
 
-    The line is the lineage's four-stream mean; the translucent band is the
-    raw four-stream min/max range.  No interpolation or epsilon is applied.
+    Each lineage contributes four raw stream traces and one aggregate trace to
+    every panel.  The translucent band is the corresponding raw four-stream
+    min/max range.  No interpolation or epsilon is applied.
     """
     groups = list(analysis.get("groups", []))
     if not groups:
@@ -271,9 +276,10 @@ def write_trajectory_figures(analysis: Mapping[str, Any], output_dir: str | Path
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     figures: dict[str, str] = {}
-    for name, value, low, high, ylabel in (
-        ("error_vs_step.png", "signed_error", "stream_error_min", "stream_error_max", "signed error (Ha)"),
-        ("variance_vs_step.png", "pooled_variance", "stream_variance_min", "stream_variance_max", "variance (Ha^2)"),
+    for name, stream_value, aggregate_value, low, high, ylabel in (
+        ("signed_error_vs_step.png", "error", "signed_error", "stream_error_min", "stream_error_max", "signed error (Ha)"),
+        ("absolute_error_vs_step.png", "absolute_error", "absolute_error", "stream_absolute_error_min", "stream_absolute_error_max", "absolute error (Ha)"),
+        ("variance_vs_step.png", "variance", "pooled_variance", "stream_variance_min", "stream_variance_max", "variance (Ha^2)"),
     ):
         figure, axis = plt.subplots(figsize=(8, 5), dpi=150)
         identities = sorted({(str(group["system_id"]), int(group["lineage"])) for group in groups})
@@ -282,14 +288,31 @@ def write_trajectory_figures(analysis: Mapping[str, Any], output_dir: str | Path
                                if str(group["system_id"]) == system_id and int(group["lineage"]) == lineage),
                               key=lambda group: int(group["checkpoint"]))
             steps = [group["checkpoint"] for group in selected]
-            means = [group[value] for group in selected]
             lows = [group[low] for group in selected]
             highs = [group[high] for group in selected]
             label = f"{system_id}/lineage-{lineage}"
-            (line,) = axis.plot(steps, means, marker="o", markersize=3, label=label)
+            stream_series = [[row[stream_value] for row in group["streams"]] for group in selected]
+            aggregate = [group[aggregate_value] for group in selected]
+            # A single 2-D call retains four stream traces plus Ehat/pooled in
+            # one lineage panel while keeping the legend label compact.
+            series = [
+                [stream_series[index][stream] for index in range(len(selected))]
+                for stream in range(4)
+            ]
+            series.append(aggregate)
+            lines = axis.plot(
+                steps,
+                list(zip(*series)),
+                marker="o",
+                markersize=3,
+                label=f"{label} streams + aggregate",
+            )
+            line = lines[0]
             axis.fill_between(steps, lows, highs, color=line.get_color(), alpha=0.16)
         axis.set_xlabel("checkpoint step")
         axis.set_ylabel(ylabel)
+        if ylabel.startswith("signed") and hasattr(axis, "axhline"):
+            axis.axhline(0.0, color="black", linewidth=0.8, alpha=0.5)
         axis.grid(True, alpha=0.25)
         axis.legend(loc="best")
         figure.tight_layout()

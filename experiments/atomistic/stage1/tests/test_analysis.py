@@ -125,6 +125,6 @@ def test_figures_are_written_to_caller_directory(tmp_path: Path) -> None:
     analysis = summarize_collection(_collection(lineages=(0, 1), checkpoints=(0, 1)))
     paths = write_trajectory_figures(analysis, tmp_path / "figures")
 
-    assert set(paths) == {"error_vs_step", "variance_vs_step"}
+    assert set(paths) == {"signed_error_vs_step", "absolute_error_vs_step", "variance_vs_step"}
     assert all(Path(path).is_file() for path in paths.values())
     assert all(Path(path).stat().st_size > 0 for path in paths.values())

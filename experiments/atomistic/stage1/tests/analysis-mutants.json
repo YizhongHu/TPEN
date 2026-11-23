@@ -20,6 +20,13 @@
       "old": "\"completed_step\": stored_step + 1",
       "new": "\"completed_step\": stored_step",
       "killer": "experiments/atomistic/stage1/tests/test_analysis.py::test_training_join_maps_zero_based_step_and_preserves_skips"
+    },
+    {
+      "id": "drop-absolute-error-panel",
+      "target": "experiments/atomistic/stage1/analysis.py",
+      "old": "(\"absolute_error_vs_step.png\", \"absolute_error\", \"absolute_error\", \"stream_absolute_error_min\", \"stream_absolute_error_max\", \"absolute error (Ha)\"),",
+      "new": "# absolute-error panel removed by mutation,",
+      "killer": "experiments/atomistic/stage1/tests/test_analysis_review_r1.py::test_figures_have_signed_absolute_variance_panels_and_all_lineage_spreads"
     }
   ]
 }
