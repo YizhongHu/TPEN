@@ -353,7 +353,7 @@ def test_rendered_driver_resolves_config_from_any_submission_cwd(
     assert cfg.run.root == row["results_root"]
 
 
-@pytest.mark.parametrize("system", ["hooke1", "hooke2", "qho2e", "he"])
+@pytest.mark.parametrize("system", ["hooke1", "hooke2", "qho2e", "he", "h2"])
 @pytest.mark.parametrize("results_env", [None, "/contradictory/stage1-root"])
 def test_production_train_rows_bind_output_before_resolution(
     system: str,
@@ -369,7 +369,7 @@ def test_production_train_rows_bind_output_before_resolution(
     assert cfg.run.root == str(root)
 
 
-@pytest.mark.parametrize("system", ["hooke1", "hooke2", "qho2e", "he"])
+@pytest.mark.parametrize("system", ["hooke1", "hooke2", "qho2e", "he", "h2"])
 @pytest.mark.parametrize("results_env", [None, "/contradictory/stage1-root"])
 def test_production_eval_rows_bind_output_before_resolution(
     system: str,
