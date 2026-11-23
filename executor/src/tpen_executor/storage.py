@@ -22,7 +22,7 @@ from .results import (
     SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3, StartReceipt,
     SuccessorAdmissionRecord, MemberPublicationV2, ReconciliationPublicationV2, decode_placement_receipt,
 )
-from .runners import CoreRunEvidence
+from .runners import CoreRunEvidence, EvidenceUnavailable
 from ._records import frozen_record
 
 
@@ -46,6 +46,38 @@ class LaunchIntentRejected(FenceRejected):
 
 class LaunchIntentAbsent(FenceRejected):
     """Raised only when a validated attempt has no launch-intent file."""
+
+
+class SuccessorAdmissionReadError(ValueError):
+    """Base class for failures while reading a successor admission."""
+
+
+class AdmissionAbsent(SuccessorAdmissionReadError):
+    """Raised when no successor admission matches the requested identity."""
+
+
+class AdmissionAmbiguous(SuccessorAdmissionReadError):
+    """Raised when more than one admission matches the requested identity."""
+
+
+class AdmissionIdentityMismatch(SuccessorAdmissionReadError):
+    """Raised when a path or durable record crosses the requested identity."""
+
+
+class AdmissionUnreadable(SuccessorAdmissionReadError):
+    """Raised when an admission or its predecessor evidence cannot be read."""
+
+
+class AdmissionIntentMismatch(SuccessorAdmissionReadError):
+    """Raised when caller intent does not match the admitted request digest."""
+
+
+class _AdmissionLedgerIdentityMismatch(ValueError):
+    """Internal marker for a ledger record crossed with its task."""
+
+
+class _AdmissionCoreIdentityMismatch(FenceRejected):
+    """Internal marker for predecessor core evidence crossed with its fence."""
 
 
 @frozen_record
@@ -91,6 +123,32 @@ def _lexical(path: str | os.PathLike[str]) -> str:
 def _inside(root: str, path: str) -> bool:
     """Check lexical containment, including the root itself."""
     return path == root or path.startswith(root + os.sep)
+
+
+def _layout_for_output_dir(output_dir: str) -> tuple[str, str, str, str, str]:
+    """Parse ``<root>/groups/<digest>/<task>/<attempt>`` lexically."""
+    if type(output_dir) is not str:
+        raise TypeError("output_dir must be a string")
+    if not os.path.isabs(output_dir):
+        raise AdmissionIdentityMismatch("output_dir must be absolute")
+    output = _lexical(output_dir)
+    attempt = os.path.basename(output)
+    task_dir = os.path.dirname(output)
+    task_id = os.path.basename(task_dir)
+    group_dir = os.path.dirname(task_dir)
+    group_digest = os.path.basename(group_dir)
+    groups_dir = os.path.dirname(group_dir)
+    if os.path.basename(groups_dir) != "groups":
+        raise AdmissionIdentityMismatch("output_dir is outside the executor group layout")
+    root = os.path.dirname(groups_dir)
+    if not attempt or not re.fullmatch(r"[A-Za-z0-9._:-]+", task_id or ""):
+        raise AdmissionIdentityMismatch("output_dir has an invalid task or attempt component")
+    try:
+        sha256_text(group_digest, "group_digest")
+        AttemptId(attempt)
+    except (TypeError, ValueError) as error:
+        raise AdmissionIdentityMismatch("output_dir has an invalid group or attempt component") from error
+    return root, output, task_dir, group_digest, task_id
 
 
 _CORE_EVIDENCE_FENCE_REASON = "core evidence run_dir crosses the attempt fence"
@@ -1362,10 +1420,10 @@ class DirectoryStore:
         return request
 
     def _continuation_predecessor_locked(
-        self, fence: AttemptFence, task_dir: str,
+        self, fence: AttemptFence, task_dir: str, *, current: bool = True,
     ) -> tuple[StartReceipt, CoreOutcomeRecord]:
         """Read the complete continuation predicate while the task is locked."""
-        start = self._validate_fence(fence, task_dir)
+        start = self._validate_fence(fence, task_dir) if current else self._validate_fence_immutable(fence, task_dir)
         output_dir = _lexical(fence.output_dir)
         core_path = _lexical(os.path.join(output_dir, "core"))
         _require_directory(core_path, "core evidence directory")
@@ -1432,7 +1490,7 @@ class DirectoryStore:
             or record.attempt_id != start.attempt_id
             or record_core_dir != expected_core_dir
         ):
-            raise FenceRejected("core outcome record crosses the attempt fence")
+            raise _AdmissionCoreIdentityMismatch("core outcome record crosses the attempt fence")
         if not record.continuation_eligible or record.outcome != "planned_yield":
             raise FenceRejected("core outcome is not a continuation-eligible planned yield")
         checkpoint_ref = record.evidence.get("checkpoint_ref")
@@ -1616,7 +1674,7 @@ class DirectoryStore:
             if encoded != record.encode():
                 raise ValueError("successor admission record is not canonical")
             if record.predecessor_task_id != task_id or record.predecessor_attempt_id.value != predecessor_attempt_id:
-                raise ValueError("foreign successor admission record in task store")
+                raise _AdmissionLedgerIdentityMismatch("foreign successor admission record in task store")
             if record.predecessor_attempt_id in seen:
                 raise ValueError("successor admission ledger contains a predecessor fork")
             seen.add(record.predecessor_attempt_id)
@@ -1973,4 +2031,134 @@ def _write_pointer(path: str, attempt_id: str) -> None:
             except FileNotFoundError: pass
 
 
-__all__ = ["AdmissionFork", "AttemptFence", "ControllerGenerationRejected", "DirectoryStore", "FenceRejected", "LaunchIntentAbsent", "LaunchIntentRejected"]
+def read_successor_admission(
+    output_dir: str,
+    *,
+    task_id: str,
+    attempt_id: str,
+    group_digest: str,
+    science_input_digest: str,
+    target_iterations: int,
+) -> Mapping[str, object]:
+    """Read one closed successor admission and rebuild its request.
+
+    Parameters
+    ----------
+    output_dir : str
+        Fenced attempt directory in the executor-owned group layout.
+    task_id, attempt_id, group_digest : str
+        The placement identity supplied to the child process.
+    science_input_digest : str
+        Digest of the caller-owned science intent.
+    target_iterations : int
+        Resolved target iteration count from the caller-owned science intent.
+
+    Returns
+    -------
+    Mapping[str, object]
+        Fresh ``record`` and rebuilt closed ``request`` mappings.
+
+    Raises
+    ------
+    SuccessorAdmissionReadError
+        If the durable admission is absent, ambiguous, crossed, unreadable,
+        or does not match the supplied intent.
+    """
+    try:
+        root, output, task_dir, path_digest, path_task = _layout_for_output_dir(output_dir)
+    except SuccessorAdmissionReadError:
+        raise
+    if type(task_id) is not str or type(attempt_id) is not str or type(group_digest) is not str:
+        raise TypeError("placement identity must be text")
+    if path_digest != group_digest or path_task != task_id or os.path.basename(output) != attempt_id:
+        raise AdmissionIdentityMismatch("output_dir does not match placement identity")
+    try:
+        AttemptId(attempt_id)
+        sha256_text(science_input_digest, "science_input_digest")
+    except (TypeError, ValueError) as error:
+        raise TypeError("invalid successor admission intent") from error
+    if type(target_iterations) is not int or target_iterations < 0:
+        raise TypeError("target_iterations must be a nonnegative integer")
+
+    try:
+        try:
+            store = DirectoryStore(root)
+        except (OSError, TypeError, ValueError, FenceRejected) as error:
+            raise AdmissionUnreadable("store root is unreadable") from error
+        _require_directory(root, "store root", AdmissionUnreadable)
+        _require_directory(os.path.join(root, "groups"), "groups directory", AdmissionUnreadable)
+        _require_directory(os.path.join(root, "groups", group_digest), "group directory", AdmissionUnreadable)
+        _require_directory(task_dir, "task directory", AdmissionUnreadable)
+        _require_directory(output, "attempt directory", AdmissionUnreadable)
+        with _task_lock(os.path.join(task_dir, _TASK_LOCK)):
+            try:
+                records = store._admission_records_for_task(task_dir, task_id)
+            except _AdmissionLedgerIdentityMismatch as error:
+                raise AdmissionIdentityMismatch("successor admission crosses task identity") from error
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise AdmissionUnreadable("successor admission ledger is unreadable") from error
+            if any(record.successor_task_id != task_id for record in records):
+                raise AdmissionIdentityMismatch("successor admission crosses task identity")
+            matches = [record for record in records if record.successor_attempt_id.value == attempt_id]
+            if not matches:
+                raise AdmissionAbsent("successor admission is absent")
+            if len(matches) > 1:
+                raise AdmissionAmbiguous("successor admission is ambiguous")
+            record = matches[0]
+            predecessor_dir = _lexical(os.path.join(task_dir, record.predecessor_attempt_id.value))
+            start_path = os.path.join(predecessor_dir, "start.json")
+            _require_regular(start_path, "predecessor start receipt", AdmissionUnreadable)
+            encoded_start = Path(start_path).read_bytes()
+            try:
+                predecessor_start = StartReceipt.decode(encoded_start)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise AdmissionUnreadable("predecessor start receipt is unreadable") from error
+            if encoded_start != predecessor_start.encode():
+                raise AdmissionUnreadable("predecessor start receipt is not canonical")
+            if (
+                predecessor_start.task_id != task_id
+                or predecessor_start.attempt_id != record.predecessor_attempt_id
+                or predecessor_start.group_digest != group_digest
+                or predecessor_start.output_dir != predecessor_dir
+            ):
+                raise AdmissionIdentityMismatch("predecessor start receipt crosses admission identity")
+            predecessor = AttemptFence(
+                root,
+                group_digest,
+                task_id,
+                predecessor_start.allocation_id.value,
+                record.predecessor_attempt_id,
+                predecessor_dir,
+            )
+            try:
+                _, core_record = store._continuation_predecessor_locked(predecessor, task_dir, current=False)
+            except _AdmissionCoreIdentityMismatch as error:
+                raise AdmissionIdentityMismatch("predecessor core outcome crosses admission identity") from error
+            except EvidenceUnavailable as error:
+                raise AdmissionUnreadable("predecessor core outcome is unreadable") from error
+            except (OSError, TypeError, ValueError, FenceRejected, json.JSONDecodeError) as error:
+                raise AdmissionUnreadable("predecessor core outcome is unreadable") from error
+            request = store._successor_request_from_record(
+                core_record,
+                record.successor_attempt_id,
+                science_input_digest,
+                target_iterations,
+            )
+            if digest(request) != record.request_digest:
+                raise AdmissionIntentMismatch("successor admission intent does not match request digest")
+            return {"record": thaw(record.to_dict()), "request": thaw(request)}
+    except SuccessorAdmissionReadError:
+        raise
+    except FenceRejected as error:
+        raise AdmissionUnreadable("successor admission is unreadable") from error
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise AdmissionUnreadable("successor admission is unreadable") from error
+
+
+__all__ = [
+    "AdmissionAbsent", "AdmissionAmbiguous", "AdmissionFork", "AdmissionIdentityMismatch",
+    "AdmissionIntentMismatch", "AdmissionUnreadable", "AttemptFence",
+    "ControllerGenerationRejected", "DirectoryStore", "FenceRejected",
+    "LaunchIntentAbsent", "LaunchIntentRejected", "SuccessorAdmissionReadError",
+    "read_successor_admission",
+]
