@@ -1,7 +1,5 @@
 """Build and validate the bounded names used for Stage-1 jobs."""
 
-from __future__ import annotations
-
 import argparse
 import re
 from typing import Any, Mapping, Optional
