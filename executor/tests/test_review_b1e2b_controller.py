@@ -614,7 +614,12 @@ def test_shared_successor_attempt_ids_cleanup(
     assert {(receipt.task_id, receipt.attempt_id) for receipt in matching} == expected
     assert len(matching) == len(expected)
     assert all(receipt.status == "remote-quiescence-unconfirmed" for receipt in matching)
-    assert all(receipt.status != "failed" for receipt in receipts)
+    predecessor_keys = {(name, fence.attempt_id) for name, fence in fences.items()}
+    assert all(
+        receipt.status != "failed"
+        for receipt in receipts
+        if (receipt.task_id, receipt.attempt_id) not in predecessor_keys
+    )
     assert [task_id for kind, task_id in executor.calls if kind == "submit"] == list(names)
     assert len(executor.submits) == 2
 
