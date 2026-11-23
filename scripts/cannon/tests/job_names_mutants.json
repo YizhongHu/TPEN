@@ -1,7 +1,7 @@
 [
   {
     "id": "stage1-lineage-seed-label",
-    "target": "scripts/cannon/job_names.py",
+    "target": "experiments/toolkit/job_names.py",
     "old": "        variant = f\"l{lineage}\"",
     "new": "        variant = f\"l{row['lineage_seed']}\"",
     "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_stage1_job_names_use_lineage_index_and_eval_identity"
@@ -19,5 +19,12 @@
     "old": "        default_job_name = build_job_name(\"tpen\", \"verify\", lane=\"s1\", sha=sha)",
     "new": "        default_job_name = \"tpen-verify-s1-deadbeef\"",
     "killer": "test_render_verify_packet.py::test_default_job_name_uses_stage_lane_and_sha8"
+  },
+  {
+    "id": "launch-scripts-import-regression",
+    "target": "experiments/atomistic/stage1/launch.py",
+    "old": "from experiments.toolkit.job_names import stage1_row_job_name",
+    "new": "from scripts.cannon.job_names import stage1_row_job_name",
+    "killer": "test_launch.py::test_launch_imports_from_experiments_only_checkout"
   }
 ]

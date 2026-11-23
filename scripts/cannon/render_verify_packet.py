@@ -20,10 +20,10 @@ import tarfile
 from typing import Dict, List, Optional, Sequence
 
 try:
-    from scripts.cannon.job_names import build_job_name, validate_job_name
+    from experiments.toolkit.job_names import build_job_name, validate_job_name
 except ModuleNotFoundError:  # Direct execution from outside the repository root.
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from job_names import build_job_name, validate_job_name
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from experiments.toolkit.job_names import build_job_name, validate_job_name
 
 
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")

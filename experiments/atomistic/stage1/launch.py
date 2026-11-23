@@ -23,7 +23,7 @@ from experiments.atomistic.stage1.protocol import (
     _validate_run_identity,
     identity_expectations,
 )
-from scripts.cannon.job_names import stage1_row_job_name
+from experiments.toolkit.job_names import stage1_row_job_name
 
 ALLOWED_PARTITIONS = ("test", "gpu_test", "seas_gpu", "kozinsky_gpu", "gpu")
 GPU_PARTITIONS = frozenset(ALLOWED_PARTITIONS[1:])

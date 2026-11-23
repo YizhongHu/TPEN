@@ -1,4 +1,9 @@
-"""Build and validate the bounded names used for Stage-1 jobs."""
+"""Build and validate bounded names used for Stage-1 jobs.
+
+This module is deliberately standard-library-only because exact-source
+science checkouts may contain ``experiments/`` and project metadata without
+the operational ``scripts/`` tree.
+"""
 
 import argparse
 import re

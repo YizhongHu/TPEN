@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import shlex
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +18,7 @@ from experiments.atomistic.stage1.launch import (
     render as _render,
     row_overrides,
 )
-from scripts.cannon.job_names import stage1_row_job_name
+from experiments.toolkit.job_names import stage1_row_job_name
 from experiments.atomistic.stage1.protocol import (
     CONFIG_IDENTITY_RULE,
     ProtocolError,
@@ -97,6 +100,28 @@ def test_stage1_job_names_use_lineage_index_and_eval_identity() -> None:
     }) == "hooke2-eval-l0-c100000-s0-s1-cccccccc"
     with pytest.raises(ValueError, match="lineage index"):
         stage1_row_job_name({**ROW, "lineage_seed": 11})
+
+
+def test_launch_imports_from_experiments_only_checkout(tmp_path: Path) -> None:
+    """Keep exact-source experiment checkouts independent of ``scripts/``."""
+
+    checkout = tmp_path / "checkout"
+    shutil.copytree(REPO_ROOT / "experiments", checkout / "experiments")
+    assert not (checkout / "scripts").exists()
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from experiments.atomistic.stage1.launch import stage1_row_job_name; "
+            "print(stage1_row_job_name({'kind': 'train', 'system': 'he', 'lineage': 0}))",
+        ],
+        cwd=checkout,
+        env={**os.environ, "PYTHONPATH": str(checkout)},
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "he-train-l0-s1"
 
 
 def test_render_fails_for_unapproved_partition_or_results_root() -> None:
