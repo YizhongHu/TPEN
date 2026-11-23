@@ -1,0 +1,25 @@
+{
+  "mutants": [
+    {
+      "id": "pooled-within-only",
+      "target": "experiments/atomistic/stage1/analysis.py",
+      "old": "pooled_variance = sum(variance + (stream_mean - mean) ** 2",
+      "new": "pooled_variance = sum(variance",
+      "killer": "experiments/atomistic/stage1/tests/test_analysis.py::test_summary_uses_between_stream_term_and_reports_ranges"
+    },
+    {
+      "id": "trailing-window-minus-one",
+      "target": "experiments/atomistic/stage1/analysis.py",
+      "old": "start = max(1, checkpoint - 99)",
+      "new": "start = max(1, checkpoint - 100)",
+      "killer": "experiments/atomistic/stage1/tests/test_analysis.py::test_training_join_maps_zero_based_step_and_preserves_skips"
+    },
+    {
+      "id": "drop-pre-update-offset",
+      "target": "experiments/atomistic/stage1/analysis.py",
+      "old": "\"completed_step\": stored_step + 1",
+      "new": "\"completed_step\": stored_step",
+      "killer": "experiments/atomistic/stage1/tests/test_analysis.py::test_training_join_maps_zero_based_step_and_preserves_skips"
+    }
+  ]
+}
