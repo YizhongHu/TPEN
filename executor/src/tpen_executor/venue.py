@@ -77,10 +77,15 @@ class GpuStratumV1:
         _require_identifier(self.name, "gpu stratum name")
         if type(self.accelerator) is not str or self.accelerator not in {"cpu", "cuda"}:
             raise _refuse("accelerator must be 'cpu' or 'cuda'")
-        if type(self.gpu_name_contains) is not tuple or any(
-            type(fragment) is not str or not fragment for fragment in self.gpu_name_contains
-        ):
+        if type(self.gpu_name_contains) is not tuple:
             raise _refuse("gpu_name_contains must contain non-empty strings")
+        for fragment in self.gpu_name_contains:
+            if type(fragment) is not str or not fragment:
+                raise _refuse("gpu_name_contains must contain non-empty strings")
+            try:
+                fragment.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise _refuse("gpu_name_contains must contain UTF-8 encodable strings") from error
         if type(self.mig_mode) is not str or self.mig_mode not in {"any", "disabled"}:
             raise _refuse("mig_mode must be 'any' or 'disabled'")
         if self.accelerator == "cpu":

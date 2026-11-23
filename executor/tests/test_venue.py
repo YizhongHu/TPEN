@@ -17,45 +17,52 @@ FIXTURES = Path(__file__).parent / "fixtures" / "venues"
 MUTANTS = (
     {
         "id": "M1",
-        "target": "VenueProfileV1.from_mapping",
+        "target": "executor/src/tpen_executor/venue.py",
         "old": 'if mapping.get("schema") != cls.schema:',
         "new": "if False:",
         "killer": "test_wrong_schema_and_unknown_keys_are_refused",
     },
     {
         "id": "M2",
-        "target": "_ensure_unique",
+        "target": "executor/src/tpen_executor/venue.py",
         "old": "if len(values) != len(set(values)):",
         "new": "if False:",
         "killer": "test_duplicate_queue_and_stratum_names_are_refused",
     },
     {
         "id": "M3",
-        "target": "_require_exact",
+        "target": "executor/src/tpen_executor/venue.py",
         "old": "if set(data) != expected:",
         "new": "if False:",
         "killer": "test_wrong_schema_and_unknown_keys_are_refused",
     },
     {
         "id": "M4",
-        "target": "GpuStratumV1",
+        "target": "executor/src/tpen_executor/venue.py",
         "old": "if type(self.memory_mib) is not int or self.memory_mib <= 0:",
         "new": "if type(self.memory_mib) is not int:",
         "killer": "test_nonpositive_or_boolean_memory_is_refused",
     },
     {
         "id": "M5",
-        "target": "load_venue_profile",
+        "target": "executor/src/tpen_executor/venue.py",
         "old": "object_pairs_hook=_reject_duplicate_keys,",
         "new": "object_pairs_hook=dict,",
         "killer": "test_duplicate_json_key_is_refused",
     },
     {
         "id": "M6",
-        "target": "load_venue_profile",
+        "target": "executor/src/tpen_executor/venue.py",
         "old": 'if candidate.suffix != ".json":',
         "new": "if False:",
         "killer": "test_unsupported_suffix_is_refused",
+    },
+    {
+        "id": "M7",
+        "target": "executor/src/tpen_executor/venue.py",
+        "old": 'fragment.encode("utf-8")',
+        "new": "# no encoding validation",
+        "killer": "test_lone_surrogates_are_refused",
     },
 )
 
@@ -82,6 +89,19 @@ def test_equivalent_json_has_equal_canonical_mapping_and_digest() -> None:
     assert equivalent.to_dict() == cannon.to_dict()
     assert equivalent.canonical_bytes() == cannon.canonical_bytes()
     assert equivalent.digest() == cannon.digest()
+
+
+def test_valid_unicode_fragments_canonicalize() -> None:
+    for fixture in ("non-ascii-fragment.json", "surrogate-pair-fragment.json"):
+        profile = load_venue_profile(FIXTURES / fixture)
+        assert profile.canonical_bytes()
+        assert len(profile.digest()) == 64
+
+
+def test_lone_surrogates_are_refused() -> None:
+    for fixture in ("lone-high-surrogate.json", "lone-low-surrogate.json"):
+        with pytest.raises(VenueProfileRefusal):
+            load_venue_profile(FIXTURES / fixture)
 
 
 @pytest.mark.parametrize(
@@ -147,6 +167,7 @@ def test_mutant_table_is_product_only_and_named_killers_exist() -> None:
     tests = Path(__file__).read_text(encoding="utf-8")
     assert len({entry["id"] for entry in MUTANTS}) == len(MUTANTS)
     for entry in MUTANTS:
+        assert entry["target"] == "executor/src/tpen_executor/venue.py"
         assert product.count(entry["old"]) == 1
         assert product.count(entry["new"]) == 0
         assert f"def {entry['killer']}" in tests
