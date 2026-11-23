@@ -59,7 +59,7 @@ def test_local_render_uses_operator_job_names(tmp_path: Path) -> None:
 
 
 def test_executor_harness_dry_run_accepts_sha8_job_name(tmp_path: Path) -> None:
-    """The staged executor harness accepts the launcher’s SHA8 job name."""
+    """The staged executor harness enforces the launcher’s SHA8 job name."""
 
     harness = tmp_path / "harness"
     shutil.copytree(REPO_ROOT / "scripts/cannon/executor-harness", harness)
@@ -72,31 +72,43 @@ def test_executor_harness_dry_run_accepts_sha8_job_name(tmp_path: Path) -> None:
 
     head_sha = "0123456789abcdef" * 2 + "01234567"
     run_root = node_tmp / "run"
+    harness_env = {
+        **os.environ,
+        "DRY_RUN": "1",
+        "DRY_NODE_TMP": str(node_tmp),
+        "HARNESS_ROOT": str(harness),
+        "HEAD_SHA": head_sha,
+        "JOB_NAME": f"devsuite-exec-s1-{head_sha[:8]}",
+        "LOCAL_FAKE": "1",
+        "LOCAL_FAKE_ROOT": str(tmp_path),
+        "MUTANT_SPEC": str(harness / "mutants.json"),
+        "RUN_ROOT": str(run_root),
+        "SLURM_JOB_ID": "99999999",
+        "SLURM_JOB_PARTITION": "test",
+        "TASK_ROOT": str(harness),
+        "USER": os.environ.get("USER", "test-user"),
+    }
     result = subprocess.run(
         [str(harness / "job.sbatch")],
         cwd=harness,
-        env={
-            **os.environ,
-            "DRY_RUN": "1",
-            "DRY_NODE_TMP": str(node_tmp),
-            "HARNESS_ROOT": str(harness),
-            "HEAD_SHA": head_sha,
-            "JOB_NAME": f"devsuite-exec-s1-{head_sha[:8]}",
-            "LOCAL_FAKE": "1",
-            "LOCAL_FAKE_ROOT": str(tmp_path),
-            "MUTANT_SPEC": str(harness / "mutants.json"),
-            "RUN_ROOT": str(run_root),
-            "SLURM_JOB_ID": "99999999",
-            "SLURM_JOB_PARTITION": "test",
-            "TASK_ROOT": str(harness),
-            "USER": os.environ.get("USER", "test-user"),
-        },
+        env=harness_env,
         text=True,
         capture_output=True,
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "DRY_RUN=1 PASS" in (run_root / "evidence/driver.log").read_text(encoding="utf-8")
+
+    rejected = subprocess.run(
+        [str(harness / "job.sbatch")],
+        cwd=harness,
+        env={**harness_env, "JOB_NAME": "devsuite-exec-s1"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert rejected.returncode != 0
+    assert "PRECHECK_FAILED JOB_NAME must contain" in rejected.stderr
 
 
 def test_local_render_stages_harness_from_sha_not_any_other_ref(tmp_path: Path) -> None:

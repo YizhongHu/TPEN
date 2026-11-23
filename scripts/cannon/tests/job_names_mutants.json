@@ -33,5 +33,12 @@
     "old": "  [[ \"$JOB_NAME\" == *\"${HEAD_SHA:0:8}\"* ]] || { echo \"PRECHECK_FAILED JOB_NAME must contain ${HEAD_SHA:0:8}: $JOB_NAME\" >&2; return 1; }",
     "new": "  [[ \"$JOB_NAME\" == *\"${HEAD_SHA:0:12}\"* ]] || { echo \"PRECHECK_FAILED JOB_NAME must contain ${HEAD_SHA:0:12}: $JOB_NAME\" >&2; return 1; }",
     "killer": "scripts/cannon/tests/test_devsuite_renderer.py::test_executor_harness_dry_run_accepts_sha8_job_name"
+  },
+  {
+    "id": "executor-harness-sha-check-removed",
+    "target": "scripts/cannon/executor-harness/job.sbatch",
+    "old": "  [[ \"$JOB_NAME\" == *\"${HEAD_SHA:0:8}\"* ]] || { echo \"PRECHECK_FAILED JOB_NAME must contain ${HEAD_SHA:0:8}: $JOB_NAME\" >&2; return 1; }",
+    "new": "  :",
+    "killer": "scripts/cannon/tests/test_devsuite_renderer.py::test_executor_harness_dry_run_accepts_sha8_job_name"
   }
 ]
