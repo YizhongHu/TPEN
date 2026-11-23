@@ -112,8 +112,17 @@ def test_launch_imports_from_experiments_only_checkout(tmp_path: Path) -> None:
         [
             sys.executable,
             "-c",
-            "from experiments.atomistic.stage1.launch import stage1_row_job_name; "
-            "print(stage1_row_job_name({'kind': 'train', 'system': 'he', 'lineage': 0}))",
+            "from experiments.atomistic.stage1.launch import render; "
+            "render(row={'kind': 'train', 'config': 'configs/he/train.yaml', "
+            "'row_id': 'he-train-0', 'seed': 123, 'updates': 50000, "
+            "'walkers': 4096, 'source_sha': 'c' * 40, "
+            "'config_sha256': 'b' * 64, "
+            "'results_root': '/n/netscratch/kozinsky_lab/Lab/rhu/stage1', "
+            "'experiment_name': 'stage1', 'sector': 'he', "
+            "'run_id': 'train-lineage-0', 'lineage': 0}, "
+            "driver='/bin/true', python='/usr/bin/true', head_sha='c' * 40, "
+            "results_root='/n/netscratch/kozinsky_lab/Lab/rhu/stage1', "
+            f"checkout_root={str(checkout)!r}, scratch_base={str(tmp_path)!r})",
         ],
         cwd=checkout,
         env={**os.environ, "PYTHONPATH": str(checkout)},
@@ -121,7 +130,6 @@ def test_launch_imports_from_experiments_only_checkout(tmp_path: Path) -> None:
         capture_output=True,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "he-train-l0-s1"
 
 
 def test_render_fails_for_unapproved_partition_or_results_root() -> None:

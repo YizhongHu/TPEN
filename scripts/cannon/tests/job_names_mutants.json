@@ -11,20 +11,20 @@
     "target": "scripts/cannon/devsuite/submit_devsuite.sh",
     "old": "ROOT_JOB_NAME=\"$(python3 \"$JOB_NAME_TOOL\" --subject devsuite --purpose root --lane s1 --sha \"$HEAD_SHA\")\"",
     "new": "ROOT_JOB_NAME=\"$(python3 \"$JOB_NAME_TOOL\" --subject devsuite --purpose root --lane s1 --sha \"00000000${HEAD_SHA:8}\")\"",
-    "killer": "test_devsuite_renderer.py::test_local_render_uses_operator_job_names"
+    "killer": "scripts/cannon/tests/test_devsuite_renderer.py::test_local_render_uses_operator_job_names"
   },
   {
     "id": "renderer-default-name-ignored",
     "target": "scripts/cannon/render_verify_packet.py",
     "old": "        default_job_name = build_job_name(\"tpen\", \"verify\", lane=\"s1\", sha=sha)",
     "new": "        default_job_name = \"tpen-verify-s1-deadbeef\"",
-    "killer": "test_render_verify_packet.py::test_default_job_name_uses_stage_lane_and_sha8"
+    "killer": "scripts/cannon/tests/test_render_verify_packet.py::test_default_job_name_uses_stage_lane_and_sha8"
   },
   {
     "id": "launch-scripts-import-regression",
     "target": "experiments/atomistic/stage1/launch.py",
     "old": "from experiments.toolkit.job_names import stage1_row_job_name",
     "new": "from scripts.cannon.job_names import stage1_row_job_name",
-    "killer": "test_launch.py::test_launch_imports_from_experiments_only_checkout"
+    "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_launch_imports_from_experiments_only_checkout"
   }
 ]
