@@ -463,7 +463,7 @@ def test_submit_base_exception_records_unconfirmed_for_outstanding(
         # submit raised before returning an acknowledgement, so only the
         # already acknowledged member has a terminal operational receipt.
         expected_keys = {one_key}
-        assert "two" in executor.fences
+        assert "two" not in executor.fences
     else:
         expected_keys = {one_key, ("two", executor.fences["two"].attempt_id)}
     assert receipt_keys == expected_keys
