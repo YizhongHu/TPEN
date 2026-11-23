@@ -61,7 +61,7 @@ MUTANTS = (
         "id": "M7",
         "target": "executor/src/tpen_executor/venue.py",
         "old": 'fragment.encode("utf-8")',
-        "new": "# no encoding validation",
+        "new": "pass",
         "killer": "test_lone_surrogates_are_refused",
     },
 )
@@ -171,3 +171,4 @@ def test_mutant_table_is_product_only_and_named_killers_exist() -> None:
         assert product.count(entry["old"]) == 1
         assert product.count(entry["new"]) == 0
         assert f"def {entry['killer']}" in tests
+        compile(product.replace(entry["old"], entry["new"]), entry["target"], "exec")
