@@ -23,6 +23,7 @@ from experiments.atomistic.stage1.protocol import (
     _validate_run_identity,
     identity_expectations,
 )
+from scripts.cannon.job_names import stage1_row_job_name
 
 ALLOWED_PARTITIONS = ("test", "gpu_test", "seas_gpu", "kozinsky_gpu", "gpu")
 GPU_PARTITIONS = frozenset(ALLOWED_PARTITIONS[1:])
@@ -264,6 +265,7 @@ def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
     command = command_for_row(
         row, python=python, driver=_resolve_driver_path(driver, checkout_root)
     )
+    job_name = stage1_row_job_name(row)
     template_path = Path(__file__).with_name("templates") / "cannon.sbatch"
     template = template_path.read_text(encoding="utf-8")
     if is_gpu:
@@ -293,6 +295,7 @@ def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
         "__PARTITION__": partition,
         "__RESULTS_ROOT__": results_root,
         "__HEAD_SHA__": head_sha,
+        "__JOB_NAME__": job_name,
         "__SCRATCH_BASE__": scratch_base.rstrip("/"),
         "__COMMAND__": command,
     }.items():

@@ -15,6 +15,7 @@ from experiments.atomistic.stage1.launch import (
     render as _render,
     row_overrides,
 )
+from scripts.cannon.job_names import stage1_row_job_name
 from experiments.atomistic.stage1.protocol import (
     CONFIG_IDENTITY_RULE,
     ProtocolError,
@@ -81,8 +82,21 @@ def test_render_contains_fail_closed_identity_and_cleanup_guards(tmp_path: Path)
     assert "STAGE1_GUARD results root outside" in script
     assert '[[ "$JOB_ROOT" == "$SCRATCH_BASE/$USER/$SLURM_JOB_ID" ]]' in script
     assert "trap 'rm -rf -- \"$JOB_ROOT\"' EXIT" in script
+    assert "#SBATCH --job-name=he-train-l0-s1-cccccccc" in script
     assert "exec " not in script
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def test_stage1_job_names_use_lineage_index_and_eval_identity() -> None:
+    assert stage1_row_job_name({**ROW, "system": "qho2e", "lineage": 0}) == (
+        "qho2e-train-l0-s1-cccccccc"
+    )
+    assert stage1_row_job_name({
+        **ROW, "system": "hooke2", "kind": "eval", "lineage": 0,
+        "checkpoint": 100000, "stream": 0,
+    }) == "hooke2-eval-l0-c100000-s0-s1-cccccccc"
+    with pytest.raises(ValueError, match="lineage index"):
+        stage1_row_job_name({**ROW, "lineage_seed": 11})
 
 
 def test_render_fails_for_unapproved_partition_or_results_root() -> None:

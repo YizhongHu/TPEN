@@ -40,6 +40,22 @@ def test_local_render_uses_exact_sha_harness() -> None:
     assert f"harness_source_sha={SHA}" in result.stdout
 
 
+def test_local_render_uses_operator_job_names(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [str(LAUNCHER), "--local-dry-run", SHA],
+        cwd=REPO_ROOT,
+        env={**os.environ, "DEVSUITE_LOCAL_STAGE_DIR": str(tmp_path / "staged")},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    root = (tmp_path / "staged" / "root" / "root.sbatch").read_text(encoding="utf-8")
+    executor = (tmp_path / "staged" / "executor" / "executor.sbatch").read_text(encoding="utf-8")
+    assert f"#SBATCH --job-name=devsuite-root-s1-{SHA[:8]}" in root
+    assert f"#SBATCH --job-name=devsuite-exec-s1-{SHA[:8]}" in executor
+
+
 def test_local_render_stages_harness_from_sha_not_any_other_ref(tmp_path: Path) -> None:
     """Inspect staged bytes when the SHA is neither HEAD nor the worktree."""
 

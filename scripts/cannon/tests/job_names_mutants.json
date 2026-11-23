@@ -1,0 +1,23 @@
+[
+  {
+    "id": "stage1-lineage-seed-label",
+    "target": "scripts/cannon/job_names.py",
+    "old": "        variant = f\"l{lineage}\"",
+    "new": "        variant = f\"l{row['lineage_seed']}\"",
+    "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_stage1_job_names_use_lineage_index_and_eval_identity"
+  },
+  {
+    "id": "devsuite-root-sha8-dropped",
+    "target": "scripts/cannon/devsuite/submit_devsuite.sh",
+    "old": "ROOT_JOB_NAME=\"$(python3 \"$JOB_NAME_TOOL\" --subject devsuite --purpose root --lane s1 --sha \"$HEAD_SHA\")\"",
+    "new": "ROOT_JOB_NAME=\"$(python3 \"$JOB_NAME_TOOL\" --subject devsuite --purpose root --lane s1 --sha \"00000000${HEAD_SHA:8}\")\"",
+    "killer": "test_devsuite_renderer.py::test_local_render_uses_operator_job_names"
+  },
+  {
+    "id": "renderer-default-name-ignored",
+    "target": "scripts/cannon/render_verify_packet.py",
+    "old": "        default_job_name = build_job_name(\"tpen\", \"verify\", lane=\"s1\", sha=sha)",
+    "new": "        default_job_name = \"tpen-verify-s1-deadbeef\"",
+    "killer": "test_render_verify_packet.py::test_default_job_name_uses_stage_lane_and_sha8"
+  }
+]
