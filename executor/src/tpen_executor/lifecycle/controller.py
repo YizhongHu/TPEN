@@ -66,6 +66,8 @@ class MemberLaunchResult:
 class AllocationLocalExecutor(Protocol):
     """Fake-friendly seam for one already-fenced local launch."""
 
+    capacity: int
+
     def submit(self, fence: AttemptFence, invocation: MemberInvocationV2) -> tuple[MemberLaunchResult, Any]:
         """Submit exactly once and return an acknowledgement plus opaque handle."""
 
@@ -255,7 +257,10 @@ def run_group_controller(
     reasons: dict[str, str] = {}
     parked_this_run: dict[str, str] = {}
     collected_members: set[str] = set()
+    collected_fences: dict[str, Any] = {}
     active: list[tuple[Any, Any, Any, Any, Any, bool]] = []
+    pending: list[Any] = []
+    current_owned: tuple[Any, Any, Any, Any, Any, bool] | None = None
 
     def _park_member(task_id: str, phase: str, error: BaseException | None = None) -> None:
         outcomes.append((task_id, "parked"))
@@ -263,169 +268,176 @@ def run_group_controller(
         reasons[task_id] = reason
         parked_this_run[task_id] = reason
 
+    def _finish_unconfirmed(entry: tuple[Any, Any, Any, Any, Any, bool]) -> None:
+        _, fence, invocation, _, _, _ = entry
+        try:
+            AttachedAllocation(allocation, store, invocation.allocation_attempt).finish(
+                fence, "remote-quiescence-unconfirmed", _now(), None,
+            )
+        except Exception:
+            pass
+
+    def _cleanup_unconfirmed(extra: tuple[Any, Any, Any, Any, Any, bool] | None = None) -> None:
+        entries = ([] if extra is None else [extra]) + active
+        seen = set()
+        for entry in entries:
+            key = entry[1].attempt_id
+            if key in seen:
+                continue
+            seen.add(key)
+            _finish_unconfirmed(entry)
+
     for member in published.members:
         if member.action in {"preserve_completed", "preserve_terminal"}:
             outcomes.append((member.task_id, member.action))
-            continue
-        if member.action not in {"start_fresh", "admit_successor"}:
+        elif member.action in {"start_fresh", "admit_successor"}:
+            pending.append(member)
+        else:
             _park_member(member.task_id, "reconcile-action")
-            continue
-        try:
-            if member.action == "start_fresh":
-                invocation_id = InvocationId(uuid4().hex)
-                fence = store.begin_attempt_current_controller(
-                    group, member.task_id, allocation, facts.observed_at_utc, "local",
-                    allocation_attempt=attempt, invocation_id=invocation_id, controller_record=controller,
-                )
-                invocation = MemberInvocationV2(
-                    attempt, group.identity, member.task_id,
-                    next(task.lineage_id for task in group.members if task.task_id == member.task_id),
-                    fence.attempt_id, invocation_id,
-                )
-            else:
-                record = next((item.admission for item in durable_publication.members if item.evidence.task_id == member.task_id), None)
-                if not isinstance(record, SuccessorAdmissionRecord) or record.successor_binding is None:
-                    raise LaunchIntentRejected("successor admission unavailable")
-                fence = store.begin_admitted_successor_current_controller(
-                    group, member.task_id, allocation, facts.observed_at_utc, "local",
-                    allocation_attempt=record.successor_binding.allocation_attempt, admission=record,
-                    controller_record=controller,
-                )
-                invocation = record.successor_binding
-            try:
-                existing = store.read_launch_intent(fence)
-            except LaunchIntentAbsent:
-                existing = None
-            except Exception as error:
-                _park_member(member.task_id, "intent-read", error)
-                continue
-            if existing is not None:
-                _park_member(member.task_id, "intent-recovered")
-                continue
-            store.create_launch_intent(fence, controller, invocation)
-            store.require_current_controller(group, controller.generation, controller.claimant_nonce)
-            try:
-                launched, handle = executor.submit(fence, invocation)
-            except Exception as error:
-                try:
-                    store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "submit-failed")
-                except Exception:
-                    pass
-                _park_member(member.task_id, "executor-launch", error)
-                continue
-            if not isinstance(launched, MemberLaunchResult) or not launched.acknowledged:
-                try:
-                    store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "invalid-submit-ack")
-                except Exception:
-                    pass
-                _park_member(member.task_id, "launch-ack")
-                continue
-            # The handle is retained even if this acknowledgement write fails.
-            try:
-                store.record_controller_outcome(fence, controller, invocation, "launched", launched.detail or "acknowledged")
-            except Exception as error:
-                reasons[member.task_id] = _reason("outcome-receipt", error)
-            active.append((member, fence, invocation, handle, controller, member.action == "admit_successor"))
-        except Exception as error:
-            _park_member(member.task_id, "member-transition", error)
-        except BaseException:
-            try:
-                AttachedAllocation(allocation, store, invocation.allocation_attempt).finish(
-                    fence, "failed", _now(), None,
-                )
-            except Exception:
-                pass
-            raise
 
-    while active:
-        member, fence, invocation, handle, owner, successor = active.pop(0)
-        try:
-            result = executor.collect(handle, facts.poll_timeout)
-        except CollectionWaitTimeout:
-            # Polling is the only repeatable operation; keep this same handle (never resubmit).
-            active.append((member, fence, invocation, handle, owner, successor))
-            continue
-        except BaseException as error:
+    capacity = getattr(executor, "capacity", 1)
+    if type(capacity) is not int or capacity <= 0:
+        capacity = 1
+
+    def _fill_capacity() -> None:
+        nonlocal current_owned
+        while pending and len(active) < capacity:
+            member = pending.pop(0)
+            current_owned = None
             try:
-                AttachedAllocation(allocation, store, invocation.allocation_attempt).finish(
-                    fence, "remote-quiescence-unconfirmed", _now(), None,
-                )
-            except Exception:
-                pass
-            _park_member(member.task_id, "collection", error)
-            if not isinstance(error, Exception):
-                for _, pending_fence, pending_invocation, _, _, _ in active:
+                if member.action == "start_fresh":
+                    invocation_id = InvocationId(uuid4().hex)
+                    fence = store.begin_attempt_current_controller(
+                        group, member.task_id, allocation, facts.observed_at_utc, "local",
+                        allocation_attempt=attempt, invocation_id=invocation_id, controller_record=controller,
+                    )
+                    invocation = MemberInvocationV2(
+                        attempt, group.identity, member.task_id,
+                        next(task.lineage_id for task in group.members if task.task_id == member.task_id),
+                        fence.attempt_id, invocation_id,
+                    )
+                else:
+                    record = next((item.admission for item in durable_publication.members if item.evidence.task_id == member.task_id), None)
+                    if not isinstance(record, SuccessorAdmissionRecord) or record.successor_binding is None:
+                        raise LaunchIntentRejected("successor admission unavailable")
+                    fence = store.begin_admitted_successor_current_controller(
+                        group, member.task_id, allocation, facts.observed_at_utc, "local",
+                        allocation_attempt=record.successor_binding.allocation_attempt, admission=record,
+                        controller_record=controller,
+                    )
+                    invocation = record.successor_binding
+                try:
+                    existing = store.read_launch_intent(fence)
+                except LaunchIntentAbsent:
+                    existing = None
+                except Exception as error:
+                    _park_member(member.task_id, "intent-read", error)
+                    continue
+                if existing is not None:
+                    _park_member(member.task_id, "intent-recovered")
+                    continue
+                store.create_launch_intent(fence, controller, invocation)
+                store.require_current_controller(group, controller.generation, controller.claimant_nonce)
+                try:
+                    launched, handle = executor.submit(fence, invocation)
+                except Exception as error:
                     try:
-                        AttachedAllocation(allocation, store, pending_invocation.allocation_attempt).finish(
-                            pending_fence, "remote-quiescence-unconfirmed", _now(), None,
-                        )
+                        store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "executor-failed")
                     except Exception:
                         pass
-                raise
-            continue
-        if not isinstance(result, LeafCompletionContext):
-            error = LeafResultRejected("collector returned a non-LeafResult")
-            try:
-                AttachedAllocation(allocation, store, invocation.allocation_attempt).finish(
-                    fence, "remote-quiescence-unconfirmed", _now(), None,
-                )
-            except Exception:
-                pass
-            _park_member(member.task_id, "validation", error)
-            continue
-        try:
-            task = next(task for task in group.members if task.task_id == member.task_id)
-            try:
-                validated = validate_leaf_result(result.request, result.result)
-            except (TypeError, LeafResultRejected) as error:
+                    _park_member(member.task_id, "executor-launch", error)
+                    continue
+                if not isinstance(launched, MemberLaunchResult) or not launched.acknowledged:
+                    try:
+                        store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "invalid-launch-ack")
+                    except Exception:
+                        pass
+                    _park_member(member.task_id, "launch-ack")
+                    continue
+                entry = (member, fence, invocation, handle, controller, member.action == "admit_successor")
+                current_owned = entry
                 try:
-                    AttachedAllocation(allocation, store, invocation.allocation_attempt).finish(
-                        fence, "remote-quiescence-unconfirmed", _now(), None,
-                    )
-                except Exception:
-                    pass
+                    store.record_controller_outcome(fence, controller, invocation, "launched", launched.detail or "acknowledged")
+                except Exception as error:
+                    _park_member(member.task_id, "outcome-receipt", error)
+                active.append(entry)
+                current_owned = None
+            except Exception as error:
+                _park_member(member.task_id, "member-transition", error)
+
+    try:
+        while pending or active:
+            _fill_capacity()
+            if not active:
+                continue
+            entry = active.pop(0)
+            current_owned = entry
+            member, fence, invocation, handle, owner, successor = entry
+            try:
+                result = executor.collect(handle, facts.poll_timeout)
+            except CollectionWaitTimeout:
+                # Polling is the only repeatable operation; keep this same handle (never resubmit).
+                active.append(entry)
+                current_owned = None
+                continue
+            except BaseException as error:
+                _finish_unconfirmed(entry)
+                _park_member(member.task_id, "collection", error)
+                current_owned = None
+                if not isinstance(error, Exception):
+                    _cleanup_unconfirmed()
+                    raise
+                continue
+            current_owned = None
+            if not isinstance(result, LeafCompletionContext):
+                error = LeafResultRejected("collector returned a non-LeafResult")
+                _finish_unconfirmed(entry)
                 _park_member(member.task_id, "validation", error)
                 continue
-            error = complete_leaf_result(
-                AttachedAllocation(allocation, store, invocation.allocation_attempt),
-                fence, result.request, validated, group=group, member=task,
-                configured=result.configured, environment=result.environment,
-                accept_segment=not successor,
-            )
-            if error is not None:
-                raise error
-            outcomes.append((member.task_id, "collected"))
-            collected_members.add(member.task_id)
-        except BaseException as error:
-            _park_member(member.task_id, "completion", error)
-            if not isinstance(error, Exception):
+            try:
+                task = next(task for task in group.members if task.task_id == member.task_id)
                 try:
-                    AttachedAllocation(allocation, store, invocation.allocation_attempt).finish(
-                        fence, "failed", _now(), None,
-                    )
-                except Exception:
-                    pass
-                for _, pending_fence, pending_invocation, _, _, _ in active:
-                    try:
-                        AttachedAllocation(allocation, store, pending_invocation.allocation_attempt).finish(
-                            pending_fence, "remote-quiescence-unconfirmed", _now(), None,
-                        )
-                    except Exception:
-                        pass
-                raise
+                    validated = validate_leaf_result(result.request, result.result)
+                except (TypeError, LeafResultRejected) as error:
+                    _finish_unconfirmed(entry)
+                    _park_member(member.task_id, "validation", error)
+                    continue
+                error = complete_leaf_result(
+                    AttachedAllocation(allocation, store, invocation.allocation_attempt),
+                    fence, result.request, validated, group=group, member=task,
+                    configured=result.configured, environment=result.environment,
+                    accept_segment=not successor,
+                )
+                if error is not None:
+                    raise error
+                collected_members.add(member.task_id)
+                collected_fences[member.task_id] = fence.attempt_id
+                if member.task_id not in parked_this_run:
+                    outcomes.append((member.task_id, "collected"))
+            except BaseException as error:
+                _finish_unconfirmed(entry)
+                _park_member(member.task_id, "completion", error)
+                if not isinstance(error, Exception):
+                    _cleanup_unconfirmed()
+                    raise
+    except BaseException:
+        _cleanup_unconfirmed(current_owned)
+        raise
 
     # Rebuild the exact member inputs from the durable manifest and ask the
     # admission port again before deriving the authoritative final action.
     try:
         manifest = store.manifest(group)
-        latest: dict[str, Any] = {}
-        for record in manifest.attempts:
-            latest[record.task_id] = record
         final_inputs = []
         for item in facts.member_inputs:
             if item.task_id not in collected_members:
                 continue
-            record = latest.get(item.task_id)
+            attempt_id = collected_fences[item.task_id]
+            record = next((candidate for candidate in manifest.attempts
+                           if candidate.task_id == item.task_id
+                           and candidate.attempt_id == attempt_id), None)
+            if record is None:
+                raise ValueError("collected attempt is absent from durable manifest")
             rebuilt = item
             if record is not None:
                 rebuilt = replace(item, attempt_id=record.attempt_id, start_receipt=record.start_receipt,

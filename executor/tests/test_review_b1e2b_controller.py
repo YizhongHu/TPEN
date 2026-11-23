@@ -10,8 +10,8 @@ from threading import Event
 import pytest
 
 from tpen_executor._codec import digest
-from tpen_executor.allocations import ConfiguredAllocation
-from tpen_executor.contracts import AllocationId, BackendJobId
+from tpen_executor.allocations import ConfiguredAllocation, ControllerOutcomeReceiptV1
+from tpen_executor.contracts import AllocationId, BackendJobId, InvocationId
 from tpen_executor.dispatch.completion import complete_leaf_result
 from tpen_executor.dispatch.transport import LeafRequest
 from tpen_executor.lifecycle.balsam import BalsamGroupRegistrationIntent, BalsamGroupRegistrationReceipt
@@ -36,22 +36,22 @@ MUTANTS = (
     {
         "id": "submit-then-collect",
         "target": CONTROLLER,
-        "old": "            active.append((member, fence, invocation, handle, controller, member.action == \"admit_successor\"))\n",
-        "new": "            active.append((member, fence, invocation, handle, controller, member.action == \"admit_successor\"))\n            executor.collect(handle, facts.poll_timeout)\n",
+        "old": "                current_owned = entry\n                try:\n                    store.record_controller_outcome(fence, controller, invocation, \"launched\", launched.detail or \"acknowledged\")\n                except Exception as error:\n                    _park_member(member.task_id, \"outcome-receipt\", error)\n                active.append(entry)\n                current_owned = None\n",
+        "new": "                current_owned = entry\n                try:\n                    store.record_controller_outcome(fence, controller, invocation, \"launched\", launched.detail or \"acknowledged\")\n                except Exception as error:\n                    _park_member(member.task_id, \"outcome-receipt\", error)\n                active.append(entry)\n                executor.collect(handle, facts.poll_timeout)\n                current_owned = None\n",
         "killer": "test_two_submits_before_either_resolves",
     },
     {
         "id": "return-before-quiescence",
         "target": CONTROLLER,
-        "old": "    while active:\n",
-        "new": "    while False:\n",
+        "old": "    try:\n        while pending or active:\n",
+        "new": "    try:\n        while False:\n",
         "killer": "test_all_handles_are_collected",
     },
     {
         "id": "stop-after-first-fault",
         "target": CONTROLLER,
-        "old": "            _park_member(member.task_id, \"collection\", error)\n            if not isinstance(error, Exception):",
-        "new": "            _park_member(member.task_id, \"collection\", error)\n            return _park(group, \"collection-failed\")\n            if not isinstance(error, Exception):",
+        "old": "                _park_member(member.task_id, \"collection\", error)\n                current_owned = None\n                if not isinstance(error, Exception):",
+        "new": "                _park_member(member.task_id, \"collection\", error)\n                current_owned = None\n                return _park(group, \"collection-failed\")\n                if not isinstance(error, Exception):",
         "killer": "test_failed_collect_does_not_skip_other",
     },
     {
@@ -78,8 +78,8 @@ MUTANTS = (
     {
         "id": "resubmit-after-poll-timeout",
         "target": CONTROLLER,
-        "old": "            active.append((member, fence, invocation, handle, owner, successor))\n            continue",
-        "new": "            active.append((member, fence, invocation, handle, owner, successor))\n            executor.submit(fence, invocation)\n            continue",
+        "old": "                active.append(entry)\n                current_owned = None\n                continue",
+        "new": "                active.append(entry)\n                executor.submit(fence, invocation)\n                current_owned = None\n                continue",
         "killer": "test_timeout_reuses_same_handle",
     },
     {
@@ -88,6 +88,55 @@ MUTANTS = (
         "old": "            accept_segment\n            and\n",
         "new": "            not accept_segment\n            and\n",
         "killer": "test_complete_leaf_result_rejects_segment_when_disabled",
+    },
+    {
+        "id": "capacity-ignores-queue",
+        "target": CONTROLLER,
+        "old": "        while pending and len(active) < capacity:\n",
+        "new": "        while pending:\n",
+        "killer": "test_capacity_one_refills_after_collect",
+    },
+    {
+        "id": "timeout-leaks-terminal-handle",
+        "target": "executor/src/tpen_executor/lifecycle/local_executor.py",
+        "old": "                    leaf_error = handle._future.exception(timeout=0)\n                    if leaf_error is not None:\n                        terminal = True",
+        "new": "                    leaf_error = handle._future.exception(timeout=0)\n                    if leaf_error is not None:",
+        "killer": "test_leaf_timeout_during_bounded_wait_consumes_handle",
+    },
+    {
+        "id": "ack-write-does-not-park",
+        "target": CONTROLLER,
+        "old": "                except Exception as error:\n                    _park_member(member.task_id, \"outcome-receipt\", error)\n                active.append(entry)",
+        "new": "                except Exception as error:\n                    reasons[member.task_id] = _reason(\"outcome-receipt\", error)\n                active.append(entry)",
+        "killer": "test_failed_launched_ack_write_parks_but_collects",
+    },
+    {
+        "id": "manifest-uses-last-attempt",
+        "target": CONTROLLER,
+        "old": "            record = next((candidate for candidate in manifest.attempts\n                           if candidate.task_id == item.task_id\n                           and candidate.attempt_id == attempt_id), None)",
+        "new": "            record = next((candidate for candidate in manifest.attempts\n                           if candidate.task_id == item.task_id), None)",
+        "killer": "test_final_reconciliation_matches_collected_attempt",
+    },
+    {
+        "id": "interrupt-settles-failed",
+        "target": CONTROLLER,
+        "old": "        _cleanup_unconfirmed(current_owned)\n        raise",
+        "new": "        _cleanup_unconfirmed()\n        raise",
+        "killer": "test_submit_base_exception_records_unconfirmed_for_outstanding",
+    },
+    {
+        "id": "submit-reason-renamed",
+        "target": CONTROLLER,
+        "old": '"executor-failed"',
+        "new": '"submit-failed"',
+        "killer": "test_controller_outcome_reason_codes_persist",
+    },
+    {
+        "id": "ack-reason-renamed",
+        "target": CONTROLLER,
+        "old": '"invalid-launch-ack"',
+        "new": '"invalid-submit-ack"',
+        "killer": "test_controller_outcome_reason_codes_persist",
     },
 )
 
@@ -113,18 +162,22 @@ class EventExecutor:
         group,
         allocation,
         *,
+        capacity: int = 2,
         fail_task: str | None = None,
         invalid_task: str | None = None,
         timeout_once: bool = False,
         base_exception_task: str | None = None,
+        submit_error_task: str | None = None,
         acknowledge: bool = True,
     ) -> None:
         self.group = group
         self.allocation = allocation
+        self.capacity = capacity
         self.fail_task = fail_task
         self.invalid_task = invalid_task
         self.timeout_once = timeout_once
         self.base_exception_task = base_exception_task
+        self.submit_error_task = submit_error_task
         self.acknowledge = acknowledge
         self.calls: list[tuple[str, str]] = []
         self.submits: list[tuple[object, object, object]] = []
@@ -137,6 +190,8 @@ class EventExecutor:
     def submit(self, fence, invocation):
         task = next(member for member in self.group.members if member.task_id == invocation.task_id)
         self.calls.append(("submit", task.task_id))
+        if task.task_id == self.submit_error_task:
+            raise RuntimeError("controlled submit failure")
         self.fences[task.task_id] = fence
         configured = _local_materializer(task.program)
         environment = _local_environment(task, configured, None)
@@ -148,7 +203,10 @@ class EventExecutor:
         self.contexts[task.task_id] = LeafCompletionContext(result, request, configured, environment)
         handle = (task.task_id, len(self.submits))
         self.submits.append((fence, invocation, handle))
-        if len(self.submits) == len(self.group.members):
+        if self.capacity == 1:
+            self.ready[task.task_id].set()
+            self.all_submitted.set()
+        elif len(self.submits) == len(self.group.members):
             self.all_submitted.set()
             for event in self.ready.values():
                 event.set()
@@ -215,6 +273,16 @@ def test_two_submits_before_either_resolves(tmp_path: Path) -> None:
     assert len(_outcomes(Path(store.root))) == 2
 
 
+def test_capacity_one_refills_after_collect(tmp_path: Path) -> None:
+    result, executor, store = _run_fresh(tmp_path, ("one", "two"), capacity=1)
+    assert result.exit_code == 0
+    assert executor.calls == [
+        ("submit", "one"), ("collect", "one"),
+        ("submit", "two"), ("collect", "two"),
+    ]
+    assert len(_outcomes(Path(store.root))) == 2
+
+
 def test_failed_collect_does_not_skip_other(tmp_path: Path) -> None:
     result, executor, store = _run_fresh(tmp_path, ("one", "two"), fail_task="one")
     outcomes = {receipt.task_id: receipt for receipt in _outcomes(Path(store.root))}
@@ -256,6 +324,134 @@ def test_final_reconciliation_feeds_exit(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert result.reconciliation.members[0].action == "preserve_completed"
     assert _outcomes(Path(store.root))[0].status == "completed"
+
+
+def test_failed_launched_ack_write_parks_but_collects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    original = DirectoryStore.record_controller_outcome
+
+    def fail_launched(self, fence, controller, invocation, status, reason=""):
+        if status == "launched":
+            raise OSError("acknowledgement ledger unavailable")
+        return original(self, fence, controller, invocation, status, reason)
+
+    monkeypatch.setattr(DirectoryStore, "record_controller_outcome", fail_launched)
+    result, executor, store = _run_fresh(tmp_path)
+    fence = executor.fences["real-task"]
+    assert result.exit_code == 2
+    assert len(executor.collects) == 1
+    assert result.reconciliation.members[0].action == "park"
+    receipts = _outcomes(Path(store.root))
+    assert len(receipts) == 1 and receipts[0].status == "completed"
+    assert not (Path(fence.output_dir) / "controller-outcome.json").exists()
+
+
+@pytest.mark.parametrize("task_ids", [("a-successor", "z-predecessor"), ("z-predecessor", "a-successor")])
+def test_final_reconciliation_matches_collected_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, task_ids: tuple[str, str],
+) -> None:
+    group, allocation, facts, binding, store = _fresh_group(tmp_path, task_ids)
+    class Executor(EventExecutor):
+        def collect(self, handle, timeout):
+            result = super().collect(handle, timeout)
+            task_id = handle[0]
+            if not hasattr(self, "stale"):
+                self.stale = {}
+            if task_id not in self.stale:
+                invocation = next(item[1] for item in self.submits if item[2][0] == task_id)
+                self.stale[task_id] = store.begin_attempt(
+                    group, task_id, allocation, "stale", "local",
+                    allocation_attempt=invocation.allocation_attempt,
+                    invocation_id=InvocationId("stale-" + task_id),
+                )
+                store.finish_attempt(self.stale[task_id], "remote-quiescence-unconfirmed", "stale-finished")
+            return result
+    executor = Executor(group, allocation)
+    original = DirectoryStore.manifest
+    def reversed_manifest(self, current_group):
+        manifest = original(self, current_group)
+        ordered = []
+        for task_id in task_ids:
+            collected = executor.fences[task_id].attempt_id
+            ordered.append(next(item for item in manifest.attempts if item.attempt_id == collected))
+            ordered.append(next(item for item in manifest.attempts
+                               if item.task_id == task_id and item.attempt_id != collected))
+        return replace(manifest, attempts=tuple(ordered))
+    monkeypatch.setattr(DirectoryStore, "manifest", reversed_manifest)
+    result = run_group_controller(binding, allocation.backend_job_id, facts, store, DurableAdmission(), executor)
+    assert result.exit_code == 0
+    assert all(member.action == "preserve_completed" for member in result.reconciliation.members)
+    assert sum(receipt.status == "completed" for receipt in _outcomes(Path(store.root))) == 2
+
+
+@pytest.mark.parametrize("mode", ["submit", "begin", "ack"])
+def test_submit_base_exception_records_unconfirmed_for_outstanding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    class StopNow(BaseException):
+        pass
+
+    group, allocation, facts, binding, store = _fresh_group(tmp_path, ("one", "two"))
+    executor = EventExecutor(
+        group, allocation, capacity=2,
+        submit_error_task="two" if mode == "submit" else None,
+    )
+    if mode == "submit":
+        def submit(fence, invocation):
+            if invocation.task_id == "two":
+                raise StopNow("submit interruption")
+            return EventExecutor.submit(executor, fence, invocation)
+        monkeypatch.setattr(executor, "submit", submit)
+    elif mode == "begin":
+        original = DirectoryStore.begin_attempt_current_controller
+        def begin(self, group, task_id, *args, **kwargs):
+            if task_id == "two":
+                raise StopNow("begin interruption")
+            return original(self, group, task_id, *args, **kwargs)
+        monkeypatch.setattr(DirectoryStore, "begin_attempt_current_controller", begin)
+    else:
+        original = DirectoryStore.record_controller_outcome
+        def record(self, fence, controller, invocation, status, reason=""):
+            if invocation.task_id == "two" and status == "launched":
+                raise StopNow("ack interruption")
+            return original(self, fence, controller, invocation, status, reason)
+        monkeypatch.setattr(DirectoryStore, "record_controller_outcome", record)
+    with pytest.raises(StopNow):
+        run_group_controller(binding, allocation.backend_job_id, facts, store, DurableAdmission(), executor)
+    receipts = _outcomes(Path(store.root))
+    assert receipts and all(receipt.status == "remote-quiescence-unconfirmed" for receipt in receipts)
+
+
+def test_controller_outcome_reason_codes_persist(tmp_path: Path) -> None:
+    failed, failed_executor, failed_store = _run_fresh(tmp_path / "failed", submit_error_task="real-task")
+    failed_receipt = ControllerOutcomeReceiptV1.decode(
+        next(Path(failed_store.root).rglob("controller-outcome.json")).read_bytes()
+    )
+    assert failed.exit_code == 2 and failed_receipt.reason == "executor-failed"
+    invalid, invalid_executor, invalid_store = _run_fresh(tmp_path / "invalid", acknowledge=False)
+    invalid_receipt = ControllerOutcomeReceiptV1.decode(
+        next(Path(invalid_store.root).rglob("controller-outcome.json")).read_bytes()
+    )
+    assert invalid.exit_code == 2 and invalid_receipt.reason == "invalid-launch-ack"
+
+
+def test_two_member_collect_base_exception_unconfirms_each_acknowledged_fence(tmp_path: Path) -> None:
+    with pytest.raises(BaseException):
+        _run_fresh(tmp_path, ("one", "two"), base_exception_task="one")
+    receipts = _outcomes(tmp_path / "real-store")
+    assert len(receipts) == 2
+    assert all(receipt.status == "remote-quiescence-unconfirmed" for receipt in receipts)
+
+
+def test_final_manifest_failure_parks_after_completed_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    original = DirectoryStore.manifest
+    def fail_final(self, group):
+        if list(Path(self.root).rglob("outcome.json")):
+            raise OSError("manifest unavailable")
+        return original(self, group)
+    monkeypatch.setattr(DirectoryStore, "manifest", fail_final)
+    result, executor, store = _run_fresh(tmp_path)
+    assert result.exit_code == 2 and result.reconciliation.members[0].action == "park"
+    assert len(_outcomes(Path(store.root))) == 1
 
 
 def test_crossed_result_parks(tmp_path: Path) -> None:

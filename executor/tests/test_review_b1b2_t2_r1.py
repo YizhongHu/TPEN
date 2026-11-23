@@ -41,6 +41,8 @@ class EchoAdmission:
 
 
 class RecordingExecutor:
+    capacity = 1
+
     def __init__(self, *, error=None, result=None):
         self.calls = []
         self.collected = []

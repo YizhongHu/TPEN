@@ -54,11 +54,15 @@ class FakeAdmission:
 
 
 class FakeExecutor:
+    capacity = 1
+
     def __init__(self, error=None):
         self.error, self.calls, self.collected = error, [], []
 
     def submit(self, fence, invocation):
         self.calls.append(fence.task_id)
+        if self.error:
+            raise self.error
         allocation = ConfiguredAllocation(
             AllocationId(fence.allocation_id),
             BackendJobId(invocation.allocation_attempt.backend_job_id.value),
@@ -76,8 +80,6 @@ class FakeExecutor:
     def collect(self, handle, timeout):
         assert 0 < timeout <= 6
         self.collected.append(handle)
-        if self.error:
-            raise self.error
         return handle
 
 
