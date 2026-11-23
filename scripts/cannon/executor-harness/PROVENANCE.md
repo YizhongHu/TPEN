@@ -5,8 +5,10 @@ Fetched: 2026-11-22 (source copy fetched at approximately 01:05Z)
 
 ## Imported file SHA-256
 
-The following 12 files are the complete imported set. Hashes are copied from
-`REMOTE-SHA256SUMS` for the verified source copy.
+The following 12 files are the complete imported set. The table records their
+CURRENT post-import SHA-256 hashes; files changed after import are identified
+in the Post-import changes section below. Hashes for unchanged imported files
+are copied from `REMOTE-SHA256SUMS` for the verified source copy.
 
 ```
 627caaadecd877f5efe3f36a747e626d1081075257f0d5cc2c45366e9d560e4f  README.md
@@ -40,3 +42,4 @@ d9ef0c0ae39fa1f9e151eb2573671ab1ac3790a304dcc68a0bb8c885edcaa903  helpers/valida
 ## Post-import changes
 
 - `helpers/reconcile_counts.py`: imported the xfail/xpass summary-folding fix from `/Users/yizhonghu/tpen-manager-receipts/execution-lane/b1e1-verify-fbcd332a-20261121T162644Z/helpers/reconcile_counts.py`; this PR preserves that harness behavior.
+- `README.md`, `job.sbatch`, and `submission-line.template`: intentionally changed locally under the TPEN root operator rule `operator-rule-job-names-20261122`; the `JOB_NAME` guard was relaxed from SHA-12 to SHA-8 and the README/template were updated to document the operator naming scheme.
