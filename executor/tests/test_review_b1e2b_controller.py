@@ -453,7 +453,21 @@ def test_submit_base_exception_records_unconfirmed_for_outstanding(
     with pytest.raises(StopNow):
         run_group_controller(binding, allocation.backend_job_id, facts, store, DurableAdmission(), executor)
     receipts = _outcomes(Path(store.root))
-    assert receipts and all(receipt.status == "remote-quiescence-unconfirmed" for receipt in receipts)
+    assert all(receipt.status != "failed" for receipt in receipts)
+    receipt_keys = {(receipt.task_id, receipt.attempt_id) for receipt in receipts}
+    one_key = ("one", executor.fences["one"].attempt_id)
+    if mode == "begin":
+        expected_keys = {one_key}
+        assert "two" not in executor.fences
+    elif mode == "submit":
+        # submit raised before returning an acknowledgement, so only the
+        # already acknowledged member has a terminal operational receipt.
+        expected_keys = {one_key}
+        assert "two" in executor.fences
+    else:
+        expected_keys = {one_key, ("two", executor.fences["two"].attempt_id)}
+    assert receipt_keys == expected_keys
+    assert all(receipt.status == "remote-quiescence-unconfirmed" for receipt in receipts)
 
 
 def test_controller_outcome_reason_codes_persist(tmp_path: Path) -> None:
