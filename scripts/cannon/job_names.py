@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import re
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 
 MAX_JOB_NAME_LENGTH = 40
@@ -42,9 +42,9 @@ def build_job_name(
     subject: str,
     purpose: str,
     *,
-    variant: str | None = None,
+    variant: Optional[str] = None,
     lane: str = "s1",
-    sha: str | None = None,
+    sha: Optional[str] = None,
 ) -> str:
     """Build ``<subject>-<purpose>[-<variant>]-<lane>[-<sha8>]``."""
 
