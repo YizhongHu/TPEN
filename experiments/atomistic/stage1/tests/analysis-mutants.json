@@ -11,8 +11,8 @@
       "id": "trailing-window-minus-one",
       "target": "experiments/atomistic/stage1/analysis.py",
       "old": "start = max(1, checkpoint - 99)",
-      "new": "start = max(1, checkpoint - 100)",
-      "killer": "experiments/atomistic/stage1/tests/test_analysis.py::test_training_join_maps_zero_based_step_and_preserves_skips"
+      "new": "start = max(1, checkpoint - 98)",
+      "killer": "experiments/atomistic/stage1/tests/test_analysis.py::test_training_join_uses_exact_trailing_100_window_at_late_checkpoint"
     },
     {
       "id": "drop-pre-update-offset",

@@ -90,6 +90,28 @@ def test_training_join_maps_zero_based_step_and_preserves_skips() -> None:
     assert comparisons[100]["training_variance"] == pytest.approx(51.5)
 
 
+def test_training_join_uses_exact_trailing_100_window_at_late_checkpoint() -> None:
+    analysis = summarize_collection(_collection(lineages=(0,), checkpoints=(250,)))
+    joined = join_training_history(analysis, _training_rows(count=250))
+    comparison = joined["comparisons"][0]
+
+    assert comparison["available"] is True
+    assert comparison["completed_steps"] == list(range(151, 251))
+    # Stored JSONL step j is the pre-update batch for completed step j + 1.
+    assert comparison["stored_steps"] == list(range(150, 250))
+    assert comparison["training_mean"] == pytest.approx(209.5)
+
+
+def test_training_join_clamps_early_window_to_completed_step_one() -> None:
+    analysis = summarize_collection(_collection(lineages=(0,), checkpoints=(50,)))
+    joined = join_training_history(analysis, _training_rows(count=50))
+    comparison = joined["comparisons"][0]
+
+    assert comparison["available"] is True
+    assert comparison["completed_steps"] == list(range(1, 51))
+    assert comparison["stored_steps"] == list(range(0, 50))
+
+
 def test_training_join_marks_missing_window_unavailable() -> None:
     analysis = summarize_collection(_collection(lineages=(0,), checkpoints=(2,)))
     joined = join_training_history(analysis, _training_rows(count=1))
