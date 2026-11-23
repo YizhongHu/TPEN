@@ -1219,6 +1219,7 @@ class DispatcherContract:
         *,
         error: BaseException | None = None,
         child_refusal: PlacementRefusal | None = None,
+        accept_segment: bool = True,
     ) -> Exception | None:
         """Write one completion's records in the established order."""
 
@@ -1303,6 +1304,8 @@ class DispatcherContract:
         if inspection_error is not None:
             raise inspection_error
         if (
+            accept_segment
+            and
             status == "completed"
             and segment_evidence is not None
             and segment_evidence.verdict in {"completed", "incomplete"}

@@ -42,6 +42,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from dataclasses import dataclass
 import threading
 from typing import Any
 
@@ -80,6 +81,25 @@ class LeafSubmissionError(LocalExecutorError):
     """Raised when the local worker cannot accept a leaf submission."""
 
 
+class CollectionWaitTimeout(FutureTimeoutError, LocalExecutorError):
+    """Raised when a nonterminal leaf has not completed within one poll."""
+
+
+@dataclass(frozen=True)
+class LeafCompletionContext:
+    """Opaque executor-owned completion facts returned by ``collect``."""
+
+    result: LeafResult
+    request: LeafRequest
+    configured: ConfiguredRun
+    environment: PreparedPythonEnvironment
+
+    def __getattr__(self, name: str) -> Any:
+        """Preserve result-like access for callers migrating from ``collect``."""
+
+        return getattr(self.result, name)
+
+
 class MemberLaunchHandle:
     """Opaque handle for one accepted local leaf.
 
@@ -91,9 +111,11 @@ class MemberLaunchHandle:
     __slots__ = (
         "_future", "_request", "_group_digest", "_task_id", "_lineage_id",
         "_attempt_id", "_allocation_id", "_backend_job_id", "_invocation_id", "_slot",
+        "_configured", "_environment",
     )
 
-    def __init__(self, request: LeafRequest, invocation: MemberInvocationV2, future: Future[Any], slot: AllocationSlot | None) -> None:
+    def __init__(self, request: LeafRequest, invocation: MemberInvocationV2, future: Future[Any], slot: AllocationSlot | None,
+                 configured: ConfiguredRun, environment: PreparedPythonEnvironment) -> None:
         self._future = future
         self._request = request
         self._slot = slot
@@ -104,6 +126,26 @@ class MemberLaunchHandle:
         self._allocation_id = request.allocation_id
         self._backend_job_id = request.backend_job_id
         self._invocation_id = invocation.invocation_id.value
+        self._configured = configured
+        self._environment = environment
+
+    @property
+    def request(self) -> LeafRequest:
+        """Return the immutable request submitted for this handle."""
+
+        return self._request
+
+    @property
+    def configured(self) -> ConfiguredRun:
+        """Return the configured run bound to this handle."""
+
+        return self._configured
+
+    @property
+    def environment(self) -> PreparedPythonEnvironment:
+        """Return the prepared environment bound to this handle."""
+
+        return self._environment
 
     @property
     def group_digest(self) -> str:
@@ -311,7 +353,7 @@ class LocalLeafExecutor:
             if isinstance(error, (InvocationMismatchError, CapacityExceededError, LeafSubmissionError)):
                 raise
             raise LeafSubmissionError(f"local leaf submission failed: {error}") from error
-        handle = MemberLaunchHandle(request, invocation, future, slot)
+        handle = MemberLaunchHandle(request, invocation, future, slot, configured, environment)
         with self._lock:
             self._handles[id(handle)] = handle
         return MemberLaunchResult(True, status="submitted", detail="local leaf accepted"), handle
@@ -327,7 +369,7 @@ class LocalLeafExecutor:
         except (TypeError, ValueError) as error:
             raise LeafResultRejected(f"leaf runner returned an invalid LeafResult: {error}") from error
 
-    def collect(self, handle: MemberLaunchHandle, timeout: float | None = None) -> LeafResult:
+    def collect(self, handle: MemberLaunchHandle, timeout: float | None = None) -> LeafCompletionContext:
         """Wait for and validate one issued handle exactly once."""
 
         if not isinstance(handle, MemberLaunchHandle):
@@ -352,10 +394,18 @@ class LocalLeafExecutor:
                 # of None cannot be a wait timeout, so this is a leaf-raised
                 # TimeoutError and is terminal.
                 terminal = timeout is None or was_done
+                if not terminal and handle._future.done():
+                    # A leaf TimeoutError can complete during the bounded
+                    # wait.  Re-raise it now and consume its handle and lease.
+                    leaf_error = handle._future.exception(timeout=0)
+                    if leaf_error is not None:
+                        terminal = True
+                        raise leaf_error
                 if not terminal:
                     # Preserve the handle and its slot lease for a later
-                    # collection attempt.
-                    raise
+                    # collection attempt.  This is the only retryable wait
+                    # boundary; a leaf-raised TimeoutError remains terminal.
+                    raise CollectionWaitTimeout("leaf collection poll timed out") from None
                 # A leaf-raised TimeoutError is terminal, but still belongs
                 # to the caller as the exact leaf exception.
                 raise
@@ -367,7 +417,7 @@ class LocalLeafExecutor:
             if not isinstance(result, LeafResult):
                 raise LeafResultRejected("leaf runner returned a non-LeafResult")
             result = validate_leaf_result(handle._request, result)
-            return result
+            return LeafCompletionContext(result, handle._request, handle._configured, handle._environment)
         finally:
             with self._lock:
                 self._collecting.discard(key)
@@ -385,6 +435,8 @@ class LocalLeafExecutor:
 
 __all__ = [
     "CapacityExceededError",
+    "CollectionWaitTimeout",
+    "LeafCompletionContext",
     "HandleCollectionInProgressError",
     "InvocationMismatchError",
     "LeafSubmissionError",

@@ -105,7 +105,7 @@ def _publish(tmp_path: Path, result: LeafResult, request, parts) -> object:
         ),
     ],
 )
-def test_complete_leaf_result_publishes_exact_outcome_and_segment_records(
+def test_820_complete_leaf_result_default_accept_segment_publishes_exact_records(
     tmp_path: Path, name: str, changes: dict, expected_status: str, accepts: bool,
 ) -> None:
     request, parts = _request(tmp_path)
@@ -123,6 +123,26 @@ def test_complete_leaf_result_publishes_exact_outcome_and_segment_records(
     assert attempt.outcome_receipt.status == expected_status
     assert attempt.outcome_receipt.result_digest == result.result_digest()
     assert bool(manifest.segments) is accepts
+
+
+def test_complete_leaf_result_rejects_segment_when_disabled(tmp_path: Path) -> None:
+    request, parts = _request(tmp_path)
+    group, _allocation_value, lifecycle, configured, fence = parts
+    result = _synthetic_result(request)
+    (Path(fence.output_dir) / "core").mkdir()
+    error = complete_leaf_result(
+        lifecycle,
+        fence,
+        request,
+        result,
+        group=group,
+        member=group.members[0],
+        configured=configured,
+        accept_segment=False,
+    )
+    assert error is None
+    assert (Path(fence.output_dir) / "outcome.json").is_file()
+    assert not (Path(fence.output_dir) / "segment.json").exists()
 
 
 def test_complete_leaf_result_does_not_accept_noneligible_segment(tmp_path: Path) -> None:

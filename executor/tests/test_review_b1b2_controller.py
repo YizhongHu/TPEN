@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import importlib
 from dataclasses import replace
+import sys
 
 import pytest
 
@@ -13,12 +14,17 @@ from tpen_executor.lifecycle.controller import MemberLaunchResult
 from tpen_executor._codec import digest
 from tpen_executor.allocations import AllocationAttemptV2, ConfiguredAllocation, ControllerGenerationV1, MemberInvocationV2
 from tpen_executor.contracts import AllocationAttemptId, AllocationId, AttemptId, BackendJobId, InvocationId
+from tpen_executor.dispatch.transport import LeafRequest
+from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.lifecycle.balsam import BalsamGroupRegistrationIntent, BalsamGroupRegistrationReceipt, GroupFailure
 from tpen_executor.recovery import GroupReconciliationV2, MemberReconciliationV2, MemberRecoveryInputV2
-from tpen_executor.storage import DirectoryStore, LaunchIntentAbsent, LaunchIntentRejected
+from tpen_executor.storage import AttemptFence, DirectoryStore, LaunchIntentAbsent, LaunchIntentRejected
+from tpen_executor.tasks import ConfiguredRun
+from tpen_executor.lifecycle.local_executor import LeafCompletionContext
 from tpen_executor.results import SuccessorAdmissionRecord
 from test_b1a_reconciliation import _group
 from test_b1a_b_publication import _fixture
+from test_s3_transport_wire import _synthetic_result
 
 MODULE = Path(__file__).parents[1] / "src" / "tpen_executor" / "lifecycle" / "controller.py"
 MODULE_NAME = "executor/src/tpen_executor/lifecycle/controller.py"
@@ -48,28 +54,52 @@ class FakeAdmission:
 
 
 class FakeExecutor:
-    def __init__(self, error=None): self.error, self.calls = error, []
-    def launch(self, fence, invocation):
+    capacity = 1
+
+    def __init__(self, error=None):
+        self.error, self.calls, self.collected = error, [], []
+
+    def submit(self, fence, invocation):
         self.calls.append(fence.task_id)
-        if self.error: raise self.error
-        return MemberLaunchResult(True)
+        if self.error:
+            raise self.error
+        allocation = ConfiguredAllocation(
+            AllocationId(fence.allocation_id),
+            BackendJobId(invocation.allocation_attempt.backend_job_id.value),
+            {},
+        )
+        configured = ConfiguredRun(invocation.task_id, "/tmp/fake.yaml", ())
+        environment = PreparedPythonEnvironment(sys.executable)
+        request = LeafRequest.for_attempt(fence, allocation, configured, environment)
+        (Path(fence.output_dir) / "core").mkdir(parents=True, exist_ok=True)
+        context = LeafCompletionContext(
+            _synthetic_result(request), request, configured, environment,
+        )
+        return MemberLaunchResult(True), context
+
+    def collect(self, handle, timeout):
+        assert 0 < timeout <= 6
+        self.collected.append(handle)
+        return handle
 
 
 class FakeStore:
     def __init__(self, real, controller, published, *, recovered=False, supersede=False, reject=False):
         self.real, self.controller, self.published = real, controller, published
         self.recovered, self.supersede, self.reject, self.calls = recovered, supersede, reject, []
+        self.synthetic_successors = set()
     def record_pre_start_receipt(self, group, backend_job_id, observed_job_id, reason): self.real.record_pre_start_receipt(group, backend_job_id, observed_job_id, reason)
     def acquire_controller_generation(self, group, record):
         self.calls.append("acquire")
         if self.reject:
             from tpen_executor.storage import ControllerGenerationRejected
             raise ControllerGenerationRejected("stale")
+        self.controller = self.real.acquire_controller_generation(group, record)
         return self.controller
     def require_current_controller(self, group, generation, nonce):
         self.calls.append("require")
         if self.supersede and self.calls.count("require") >= 2: raise RuntimeError("superseded")
-        return self.controller
+        return self.real.require_current_controller(group, generation, nonce)
     def publish_reconciliation(self, group, attempt, inputs, *, bindings, successors):
         self.calls.append("publish"); return self.published
     def read_reconciliation(self, group, allocation_attempt):
@@ -82,14 +112,24 @@ class FakeStore:
         return SimpleNamespace(reconciliation=self.published, members=(SimpleNamespace(evidence=SimpleNamespace(task_id="task-0"), admission=admission),))
     def begin_attempt(self, group, task_id, allocation, *args, **kwargs):
         self.calls.append("begin_attempt:" + task_id)
-        return SimpleNamespace(task_id=task_id, attempt_id=AttemptId("attempt-" + task_id), output_dir=str(self.real.root))
+        return self.real.begin_attempt(group, task_id, allocation, *args, **kwargs)
     def begin_attempt_current_controller(self, group, task_id, allocation, *args, **kwargs):
-        return self.begin_attempt(group, task_id, allocation, *args, **kwargs)
+        self.calls.append("begin_attempt:" + task_id)
+        return self.real.begin_attempt_current_controller(group, task_id, allocation, *args, **kwargs)
     def begin_admitted_successor(self, group, task_id, allocation, *args, **kwargs):
         self.calls.append("begin_admitted_successor:" + task_id)
-        return SimpleNamespace(task_id=task_id, attempt_id=AttemptId("successor-" + task_id), output_dir=str(self.real.root))
+        return self.real.begin_admitted_successor(group, task_id, allocation, *args, **kwargs)
     def begin_admitted_successor_current_controller(self, group, task_id, allocation, *args, **kwargs):
-        return self.begin_admitted_successor(group, task_id, allocation, *args, **kwargs)
+        self.calls.append("begin_admitted_successor:" + task_id)
+        attempt = AttemptId("successor-" + task_id)
+        output_dir = Path(self.real.root, "synthetic-successors", task_id, attempt.value)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        fence = AttemptFence(
+            str(self.real.root), group.identity, task_id, allocation.allocation_id.value,
+            attempt, str(output_dir),
+        )
+        self.synthetic_successors.add(fence)
+        return fence
     def read_reconciliation(self, group, allocation_attempt):
         self.calls.append("read_reconciliation")
         binding = MemberInvocationV2(allocation_attempt, group.identity, "task-0", group.members[0].lineage_id, AttemptId("successor-task-0"), InvocationId("successor-invocation-0"))
@@ -97,10 +137,37 @@ class FakeStore:
         return SimpleNamespace(reconciliation=self.published, members=(SimpleNamespace(evidence=SimpleNamespace(task_id="task-0"), admission=admission),))
     def read_launch_intent(self, fence):
         self.calls.append("read_intent:" + fence.task_id)
+        if fence in self.synthetic_successors:
+            raise LaunchIntentAbsent("synthetic successor has no launch intent")
         if self.recovered: return object()
-        raise LaunchIntentAbsent("none")
-    def create_launch_intent(self, fence, controller, invocation): self.calls.append("intent:" + fence.task_id); return object()
-    def record_controller_outcome(self, fence, controller, invocation, status, reason=""): self.calls.append("outcome:" + fence.task_id); return object()
+        return self.real.read_launch_intent(fence)
+    def create_launch_intent(self, fence, controller, invocation):
+        self.calls.append("intent:" + fence.task_id)
+        if fence in self.synthetic_successors:
+            return object()
+        return self.real.create_launch_intent(fence, controller, invocation)
+    def record_controller_outcome(self, fence, controller, invocation, status, reason=""):
+        self.calls.append("outcome:" + fence.task_id)
+        if fence in self.synthetic_successors:
+            return object()
+        return self.real.record_controller_outcome(fence, controller, invocation, status, reason)
+    def finish_attempt(self, fence, *args, **kwargs):
+        if fence in self.synthetic_successors:
+            return None
+        return self.real.finish_attempt(fence, *args, **kwargs)
+    def publish_placement(self, fence, *args, **kwargs):
+        if fence in self.synthetic_successors:
+            return None
+        return self.real.publish_placement(fence, *args, **kwargs)
+    def record_core_outcome(self, fence, *args, **kwargs):
+        if fence in self.synthetic_successors:
+            return None
+        return self.real.record_core_outcome(fence, *args, **kwargs)
+    def accept_segment(self, fence, *args, **kwargs):
+        if fence in self.synthetic_successors:
+            return None
+        return self.real.accept_segment(fence, *args, **kwargs)
+    def manifest(self, *args, **kwargs): return self.real.manifest(*args, **kwargs)
 
 
 def _setup(tmp_path, actions=("start_fresh",), **kwargs):
@@ -151,6 +218,15 @@ def test_superseded_after_intent_does_not_launch(tmp_path):
     result, store, executor = _run(tmp_path, supersede=True)
     assert result.member_outcomes[0][1] == "parked"
     assert result.reconciliation.members[0].action == "park" and not executor.calls
+
+
+def test_final_reconciliation_preserves_controller_park(tmp_path):
+    result, _store, executor = _run(tmp_path, supersede=True)
+    member = result.reconciliation.members[0]
+    assert not executor.calls
+    assert member.action == "park"
+    assert member.reason_code.startswith("member-transition:RuntimeError:superseded")
+
 
 def test_recovered_intent_never_relaunches(tmp_path):
     result, store, executor = _run(tmp_path, recovered=True)
@@ -203,7 +279,7 @@ def test_real_store_fresh_start_writes_intent_and_launches_once(tmp_path):
 def test_real_store_launch_writes_controller_outcome(tmp_path):
     group, allocation, facts, binding, store = _real_fresh(tmp_path)
     result = controller_module.run_group_controller(binding, BackendJobId("real-job"), facts, store, FakeAdmission(), FakeExecutor())
-    assert result.member_outcomes == (("real-task", "launched"),)
+    assert result.member_outcomes == (("real-task", "collected"),)
     assert len(list(Path(store.root).rglob("controller-outcome.json"))) == 1
 
 
