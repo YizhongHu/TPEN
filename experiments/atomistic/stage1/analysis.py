@@ -277,7 +277,7 @@ def write_trajectory_figures(analysis: Mapping[str, Any], output_dir: str | Path
     output.mkdir(parents=True, exist_ok=True)
     figures: dict[str, str] = {}
     for name, stream_value, aggregate_value, low, high, ylabel in (
-        ("signed_error_vs_step.png", "error", "signed_error", "stream_error_min", "stream_error_max", "signed error (Ha)"),
+        ("error_vs_step.png", "error", "signed_error", "stream_error_min", "stream_error_max", "signed error (Ha)"),
         ("absolute_error_vs_step.png", "absolute_error", "absolute_error", "stream_absolute_error_min", "stream_absolute_error_max", "absolute error (Ha)"),
         ("variance_vs_step.png", "variance", "pooled_variance", "stream_variance_min", "stream_variance_max", "variance (Ha^2)"),
     ):
