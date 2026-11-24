@@ -518,6 +518,7 @@ def test_state_envelope_round_trips_with_squared_update_norm_bound() -> None:
             SRPolicy(
                 damping=DampingPolicy(absolute=0.0, relative=1.0e-2),
                 learning_rate=LEARNING_RATE * 2.0,
+                squared_update_norm_bound=0.25,
             ),
         ),
         (
@@ -525,6 +526,7 @@ def test_state_envelope_round_trips_with_squared_update_norm_bound() -> None:
             SRPolicy(
                 damping=DampingPolicy(absolute=0.0, relative=2.0e-2),
                 learning_rate=LEARNING_RATE,
+                squared_update_norm_bound=0.25,
             ),
         ),
     ],
