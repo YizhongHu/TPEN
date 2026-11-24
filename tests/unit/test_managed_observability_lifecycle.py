@@ -1908,3 +1908,82 @@ def test_secondary_cleanup_errors_logged_in_open_run_context_and_on_keyboard_int
             )
     finally:
         bootstrap_logger.removeHandler(caplog.handler)
+
+
+@pytest.mark.parametrize(
+    "forbidden_target",
+    [
+        "tpen.events.Subscription.of",
+        "tpen.events.Subscription.started",
+        "tpen.events.Subscription.ended",
+        "tpen.events.started",
+        "tpen.events.ended",
+        "tpen.callback.SubscriptionGroup.from_config",
+    ],
+)
+def test_forbidden_selector_factory_targets_refused_before_dirs(
+    tmp_path: Path, forbidden_target: str
+) -> None:
+    """Subscription factory callables and helper targets fail preflight leaving zero dirs."""
+
+    cfg = _base_cfg(
+        tmp_path / "direct",
+        callbacks=[
+            {
+                "_target_": f"{__name__}._OrdinaryCallback",
+                "custom": {"_target_": forbidden_target},
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="forbidden"):
+        prepare_run_context(cfg)
+    assert not (tmp_path / "direct" / "outputs").exists()
+
+    with pytest.raises(ValueError, match="forbidden"):
+        run_from_config(cfg, raise_exceptions=True)
+    assert not (tmp_path / "direct" / "outputs").exists()
+
+    cfg_interp = _base_cfg(
+        tmp_path / "interp",
+        bad_cb={
+            "_target_": f"{__name__}._OrdinaryCallback",
+            "custom": {"_target_": forbidden_target},
+        },
+        callbacks=["${bad_cb}"],
+    )
+    with pytest.raises(ValueError, match="forbidden"):
+        run_from_config(cfg_interp, raise_exceptions=True)
+    assert not (tmp_path / "interp" / "outputs").exists()
+
+
+def test_known_non_managed_callback_targets_consistent_with_callback_exports() -> None:
+    """Every shipped non-managed callback export and defining path is registered cleanly."""
+
+    import tpen.callback as callback_pkg
+    from tpen.callback import _KNOWN_NON_MANAGED_CALLBACK_TARGETS
+    from tpen.callback.base import _CallbackCore, _is_managed_callback_class
+
+    base_classes = {Callback, StatefulCallback}
+    concrete_exports: list[tuple[str, type]] = []
+    for name in callback_pkg.__all__:
+        obj = getattr(callback_pkg, name)
+        if (
+            isinstance(obj, type)
+            and issubclass(obj, _CallbackCore)
+            and obj not in base_classes
+        ):
+            concrete_exports.append((name, obj))
+
+    assert concrete_exports, "expected shipped concrete callbacks in tpen.callback.__all__"
+    for name, cls in concrete_exports:
+        if _is_managed_callback_class(cls):
+            assert f"tpen.callback.{name}" not in _KNOWN_NON_MANAGED_CALLBACK_TARGETS
+            assert f"{cls.__module__}.{cls.__qualname__}" not in _KNOWN_NON_MANAGED_CALLBACK_TARGETS
+        else:
+            assert f"tpen.callback.{name}" in _KNOWN_NON_MANAGED_CALLBACK_TARGETS
+            assert f"{cls.__module__}.{cls.__qualname__}" in _KNOWN_NON_MANAGED_CALLBACK_TARGETS
+
+    for target in _KNOWN_NON_MANAGED_CALLBACK_TARGETS:
+        resolved = run_mod.get_class(target)
+        assert isinstance(resolved, type) and issubclass(resolved, _CallbackCore)
+        assert not _is_managed_callback_class(resolved)
