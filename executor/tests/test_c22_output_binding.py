@@ -112,10 +112,77 @@ def test_serialized_leaf_carries_delta_and_rejects_crossed_output(tmp_path: Path
 
 def test_common_configured_binding_has_no_legacy_run_overrides(tmp_path: Path) -> None:
     args = _configured(tmp_path).command_for_attempt(
-        "/store/groups/g/task/attempt", group_digest=GROUP, task_id="task", attempt_id="attempt",
+        f"/store/groups/{GROUP}/task/attempt", root="/store", group_digest=GROUP, task_id="task", attempt_id="attempt",
     ).args
     assert "--attempt-delta" in args
     assert not any(argument.startswith("run.") for argument in args)
+
+
+@pytest.mark.parametrize("crossed", ["group", "task", "attempt"])
+def test_crossed_identity_is_refused_before_child_on_all_carriers(tmp_path: Path, crossed: str) -> None:
+    """The shared equation rejects crossed local/Parsl bindings and wire requests."""
+
+    root = tmp_path / "store"
+    valid_output = root / "groups" / GROUP / "task" / "attempt"
+    values = {"group": GROUP, "task": "task", "attempt": "attempt"}
+    values[crossed] = {"group": "foreign-group", "task": "foreign-task", "attempt": "foreign-attempt"}[crossed]
+    crossed_output = root / "groups" / values["group"] / values["task"] / values["attempt"]
+    configured = _configured(tmp_path)
+    child_calls: list[str] = []
+    for carrier in ("local", "parsl"):
+        try:
+            configured.command_for_attempt(
+                str(crossed_output), root=str(root), group_digest=GROUP, task_id="task", attempt_id="attempt",
+            )
+        except ValueError as error:
+            assert "placement fence" in str(error)
+        else:
+            child_calls.append(carrier)
+    assert child_calls == []
+    positive = configured.command_for_attempt(
+        str(valid_output), root=str(root), group_digest=GROUP, task_id="task", attempt_id="attempt",
+    )
+    assert "--attempt-delta" in positive.args
+
+    request = _request(tmp_path)
+    payload = request.to_dict()
+    payload["output_dir"] = str(crossed_output)
+    with pytest.raises(ValueError):
+        LeafRequest.from_mapping(payload)
+    assert request == LeafRequest.decode(request.encode())
+
+
+def test_all_carriers_use_the_shared_full_argv_binding(tmp_path: Path) -> None:
+    """Legacy and configured argv stay identical for local, Parsl, and wire seams."""
+
+    configured = _configured(tmp_path)
+    request = _request(tmp_path)
+    output = request.output_dir
+    expected_configured = configured.command_for_attempt(
+        output, root=request.root, group_digest=GROUP, task_id="task", attempt_id="attempt",
+    ).args
+    assert request.science_args() == expected_configured
+
+    legacy_config = "/prepared/config.yaml"
+    legacy_overrides = ("payload.mode=attached",)
+    legacy = dataclasses.replace(
+        request,
+        program=None,
+        attempt_delta=None,
+        config=legacy_config,
+        overrides=legacy_overrides,
+        payload_digest=digest({"config": legacy_config, "overrides": list(legacy_overrides)}),
+    )
+    expected_legacy = ConfiguredRun("task", legacy_config, legacy_overrides).command_for_attempt(output).args
+    assert legacy.science_args() == expected_legacy
+
+    contract = (ROOT / "executor/src/tpen_executor/dispatch/contract.py").read_text(encoding="utf-8")
+    parsl = (ROOT / "executor/src/tpen_executor/dispatch/parsl.py").read_text(encoding="utf-8")
+    transport = (ROOT / "executor/src/tpen_executor/dispatch/transport.py").read_text(encoding="utf-8")
+    assert contract.count("configured.command_for_attempt(") == 1
+    assert parsl.count("configured.command_for_attempt(") == 1
+    assert transport.count("command_for_attempt(") == 1
+    assert "ConfiguredProgramCommand" not in transport
 
 
 def test_attempt_binding_digest_changes_with_placement_delta(tmp_path: Path) -> None:
@@ -123,8 +190,8 @@ def test_attempt_binding_digest_changes_with_placement_delta(tmp_path: Path) -> 
     resumed = _configured(tmp_path, load={"mode": "train_resume", "path": "/predecessor/core"})
     assert configured.program is not None and resumed.program is not None
     assert configured.program.program_digest != resumed.program.program_digest
-    first = configured.attempt_binding_digest("/store/groups/g/task/a", group_digest=GROUP, task_id="task", attempt_id="a")
-    second = configured.attempt_binding_digest("/store/groups/g/task/b", group_digest=GROUP, task_id="task", attempt_id="b")
+    first = configured.attempt_binding_digest(f"/store/groups/{GROUP}/task/a", root="/store", group_digest=GROUP, task_id="task", attempt_id="a")
+    second = configured.attempt_binding_digest(f"/store/groups/{GROUP}/task/b", root="/store", group_digest=GROUP, task_id="task", attempt_id="b")
     assert first != second
 
 
@@ -133,21 +200,21 @@ MUTANTS = (
         "id": "configured-local-duplicate-run-injection",
         "target": "executor/src/tpen_executor/tasks.py",
         "old": "        return ConfiguredProgramCommand(self.program, delta)\n",
-        "new": "        return TPENCommand(self.config, (*self.overrides, f\"run.root={output_dir}\", \"run.layout=flat\", \"run.run_id=core\"))\n",
+        "new": "        command = ConfiguredProgramCommand(self.program, delta)\n        return type(\"MutatedConfiguredCommand\", (), {\"args\": command.args + (f\"run.root={output_dir}\", \"run.layout=flat\", \"run.run_id=core\")})()\n",
         "killer": "test_common_configured_binding_has_no_legacy_run_overrides",
     },
     {
         "id": "parsl-duplicate-run-injection",
         "target": "executor/src/tpen_executor/dispatch/parsl.py",
-        "old": "                args = configured.command_for_attempt(\n                    output_dir,\n                    group_digest=group.identity,\n                    task_id=member.task_id,\n                    attempt_id=fence.attempt_id.value,\n                ).args\n",
-        "new": "                args = (*configured.command().args, f\"run.root={output_dir}\", \"run.layout=flat\", \"run.run_id=core\")\n",
+        "old": "                args = configured.command_for_attempt(\n                    output_dir,\n                    root=fence.root,\n                    group_digest=group.identity,\n                    task_id=member.task_id,\n                    attempt_id=fence.attempt_id.value,\n                ).args\n",
+        "new": "                args = configured.command_for_attempt(\n                    output_dir,\n                    root=fence.root,\n                    group_digest=group.identity,\n                    task_id=member.task_id,\n                    attempt_id=fence.attempt_id.value,\n                ).args + (f\"run.root={output_dir}\", \"run.layout=flat\", \"run.run_id=core\")\n",
         "killer": "test_local_and_parsl_sources_use_one_typed_binding_without_duplicate_run_overrides",
     },
     {
         "id": "transport-duplicate-run-injection",
         "target": "executor/src/tpen_executor/dispatch/transport.py",
-        "old": "            return ConfiguredProgramCommand(self.program, self.attempt_delta).args\n",
-        "new": "            return (*TPENCommand(self.config, self.overrides).args, f\"run.root={output_dir}\", \"run.layout=flat\", \"run.run_id=core\")\n",
+        "old": "            return ConfiguredRun(self.task_id, \"\", (), self.program).command_for_attempt(\n                output_dir,\n                root=self.root,\n                group_digest=self.group_digest,\n                task_id=self.task_id,\n                attempt_id=self.attempt_id,\n            ).args\n",
+        "new": "            return ConfiguredRun(self.task_id, \"\", (), self.program).command_for_attempt(\n                output_dir,\n                root=self.root,\n                group_digest=self.group_digest,\n                task_id=self.task_id,\n                attempt_id=self.attempt_id,\n            ).args + (f\"run.root={output_dir}\", \"run.layout=flat\", \"run.run_id=core\")\n",
         "killer": "test_serialized_leaf_carries_delta_and_rejects_crossed_output",
     },
     {
@@ -175,7 +242,7 @@ MUTANTS = (
         "id": "missing-load-mode-defaults-to-fresh",
         "target": "executor/src/tpen_executor/configured_program.py",
         "old": "        if not isinstance(data, Mapping) or set(data) != {\"mode\", \"path\"}:\n            raise ValueError(\"ConfiguredLoad keys differ\")\n",
-        "new": "        if not isinstance(data, Mapping):\n            raise ValueError(\"ConfiguredLoad keys differ\")\n",
+        "new": "        if not isinstance(data, Mapping):\n            raise ValueError(\"ConfiguredLoad keys differ\")\n        if \"mode\" not in data:\n            data = {**data, \"mode\": \"fresh\", \"path\": None}\n        if set(data) != {\"mode\", \"path\"}:\n            raise ValueError(\"ConfiguredLoad keys differ\")\n",
         "killer": "test_load_mode_is_explicit_and_train_resume_is_not_own_leaf",
     },
     {

@@ -327,6 +327,7 @@ def _with_child_placement(
             }
     payload_digest = configured.attempt_binding_digest(
         fence.output_dir,
+        root=fence.root,
         group_digest=group.identity,
         task_id=member.task_id,
         attempt_id=fence.attempt_id.value,
@@ -517,6 +518,7 @@ def _placement_receipt(
     values = environment.env
     expected_payload = configured.attempt_binding_digest(
         fence.output_dir,
+        root=fence.root,
         group_digest=group.identity,
         task_id=member.task_id,
         attempt_id=fence.attempt_id.value,
@@ -796,6 +798,7 @@ def _placement_refusal_receipt(
         values.get("TPEN_SLOT_ID", "unavailable"),
         configured.attempt_binding_digest(
             fence.output_dir,
+            root=fence.root,
             group_digest=group.identity,
             task_id=member.task_id,
             attempt_id=fence.attempt_id.value,
@@ -940,6 +943,7 @@ def _ensure_placement_refusal_environment(
         "TPEN_PLACEMENT_DECLARED_DEVICES": values.get("TPEN_PLACEMENT_DECLARED_DEVICES", ""),
         "TPEN_PLACEMENT_PAYLOAD_DIGEST": configured.attempt_binding_digest(
             fence.output_dir,
+            root=fence.root,
             group_digest=group.identity,
             task_id=member.task_id,
             attempt_id=fence.attempt_id.value,
@@ -1177,6 +1181,7 @@ class DispatcherContract:
                 output_dir, _core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = _member_paths(fence)
                 args = configured.command_for_attempt(
                     output_dir,
+                    root=fence.root,
                     group_digest=group.identity,
                     task_id=member.task_id,
                     attempt_id=fence.attempt_id.value,

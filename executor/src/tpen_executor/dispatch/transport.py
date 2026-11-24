@@ -56,7 +56,8 @@ from .._records import frozen_record
 from ..environments import PreparedPythonEnvironment, SourceScript
 from ..gpu_sampler import GPU_SAMPLER_OUTPUT_ENV, SLOT_QUARANTINE_ENV, slot_quarantine_dir
 from ..placement import PLACEMENT_REFUSAL_ENV, PlacementRefusal, parse_cpu_set
-from ..runners import ConfiguredProgramCommand, CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
+from ..runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
+from ..tasks import ConfiguredRun
 from ..workers import SubprocessWorker
 from .contract import (
     ConfiguredProgramRouteRefused,
@@ -427,9 +428,14 @@ class LeafRequest:
         else:
             if self.config or self.overrides or self.attempt_delta is None:
                 raise ValueError("configured request must carry only its typed program and attempt delta")
-            expected_delta = AttemptDelta(
-                os.path.join(self.output_dir, "core"), self.program.load,
-                self.group_digest, self.task_id, self.attempt_id,
+            expected_delta = ConfiguredRun(
+                self.task_id, "", (), self.program,
+            ).attempt_delta(
+                self.output_dir,
+                root=self.root,
+                group_digest=self.group_digest,
+                task_id=self.task_id,
+                attempt_id=self.attempt_id,
             )
             if self.attempt_delta != expected_delta:
                 raise ValueError("attempt delta does not bind the request fence")
@@ -525,6 +531,7 @@ class LeafRequest:
         if program is not None:
             attempt_delta = configured.attempt_delta(
                 fence.output_dir,
+                root=fence.root,
                 group_digest=fence.group_digest,
                 task_id=fence.task_id,
                 attempt_id=fence.attempt_id.value,
@@ -544,6 +551,7 @@ class LeafRequest:
             attempt_delta,
             configured.attempt_binding_digest(
                 fence.output_dir,
+                root=fence.root,
                 group_digest=fence.group_digest,
                 task_id=fence.task_id,
                 attempt_id=fence.attempt_id.value,
@@ -578,7 +586,13 @@ class LeafRequest:
 
         output_dir = self.paths()[0]
         if self.program is not None:
-            return ConfiguredProgramCommand(self.program, self.attempt_delta).args
+            return ConfiguredRun(self.task_id, "", (), self.program).command_for_attempt(
+                output_dir,
+                root=self.root,
+                group_digest=self.group_digest,
+                task_id=self.task_id,
+                attempt_id=self.attempt_id,
+            ).args
         return (*TPENCommand(self.config, self.overrides).args, f"run.root={output_dir}", "run.layout=flat", "run.run_id=core")
 
     def to_dict(self) -> dict[str, Any]:

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 
 import pytest
 
 from tpen_executor._codec import digest
+from tpen_executor.configured_program import AttemptDelta, ConfiguredLoad
 from tpen_executor.programs import ConfiguredProgram
 from tpen_executor.runners import CONFIGURED_RUN_SHIM, ConfiguredProgramCommand, RUN_SHIM, TPENCommand
 from tpen_executor.tasks import ConfiguredRun, ConfiguredRunTable
@@ -20,7 +24,7 @@ STAGE_Q = ROOT / "experiments" / "atomistic" / "he-importance" / "run_stage_q.py
 MANIFEST = ROOT / "experiments" / "atomistic" / "he-importance" / "o1_scan_manifest_v1.json"
 ROW = "0" * 64
 EXPECTED_RUN_SHIM_SHA256 = "066b37db2a22c1fd698327f21bbf2f55278023fd59f3e064323da057efa07c03"
-EXPECTED_CONFIGURED_RUN_SHIM_SHA256 = "1900a8836e19d91799360cf3a688e77760dcea8a3060a155158d0dc160c43247"
+EXPECTED_CONFIGURED_RUN_SHIM_SHA256 = "a3d4e64194cc3364783ba12674a992f76b0822c25af893e8ceb6b4fa1cce1533"
 
 
 def _program(**changes: str) -> ConfiguredProgram:
@@ -48,6 +52,64 @@ def test_legacy_tpen_command_argv_matches_golden(tmp_path: Path) -> None:
         "-c", RUN_SHIM, "--config", config, "run.seed=7", "payload.mode=attached",
     )
     assert ConfiguredRun("legacy", config, overrides).command().args == TPENCommand(config, overrides).args
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs Linux sched affinity and /proc")
+def test_configured_shim_applies_placement_prelude_before_marker(tmp_path: Path) -> None:
+    """The real configured shim applies affinity, sidecars, and strict host refusal."""
+
+    cpu = min(os.sched_getaffinity(0))
+    attempt = tmp_path / "store" / "groups" / ("g" * 64) / "task" / "attempt"
+    (attempt / "core").mkdir(parents=True)
+    placement = attempt / "child-placement.json"
+    delta = AttemptDelta(
+        str(attempt / "core"), ConfiguredLoad("fresh", None), "g" * 64, "task", "attempt",
+    )
+    script = tmp_path / "marker.py"
+    marker = tmp_path / "marker"
+    script.write_text(
+        "import os\n"
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text(str(sorted(os.sched_getaffinity(0))))\n",
+        encoding="utf-8",
+    )
+    environment = dict(os.environ)
+    environment.update({
+        "TPEN_PLACEMENT_OUTPUT": str(placement),
+        "TPEN_PLACEMENT_OUTPUT_DIR": str(attempt),
+        "TPEN_PLACEMENT_DECLARED_CPUS": str(cpu),
+        "TPEN_PLACEMENT_DECLARED_HOST": socket.gethostname(),
+        "TPEN_ROUTED_STRICT_HOST": "1",
+    })
+    result = subprocess.run(
+        [
+            sys.executable, "-c", CONFIGURED_RUN_SHIM,
+            "--tpen-executor-script", str(script), "--output-root", str(tmp_path / "campaign"),
+            "--attempt-delta", delta.canonical_bytes.decode("utf-8"),
+        ], env=environment, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text(encoding="utf-8") == str([cpu])
+    assert placement.exists()
+    assert (attempt / "executor-child-observation.json").exists()
+    assert json.loads(placement.read_text(encoding="utf-8"))["affinity"] == [cpu]
+
+    mismatch_marker = tmp_path / "mismatch-marker"
+    mismatch_script = tmp_path / "mismatch.py"
+    mismatch_script.write_text(
+        f"from pathlib import Path\nPath({str(mismatch_marker)!r}).write_text('launched')\n",
+        encoding="utf-8",
+    )
+    mismatch_environment = dict(environment)
+    mismatch_environment["TPEN_PLACEMENT_DECLARED_HOST"] = "not-" + socket.gethostname()
+    mismatch = subprocess.run(
+        [
+            sys.executable, "-c", CONFIGURED_RUN_SHIM,
+            "--tpen-executor-script", str(mismatch_script), "--output-root", str(tmp_path / "campaign"),
+            "--attempt-delta", delta.canonical_bytes.decode("utf-8"),
+        ], env=mismatch_environment, capture_output=True, text=True, check=False,
+    )
+    assert mismatch.returncode == 2
+    assert not mismatch_marker.exists()
 
 
 def test_configured_program_generates_fixed_stage_q_argv() -> None:
@@ -207,7 +269,8 @@ def test_configured_run_rejects_unbound_prepared_inputs_before_spawn() -> None:
 def test_configured_command_for_attempt_carries_only_the_typed_delta(tmp_path: Path) -> None:
     configured = ConfiguredRun("configured", "", (), _program())
     command = configured.command_for_attempt(
-        str(tmp_path / "attempt"),
+        str(tmp_path / "groups" / ("g" * 64) / "configured" / "a1"),
+        root=str(tmp_path),
         group_digest="g" * 64,
         task_id="configured",
         attempt_id="a1",
@@ -226,7 +289,7 @@ def test_legacy_and_configured_attempt_bindings_are_separate(tmp_path: Path) -> 
     ).args
     configured = ConfiguredRun("configured", "", (), _program())
     configured_args = configured.command_for_attempt(
-        str(tmp_path / "configured"), group_digest="g", task_id="configured", attempt_id="a",
+        str(tmp_path / "groups" / "g" / "configured" / "a"), root=str(tmp_path), group_digest="g", task_id="configured", attempt_id="a",
     ).args
     assert "--attempt-delta" in configured_args
     assert not any(arg.startswith("run.") for arg in configured_args)
@@ -240,12 +303,17 @@ def test_configured_shim_refuses_mismatched_attempt_output(tmp_path: Path) -> No
     wrong = tmp_path / "wrong"
     expected.mkdir()
     wrong.mkdir()
+    delta = AttemptDelta(
+        str(expected / "core"), ConfiguredLoad("fresh", None), "g", "task", "attempt",
+    )
+    environment = dict(os.environ)
+    environment.update({"TPEN_PLACEMENT_OUTPUT": str(expected / "child-placement.json")})
     result = subprocess.run(
         [
             sys.executable, "-c", CONFIGURED_RUN_SHIM,
             "--tpen-executor-script", str(script), "--output-root", str(expected),
-            f"run.root={wrong}",
-        ], capture_output=True, text=True, check=False,
+            "--attempt-delta", delta.canonical_bytes.decode("utf-8"), f"run.root={wrong}",
+        ], env=environment, capture_output=True, text=True, check=False,
     )
     assert result.returncode == 2
     assert not marker.exists()
@@ -255,6 +323,13 @@ def test_configured_shim_refuses_mismatched_attempt_output(tmp_path: Path) -> No
 # Required T2 mutation map.  Each ``old`` fragment occurs exactly once in its
 # target source, and every killer is a test above.
 MUTANTS = (
+    {
+        "id": "configured-shim-skips-placement-prelude",
+        "target": "executor/src/tpen_executor/runners.py",
+        "old": "\"        run_roots = [_attempt_leaf]\\n\"",
+        "new": "\"        run_roots = []\\n\"",
+        "killer": "test_configured_shim_applies_placement_prelude_before_marker",
+    },
     {
         "id": "allowlist-bypass",
         "target": "executor/src/tpen_executor/configured_program.py",
