@@ -325,7 +325,12 @@ def _with_child_placement(
                 "code": "placement-cpu-outside-controller-affinity",
                 "reason": "declared slot CPUs are not all permitted to this controller",
             }
-    payload_digest = digest({"config": configured.config, "overrides": list(configured.overrides)})
+    payload_digest = configured.attempt_binding_digest(
+        fence.output_dir,
+        group_digest=group.identity,
+        task_id=member.task_id,
+        attempt_id=fence.attempt_id.value,
+    )
     placement_values = {
         PLACEMENT_OUTPUT_ENV: os.path.join(fence.output_dir, "child-placement.json"),
         "TPEN_PLACEMENT_OUTPUT_DIR": fence.output_dir,
@@ -510,7 +515,12 @@ def _placement_receipt(
     if not isinstance(environment, PreparedPythonEnvironment):
         raise PlacementRefusal("placement-environment", "child environment is not a prepared Python environment")
     values = environment.env
-    expected_payload = digest({"config": configured.config, "overrides": list(configured.overrides)})
+    expected_payload = configured.attempt_binding_digest(
+        fence.output_dir,
+        group_digest=group.identity,
+        task_id=member.task_id,
+        attempt_id=fence.attempt_id.value,
+    )
     checks = {
         "task": observation.task_id == member.task_id,
         "attempt": observation.attempt_id == fence.attempt_id.value,
@@ -784,7 +794,12 @@ def _placement_refusal_receipt(
         allocation.allocation_id.value,
         allocation.backend_job_id.value,
         values.get("TPEN_SLOT_ID", "unavailable"),
-        digest({"config": configured.config, "overrides": list(configured.overrides)}),
+        configured.attempt_binding_digest(
+            fence.output_dir,
+            group_digest=group.identity,
+            task_id=member.task_id,
+            attempt_id=fence.attempt_id.value,
+        ),
         fence.output_dir,
         {
             "host": values.get("TPEN_SLOT_NODE", "unknown") if not _placement_v2_requested(allocation, values) else "unavailable",
@@ -923,7 +938,12 @@ def _ensure_placement_refusal_environment(
         "TPEN_PLACEMENT_DECLARED_HOST": host,
         "TPEN_PLACEMENT_DECLARED_CPUS": ",".join(str(cpu) for cpu in declared_cpus),
         "TPEN_PLACEMENT_DECLARED_DEVICES": values.get("TPEN_PLACEMENT_DECLARED_DEVICES", ""),
-        "TPEN_PLACEMENT_PAYLOAD_DIGEST": digest({"config": configured.config, "overrides": list(configured.overrides)}),
+        "TPEN_PLACEMENT_PAYLOAD_DIGEST": configured.attempt_binding_digest(
+            fence.output_dir,
+            group_digest=group.identity,
+            task_id=member.task_id,
+            attempt_id=fence.attempt_id.value,
+        ),
         PLACEMENT_REFUSAL_ENV: json.dumps(refusal.to_dict(), sort_keys=True),
     }
     if v2_requested:
@@ -1155,7 +1175,12 @@ class DispatcherContract:
                 if not callable(getattr(evidence, "read", None)):
                     raise TypeError("materialized worker evidence reader lacks read()")
                 output_dir, _core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = _member_paths(fence)
-                args = (*configured.command().args, f"run.root={output_dir}", "run.layout=flat", "run.run_id=core")
+                args = configured.command_for_attempt(
+                    output_dir,
+                    group_digest=group.identity,
+                    task_id=member.task_id,
+                    attempt_id=fence.attempt_id.value,
+                ).args
                 outcome = self._execute_process(
                     materialized,
                     environment,
@@ -1452,10 +1477,6 @@ class DispatcherContract:
                 raise TypeError("runs values must be ConfiguredRun records")
             if configured.id != task_id:
                 raise ValueError("ConfiguredRun.id must match its mapping task ID")
-            if configured.program is not None:
-                raise ConfiguredProgramRouteRefused(
-                    "configured program not supported on this route until C2.2"
-                )
 
 
 __all__ = ["ConfiguredProgramRouteRefused", "DispatcherContract", "LeafRefused"]

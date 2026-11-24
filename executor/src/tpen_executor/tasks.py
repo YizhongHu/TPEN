@@ -6,7 +6,7 @@ import os
 from typing import Any, ClassVar, Sequence
 
 from ._codec import decode_json, digest, sha256_text
-from .configured_program import ConfiguredProgram
+from .configured_program import AttemptDelta, ConfiguredProgram
 from .runners import ConfiguredProgramCommand, TPENCommand
 from ._records import frozen_record
 
@@ -52,6 +52,50 @@ class ConfiguredRun:
             return ConfiguredProgramCommand(self.program)
         return TPENCommand(self.config, self.overrides)
 
+    @property
+    def binding_digest(self) -> str:
+        """Return the digest of the configured payload before placement."""
+
+        if self.program is not None:
+            return self.program.program_digest
+        return digest({"config": self.config, "overrides": list(self.overrides)})
+
+    def attempt_delta(
+        self,
+        output_dir: str,
+        *,
+        group_digest: str,
+        task_id: str,
+        attempt_id: str,
+    ) -> AttemptDelta:
+        """Build one placement-bound delta for a configured program."""
+
+        if self.program is None:
+            raise ValueError("legacy TPEN runs do not carry an attempt delta")
+        if self.id != task_id:
+            raise ValueError("configured run does not belong to the attempt task")
+        return AttemptDelta(
+            os.path.join(output_dir, "core"), self.program.load,
+            group_digest, task_id, attempt_id,
+        )
+
+    def attempt_binding_digest(
+        self,
+        output_dir: str,
+        *,
+        group_digest: str,
+        task_id: str,
+        attempt_id: str,
+    ) -> str:
+        """Return the run/request digest including a placement-bound delta."""
+
+        if self.program is None:
+            return self.binding_digest
+        delta = self.attempt_delta(
+            output_dir, group_digest=group_digest, task_id=task_id, attempt_id=attempt_id,
+        )
+        return digest({"program_digest": self.program.program_digest, "attempt_delta_digest": delta.digest})
+
     def to_dict(self) -> dict[str, Any]:
         """Return the canonical configured-run payload used for binding."""
 
@@ -69,17 +113,36 @@ class ConfiguredRun:
 
         return digest(self.to_dict())
 
-    def command_for_attempt(self, output_dir: str) -> TPENCommand | ConfiguredProgramCommand:
+    def command_for_attempt(
+        self,
+        output_dir: str,
+        *,
+        group_digest: str | None = None,
+        task_id: str | None = None,
+        attempt_id: str | None = None,
+    ) -> TPENCommand | ConfiguredProgramCommand:
         """Return the fixed command after validating an attempt output path.
 
-        Output binding is intentionally not appended here yet; C2.2 owns the
-        dispatcher-wide binding change.  The check keeps this seam fail-closed
-        for callers that prepare a command before spawning.
+        Legacy TPEN output binding appends the existing three run.* overrides.
+        Configured programs receive one canonical attempt delta instead.
+        Configured calls require the placement group, task and attempt
+        identities because those values are not known when the program is
+        prepared.
         """
 
         if type(output_dir) is not str or not os.path.isabs(output_dir):
             raise ValueError("output_dir must be an absolute path")
-        return self.command()
+        if self.program is None:
+            return TPENCommand(
+                self.config,
+                (*self.overrides, f"run.root={output_dir}", "run.layout=flat", "run.run_id=core"),
+            )
+        if group_digest is None or task_id is None or attempt_id is None:
+            raise ValueError("configured attempt binding requires group, task and attempt identities")
+        delta = self.attempt_delta(
+            output_dir, group_digest=group_digest, task_id=task_id, attempt_id=attempt_id,
+        )
+        return ConfiguredProgramCommand(self.program, delta)
 
 
 @frozen_record
