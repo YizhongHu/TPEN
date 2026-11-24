@@ -99,19 +99,19 @@ EXPECTED_TEST_INVENTORY = {
     ("test_launch.py", 1246, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_train_config.py", 333, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 336, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: test-only schema validation for the independent HI grid oracle."
     ),
-    ("test_train_config.py", 396, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 399, "tpen.hi_schema"): InventoryEntry(
         "item 1c0b06fd: executed A9 schema measurement for the HI train-resume load shape."
     ),
-    ("test_train_config.py", 634, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 637, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 1071, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 1074, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 1163, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 1166, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("test_run_stage_q.py", 775, "tpen.hi_schema"): InventoryEntry(
