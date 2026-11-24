@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 from pathlib import Path
 import socket
 from types import SimpleNamespace
@@ -12,17 +13,21 @@ import sys
 
 import pytest
 
-from tpen_executor._codec import digest
+from tpen_executor._codec import digest, thaw
+from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.configured_program import CONFIGURED_PROGRAM_ALLOWLIST, AttemptDelta, ConfiguredLoad, ConfiguredProgram
+from tpen_executor.contracts import AllocationId, BackendJobId, ProgramSpecRef
 from tpen_executor.dispatch import LocalDispatcher
+from tpen_executor.dispatch import contract as dispatch_contract
 from tpen_executor.dispatch import parsl as parsl_dispatch
 from tpen_executor.dispatch.transport import LeafRequest, LeafResult, run_leaf, validate_leaf_result
 from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.lifecycle import AttachedAllocation
-from tpen_executor.placement import PLACEMENT_OUTPUT_ENV, PlacementRefusal
+from tpen_executor.placement import AllocationSlot, PLACEMENT_OUTPUT_ENV, PlacementRefusal
 from tpen_executor.placement import physical_slots_from_allocation
 from tpen_executor.storage import DirectoryStore
 from tpen_executor.tasks import ConfiguredRun
+from tpen_executor.programs import WorkerProgram
 from tpen_executor.workers import ProcessOutcome, SubprocessWorker
 
 from test_s2b2_placement_v2 import _allocation as _slurm_allocation
@@ -75,11 +80,30 @@ def _physical_lifecycle(tmp_path: Path, name: str = "physical-store") -> Attache
     return AttachedAllocation(allocation, DirectoryStore(root))
 
 
-def _physical_leaf_request(tmp_path: Path, configured: ConfiguredRun) -> LeafRequest:
+def _allocation_with_cpu(cpu: int) -> ConfiguredAllocation:
+    slot = AllocationSlot("logical-slot", "logical-label", (), (cpu,), (), ()).to_dict()
+    return ConfiguredAllocation(
+        AllocationId("allocation-a"), BackendJobId("job-a"),
+        {"slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": [slot]},
+         "scheduler": {"SLURM_NODELIST": socket.gethostname()}},
+    )
+
+
+def _worker_with_environment(tmp_path: Path, values: dict[str, str]) -> WorkerProgram:
+    worker = _worker(tmp_path)
+    raw = thaw(worker.spec.config_ref)
+    raw["environment"]["env"].update(values)
+    return WorkerProgram(ProgramSpecRef(raw, digest(raw)))
+
+
+def _physical_leaf_request(
+    tmp_path: Path, configured: ConfiguredRun, *, allocation: ConfiguredAllocation | None = None,
+) -> LeafRequest:
     root = tmp_path / "leaf-store"
     output = root / "groups" / GROUP / configured.id / "attempt"
-    allocation = _slurm_allocation(scheduler={"SLURM_NODELIST": socket.gethostname()}, device=())
+    allocation = allocation or _slurm_allocation(scheduler={"SLURM_NODELIST": socket.gethostname()}, device=())
     slot = physical_slots_from_allocation(allocation)[0]
+    output.mkdir(parents=True)
     fence = SimpleNamespace(
         allocation_id=allocation.allocation_id.value,
         group_digest=GROUP,
@@ -103,7 +127,7 @@ def _marker_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Config
         "from pathlib import Path\n"
         "core = Path(os.environ['TPEN_PLACEMENT_OUTPUT_DIR']) / 'core'\n"
         "core.mkdir(parents=True, exist_ok=True)\n"
-        f"Path({str(marker)!r}).write_text(json.dumps({{'argv': sys.argv, 'env': {{key: os.environ.get(key) for key in ('TPEN_PLACEMENT_OUTPUT', 'TPEN_PLACEMENT_OUTPUT_DIR', 'TPEN_PLACEMENT_TASK_ID', 'TPEN_PLACEMENT_ATTEMPT_ID', 'TPEN_PLACEMENT_GROUP_DIGEST', 'TPEN_PLACEMENT_SLOT_ID')}}}}))\n"
+        f"Path({str(marker)!r}).write_text(json.dumps({{'argv': sys.argv, 'env': {{key: os.environ.get(key) for key in ('TPEN_PLACEMENT_OUTPUT', 'TPEN_PLACEMENT_OUTPUT_DIR', 'TPEN_PLACEMENT_TASK_ID', 'TPEN_PLACEMENT_ATTEMPT_ID', 'TPEN_PLACEMENT_GROUP_DIGEST', 'TPEN_PLACEMENT_SLOT_ID', 'TPEN_PLACEMENT_PAYLOAD_DIGEST')}}}}))\n"
         "(core / 'evidence.json').write_text(json.dumps({"
         "'schema': 'tpen.run-evidence/v2', 'run_dir': str(core), 'verdict': 'completed', "
         "'run_status': 'completed', 'checkpoint': {'checkpoint_dir': str(core / 'checkpoint'), "
@@ -205,7 +229,7 @@ def test_no_slot_configured_parsl_refuses_before_submission(
 
 
 def test_no_slot_configured_serialized_for_attempt_refuses_before_leaf(tmp_path: Path) -> None:
-    configured = _configured(tmp_path)
+    configured = _configured(tmp_path, task_id="member")
     root = tmp_path / "store"
     output = root / "groups" / GROUP / "member" / "attempt"
     allocation = SimpleNamespace(
@@ -216,20 +240,31 @@ def test_no_slot_configured_serialized_for_attempt_refuses_before_leaf(tmp_path:
         allocation_id="allocation", group_digest=GROUP, task_id="member",
         attempt_id=SimpleNamespace(value="attempt"), root=str(root), output_dir=str(output),
     )
-    with pytest.raises(PlacementRefusal, match="physical slot"):
+    with pytest.raises(PlacementRefusal, match="physical slot") as raised:
         LeafRequest.for_attempt(
             fence, allocation, configured, PreparedPythonEnvironment(sys.executable, env={}), 60,
         )
+    assert raised.value.code == "configured-physical-slot-required"
 
 
 def test_carried_slot_id_without_cpus_refuses_before_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     configured, marker = _marker_run(tmp_path, monkeypatch)
     calls: list[tuple[object, tuple[str, ...]]] = []
+    seen_environment: dict[str, str] = {}
+    original_placement = dispatch_contract._with_child_placement
+
+    def observe_placement(environment, *args, **kwargs):
+        seen_environment.update(environment.env)
+        return original_placement(environment, *args, **kwargs)
+
+    monkeypatch.setattr(dispatch_contract, "_with_child_placement", observe_placement)
     monkeypatch.setattr(SubprocessWorker, "run", lambda self, environment, args, **kwargs: calls.append((environment, tuple(args))))
-    manifest = LocalDispatcher(_worker(tmp_path)).run(
+    manifest = LocalDispatcher(_worker_with_environment(tmp_path, {"TPEN_SLOT_ID": "carried"})).run(
         _group("c22-carried-id-no-cpus", "member"), {"member": configured}, _lifecycle(tmp_path),
-        env={"TPEN_SLOT_ID": "carried"}, timeout=60,
+        timeout=60,
     )
+    assert seen_environment["TPEN_SLOT_ID"] == "carried"
+    assert "TPEN_SLOT_CPUS" not in seen_environment
     assert calls == []
     assert not marker.exists()
     assert manifest.attempts[0].outcome_receipt.status == "launch_failed"
@@ -350,8 +385,36 @@ def test_physical_configured_serialized_leaf_completes_and_validates(
     request = _physical_leaf_request(tmp_path, configured)
     result = LeafResult.decode(run_leaf(request.encode()))
     assert validate_leaf_result(request, result) is result
+    expected = configured.attempt_binding_digest(
+        request.output_dir, root=request.root, group_digest=GROUP, task_id="member", attempt_id="attempt",
+    )
+    assert request.environment.env["TPEN_PLACEMENT_PAYLOAD_DIGEST"] == expected
+    declared_cpus = [int(value) for value in request.environment.env["TPEN_PLACEMENT_DECLARED_CPUS"].split(",")]
+    assert declared_cpus == [min(os.sched_getaffinity(0))]
     assert result.science["returncode"] == 0
     assert marker.exists()
+    observation = json.loads(Path(request.environment.env[PLACEMENT_OUTPUT_ENV]).read_text(encoding="utf-8"))
+    assert observation["affinity"] == declared_cpus
+    observed = json.loads(marker.read_text(encoding="utf-8"))
+    assert observed["env"]["TPEN_PLACEMENT_PAYLOAD_DIGEST"] == expected
+    resumed = _configured(tmp_path, task_id="member", load={"mode": "train_resume", "path": "/predecessor/core"})
+    assert resumed.attempt_binding_digest(
+        request.output_dir, root=request.root, group_digest=GROUP, task_id="member", attempt_id="attempt",
+    ) != expected
+
+
+def test_serialized_configured_unavailable_cpu_refuses_before_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured, marker = _marker_run(tmp_path, monkeypatch)
+    configured = dataclasses.replace(configured, id="member")
+    unavailable = max(os.sched_getaffinity(0)) + 10000
+    request = _physical_leaf_request(tmp_path, configured, allocation=_allocation_with_cpu(unavailable))
+    result = LeafResult.decode(run_leaf(request.encode()))
+    assert result.science is None
+    assert result.launch_error is not None
+    assert "placement-cpu-outside-worker-affinity" in result.launch_error["message"]
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize("carrier", ["local", "parsl"])
@@ -375,6 +438,19 @@ def test_physical_configured_carrier_completes_with_leaf_result(
     receipt = attempt.placement_receipt
     base_receipt = getattr(receipt, "base", receipt)
     assert base_receipt.comparison["host"] == "matched"
+    expected = configured.attempt_binding_digest(
+        str(Path(lifecycle.store.root) / "groups" / group.identity / "member" / attempt.attempt_id.value),
+        root=str(lifecycle.store.root), group_digest=group.identity, task_id="member",
+        attempt_id=attempt.attempt_id.value,
+    )
+    observed = json.loads(marker.read_text(encoding="utf-8"))
+    assert observed["env"]["TPEN_PLACEMENT_PAYLOAD_DIGEST"] == expected
+    resumed = _configured(tmp_path, task_id="member", load={"mode": "train_resume", "path": "/predecessor/core"})
+    assert resumed.attempt_binding_digest(
+        str(Path(lifecycle.store.root) / "groups" / group.identity / "member" / attempt.attempt_id.value),
+        root=str(lifecycle.store.root), group_digest=group.identity, task_id="member",
+        attempt_id=attempt.attempt_id.value,
+    ) != expected
 
 
 def test_serialized_variants_call_shared_command_method(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -443,11 +519,32 @@ MUTANTS = (
         "killer": "test_serialized_leaf_carries_delta_and_rejects_crossed_output",
     },
     {
+        "id": "configured-overlay-legacy-payload-digest",
+        "target": "executor/src/tpen_executor/dispatch/contract.py",
+        "old": "        \"TPEN_PLACEMENT_PAYLOAD_DIGEST\": payload_digest,\n",
+        "new": "        \"TPEN_PLACEMENT_PAYLOAD_DIGEST\": digest({\"config\": configured.config, \"overrides\": list(configured.overrides)}),\n",
+        "killer": "test_physical_configured_carrier_completes_with_leaf_result",
+    },
+    {
+        "id": "serialized-slot-gate-bypass",
+        "target": "executor/src/tpen_executor/dispatch/transport.py",
+        "old": "            slot = _require_configured_physical_slot(allocation)\n",
+        "new": "            slot = physical_slots_from_allocation(allocation)[0]\n",
+        "killer": "test_no_slot_configured_serialized_for_attempt_refuses_before_leaf",
+    },
+    {
         "id": "configured-without-physical-slot-admitted",
         "target": "executor/src/tpen_executor/dispatch/contract.py",
         "old": "    if configured.program is not None:\n",
         "new": "    if False:\n",
         "killer": "test_no_slot_configured_local_refuses_before_child",
+    },
+    {
+        "id": "carried-id-only-admitted",
+        "target": "executor/src/tpen_executor/dispatch/contract.py",
+        "old": "    if configured.program is not None:\n",
+        "new": "    if configured.program is not None and not slot_id:\n",
+        "killer": "test_carried_slot_id_without_cpus_refuses_before_child",
     },
     {
         "id": "crossed-group-check",
