@@ -12,6 +12,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from math import prod
 from typing import Any, Generic, Protocol, Self, TypeVar, runtime_checkable
 
 from tpen.data.batch import (
@@ -25,7 +26,11 @@ from tpen.data.batch import (
 from tpen.data.equivariant_state import compare_tensor_blocks
 from tpen.data.permutation import Permutation
 from tpen.dependencies import require_torch
-from tpen.nn.forward import ParameterScoreRequest
+from tpen.nn.forward import (
+    DenseFactorBlock,
+    KroneckerFactorBlock,
+    ParameterScoreRequest,
+)
 from tpen.physics.hamiltonian import LocalEnergyResult, local_energy
 from tpen.training.update import (
     AutogradUpdateInput,
@@ -313,6 +318,197 @@ class HamiltonianTangentUpdateInput(VMCStepData):
 
 
 @dataclass(frozen=True, kw_only=True)
+class StructuredCurvatureUpdateInput(VMCStepData):
+    """Typed update input carrying detached KFAC curvature factors and half-gradient.
+
+    Parameters
+    ----------
+    step : int
+        Zero-based training iteration index.
+    parameter_binding : ParameterBinding
+        Direct live parameter references aligned with every curvature block.
+    solve_dtype : torch.dtype
+        Real floating dtype (``torch.float32`` or ``torch.float64``) of all
+        curvature factors and ``energy_half_gradient`` tensors.
+    kronecker_blocks : tuple of KroneckerFactorBlock
+        Detached uncentered KFAC-expand Kronecker blocks ``(A, G)``.
+    dense_blocks : tuple of DenseFactorBlock
+        Detached centered empirical score-covariance blocks ``F``.
+    energy_half_gradient : tuple of torch.Tensor
+        Detached ``solve_dtype`` energy half-gradient blocks (``scale = 1.0``)
+        aligned with ``parameter_binding.layout.slots``.
+    n_finite_samples : int
+        Count of pinned finite local-energy samples used to form the curvature
+        factors and half-gradient.
+    curvature_available : bool, optional
+        ``True`` for normal non-degenerate steps; ``False`` only for degenerate
+        skip steps (``n_electrons == 0`` or ``n_finite_samples < 2``) where no
+        curvature backward pass ran.
+    """
+
+    step: int
+    parameter_binding: ParameterBinding
+    solve_dtype: torch.dtype
+    kronecker_blocks: tuple[KroneckerFactorBlock, ...]
+    dense_blocks: tuple[DenseFactorBlock, ...]
+    energy_half_gradient: tuple[torch.Tensor, ...]
+    n_finite_samples: int
+    curvature_available: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kronecker_blocks", tuple(self.kronecker_blocks))
+        object.__setattr__(self, "dense_blocks", tuple(self.dense_blocks))
+        object.__setattr__(self, "energy_half_gradient", tuple(self.energy_half_gradient))
+        self.validate()
+
+    def validate(self) -> Self:
+        """Validate step data, binding, curvature block partition, and half-gradient."""
+
+        super().validate()
+        _validate_step(self.step)
+        if not isinstance(self.parameter_binding, ParameterBinding):
+            raise TypeError(
+                "StructuredCurvatureUpdateInput.parameter_binding must be a ParameterBinding"
+            )
+        self.parameter_binding.validate()
+        if not isinstance(self.solve_dtype, torch.dtype) or self.solve_dtype not in (
+            torch.float32,
+            torch.float64,
+        ):
+            raise ValueError(
+                "StructuredCurvatureUpdateInput.solve_dtype must be torch.float32 or torch.float64"
+            )
+        if (
+            type(self.n_finite_samples) is not int
+            or self.n_finite_samples < 0
+            or self.n_finite_samples > self.batch.batch_size
+        ):
+            raise ValueError(
+                "StructuredCurvatureUpdateInput.n_finite_samples must be in [0, batch.batch_size]"
+            )
+        if type(self.curvature_available) is not bool:
+            raise TypeError("StructuredCurvatureUpdateInput.curvature_available must be a bool")
+
+        if self.parameter_binding.parameters:
+            binding_device = self.parameter_binding.parameters[0].device
+            if any(
+                parameter.device != binding_device
+                for parameter in self.parameter_binding.parameters
+            ):
+                raise ValueError(
+                    "StructuredCurvatureUpdateInput parameter binding parameters must "
+                    "share one device"
+                )
+
+        if not self.curvature_available:
+            if self.kronecker_blocks or self.dense_blocks or self.energy_half_gradient:
+                raise ValueError(
+                    "StructuredCurvatureUpdateInput with curvature_available=False must carry empty blocks"
+                )
+            return self
+
+        slots = self.parameter_binding.layout.slots
+        if not slots:
+            raise ValueError(
+                "StructuredCurvatureUpdateInput requires at least one trainable parameter"
+            )
+        if len(self.energy_half_gradient) != len(slots):
+            raise ValueError(
+                "StructuredCurvatureUpdateInput.energy_half_gradient must have one tensor per slot"
+            )
+        binding_device = self.parameter_binding.parameters[0].device
+        if self.wavefunction.logabs.device != binding_device:
+            raise ValueError(
+                "StructuredCurvatureUpdateInput wavefunction and binding must share one device"
+            )
+        for slot, grad in zip(slots, self.energy_half_gradient, strict=True):
+            if not isinstance(grad, torch.Tensor):
+                raise TypeError("energy_half_gradient entries must be torch.Tensor values")
+            if tuple(grad.shape) != slot.shape:
+                raise ValueError(
+                    f"energy_half_gradient[{slot.ordinal}] expected shape {slot.shape}, got {tuple(grad.shape)}"
+                )
+            if grad.dtype != self.solve_dtype:
+                raise ValueError(
+                    f"energy_half_gradient[{slot.ordinal}] expected dtype {self.solve_dtype}, got {grad.dtype}"
+                )
+            if grad.device != binding_device:
+                raise ValueError("energy_half_gradient tensors must share the parameter device")
+
+        covered: set[int] = set()
+        for block in self.kronecker_blocks:
+            if not isinstance(block, KroneckerFactorBlock):
+                raise TypeError("kronecker_blocks must contain KroneckerFactorBlock instances")
+            block.validate()
+            if block.A.dtype != self.solve_dtype or block.A.device != binding_device:
+                raise ValueError("KroneckerFactorBlock dtype/device disagrees with update input")
+            for ordinal in block.parameter_ordinals:
+                if ordinal >= len(slots):
+                    raise ValueError(f"KroneckerFactorBlock ordinal {ordinal} out of range")
+                if ordinal in covered:
+                    raise ValueError(f"Duplicate curvature coverage of parameter ordinal {ordinal}")
+                covered.add(ordinal)
+            weight_slot = slots[block.parameter_ordinals[0]]
+            expected_in = prod(weight_slot.shape[1:]) + (1 if block.has_bias else 0)
+            if (
+                len(weight_slot.shape) < 2
+                or weight_slot.shape[0] != block.out_dim
+                or expected_in != block.in_dim
+            ):
+                raise ValueError(
+                    f"KroneckerFactorBlock dimensions {(block.out_dim, block.in_dim)} disagree with "
+                    f"weight slot shape {weight_slot.shape} (has_bias={block.has_bias})"
+                )
+            if block.has_bias:
+                bias_slot = slots[block.parameter_ordinals[1]]
+                if bias_slot.shape != (block.out_dim,):
+                    raise ValueError(
+                        f"KroneckerFactorBlock bias slot shape {bias_slot.shape} disagrees with "
+                        f"out_dim={block.out_dim}"
+                    )
+
+        for block in self.dense_blocks:
+            if not isinstance(block, DenseFactorBlock):
+                raise TypeError("dense_blocks must contain DenseFactorBlock instances")
+            block.validate()
+            if block.F.dtype != self.solve_dtype or block.F.device != binding_device:
+                raise ValueError("DenseFactorBlock dtype/device disagrees with update input")
+            expected_dim = 0
+            for ordinal in block.parameter_ordinals:
+                if ordinal >= len(slots):
+                    raise ValueError(f"DenseFactorBlock ordinal {ordinal} out of range")
+                if ordinal in covered:
+                    raise ValueError(f"Duplicate curvature coverage of parameter ordinal {ordinal}")
+                covered.add(ordinal)
+                expected_dim += slots[ordinal].numel
+            if expected_dim != block.dim:
+                raise ValueError(
+                    f"DenseFactorBlock dim {block.dim} disagrees with covered numel {expected_dim}"
+                )
+
+        missing = sorted(set(range(len(slots))) - covered)
+        if missing:
+            raise ValueError(
+                f"StructuredCurvatureUpdateInput does not exhaustively cover parameter ordinals: missing {missing}"
+            )
+        return self
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Unconditionally refuse serialization, prioritizing graph-bearing errors first."""
+
+        super().__getstate__()
+        if (
+            any(b.A.requires_grad or b.G.requires_grad for b in self.kronecker_blocks)
+            or any(b.F.requires_grad for b in self.dense_blocks)
+            or any(g.requires_grad for g in self.energy_half_gradient)
+        ):
+            raise RuntimeError(
+                "graph-bearing StructuredCurvatureUpdateInput cannot be serialized"
+            )
+        raise RuntimeError("live StructuredCurvatureUpdateInput cannot be serialized")
+
+
+@dataclass(frozen=True, kw_only=True)
 class ProducedVMCStep(Generic[InputT]):
     """Frozen ephemeral carrier returned by :meth:`VMCStepRequest.produce`.
 
@@ -493,6 +689,54 @@ class MaterializedHamiltonianTangentStepRequest(
         return "tpen.training.step_requests.MaterializedHamiltonianTangentStepRequest"
 
 
+@dataclass(frozen=True, kw_only=True)
+class StructuredCurvatureStepRequest(VMCStepRequest[StructuredCurvatureUpdateInput]):
+    """Request structured KFAC curvature factors and energy half-gradient in one forward.
+
+    Parameters
+    ----------
+    solve_dtype : torch.dtype, optional
+        Real floating dtype (``torch.float32`` or ``torch.float64``) used for
+        curvature factor accumulation and energy half-gradient blocks.
+    max_dense_block_numel : int, optional
+        Maximum allowed scalar element count for any :class:`DenseFactorBlock`.
+    """
+
+    solve_dtype: torch.dtype = torch.float64
+    max_dense_block_numel: int = 2048
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.solve_dtype, torch.dtype) or self.solve_dtype not in (
+            torch.float32,
+            torch.float64,
+        ):
+            raise ValueError(
+                "StructuredCurvatureStepRequest.solve_dtype must be torch.float32 or torch.float64"
+            )
+        if (
+            isinstance(self.max_dense_block_numel, bool)
+            or not isinstance(self.max_dense_block_numel, int)
+            or self.max_dense_block_numel < 1
+        ):
+            raise ValueError(
+                "StructuredCurvatureStepRequest.max_dense_block_numel must be a positive integer"
+            )
+
+    def produce(
+        self,
+        producer: "StructuredCurvatureStepProducer",
+        /,
+    ) -> ProducedVMCStep[StructuredCurvatureUpdateInput]:
+        """Delegate to the producer's structured-curvature step implementation."""
+
+        return producer.produce_structured_curvature_step(self)
+
+    def describe_label(self) -> str:
+        """Return the qualified class label for this structured-curvature request."""
+
+        return "tpen.training.step_requests.StructuredCurvatureStepRequest"
+
+
 @runtime_checkable
 class AutogradStepProducer(Protocol):
     """Narrow method-only producer targeted by :class:`AutogradStepRequest`."""
@@ -530,10 +774,23 @@ class HamiltonianTangentStepProducer(Protocol):
 
 
 @runtime_checkable
+class StructuredCurvatureStepProducer(Protocol):
+    """Narrow method-only producer targeted by :class:`StructuredCurvatureStepRequest`."""
+
+    def produce_structured_curvature_step(
+        self,
+        request: StructuredCurvatureStepRequest,
+    ) -> ProducedVMCStep[StructuredCurvatureUpdateInput]:
+        """Produce one detached structured-curvature step record."""
+        ...
+
+
+@runtime_checkable
 class VMCStepProducer(
     AutogradStepProducer,
     ParameterScoreStepProducer,
     HamiltonianTangentStepProducer,
+    StructuredCurvatureStepProducer,
     Protocol,
 ):
     """Composite method-only step producer supporting all core step requests."""
@@ -951,6 +1208,9 @@ __all__ = [
     "ParameterScoreStepProducer",
     "ParameterScoreStepRequest",
     "ProducedVMCStep",
+    "StructuredCurvatureStepProducer",
+    "StructuredCurvatureStepRequest",
+    "StructuredCurvatureUpdateInput",
     "VMCStepProducer",
     "VMCStepRequest",
     "evaluate_hamiltonian_tangent_step",

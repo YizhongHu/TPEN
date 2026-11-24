@@ -76,6 +76,7 @@ from tpen.training.statistics import (
     center_statistics,
 )
 from tpen.training.update import serialize_parameter_layout
+from tpen.training.vmc import resolve_nonfinite_local_energy_policy
 
 torch = require_torch(feature="VMC score geometry")
 
@@ -84,6 +85,177 @@ torch = require_torch(feature="VMC score geometry")
 # state envelope records this string so a resumed run cannot silently reuse
 # a warm start built under different centering or normalization.
 SCORE_CONVENTION_VERSION = "score-geometry-1"
+
+#: Canonical score-row non-finiteness policy shared by SR and SPRING.
+#:
+#: Implements the consolidated ``377f6b0f`` / ``02859027`` operator ruling:
+#:
+#: 1. Each step pins its finite row mask at the first (local-energy)
+#:    evaluation (``energy_finite``).
+#: 2. Any pinned row carrying a non-finite parameter score raises rather than
+#:    silently re-masking.  Dropping pinned rows on score non-finiteness would
+#:    shift the step onto a second, systematically selected subsample that
+#:    diverges from the pinned local-energy estimator.
+#: 3. No opt-out boolean flag is shipped.  Any future per-optimizer
+#:    propagation opt-out requires a typed capability carrying the node ID of
+#:    its own admission test proving its search rejects non-finite trial values
+#:    and terminates.
+NONFINITE_SCORE_ROW_POLICY = "fail_on_pinned"
+
+
+@dataclass(frozen=True, kw_only=True)
+class ScoreRowSelection:
+    """Pinned row selection and non-finiteness counts for a score-based update.
+
+    Parameters
+    ----------
+    finite_mask : torch.Tensor
+        1-D boolean mask of the rows pinned as finite at the local-energy
+        evaluation.  Every selected row is guaranteed to have finite local
+        energy and all-finite parameter scores.
+    n_samples : int
+        Total number of sample rows in the incoming batch.
+    n_finite : int
+        Number of pinned finite rows surviving into the solve.
+    n_nonfinite_energy : int
+        Number of rows excluded due to non-finite local energy.
+    n_nonfinite_score_total : int
+        Total number of rows in the incoming batch with at least one non-finite
+        parameter score (counting only unpinned rows when selection succeeds,
+        since any non-finite score on a pinned row raises).
+    nonfinite_local_energy_policy : str
+        Resolved local-energy policy active for this step (``"fail"`` or
+        ``"mask"``).
+    nonfinite_score_row_policy : str, optional
+        Score-row policy enforced for this step; always
+        :data:`NONFINITE_SCORE_ROW_POLICY` (``"fail_on_pinned"``).
+    """
+
+    finite_mask: Any
+    n_samples: int
+    n_finite: int
+    n_nonfinite_energy: int
+    n_nonfinite_score_total: int
+    nonfinite_local_energy_policy: str
+    nonfinite_score_row_policy: str = NONFINITE_SCORE_ROW_POLICY
+
+
+def select_score_update_rows(
+    *,
+    local_energy: Any,
+    rows: Any,
+    nonfinite_local_energy_policy: str,
+    method_name: str,
+) -> ScoreRowSelection:
+    """Select pinned finite rows for a score-based update and refuse bad scores.
+
+    Enforces the consolidated ``377f6b0f`` / ``02859027`` operator ruling in
+    one canonical place shared by SR and SPRING:
+
+    - Under ``nonfinite_local_energy_policy == "fail"``, any non-finite local
+      energy refuses the step before scores are inspected.
+    - Under ``"mask"``, the step pins its finite row mask at the first
+      (local-energy) evaluation (``energy_finite``).
+    - If any pinned row carries a non-finite parameter score, the step raises
+      :class:`RuntimeError` naming the offending row indices rather than
+      silently re-masking.
+    - No opt-out boolean flag exists here; any future per-optimizer
+      propagation opt-out requires a typed capability carrying its admission
+      test node ID.
+
+    Parameters
+    ----------
+    local_energy : torch.Tensor
+        1-D tensor of per-sample local energies with shape ``[B]``.
+    rows : torch.Tensor
+        2-D flattened raw parameter-score matrix with shape ``[B, P]``.
+    nonfinite_local_energy_policy : {"fail", "mask"}
+        Active non-finite local-energy policy for this step.
+    method_name : str
+        Human-readable name of the calling update method (e.g.
+        ``"stochastic reconfiguration"`` or ``"SPRING"``) included in refusal
+        messages.
+
+    Returns
+    -------
+    ScoreRowSelection
+        Pinned finite mask, sample/non-finite counts, and active policies.
+
+    Raises
+    ------
+    TypeError
+        If ``local_energy`` or ``rows`` is not a :class:`torch.Tensor`.
+    ValueError
+        If ``local_energy`` is not 1-D, ``rows`` is not 2-D, their sample
+        counts disagree, or ``nonfinite_local_energy_policy`` is unrecognised.
+    RuntimeError
+        If ``nonfinite_local_energy_policy == "fail"`` and any local energy is
+        non-finite, or if any pinned finite local-energy row has a non-finite
+        parameter score.
+    """
+
+    if not isinstance(local_energy, torch.Tensor):
+        raise TypeError("select_score_update_rows.local_energy must be a torch.Tensor")
+    if local_energy.ndim != 1:
+        raise ValueError(
+            "select_score_update_rows.local_energy must be 1-D, "
+            f"got shape {tuple(local_energy.shape)}"
+        )
+    if not isinstance(rows, torch.Tensor):
+        raise TypeError("select_score_update_rows.rows must be a torch.Tensor")
+    if rows.ndim != 2:
+        raise ValueError(
+            "select_score_update_rows.rows must be 2-D, "
+            f"got shape {tuple(rows.shape)}"
+        )
+    if int(rows.shape[0]) != int(local_energy.numel()):
+        raise ValueError(
+            "select_score_update_rows requires one score row per local energy, "
+            f"got {int(rows.shape[0])} rows for {int(local_energy.numel())} local energies"
+        )
+
+    resolved_policy = resolve_nonfinite_local_energy_policy(nonfinite_local_energy_policy)
+    n_samples = int(local_energy.numel())
+    energy_finite = torch.isfinite(local_energy)
+    n_nonfinite_energy = int((~energy_finite).sum().item())
+
+    if resolved_policy == "fail" and n_nonfinite_energy > 0:
+        raise RuntimeError(
+            f"{method_name} refused a step: {n_nonfinite_energy} of {n_samples} "
+            "local-energy samples are non-finite and the active policy is 'fail'. "
+            "Masking them would drop a systematically selected subsample, biasing "
+            "the estimator by an uncharacterised amount"
+        )
+
+    score_finite = torch.isfinite(rows).all(dim=1)
+    n_nonfinite_score_total = int((~score_finite).sum().item())
+    pinned_score_bad = energy_finite & ~score_finite
+    if bool(pinned_score_bad.any()):
+        bad_indices = pinned_score_bad.nonzero(as_tuple=False).flatten().tolist()
+        n_bad_scores = len(bad_indices)
+        n_pinned = int(energy_finite.sum().item())
+        preview = bad_indices[:10]
+        suffix = f" (showing first 10 of {n_bad_scores})" if n_bad_scores > 10 else ""
+        raise RuntimeError(
+            f"{method_name} refused a step: {n_bad_scores} of {n_pinned} pinned "
+            f"finite local-energy row(s) have non-finite parameter scores at "
+            f"row indices {preview}{suffix} under "
+            f"nonfinite_score_row_policy='{NONFINITE_SCORE_ROW_POLICY}' "
+            f"(nonfinite_local_energy_policy={resolved_policy!r}). "
+            "Silent re-masking is rejected because dropping pinned rows on score "
+            "non-finiteness shifts the step to a second, systematically selected "
+            "subsample that diverges from the pinned local-energy estimator"
+        )
+
+    return ScoreRowSelection(
+        finite_mask=energy_finite,
+        n_samples=n_samples,
+        n_finite=int(energy_finite.sum().item()),
+        n_nonfinite_energy=n_nonfinite_energy,
+        n_nonfinite_score_total=n_nonfinite_score_total,
+        nonfinite_local_energy_policy=resolved_policy,
+        nonfinite_score_row_policy=NONFINITE_SCORE_ROW_POLICY,
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -561,13 +733,16 @@ def build_energy_residual(
 
 
 __all__ = [
+    "NONFINITE_SCORE_ROW_POLICY",
     "SCORE_CONVENTION_VERSION",
     "ScoreConventions",
     "ScoreGeometry",
+    "ScoreRowSelection",
     "build_energy_residual",
     "build_score_geometry",
     "build_score_geometry_from_rows",
     "flatten_parameter_score_blocks",
     "layout_convention_fingerprint",
+    "select_score_update_rows",
     "unflatten_to_layout",
 ]

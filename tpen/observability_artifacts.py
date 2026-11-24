@@ -554,13 +554,27 @@ def _freeze_key(value: Any) -> Any:
     return value
 
 
+_CGROUP_VOLATILE_SUBJECT_KEYS: frozenset[str] = frozenset(
+    {
+        "observed_member_count",
+        "includes_other_tasks",
+        "procs_truncated",
+        "effective_memory_limit_path",
+        "effective_cpu_limit_path",
+    }
+)
+
+
 def _subject_generation_key(subject: Mapping[str, Any]) -> Any:
     """Return a hashable subject-identity key used to detect generation shifts."""
 
+    ignored = {"mapping_evidence", "evidence"}
+    if subject.get("kind") == "cgroup":
+        ignored |= _CGROUP_VOLATILE_SUBJECT_KEYS
     filtered = {
         key: val
         for key, val in subject.items()
-        if key not in {"mapping_evidence", "evidence"}
+        if key not in ignored
     }
     return _freeze_key(filtered)
 

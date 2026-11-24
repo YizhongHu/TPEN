@@ -25,7 +25,13 @@ from tpen.dependencies import require_torch, require_torch_nn
 from tpen.equivariance import EquivariantMap
 from tpen.nn.context import TPENForwardContext
 from tpen.nn.cusp import ElectronNucleusCusp
-from tpen.nn.forward import CoordinateGradientRequest, MaterializedParameterScoreRequest
+from tpen.nn.forward import (
+    CoordinateGradientRequest,
+    MaterializedParameterScoreRequest,
+    StructuredCurvatureForwardPacket,
+    StructuredCurvatureForwardRequest,
+)
+from tpen.nn.structured_curvature import evaluate_structured_curvature_forward
 from tpen.nn.tpen_layer import TPENLayer
 from tpen.nn.tpen_stack import TPENStack
 
@@ -258,15 +264,50 @@ class TPENWaveFunction(EquivariantMap):
     def forward_impl(
         self,
         batch: ElectronBatch,
-        request: CoordinateGradientRequest | MaterializedParameterScoreRequest | None = None,
-    ) -> WavefunctionOutput | CoordinateForwardPacket | ParameterScoreForwardPacket:
-        """Evaluate the value or an explicitly requested coordinate packet."""
+        request: (
+            CoordinateGradientRequest
+            | MaterializedParameterScoreRequest
+            | StructuredCurvatureForwardRequest
+            | None
+        ) = None,
+    ) -> (
+        WavefunctionOutput
+        | CoordinateForwardPacket
+        | ParameterScoreForwardPacket
+        | StructuredCurvatureForwardPacket
+    ):
+        """Evaluate the value or an explicitly requested derivative packet."""
 
         if request is None:
             return self._construct_output(batch, include_analytic_cusp=True)
-        if not isinstance(request, (CoordinateGradientRequest, MaterializedParameterScoreRequest)):
+        if not isinstance(
+            request,
+            (
+                CoordinateGradientRequest,
+                MaterializedParameterScoreRequest,
+                StructuredCurvatureForwardRequest,
+            ),
+        ):
             raise TypeError(f"unsupported wavefunction forward request: {type(request)!r}")
         return request.evaluate(self, batch)
+
+    def evaluate_structured_curvature_request(
+        self,
+        *,
+        request: StructuredCurvatureForwardRequest,
+        batch: ElectronBatch,
+    ) -> StructuredCurvatureForwardPacket:
+        """Return detached KFAC curvature factors and energy half-gradient in one forward."""
+
+        self._validate_parameter_binding()
+        return evaluate_structured_curvature_forward(
+            self,
+            batch=batch,
+            sample_weights=request.sample_weights,
+            solve_dtype=request.solve_dtype,
+            max_dense_block_numel=request.max_dense_block_numel,
+            forward_fn=lambda b: self._construct_output(b, include_analytic_cusp=True),
+        )
 
     def evaluate_coordinate_gradient_request(
         self,

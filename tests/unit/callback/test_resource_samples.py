@@ -11,6 +11,8 @@ import math
 import os
 from pathlib import Path
 import random
+import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -29,6 +31,10 @@ from tpen.accelerator import (
     AllocatorCurrentUsage,
     AllocatorUnavailable,
     AllocatorUsage,
+    NvidiaDeviceCommandResult,
+    NvidiaDeviceReading,
+    NvidiaDeviceUnavailable,
+    NvidiaSmiDeviceProbe,
 )
 from tpen.artifacts import (
     ArtifactDestination,
@@ -40,7 +46,11 @@ from tpen.artifacts import (
 )
 from tpen.callback import (
     AllocatorSource,
+    LinuxCgroupV2Source,
+    LinuxMemorySource,
+    LinuxProcessTreeSource,
     ManagedLifecycleError,
+    NvidiaDeviceSource,
     RUsageSource,
     ResourceOwnershipConflictError,
     ResourceSamples,
@@ -53,6 +63,15 @@ from tpen.callback.resource_samples import (
     ALLOCATOR_CURRENT_QUANTITY_IDS,
     ALLOCATOR_PEAK_QUANTITY_IDS,
     ALLOCATOR_SOURCE_ID,
+    LINUX_CGROUP_V2_QUANTITY_IDS,
+    LINUX_CGROUP_V2_SOURCE_ID,
+    LINUX_MEMORY_QUANTITY_IDS,
+    LINUX_MEMORY_SOURCE_ID,
+    LINUX_PROCESS_TREE_QUANTITY_IDS,
+    LINUX_PROCESS_TREE_SOURCE_ID,
+    NVIDIA_DEVICE_EXECUTION_MODE,
+    NVIDIA_DEVICE_QUANTITY_IDS,
+    NVIDIA_DEVICE_SOURCE_ID,
     RUSAGE_QUANTITY_IDS,
     RUSAGE_SOURCE_ID,
 )
@@ -63,7 +82,21 @@ from tpen.checkpoint.profiles import NATIVE_RECOVERY_PROFILE, check_profile
 from tpen.distributed import ExecutionTopology
 from tpen.inspection import inspect_observability_bundle, inspect_run_observability
 from tpen.observability_artifacts import ObservabilityPathError
-from tpen.process_resources import ProcessResourceBaseline, ResourceUnavailable
+from tpen.process_resources import (
+    DEFAULT_LINUX_CGROUP_MAX_MOUNTINFO_BYTES,
+    LinuxCgroupV2Identity,
+    LinuxCgroupV2Probe,
+    LinuxCgroupV2Reading,
+    LinuxMemoryUnavailable,
+    LinuxProcessGeneration,
+    LinuxProcessMemoryProbe,
+    LinuxProcessMemoryReading,
+    LinuxProcessTreeMember,
+    LinuxProcessTreeProbe,
+    LinuxProcessTreeReading,
+    ProcessResourceBaseline,
+    ResourceUnavailable,
+)
 import tpen.run as run_mod
 from tpen.run import _ManagedLifecycleRegistry, open_run_context, run_from_config
 from tpen.run_events import RunCompleted, RunStarted
@@ -2031,3 +2064,3384 @@ def test_allocator_reset_ownership_conflicts_across_rocm_hip_injected_and_duplic
     assert obs_1.status == "present"
     assert obs_0.invocations[0].derived_lifecycle_state == "closed"
     assert obs_1.invocations[0].derived_lifecycle_state == "closed"
+
+
+# ---------------------------------------------------------------------------
+# O4: LinuxMemorySource configuration, O2 wire round-trip, and failure modes
+# ---------------------------------------------------------------------------
+
+
+class _FakeLinuxMemoryProbe:
+    """Deterministic sequence-backed Linux memory probe for callback unit tests."""
+
+    def __init__(
+        self,
+        readings: list[LinuxProcessMemoryReading | Exception],
+        *,
+        generation: LinuxProcessGeneration | None = None,
+        bind_error: LinuxMemoryUnavailable | None = None,
+        target_reads: int | None = None,
+    ) -> None:
+        self._readings = list(readings)
+        self._index = 0
+        self._generation = generation
+        self._bind_error = bind_error
+        self._target_reads = target_reads
+        self.reached_target = threading.Event()
+        self.bind_calls = 0
+        self.read_calls = 0
+        self.thread_ids: list[int] = []
+
+    @property
+    def target_generation(self) -> LinuxProcessGeneration | None:
+        return self._generation
+
+    @property
+    def bind_error(self) -> LinuxMemoryUnavailable | None:
+        return self._bind_error
+
+    def bind_target(self) -> LinuxProcessGeneration | None:
+        self.bind_calls += 1
+        return self._generation
+
+    def read(self) -> LinuxProcessMemoryReading:
+        self.read_calls += 1
+        self.thread_ids.append(threading.get_ident())
+        idx = min(self._index, len(self._readings) - 1)
+        self._index += 1
+        if self._target_reads is not None and self.read_calls >= self._target_reads:
+            self.reached_target.set()
+        item = self._readings[idx]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class _BlockingLinuxMemoryProbe:
+    """Linux memory probe that blocks on its second read to verify close timeouts."""
+
+    def __init__(self, generation: LinuxProcessGeneration) -> None:
+        self._generation = generation
+        self.blocked_in_second = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def bind_target(self) -> LinuxProcessGeneration:
+        return self._generation
+
+    def read(self) -> LinuxProcessMemoryReading:
+        self.calls += 1
+        if self.calls == 1:
+            return LinuxProcessMemoryReading(
+                status="ok",
+                rss_bytes=4 * 1024 * 1024,
+                virtual_bytes=16 * 1024 * 1024,
+                thread_count=2,
+                read_start_ns=100,
+                read_end_ns=110,
+                target_generation=self._generation,
+                observed_generation_before=self._generation,
+                observed_generation_after=self._generation,
+            )
+        self.blocked_in_second.set()
+        self.release.wait(timeout=5.0)
+        return LinuxProcessMemoryReading(
+            status="ok",
+            rss_bytes=8 * 1024 * 1024,
+            virtual_bytes=16 * 1024 * 1024,
+            thread_count=2,
+            read_start_ns=200,
+            read_end_ns=210,
+            target_generation=self._generation,
+            observed_generation_before=self._generation,
+            observed_generation_after=self._generation,
+        )
+
+
+def _write_fake_proc_tree(
+    proc_root: Path,
+    *,
+    pid: int,
+    start_ticks: int = 9000,
+    boot_id: str = "00000000-0000-4000-8000-000000000002",
+    pid_ns: str = "pid:[4026531836]",
+    vm_rss_kib: int = 1024,
+    vm_size_kib: int = 4096,
+    threads: int = 3,
+) -> Path:
+    proc_root.mkdir(parents=True, exist_ok=True)
+    boot_file = proc_root / "sys" / "kernel" / "random" / "boot_id"
+    boot_file.parent.mkdir(parents=True, exist_ok=True)
+    boot_file.write_text(f"{boot_id}\n", encoding="utf-8")
+    pid_dir = proc_root / str(pid)
+    pid_dir.mkdir(parents=True, exist_ok=True)
+    stat_fields = "S 1 1 1 0 -1 4194304 10 0 0 0 1 1 0 0 20 0 3 0"
+    (pid_dir / "stat").write_text(
+        f"{pid} (python3) {stat_fields} {start_ticks} 1000 50\n",
+        encoding="utf-8",
+    )
+    (pid_dir / "status").write_text(
+        f"Name:\tpython3\nPid:\t{pid}\nVmSize:\t{vm_size_kib} kB\n"
+        f"VmRSS:\t{vm_rss_kib} kB\nThreads:\t{threads}\n",
+        encoding="utf-8",
+    )
+    ns_dir = pid_dir / "ns"
+    ns_dir.mkdir(parents=True, exist_ok=True)
+    ns_link = ns_dir / "pid"
+    if ns_link.is_symlink() or ns_link.exists():
+        ns_link.unlink()
+    os.symlink(pid_ns, ns_link)
+    return proc_root
+
+
+def test_linux_memory_source_torch_free_export_and_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lazy export is Torch-free, pure at construction, and enforces strict validation."""
+
+    assert "tpen.callback.LinuxMemorySource" not in _KNOWN_NON_MANAGED_CALLBACK_TARGETS
+    assert (
+        "tpen.callback.resource_samples.LinuxMemorySource"
+        not in _KNOWN_NON_MANAGED_CALLBACK_TARGETS
+    )
+
+    # Fresh subprocess Torch-free check covering process_resources + LinuxMemorySource.
+    code = (
+        "import sys, tpen.process_resources, tpen.callback.resource_samples; "
+        "from tpen.callback import LinuxMemorySource, ResourceSamples; "
+        "cb = ResourceSamples(linux_memory=LinuxMemorySource(enabled=True)); "
+        "assert cb.linux_memory.enabled is True; "
+        "assert cb.rusage.enabled is False; "
+        "assert cb.allocator.enabled is False; "
+        "assert 'torch' not in sys.modules; "
+        "assert 'experiments' not in sys.modules; "
+        "assert 'tpen_executor' not in sys.modules; "
+        "print('TORCH_FREE_OK')"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-B", "-c", code],
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "TORCH_FREE_OK" in proc.stdout
+
+    # Default ResourceSamples preserves O3 defaults (linux_memory disabled).
+    default_cb = ResourceSamples()
+    assert default_cb.rusage.enabled is True
+    assert default_cb.allocator.enabled is False
+    assert default_cb.linux_memory.enabled is False
+
+    # Subclass refusal (exact-type coercion).
+    class _SubLinuxMemory(LinuxMemorySource):
+        pass
+
+    with pytest.raises(TypeError, match="subclass"):
+        ResourceSamples(linux_memory=_SubLinuxMemory())
+
+    # Forbidden selector keys refused in mapping coercion.
+    with pytest.raises(ValueError, match="forbidden"):
+        ResourceSamples(linux_memory={"enabled": True, "triggers": ["step"]})
+
+    # Duplicate source_id across enabled sources refused.
+    with pytest.raises(ValueError, match="distinct source_id"):
+        ResourceSamples(
+            rusage=RUsageSource(enabled=True, source_id="shared"),
+            linux_memory=LinuxMemorySource(enabled=True, source_id="shared"),
+        )
+    with pytest.raises(ValueError, match="distinct source_id"):
+        ResourceSamples(
+            allocator=AllocatorSource(enabled=True, reset_peaks=False, source_id="shared"),
+            linux_memory=LinuxMemorySource(enabled=True, source_id="shared"),
+        )
+
+    # Foreign PID refused; current PID accepted; pid=None never calls os.getpid().
+    foreign_pid = os.getpid() + 1
+    with pytest.raises(ValueError, match="foreign PID"):
+        LinuxMemorySource(pid=foreign_pid)
+    assert LinuxMemorySource(pid=os.getpid()).pid == os.getpid()
+
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            os,
+            "getpid",
+            lambda: (_ for _ in ()).throw(AssertionError("must not freeze pid at init")),
+        )
+        pure_src = LinuxMemorySource(enabled=True)
+        assert pure_src.pid is None
+
+    # Invalid execution_mode, bounds, and quantities refused.
+    for bad_mode in ("helper", "subprocess", "in_process_cooperative", ""):
+        with pytest.raises(ValueError, match="execution_mode"):
+            LinuxMemorySource(execution_mode=bad_mode)
+    with pytest.raises(TypeError):
+        LinuxMemorySource(max_read_bytes=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        LinuxMemorySource(max_read_bytes=0)
+    with pytest.raises(ValueError):
+        LinuxMemorySource(max_read_seconds=0.0)
+    with pytest.raises(ValueError):
+        LinuxMemorySource(max_read_seconds=math.nan)
+    with pytest.raises(ValueError):
+        LinuxMemorySource(quantities=())
+    with pytest.raises(ValueError):
+        LinuxMemorySource(quantities=("process.rusage.max_rss_bytes",))
+    with pytest.raises(ValueError):
+        LinuxMemorySource(
+            quantities=("process.memory.rss_bytes", "process.memory.rss_bytes")
+        )
+    with pytest.raises(ValueError):
+        LinuxMemorySource(proc_root="   ")
+    with pytest.raises(TypeError):
+        LinuxMemorySource(proc_root=123)  # type: ignore[arg-type]
+
+
+def test_linux_memory_alongside_rusage_distinguishes_gauge_from_lifetime_high_water(
+    tmp_path: Path,
+) -> None:
+    """Enabled LinuxMemorySource + RUsageSource keep gauge current RSS distinct from RUSAGE peak."""
+
+    gen = LinuxProcessGeneration(
+        pid=os.getpid(),
+        start_ticks=91000,
+        boot_id="11111111-1111-4111-8111-111111111111",
+        pid_ns_inode="pid:[4026531836]",
+        host_id="host-o4",
+    )
+    lm_probe = _FakeLinuxMemoryProbe(
+        [
+            LinuxProcessMemoryReading(
+                status="ok",
+                rss_bytes=1 * 1024 * 1024 * 1024,
+                virtual_bytes=4 * 1024 * 1024 * 1024,
+                thread_count=4,
+                read_start_ns=10,
+                read_end_ns=20,
+                target_generation=gen,
+                observed_generation_before=gen,
+                observed_generation_after=gen,
+            ),
+            LinuxProcessMemoryReading(
+                status="ok",
+                rss_bytes=2 * 1024 * 1024 * 1024,
+                virtual_bytes=5 * 1024 * 1024 * 1024,
+                thread_count=6,
+                read_start_ns=30,
+                read_end_ns=40,
+                target_generation=gen,
+                observed_generation_before=gen,
+                observed_generation_after=gen,
+            ),
+        ],
+        generation=gen,
+    )
+    rusage_probe = _FakeRUsageProbe(
+        [
+            ProcessResourceBaseline(1.0, 0.2, 0, 0, 1, 0, 5120.0),
+            ProcessResourceBaseline(2.0, 0.4, 0, 0, 2, 0, 5120.0),
+        ]
+    )
+    clock = _SteppingClock(start_ns=1_000_000_000_000, step_ns=1_000_000_000)
+    cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        rusage=RUsageSource(enabled=True, probe=rusage_probe),
+        linux_memory=LinuxMemorySource(enabled=True, probe=lm_probe),
+        monotonic_ns=clock,
+    )
+    assert lm_probe.bind_calls == 0
+    assert lm_probe.read_calls == 0
+
+    with open_run_context(_base_cfg(tmp_path), runtime_callbacks=[cb]) as ctx:
+        run_dir = ctx.run_dir
+
+    assert lm_probe.bind_calls == 1
+    assert lm_probe.read_calls == 2
+
+    bundle_dir = next((run_dir / "observability").iterdir())
+    bundle = inspect_observability_bundle(bundle_dir)
+    assert bundle.derived_lifecycle_state == "closed"
+    assert bundle.derived_data_completeness == "complete"
+
+    assert bundle.descriptors is not None
+    lm_rss_desc = bundle.descriptors.quantities["process.memory.rss_bytes"]
+    lm_virt_desc = bundle.descriptors.quantities["process.memory.virtual_bytes"]
+    lm_thr_desc = bundle.descriptors.quantities["process.memory.thread_count"]
+    ru_rss_desc = bundle.descriptors.quantities["process.rusage.max_rss_bytes"]
+
+    assert lm_rss_desc.source_id == LINUX_MEMORY_SOURCE_ID
+    assert lm_rss_desc.unit == "B"
+    assert lm_rss_desc.statistic == "gauge"
+    assert lm_rss_desc.subject_kind == "process"
+    assert lm_rss_desc.window == "read_interval"
+    assert lm_rss_desc.native_name == "VmRSS"
+    assert lm_rss_desc.native_unit == "KiB"
+    assert lm_rss_desc.conversion == "multiply_by_1024"
+    assert lm_rss_desc.quality == ("approximate_rss",)
+
+    assert lm_virt_desc.statistic == "gauge"
+    assert lm_virt_desc.native_name == "VmSize"
+    assert lm_virt_desc.native_unit == "KiB"
+    assert lm_virt_desc.conversion == "multiply_by_1024"
+
+    assert lm_thr_desc.unit == "1"
+    assert lm_thr_desc.statistic == "gauge"
+    assert lm_thr_desc.native_name == "Threads"
+    assert lm_thr_desc.conversion == "identity"
+
+    assert ru_rss_desc.statistic == "high_water"
+    assert ru_rss_desc.window == "process_lifetime"
+
+    # Inventory & sample subject record exact generation provenance.
+    assert bundle.inventory is not None
+    assert bundle.inventory.sources[LINUX_MEMORY_SOURCE_ID]["capability"] == "available"
+    assert bundle.inventory.sources[LINUX_MEMORY_SOURCE_ID]["target_generation"] == gen.to_dict()
+    assert bundle.inventory.process["start_ticks"] == 91000
+    assert bundle.inventory.process["boot_id"] == gen.boot_id
+    assert bundle.inventory.process["pid_ns_inode"] == gen.pid_ns_inode
+
+    lm_samples = [
+        s for s in bundle.samples["resource-samples"] if s.source_id == LINUX_MEMORY_SOURCE_ID
+    ]
+    assert len(lm_samples) == 2
+    assert [s.sequence for s in lm_samples] == [0, 1]
+    assert lm_samples[0].subject["kind"] == "process"
+    assert lm_samples[0].subject["start_ticks"] == 91000
+    assert lm_samples[0].subject["boot_id"] == gen.boot_id
+    assert lm_samples[0].subject["pid_ns_inode"] == gen.pid_ns_inode
+
+    # O2 summary keeps gauge (sampled_min/sampled_max lower bound) separate from high-water.
+    lm_rss_summary = bundle.summary.quantity(
+        LINUX_MEMORY_SOURCE_ID, "process.memory.rss_bytes"
+    )
+    ru_rss_summary = bundle.summary.quantity(
+        RUSAGE_SOURCE_ID, "process.rusage.max_rss_bytes"
+    )
+    assert lm_rss_summary is not None
+    assert lm_rss_summary.sampled_min == 1 * 1024 * 1024 * 1024
+    assert lm_rss_summary.sampled_max == 2 * 1024 * 1024 * 1024
+    assert lm_rss_summary.sampled_max_is_lower_bound is True
+    assert lm_rss_summary.observed_max is None
+
+    assert ru_rss_summary is not None
+    assert ru_rss_summary.observed_max == 5120 * 1024 * 1024
+    assert ru_rss_summary.sampled_max is None
+
+    status = bundle.statuses["resource-samples"]
+    assert status.source_status[LINUX_MEMORY_SOURCE_ID] == "available"
+    assert status.source_status[RUSAGE_SOURCE_ID] == "available"
+    assert status.counts == {"attempted": 4, "written": 4, "dropped": 0, "failed": 0}
+
+
+def test_linux_memory_only_and_disabled_configurations(tmp_path: Path) -> None:
+    """LinuxMemorySource-only omits RUSAGE; disabled configs emit zero linux-memory records."""
+
+    proc_root = _write_fake_proc_tree(
+        tmp_path / "proc",
+        pid=os.getpid(),
+        start_ticks=12345,
+        vm_rss_kib=2048,
+        vm_size_kib=8192,
+        threads=3,
+    )
+
+    # 1. LinuxMemorySource-only (via YAML/mapping coercion)
+    cb_only = ResourceSamples(
+        interval_seconds=60.0,
+        linux_memory={"enabled": True, "proc_root": str(proc_root)},
+    )
+    with open_run_context(_base_cfg(tmp_path / "only"), runtime_callbacks=[cb_only]) as ctx:
+        only_dir = ctx.run_dir
+
+    bundle_only = inspect_run_observability(only_dir).invocations[0]
+    assert bundle_only.derived_lifecycle_state == "closed"
+    assert bundle_only.derived_data_completeness == "complete"
+    assert bundle_only.descriptors is not None
+    assert set(bundle_only.descriptors.quantities.keys()) == set(LINUX_MEMORY_QUANTITY_IDS)
+    assert RUSAGE_SOURCE_ID not in bundle_only.statuses["resource-samples"].source_status
+    assert bundle_only.statuses["resource-samples"].source_status[LINUX_MEMORY_SOURCE_ID] == "available"
+    assert bundle_only.statuses["resource-samples"].helper_cleanup["state"] == "confirmed_stopped"
+
+    # 2. linux_memory.enabled=False alongside enabled rusage emits zero linux-memory records
+    untouched_probe = _FakeLinuxMemoryProbe([])
+    cb_lm_off = ResourceSamples(
+        interval_seconds=60.0,
+        rusage=RUsageSource(enabled=True),
+        linux_memory=LinuxMemorySource(enabled=False, probe=untouched_probe),
+    )
+    with open_run_context(_base_cfg(tmp_path / "lm_off"), runtime_callbacks=[cb_lm_off]) as ctx:
+        off_dir = ctx.run_dir
+    assert untouched_probe.bind_calls == 0
+    assert untouched_probe.read_calls == 0
+    bundle_off = inspect_run_observability(off_dir).invocations[0]
+    assert bundle_off.descriptors is not None
+    assert not any(
+        d.source_id == LINUX_MEMORY_SOURCE_ID
+        for d in bundle_off.descriptors.quantities.values()
+    )
+    assert bundle_off.inventory is not None
+    assert LINUX_MEMORY_SOURCE_ID not in bundle_off.inventory.sources
+    assert all(
+        s.source_id != LINUX_MEMORY_SOURCE_ID
+        for s in bundle_off.samples["resource-samples"]
+    )
+
+    # 3. ResourceSamples(enabled=False, linux_memory=enabled) emits zero files or probe calls
+    cb_all_off = ResourceSamples(
+        enabled=False,
+        linux_memory=LinuxMemorySource(enabled=True, probe=untouched_probe),
+    )
+    assert (
+        run_from_config(
+            _base_cfg(tmp_path / "all_off"),
+            raise_exceptions=True,
+            runtime_callbacks=[cb_all_off],
+        )
+        == 0
+    )
+    assert untouched_probe.bind_calls == 0
+    assert untouched_probe.read_calls == 0
+    assert inspect_run_observability(tmp_path / "all_off" / "outputs" / "o3-run").status == "absent"
+
+
+def test_linux_memory_partial_unavailable_changed_generation_oversize_and_timeout_roundtrip(
+    tmp_path: Path,
+) -> None:
+    """Partial, generation_changed, oversize, timeout, and non-Linux outcomes reconcile cleanly."""
+
+    gen = LinuxProcessGeneration(
+        pid=os.getpid(),
+        start_ticks=55555,
+        boot_id="22222222-2222-4222-8222-222222222222",
+        pid_ns_inode="pid:[4026531836]",
+        host_id="host-err",
+    )
+    changed_gen = LinuxProcessGeneration(
+        pid=os.getpid(),
+        start_ticks=66666,
+        boot_id="22222222-2222-4222-8222-222222222222",
+        pid_ns_inode="pid:[4026531836]",
+        host_id="host-err",
+    )
+    field_missing = LinuxMemoryUnavailable(
+        reason="VmSize missing", reason_code="field_missing", status="unavailable"
+    )
+    gen_changed = LinuxMemoryUnavailable(
+        reason="start_ticks changed", reason_code="generation_changed", status="unavailable"
+    )
+    oversize = LinuxMemoryUnavailable(
+        reason="status exceeded max_read_bytes",
+        reason_code="input_limit_exceeded",
+        status="error",
+    )
+    timeout = LinuxMemoryUnavailable(
+        reason="status exceeded max_read_seconds",
+        reason_code="read_timeout",
+        status="error",
+    )
+
+    # Sequence covering partial -> generation_changed -> oversize -> timeout
+    sequence_probe = _FakeLinuxMemoryProbe(
+        [
+            LinuxProcessMemoryReading(
+                status="partial",
+                rss_bytes=0,  # legitimate zero!
+                virtual_bytes=field_missing,
+                thread_count=2,
+                read_start_ns=10,
+                read_end_ns=15,
+                reason_code="field_missing",
+                detail="VmSize missing",
+                target_generation=gen,
+                observed_generation_before=gen,
+                observed_generation_after=gen,
+            ),
+            LinuxProcessMemoryReading(
+                status="unavailable",
+                rss_bytes=gen_changed,
+                virtual_bytes=gen_changed,
+                thread_count=gen_changed,
+                read_start_ns=20,
+                read_end_ns=25,
+                reason_code="generation_changed",
+                detail="start_ticks changed",
+                target_generation=gen,
+                observed_generation_before=changed_gen,
+                observed_generation_after=None,
+            ),
+            LinuxProcessMemoryReading(
+                status="error",
+                rss_bytes=oversize,
+                virtual_bytes=oversize,
+                thread_count=oversize,
+                read_start_ns=30,
+                read_end_ns=35,
+                reason_code="input_limit_exceeded",
+                detail="status exceeded max_read_bytes",
+                target_generation=gen,
+                observed_generation_before=gen,
+                observed_generation_after=None,
+            ),
+            LinuxProcessMemoryReading(
+                status="error",
+                rss_bytes=timeout,
+                virtual_bytes=timeout,
+                thread_count=timeout,
+                read_start_ns=40,
+                read_end_ns=45,
+                reason_code="read_timeout",
+                detail="status exceeded max_read_seconds",
+                target_generation=gen,
+                observed_generation_before=gen,
+                observed_generation_after=None,
+            ),
+        ],
+        generation=gen,
+        target_reads=4,
+    )
+
+    cb = ResourceSamples(
+        interval_seconds=0.015,
+        max_pending_envelopes=32,
+        linux_memory=LinuxMemorySource(enabled=True, probe=sequence_probe),
+    )
+    with open_run_context(_base_cfg(tmp_path / "outcomes"), runtime_callbacks=[cb]) as ctx:
+        assert sequence_probe.reached_target.wait(timeout=2.0)
+        outcomes_run_dir = ctx.run_dir
+
+    bundle_dir = next((outcomes_run_dir / "observability").iterdir())
+    bundle = inspect_observability_bundle(bundle_dir)
+    assert bundle.derived_lifecycle_state == "closed"
+    assert bundle.derived_data_completeness == "partial"
+
+    samples = bundle.samples["resource-samples"]
+    assert len(samples) >= 4
+    # Sample 0: partial (legitimate 0 ok + field_missing unavailable)
+    assert samples[0].readings["process.memory.rss_bytes"].status == "ok"
+    assert samples[0].readings["process.memory.rss_bytes"].value == 0
+    assert samples[0].readings["process.memory.virtual_bytes"].status == "unavailable"
+    assert samples[0].readings["process.memory.virtual_bytes"].reason_code == "field_missing"
+    assert samples[0].readings["process.memory.virtual_bytes"].value is None
+    # Sample 1: generation_changed
+    assert samples[1].readings["process.memory.rss_bytes"].status == "unavailable"
+    assert samples[1].readings["process.memory.rss_bytes"].reason_code == "generation_changed"
+    assert samples[1].readings["process.memory.rss_bytes"].value is None
+    # Sample 2: input_limit_exceeded
+    assert samples[2].readings["process.memory.rss_bytes"].status == "error"
+    assert samples[2].readings["process.memory.rss_bytes"].reason_code == "input_limit_exceeded"
+    # Sample 3: read_timeout
+    assert samples[3].readings["process.memory.rss_bytes"].status == "error"
+    assert samples[3].readings["process.memory.rss_bytes"].reason_code == "read_timeout"
+
+    status = bundle.statuses["resource-samples"]
+    assert status.source_status[LINUX_MEMORY_SOURCE_ID] == "partial"
+    assert status.counts["failed"] == 0
+    assert status.counts["attempted"] == (
+        status.counts["written"] + status.counts["dropped"] + status.counts["failed"]
+    )
+    assert status.counts["written"] == len(samples)
+
+    # Non-Linux platform probe: inventory capability='unavailable', samples typed unavailable.
+    darwin_probe = LinuxProcessMemoryProbe(platform_name="darwin")
+    cb_darwin = ResourceSamples(
+        interval_seconds=60.0,
+        linux_memory=LinuxMemorySource(enabled=True, probe=darwin_probe),
+    )
+    with open_run_context(_base_cfg(tmp_path / "darwin"), runtime_callbacks=[cb_darwin]) as ctx:
+        darwin_dir = ctx.run_dir
+
+    darwin_bundle = inspect_run_observability(darwin_dir).invocations[0]
+    assert darwin_bundle.derived_lifecycle_state == "closed"
+    assert darwin_bundle.inventory is not None
+    assert darwin_bundle.inventory.sources[LINUX_MEMORY_SOURCE_ID]["capability"] == "unavailable"
+    assert (
+        darwin_bundle.inventory.sources[LINUX_MEMORY_SOURCE_ID]["unavailable_reason_code"]
+        == "unsupported_platform"
+    )
+    darwin_status = darwin_bundle.statuses["resource-samples"]
+    assert darwin_status.source_status[LINUX_MEMORY_SOURCE_ID] == "unavailable"
+    assert darwin_status.counts == {"attempted": 2, "written": 2, "dropped": 0, "failed": 0}
+    first_darwin = darwin_bundle.samples["resource-samples"][0]
+    for qty_id in LINUX_MEMORY_QUANTITY_IDS:
+        assert first_darwin.readings[qty_id].status == "unavailable"
+        assert first_darwin.readings[qty_id].reason_code == "unsupported_platform"
+        assert first_darwin.readings[qty_id].value is None
+
+
+def test_blocking_linux_memory_worker_marks_bundle_unsafe_and_refuses_reuse(
+    tmp_path: Path,
+) -> None:
+    """A hung linux-memory thread respects close_timeout_seconds, marks unsafe, and blocks reuse."""
+
+    gen = LinuxProcessGeneration(pid=os.getpid(), start_ticks=12345)
+    probe = _BlockingLinuxMemoryProbe(gen)
+    cb = ResourceSamples(
+        interval_seconds=0.01,
+        close_timeout_seconds=0.08,
+        linux_memory=LinuxMemorySource(enabled=True, probe=probe),
+    )
+    try:
+        with pytest.raises(ManagedLifecycleError, match="quiescence"):
+            with open_run_context(_base_cfg(tmp_path / "hung"), runtime_callbacks=[cb]) as ctx:
+                assert probe.blocked_in_second.wait(timeout=2.0)
+                hung_dir = ctx.run_dir
+
+        bundle = inspect_run_observability(hung_dir).invocations[0]
+        assert bundle.derived_lifecycle_state == "unsafe"
+        assert bundle.derived_finalization == "unsafe"
+        status = bundle.statuses["resource-samples"]
+        assert status.helper_cleanup["state"] == "unconfirmed_timeout"
+        assert "close_timeout" in status.truncation_reasons
+        assert cb.is_managed_scope_active() is True
+    finally:
+        probe.release.set()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires real Linux /proc filesystem")
+def test_linux_memory_live_procfs_roundtrip_with_rusage_on_linux(tmp_path: Path) -> None:
+    """On Linux (Cannon), live LinuxMemorySource + RUsageSource round-trip through O2 cleanly."""
+
+    cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        rusage=RUsageSource(enabled=True),
+        linux_memory=LinuxMemorySource(enabled=True),
+    )
+    assert (
+        run_from_config(_base_cfg(tmp_path), raise_exceptions=True, runtime_callbacks=[cb])
+        == 0
+    )
+    bundle = inspect_run_observability(tmp_path / "outputs" / "o3-run").invocations[0]
+    assert bundle.derived_lifecycle_state == "closed"
+    assert bundle.derived_data_completeness == "complete"
+    assert bundle.inventory is not None
+    assert bundle.inventory.sources[LINUX_MEMORY_SOURCE_ID]["capability"] == "available"
+    assert bundle.inventory.process["pid"] == os.getpid()
+    assert bundle.inventory.process["start_ticks"] > 0
+
+    lm_summary = bundle.summary.quantity(
+        LINUX_MEMORY_SOURCE_ID, "process.memory.rss_bytes"
+    )
+    assert lm_summary is not None
+    assert lm_summary.ok_count >= 2
+    assert lm_summary.sampled_min is not None and lm_summary.sampled_min > 0
+    assert lm_summary.sampled_max is not None and lm_summary.sampled_max >= lm_summary.sampled_min
+    assert lm_summary.sampled_max_is_lower_bound is True
+
+
+# ---------------------------------------------------------------------------
+# O4 T2 review tests
+# ---------------------------------------------------------------------------
+
+
+def test_linux_memory_non_linux_platform_refused_with_expected_generation_and_explicit_proc_root(
+    tmp_path: Path,
+) -> None:
+    """T3 (F3): Non-Linux platform must be refused even with expected_generation or explicit proc_root."""
+
+    failures: list[str] = []
+
+    # Sub-case A: expected_generation supplied with platform_name="darwin"
+    gen = LinuxProcessGeneration(pid=os.getpid(), start_ticks=1234, host_id="h1")
+    probe_a = LinuxProcessMemoryProbe(expected_generation=gen, platform_name="darwin")
+    bound_a = probe_a.bind_target()
+    if (
+        bound_a is not None
+        or probe_a.bind_error is None
+        or probe_a.bind_error.reason_code != "unsupported_platform"
+    ):
+        failures.append(
+            "sub-case A1 bind_target accepted non-Linux probe with expected_generation: "
+            f"bound={bound_a!r}, bind_error={probe_a.bind_error!r}"
+        )
+
+    probe_a2 = LinuxProcessMemoryProbe(expected_generation=gen, platform_name="darwin")
+    cb_a2 = ResourceSamples(
+        interval_seconds=60.0,
+        linux_memory=LinuxMemorySource(enabled=True, probe=probe_a2),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "darwin_expected_gen"), runtime_callbacks=[cb_a2]
+    ) as ctx_a2:
+        run_dir_a2 = ctx_a2.run_dir
+    bundle_a2 = inspect_run_observability(run_dir_a2).invocations[0]
+    assert bundle_a2.inventory is not None
+    src_inv_a2 = bundle_a2.inventory.sources[LINUX_MEMORY_SOURCE_ID]
+    if (
+        src_inv_a2.get("capability") != "unavailable"
+        or src_inv_a2.get("unavailable_reason_code") != "unsupported_platform"
+    ):
+        failures.append(
+            "sub-case A2 inventory failed to report unsupported_platform on darwin with expected_generation: "
+            f"capability={src_inv_a2.get('capability')!r}, "
+            f"unavailable_reason_code={src_inv_a2.get('unavailable_reason_code')!r}"
+        )
+
+    # Sub-case B: explicit proc_root="/proc" with platform_name="darwin"
+    probe_b = LinuxProcessMemoryProbe(proc_root="/proc", platform_name="darwin")
+    bound_b = probe_b.bind_target()
+    read_b = probe_b.read()
+    if (
+        bound_b is not None
+        or probe_b.bind_error is None
+        or probe_b.bind_error.reason_code != "unsupported_platform"
+        or read_b.status != "unavailable"
+        or read_b.reason_code != "unsupported_platform"
+    ):
+        failures.append(
+            "sub-case B accepted proc_root='/proc' on platform_name='darwin': "
+            f"bound={bound_b!r}, bind_error={probe_b.bind_error!r}, "
+            f"read=({read_b.status!r}, {read_b.reason_code!r})"
+        )
+
+    # Sub-case C: custom fake proc_root with platform_name="darwin"
+    proc_root_c = _write_fake_proc_tree(tmp_path / "proc_darwin", pid=os.getpid())
+    probe_c = LinuxProcessMemoryProbe(
+        pid=os.getpid(), proc_root=proc_root_c, platform_name="darwin"
+    )
+    read_c = probe_c.read()
+    if read_c.status != "unavailable" or read_c.reason_code != "unsupported_platform":
+        failures.append(
+            "sub-case C accepted custom proc_root on platform_name='darwin': "
+            f"status={read_c.status!r}, reason_code={read_c.reason_code!r}"
+        )
+
+    assert failures == [], "; ".join(failures)
+
+
+def test_linux_memory_bind_target_failure_does_not_poll_or_report_available_complete(
+    tmp_path: Path,
+) -> None:
+    """T5 (F5): Failed bind_target must not poll probe.read() or report available/complete."""
+
+    failures: list[str] = []
+    gen = LinuxProcessGeneration(pid=os.getpid(), start_ticks=4321, host_id="h-bind")
+
+    # Sub-case A: bind_target() raises RuntimeError("bind exploded") while read() returns ok
+    class _ExplodingBindProbe:
+        def __init__(self) -> None:
+            self.read_calls = 0
+
+        def bind_target(self) -> LinuxProcessGeneration | None:
+            raise RuntimeError("bind exploded")
+
+        def read(self) -> LinuxProcessMemoryReading:
+            self.read_calls += 1
+            return LinuxProcessMemoryReading(
+                status="ok",
+                rss_bytes=1024 * 1024,
+                virtual_bytes=4 * 1024 * 1024,
+                thread_count=2,
+                read_start_ns=10,
+                read_end_ns=20,
+                target_generation=gen,
+                observed_generation_before=gen,
+                observed_generation_after=gen,
+            )
+
+    probe_a = _ExplodingBindProbe()
+    cb_a = ResourceSamples(
+        interval_seconds=60.0,
+        linux_memory=LinuxMemorySource(enabled=True, probe=probe_a),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "bind_exploded"), runtime_callbacks=[cb_a]
+    ) as ctx_a:
+        run_dir_a = ctx_a.run_dir
+
+    bundle_a = inspect_run_observability(run_dir_a).invocations[0]
+    assert bundle_a.inventory is not None
+    inv_a = bundle_a.inventory.sources[LINUX_MEMORY_SOURCE_ID]
+    status_a = bundle_a.statuses["resource-samples"]
+    samples_a = bundle_a.samples["resource-samples"]
+
+    if probe_a.read_calls != 0:
+        failures.append(f"sub-case A polled read() {probe_a.read_calls} time(s) after bind_target raised")
+    if inv_a.get("capability") != "unavailable":
+        failures.append(f"sub-case A inventory capability={inv_a.get('capability')!r} (expected 'unavailable')")
+    if inv_a.get("unavailable_reason_code") != "probe_init_failed":
+        failures.append(
+            f"sub-case A inventory unavailable_reason_code={inv_a.get('unavailable_reason_code')!r} "
+            "(expected 'probe_init_failed')"
+        )
+    if status_a.source_status.get(LINUX_MEMORY_SOURCE_ID) != "unavailable":
+        failures.append(
+            f"sub-case A status.source_status={status_a.source_status.get(LINUX_MEMORY_SOURCE_ID)!r} "
+            "(expected 'unavailable')"
+        )
+    if bundle_a.derived_data_completeness == "complete":
+        failures.append("sub-case A reported derived_data_completeness='complete' after bind_target raised")
+    if not samples_a:
+        failures.append("sub-case A emitted zero samples instead of probe_init_failed records")
+    else:
+        bad_reasons = [
+            (s.sequence, qty, r.status, r.reason_code)
+            for s in samples_a
+            for qty, r in s.readings.items()
+            if r.reason_code != "probe_init_failed" or r.value is not None
+        ]
+        if bad_reasons:
+            failures.append(
+                f"sub-case A samples did not carry probe_init_failed with value=None: {bad_reasons[:3]!r}"
+            )
+    if status_a.counts["failed"] != 0 or status_a.counts["attempted"] != (
+        status_a.counts["written"] + status_a.counts["dropped"] + status_a.counts["failed"]
+    ):
+        failures.append(f"sub-case A unreconciled counts: {status_a.counts!r}")
+
+    # Sub-case B: bind_target() returns None with bind_error=None
+    class _SilentNoneBindProbe:
+        @property
+        def bind_error(self) -> LinuxMemoryUnavailable | None:
+            return None
+
+        def bind_target(self) -> LinuxProcessGeneration | None:
+            return None
+
+        def read(self) -> LinuxProcessMemoryReading:
+            issue = LinuxMemoryUnavailable(
+                reason="procfs missing", reason_code="procfs_missing", status="unavailable"
+            )
+            return LinuxProcessMemoryReading(
+                status="unavailable",
+                rss_bytes=issue,
+                virtual_bytes=issue,
+                thread_count=issue,
+                read_start_ns=10,
+                read_end_ns=20,
+                reason_code="procfs_missing",
+                detail="procfs missing",
+            )
+
+    probe_b = _SilentNoneBindProbe()
+    cb_b = ResourceSamples(
+        interval_seconds=60.0,
+        linux_memory=LinuxMemorySource(enabled=True, probe=probe_b),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "bind_none"), runtime_callbacks=[cb_b]
+    ) as ctx_b:
+        run_dir_b = ctx_b.run_dir
+
+    bundle_b = inspect_run_observability(run_dir_b).invocations[0]
+    assert bundle_b.inventory is not None
+    cap_b = bundle_b.inventory.sources[LINUX_MEMORY_SOURCE_ID].get("capability")
+    if cap_b != "unavailable":
+        failures.append(
+            f"sub-case B inventory capability={cap_b!r} when bind_target() returned None with bind_error=None"
+        )
+
+    assert failures == [], "; ".join(failures)
+
+
+def test_linux_memory_yaml_nested_target_routed_destination_config_identity_and_profile_refusal(
+    tmp_path: Path,
+) -> None:
+    """T6: LinuxMemorySource YAML targets, plain mappings, routed destination, identity, and profile refusal."""
+
+    proc_root = _write_fake_proc_tree(
+        tmp_path / "proc_yaml",
+        pid=os.getpid(),
+        start_ticks=54321,
+        vm_rss_kib=3072,
+        vm_size_kib=9216,
+        threads=5,
+    )
+    physical_root = tmp_path / "physical_routed_lm"
+    logical_outputs_a = tmp_path / "logical_yaml_a" / "outputs"
+
+    yaml_a = f"""
+experiment:
+  name: o4_yaml_test
+  sector: unit
+run:
+  root: {json.dumps(str(logical_outputs_a))}
+  layout: flat
+  run_id: o4-yaml-run
+  timezone: UTC
+runtime:
+  device: cpu
+  dtype: float64
+callbacks:
+  - _target_: tpen.callback.ResourceSamples
+    interval_seconds: 60.0
+    linux_memory:
+      _target_: tpen.callback.LinuxMemorySource
+      enabled: true
+      proc_root: {json.dumps(str(proc_root))}
+      max_read_bytes: 65536
+      quantities:
+        - process.memory.rss_bytes
+        - process.memory.thread_count
+    sink:
+      _target_: tpen.artifacts.RunArtifactSink
+      relative_dir: observability
+loggers: []
+runner:
+  _target_: {__name__}._NoopRunner
+"""
+    cfg_a = OmegaConf.create(yaml_a)
+    exit_code_a = run_from_config(
+        cfg_a,
+        raise_exceptions=True,
+        artifact_destination=ArtifactDestination(physical_root),
+    )
+    assert exit_code_a == 0
+    assert not logical_outputs_a.exists()
+
+    obs_a = inspect_run_observability(physical_root)
+    assert obs_a.status == "present"
+    assert len(obs_a.invocations) == 1
+    bundle_a = obs_a.invocations[0]
+    assert bundle_a.derived_lifecycle_state == "closed"
+    assert bundle_a.derived_data_completeness == "complete"
+    assert bundle_a.descriptors is not None
+    expected_qtys = {"process.memory.rss_bytes", "process.memory.thread_count"}
+    assert set(bundle_a.descriptors.quantities.keys()) == expected_qtys
+    assert "process.memory.virtual_bytes" not in bundle_a.descriptors.quantities
+    assert bundle_a.inventory is not None
+    assert bundle_a.inventory.process["start_ticks"] == 54321
+    samples_a = bundle_a.samples["resource-samples"]
+    assert len(samples_a) >= 1
+    assert set(samples_a[0].readings.keys()) == expected_qtys
+    assert samples_a[0].readings["process.memory.rss_bytes"].value == 3072 * 1024
+    assert samples_a[0].readings["process.memory.thread_count"].value == 5
+    assert bundle_a.statuses["resource-samples"].application_outcome == "completed"
+
+    # YAML B: plain mapping without nested _target_
+    yaml_b = f"""
+experiment:
+  name: o4_yaml_plain
+  sector: unit
+run:
+  root: {json.dumps(str(tmp_path / "yaml_plain_lm" / "outputs"))}
+  layout: flat
+  run_id: o4-plain-run
+  timezone: UTC
+runtime:
+  device: cpu
+  dtype: float64
+callbacks:
+  - _target_: tpen.callback.ResourceSamples
+    interval_seconds: 60.0
+    linux_memory:
+      enabled: true
+      proc_root: {json.dumps(str(proc_root))}
+loggers: []
+runner:
+  _target_: {__name__}._NoopRunner
+"""
+    cfg_b = OmegaConf.create(yaml_b)
+    assert run_from_config(cfg_b, raise_exceptions=True) == 0
+    bundle_b = inspect_run_observability(
+        tmp_path / "yaml_plain_lm" / "outputs" / "o4-plain-run"
+    ).invocations[0]
+    assert bundle_b.derived_lifecycle_state == "closed"
+    assert bundle_b.derived_data_completeness == "complete"
+
+    # Config identity sensitivity to linux_memory.max_read_bytes
+    cfg_a_alt = OmegaConf.create(
+        yaml_a.replace("max_read_bytes: 65536", "max_read_bytes: 32768")
+    )
+    assert resolved_config_identity(cfg_a) != resolved_config_identity(cfg_a_alt)
+
+    # Profile refusal on NATIVE_RECOVERY_PROFILE
+    profile_check = check_profile(cfg_a, NATIVE_RECOVERY_PROFILE)
+    assert profile_check.verdict == "refused"
+    assert profile_check.refusal is not None
+    assert profile_check.refusal["code"] == "unsupported-callback"
+
+
+def test_real_linux_memory_probe_in_resource_samples_mid_run_generation_change_roundtrip(
+    tmp_path: Path,
+) -> None:
+    """T7: Real LinuxProcessMemoryProbe in ResourceSamples catches mid-run start_ticks drift cleanly."""
+
+    pid = os.getpid()
+    proc_root = _write_fake_proc_tree(
+        tmp_path / "proc_mid_drift",
+        pid=pid,
+        start_ticks=1000,
+        vm_rss_kib=2048,
+        vm_size_kib=8192,
+        threads=3,
+    )
+    cb = ResourceSamples(
+        interval_seconds=60.0,
+        linux_memory=LinuxMemorySource(enabled=True, proc_root=proc_root),
+    )
+    with open_run_context(_base_cfg(tmp_path / "mid_drift"), runtime_callbacks=[cb]) as ctx:
+        run_dir = ctx.run_dir
+        stat_fields = "S 1 1 1 0 -1 4194304 10 0 0 0 1 1 0 0 20 0 3 0"
+        (proc_root / str(pid) / "stat").write_text(
+            f"{pid} (python3) {stat_fields} 9999 1000 50\n",
+            encoding="utf-8",
+        )
+        (proc_root / str(pid) / "status").write_text(
+            f"Name:\tpython3\nPid:\t{pid}\nVmSize:\t8192 kB\n"
+            "VmRSS:\t999999 kB\nThreads:\t3\n",
+            encoding="utf-8",
+        )
+
+    bundle_dir = next((run_dir / "observability").iterdir())
+    bundle = inspect_observability_bundle(bundle_dir)
+    assert bundle.derived_lifecycle_state == "closed"
+    assert bundle.derived_data_completeness == "partial"
+
+    samples = bundle.samples["resource-samples"]
+    assert len(samples) == 2
+    assert samples[0].readings["process.memory.rss_bytes"].status == "ok"
+    assert samples[0].readings["process.memory.rss_bytes"].value == 2048 * 1024
+
+    for qty_id in LINUX_MEMORY_QUANTITY_IDS:
+        reading = samples[1].readings[qty_id]
+        assert reading.status == "unavailable"
+        assert reading.reason_code == "generation_changed"
+        assert reading.value is None
+
+    rss_summary = bundle.summary.quantity(
+        LINUX_MEMORY_SOURCE_ID, "process.memory.rss_bytes"
+    )
+    assert rss_summary is not None
+    assert rss_summary.ok_count == 1
+    assert rss_summary.unavailable_count == 1
+    assert rss_summary.sampled_max == 2048 * 1024
+    assert rss_summary.reason_codes == ("generation_changed",)
+
+    status = bundle.statuses["resource-samples"]
+    assert status.counts == {"attempted": 2, "written": 2, "dropped": 0, "failed": 0}
+
+
+def test_dual_blocking_rusage_and_linux_memory_share_single_close_deadline_and_start_rollback(
+    tmp_path: Path,
+) -> None:
+    """T8: Dual blocking threads share one close deadline; symlinked manifest rolls back start cleanly."""
+
+    # Sub-case A: dual blocking RUSAGE + linux-memory share a single close deadline
+    gen = LinuxProcessGeneration(pid=os.getpid(), start_ticks=12345)
+    rusage_probe = _BlockingRUsageProbe()
+    lm_probe = _BlockingLinuxMemoryProbe(gen)
+    cb = ResourceSamples(
+        interval_seconds=0.01,
+        close_timeout_seconds=0.12,
+        rusage=RUsageSource(enabled=True, probe=rusage_probe),
+        linux_memory=LinuxMemorySource(enabled=True, probe=lm_probe),
+    )
+
+    dual_dir: Path | None = None
+    close_start = 0.0
+    try:
+        with pytest.raises(ManagedLifecycleError, match="quiescence"):
+            with open_run_context(
+                _base_cfg(tmp_path / "dual_hung"), runtime_callbacks=[cb]
+            ) as ctx:
+                assert rusage_probe.blocked_in_second.wait(timeout=2.0)
+                assert lm_probe.blocked_in_second.wait(timeout=2.0)
+                dual_dir = ctx.run_dir
+                close_start = time.monotonic()
+        close_elapsed = time.monotonic() - close_start
+        assert close_elapsed < 0.6
+
+        assert dual_dir is not None
+        bundle = inspect_run_observability(dual_dir).invocations[0]
+        assert bundle.derived_lifecycle_state == "unsafe"
+        status = bundle.statuses["resource-samples"]
+        assert status.helper_cleanup["state"] == "unconfirmed_timeout"
+        diag_text = " ".join(status.diagnostics or ())
+        assert "rusage" in diag_text
+        assert "linux-memory" in diag_text
+        assert cb.is_managed_scope_active() is True
+
+        with pytest.raises(ManagedLifecycleError):
+            with open_run_context(
+                _base_cfg(tmp_path / "dual_reuse"), runtime_callbacks=[cb]
+            ):
+                pass
+    finally:
+        rusage_probe.release.set()
+        lm_probe.release.set()
+
+    # Sub-case B: symlinked manifest.json during start() with linux_memory rolls back cleanly
+    proc_root = _write_fake_proc_tree(tmp_path / "proc_rollback", pid=os.getpid())
+    ctx_b = make_run_context(tmp_path / "lm_rollback", run_id="o4-rollback")
+    ctx_b.invocation_id = "inv-lm-symlink"
+    bundle_b = ctx_b.run_dir / "observability" / "inv-lm-symlink"
+    bundle_b.mkdir(parents=True, exist_ok=True)
+    (bundle_b / "manifest.json").symlink_to(tmp_path / "outside_lm_manifest.json")
+
+    cb_b = ResourceSamples(
+        interval_seconds=60.0,
+        linux_memory=LinuxMemorySource(enabled=True, proc_root=proc_root),
+    )
+    with pytest.raises(ObservabilityPathError):
+        with cb_b.run_scope(ctx_b):
+            pass
+    assert not (bundle_b / "status" / "resource-samples.json").exists()
+    assert cb_b.is_managed_scope_active() is False
+
+
+# ---------------------------------------------------------------------------
+# O5 LinuxProcessTreeSource & LinuxCgroupV2Source integration tests
+# ---------------------------------------------------------------------------
+
+
+def _write_o5_proc_and_cgroup_fixture(
+    base_dir: Path,
+    *,
+    root_pid: int,
+    child_pids: list[int] | None = None,
+    cgroup_rel_path: str = "/slurm/uid_1000/job_99",
+    memory_max: str = "4294967296",
+    parent_memory_max: str | None = "2147483648",
+    memory_peak: str | None = "134217728",
+    cpu_max: str = "400000 100000",
+    parent_cpu_max: str | None = "200000 100000",
+    cgroup_v1_only: bool = False,
+) -> tuple[Path, Path]:
+    proc_root = base_dir / "proc"
+    boot_file = proc_root / "sys" / "kernel" / "random" / "boot_id"
+    boot_file.parent.mkdir(parents=True, exist_ok=True)
+    boot_file.write_text("00000000-0000-4000-8000-000000000055\n", encoding="utf-8")
+
+    def _put_pid(
+        pid: int,
+        *,
+        ppid: int,
+        start_ticks: int,
+        utime: int,
+        stime: int,
+        rss_kib: int,
+    ) -> Path:
+        pdir = proc_root / str(pid)
+        pdir.mkdir(parents=True, exist_ok=True)
+        fields = (
+            f"S {ppid} {pid} {pid} 0 -1 4194304 10 0 0 0 {utime} {stime} "
+            f"0 0 20 0 2 0 {start_ticks} 100000 50"
+        )
+        (pdir / "stat").write_text(f"{pid} (python3) {fields}\n", encoding="utf-8")
+        (pdir / "status").write_text(
+            f"Name:\tpython3\nPid:\t{pid}\nVmSize:\t{rss_kib * 2} kB\n"
+            f"VmRSS:\t{rss_kib} kB\nThreads:\t2\n",
+            encoding="utf-8",
+        )
+        ns_dir = pdir / "ns"
+        ns_dir.mkdir(parents=True, exist_ok=True)
+        ns_link = ns_dir / "pid"
+        if ns_link.is_symlink() or ns_link.exists():
+            ns_link.unlink()
+        os.symlink("pid:[4026531836]", ns_link)
+        return pdir
+
+    root_dir = _put_pid(
+        root_pid, ppid=1, start_ticks=1000, utime=10, stime=5, rss_kib=4096
+    )
+    for idx, cpid in enumerate(child_pids or [], start=1):
+        _put_pid(
+            cpid,
+            ppid=root_pid,
+            start_ticks=1100 + idx,
+            utime=50 * idx,
+            stime=10 * idx,
+            rss_kib=1024 * idx,
+        )
+
+    cg_mount = base_dir / "cgroup2"
+    cg_mount.mkdir(parents=True, exist_ok=True)
+    if cgroup_v1_only:
+        (root_dir / "cgroup").write_text("12:memory:/slurm/job_99\n", encoding="utf-8")
+        (root_dir / "mountinfo").write_text(
+            "21 1 0:30 / /sys/fs/cgroup/memory rw - cgroup cgroup rw\n",
+            encoding="utf-8",
+        )
+        return proc_root, cg_mount
+
+    (root_dir / "cgroup").write_text(f"0::{cgroup_rel_path}\n", encoding="utf-8")
+    (root_dir / "mountinfo").write_text(
+        f"36 28 0:30 / {cg_mount} rw,nosuid - cgroup2 cgroup2 rw\n",
+        encoding="utf-8",
+    )
+    parts = [p for p in cgroup_rel_path.split("/") if p]
+    leaf = cg_mount.joinpath(*parts)
+    leaf.mkdir(parents=True, exist_ok=True)
+    (leaf / "memory.current").write_text("67108864\n", encoding="utf-8")
+    if memory_peak is not None:
+        (leaf / "memory.peak").write_text(f"{memory_peak}\n", encoding="utf-8")
+    (leaf / "memory.max").write_text(f"{memory_max}\n", encoding="utf-8")
+    (leaf / "cpu.stat").write_text(
+        "usage_usec 3000000\nuser_usec 2400000\nsystem_usec 600000\n"
+        "nr_throttled 2\nthrottled_usec 50000\n",
+        encoding="utf-8",
+    )
+    (leaf / "cpu.max").write_text(f"{cpu_max}\n", encoding="utf-8")
+    (leaf / "cpuset.cpus.effective").write_text("0-3,6\n", encoding="utf-8")
+    procs_lines = [str(root_pid)] + [str(c) for c in (child_pids or [])]
+    (leaf / "cgroup.procs").write_text("\n".join(procs_lines) + "\n", encoding="utf-8")
+
+    if len(parts) >= 2:
+        parent = cg_mount.joinpath(*parts[:-1])
+        if parent_memory_max is not None:
+            (parent / "memory.max").write_text(f"{parent_memory_max}\n", encoding="utf-8")
+        if parent_cpu_max is not None:
+            (parent / "cpu.max").write_text(f"{parent_cpu_max}\n", encoding="utf-8")
+
+    return proc_root, cg_mount
+
+
+class _BlockingTreeProbe:
+    def __init__(self, gen: LinuxProcessGeneration) -> None:
+        self._gen = gen
+        self.blocked_in_second = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def bind_target(self) -> LinuxProcessGeneration:
+        return self._gen
+
+    def read(self) -> LinuxProcessTreeReading:
+        self.calls += 1
+        if self.calls >= 2:
+            self.blocked_in_second.set()
+            self.release.wait(timeout=5.0)
+        pending = LinuxMemoryUnavailable(
+            reason="baseline pending", reason_code="baseline_pending", status="unavailable"
+        )
+        return LinuxProcessTreeReading(
+            status="partial",
+            live_member_count=0,
+            sum_rss_bytes=0,
+            matched_cpu_user_delta_seconds=pending,
+            matched_cpu_system_delta_seconds=pending,
+            read_start_ns=10,
+            read_end_ns=20,
+            membership_complete=True,
+            reason_code="baseline_pending",
+            detail="baseline pending",
+            target_generation=self._gen,
+            observed_generation_before=self._gen,
+            observed_generation_after=self._gen,
+        )
+
+
+class _BlockingCgroupProbe:
+    def __init__(self, gen: LinuxProcessGeneration) -> None:
+        self._gen = gen
+        self.blocked_in_second = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def bind_target(self) -> LinuxProcessGeneration:
+        return self._gen
+
+    def read(self) -> LinuxCgroupV2Reading:
+        self.calls += 1
+        if self.calls >= 2:
+            self.blocked_in_second.set()
+            self.release.wait(timeout=5.0)
+        ident = LinuxCgroupV2Identity(
+            mount_root="/sys/fs/cgroup",
+            cgroup_path="/job",
+            observed_member_count=1,
+            includes_other_tasks=False,
+        )
+        return LinuxCgroupV2Reading(
+            status="ok",
+            memory_current_bytes=1024,
+            memory_peak_bytes=2048,
+            memory_max_bytes=4096,
+            cpu_usage_seconds=1.0,
+            cpu_user_seconds=0.8,
+            cpu_system_seconds=0.2,
+            cpu_throttled_seconds=0.0,
+            cpu_nr_throttled=0,
+            cpu_max_cores=2.0,
+            cpuset_effective_cpus=4,
+            read_start_ns=10,
+            read_end_ns=20,
+            cgroup_identity=ident,
+            target_generation=self._gen,
+            observed_generation_before=self._gen,
+            observed_generation_after=self._gen,
+        )
+
+
+def test_o5_sources_lazy_torch_free_exports_and_validation() -> None:
+    """LinuxProcessTreeSource & LinuxCgroupV2Source are lazy Torch-free exports with strict validation."""
+
+    assert "tpen.callback.LinuxProcessTreeSource" not in _KNOWN_NON_MANAGED_CALLBACK_TARGETS
+    assert "tpen.callback.LinuxCgroupV2Source" not in _KNOWN_NON_MANAGED_CALLBACK_TARGETS
+
+    code = (
+        "import sys, tpen.callback; "
+        "cb = tpen.callback.ResourceSamples("
+        "linux_tree=tpen.callback.LinuxProcessTreeSource(enabled=True), "
+        "linux_cgroup=tpen.callback.LinuxCgroupV2Source(enabled=True)); "
+        "assert 'torch' not in sys.modules; "
+        "assert 'psutil' not in sys.modules; "
+        "print('TORCH_FREE_OK')"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-B", "-c", code],
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "TORCH_FREE_OK" in proc.stdout
+
+    # Exact-type coercion rejects subclasses with TypeError.
+    class _TreeSub(LinuxProcessTreeSource):
+        pass
+
+    class _CgSub(LinuxCgroupV2Source):
+        pass
+
+    with pytest.raises(TypeError, match="subclass"):
+        ResourceSamples(linux_tree=_TreeSub())
+    with pytest.raises(TypeError, match="subclass"):
+        ResourceSamples(linux_cgroup=_CgSub())
+
+    # Forbidden selector keys refused inside source dicts.
+    with pytest.raises(ValueError, match="forbidden"):
+        ResourceSamples(linux_tree={"enabled": True, "triggers": ["step"]})
+    with pytest.raises(ValueError, match="forbidden"):
+        ResourceSamples(linux_cgroup={"enabled": True, "selectors": ["step"]})
+
+    # Foreign PID refused.
+    foreign = os.getpid() + 1
+    with pytest.raises(ValueError, match="foreign PID"):
+        LinuxProcessTreeSource(pid=foreign)
+    with pytest.raises(ValueError, match="foreign PID"):
+        LinuxCgroupV2Source(pid=foreign)
+
+    # Duplicate source_id refused across all 5 sources.
+    with pytest.raises(ValueError, match="distinct source_id"):
+        ResourceSamples(
+            linux_tree=LinuxProcessTreeSource(enabled=True, source_id="shared-id"),
+            linux_cgroup=LinuxCgroupV2Source(enabled=True, source_id="shared-id"),
+        )
+    with pytest.raises(ValueError, match="distinct source_id"):
+        ResourceSamples(
+            rusage=RUsageSource(enabled=True, source_id="dup-5"),
+            linux_tree=LinuxProcessTreeSource(enabled=True, source_id="dup-5"),
+        )
+
+    # Single-source ergonomics: passing only linux_tree or only linux_cgroup disables omitted sources.
+    cb_tree = ResourceSamples(linux_tree=LinuxProcessTreeSource(enabled=True))
+    assert cb_tree.linux_tree.enabled is True
+    assert cb_tree.rusage.enabled is False
+    assert cb_tree.linux_memory.enabled is False
+    assert cb_tree.linux_cgroup.enabled is False
+    assert cb_tree.allocator.enabled is False
+
+    cb_cg = ResourceSamples(linux_cgroup=LinuxCgroupV2Source(enabled=True))
+    assert cb_cg.linux_cgroup.enabled is True
+    assert cb_cg.rusage.enabled is False
+    assert cb_cg.linux_tree.enabled is False
+
+
+def test_o5_disabled_mode_emits_zero_artifacts_and_descriptors(tmp_path: Path) -> None:
+    """Disabled ResourceSamples or disabled O5 sources leave zero artifacts or descriptors."""
+
+    cb_disabled = ResourceSamples(
+        enabled=False,
+        linux_tree=LinuxProcessTreeSource(enabled=True),
+        linux_cgroup=LinuxCgroupV2Source(enabled=True),
+    )
+    assert cb_disabled.ownership_claims(run_dir=tmp_path) == []
+    assert (
+        run_from_config(
+            _base_cfg(tmp_path / "disabled"),
+            raise_exceptions=True,
+            runtime_callbacks=[cb_disabled],
+        )
+        == 0
+    )
+    assert not (tmp_path / "disabled" / "outputs" / "o3-run" / "observability").exists()
+
+
+def test_o5_bind_target_failure_or_none_latches_without_polling_read(tmp_path: Path) -> None:
+    """Failed or None bind_target on linux_tree / linux_cgroup never polls probe.read()."""
+
+    class _ExplodingProbe:
+        def __init__(self) -> None:
+            self.read_calls = 0
+
+        def bind_target(self) -> Any:
+            raise RuntimeError("boom")
+
+        def read(self) -> Any:
+            self.read_calls += 1
+            raise AssertionError("read must not be polled")
+
+    class _NoneProbe:
+        def __init__(self) -> None:
+            self.read_calls = 0
+
+        def bind_target(self) -> Any:
+            return None
+
+        def read(self) -> Any:
+            self.read_calls += 1
+            raise AssertionError("read must not be polled")
+
+    p_tree_err = _ExplodingProbe()
+    p_cg_none = _NoneProbe()
+    cb = ResourceSamples(
+        interval_seconds=60.0,
+        linux_tree=LinuxProcessTreeSource(enabled=True, probe=p_tree_err),
+        linux_cgroup=LinuxCgroupV2Source(enabled=True, probe=p_cg_none),
+    )
+    with open_run_context(_base_cfg(tmp_path / "bind_latch"), runtime_callbacks=[cb]) as ctx:
+        run_dir = ctx.run_dir
+
+    assert p_tree_err.read_calls == 0
+    assert p_cg_none.read_calls == 0
+
+    bundle = inspect_run_observability(run_dir).invocations[0]
+    assert bundle.inventory is not None
+    assert bundle.inventory.sources[LINUX_PROCESS_TREE_SOURCE_ID]["capability"] == "unavailable"
+    assert (
+        bundle.inventory.sources[LINUX_PROCESS_TREE_SOURCE_ID]["unavailable_reason_code"]
+        == "probe_init_failed"
+    )
+    assert bundle.inventory.sources[LINUX_CGROUP_V2_SOURCE_ID]["capability"] == "unavailable"
+    assert (
+        bundle.inventory.sources[LINUX_CGROUP_V2_SOURCE_ID]["unavailable_reason_code"]
+        == "target_bind_failed"
+    )
+    status = bundle.statuses["resource-samples"]
+    assert status.source_status[LINUX_PROCESS_TREE_SOURCE_ID] == "unavailable"
+    assert status.source_status[LINUX_CGROUP_V2_SOURCE_ID] == "unavailable"
+    assert status.counts["failed"] == 0
+
+
+def test_o5_linux_tree_and_cgroup_v2_o2_roundtrip_and_record_budget_truncation(
+    tmp_path: Path,
+) -> None:
+    """Full O2 wire round-trip for LinuxProcessTreeSource + LinuxCgroupV2Source including budget bounding."""
+
+    root_pid = os.getpid()
+    child_pids = [root_pid + 1001, root_pid + 1002]
+    proc_root, _ = _write_o5_proc_and_cgroup_fixture(
+        tmp_path / "normal",
+        root_pid=root_pid,
+        child_pids=child_pids,
+        memory_max="4294967296",
+        parent_memory_max="2147483648",
+        cpu_max="400000 100000",
+        parent_cpu_max="200000 100000",
+    )
+
+    cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        linux_tree=LinuxProcessTreeSource(
+            enabled=True,
+            observer_pids=(child_pids[1],),
+            proc_root=proc_root,
+        ),
+        linux_cgroup=LinuxCgroupV2Source(enabled=True, proc_root=proc_root),
+    )
+    with open_run_context(_base_cfg(tmp_path / "run_normal"), runtime_callbacks=[cb]) as ctx:
+        run_dir = ctx.run_dir
+        # Advance child 0 CPU ticks and cgroup cpu.stat before final capture on exit.
+        c0 = child_pids[0]
+        fields = (
+            f"S {root_pid} {c0} {c0} 0 -1 4194304 10 0 0 0 150 30 "
+            "0 0 20 0 2 0 1101 100000 50"
+        )
+        (proc_root / str(c0) / "stat").write_text(f"{c0} (python3) {fields}\n", encoding="utf-8")
+        cg_leaf = tmp_path / "normal" / "cgroup2" / "slurm" / "uid_1000" / "job_99"
+        (cg_leaf / "cpu.stat").write_text(
+            "usage_usec 4000000\nuser_usec 3200000\nsystem_usec 800000\n"
+            "nr_throttled 4\nthrottled_usec 80000\n",
+            encoding="utf-8",
+        )
+
+    bundle_dir = next((run_dir / "observability").iterdir())
+    bundle = inspect_observability_bundle(bundle_dir)
+    assert bundle.derived_lifecycle_state == "closed"
+    assert bundle.descriptors is not None
+    assert set(LINUX_PROCESS_TREE_QUANTITY_IDS).issubset(bundle.descriptors.quantities)
+    assert set(LINUX_CGROUP_V2_QUANTITY_IDS).issubset(bundle.descriptors.quantities)
+
+    # Verify cgroup v2 descriptor semantics & quality tags.
+    mem_cur_d = bundle.descriptors.quantities["cgroup.memory.current_bytes"]
+    assert mem_cur_d.statistic == "gauge" and mem_cur_d.window == "cgroup_read_interval"
+    assert "cgroup_scope_not_sum_rss" in mem_cur_d.quality
+    assert "shared_cgroup_scope_not_exclusive_entitlement" in mem_cur_d.quality
+    mem_peak_d = bundle.descriptors.quantities["cgroup.memory.peak_bytes"]
+    assert mem_peak_d.statistic == "high_water" and mem_peak_d.window == "cgroup_lifetime"
+    assert "cgroup_lifetime_high_water_not_reset_per_run" in mem_peak_d.quality
+    mem_max_d = bundle.descriptors.quantities["cgroup.memory.max_bytes"]
+    assert mem_max_d.statistic == "capacity"
+    assert "hierarchical_effective_limit" in mem_max_d.quality
+
+    samples = bundle.samples["resource-samples"]
+    tree_samples = [s for s in samples if s.source_id == LINUX_PROCESS_TREE_SOURCE_ID]
+    cg_samples = [s for s in samples if s.source_id == LINUX_CGROUP_V2_SOURCE_ID]
+    assert len(tree_samples) == 2
+    assert len(cg_samples) == 2
+
+    # Tree sample 0: baseline_pending CPU deltas, valid count & sum_rss, observer role tagged.
+    assert tree_samples[0].subject["kind"] == "descendant_set"
+    assert tree_samples[0].readings["descendants.live_member_count"].value == 2
+    assert tree_samples[0].readings["descendants.sum_rss_bytes"].value == (1024 + 2048) * 1024
+    assert (
+        tree_samples[0].readings["descendants.matched_cpu_user_delta_seconds"].status
+        == "unavailable"
+    )
+    assert (
+        tree_samples[0].readings["descendants.matched_cpu_user_delta_seconds"].reason_code
+        == "baseline_pending"
+    )
+    roles = {m["pid"]: m["role"] for m in tree_samples[0].subject["members"]}
+    assert roles == {child_pids[0]: "descendant", child_pids[1]: "observer"}
+
+    # Tree sample 1: matched positive CPU deltas.
+    assert tree_samples[1].readings["descendants.matched_cpu_user_delta_seconds"].status == "ok"
+    assert tree_samples[1].readings["descendants.matched_cpu_user_delta_seconds"].value > 0.0
+
+    # Cgroup samples: hierarchical effective limits & shared scope provenance.
+    assert cg_samples[0].subject["kind"] == "cgroup"
+    assert cg_samples[0].subject["shared_scope_not_exclusive"] is True
+    assert cg_samples[0].subject["includes_other_tasks"] is True
+    assert cg_samples[0].subject["effective_memory_limit_path"] == "/slurm/uid_1000"
+    assert cg_samples[0].subject["effective_cpu_limit_path"] == "/slurm/uid_1000"
+    assert cg_samples[0].readings["cgroup.memory.max_bytes"].value == 2_147_483_648
+    assert cg_samples[0].readings["cgroup.cpu.max_cores"].value == pytest.approx(2.0)
+    assert cg_samples[0].readings["cgroup.cpuset.effective_cpus"].value == 5
+
+    # O2 counter reduction on cgroup.cpu.usage_seconds across identical subject.
+    cg_cpu_summary = bundle.summary.quantity(
+        LINUX_CGROUP_V2_SOURCE_ID, "cgroup.cpu.usage_seconds"
+    )
+    assert cg_cpu_summary is not None
+    assert cg_cpu_summary.valid_interval_count == 1
+    assert cg_cpu_summary.valid_delta_total == pytest.approx(1.0)
+
+    # Record-budget member truncation: tight pending/sample budget truncates members cleanly.
+    many_children = [root_pid + 2000 + i for i in range(40)]
+    proc_many, _ = _write_o5_proc_and_cgroup_fixture(
+        tmp_path / "many", root_pid=root_pid, child_pids=many_children
+    )
+    cb_budget = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=8,
+        linux_tree=LinuxProcessTreeSource(enabled=True, proc_root=proc_many),
+        sink=RunArtifactSink(max_sample_bytes=16384, max_pending_bytes=4096),
+    )
+    with open_run_context(_base_cfg(tmp_path / "run_many"), runtime_callbacks=[cb_budget]) as ctx:
+        many_dir = ctx.run_dir
+
+    many_bundle = inspect_run_observability(many_dir).invocations[0]
+    many_samples = many_bundle.samples["resource-samples"]
+    assert len(many_samples) >= 1
+    first_many = many_samples[0]
+    assert first_many.subject["observed_member_count"] == 40
+    assert first_many.subject["members_truncated_for_record_budget"] is True
+    assert first_many.subject["serialized_member_count"] == len(first_many.subject["members"])
+    assert len(first_many.subject["members"]) < 40
+    assert "descendant_members_truncated" in many_bundle.statuses["resource-samples"].truncation_reasons
+
+
+def test_o5_cgroup_v1_unlimited_and_missing_peak_o2_roundtrip(tmp_path: Path) -> None:
+    """Cgroup v1 refusal and unlimited/missing peak emit typed unavailable without 'value' key."""
+
+    root_pid = os.getpid()
+    proc_unlim, _ = _write_o5_proc_and_cgroup_fixture(
+        tmp_path / "unlim",
+        root_pid=root_pid,
+        memory_max="max",
+        parent_memory_max=None,
+        memory_peak=None,
+        cpu_max="max 100000",
+        parent_cpu_max=None,
+    )
+    cb_u = ResourceSamples(
+        interval_seconds=60.0,
+        linux_cgroup=LinuxCgroupV2Source(enabled=True, proc_root=proc_unlim),
+    )
+    with open_run_context(_base_cfg(tmp_path / "run_unlim"), runtime_callbacks=[cb_u]) as ctx:
+        u_dir = ctx.run_dir
+    u_bundle = inspect_run_observability(u_dir).invocations[0]
+    u_sample = u_bundle.samples["resource-samples"][0]
+    for qty, expected_code in (
+        ("cgroup.memory.max_bytes", "unlimited"),
+        ("cgroup.cpu.max_cores", "unlimited"),
+        ("cgroup.memory.peak_bytes", "field_missing"),
+    ):
+        r = u_sample.readings[qty]
+        assert r.status == "unavailable"
+        assert r.reason_code == expected_code
+        assert r.value is None
+        assert "value" not in r.to_dict()
+
+    proc_v1, _ = _write_o5_proc_and_cgroup_fixture(
+        tmp_path / "v1", root_pid=root_pid, cgroup_v1_only=True
+    )
+    cb_v1 = ResourceSamples(
+        interval_seconds=60.0,
+        linux_cgroup=LinuxCgroupV2Source(enabled=True, proc_root=proc_v1),
+    )
+    with open_run_context(_base_cfg(tmp_path / "run_v1"), runtime_callbacks=[cb_v1]) as ctx:
+        v1_dir = ctx.run_dir
+    v1_bundle = inspect_run_observability(v1_dir).invocations[0]
+    assert v1_bundle.inventory is not None
+    assert v1_bundle.inventory.sources[LINUX_CGROUP_V2_SOURCE_ID]["capability"] == "unavailable"
+    assert (
+        v1_bundle.inventory.sources[LINUX_CGROUP_V2_SOURCE_ID]["unavailable_reason_code"]
+        == "cgroup_v2_not_mounted_or_v1_only"
+    )
+    v1_sample = v1_bundle.samples["resource-samples"][0]
+    for qty in LINUX_CGROUP_V2_QUANTITY_IDS:
+        assert v1_sample.readings[qty].status == "unavailable"
+        assert v1_sample.readings[qty].reason_code == "cgroup_v2_not_mounted_or_v1_only"
+        assert v1_sample.readings[qty].value is None
+
+
+def test_o5_blocking_tree_and_cgroup_share_single_close_deadline_and_refuse_reuse(
+    tmp_path: Path,
+) -> None:
+    """Hung linux-process-tree + linux-cgroup-v2 threads share one close deadline and mark unsafe."""
+
+    gen = LinuxProcessGeneration(pid=os.getpid(), start_ticks=9999)
+    tree_probe = _BlockingTreeProbe(gen)
+    cg_probe = _BlockingCgroupProbe(gen)
+    cb = ResourceSamples(
+        interval_seconds=0.01,
+        close_timeout_seconds=0.12,
+        linux_tree=LinuxProcessTreeSource(enabled=True, probe=tree_probe),
+        linux_cgroup=LinuxCgroupV2Source(enabled=True, probe=cg_probe),
+    )
+    hung_dir: Path | None = None
+    close_start = 0.0
+    try:
+        with pytest.raises(ManagedLifecycleError, match="quiescence"):
+            with open_run_context(_base_cfg(tmp_path / "o5_hung"), runtime_callbacks=[cb]) as ctx:
+                assert tree_probe.blocked_in_second.wait(timeout=2.0)
+                assert cg_probe.blocked_in_second.wait(timeout=2.0)
+                hung_dir = ctx.run_dir
+                close_start = time.monotonic()
+        assert (time.monotonic() - close_start) < 0.6
+        assert hung_dir is not None
+        bundle = inspect_run_observability(hung_dir).invocations[0]
+        assert bundle.derived_lifecycle_state == "unsafe"
+        status = bundle.statuses["resource-samples"]
+        assert status.helper_cleanup["state"] == "unconfirmed_timeout"
+        diag = " ".join(status.diagnostics or ())
+        assert "linux-process-tree" in diag
+        assert "linux-cgroup-v2" in diag
+        assert cb.is_managed_scope_active() is True
+    finally:
+        tree_probe.release.set()
+        cg_probe.release.set()
+
+
+def test_o5_yaml_nested_targets_routed_destination_and_config_identity(
+    tmp_path: Path,
+) -> None:
+    """Hydra YAML _target_ instantiation for LinuxProcessTreeSource + LinuxCgroupV2Source with routing."""
+
+    root_pid = os.getpid()
+    proc_root, _ = _write_o5_proc_and_cgroup_fixture(
+        tmp_path / "yaml_o5_fx",
+        root_pid=root_pid,
+        child_pids=[root_pid + 3001],
+    )
+    physical_root = tmp_path / "physical_routed_o5"
+    logical_outputs = tmp_path / "logical_yaml_o5" / "outputs"
+    yaml_text = f"""
+experiment:
+  name: o5_yaml_test
+  sector: unit
+run:
+  root: {json.dumps(str(logical_outputs))}
+  layout: flat
+  run_id: o5-yaml-run
+  timezone: UTC
+runtime:
+  device: cpu
+  dtype: float64
+callbacks:
+  - _target_: tpen.callback.ResourceSamples
+    interval_seconds: 60.0
+    max_pending_envelopes: 16
+    linux_tree:
+      _target_: tpen.callback.LinuxProcessTreeSource
+      enabled: true
+      proc_root: {json.dumps(str(proc_root))}
+      max_observed_members: 128
+    linux_cgroup:
+      _target_: tpen.callback.LinuxCgroupV2Source
+      enabled: true
+      proc_root: {json.dumps(str(proc_root))}
+      max_ancestor_depth: 32
+    sink:
+      _target_: tpen.artifacts.RunArtifactSink
+      relative_dir: observability
+loggers: []
+runner:
+  _target_: {__name__}._NoopRunner
+"""
+    cfg = OmegaConf.create(yaml_text)
+    exit_code = run_from_config(
+        cfg,
+        raise_exceptions=True,
+        artifact_destination=ArtifactDestination(physical_root),
+    )
+    assert exit_code == 0
+    assert not logical_outputs.exists()
+    bundle = inspect_run_observability(physical_root).invocations[0]
+    assert bundle.derived_lifecycle_state == "closed"
+    assert bundle.descriptors is not None
+    assert set(LINUX_PROCESS_TREE_QUANTITY_IDS).issubset(bundle.descriptors.quantities)
+    assert set(LINUX_CGROUP_V2_QUANTITY_IDS).issubset(bundle.descriptors.quantities)
+
+    cfg_alt = OmegaConf.create(yaml_text.replace("max_observed_members: 128", "max_observed_members: 64"))
+    assert resolved_config_identity(cfg) != resolved_config_identity(cfg_alt)
+
+
+def test_o5_linux_cgroup_source_max_mountinfo_bytes_validation_inventory_wiring_and_identity(
+    tmp_path: Path,
+) -> None:
+    """LinuxCgroupV2Source validates, exposes, wires, and hashes max_mountinfo_bytes."""
+
+    default_src = LinuxCgroupV2Source(enabled=True)
+    assert default_src.max_mountinfo_bytes == DEFAULT_LINUX_CGROUP_MAX_MOUNTINFO_BYTES
+
+    for bad_type in (True, False, "1024", 1.5, None):
+        with pytest.raises(TypeError, match="max_mountinfo_bytes"):
+            LinuxCgroupV2Source(enabled=True, max_mountinfo_bytes=bad_type)  # type: ignore[arg-type]
+    for bad_val in (0, -1, -65536):
+        with pytest.raises(ValueError, match="max_mountinfo_bytes"):
+            LinuxCgroupV2Source(enabled=True, max_mountinfo_bytes=bad_val)
+
+    # Synthetic >64 KiB mountinfo succeeds under default max_mountinfo_bytes (2 MiB)
+    # even though max_read_bytes stays 65536, and fails cleanly when max_mountinfo_bytes is small.
+    root_pid = os.getpid()
+    proc_root, cg_mount = _write_o5_proc_and_cgroup_fixture(
+        tmp_path / "large_mi",
+        root_pid=root_pid,
+    )
+    large_lines = [
+        f"{100 + i} 28 0:{100 + i} / /mnt/nfs/export_{i:04d}/"
+        + ("a" * 160)
+        + " rw,relatime shared:1 - nfs4 server.example:/export rw\n"
+        for i in range(900)
+    ]
+    large_lines.append(f"36 28 0:30 / {cg_mount} rw,nosuid - cgroup2 cgroup2 rw\n")
+    large_bytes = "".join(large_lines).encode("utf-8")
+    assert len(large_bytes) > 65536
+    (proc_root / str(root_pid) / "mountinfo").write_bytes(large_bytes)
+
+    cb_ok = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        linux_cgroup=LinuxCgroupV2Source(enabled=True, proc_root=proc_root),
+    )
+    with open_run_context(_base_cfg(tmp_path / "run_mi_ok"), runtime_callbacks=[cb_ok]) as ctx:
+        ok_dir = ctx.run_dir
+
+    ok_bundle = inspect_run_observability(ok_dir).invocations[0]
+    assert ok_bundle.inventory is not None
+    ok_inv = ok_bundle.inventory.sources[LINUX_CGROUP_V2_SOURCE_ID]
+    assert ok_inv["max_mountinfo_bytes"] == DEFAULT_LINUX_CGROUP_MAX_MOUNTINFO_BYTES
+    assert ok_inv["capability"] == "available"
+    ok_samples = [
+        s for s in ok_bundle.samples["resource-samples"] if s.source_id == LINUX_CGROUP_V2_SOURCE_ID
+    ]
+    assert len(ok_samples) >= 2
+    assert ok_samples[0].readings["cgroup.memory.current_bytes"].status == "ok"
+    assert ok_samples[0].readings["cgroup.memory.current_bytes"].value == 67108864
+
+    small_limit = 32768
+    cb_small = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        linux_cgroup=LinuxCgroupV2Source(
+            enabled=True,
+            proc_root=proc_root,
+            max_mountinfo_bytes=small_limit,
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_mi_small"), runtime_callbacks=[cb_small]
+    ) as ctx:
+        small_dir = ctx.run_dir
+
+    small_bundle = inspect_run_observability(small_dir).invocations[0]
+    assert small_bundle.inventory is not None
+    small_inv = small_bundle.inventory.sources[LINUX_CGROUP_V2_SOURCE_ID]
+    assert small_inv["max_mountinfo_bytes"] == small_limit
+    assert small_inv["capability"] == "unavailable"
+    assert small_inv["unavailable_reason_code"] == "input_limit_exceeded"
+    small_samples = [
+        s
+        for s in small_bundle.samples["resource-samples"]
+        if s.source_id == LINUX_CGROUP_V2_SOURCE_ID
+    ]
+    assert small_samples[0].readings["cgroup.memory.current_bytes"].status == "error"
+    assert (
+        small_samples[0].readings["cgroup.memory.current_bytes"].reason_code
+        == "input_limit_exceeded"
+    )
+
+    # resolved_config_identity sensitivity to max_mountinfo_bytes in YAML config.
+    yaml_base = f"""
+experiment:
+  name: o5_mi_identity
+  sector: unit
+run:
+  root: {json.dumps(str(tmp_path / "mi_id_out"))}
+  layout: flat
+  run_id: o5-mi-id
+  timezone: UTC
+runtime:
+  device: cpu
+  dtype: float64
+callbacks:
+  - _target_: tpen.callback.ResourceSamples
+    interval_seconds: 60.0
+    linux_cgroup:
+      _target_: tpen.callback.LinuxCgroupV2Source
+      enabled: true
+      max_mountinfo_bytes: 2097152
+loggers: []
+runner:
+  _target_: {__name__}._NoopRunner
+"""
+    cfg_a = OmegaConf.create(yaml_base)
+    cfg_b = OmegaConf.create(
+        yaml_base.replace("max_mountinfo_bytes: 2097152", "max_mountinfo_bytes: 524288")
+    )
+    assert resolved_config_identity(cfg_a) != resolved_config_identity(cfg_b)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires real Linux /proc filesystem")
+def test_o5_live_linux_tree_and_cgroup_roundtrip_in_resource_samples(tmp_path: Path) -> None:
+    """On Linux (Cannon), LinuxProcessTreeSource + LinuxCgroupV2Source round-trip honestly."""
+
+    cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        linux_tree=LinuxProcessTreeSource(enabled=True),
+        linux_cgroup=LinuxCgroupV2Source(enabled=True),
+    )
+    assert (
+        run_from_config(_base_cfg(tmp_path), raise_exceptions=True, runtime_callbacks=[cb])
+        == 0
+    )
+    bundle = inspect_run_observability(tmp_path / "outputs" / "o3-run").invocations[0]
+    assert bundle.derived_lifecycle_state == "closed"
+    assert bundle.inventory is not None
+    assert bundle.inventory.sources[LINUX_PROCESS_TREE_SOURCE_ID]["capability"] == "available"
+
+    samples = bundle.samples["resource-samples"]
+    tree_samples = [s for s in samples if s.source_id == LINUX_PROCESS_TREE_SOURCE_ID]
+    cg_samples = [s for s in samples if s.source_id == LINUX_CGROUP_V2_SOURCE_ID]
+    assert len(tree_samples) >= 2
+    assert len(cg_samples) >= 2
+    r0_count = tree_samples[0].readings["descendants.live_member_count"]
+    assert r0_count.status == "ok" or r0_count.reason_code == "permission_denied"
+    if r0_count.status == "ok":
+        assert (
+            tree_samples[0].readings["descendants.matched_cpu_user_delta_seconds"].reason_code
+            == "baseline_pending"
+        )
+    # Cannon compute nodes run Linux 4.18 with unified cgroup v2 mounted at /sys/fs/cgroup
+    # (not cgroup v1); non-v2 Linux hosts still return honest unavailability.
+    cg_cap = bundle.inventory.sources[LINUX_CGROUP_V2_SOURCE_ID]["capability"]
+    assert cg_cap in ("available", "unavailable")
+    if cg_cap == "available":
+        assert cg_samples[0].subject["kind"] == "cgroup"
+        assert cg_samples[0].subject["cgroup_version"] == 2
+        assert cg_samples[0].subject["shared_scope_not_exclusive"] is True
+        assert isinstance(cg_samples[0].subject["cgroup_path"], str)
+        assert cg_samples[0].subject["cgroup_path"].startswith("/")
+        assert all(r.status != "error" for r in cg_samples[0].readings.values())
+        assert any(r.status == "ok" for r in cg_samples[0].readings.values())
+    else:
+        assert cg_samples[0].readings["cgroup.memory.current_bytes"].status == "unavailable"
+        assert cg_samples[0].readings["cgroup.memory.current_bytes"].value is None
+
+
+# ---------------------------------------------------------------------------
+# O5 T2 Round-1 review tests (F1, F2b, F4 defect checks + T7b coverage)
+# ---------------------------------------------------------------------------
+
+
+def test_o5_review_f1_cgroup_cpu_counter_reduction_survives_comember_and_limit_provenance_changes(
+    tmp_path: Path,
+) -> None:
+    """F1: cgroup.cpu.* counter reduction must survive co-member changes in the same cgroup."""
+
+    root_pid = os.getpid()
+
+    # Sub-case B (positive control): actual cgroup migration between job_a and job_b MUST break interval.
+    proc_mig, cg_mig = _write_o5_proc_and_cgroup_fixture(
+        tmp_path / "f1_mig",
+        root_pid=root_pid,
+        child_pids=[],
+        cgroup_rel_path="/slurm/uid_1000/job_a",
+    )
+    job_b = cg_mig / "slurm" / "uid_1000" / "job_b"
+    job_b.mkdir(parents=True, exist_ok=True)
+    (job_b / "memory.current").write_text("67108864\n", encoding="utf-8")
+    (job_b / "memory.peak").write_text("134217728\n", encoding="utf-8")
+    (job_b / "memory.max").write_text("4294967296\n", encoding="utf-8")
+    (job_b / "cpu.stat").write_text(
+        "usage_usec 5000000\nuser_usec 4000000\nsystem_usec 1000000\n"
+        "nr_throttled 5\nthrottled_usec 90000\n",
+        encoding="utf-8",
+    )
+    (job_b / "cpu.max").write_text("400000 100000\n", encoding="utf-8")
+    (job_b / "cpuset.cpus.effective").write_text("0-3,6\n", encoding="utf-8")
+    (job_b / "cgroup.procs").write_text(f"{root_pid}\n", encoding="utf-8")
+
+    cb_mig = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        linux_cgroup=LinuxCgroupV2Source(enabled=True, proc_root=proc_mig),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_f1_mig"), runtime_callbacks=[cb_mig]
+    ) as ctx:
+        mig_dir = ctx.run_dir
+        (proc_mig / str(root_pid) / "cgroup").write_text(
+            "0::/slurm/uid_1000/job_b\n", encoding="utf-8"
+        )
+
+    mig_bundle = inspect_run_observability(mig_dir).invocations[0]
+    mig_cpu = mig_bundle.summary.quantity(
+        LINUX_CGROUP_V2_SOURCE_ID, "cgroup.cpu.usage_seconds"
+    )
+    assert mig_cpu is not None
+    assert mig_cpu.valid_interval_count == 0
+    assert mig_cpu.broken_interval_count == 1
+    assert any(d.code == "generation_change" for d in mig_bundle.diagnostics)
+
+    # Sub-case A: adding a co-member in the exact same cgroup must NOT break counter reduction.
+    proc_root, cg_mount = _write_o5_proc_and_cgroup_fixture(
+        tmp_path / "f1_comember",
+        root_pid=root_pid,
+        child_pids=[],
+    )
+    leaf = cg_mount / "slurm" / "uid_1000" / "job_99"
+    cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        linux_cgroup=LinuxCgroupV2Source(enabled=True, proc_root=proc_root),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_f1_comember"), runtime_callbacks=[cb]
+    ) as ctx:
+        run_dir = ctx.run_dir
+        (leaf / "cgroup.procs").write_text(
+            f"{root_pid}\n{root_pid + 4001}\n", encoding="utf-8"
+        )
+        (leaf / "cpu.stat").write_text(
+            "usage_usec 4500000\nuser_usec 3600000\nsystem_usec 900000\n"
+            "nr_throttled 3\nthrottled_usec 70000\n",
+            encoding="utf-8",
+        )
+
+    bundle = inspect_run_observability(run_dir).invocations[0]
+    cg_samples = [
+        s
+        for s in bundle.samples["resource-samples"]
+        if s.source_id == LINUX_CGROUP_V2_SOURCE_ID
+    ]
+    assert len(cg_samples) == 2
+    assert cg_samples[0].subject["cgroup_path"] == "/slurm/uid_1000/job_99"
+    assert cg_samples[1].subject["cgroup_path"] == "/slurm/uid_1000/job_99"
+    assert cg_samples[0].subject["mount_root"] == cg_samples[1].subject["mount_root"]
+    assert (
+        cg_samples[0].subject["target_generation"]
+        == cg_samples[1].subject["target_generation"]
+    )
+    assert cg_samples[0].subject["observed_member_count"] == 1
+    assert cg_samples[1].subject["observed_member_count"] == 2
+    assert cg_samples[0].subject["includes_other_tasks"] is False
+    assert cg_samples[1].subject["includes_other_tasks"] is True
+
+    cg_cpu = bundle.summary.quantity(
+        LINUX_CGROUP_V2_SOURCE_ID, "cgroup.cpu.usage_seconds"
+    )
+    assert cg_cpu is not None
+    assert cg_cpu.valid_interval_count == 1
+    assert cg_cpu.broken_interval_count == 0
+    assert cg_cpu.valid_delta_total == pytest.approx(1.5)
+    assert cg_cpu.valid_rate_per_second is not None and cg_cpu.valid_rate_per_second > 0.0
+    assert not any(d.code == "generation_change" for d in bundle.diagnostics)
+
+
+def test_o5_review_f2b_resource_samples_resolve_cgroup_identity_none_unavailable_and_exception_semantics(
+    tmp_path: Path,
+) -> None:
+    """F2b: resolve_cgroup_identity() None, plain ResourceUnavailable, and exception handling."""
+
+    gen = LinuxProcessGeneration(pid=os.getpid(), start_ticks=4242)
+    unavail_field = LinuxMemoryUnavailable(
+        reason="no v2", reason_code="cgroup_v2_not_mounted_or_v1_only", status="unavailable"
+    )
+
+    def _make_unavail_reading() -> LinuxCgroupV2Reading:
+        return LinuxCgroupV2Reading(
+            status="unavailable",
+            memory_current_bytes=unavail_field,
+            memory_peak_bytes=unavail_field,
+            memory_max_bytes=unavail_field,
+            cpu_usage_seconds=unavail_field,
+            cpu_user_seconds=unavail_field,
+            cpu_system_seconds=unavail_field,
+            cpu_throttled_seconds=unavail_field,
+            cpu_nr_throttled=unavail_field,
+            cpu_max_cores=unavail_field,
+            cpuset_effective_cpus=unavail_field,
+            read_start_ns=10,
+            read_end_ns=20,
+            reason_code="cgroup_v2_not_mounted_or_v1_only",
+            detail="no v2",
+            target_generation=gen,
+            observed_generation_before=gen,
+            observed_generation_after=gen,
+        )
+
+    def _make_ok_reading() -> LinuxCgroupV2Reading:
+        return LinuxCgroupV2Reading(
+            status="ok",
+            memory_current_bytes=1024,
+            memory_peak_bytes=2048,
+            memory_max_bytes=4096,
+            cpu_usage_seconds=1.0,
+            cpu_user_seconds=0.8,
+            cpu_system_seconds=0.2,
+            cpu_throttled_seconds=0.0,
+            cpu_nr_throttled=0,
+            cpu_max_cores=2.0,
+            cpuset_effective_cpus=4,
+            read_start_ns=10,
+            read_end_ns=20,
+            cgroup_identity=LinuxCgroupV2Identity(
+                mount_root="/sys/fs/cgroup", cgroup_path="/job_ok"
+            ),
+            target_generation=gen,
+            observed_generation_before=gen,
+            observed_generation_after=gen,
+        )
+
+    failures: list[str] = []
+
+    # Sub-case A: resolve_cgroup_identity() returns None or plain ResourceUnavailable("no v2").
+    for label, resolve_return in (
+        ("none", None),
+        ("resource_unavailable", ResourceUnavailable("no v2")),
+    ):
+
+        class _UnavailResolveProbe:
+            def bind_target(self) -> LinuxProcessGeneration:
+                return gen
+
+            def resolve_cgroup_identity(self) -> Any:
+                return resolve_return
+
+            def read(self) -> LinuxCgroupV2Reading:
+                return _make_unavail_reading()
+
+        cb_a = ResourceSamples(
+            interval_seconds=60.0,
+            linux_cgroup=LinuxCgroupV2Source(
+                enabled=True, probe=_UnavailResolveProbe()
+            ),
+        )
+        with open_run_context(
+            _base_cfg(tmp_path / f"f2b_{label}"), runtime_callbacks=[cb_a]
+        ) as ctx:
+            run_dir_a = ctx.run_dir
+
+        bundle_a = inspect_run_observability(run_dir_a).invocations[0]
+        assert bundle_a.inventory is not None
+        inv_a = bundle_a.inventory.sources[LINUX_CGROUP_V2_SOURCE_ID]
+        if inv_a.get("capability") != "unavailable":
+            failures.append(
+                f"Sub-case A ({label}): expected capability='unavailable', got {inv_a.get('capability')!r}"
+            )
+        if "unavailable_reason_code" not in inv_a:
+            failures.append(
+                f"Sub-case A ({label}): expected 'unavailable_reason_code' in inventory entry {inv_a!r}"
+            )
+
+    # Sub-case B: resolve_cgroup_identity() raises RuntimeError -> must latch and never poll read().
+    class _ExplodingResolveProbe:
+        def __init__(self) -> None:
+            self.read_calls = 0
+
+        def bind_target(self) -> LinuxProcessGeneration:
+            return gen
+
+        def resolve_cgroup_identity(self) -> Any:
+            raise RuntimeError("resolve boom")
+
+        def read(self) -> LinuxCgroupV2Reading:
+            self.read_calls += 1
+            return _make_ok_reading()
+
+    probe_exc = _ExplodingResolveProbe()
+    cb_b = ResourceSamples(
+        interval_seconds=60.0,
+        linux_cgroup=LinuxCgroupV2Source(enabled=True, probe=probe_exc),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "f2b_exc"), runtime_callbacks=[cb_b]
+    ) as ctx:
+        run_dir_b = ctx.run_dir
+
+    bundle_b = inspect_run_observability(run_dir_b).invocations[0]
+    assert bundle_b.inventory is not None
+    inv_b = bundle_b.inventory.sources[LINUX_CGROUP_V2_SOURCE_ID]
+    status_b = bundle_b.statuses["resource-samples"]
+    cg_samples_b = [
+        s
+        for s in bundle_b.samples["resource-samples"]
+        if s.source_id == LINUX_CGROUP_V2_SOURCE_ID
+    ]
+
+    if probe_exc.read_calls != 0:
+        failures.append(
+            f"Sub-case B (exception): expected probe_exc.read_calls == 0, got {probe_exc.read_calls}"
+        )
+    if (
+        inv_b.get("capability") != "unavailable"
+        or inv_b.get("unavailable_reason_code") != "cgroup_resolve_failed"
+    ):
+        failures.append(
+            "Sub-case B (exception): expected inventory capability='unavailable' and "
+            f"unavailable_reason_code='cgroup_resolve_failed', got {inv_b!r}"
+        )
+    if status_b.source_status.get(LINUX_CGROUP_V2_SOURCE_ID) != "unavailable":
+        failures.append(
+            "Sub-case B (exception): expected source_status['linux-cgroup-v2']=='unavailable', "
+            f"got {status_b.source_status.get(LINUX_CGROUP_V2_SOURCE_ID)!r}"
+        )
+    if bundle_b.derived_data_completeness == "complete":
+        failures.append(
+            "Sub-case B (exception): expected derived_data_completeness != 'complete', got 'complete'"
+        )
+    if not any(
+        "cgroup_resolve" in d or "resolve" in d for d in (status_b.diagnostics or ())
+    ):
+        failures.append(
+            "Sub-case B (exception): expected resolve diagnostic in status.diagnostics, "
+            f"got {status_b.diagnostics!r}"
+        )
+    if not cg_samples_b:
+        failures.append("Sub-case B (exception): expected written error samples, got none")
+    else:
+        bad_readings = [
+            (s.sequence, qty, r.status, r.reason_code, r.value)
+            for s in cg_samples_b
+            for qty, r in s.readings.items()
+            if not (
+                r.status == "error"
+                and r.reason_code == "cgroup_resolve_failed"
+                and r.value is None
+            )
+        ]
+        if bad_readings:
+            failures.append(
+                "Sub-case B (exception): expected all written readings to be "
+                f"error/cgroup_resolve_failed/None, got sample mismatches: {bad_readings[:3]!r}"
+            )
+
+    assert failures == [], "; ".join(failures)
+
+
+def test_o5_review_f4_linux_tree_quantity_subset_without_cpu_deltas_reports_available_complete(
+    tmp_path: Path,
+) -> None:
+    """F4: linux_tree subset omitting CPU deltas must report available/complete when membership is complete."""
+
+    root_pid = os.getpid()
+    proc_root, _ = _write_o5_proc_and_cgroup_fixture(
+        tmp_path / "f4_subset",
+        root_pid=root_pid,
+        child_pids=[root_pid + 5001, root_pid + 5002],
+    )
+    selected = ("descendants.live_member_count", "descendants.sum_rss_bytes")
+
+    # Sub-case B (positive control): hitting max_observed_members=1 with same 2-quantity subset stays partial.
+    cb_cap = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        linux_tree=LinuxProcessTreeSource(
+            enabled=True,
+            quantities=selected,
+            max_observed_members=1,
+            proc_root=proc_root,
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_f4_cap"), runtime_callbacks=[cb_cap]
+    ) as ctx:
+        cap_dir = ctx.run_dir
+
+    cap_bundle = inspect_run_observability(cap_dir).invocations[0]
+    cap_status = cap_bundle.statuses["resource-samples"]
+    assert cap_status.source_status[LINUX_PROCESS_TREE_SOURCE_ID] == "partial"
+    assert cap_bundle.derived_data_completeness == "partial"
+
+    # Sub-case A: healthy 2-quantity subset omitting CPU deltas must be available and complete.
+    cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        linux_tree=LinuxProcessTreeSource(
+            enabled=True,
+            quantities=selected,
+            proc_root=proc_root,
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_f4_ok"), runtime_callbacks=[cb]
+    ) as ctx:
+        ok_dir = ctx.run_dir
+
+    bundle = inspect_run_observability(ok_dir).invocations[0]
+    samples = [
+        s
+        for s in bundle.samples["resource-samples"]
+        if s.source_id == LINUX_PROCESS_TREE_SOURCE_ID
+    ]
+    assert len(samples) >= 2
+    for sample in samples:
+        assert set(sample.readings.keys()) == set(selected)
+        assert all(r.status == "ok" for r in sample.readings.values())
+        assert sample.subject["membership_complete"] is True
+        assert sample.subject["partial_reasons"] == []
+
+    status = bundle.statuses["resource-samples"]
+    assert status.source_status[LINUX_PROCESS_TREE_SOURCE_ID] == "available"
+    assert status.data_completeness == "complete"
+    assert bundle.derived_data_completeness == "complete"
+    assert status.unavailable_fields is None
+    assert status.truncation_reasons == ()
+
+
+def test_o5_review_t7b_o5_plain_mapping_yaml_and_native_recovery_profile_refusal(
+    tmp_path: Path,
+) -> None:
+    """T7b: plain-mapping YAML (no nested _target_) configures O5 sources and refuses NATIVE_RECOVERY_PROFILE."""
+
+    root_pid = os.getpid()
+    obs_pid = root_pid + 6001
+    worker_pid = root_pid + 6002
+    proc_root, _ = _write_o5_proc_and_cgroup_fixture(
+        tmp_path / "t7b_plain",
+        root_pid=root_pid,
+        child_pids=[obs_pid, worker_pid],
+    )
+    out_root = tmp_path / "t7b_out" / "outputs"
+    yaml_text = f"""
+experiment:
+  name: o5_plain_yaml
+  sector: unit
+run:
+  root: {json.dumps(str(out_root))}
+  layout: flat
+  run_id: o5-plain-run
+  timezone: UTC
+runtime:
+  device: cpu
+  dtype: float64
+callbacks:
+  - _target_: tpen.callback.ResourceSamples
+    interval_seconds: 60.0
+    max_pending_envelopes: 16
+    linux_tree:
+      enabled: true
+      observer_pids:
+        - {obs_pid}
+      quantities:
+        - descendants.live_member_count
+        - descendants.sum_rss_bytes
+      proc_root: {json.dumps(str(proc_root))}
+    linux_cgroup:
+      enabled: true
+      max_mountinfo_bytes: 524288
+      proc_root: {json.dumps(str(proc_root))}
+loggers: []
+runner:
+  _target_: {__name__}._NoopRunner
+"""
+    cfg = OmegaConf.create(yaml_text)
+    assert run_from_config(cfg, raise_exceptions=True) == 0
+
+    bundle = inspect_run_observability(out_root / "o5-plain-run").invocations[0]
+    assert bundle.derived_lifecycle_state == "closed"
+    assert bundle.inventory is not None
+    assert (
+        bundle.inventory.sources[LINUX_CGROUP_V2_SOURCE_ID]["max_mountinfo_bytes"]
+        == 524288
+    )
+    assert bundle.inventory.sources[LINUX_PROCESS_TREE_SOURCE_ID]["observer_pids"] == [
+        obs_pid
+    ]
+
+    samples = bundle.samples["resource-samples"]
+    tree_samples = [s for s in samples if s.source_id == LINUX_PROCESS_TREE_SOURCE_ID]
+    cg_samples = [s for s in samples if s.source_id == LINUX_CGROUP_V2_SOURCE_ID]
+    assert len(tree_samples) >= 2
+    assert len(cg_samples) >= 2
+    assert set(tree_samples[0].readings.keys()) == {
+        "descendants.live_member_count",
+        "descendants.sum_rss_bytes",
+    }
+    assert tree_samples[0].readings["descendants.live_member_count"].value == 2
+    roles = {m["pid"]: m["role"] for m in tree_samples[0].subject["members"]}
+    assert roles == {obs_pid: "observer", worker_pid: "descendant"}
+    assert cg_samples[0].readings["cgroup.memory.current_bytes"].status == "ok"
+    assert cg_samples[0].readings["cgroup.memory.current_bytes"].value == 67108864
+
+    profile_check = check_profile(cfg, NATIVE_RECOVERY_PROFILE)
+    assert profile_check.verdict == "refused"
+    assert profile_check.refusal is not None
+    assert profile_check.refusal["code"] == "unsupported-callback"
+
+
+# ---------------------------------------------------------------------------
+# O6: Explicit NVIDIA physical-device probe & NvidiaDeviceSource tests
+# ---------------------------------------------------------------------------
+
+_O6_RAW_UUID = "97933565-57cb-fec7-c442-188c7b300fd3"
+_O6_CANONICAL_UUID = f"GPU-{_O6_RAW_UUID}"
+
+
+def test_o6_nvidia_device_source_validation_coercion_and_descriptors() -> None:
+    """Validate NvidiaDeviceSource constraints, mapping coercion, and O2 descriptors."""
+
+    src = NvidiaDeviceSource(
+        identity={"kind": "cuda", "index": 1, "uuid": _O6_RAW_UUID},
+        timeout_seconds=10.0,
+    )
+    assert src.enabled is True
+    assert src.source_id == NVIDIA_DEVICE_SOURCE_ID
+    assert src.execution_mode == NVIDIA_DEVICE_EXECUTION_MODE
+    assert src.quantities == NVIDIA_DEVICE_QUANTITY_IDS
+    assert src.identity == AcceleratorIdentity(AcceleratorKind.CUDA, 1, _O6_RAW_UUID)
+    assert src.timeout_seconds == 10.0
+
+    descs = src.descriptors()
+    assert set(descs.keys()) == set(NVIDIA_DEVICE_QUANTITY_IDS)
+
+    used_d = descs["device.framebuffer.used_bytes"]
+    assert used_d.unit == "B"
+    assert used_d.statistic == "gauge"
+    assert used_d.subject_kind == "physical_gpu"
+    assert used_d.window == "read_interval"
+    assert used_d.native_name == "memory.used"
+    assert used_d.native_unit == "MiB"
+    assert used_d.conversion == "multiply_by_1048576"
+    assert "shared_physical_device_not_per_process_attribution" in used_d.quality
+    assert "physical_gpu_scope_not_process_allocator" in used_d.quality
+
+    total_d = descs["device.framebuffer.total_bytes"]
+    assert total_d.unit == "B"
+    assert total_d.statistic == "capacity"
+    assert total_d.subject_kind == "physical_gpu"
+    assert total_d.window == "inventory_or_read_interval"
+    assert total_d.native_name == "memory.total"
+    assert total_d.native_unit == "MiB"
+    assert total_d.conversion == "multiply_by_1048576"
+    assert "shared_physical_device_not_per_process_attribution" in total_d.quality
+
+    busy_d = descs["device.busy_fraction"]
+    assert busy_d.unit == "1"
+    assert busy_d.statistic == "vendor_window_mean"
+    assert busy_d.subject_kind == "physical_gpu"
+    assert busy_d.window == "vendor_recent_window_unknown_bounds"
+    assert busy_d.native_name == "utilization.gpu"
+    assert busy_d.native_unit == "percent"
+    assert busy_d.conversion == "divide_by_100"
+    assert "shared_physical_device_not_per_process_attribution" in busy_d.quality
+    assert "vendor_recent_window_not_extrapolated_utilization" in busy_d.quality
+
+    # Hard <= 10.0 s timeout cap and strict validation
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        NvidiaDeviceSource(timeout_seconds=10.5)
+    with pytest.raises(ValueError, match="execution_mode"):
+        NvidiaDeviceSource(execution_mode="in_process_thread")
+    with pytest.raises(ValueError, match="unsupported key"):
+        NvidiaDeviceSource(identity={"kind": "cuda", "bogus": 1})
+    with pytest.raises(ValueError, match="unsupported NvidiaDeviceSource.identity.kind"):
+        NvidiaDeviceSource(identity={"kind": "tpu"})
+
+    # Reject subclass and forbidden selector keys via ResourceSamples coercion
+    class _SubNvidiaSource(NvidiaDeviceSource):
+        pass
+
+    with pytest.raises(TypeError, match="subclass"):
+        ResourceSamples(nvidia_device=_SubNvidiaSource())
+    with pytest.raises(ValueError, match="forbidden"):
+        ResourceSamples(nvidia_device={"enabled": True, "event_types": ["RunStarted"]})
+
+    # Default ResourceSamples() keeps nvidia_device disabled and rusage enabled.
+    default_cb = ResourceSamples()
+    assert default_cb.rusage.enabled is True
+    assert default_cb.nvidia_device.enabled is False
+
+
+def test_o6_nvidia_device_bundle_roundtrip_and_vendor_window_mean_reduction(
+    tmp_path: Path,
+) -> None:
+    """Full ResourceSamples -> ObservabilityBundleWriter -> inspect_observability_bundle round-trip."""
+
+    identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, _O6_RAW_UUID)
+    rows = iter(
+        (
+            f"{_O6_CANONICAL_UUID}, 2026/11/24 12:00:01.000, 1024, 40960, 20, Disabled\n",
+            f"{_O6_CANONICAL_UUID}, 2026/11/24 12:00:02.000, 2048, 40960, 80, Disabled\n",
+            f"{_O6_CANONICAL_UUID}, 2026/11/24 12:00:03.000, 1536, 40960, 50, Disabled\n",
+        )
+    )
+    last_row = f"{_O6_CANONICAL_UUID}, 2026/11/24 12:00:03.000, 1536, 40960, 50, Disabled\n"
+
+    def _runner(argv: list[str], **kwargs: Any) -> NvidiaDeviceCommandResult:
+        del argv, kwargs
+        row = next(rows, last_row)
+        return NvidiaDeviceCommandResult(returncode=0, stdout=row)
+
+    probe = NvidiaSmiDeviceProbe(identity=identity, command_runner=_runner)
+    cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity=identity,
+            probe=probe,
+        ),
+    )
+
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_ok", device="cuda:0"),
+        runtime_callbacks=[cb],
+    ) as ctx:
+        run_dir = ctx.run_dir
+
+    run_obs = inspect_run_observability(run_dir)
+    assert len(run_obs.invocations) == 1
+    bundle = inspect_observability_bundle(run_obs.invocations[0].bundle_dir)
+    assert bundle.derived_lifecycle_state == "closed"
+    assert bundle.derived_data_completeness == "complete"
+    assert bundle.inventory is not None
+
+    inv_src = bundle.inventory.sources[NVIDIA_DEVICE_SOURCE_ID]
+    assert inv_src["shared_device_not_exclusive"] is True
+    assert inv_src["per_process_attribution"] is False
+    assert inv_src["allocator_reset_authority"] == "none"
+    assert inv_src["selected_identity"] == {
+        "kind": "cuda",
+        "index": 0,
+        "uuid": _O6_RAW_UUID,
+    }
+    assert inv_src["capability"] == "available"
+
+    samples = [
+        s
+        for s in bundle.samples["resource-samples"]
+        if s.source_id == NVIDIA_DEVICE_SOURCE_ID
+    ]
+    assert len(samples) >= 2
+    assert samples[0].subject["kind"] == "physical_gpu"
+    assert samples[0].subject["device_uuid"] == _O6_CANONICAL_UUID
+    assert samples[0].subject["shared_device_not_exclusive"] is True
+    assert samples[0].subject["per_process_attribution"] is False
+    assert samples[0].subject["evidence"] == {
+        "vendor_timestamp": "2026/11/24 12:00:01.000",
+        "mig_mode": "disabled",
+        "mig_ambiguous": False,
+    }
+    assert samples[1].subject["evidence"]["vendor_timestamp"] == "2026/11/24 12:00:02.000"
+
+    assert bundle.summary is not None
+    by_qty = {q.quantity_id: q for q in bundle.summary.quantities}
+    busy_summary = by_qty["device.busy_fraction"]
+    assert busy_summary.statistic == "vendor_window_mean"
+    assert busy_summary.window == "vendor_recent_window_unknown_bounds"
+    assert busy_summary.continuous_window_integrated is False
+    assert busy_summary.observation_min == pytest.approx(0.20)
+    assert busy_summary.observation_max == pytest.approx(0.80)
+    assert busy_summary.observation_mean == pytest.approx(0.50)
+
+    used_summary = by_qty["device.framebuffer.used_bytes"]
+    assert used_summary.statistic == "gauge"
+    assert used_summary.sampled_min == 1024 * 1024 * 1024
+    assert used_summary.sampled_max == 2048 * 1024 * 1024
+    assert used_summary.sampled_max_is_lower_bound is True
+
+    total_summary = by_qty["device.framebuffer.total_bytes"]
+    assert total_summary.statistic == "capacity"
+    assert total_summary.latest_value == 40960 * 1024 * 1024
+
+    status = bundle.statuses["resource-samples"]
+    assert status.source_status[NVIDIA_DEVICE_SOURCE_ID] == "available"
+    assert status.data_completeness == "complete"
+    assert status.unavailable_fields is None
+
+
+def test_o6_partial_unselected_sibling_keeps_selected_subset_available_and_complete(
+    tmp_path: Path,
+) -> None:
+    """An unselected failing sibling field must not degrade selected quantities."""
+
+    identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, _O6_RAW_UUID)
+
+    def _partial_runner(argv: list[str], **kwargs: Any) -> NvidiaDeviceCommandResult:
+        del argv, kwargs
+        return NvidiaDeviceCommandResult(
+            returncode=0,
+            stdout=f"{_O6_CANONICAL_UUID}, 2026/11/24 12:05:00.000, 512, 40960, [Not Supported], Disabled\n",
+        )
+
+    # Subset excluding busy_fraction stays available & complete.
+    subset_cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            quantities=("device.framebuffer.used_bytes", "device.framebuffer.total_bytes"),
+            identity=identity,
+            probe=NvidiaSmiDeviceProbe(identity=identity, command_runner=_partial_runner),
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_subset", device="cuda:0"),
+        runtime_callbacks=[subset_cb],
+    ) as ctx:
+        subset_dir = ctx.run_dir
+
+    subset_bundle = inspect_run_observability(subset_dir).invocations[0]
+    assert subset_bundle.statuses["resource-samples"].source_status[NVIDIA_DEVICE_SOURCE_ID] == "available"
+    assert subset_bundle.derived_data_completeness == "complete"
+
+    # Full 3-quantity selection marks partial cleanly.
+    full_cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity=identity,
+            probe=NvidiaSmiDeviceProbe(identity=identity, command_runner=_partial_runner),
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_partial", device="cuda:0"),
+        runtime_callbacks=[full_cb],
+    ) as ctx:
+        full_dir = ctx.run_dir
+
+    full_bundle = inspect_run_observability(full_dir).invocations[0]
+    assert full_bundle.statuses["resource-samples"].source_status[NVIDIA_DEVICE_SOURCE_ID] == "partial"
+    assert full_bundle.derived_data_completeness == "partial"
+
+
+def test_o6_mig_ambiguity_and_unavailable_executable_persist_typed_unavailable(
+    tmp_path: Path,
+) -> None:
+    """MIG ambiguity and missing executable record typed unavailable evidence without crashing."""
+
+    identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, _O6_RAW_UUID)
+
+    def _mig_runner(argv: list[str], **kwargs: Any) -> NvidiaDeviceCommandResult:
+        del argv, kwargs
+        return NvidiaDeviceCommandResult(
+            returncode=0,
+            stdout=f"{_O6_CANONICAL_UUID}, 2026/11/24 12:10:00.000, 512, 40960, 40, Enabled\n",
+        )
+
+    mig_cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity=identity,
+            probe=NvidiaSmiDeviceProbe(identity=identity, command_runner=_mig_runner),
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_mig", device="cuda:0"),
+        runtime_callbacks=[mig_cb],
+    ) as ctx:
+        mig_dir = ctx.run_dir
+
+    mig_bundle = inspect_run_observability(mig_dir).invocations[0]
+    mig_samples = mig_bundle.samples["resource-samples"]
+    assert len(mig_samples) >= 2
+    assert mig_samples[0].subject["evidence"]["mig_mode"] == "enabled"
+    assert mig_samples[0].subject["evidence"]["mig_ambiguous"] is True
+    for qty_id in NVIDIA_DEVICE_QUANTITY_IDS:
+        r = mig_samples[0].readings[qty_id]
+        assert r.status == "unavailable"
+        assert r.reason_code == "mig_subdevice_ambiguous"
+        assert r.value is None
+    assert mig_bundle.statuses["resource-samples"].source_status[NVIDIA_DEVICE_SOURCE_ID] == "unavailable"
+
+    # Missing executable path
+    missing_cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity=identity,
+            executable=tmp_path / "no-such-nvidia-smi",
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_missing_exe", device="cuda:0"),
+        runtime_callbacks=[missing_cb],
+    ) as ctx:
+        missing_dir = ctx.run_dir
+
+    missing_bundle = inspect_run_observability(missing_dir).invocations[0]
+    assert missing_bundle.inventory is not None
+    assert (
+        missing_bundle.inventory.sources[NVIDIA_DEVICE_SOURCE_ID]["unavailable_reason_code"]
+        == "executable_unavailable"
+    )
+    missing_sample = missing_bundle.samples["resource-samples"][0]
+    for qty_id in NVIDIA_DEVICE_QUANTITY_IDS:
+        assert missing_sample.readings[qty_id].status == "unavailable"
+        assert missing_sample.readings[qty_id].reason_code == "executable_unavailable"
+
+
+def test_o6_allocator_current_peak_reset_ownership_and_nvidia_device_isolation(
+    tmp_path: Path,
+) -> None:
+    """NvidiaDeviceSource never claims allocator_reset or resets peaks; allocator keeps sole ownership."""
+
+    identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, _O6_RAW_UUID)
+
+    # 1. NvidiaDeviceSource alone emits ZERO allocator_reset claims.
+    nd_only = ResourceSamples(
+        nvidia_device=NvidiaDeviceSource(enabled=True, identity=identity),
+    )
+    nd_claims = nd_only.ownership_claims(
+        cfg=_base_cfg(tmp_path / "claims_only", device="cuda:0"),
+        run_dir=tmp_path / "claims_only",
+    )
+    assert all(c.kind != "allocator_reset" for c in nd_claims)
+
+    # 2. Combined with AllocatorSource(reset_peaks=True): exactly one reset from allocator,
+    #    and NvidiaDeviceSource reuses allocator's resolved identity without resetting peaks.
+    reset_calls: list[str] = []
+    seen_identities: list[str] = []
+
+    class _FakeCurrentProbe:
+        def __init__(self, device: Any) -> None:
+            self._device = device
+
+        def identity(self) -> AcceleratorIdentity:
+            return identity
+
+        def available(self) -> bool:
+            return True
+
+        def read(self) -> AllocatorCurrentUsage:
+            return AllocatorCurrentUsage(
+                identity=identity,
+                allocated_bytes=10 * 1024 * 1024,
+                reserved_bytes=20 * 1024 * 1024,
+                device_count=1,
+            )
+
+    class _FakePeakProbe:
+        def __init__(self, device: Any) -> None:
+            self._device = device
+
+        def identity(self) -> AcceleratorIdentity:
+            return identity
+
+        def available(self) -> bool:
+            return True
+
+        def reset(self) -> AcceleratorIdentity:
+            reset_calls.append(str(self._device))
+            return identity
+
+        def read(self) -> AllocatorUsage:
+            return AllocatorUsage(
+                identity=identity,
+                allocated_mb=32.0,
+                reserved_mb=64.0,
+                device_count=1,
+            )
+
+    def _runner(argv: list[str], **kwargs: Any) -> NvidiaDeviceCommandResult:
+        del kwargs
+        seen_identities.append(argv[2])
+        return NvidiaDeviceCommandResult(
+            returncode=0,
+            stdout=f"{_O6_CANONICAL_UUID}, 2026/11/24 12:15:00.000, 1024, 40960, 25, Disabled\n",
+        )
+
+    combined = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        allocator=AllocatorSource(
+            enabled=True,
+            include_current=True,
+            include_peak=True,
+            reset_peaks=True,
+            current_probe_factory=_FakeCurrentProbe,
+            peak_probe_factory=_FakePeakProbe,
+        ),
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            probe=NvidiaSmiDeviceProbe(identity=identity, command_runner=_runner),
+        ),
+    )
+    combined_claims = combined.ownership_claims(
+        cfg=_base_cfg(tmp_path / "claims_combined", device="cuda:0"),
+        run_dir=tmp_path / "claims_combined",
+    )
+    reset_claims = [c for c in combined_claims if c.kind == "allocator_reset"]
+    assert len(reset_claims) == 1
+
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_combined", device="cuda:0"),
+        runtime_callbacks=[combined],
+    ) as ctx:
+        combined_dir = ctx.run_dir
+
+    # Allocator peak reset occurred strictly once (never silently reset by nvidia-smi probe).
+    assert reset_calls == ["cuda:0"]
+    assert seen_identities and all(u == _O6_CANONICAL_UUID for u in seen_identities)
+
+    bundle = inspect_run_observability(combined_dir).invocations[0]
+    assert bundle.descriptors is not None
+    q_descs = bundle.descriptors.quantities
+    assert q_descs["allocator.current.allocated_bytes"].statistic == "gauge"
+    assert q_descs["allocator.current.allocated_bytes"].subject_kind == "process_allocator"
+    assert q_descs["allocator.peak.allocated_bytes"].statistic == "high_water"
+    assert q_descs["allocator.peak.allocated_bytes"].window == "allocator_reset_window"
+    assert q_descs["device.framebuffer.used_bytes"].statistic == "gauge"
+    assert q_descs["device.framebuffer.used_bytes"].subject_kind == "physical_gpu"
+    assert q_descs["device.busy_fraction"].statistic == "vendor_window_mean"
+
+    # 3. Verify NvidiaDeviceSource(identity=None, probe=None) reuses allocator's
+    #    resolved AcceleratorIdentity for the same device without calling Torch
+    #    again or resetting peaks.
+    fake_exe_impl = tmp_path / "reuse_nvidia_smi.impl.py"
+    fake_exe_impl.write_text(
+        "import sys\n"
+        f"assert sys.argv[1:3] == ['-i', {_O6_CANONICAL_UUID!r}], sys.argv\n"
+        f"print('{_O6_CANONICAL_UUID}, 2026/11/24 12:16:00.000, 256, 40960, 10, Disabled')\n",
+        encoding="utf-8",
+    )
+    fake_exe = tmp_path / "reuse_nvidia_smi.sh"
+    fake_exe.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(fake_exe_impl))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_exe.chmod(0o755)
+    reset_calls.clear()
+    reuse_cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        allocator=AllocatorSource(
+            enabled=True,
+            include_current=True,
+            include_peak=True,
+            reset_peaks=True,
+            current_probe_factory=_FakeCurrentProbe,
+            peak_probe_factory=_FakePeakProbe,
+        ),
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            executable=fake_exe,
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_reuse", device="cuda:0"),
+        runtime_callbacks=[reuse_cb],
+    ) as ctx:
+        reuse_dir = ctx.run_dir
+    assert reset_calls == ["cuda:0"]
+    reuse_bundle = inspect_run_observability(reuse_dir).invocations[0]
+    assert reuse_bundle.derived_data_completeness == "complete"
+    assert reuse_bundle.inventory is not None
+    assert reuse_bundle.inventory.sources[NVIDIA_DEVICE_SOURCE_ID]["selected_identity"] == {
+        "kind": "cuda",
+        "index": 0,
+        "uuid": _O6_RAW_UUID,
+    }
+
+    # 4. Verify identity_resolver errors are contained cleanly without crashing runs.
+    failing_resolver_cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity_resolver=lambda _dev: (_ for _ in ()).throw(
+                RuntimeError("boom resolver")
+            ),
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_bad_resolver", device="cuda:0"),
+        runtime_callbacks=[failing_resolver_cb],
+    ) as ctx:
+        bad_res_dir = ctx.run_dir
+    bad_bundle = inspect_run_observability(bad_res_dir).invocations[0]
+    assert bad_bundle.derived_lifecycle_state == "closed"
+    bad_sample = bad_bundle.samples["resource-samples"][0]
+    assert bad_sample.readings["device.busy_fraction"].status == "error"
+    assert bad_sample.readings["device.busy_fraction"].reason_code == "identity_resolution_failed"
+
+
+def test_o6_disabled_mode_plain_mapping_yaml_and_torch_free_imports(
+    tmp_path: Path,
+) -> None:
+    """Disabled mode emits nothing; plain-mapping YAML works; callback imports stay Torch-free."""
+
+    called = False
+
+    def _never_called(argv: list[str], **kwargs: Any) -> NvidiaDeviceCommandResult:
+        nonlocal called
+        called = True
+        raise AssertionError("disabled ResourceSamples must not invoke nvidia-smi")
+
+    identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, _O6_RAW_UUID)
+    disabled_cb = ResourceSamples(
+        enabled=False,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity=identity,
+            probe=NvidiaSmiDeviceProbe(identity=identity, command_runner=_never_called),
+        ),
+    )
+    assert disabled_cb.ownership_claims(run_dir=tmp_path / "disabled") == []
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_disabled", device="cuda:0"),
+        runtime_callbacks=[disabled_cb],
+    ) as ctx:
+        disabled_dir = ctx.run_dir
+    assert not called
+    assert inspect_run_observability(disabled_dir).invocations == ()
+
+    # Plain-mapping YAML with fake executable script
+    fake_exe_impl = tmp_path / "yaml_nvidia_smi.impl.py"
+    fake_exe_impl.write_text(
+        f"print('{_O6_CANONICAL_UUID}, 2026/11/24 12:20:00.000, 4096, 81920, 75, Disabled')\n",
+        encoding="utf-8",
+    )
+    fake_exe = tmp_path / "yaml_nvidia_smi.sh"
+    fake_exe.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(fake_exe_impl))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_exe.chmod(0o755)
+    out_root = tmp_path / "yaml_out" / "outputs"
+    yaml_text = f"""
+experiment:
+  name: o6_plain_yaml
+  sector: unit
+run:
+  root: {json.dumps(str(out_root))}
+  layout: flat
+  run_id: o6-plain-run
+  timezone: UTC
+runtime:
+  device: cpu
+  dtype: float64
+callbacks:
+  - _target_: tpen.callback.ResourceSamples
+    interval_seconds: 60.0
+    max_pending_envelopes: 16
+    nvidia_device:
+      enabled: true
+      timeout_seconds: 5.0
+      executable: {json.dumps(str(fake_exe))}
+      identity:
+        kind: cuda
+        index: 0
+        uuid: {json.dumps(_O6_RAW_UUID)}
+loggers: []
+runner:
+  _target_: {__name__}._NoopRunner
+"""
+    cfg = OmegaConf.create(yaml_text)
+    assert run_from_config(cfg, raise_exceptions=True) == 0
+
+    bundle = inspect_run_observability(out_root / "o6-plain-run").invocations[0]
+    assert bundle.derived_lifecycle_state == "closed"
+    assert bundle.derived_data_completeness == "complete"
+    nd_samples = [
+        s
+        for s in bundle.samples["resource-samples"]
+        if s.source_id == NVIDIA_DEVICE_SOURCE_ID
+    ]
+    assert len(nd_samples) >= 2
+    assert nd_samples[0].readings["device.framebuffer.used_bytes"].value == 4096 * 1024 * 1024
+    assert nd_samples[0].readings["device.busy_fraction"].value == pytest.approx(0.75)
+
+    profile_check = check_profile(cfg, NATIVE_RECOVERY_PROFILE)
+    assert profile_check.verdict == "refused"
+    assert profile_check.refusal is not None
+    assert profile_check.refusal["code"] == "unsupported-callback"
+
+    # Fresh-subprocess Torch-free and psutil-free import check
+    code = (
+        "import sys\n"
+        "import tpen._nvidia_smi\n"
+        "import tpen.accelerator\n"
+        "import tpen.callback\n"
+        "from tpen.callback import NvidiaDeviceSource, ResourceSamples\n"
+        "import tpen.callback.resource_samples\n"
+        "cb = ResourceSamples(nvidia_device=NvidiaDeviceSource(enabled=True))\n"
+        "assert 'torch' not in sys.modules, 'torch imported'\n"
+        "assert 'psutil' not in sys.modules, 'psutil imported'\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+
+
+def test_o6_review_t2_normal_teardown_cancel_of_healthy_inflight_poll_stays_complete(
+    tmp_path: Path,
+) -> None:
+    """T2 (F2): cancelling an in-flight healthy background poll during normal close() must stay complete."""
+
+    identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, _O6_RAW_UUID)
+    call_lock = threading.Lock()
+    call_count = 0
+    inflight_entered = threading.Event()
+
+    def _runner(argv: list[str], **kwargs: Any) -> NvidiaDeviceCommandResult:
+        nonlocal call_count
+        del argv
+        with call_lock:
+            call_count += 1
+            seq = call_count
+        cancel_event = kwargs.get("cancel_event")
+        if seq == 1:
+            return NvidiaDeviceCommandResult(
+                returncode=0,
+                stdout=(
+                    f"{_O6_CANONICAL_UUID}, 2026/11/24 12:50:01.000, "
+                    "1024, 40960, 20, Disabled\n"
+                ),
+            )
+        if seq == 2:
+            inflight_entered.set()
+            if cancel_event is not None:
+                cancel_event.wait(timeout=5.0)
+                if cancel_event.is_set():
+                    return NvidiaDeviceCommandResult(
+                        returncode=None,
+                        stdout="",
+                        cancelled=True,
+                        error_reason_code="read_cancelled",
+                        error_detail="nvidia-smi read cancelled during execution",
+                    )
+            return NvidiaDeviceCommandResult(
+                returncode=0,
+                stdout=(
+                    f"{_O6_CANONICAL_UUID}, 2026/11/24 12:50:02.000, "
+                    "1536, 40960, 30, Disabled\n"
+                ),
+            )
+        return NvidiaDeviceCommandResult(
+            returncode=0,
+            stdout=(
+                f"{_O6_CANONICAL_UUID}, 2026/11/24 12:50:03.000, "
+                "2048, 40960, 40, Disabled\n"
+            ),
+        )
+
+    probe = NvidiaSmiDeviceProbe(identity=identity, command_runner=_runner)
+    cb = ResourceSamples(
+        interval_seconds=0.02,
+        max_pending_envelopes=16,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity=identity,
+            probe=probe,
+        ),
+    )
+
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_t2", device="cuda:0"),
+        runtime_callbacks=[cb],
+    ) as ctx:
+        run_dir = ctx.run_dir
+        assert inflight_entered.wait(timeout=5.0)
+
+    bundle = inspect_observability_bundle(
+        inspect_run_observability(run_dir).invocations[0].bundle_dir
+    )
+    assert bundle.derived_lifecycle_state == "closed"
+    assert (
+        bundle.statuses["resource-samples"].source_status[NVIDIA_DEVICE_SOURCE_ID]
+        == "available"
+    )
+    assert bundle.derived_data_completeness == "complete"
+    assert bundle.statuses["resource-samples"].unavailable_fields is None
+    nd_samples = [
+        s
+        for s in bundle.samples["resource-samples"]
+        if s.source_id == NVIDIA_DEVICE_SOURCE_ID
+    ]
+    assert len(nd_samples) >= 2
+    for sample in nd_samples:
+        assert all(r.status == "ok" for r in sample.readings.values())
+
+
+def test_o6_review_t5_injected_probe_identity_not_overridden_by_allocator_reuse(
+    tmp_path: Path,
+) -> None:
+    """T5 (F5): injected probe.identity must take precedence over allocator's resolved CPU identity."""
+
+    cuda_identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, _O6_RAW_UUID)
+
+    def _ok_runner(argv: list[str], **kwargs: Any) -> NvidiaDeviceCommandResult:
+        del argv, kwargs
+        return NvidiaDeviceCommandResult(
+            returncode=0,
+            stdout=(
+                f"{_O6_CANONICAL_UUID}, 2026/11/24 12:52:00.000, "
+                "1024, 40960, 35, Disabled\n"
+            ),
+        )
+
+    cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        allocator=AllocatorSource(
+            enabled=True,
+            include_current=True,
+            include_peak=False,
+            reset_peaks=False,
+        ),
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            probe=NvidiaSmiDeviceProbe(
+                identity=cuda_identity,
+                command_runner=_ok_runner,
+            ),
+        ),
+    )
+
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_t5", device="cpu"),
+        runtime_callbacks=[cb],
+    ) as ctx:
+        run_dir = ctx.run_dir
+
+    bundle = inspect_observability_bundle(
+        inspect_run_observability(run_dir).invocations[0].bundle_dir
+    )
+    assert bundle.inventory is not None
+    assert bundle.inventory.sources[NVIDIA_DEVICE_SOURCE_ID]["selected_identity"] == {
+        "kind": "cuda",
+        "index": 0,
+        "uuid": _O6_RAW_UUID,
+    }
+    nd_samples = [
+        s
+        for s in bundle.samples["resource-samples"]
+        if s.source_id == NVIDIA_DEVICE_SOURCE_ID
+    ]
+    assert len(nd_samples) >= 2
+    for sample in nd_samples:
+        assert sample.subject["backend"] == "cuda"
+        assert sample.subject["device_index"] == 0
+        assert sample.subject["device_uuid"] == _O6_CANONICAL_UUID
+
+
+def test_o6_review_t7_differing_devices_close_timeout_yaml_subset_and_mig_summary_coverage(
+    tmp_path: Path,
+) -> None:
+    """T7: cover differing devices, close_timeout teardown, YAML quantity subset, and MIG summary non-fabrication."""
+
+    # (a) Differing allocator.device ("cuda:0") vs nvidia_device.device ("cuda:1")
+    gpu_a_raw = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    gpu_b_raw = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    gpu_b_canonical = f"GPU-{gpu_b_raw}"
+    id_a = AcceleratorIdentity(AcceleratorKind.CUDA, 0, gpu_a_raw)
+    id_b = AcceleratorIdentity(AcceleratorKind.CUDA, 1, gpu_b_raw)
+
+    class _FakeCurrentA:
+        def __init__(self, device: Any) -> None:
+            self._device = device
+
+        def identity(self) -> AcceleratorIdentity:
+            return id_a
+
+        def available(self) -> bool:
+            return True
+
+        def read(self) -> AllocatorCurrentUsage:
+            return AllocatorCurrentUsage(
+                identity=id_a,
+                allocated_bytes=16 * 1024 * 1024,
+                reserved_bytes=32 * 1024 * 1024,
+                device_count=2,
+            )
+
+    seen_resolver_devices: list[str] = []
+
+    def _resolve_b(device: str) -> AcceleratorIdentity:
+        seen_resolver_devices.append(device)
+        assert device == "cuda:1"
+        return id_b
+
+    fake_exe_b_impl = tmp_path / "t7a_gpu_b.impl.py"
+    fake_exe_b_impl.write_text(
+        (
+            "import sys\n"
+            f"assert sys.argv[1:3] == ['-i', {gpu_b_canonical!r}], sys.argv\n"
+            f"print('{gpu_b_canonical}, 2026/11/24 12:55:00.000, 512, 40960, 30, Disabled')\n"
+        ),
+        encoding="utf-8",
+    )
+    fake_exe_b = tmp_path / "t7a_gpu_b.sh"
+    fake_exe_b.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -S {shlex.quote(str(fake_exe_b_impl))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_exe_b.chmod(0o755)
+
+    cb_a = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        allocator=AllocatorSource(
+            enabled=True,
+            device="cuda:0",
+            include_current=True,
+            include_peak=False,
+            reset_peaks=False,
+            current_probe_factory=_FakeCurrentA,
+        ),
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            device="cuda:1",
+            identity_resolver=_resolve_b,
+            executable=fake_exe_b,
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_t7a", device="cuda:0"),
+        runtime_callbacks=[cb_a],
+    ) as ctx:
+        dir_a = ctx.run_dir
+
+    assert seen_resolver_devices == ["cuda:1"]
+    bundle_a = inspect_observability_bundle(
+        inspect_run_observability(dir_a).invocations[0].bundle_dir
+    )
+    assert bundle_a.inventory is not None
+    assert bundle_a.inventory.sources[NVIDIA_DEVICE_SOURCE_ID]["selected_identity"] == {
+        "kind": "cuda",
+        "index": 1,
+        "uuid": gpu_b_raw,
+    }
+    nd_samples_a = [
+        s
+        for s in bundle_a.samples["resource-samples"]
+        if s.source_id == NVIDIA_DEVICE_SOURCE_ID
+    ]
+    assert len(nd_samples_a) >= 2
+    for sample in nd_samples_a:
+        assert sample.subject["device_uuid"] == gpu_b_canonical
+        assert sample.subject["device_index"] == 1
+
+    # (b) Bounded close_timeout_seconds teardown on hanging final nvidia-smi read
+    cuda_identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, _O6_RAW_UUID)
+    marker_file = tmp_path / "t7b_first_done.marker"
+    sleep_pid_file = tmp_path / "t7b_sleep.pid"
+    sleep_pid_tmp = tmp_path / "t7b_sleep.pid.tmp"
+    hang_impl = tmp_path / "t7b_hang_second.impl.py"
+    hang_impl.write_text(
+        (
+            "import os, time\n"
+            f"marker = {str(marker_file)!r}\n"
+            "if not os.path.exists(marker):\n"
+            "    with open(marker, 'w', encoding='utf-8') as f:\n"
+            "        f.write('1')\n"
+            f"    print('{_O6_CANONICAL_UUID}, 2026/11/24 12:56:00.000, 1024, 40960, 15, Disabled')\n"
+            "else:\n"
+            f"    with open({str(sleep_pid_tmp)!r}, 'w', encoding='utf-8') as f:\n"
+            "        f.write(str(os.getpid()))\n"
+            "        f.flush()\n"
+            "        os.fsync(f.fileno())\n"
+            f"    os.replace({str(sleep_pid_tmp)!r}, {str(sleep_pid_file)!r})\n"
+            "    time.sleep(30.0)\n"
+        ),
+        encoding="utf-8",
+    )
+    hang_script = tmp_path / "t7b_hang_second.sh"
+    hang_script.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -S {shlex.quote(str(hang_impl))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    hang_script.chmod(0o755)
+
+    cb_b = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        close_timeout_seconds=0.6,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity=cuda_identity,
+            executable=hang_script,
+            timeout_seconds=5.0,
+        ),
+    )
+    sleep_pid: int | None = None
+    try:
+        with open_run_context(
+            _base_cfg(tmp_path / "run_o6_t7b", device="cuda:0"),
+            runtime_callbacks=[cb_b],
+        ) as ctx:
+            dir_b = ctx.run_dir
+            t_close_start = time.monotonic()
+        close_elapsed = time.monotonic() - t_close_start
+        assert close_elapsed < 3.5
+        assert sleep_pid_file.exists()
+        sleep_pid = int(sleep_pid_file.read_text(encoding="utf-8").strip())
+        with pytest.raises(ProcessLookupError):
+            os.kill(sleep_pid, 0)
+    finally:
+        if sleep_pid is None and sleep_pid_file.exists():
+            raw = sleep_pid_file.read_text(encoding="utf-8").strip()
+            if raw.isdigit():
+                sleep_pid = int(raw)
+        if sleep_pid is not None:
+            try:
+                os.kill(sleep_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    bundle_b = inspect_observability_bundle(
+        inspect_run_observability(dir_b).invocations[0].bundle_dir
+    )
+    assert bundle_b.derived_lifecycle_state == "closed"
+
+    # (c) Plain-mapping Hydra YAML with quantities list subset under Typeguard
+    yaml_exe_impl = tmp_path / "t7c_yaml.impl.py"
+    yaml_exe_impl.write_text(
+        f"print('{_O6_CANONICAL_UUID}, 2026/11/24 12:57:00.000, 2048, 81920, 45, Disabled')\n",
+        encoding="utf-8",
+    )
+    yaml_exe = tmp_path / "t7c_yaml.sh"
+    yaml_exe.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -S {shlex.quote(str(yaml_exe_impl))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    yaml_exe.chmod(0o755)
+    yaml_out_root = tmp_path / "t7c_out" / "outputs"
+    yaml_text = f"""
+experiment:
+  name: o6_t7c_yaml_subset
+  sector: unit
+run:
+  root: {json.dumps(str(yaml_out_root))}
+  layout: flat
+  run_id: o6-t7c-run
+  timezone: UTC
+runtime:
+  device: cpu
+  dtype: float64
+callbacks:
+  - _target_: tpen.callback.ResourceSamples
+    interval_seconds: 60.0
+    max_pending_envelopes: 16
+    nvidia_device:
+      enabled: true
+      timeout_seconds: 5.0
+      executable: {json.dumps(str(yaml_exe))}
+      quantities:
+        - device.framebuffer.used_bytes
+        - device.busy_fraction
+      identity:
+        kind: cuda
+        index: 0
+        uuid: {json.dumps(_O6_RAW_UUID)}
+loggers: []
+runner:
+  _target_: {__name__}._NoopRunner
+"""
+    cfg_c = OmegaConf.create(yaml_text)
+    assert run_from_config(cfg_c, raise_exceptions=True) == 0
+    bundle_c = inspect_observability_bundle(
+        inspect_run_observability(yaml_out_root / "o6-t7c-run").invocations[0].bundle_dir
+    )
+    assert bundle_c.derived_lifecycle_state == "closed"
+    assert bundle_c.derived_data_completeness == "complete"
+    nd_samples_c = [
+        s
+        for s in bundle_c.samples["resource-samples"]
+        if s.source_id == NVIDIA_DEVICE_SOURCE_ID
+    ]
+    assert len(nd_samples_c) >= 2
+    expected_subset = {"device.framebuffer.used_bytes", "device.busy_fraction"}
+    for sample in nd_samples_c:
+        assert set(sample.readings.keys()) == expected_subset
+        assert all(r.status == "ok" for r in sample.readings.values())
+
+    # (d) O2 summary non-fabrication on MIG ambiguity
+    def _mig_runner(argv: list[str], **kwargs: Any) -> NvidiaDeviceCommandResult:
+        del argv, kwargs
+        return NvidiaDeviceCommandResult(
+            returncode=0,
+            stdout=(
+                f"{_O6_CANONICAL_UUID}, 2026/11/24 12:58:00.000, "
+                "512, 40960, 40, Enabled\n"
+            ),
+        )
+
+    cb_d = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity=cuda_identity,
+            probe=NvidiaSmiDeviceProbe(
+                identity=cuda_identity,
+                command_runner=_mig_runner,
+            ),
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_t7d", device="cuda:0"),
+        runtime_callbacks=[cb_d],
+    ) as ctx:
+        dir_d = ctx.run_dir
+
+    bundle_d = inspect_observability_bundle(
+        inspect_run_observability(dir_d).invocations[0].bundle_dir
+    )
+    assert bundle_d.summary is not None
+    for qty_id in NVIDIA_DEVICE_QUANTITY_IDS:
+        qty_summary = bundle_d.summary.quantity(NVIDIA_DEVICE_SOURCE_ID, qty_id)
+        assert qty_summary is not None
+        assert qty_summary.ok_count == 0
+        assert qty_summary.unavailable_count >= 2
+        assert qty_summary.reason_codes == ("mig_subdevice_ambiguous",)
+        assert qty_summary.observation_min is None
+        assert qty_summary.observation_max is None
+        assert qty_summary.observation_mean is None
+        assert qty_summary.sampled_min is None
+        assert qty_summary.sampled_max is None
+        assert qty_summary.latest_value is None
+
+
+
+

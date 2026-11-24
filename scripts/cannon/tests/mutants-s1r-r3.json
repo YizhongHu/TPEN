@@ -1,0 +1,46 @@
+{
+  "mutants": [
+    {
+      "id": "recorder-refusal-removed",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "if configured_overlay is not None:",
+      "new": "if False:",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart.py::test_recorder_configured_refuses_before_runner_call"
+    },
+    {
+      "id": "recorder-silently-stripped",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "        raise RestartRefusal(\n            \"RawTrainingBatchRecorder cannot be resumed by Stage-1; \"\n            \"core item 7eaf9e0c (Executor lane ea7125c1) owns deferred recorder \"\n            f\"resume semantics; refusing overlay {configured_overlay}\",\n            cause=RestartCause.INVALID_RESUME,\n        )",
+      "new": "        callbacks = [\n            callback for callback in (OmegaConf.select(cfg, \"callbacks\", default=()) or ())\n            if not isinstance(callback, Mapping)\n            or callback.get(\"_target_\") != \"tpen.callback.RawTrainingBatchRecorder\"\n        ]\n        OmegaConf.update(cfg, \"callbacks\", callbacks, merge=False, force_add=True)",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart.py::test_recorder_configured_refuses_before_runner_call"
+    },
+    {
+      "id": "configured-load-ignored",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "evidence = inspector(admitted)",
+      "new": "evidence = inspect_run(admitted)",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart.py::test_missing_resume_refuses_before_runner_call"
+    },
+    {
+      "id": "model-only-load-selected",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "load = {\"mode\": \"train_resume\", \"path\": str(checkpoint_dir)}",
+      "new": "load = {\"mode\": \"model_only\", \"path\": str(checkpoint_dir)}",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart.py::test_exact_runner_load_and_overlay_survive_configured_restore"
+    },
+    {
+      "id": "checkpoint-zero-callback-retained",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "_remove_initial_checkpoint(cfg)",
+      "new": "# checkpoint-zero callback retained",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart.py::test_exact_runner_load_and_overlay_survive_configured_restore"
+    },
+    {
+      "id": "row-horizon-binding-removed",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "if type(target) is not int or type(expected) is not int or target <= 0 or target != expected:",
+      "new": "if type(target) is not int or type(expected) is not int or target <= 0:",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart.py::test_row_update_horizon_mismatch_refuses_before_runner_call"
+    }
+  ]
+}

@@ -575,3 +575,109 @@ def test_allocator_current_probe_handles_cpu_unavailable_and_partial_counter_err
     assert isinstance(partial.reserved_bytes, AllocatorUnavailable)
     assert "RuntimeError" in partial.reserved_bytes.reason
     assert partial.device_count == 1
+
+
+def test_resolve_selected_accelerator_identity_is_read_only_and_pins_indexless_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Read-only identity helper pins indexless CUDA devices and never resets or syncs."""
+
+    import tpen.accelerator as accelerator
+
+    calls: list[tuple[str, object]] = []
+
+    class FakeUUID:
+        def __str__(self) -> str:
+            return "97933565-57cb-fec7-c442-188c7b300fd3"
+
+    class Backend:
+        @staticmethod
+        def is_available() -> bool:
+            calls.append(("is_available", None))
+            return True
+
+        @staticmethod
+        def current_device() -> int:
+            calls.append(("current_device", None))
+            return 2
+
+        @staticmethod
+        def get_device_properties(index: int):
+            calls.append(("properties", index))
+            return type("Properties", (), {"uuid": FakeUUID()})()
+
+        @staticmethod
+        def reset_peak_memory_stats(*args: object, **kwargs: object) -> None:
+            raise AssertionError("resolve_selected_accelerator_identity must never reset peaks")
+
+        @staticmethod
+        def synchronize(*args: object, **kwargs: object) -> None:
+            raise AssertionError("resolve_selected_accelerator_identity must never synchronize")
+
+    class FakeTorch:
+        device = staticmethod(torch.device)
+        version = type("Version", (), {"hip": None})()
+
+    monkeypatch.setattr(accelerator, "_torch", lambda feature: FakeTorch)
+    monkeypatch.setattr(accelerator, "device_module", lambda *args, **kwargs: Backend)
+
+    identity = accelerator.resolve_selected_accelerator_identity("cuda")
+    assert identity == AcceleratorIdentity(
+        kind=AcceleratorKind.CUDA,
+        index=2,
+        uuid="97933565-57cb-fec7-c442-188c7b300fd3",
+    )
+    assert calls == [
+        ("is_available", None),
+        ("current_device", None),
+        ("properties", 2),
+    ]
+
+
+def test_resolve_selected_accelerator_identity_handles_cpu_rocm_and_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CPU, ROCm, and unavailable backends resolve cleanly without errors."""
+
+    import tpen.accelerator as accelerator
+
+    cpu_id = accelerator.resolve_selected_accelerator_identity("cpu")
+    assert cpu_id == AcceleratorIdentity(AcceleratorKind.CPU, None, None)
+
+    class UnavailableBackend:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class FakeRocmTorch:
+        device = staticmethod(torch.device)
+        version = type("Version", (), {"hip": "6.2"})()
+
+    monkeypatch.setattr(accelerator, "_torch", lambda feature: FakeRocmTorch)
+    monkeypatch.setattr(accelerator, "device_module", lambda *args, **kwargs: UnavailableBackend)
+    rocm_id = accelerator.resolve_selected_accelerator_identity("cuda:1")
+    assert rocm_id == AcceleratorIdentity(AcceleratorKind.ROCM, 1, None)
+
+
+def test_accelerator_reexports_o6_nvidia_smi_surface() -> None:
+    """``tpen.accelerator`` publicly re-exports the O6 NVIDIA SMI probe contract."""
+
+    import tpen._nvidia_smi as nvidia_smi
+    import tpen.accelerator as accelerator
+
+    for symbol in (
+        "DEFAULT_NVIDIA_SMI_EXECUTABLE",
+        "DEFAULT_NVIDIA_SMI_MAX_OUTPUT_BYTES",
+        "DEFAULT_NVIDIA_SMI_TIMEOUT_SECONDS",
+        "MAX_NVIDIA_SMI_TIMEOUT_SECONDS",
+        "NVIDIA_DEVICE_READING_STATUSES",
+        "NvidiaDeviceCommandResult",
+        "NvidiaDeviceReading",
+        "NvidiaDeviceUnavailable",
+        "NvidiaSmiDeviceProbe",
+        "canonicalize_nvidia_device_uuid",
+        "parse_nvidia_smi_query_output",
+    ):
+        assert getattr(accelerator, symbol) is getattr(nvidia_smi, symbol)
+        assert symbol in accelerator.__all__
+    assert "resolve_selected_accelerator_identity" in accelerator.__all__

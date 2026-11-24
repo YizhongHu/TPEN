@@ -14,6 +14,7 @@ from tpen.data.partition import Partition
 from tpen.data.real import Feature
 from tpen.dependencies import require_torch, require_torch_nn
 from tpen.nn.initialization import TorchInitializer
+from tpen.nn.structured_curvature import active_structured_curvature_session
 
 torch = require_torch(feature="Pfaffian readout")
 nn = require_torch_nn(feature="Pfaffian readout")
@@ -262,6 +263,13 @@ class PfaffianReadout(nn.Module):
         # round trip existed only to feed a per-matrix Python loop.
         channel_pfaffians = pfaffian(kernel)
         psi = (channel_pfaffians * self._weights().reshape(1, -1)).sum(dim=1)
+        session = active_structured_curvature_session()
+        if session is not None and self.trainable and self.channel_weights is not None:
+            session.record_pfaffian_readout(
+                channel_weights=self.channel_weights,
+                channel_pfaffians=channel_pfaffians,
+                psi=psi,
+            )
         sign = torch.sign(psi)
         logabs = torch.where(sign == 0, torch.full_like(psi, -torch.inf), 0.5 * torch.log(psi.square().clamp_min(self.eps)))
         return WavefunctionOutput(

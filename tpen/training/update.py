@@ -1549,6 +1549,42 @@ class VMCUpdateMethod(Generic[InputT], ABC):
         if state:
             raise ValueError("stateless VMCUpdateMethod cannot load non-empty method state")
 
+    def method_tensor_state_dict(self) -> Mapping[str, Any] | None:
+        """Return optional binary tensor state persisted to ``method_state.pt``.
+
+        Returns ``None`` by default so methods without large curvature tensors
+        omit ``method_state.pt`` and keep existing checkpoints unchanged.
+        """
+
+        return None
+
+    def load_method_tensor_state_dict(self, state: Mapping[str, Any] | None) -> None:
+        """Restore optional binary tensor state from ``method_state.pt``."""
+
+        if state is not None:
+            raise ValueError(
+                f"{type(self).__name__} does not accept binary method tensor state"
+            )
+
+    def validate_method_tensor_state_dict(
+        self,
+        state: Mapping[str, Any] | None,
+        *,
+        method_state: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Validate optional binary tensor state without mutating live method state.
+
+        Methods that persist binary tensor payloads in ``method_state.pt``
+        override this hook so checkpoint restore can verify JSON metadata and
+        binary tensors together before mutating any live object.
+        """
+
+        del method_state
+        if state is not None:
+            raise ValueError(
+                f"{type(self).__name__} does not accept binary method tensor state"
+            )
+
     def forward_request(self) -> Any | None:
         """Return the typed forward request this method's input requires.
 
@@ -1716,6 +1752,20 @@ class VMCUpdateMethod(Generic[InputT], ABC):
         """
 
         return "method_defined"
+
+    def declared_nonfinite_local_energy_policy(self) -> str | None:
+        """Return the non-finite local-energy policy this method enforces, or ``None``.
+
+        Score-based methods (such as SR and SPRING) consume local energies
+        directly and override this hook to expose their resolved
+        ``nonfinite_local_energy_policy``.
+        :class:`~tpen.training.trainer.VMCTrainer` checks this declaration
+        before sampling or checkpoint restore so the trainer and update method
+        cannot silently run under disagreeing estimators. Methods that rely
+        solely on the trainer's objective return ``None``.
+        """
+
+        return None
 
     def set_step_scopes(
         self,

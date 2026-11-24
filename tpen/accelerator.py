@@ -537,6 +537,58 @@ def device_event_timer(
     return DeviceEventTimer(_module=module, _event_factory=event_factory)
 
 
+def resolve_selected_accelerator_identity(
+    device: Any,
+    *,
+    feature: str = "selected accelerator identity",
+) -> AcceleratorIdentity:
+    """Resolve the selected accelerator's physical identity without mutating state.
+
+    Unlike :class:`TorchAllocatorPeakProbe`, this helper is strictly read-only:
+    it never calls ``reset_peak_memory_stats``, never calls ``synchronize``,
+    and never mutates caching-allocator state.
+
+    Parameters
+    ----------
+    device : torch.device or str
+        Configured runtime device to inspect.
+    feature : str, optional
+        Feature name used in the torch-missing error message.
+
+    Returns
+    -------
+    AcceleratorIdentity
+        Resolved backend classification, device index (pinning indexless
+        available accelerators via ``current_device()`` once), and physical
+        device UUID when reported by the backend.
+    """
+
+    torch = _torch(feature)
+    resolved = torch.device(device)
+    kind = _accelerator_kind(torch, resolved.type)
+    index = resolved.index
+    if kind is AcceleratorKind.CPU:
+        return AcceleratorIdentity(kind=kind, index=index, uuid=None)
+    module = device_module(resolved, feature=feature)
+    try:
+        available = bool(module.is_available())
+    except (AttributeError, RuntimeError):
+        return AcceleratorIdentity(kind=kind, index=index, uuid=None)
+    if available and index is None:
+        try:
+            index = module.current_device()
+        except (AttributeError, RuntimeError):
+            return AcceleratorIdentity(kind=kind, index=None, uuid=None)
+    uuid: str | None = None
+    if available and index is not None:
+        try:
+            raw_uuid = module.get_device_properties(index).uuid
+            uuid = str(raw_uuid) if raw_uuid is not None else None
+        except (AttributeError, RuntimeError):
+            uuid = None
+    return AcceleratorIdentity(kind=kind, index=index, uuid=uuid)
+
+
 def seed_all(seed: int, *, feature: str = "seeded run") -> None:
     """Seed the accelerator's global RNG for every visible device.
 
@@ -559,6 +611,21 @@ def seed_all(seed: int, *, feature: str = "seeded run") -> None:
         seed_fn(int(seed))
 
 
+from tpen._nvidia_smi import (  # noqa: E402
+    DEFAULT_NVIDIA_SMI_EXECUTABLE,
+    DEFAULT_NVIDIA_SMI_MAX_OUTPUT_BYTES,
+    DEFAULT_NVIDIA_SMI_TIMEOUT_SECONDS,
+    MAX_NVIDIA_SMI_TIMEOUT_SECONDS,
+    NVIDIA_DEVICE_READING_STATUSES,
+    NvidiaDeviceCommandResult,
+    NvidiaDeviceReading,
+    NvidiaDeviceUnavailable,
+    NvidiaSmiDeviceProbe,
+    canonicalize_nvidia_device_uuid,
+    parse_nvidia_smi_query_output,
+)
+
+
 __all__ = [
     "AcceleratorIdentity",
     "AcceleratorKind",
@@ -567,13 +634,25 @@ __all__ = [
     "AllocatorPeakProbe",
     "AllocatorUnavailable",
     "AllocatorUsage",
+    "DEFAULT_NVIDIA_SMI_EXECUTABLE",
+    "DEFAULT_NVIDIA_SMI_MAX_OUTPUT_BYTES",
+    "DEFAULT_NVIDIA_SMI_TIMEOUT_SECONDS",
     "DeviceEventTimer",
+    "MAX_NVIDIA_SMI_TIMEOUT_SECONDS",
+    "NVIDIA_DEVICE_READING_STATUSES",
+    "NvidiaDeviceCommandResult",
+    "NvidiaDeviceReading",
+    "NvidiaDeviceUnavailable",
+    "NvidiaSmiDeviceProbe",
+    "TorchAllocatorCurrentProbe",
+    "TorchAllocatorPeakProbe",
     "canonical_device",
+    "canonicalize_nvidia_device_uuid",
     "current_accelerator_type",
     "device_event_timer",
     "device_module",
+    "parse_nvidia_smi_query_output",
+    "resolve_selected_accelerator_identity",
     "seed_all",
     "synchronize",
-    "TorchAllocatorCurrentProbe",
-    "TorchAllocatorPeakProbe",
 ]
