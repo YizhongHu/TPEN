@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping
 from omegaconf import OmegaConf
 
 from experiments.atomistic.stage1.protocol import (
+    SYSTEM_SPECS,
     validate_gateway_binding,
     validate_resolved_train_config,
 )
@@ -115,6 +116,25 @@ def _target_iterations(cfg: Any, row: Mapping[str, Any]) -> int:
             cause=RestartCause.HORIZON_MISMATCH,
         )
     return target
+
+
+def _validate_system_identity(cfg: Any, row: Mapping[str, Any]) -> None:
+    """Require one manifest/config Hamiltonian identity before inspection."""
+
+    system = row.get("system")
+    row_system_id = row.get("system_id")
+    expected_system_ids = {spec.name: spec.system_id for spec in SYSTEM_SPECS}
+    config_system_id = OmegaConf.select(cfg, "system.id", default=None)
+    if (
+        not isinstance(system, str)
+        or not isinstance(row_system_id, str)
+        or expected_system_ids.get(system) != row_system_id
+        or config_system_id != row_system_id
+    ):
+        raise RestartRefusal(
+            "manifest row system identity does not match the resolved Hamiltonian identity",
+            cause=RestartCause.INVALID_RESUME,
+        )
 
 
 def _config_run_dir(cfg: Any) -> Path:
@@ -226,6 +246,7 @@ def select_restart(
     torn, or incompatible public evidence raises before the runner is called.
     """
 
+    _validate_system_identity(cfg, row)
     target = _target_iterations(cfg, row)
     admitted = _admitted_run_dir(cfg, row, run_dir)
     evidence = inspector(admitted)

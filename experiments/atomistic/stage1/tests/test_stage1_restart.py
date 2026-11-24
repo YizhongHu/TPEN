@@ -18,10 +18,13 @@ from omegaconf import OmegaConf
 from experiments.atomistic.stage1 import restart
 from experiments.atomistic.stage1.launch import row_overrides
 from experiments.atomistic.stage1.protocol import (
+    HOOKE_SCIENCE_PROFILE,
+    STAGE1_PROTOCOL,
     Protocol,
     build_manifest,
     config_identities,
     overlay_sha256,
+    overlay_path_for_system,
 )
 from experiments.atomistic.stage1.train import build_train_config
 from experiments.toolkit.run_paths import resolve_run_dir
@@ -30,6 +33,7 @@ from tpen.run import run_from_config
 
 CONFIG_ROOT = Path(__file__).parents[1] / "configs"
 OVERLAY = CONFIG_ROOT / "overlays" / "diagnostics-v1.yaml"
+HOOKE_OVERLAY = CONFIG_ROOT / "overlays" / "hooke-diagnostics-v1.yaml"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
@@ -38,6 +42,7 @@ def _cfg(tmp_path: Path) -> object:
         {
             "experiment": {"name": "stage1_he", "sector": "atomistic"},
             "run": {"root": str(tmp_path), "run_id": "run-0", "layout": "nested"},
+            "system": {"id": "he_atom"},
             "trainer": {"max_steps": 100000},
             "runtime": {"seed": 11},
             "overlay_marker": "preserve-me",
@@ -204,6 +209,27 @@ def test_row_and_config_run_identity_are_preserved(tmp_path: Path, monkeypatch) 
     assert calls == []
 
 
+def test_manifest_system_identity_refuses_before_runner_call(tmp_path: Path, monkeypatch) -> None:
+    """A row cannot resume a checkpoint under another Hamiltonian identity."""
+
+    cfg = _cfg(tmp_path)
+    row = _row(tmp_path)
+    row["system_id"] = "h2_molecule"
+    calls: list[object] = []
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+
+    with pytest.raises(restart.RestartRefusal, match="system identity") as error:
+        restart.execute_restart(
+            cfg=cfg,
+            row=row,
+            config_path="train.yaml",
+            inspector=lambda _path: pytest.fail("identity refusal must precede inspection"),
+            run=lambda *_a, **_k: calls.append(True) or 0,
+        )
+    assert error.value.cause is restart.RestartCause.INVALID_RESUME
+    assert calls == []
+
+
 def test_requested_resume_never_falls_back_to_fresh(tmp_path: Path, monkeypatch) -> None:
     cfg = _cfg(tmp_path)
     row = _row(tmp_path)
@@ -300,6 +326,77 @@ def _real_restart_row(tmp_path: Path, *, run_id: str) -> dict[str, object]:
     return row
 
 
+def _real_hooke_restart_row(tmp_path: Path, *, run_id: str) -> dict[str, object]:
+    """Build one production-shaped Hooke row for overlay-composition refusal."""
+
+    rows = build_manifest(
+        protocol=STAGE1_PROTOCOL,
+        source_sha="a" * 40,
+        config_sha256=config_identities(config_root=CONFIG_ROOT, systems=("hooke1",)),
+        checkpoints=list(range(0, STAGE1_PROTOCOL.lineage_updates + 1, 1000)),
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root=str(tmp_path),
+        systems=("hooke1",),
+        phase=1,
+        device="cpu",
+        overlay=HOOKE_OVERLAY,
+        overlay_sha256=overlay_sha256(HOOKE_OVERLAY),
+        science_profile=HOOKE_SCIENCE_PROFILE,
+        evaluation_selection="A37",
+    )
+    row = next(item for item in rows if item["kind"] == "train")
+    row["run_id"] = run_id
+    return row
+
+
+@pytest.mark.parametrize(
+    ("label", "system", "config_name", "overlay"),
+    (
+        ("protocol-default", "he", "he", overlay_path_for_system("he")),
+        ("diagnostics-v1", "he", "he", str(OVERLAY)),
+        ("hooke-diagnostics-v1", "hooke1", "hooke1", str(HOOKE_OVERLAY)),
+    ),
+)
+def test_real_recorder_compositions_refuse_before_runner_call(
+    tmp_path: Path, monkeypatch, label: str, system: str, config_name: str, overlay: str,
+) -> None:
+    """Every committed recorder-enabled train composition is refused loudly."""
+
+    if system == "he":
+        row = _real_restart_row(tmp_path / label, run_id=f"{label}-run")
+    else:
+        row = _real_hooke_restart_row(tmp_path / label, run_id=f"{label}-run")
+    config_path = CONFIG_ROOT / config_name / "train.yaml"
+    cfg = build_train_config(
+        row,
+        config_path=config_path,
+        overrides=row_overrides(row),
+        overlay=overlay,
+        overlay_sha256=overlay_sha256(overlay),
+    )
+    assert any(
+        callback.get("_target_") == "tpen.callback.RawTrainingBatchRecorder"
+        for callback in cfg.callbacks
+    )
+    calls: list[object] = []
+    monkeypatch.setattr(restart, "run_from_config", lambda *_a, **_k: calls.append(True) or 0)
+
+    with pytest.raises(
+        restart.RestartRefusal,
+        match=rf"7eaf9e0c.*{label.split('-', 1)[-1]}",
+    ):
+        restart.execute_restart(
+            cfg=cfg,
+            row=row,
+            config_path=config_path,
+            overlay=overlay,
+            overlay_sha256=overlay_sha256(overlay),
+            inspector=lambda _path: pytest.fail("recorder refusal must precede inspection"),
+        )
+    assert calls == []
+
+
 def _assert_nested_state_equal(actual: object, expected: object, *, path: str = "$") -> None:
     """Compare nested checkpoint state with a path to the first difference."""
 
@@ -388,14 +485,21 @@ def _assert_nested_state_equal(actual: object, expected: object, *, path: str = 
         mismatch(f"values differ ({actual!r} != {expected!r})")
 
 
-def _assert_checkpoint_payload_equal(left: Path, right: Path) -> None:
+def _assert_checkpoint_payload_equal(left: Path, right: Path) -> frozenset[object]:
     """Compare serialized tensor/state payloads, not archive container bytes."""
 
     import torch
 
     left_payload = torch.load(left, map_location="cpu", weights_only=False)
     right_payload = torch.load(right, map_location="cpu", weights_only=False)
+    if not isinstance(left_payload, Mapping) or not isinstance(right_payload, Mapping):
+        raise AssertionError(f"{left.name}: checkpoint payloads must be mappings")
+    left_keys = frozenset(left_payload)
+    right_keys = frozenset(right_payload)
+    if left_keys != right_keys:
+        raise AssertionError(f"{left.name}: top-level keys differ ({left_keys!r} != {right_keys!r})")
     _assert_nested_state_equal(left_payload, right_payload, path=left.name)
+    return left_keys
 
 
 def test_nested_state_equal_handles_checkpoint_like_payload() -> None:
@@ -616,8 +720,21 @@ def test_real_fresh_process_restore_parity_with_checkpoint_zero_and_overlay(
 
     resumed_checkpoint = resumed_dir / "checkpoints" / "step_000002"
     reference_checkpoint = reference_dir / "checkpoints" / "step_000002"
-    for name in ("model.pt", "optimizer.pt", "sampler.pt", "rng.pt"):
-        _assert_checkpoint_payload_equal(resumed_checkpoint / name, reference_checkpoint / name)
-    assert json.loads((resumed_checkpoint / "trainer.json").read_text(encoding="utf-8")) == json.loads(
-        (reference_checkpoint / "trainer.json").read_text(encoding="utf-8")
-    )
+    payload_files = ("model.pt", "optimizer.pt", "sampler.pt", "rng.pt")
+    covered_payload_keys = {
+        name: _assert_checkpoint_payload_equal(resumed_checkpoint / name, reference_checkpoint / name)
+        for name in payload_files
+    }
+    import torch
+
+    expected_payload_keys = {
+        name: frozenset(torch.load(reference_checkpoint / name, map_location="cpu", weights_only=False))
+        for name in payload_files
+    }
+    assert covered_payload_keys == expected_payload_keys
+    assert set(covered_payload_keys) == set(payload_files)
+    assert all(covered_payload_keys.values())
+    resumed_trainer = json.loads((resumed_checkpoint / "trainer.json").read_text(encoding="utf-8"))
+    reference_trainer = json.loads((reference_checkpoint / "trainer.json").read_text(encoding="utf-8"))
+    assert resumed_trainer == reference_trainer
+    assert {"next_iteration", "completed_updates"} <= set(resumed_trainer)
