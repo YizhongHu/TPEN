@@ -54,11 +54,16 @@ OBSERVABILITY_RECORD_KINDS: frozenset[str] = frozenset(
     }
 )
 PROFILE_SUMMARY_RECORD_KIND = "profile_summary"
+LIFECYCLE_MARKER_RECORD_KIND = "lifecycle_marker"
 OBSERVABILITY_ALL_RECORD_KINDS: frozenset[str] = (
-    OBSERVABILITY_RECORD_KINDS | {PROFILE_SUMMARY_RECORD_KIND}
+    OBSERVABILITY_RECORD_KINDS
+    | {PROFILE_SUMMARY_RECORD_KIND, LIFECYCLE_MARKER_RECORD_KIND}
 )
 
 OBSERVABILITY_LIFECYCLE_STATES: frozenset[str] = frozenset({"open", "closed", "unsafe"})
+OBSERVABILITY_LIFECYCLE_MARKER_STATES: frozenset[str] = frozenset(
+    {"open", "finalized", "unsafe"}
+)
 OBSERVABILITY_DATA_COMPLETENESS: frozenset[str] = frozenset(
     {"unknown", "none", "partial", "complete"}
 )
@@ -94,6 +99,7 @@ OBSERVABILITY_WINDOWS: frozenset[str] = frozenset(
 OBSERVABILITY_PROFILE_WINDOW_KINDS: frozenset[str] = frozenset({"operation", "elapsed"})
 
 MANIFEST_FILENAME = "manifest.json"
+LIFECYCLE_MARKER_FILENAME = "lifecycle-marker.json"
 INVENTORY_FILENAME = "inventory.json"
 DESCRIPTORS_FILENAME = "descriptors.json"
 # Legacy tpen.inspection._read_status scans ``run_dir.rglob("status.json")`` and
@@ -424,9 +430,12 @@ def validate_relative_path(
     if Path(value).is_absolute():
         raise ObservabilityPathError(f"{name} {value!r} must be relative")
     normalized = PurePosixPath(*segments).as_posix()
-    if forbid_manifest_self and normalized.lower() == MANIFEST_FILENAME.lower():
+    if forbid_manifest_self and normalized.lower() in {
+        MANIFEST_FILENAME.lower(),
+        LIFECYCLE_MARKER_FILENAME.lower(),
+    }:
         raise ObservabilityPathError(
-            "manifest.artifacts must not reference manifest.json recursively"
+            f"manifest.artifacts must not reference {normalized!r} recursively"
         )
     return normalized
 
@@ -2314,6 +2323,182 @@ class ObservabilityProfileSummary:
         )
 
 
+@dataclass(frozen=True)
+class ObservabilityLifecycleMarker:
+    """Additive recovery-safe open/finalized marker (``lifecycle-marker.json``).
+
+    Written atomically alongside ``manifest.json`` on open and finalization so
+    recovery readers can independently cross-check whether bundle finalization
+    completed cleanly and whether ``manifest.json`` matches its finalized hash.
+    The marker is never hashed by ``manifest.json`` (preventing any hash cycle),
+    and its absence remains valid for earlier O2 bundles.
+
+    Parameters
+    ----------
+    invocation_id : str
+        Owning invocation identifier.
+    state : {"open", "finalized", "unsafe"}
+        Marker transition state.
+    manifest_lifecycle_state : {"open", "closed", "unsafe"}
+        Lifecycle state recorded in the corresponding ``manifest.json``.
+    manifest_data_completeness : {"unknown", "none", "partial", "complete"}
+        Data completeness recorded in the corresponding ``manifest.json``.
+    manifest_sha256 : str
+        Lowercase 64-hex SHA-256 digest of the paired ``manifest.json`` bytes.
+    manifest_bytes : int
+        Exact byte length of the paired ``manifest.json`` payload.
+    run_id : str
+        Owning run identifier linked from ``manifest.json``.
+    configuration_digest : str
+        64-hex SHA-256 configuration digest linked from ``manifest.json``.
+    inventory_id : str
+        Immutable inventory identifier linked from ``manifest.json``.
+    descriptor_set_id : str
+        Immutable descriptor-set identifier linked from ``manifest.json``.
+    observer_ids : tuple of str, optional
+        Sorted observer identifiers declared in ``manifest.json``.
+    artifact_count : int, optional
+        Number of finalized bundle artifacts recorded in ``manifest.artifacts``.
+    """
+
+    invocation_id: str
+    state: str
+    manifest_lifecycle_state: str
+    manifest_data_completeness: str
+    manifest_sha256: str
+    manifest_bytes: int
+    run_id: str
+    configuration_digest: str
+    inventory_id: str
+    descriptor_set_id: str
+    observer_ids: tuple[str, ...] = ()
+    artifact_count: int = 0
+    schema: str = RUN_OBSERVABILITY_SCHEMA
+    kind: str = LIFECYCLE_MARKER_RECORD_KIND
+
+    def __post_init__(self) -> None:
+        _require_schema(self.schema, "lifecycle_marker")
+        _require_kind(self.kind, LIFECYCLE_MARKER_RECORD_KIND, "lifecycle_marker")
+        validate_identifier(self.invocation_id, "lifecycle_marker.invocation_id")
+        state = _require_choice(
+            self.state,
+            OBSERVABILITY_LIFECYCLE_MARKER_STATES,
+            "lifecycle_marker.state",
+        )
+        manifest_state = _require_choice(
+            self.manifest_lifecycle_state,
+            OBSERVABILITY_LIFECYCLE_STATES,
+            "lifecycle_marker.manifest_lifecycle_state",
+        )
+        # Keep marker state and paired manifest lifecycle state internally consistent.
+        expected_manifest_state = "closed" if state == "finalized" else state
+        if manifest_state != expected_manifest_state:
+            raise ObservabilitySchemaError(
+                f"lifecycle_marker.state {state!r} requires "
+                f"manifest_lifecycle_state == {expected_manifest_state!r}, "
+                f"got {manifest_state!r}"
+            )
+        _require_choice(
+            self.manifest_data_completeness,
+            OBSERVABILITY_DATA_COMPLETENESS,
+            "lifecycle_marker.manifest_data_completeness",
+        )
+        _require_sha256_hex(self.manifest_sha256, "lifecycle_marker.manifest_sha256")
+        _require_int(self.manifest_bytes, "lifecycle_marker.manifest_bytes", min_value=1)
+        _require_nonempty_str(self.run_id, "lifecycle_marker.run_id")
+        _require_sha256_hex(
+            self.configuration_digest, "lifecycle_marker.configuration_digest"
+        )
+        validate_identifier(self.inventory_id, "lifecycle_marker.inventory_id")
+        validate_identifier(
+            self.descriptor_set_id, "lifecycle_marker.descriptor_set_id"
+        )
+        if not isinstance(self.observer_ids, (list, tuple)):
+            raise ObservabilitySchemaError(
+                "lifecycle_marker.observer_ids must be a sequence of observer IDs"
+            )
+        validated_observers: list[str] = []
+        seen_obs: set[str] = set()
+        for idx, raw_obs in enumerate(self.observer_ids):
+            obs_id = validate_identifier(
+                raw_obs,
+                f"lifecycle_marker.observer_ids[{idx}]",
+                forbid_status_collision=True,
+            )
+            if obs_id in seen_obs:
+                raise ObservabilitySchemaError(
+                    f"duplicate observer_id {obs_id!r} in lifecycle_marker.observer_ids"
+                )
+            seen_obs.add(obs_id)
+            validated_observers.append(obs_id)
+        object.__setattr__(self, "observer_ids", tuple(validated_observers))
+        _require_int(self.artifact_count, "lifecycle_marker.artifact_count", min_value=0)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a strict JSON-safe dictionary matching ``lifecycle-marker.json``."""
+
+        return {
+            "schema": self.schema,
+            "kind": self.kind,
+            "invocation_id": self.invocation_id,
+            "state": self.state,
+            "manifest_lifecycle_state": self.manifest_lifecycle_state,
+            "manifest_data_completeness": self.manifest_data_completeness,
+            "manifest_sha256": self.manifest_sha256,
+            "manifest_bytes": self.manifest_bytes,
+            "run_id": self.run_id,
+            "configuration_digest": self.configuration_digest,
+            "inventory_id": self.inventory_id,
+            "descriptor_set_id": self.descriptor_set_id,
+            "observer_ids": list(self.observer_ids),
+            "artifact_count": self.artifact_count,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> ObservabilityLifecycleMarker:
+        """Validate and construct an :class:`ObservabilityLifecycleMarker`."""
+
+        mapping = _require_mapping(data, "lifecycle_marker")
+        _require_keys(
+            mapping,
+            required={
+                "schema",
+                "kind",
+                "invocation_id",
+                "state",
+                "manifest_lifecycle_state",
+                "manifest_data_completeness",
+                "manifest_sha256",
+                "manifest_bytes",
+                "run_id",
+                "configuration_digest",
+                "inventory_id",
+                "descriptor_set_id",
+                "observer_ids",
+                "artifact_count",
+            },
+            context="lifecycle_marker",
+        )
+        return cls(
+            schema=mapping["schema"],
+            kind=mapping["kind"],
+            invocation_id=mapping["invocation_id"],
+            state=mapping["state"],
+            manifest_lifecycle_state=mapping["manifest_lifecycle_state"],
+            manifest_data_completeness=mapping["manifest_data_completeness"],
+            manifest_sha256=mapping["manifest_sha256"],
+            manifest_bytes=mapping["manifest_bytes"],
+            run_id=mapping["run_id"],
+            configuration_digest=mapping["configuration_digest"],
+            inventory_id=mapping["inventory_id"],
+            descriptor_set_id=mapping["descriptor_set_id"],
+            observer_ids=tuple(mapping["observer_ids"])
+            if isinstance(mapping["observer_ids"], (list, tuple))
+            else mapping["observer_ids"],
+            artifact_count=mapping["artifact_count"],
+        )
+
+
 def parse_observability_record(
     data: Any,
 ) -> (
@@ -2324,6 +2509,7 @@ def parse_observability_record(
     | ObservabilityStatus
     | ObservabilityProfileStatus
     | ObservabilityProfileSummary
+    | ObservabilityLifecycleMarker
 ):
     """Dispatch a raw mapping to its validated ``tpen.run-observability/v1`` type."""
 
@@ -2342,6 +2528,8 @@ def parse_observability_record(
         return ObservabilityStatus.from_mapping(mapping)
     if kind == "profile_status":
         return ObservabilityProfileStatus.from_mapping(mapping)
+    if kind == LIFECYCLE_MARKER_RECORD_KIND:
+        return ObservabilityLifecycleMarker.from_mapping(mapping)
     return ObservabilityProfileSummary.from_mapping(mapping)
 
 
@@ -2666,6 +2854,31 @@ class ObservabilityBundleWriter:
         self._pending_bytes: dict[str, int] = {}
         self._written_artifacts: dict[str, Path] = {}
 
+    def __getstate__(self) -> Any:
+        """Refuse serialization of live observability bundle writers."""
+
+        raise TypeError(
+            "ObservabilityBundleWriter is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
+
+    def __reduce__(self) -> Any:
+        """Refuse pickling of live observability bundle writers."""
+
+        raise TypeError(
+            "ObservabilityBundleWriter is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        """Refuse pickling of live observability bundle writers."""
+
+        del protocol
+        raise TypeError(
+            "ObservabilityBundleWriter is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
+
     @property
     def finalized(self) -> bool:
         """Return whether ``manifest.json`` has been finalized."""
@@ -2773,8 +2986,43 @@ class ObservabilityBundleWriter:
                 except OSError:
                     pass
 
+    def _write_lifecycle_marker(
+        self,
+        manifest: ObservabilityManifest,
+        manifest_payload: bytes,
+    ) -> Path:
+        """Atomically write additive ``lifecycle-marker.json`` linked to ``manifest.json``."""
+
+        marker_state = (
+            "finalized"
+            if manifest.lifecycle_state == "closed"
+            else manifest.lifecycle_state
+        )
+        marker = ObservabilityLifecycleMarker(
+            invocation_id=manifest.invocation_id,
+            state=marker_state,
+            manifest_lifecycle_state=manifest.lifecycle_state,
+            manifest_data_completeness=manifest.data_completeness,
+            manifest_sha256=hashlib.sha256(manifest_payload).hexdigest(),
+            manifest_bytes=len(manifest_payload),
+            run_id=manifest.run_id,
+            configuration_digest=manifest.configuration_digest,
+            inventory_id=manifest.inventory_id,
+            descriptor_set_id=manifest.descriptor_set_id,
+            observer_ids=tuple(
+                sorted(str(obs["observer_id"]) for obs in manifest.observers)
+            ),
+            artifact_count=len(manifest.artifacts),
+        )
+        marker_target = self._safe_artifact_path(
+            LIFECYCLE_MARKER_FILENAME, allow_manifest=True
+        )
+        marker_payload = _dumps_canonical_json(marker.to_dict()).encode("ascii")
+        self._atomic_write_bytes(marker_target, marker_payload)
+        return marker_target
+
     def write_open_manifest(self, manifest: ObservabilityManifest) -> Path:
-        """Atomically write the initial ``lifecycle_state="open"`` manifest."""
+        """Atomically write the initial ``lifecycle_state="open"`` manifest and open marker."""
 
         self._require_not_finalized("write_open_manifest")
         if not isinstance(manifest, ObservabilityManifest):
@@ -2791,6 +3039,7 @@ class ObservabilityBundleWriter:
         target = self._safe_artifact_path(MANIFEST_FILENAME, allow_manifest=True)
         payload = _dumps_canonical_json(manifest.to_dict()).encode("ascii")
         self._atomic_write_bytes(target, payload)
+        self._write_lifecycle_marker(manifest, payload)
         return target
 
     def write_inventory(self, inventory: ObservabilityInventory) -> Path:
@@ -3247,6 +3496,7 @@ class ObservabilityBundleWriter:
         )
         payload = _dumps_canonical_json(finalized_manifest.to_dict()).encode("ascii")
         self._atomic_write_bytes(manifest_target, payload)
+        self._write_lifecycle_marker(finalized_manifest, payload)
         self._finalized = True
         return finalized_manifest
 
@@ -4584,9 +4834,12 @@ __all__ = [
     "DESCRIPTORS_FILENAME",
     "INVENTORY_FILENAME",
     "LEGACY_PROFILE_STATUS_FILENAME",
+    "LIFECYCLE_MARKER_FILENAME",
+    "LIFECYCLE_MARKER_RECORD_KIND",
     "MANIFEST_FILENAME",
     "OBSERVABILITY_ALL_RECORD_KINDS",
     "OBSERVABILITY_DATA_COMPLETENESS",
+    "OBSERVABILITY_LIFECYCLE_MARKER_STATES",
     "OBSERVABILITY_LIFECYCLE_STATES",
     "OBSERVABILITY_PROFILE_WINDOW_KINDS",
     "OBSERVABILITY_READING_STATUSES",
@@ -4606,6 +4859,7 @@ __all__ = [
     "ObservabilityDescriptorSet",
     "ObservabilityDiagnostic",
     "ObservabilityInventory",
+    "ObservabilityLifecycleMarker",
     "ObservabilityManifest",
     "ObservabilityPathError",
     "ObservabilityProfileStatus",

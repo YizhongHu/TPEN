@@ -238,6 +238,31 @@ class TorchAllocatorPeakProbe:
         except (RuntimeError, AttributeError) as exc:
             return AllocatorUnavailable(f"{type(exc).__name__}: {exc}")
 
+    def __getstate__(self) -> Any:
+        """Refuse serialization of live allocator probes and reset epochs."""
+
+        raise TypeError(
+            "TorchAllocatorPeakProbe is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
+
+    def __reduce__(self) -> Any:
+        """Refuse pickling of live allocator probes and reset epochs."""
+
+        raise TypeError(
+            "TorchAllocatorPeakProbe is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        """Refuse pickling of live allocator probes and reset epochs."""
+
+        del protocol
+        raise TypeError(
+            "TorchAllocatorPeakProbe is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
+
 
 class TorchAllocatorCurrentProbe:
     """Read point-in-time allocator counters for one configured torch device.
@@ -350,6 +375,31 @@ class TorchAllocatorCurrentProbe:
             return int(self.module.device_count())
         except (RuntimeError, AttributeError) as exc:
             return AllocatorUnavailable(f"{type(exc).__name__}: {exc}")
+
+    def __getstate__(self) -> Any:
+        """Refuse serialization of live allocator probes."""
+
+        raise TypeError(
+            "TorchAllocatorCurrentProbe is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
+
+    def __reduce__(self) -> Any:
+        """Refuse pickling of live allocator probes."""
+
+        raise TypeError(
+            "TorchAllocatorCurrentProbe is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        """Refuse pickling of live allocator probes."""
+
+        del protocol
+        raise TypeError(
+            "TorchAllocatorCurrentProbe is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
 
 
 def _torch(feature: str) -> Any:
@@ -515,6 +565,31 @@ class DeviceEventTimer:
             return float(start_event.elapsed_time(end_event)) / 1_000.0
         finally:
             self._start_event = None
+
+    def __getstate__(self) -> Any:
+        """Refuse serialization of live accelerator event timers."""
+
+        raise TypeError(
+            "DeviceEventTimer is invocation-local timing state and cannot be "
+            "serialized or checkpointed"
+        )
+
+    def __reduce__(self) -> Any:
+        """Refuse pickling of live accelerator event timers."""
+
+        raise TypeError(
+            "DeviceEventTimer is invocation-local timing state and cannot be "
+            "serialized or checkpointed"
+        )
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        """Refuse pickling of live accelerator event timers."""
+
+        del protocol
+        raise TypeError(
+            "DeviceEventTimer is invocation-local timing state and cannot be "
+            "serialized or checkpointed"
+        )
 
 
 def device_event_timer(

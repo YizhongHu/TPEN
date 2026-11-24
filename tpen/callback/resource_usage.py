@@ -96,6 +96,31 @@ class ResourceUsage(Callback):
         self._process_baseline = None
         self._reported = False
 
+    def __getstate__(self) -> Any:
+        """Refuse serialization of invocation-local RUSAGE/allocator handles."""
+
+        raise TypeError(
+            "ResourceUsage holds invocation-local RUSAGE baselines and allocator "
+            "probes and cannot be serialized or checkpointed"
+        )
+
+    def __reduce__(self) -> Any:
+        """Refuse pickling of invocation-local RUSAGE/allocator handles."""
+
+        raise TypeError(
+            "ResourceUsage holds invocation-local RUSAGE baselines and allocator "
+            "probes and cannot be serialized or checkpointed"
+        )
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        """Refuse pickling of invocation-local RUSAGE/allocator handles."""
+
+        del protocol
+        raise TypeError(
+            "ResourceUsage holds invocation-local RUSAGE baselines and allocator "
+            "probes and cannot be serialized or checkpointed"
+        )
+
     def handle_occurrence_impl(
         self, occurrence: Occurrence[TypedEvent], context: RunContext
     ) -> None:

@@ -1903,6 +1903,31 @@ class _ResourceSamplesHandle:
     def __init__(self, session: _ResourceSamplesSession) -> None:
         self._session = session
 
+    def __getstate__(self) -> Any:
+        """Refuse serialization of live cooperative RunResource handles."""
+
+        raise TypeError(
+            "_ResourceSamplesHandle is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
+
+    def __reduce__(self) -> Any:
+        """Refuse pickling of live cooperative RunResource handles."""
+
+        raise TypeError(
+            "_ResourceSamplesHandle is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        """Refuse pickling of live cooperative RunResource handles."""
+
+        del protocol
+        raise TypeError(
+            "_ResourceSamplesHandle is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
+
     def checkpoint(self) -> None:
         """Advance due cooperative allocator sampling on the owning thread."""
 
@@ -1916,6 +1941,31 @@ class _ResourceSamplesHandle:
 
 class _ResourceSamplesSession:
     """Runtime owner for one active ``ResourceSamples.run_scope(context)``."""
+
+    def __getstate__(self) -> Any:
+        """Refuse serialization of live sampling sessions and helper threads."""
+
+        raise TypeError(
+            "_ResourceSamplesSession is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
+
+    def __reduce__(self) -> Any:
+        """Refuse pickling of live sampling sessions and helper threads."""
+
+        raise TypeError(
+            "_ResourceSamplesSession is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        """Refuse pickling of live sampling sessions and helper threads."""
+
+        del protocol
+        raise TypeError(
+            "_ResourceSamplesSession is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
 
     def __init__(
         self,
@@ -4370,6 +4420,31 @@ class _DisabledScope(AbstractContextManager[RunResource | None]):
 class _ResourceSamplesScope(AbstractContextManager[RunResource | None]):
     """Context manager acquiring and releasing one :class:`_ResourceSamplesSession`."""
 
+    def __getstate__(self) -> Any:
+        """Refuse serialization of live managed callback scopes."""
+
+        raise TypeError(
+            "_ResourceSamplesScope is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
+
+    def __reduce__(self) -> Any:
+        """Refuse pickling of live managed callback scopes."""
+
+        raise TypeError(
+            "_ResourceSamplesScope is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        """Refuse pickling of live managed callback scopes."""
+
+        del protocol
+        raise TypeError(
+            "_ResourceSamplesScope is invocation-local observability state "
+            "and cannot be serialized or checkpointed"
+        )
+
     def __init__(self, callback: ResourceSamples, context: RunContext) -> None:
         self._callback = callback
         self._context = context
@@ -4736,6 +4811,31 @@ class ResourceSamples(Callback):
         self._unsafe = False
         self._active_session: _ResourceSamplesSession | None = None
         self._observed_application_outcome: str = "not_supplied"
+
+    def __getstate__(self) -> Any:
+        """Refuse serialization of managed observability callbacks."""
+
+        raise TypeError(
+            "ResourceSamples is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
+
+    def __reduce__(self) -> Any:
+        """Refuse pickling of managed observability callbacks."""
+
+        raise TypeError(
+            "ResourceSamples is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        """Refuse pickling of managed observability callbacks."""
+
+        del protocol
+        raise TypeError(
+            "ResourceSamples is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
 
     def _reset_typed_state(self) -> None:
         # Only reset between invocations; an active scope keeps its live state.
