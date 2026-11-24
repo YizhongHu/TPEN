@@ -20,13 +20,16 @@ from __future__ import annotations
 import copy
 import inspect
 import json
+import shutil
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
 import torch
 
-from tests.helpers.hooke_models import build_tiny_hamiltonian_terms
+from tests.helpers.hooke_models import build_tiny_hamiltonian_terms, build_tiny_spenn
 from tests.helpers.spring_dense_oracle import spring_trajectory
 from tests.helpers.sr_dense_oracle import sr_direction
 from tests.unit.training.test_sr_trainer_integration import (
@@ -34,7 +37,13 @@ from tests.unit.training.test_sr_trainer_integration import (
     _FixedSampler,
     build_connected_model,
 )
+from tests.unit.training.test_update_binding import (
+    _FixedSampler as _CheckpointFixedSampler,
+    _checkpoint_context,
+)
 from tests.unit.training.test_vmc_trainer_tpen_smoke import _StubContext
+from tpen.checkpoint import TrainResume, restore_checkpoint, save_checkpoint
+from tpen.checkpoint.hashing import file_sha256
 from tpen.data.batch import (
     ElectronBatch,
     MaterializedParameterLogScores,
@@ -732,3 +741,345 @@ def test_nonfinite_score_injected_during_trainer_fit_raises_and_preserves_state(
         assert post_step0_history is not None
         assert torch.linalg.vector_norm(post_step0_history).item() > 0.0
         assert torch.equal(method.history, post_step0_history)
+
+
+# --------------------------------------------------------------------------
+# Consumer-side save_checkpoint -> restore_checkpoint v2 policy round-trip
+# --------------------------------------------------------------------------
+
+
+def _build_checkpoint_run(
+    kind: str,
+    *,
+    max_steps: int,
+    seed: int,
+    nonfinite_local_energy_policy: str,
+) -> tuple[
+    torch.nn.Module,
+    StochasticReconfigurationUpdate | SPRINGUpdate,
+    VMCTrainer,
+    _CheckpointFixedSampler,
+]:
+    """Build one seeded tiny model/method/trainer/sampler bundle for checkpoint resume."""
+
+    torch.manual_seed(seed)
+    model = build_tiny_spenn()
+    parameters = tuple(model.parameters())
+    optimizer = torch.optim.SGD(parameters, lr=TRAINER_LEARNING_RATE)
+    binding = ModelParameterBinding(parameters=parameters)
+    if kind == "sr":
+        method: StochasticReconfigurationUpdate | SPRINGUpdate = (
+            StochasticReconfigurationUpdate(
+                optimizer,
+                model_parameters=binding,
+                policy=SRPolicy(
+                    solve_space="parameter",
+                    damping=DampingPolicy(absolute=0.0, relative=1.0e-2, minimum=1.0e-12),
+                    learning_rate=TRAINER_LEARNING_RATE,
+                ),
+                conventions=ScoreConventions(solve_dtype=torch.float64),
+                nonfinite_local_energy_policy=nonfinite_local_energy_policy,
+            )
+        )
+    elif kind == "spring":
+        base = SRPolicy(
+            solve_space="sample",
+            damping=DampingPolicy(absolute=0.0, relative=1.0e-2, minimum=1.0e-12),
+            learning_rate=TRAINER_LEARNING_RATE,
+        )
+        method = SPRINGUpdate(
+            optimizer,
+            model_parameters=binding,
+            policy=SPRINGPolicy(base=base, history_decay=0.35),
+            conventions=ScoreConventions(solve_dtype=torch.float64),
+            nonfinite_local_energy_policy=nonfinite_local_energy_policy,
+        )
+    else:
+        raise ValueError(f"unknown checkpoint method kind {kind!r}")
+    trainer = VMCTrainer(
+        max_steps=max_steps,
+        log_every_n_steps=1,
+        update_method=method,
+        nonfinite_local_energy_policy=nonfinite_local_energy_policy,
+    )
+    return model, method, trainer, _CheckpointFixedSampler()
+
+
+def _rewrite_trainer_json_and_digest(
+    src_dir: Path,
+    dst_dir: Path,
+    mutate: Callable[[dict[str, Any]], None],
+) -> Path:
+    """Clone a checkpoint dir, mutate ``trainer.json``, and recompute ``trainer_sha256``."""
+
+    shutil.copytree(src_dir, dst_dir)
+    trainer_path = dst_dir / "trainer.json"
+    manifest_path = dst_dir / "manifest.json"
+    trainer_state = json.loads(trainer_path.read_text(encoding="utf-8"))
+    mutate(trainer_state)
+    trainer_path.write_text(
+        json.dumps(trainer_state, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["hashes"]["trainer_sha256"] = file_sha256(trainer_path)
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return dst_dir
+
+
+@pytest.mark.parametrize("kind", ["sr", "spring"])
+def test_checkpoint_save_restore_v2_policy_roundtrip_and_refusals(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    """Real ``save_checkpoint`` -> ``restore_checkpoint`` pins v2 schema and policy gates."""
+
+    terms = build_tiny_hamiltonian_terms()
+    ckpt_context = _checkpoint_context(tmp_path)
+
+    # 1. Uninterrupted 2-step "fail" reference vs 1-step save + train_resume + step 2.
+    straight_model, straight_method, straight_trainer, straight_sampler = (
+        _build_checkpoint_run(
+            kind, max_steps=2, seed=0, nonfinite_local_energy_policy="fail"
+        )
+    )
+    straight_trainer.resolve_update_state(
+        model=straight_model, optimizer=straight_method.optimizer
+    )
+    straight_trainer.fit(
+        model=straight_model,
+        sampler=straight_sampler,
+        hamiltonian_terms=terms,
+        optimizer=straight_method.optimizer,
+        context=_StubContext(),
+        emit=lambda **_: None,
+    )
+    assert straight_trainer.next_iteration == 2
+    assert straight_trainer.completed_updates == 2
+    assert straight_method.completed_updates == 2
+    straight_params = [p.detach().clone() for p in straight_model.parameters()]
+
+    model, method, trainer, sampler = _build_checkpoint_run(
+        kind, max_steps=1, seed=0, nonfinite_local_energy_policy="fail"
+    )
+    trainer.resolve_update_state(model=model, optimizer=method.optimizer)
+    trainer.fit(
+        model=model,
+        sampler=sampler,
+        hamiltonian_terms=terms,
+        optimizer=method.optimizer,
+        context=_StubContext(),
+        emit=lambda **_: None,
+    )
+    assert trainer.next_iteration == 1
+    assert trainer.completed_updates == 1
+    assert method.completed_updates == 1
+    step1_params = [p.detach().clone() for p in model.parameters()]
+    assert any(
+        not torch.equal(first, second)
+        for first, second in zip(step1_params, straight_params, strict=True)
+    ), "step 2 must move parameters so resumed step parity is non-vacuous"
+    if isinstance(method, SPRINGUpdate):
+        assert torch.linalg.vector_norm(method.history).item() > 0.0
+
+    checkpoint_dir = save_checkpoint(
+        output_dir=tmp_path / "checkpoints",
+        next_iteration=trainer.next_iteration,
+        completed_updates=trainer.completed_updates,
+        model=model,
+        context=ckpt_context,
+        optimizer=method.optimizer,
+        trainer=trainer,
+        sampler=sampler,
+        payload=TrainResume(),
+    )
+
+    expected_version = SPRING_STATE_VERSION if kind == "spring" else SR_STATE_VERSION
+    on_disk_trainer = json.loads(
+        (checkpoint_dir / "trainer.json").read_text(encoding="utf-8")
+    )
+    assert on_disk_trainer["nonfinite_local_energy_policy"] == "fail"
+    on_disk_method = on_disk_trainer["update_method"]
+    assert on_disk_method["version"] == expected_version
+    assert on_disk_method["nonfinite_local_energy_policy"] == "fail"
+    assert on_disk_method["nonfinite_score_row_policy"] == "fail_on_pinned"
+    assert on_disk_method["completed_updates"] == 1
+
+    resumed_model, resumed_method, resumed_trainer, resumed_sampler = (
+        _build_checkpoint_run(
+            kind, max_steps=2, seed=99, nonfinite_local_energy_policy="fail"
+        )
+    )
+    resumed_trainer.resolve_update_state(
+        model=resumed_model, optimizer=resumed_method.optimizer
+    )
+    report = restore_checkpoint(
+        load={"mode": "train_resume", "path": str(checkpoint_dir)},
+        model=resumed_model,
+        context=ckpt_context,
+        optimizer=resumed_method.optimizer,
+        trainer=resumed_trainer,
+        sampler=resumed_sampler,
+        mode="train_resume",
+    )
+    assert report.loaded_trainer is True
+    assert report.completed_updates == 1
+    assert resumed_trainer.next_iteration == 1
+    assert resumed_trainer.completed_updates == 1
+    assert resumed_method.completed_updates == 1
+    for expected_param, actual_param in zip(
+        step1_params, resumed_model.parameters(), strict=True
+    ):
+        assert torch.equal(actual_param.detach(), expected_param)
+    if isinstance(resumed_method, SPRINGUpdate) and isinstance(method, SPRINGUpdate):
+        assert torch.equal(resumed_method.history, method.history)
+
+    resumed_trainer.rebuild_update_state(model=resumed_model)
+    resumed_trainer.fit(
+        model=resumed_model,
+        sampler=resumed_sampler,
+        hamiltonian_terms=terms,
+        optimizer=resumed_method.optimizer,
+        context=_StubContext(),
+        emit=lambda **_: None,
+    )
+    assert resumed_trainer.next_iteration == 2
+    assert resumed_trainer.completed_updates == 2
+    assert resumed_method.completed_updates == 2
+    for expected_param, actual_param in zip(
+        straight_params, resumed_model.parameters(), strict=True
+    ):
+        assert torch.equal(actual_param.detach(), expected_param)
+    if isinstance(resumed_method, SPRINGUpdate) and isinstance(
+        straight_method, SPRINGUpdate
+    ):
+        assert torch.linalg.vector_norm(straight_method.history).item() > 0.0
+        assert torch.equal(resumed_method.history, straight_method.history)
+
+    # 2. Legacy v1 schema refusal via restore_checkpoint (updated trainer_sha256 so the
+    #    method version gate fires rather than the digest gate or trainer policy gate).
+    legacy_version = "spring-state-1" if kind == "spring" else "sr-state-1"
+
+    def _to_legacy_v1(state: dict[str, Any]) -> None:
+        state["nonfinite_local_energy_policy"] = "mask"
+        state["update_method"]["version"] = legacy_version
+        state["update_method"].pop("nonfinite_local_energy_policy", None)
+        state["update_method"].pop("nonfinite_score_row_policy", None)
+
+    legacy_dir = _rewrite_trainer_json_and_digest(
+        checkpoint_dir, tmp_path / "legacy-v1", _to_legacy_v1
+    )
+    legacy_model, legacy_method, legacy_trainer, legacy_sampler = (
+        _build_checkpoint_run(
+            kind, max_steps=2, seed=101, nonfinite_local_energy_policy="mask"
+        )
+    )
+    legacy_trainer.resolve_update_state(
+        model=legacy_model, optimizer=legacy_method.optimizer
+    )
+    with pytest.raises(ValueError, match=r"unsupported (SR|SPRING) state version"):
+        restore_checkpoint(
+            load={"mode": "train_resume", "path": str(legacy_dir)},
+            model=legacy_model,
+            context=ckpt_context,
+            optimizer=legacy_method.optimizer,
+            trainer=legacy_trainer,
+            sampler=legacy_sampler,
+            mode="train_resume",
+        )
+    assert legacy_trainer.next_iteration == 0
+    assert legacy_trainer.completed_updates == 0
+    assert legacy_method.completed_updates == 0
+    if isinstance(legacy_method, SPRINGUpdate):
+        assert torch.equal(legacy_method.history, torch.zeros_like(legacy_method.history))
+
+    # 3a. Unmodified "fail" checkpoint fed into a fresh "mask" trainer+method:
+    #     same ckpt_context passes config-hash checks so trainer policy refusal fires.
+    mask_model, mask_method, mask_trainer, mask_sampler = _build_checkpoint_run(
+        kind, max_steps=2, seed=102, nonfinite_local_energy_policy="mask"
+    )
+    mask_trainer.resolve_update_state(
+        model=mask_model, optimizer=mask_method.optimizer
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"non-finite local-energy policy disagrees with the checkpoint",
+    ):
+        restore_checkpoint(
+            load={"mode": "train_resume", "path": str(checkpoint_dir)},
+            model=mask_model,
+            context=ckpt_context,
+            optimizer=mask_method.optimizer,
+            trainer=mask_trainer,
+            sampler=mask_sampler,
+            mode="train_resume",
+        )
+    assert mask_trainer.next_iteration == 0
+    assert mask_trainer.completed_updates == 0
+    assert mask_method.completed_updates == 0
+
+    # 3b. Method-level nonfinite_local_energy_policy drift inside trainer.json["update_method"]
+    #     (top-level trainer policy matches "fail" so load_method_state_dict's check fires).
+    def _drift_method_energy_policy(state: dict[str, Any]) -> None:
+        state["update_method"]["nonfinite_local_energy_policy"] = "mask"
+
+    energy_drift_dir = _rewrite_trainer_json_and_digest(
+        checkpoint_dir, tmp_path / "method-energy-drift", _drift_method_energy_policy
+    )
+    ed_model, ed_method, ed_trainer, ed_sampler = _build_checkpoint_run(
+        kind, max_steps=2, seed=103, nonfinite_local_energy_policy="fail"
+    )
+    ed_trainer.resolve_update_state(model=ed_model, optimizer=ed_method.optimizer)
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"(SR|SPRING) checkpoint nonfinite_local_energy_policy does not match "
+            r"the live method: recorded 'mask', live 'fail'"
+        ),
+    ):
+        restore_checkpoint(
+            load={"mode": "train_resume", "path": str(energy_drift_dir)},
+            model=ed_model,
+            context=ckpt_context,
+            optimizer=ed_method.optimizer,
+            trainer=ed_trainer,
+            sampler=ed_sampler,
+            mode="train_resume",
+        )
+    assert ed_trainer.next_iteration == 0
+    assert ed_trainer.completed_updates == 0
+    assert ed_method.completed_updates == 0
+
+    # 3c. Method-level nonfinite_score_row_policy drift inside trainer.json["update_method"].
+    def _drift_score_row_policy(state: dict[str, Any]) -> None:
+        state["update_method"]["nonfinite_score_row_policy"] = "mask"
+
+    score_drift_dir = _rewrite_trainer_json_and_digest(
+        checkpoint_dir, tmp_path / "score-policy-drift", _drift_score_row_policy
+    )
+    sd_model, sd_method, sd_trainer, sd_sampler = _build_checkpoint_run(
+        kind, max_steps=2, seed=104, nonfinite_local_energy_policy="fail"
+    )
+    sd_trainer.resolve_update_state(model=sd_model, optimizer=sd_method.optimizer)
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"(SR|SPRING) checkpoint nonfinite_score_row_policy does not match "
+            r"the live method: recorded 'mask', live 'fail_on_pinned'"
+        ),
+    ):
+        restore_checkpoint(
+            load={"mode": "train_resume", "path": str(score_drift_dir)},
+            model=sd_model,
+            context=ckpt_context,
+            optimizer=sd_method.optimizer,
+            trainer=sd_trainer,
+            sampler=sd_sampler,
+            mode="train_resume",
+        )
+    assert sd_trainer.next_iteration == 0
+    assert sd_trainer.completed_updates == 0
+    assert sd_method.completed_updates == 0
