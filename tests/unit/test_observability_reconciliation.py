@@ -856,10 +856,6 @@ def test_open_marker_identity_mismatch_is_not_masked_as_interrupted(
     marker["run_id"] = "different-strict-valid-run-id"
     marker_path.write_text(json.dumps(marker), encoding="utf-8")
     mismatched = reconcile_observability_bundle(writer.bundle_dir)
-    assert mismatched.reconciliation_state == "failed"
-    assert mismatched.lifecycle_state == "unsafe"
-    assert mismatched.finalization == "unsafe"
-    assert mismatched.assessment_reason == "lifecycle_marker_identity_mismatch"
     assert mismatched.lifecycle_marker.diagnostic_code == (
         "lifecycle_marker_identity_mismatch"
     )
@@ -877,6 +873,50 @@ def test_open_marker_identity_mismatch_is_not_masked_as_interrupted(
     assert closed_mismatch.reconciliation_state == "failed"
     assert closed_mismatch.lifecycle_state == "unsafe"
     assert closed_mismatch.assessment_reason == "lifecycle_marker_identity_mismatch"
+
+    # Keep the expected-red assertion last so the closed control and marker
+    # diagnostic evidence above are independently measured in one run.
+    assert mismatched.reconciliation_state == "failed"
+    assert mismatched.lifecycle_state == "unsafe"
+    assert mismatched.finalization == "unsafe"
+    assert mismatched.assessment_reason == "lifecycle_marker_identity_mismatch"
+
+
+def test_unsafe_status_before_manifest_is_not_masked_as_open(
+    tmp_path: Path,
+) -> None:
+    """A real unsafe status survives a crash before final manifest replacement."""
+
+    manager = _make_manager(tmp_path, run_id="unsafe-status-before-manifest")
+    writer = ObservabilityBundleWriter(manager, INVOCATION_ID)
+    writer.write_open_manifest(_base_manifest())
+    writer.write_inventory(_base_inventory())
+    writer.write_descriptors(_base_descriptors())
+    assert writer.append_sample(_sample_packets()[0]).written is True
+    writer.write_status(
+        _make_status(
+            lifecycle_state="unsafe",
+            data_completeness="partial",
+            writer={
+                "state": "unsafe",
+                "flush_confirmed": False,
+                "fsync_confirmed": False,
+            },
+            helper_cleanup={"state": "unconfirmed_timeout"},
+        )
+    )
+
+    reconciled = reconcile_observability_bundle(writer.bundle_dir)
+    status = reconciled.inspection.statuses["resources-main"]
+    assert status.lifecycle_state == "unsafe"
+    assert status.writer["state"] == "unsafe"
+    assert status.helper_cleanup["state"] == "unconfirmed_timeout"
+
+    # This is the expected-red assertion: the known unsafe status must not be
+    # hidden by the still-open manifest precedence.
+    assert reconciled.reconciliation_state == "failed"
+    assert reconciled.lifecycle_state == "unsafe"
+    assert reconciled.finalization == "unsafe"
 
 
 def test_renderer_bounds_embedded_newlines_without_changing_identity(
@@ -896,7 +936,6 @@ def test_renderer_bounds_embedded_newlines_without_changing_identity(
     rendered = render_operator_summary(
         newline_summary, max_lines=3, max_line_chars=256
     )
-    assert len(rendered.splitlines()) <= 3
     assert newline_summary.identity.to_dict() == identity_before
     assert newline_summary.identity.run_id == manifest_run_id
     assert newline_summary.identity.invocation_id == INVOCATION_ID
@@ -915,27 +954,9 @@ def test_renderer_bounds_embedded_newlines_without_changing_identity(
     )
     assert len(ordinary_rendered.splitlines()) <= 3
 
-
-def test_renderer_bounds_mutant_is_detected_with_green_baseline(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The bounded-render assertion detects an explicit truncation mutant."""
-
-    _, writer = _write_clean_bundle(tmp_path, run_id="renderer-mutant")
-    summary = reconcile_observability_bundle(writer.bundle_dir).summary
-    baseline = render_operator_summary(summary, max_lines=3, max_line_chars=256)
-    assert len(baseline.splitlines()) <= 3
-
-    def mutant(_summary: BoundedOperatorSummary, **_kwargs: Any) -> str:
-        return "\n".join(("mutant-line",) * 4)
-
-    monkeypatch.setattr(rec_mod, "render_operator_summary", mutant)
-    mutant_output = rec_mod.render_operator_summary(
-        summary, max_lines=3, max_line_chars=256
-    )
-    assert len(mutant_output.splitlines()) > 3
-    with pytest.raises(AssertionError):
-        assert len(mutant_output.splitlines()) <= 3
+    # The expected-red assertion is last; ordinary text control and identity
+    # checks above are therefore not skipped when this detector fails.
+    assert len(rendered.splitlines()) <= 3
 
 
 # ---------------------------------------------------------------------------
