@@ -1187,6 +1187,7 @@ class ParslDispatcher(DispatcherContract):
                 output_dir, _core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = _member_paths(fence)
                 args = configured.command_for_attempt(
                     output_dir,
+                    root=fence.root,
                     group_digest=group.identity,
                     task_id=member.task_id,
                     attempt_id=fence.attempt_id.value,

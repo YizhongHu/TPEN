@@ -112,6 +112,31 @@ RUN_SHIM = (
 # leaf gets the same placement/observation prelude plus a closed script-path
 # handoff, derived once here rather than maintaining a second copy.
 _CONFIGURED_SHIM_IMPORT = "from tpen.run import main\n"
+# The configured prelude has the same run-root contract as RUN_SHIM, but its
+# root comes from the typed delta rather than a legacy run.root override.
+_CONFIGURED_SHIM_ROOTS = (
+    "if '--tpen-executor-script' in sys.argv[1:]:\n"
+    "    try:\n"
+    "        _delta_index = sys.argv.index('--attempt-delta')\n"
+    "        _delta = json.loads(sys.argv[_delta_index + 1])\n"
+    "        _attempt_core = _delta['attempt_core_dir']\n"
+    "        _attempt_leaf = os.path.dirname(_attempt_core)\n"
+    "        _placement_path = os.environ['TPEN_PLACEMENT_OUTPUT']\n"
+    "        _placement_leaf = os.path.dirname(_placement_path)\n"
+    "        if (type(_attempt_core) is not str or not os.path.isabs(_attempt_core)\n"
+    "                or os.path.normpath(_attempt_core) != _attempt_core\n"
+    "                or os.path.basename(_attempt_core) != 'core'\n"
+    "                or not os.path.isabs(_placement_path)\n"
+    "                or os.path.normpath(_placement_path) != _placement_path\n"
+    "                or _placement_leaf != _attempt_leaf):\n"
+    "            raise ValueError('configured attempt output does not bind placement output')\n"
+    "        run_roots = [_attempt_leaf]\n"
+    "    except (KeyError, IndexError, TypeError, ValueError):\n"
+    "        print('configured placement refused: invalid attempt delta/output binding', file=sys.stderr)\n"
+    "        raise SystemExit(2)\n"
+    "else:\n"
+    "    run_roots = [arg.split('=', 1)[1] for arg in sys.argv[1:] if arg.startswith('run.root=')]\n"
+)
 # C2.2 binds configured attempt output through one canonical delta and never
 # silently strips arbitrary run.* values from a configured command.
 _CONFIGURED_SHIM_BRANCH = (
@@ -131,6 +156,9 @@ _CONFIGURED_SHIM_BRANCH = (
     "    raise SystemExit(0)\n"
 )
 CONFIGURED_RUN_SHIM = RUN_SHIM.replace(
+    "run_roots = [arg.split('=', 1)[1] for arg in sys.argv[1:] if arg.startswith('run.root=')]\n",
+    _CONFIGURED_SHIM_ROOTS,
+).replace(
     _CONFIGURED_SHIM_IMPORT,
     _CONFIGURED_SHIM_BRANCH + _CONFIGURED_SHIM_IMPORT,
 )

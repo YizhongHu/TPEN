@@ -64,6 +64,7 @@ class ConfiguredRun:
         self,
         output_dir: str,
         *,
+        root: str | None = None,
         group_digest: str,
         task_id: str,
         attempt_id: str,
@@ -74,6 +75,11 @@ class ConfiguredRun:
             raise ValueError("legacy TPEN runs do not carry an attempt delta")
         if self.id != task_id:
             raise ValueError("configured run does not belong to the attempt task")
+        if type(root) is not str or not os.path.isabs(root) or os.path.normpath(root) != root:
+            raise ValueError("configured attempt binding requires a normalized absolute root")
+        expected_output = os.path.join(root, "groups", group_digest, task_id, attempt_id)
+        if output_dir != os.path.normpath(output_dir) or output_dir != expected_output:
+            raise ValueError("configured attempt output does not bind the placement fence")
         return AttemptDelta(
             os.path.join(output_dir, "core"), self.program.load,
             group_digest, task_id, attempt_id,
@@ -83,6 +89,7 @@ class ConfiguredRun:
         self,
         output_dir: str,
         *,
+        root: str | None = None,
         group_digest: str,
         task_id: str,
         attempt_id: str,
@@ -92,7 +99,7 @@ class ConfiguredRun:
         if self.program is None:
             return self.binding_digest
         delta = self.attempt_delta(
-            output_dir, group_digest=group_digest, task_id=task_id, attempt_id=attempt_id,
+            output_dir, root=root, group_digest=group_digest, task_id=task_id, attempt_id=attempt_id,
         )
         return digest({"program_digest": self.program.program_digest, "attempt_delta_digest": delta.digest})
 
@@ -117,6 +124,7 @@ class ConfiguredRun:
         self,
         output_dir: str,
         *,
+        root: str | None = None,
         group_digest: str | None = None,
         task_id: str | None = None,
         attempt_id: str | None = None,
@@ -140,7 +148,7 @@ class ConfiguredRun:
         if group_digest is None or task_id is None or attempt_id is None:
             raise ValueError("configured attempt binding requires group, task and attempt identities")
         delta = self.attempt_delta(
-            output_dir, group_digest=group_digest, task_id=task_id, attempt_id=attempt_id,
+            output_dir, root=root, group_digest=group_digest, task_id=task_id, attempt_id=attempt_id,
         )
         return ConfiguredProgramCommand(self.program, delta)
 
