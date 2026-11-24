@@ -230,6 +230,29 @@ def test_manifest_system_identity_refuses_before_runner_call(tmp_path: Path, mon
     assert calls == []
 
 
+def test_valid_but_different_system_identity_refuses_before_runner_call(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Two valid Stage-1 systems cannot be mixed during a requested resume."""
+
+    cfg = _cfg(tmp_path)
+    cfg.system.id = "h2_molecule"
+    row = _row(tmp_path)
+    calls: list[object] = []
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+
+    with pytest.raises(restart.RestartRefusal, match=r"he \(he_atom\).*h2 \(h2_molecule\)") as error:
+        restart.execute_restart(
+            cfg=cfg,
+            row=row,
+            config_path="train.yaml",
+            inspector=lambda _path: pytest.fail("identity refusal must precede inspection"),
+            run=lambda *_a, **_k: calls.append(True) or 0,
+        )
+    assert error.value.cause is restart.RestartCause.INVALID_RESUME
+    assert calls == []
+
+
 def test_requested_resume_never_falls_back_to_fresh(tmp_path: Path, monkeypatch) -> None:
     cfg = _cfg(tmp_path)
     row = _row(tmp_path)

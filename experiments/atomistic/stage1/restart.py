@@ -131,8 +131,13 @@ def _validate_system_identity(cfg: Any, row: Mapping[str, Any]) -> None:
         or expected_system_ids.get(system) != row_system_id
         or config_system_id != row_system_id
     ):
+        config_system = next(
+            (spec.name for spec in SYSTEM_SPECS if spec.system_id == config_system_id),
+            "<unknown>",
+        )
         raise RestartRefusal(
-            "manifest row system identity does not match the resolved Hamiltonian identity",
+            "manifest row system identity does not match the resolved Hamiltonian identity: "
+            f"row={system} ({row_system_id}) config={config_system} ({config_system_id})",
             cause=RestartCause.INVALID_RESUME,
         )
 
