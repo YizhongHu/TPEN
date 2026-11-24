@@ -447,6 +447,8 @@ def collect_observable_trajectory_with_diagnostics(
         If `verify_model_unchanged` is set and any parameter moved.
     """
 
+    if not isinstance(sampler, SamplingCollector):
+        raise TypeError("sampler must implement SamplingCollector.collect_samples")
     if n_draws < 1:
         raise ValueError(f"n_draws must be at least 1, got {n_draws}")
     if discard_draws < 0:

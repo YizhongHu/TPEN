@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from tpen.data.batch.walkers import Walkers
 from tpen.events import EventEmitter
 from tpen.sampling.stats import SamplerStats
 
 
+@runtime_checkable
 class SamplingCollector(Protocol):
     """Sampler interface used by training and evaluation generators."""
 
