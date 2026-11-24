@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import Any, ClassVar, Mapping
 
 from ._codec import canonical_bytes, decode_json
-from .configured_program import ConfiguredProgram
+from .configured_program import AttemptDelta, ConfiguredProgram
 from .environments import PreparedPythonEnvironment
 from ._records import frozen_record
 from .workers import LaunchPurpose, SubprocessWorker
@@ -112,8 +112,8 @@ RUN_SHIM = (
 # leaf gets the same placement/observation prelude plus a closed script-path
 # handoff, derived once here rather than maintaining a second copy.
 _CONFIGURED_SHIM_IMPORT = "from tpen.run import main\n"
-# C2.2 owns any future attempt-output rebinding; C2.1 refuses mismatches and
-# never silently strips run.* values from a configured command.
+# C2.2 binds configured attempt output through one canonical delta and never
+# silently strips arbitrary run.* values from a configured command.
 _CONFIGURED_SHIM_BRANCH = (
     "if '--tpen-executor-script' in sys.argv[1:]:\n"
     "    import runpy\n"
@@ -413,21 +413,27 @@ class ConfiguredProgramCommand:
     """Command for a validated :class:`ConfiguredProgram` leaf entry."""
 
     program: Any
+    attempt_delta: AttemptDelta | None = None
 
     def __post_init__(self) -> None:
         if type(self.program) is not ConfiguredProgram:
             raise TypeError("program must be ConfiguredProgram")
+        if self.attempt_delta is not None and type(self.attempt_delta) is not AttemptDelta:
+            raise TypeError("attempt_delta must be AttemptDelta or None")
 
     @property
     def args(self) -> tuple[str, ...]:
         """Return generated argv for the allowlisted script."""
 
-        return (
+        args = (
             "-c", CONFIGURED_RUN_SHIM,
             "--tpen-executor-entry", self.program.entrypoint,
             "--tpen-executor-script", self.program.script_path,
             *self.program.argv(),
         )
+        if self.attempt_delta is not None:
+            args += ("--attempt-delta", self.attempt_delta.canonical_bytes.decode("utf-8"))
+        return args
 
 
 @frozen_record

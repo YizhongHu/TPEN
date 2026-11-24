@@ -51,11 +51,12 @@ from types import MappingProxyType
 from typing import Any, ClassVar
 
 from .._codec import _freeze, canonical_bytes, decode_json, digest, fields, thaw
+from ..configured_program import AttemptDelta, ConfiguredProgram
 from .._records import frozen_record
 from ..environments import PreparedPythonEnvironment, SourceScript
 from ..gpu_sampler import GPU_SAMPLER_OUTPUT_ENV, SLOT_QUARANTINE_ENV, slot_quarantine_dir
 from ..placement import PLACEMENT_REFUSAL_ENV, PlacementRefusal, parse_cpu_set
-from ..runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
+from ..runners import ConfiguredProgramCommand, CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
 from ..workers import SubprocessWorker
 from .contract import (
     ConfiguredProgramRouteRefused,
@@ -327,6 +328,10 @@ class LeafRequest:
         Absolute configured-run Hydra configuration path.
     overrides : tuple of str
         Configured-run dot-list overrides.
+    program : ConfiguredProgram or None
+        Typed configured program for non-legacy requests.
+    attempt_delta : AttemptDelta or None
+        Canonical placement-bound load/output delta for configured requests.
     payload_digest : str
         Digest of ``config`` and ``overrides``; it must match them.
     root : str
@@ -367,6 +372,8 @@ class LeafRequest:
     slot_id: str | None
     config: str
     overrides: tuple[str, ...]
+    program: ConfiguredProgram | None
+    attempt_delta: AttemptDelta | None
     payload_digest: str
     root: str
     output_dir: str
@@ -390,9 +397,16 @@ class LeafRequest:
             _text(getattr(self, name), name)
         if self.slot_id is not None:
             _text(self.slot_id, "slot_id")
-        # Same rule as ConfiguredRun: absolute, but not necessarily normalized.
-        if not os.path.isabs(_text(self.config, "config")):
+        if self.program is not None and type(self.program) is not ConfiguredProgram:
+            raise TypeError("program must be ConfiguredProgram or None")
+        if self.attempt_delta is not None and type(self.attempt_delta) is not AttemptDelta:
+            raise TypeError("attempt_delta must be AttemptDelta or None")
+        # Legacy runs carry an absolute Hydra config; configured programs carry
+        # their typed program record instead of a second config authority.
+        if self.program is None and not os.path.isabs(_text(self.config, "config")):
             raise ValueError("config must be an absolute path")
+        if self.program is not None and type(self.config) is not str:
+            raise TypeError("configured request config must be an empty string")
         if not isinstance(self.overrides, tuple) or any(not isinstance(item, str) for item in self.overrides):
             raise TypeError("overrides must be a sequence of strings")
         _absolute(self.root, "root")
@@ -406,8 +420,25 @@ class LeafRequest:
             raise TypeError("timeout must be an int, a float or None")
         if self.timeout is not None and (not math.isfinite(self.timeout) or self.timeout <= 0):
             raise ValueError("timeout must be finite and positive or None")
+        if self.program is None:
+            if self.attempt_delta is not None:
+                raise ValueError("legacy request cannot carry an attempt delta")
+            expected_payload = digest({"config": self.config, "overrides": list(self.overrides)})
+        else:
+            if self.config or self.overrides or self.attempt_delta is None:
+                raise ValueError("configured request must carry only its typed program and attempt delta")
+            expected_delta = AttemptDelta(
+                os.path.join(self.output_dir, "core"), self.program.load,
+                self.group_digest, self.task_id, self.attempt_id,
+            )
+            if self.attempt_delta != expected_delta:
+                raise ValueError("attempt delta does not bind the request fence")
+            expected_payload = digest({
+                "program_digest": self.program.program_digest,
+                "attempt_delta_digest": self.attempt_delta.digest,
+            })
         # Same digest as the controller placement overlay and receipts.
-        if self.payload_digest != digest({"config": self.config, "overrides": list(self.overrides)}):
+        if self.payload_digest != expected_payload:
             raise ValueError("payload_digest does not match the configured payload")
         values = self.environment.env
         if values.get("TPEN_SLOT_ID") != self.slot_id:
@@ -487,10 +518,19 @@ class LeafRequest:
             raise ValueError("fence allocation does not match the allocation")
         if configured.id != fence.task_id:
             raise ValueError("configured run does not belong to the fenced task")
-        if getattr(configured, "program", None) is not None:
-            raise ConfiguredProgramRouteRefused(
-                "configured program not supported on this route until C2.2"
+        program = getattr(configured, "program", None)
+        attempt_delta = None
+        config = configured.config
+        overrides = tuple(configured.overrides)
+        if program is not None:
+            attempt_delta = configured.attempt_delta(
+                fence.output_dir,
+                group_digest=fence.group_digest,
+                task_id=fence.task_id,
+                attempt_id=fence.attempt_id.value,
             )
+            config = ""
+            overrides = ()
         return cls(
             fence.group_digest,
             fence.task_id,
@@ -498,9 +538,16 @@ class LeafRequest:
             allocation.allocation_id.value,
             allocation.backend_job_id.value,
             environment.env.get("TPEN_SLOT_ID"),
-            configured.config,
-            tuple(configured.overrides),
-            digest({"config": configured.config, "overrides": list(configured.overrides)}),
+            config,
+            overrides,
+            program,
+            attempt_delta,
+            configured.attempt_binding_digest(
+                fence.output_dir,
+                group_digest=fence.group_digest,
+                task_id=fence.task_id,
+                attempt_id=fence.attempt_id.value,
+            ),
             fence.root,
             fence.output_dir,
             environment,
@@ -530,6 +577,8 @@ class LeafRequest:
         """
 
         output_dir = self.paths()[0]
+        if self.program is not None:
+            return ConfiguredProgramCommand(self.program, self.attempt_delta).args
         return (*TPENCommand(self.config, self.overrides).args, f"run.root={output_dir}", "run.layout=flat", "run.run_id=core")
 
     def to_dict(self) -> dict[str, Any]:
@@ -545,6 +594,8 @@ class LeafRequest:
             "slot_id": self.slot_id,
             "config": self.config,
             "overrides": list(self.overrides),
+            "program": self.program.to_dict() if self.program is not None else None,
+            "attempt_delta": self.attempt_delta.to_dict() if self.attempt_delta is not None else None,
             "payload_digest": self.payload_digest,
             "root": self.root,
             "output_dir": self.output_dir,
@@ -572,7 +623,7 @@ class LeafRequest:
             If keys, schema, types, or any request invariant are invalid.
         """
 
-        keys = {"schema", *(name for name in _REQUEST_PLAIN_FIELDS), "environment"}
+        keys = {"schema", *(name for name in _REQUEST_PLAIN_FIELDS), "environment", "program", "attempt_delta"}
         fields(data, keys, cls.schema, "LeafRequest")
         overrides = data["overrides"]
         if type(overrides) is not list:
@@ -586,6 +637,8 @@ class LeafRequest:
             data["slot_id"],
             data["config"],
             tuple(overrides),
+            ConfiguredProgram.from_mapping(data["program"]) if data["program"] is not None else None,
+            AttemptDelta.from_mapping(data["attempt_delta"]) if data["attempt_delta"] is not None else None,
             data["payload_digest"],
             data["root"],
             data["output_dir"],

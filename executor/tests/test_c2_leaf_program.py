@@ -6,15 +6,10 @@ import hashlib
 from pathlib import Path
 import subprocess
 import sys
-from types import SimpleNamespace
 
 import pytest
 
 from tpen_executor._codec import digest
-from tpen_executor.contracts import ProgramSpecRef, ReadyGroup, TaskSpec
-from tpen_executor.dispatch import LocalDispatcher
-from tpen_executor.dispatch.contract import ConfiguredProgramRouteRefused
-from tpen_executor.dispatch.transport import LeafRequest
 from tpen_executor.programs import ConfiguredProgram
 from tpen_executor.runners import CONFIGURED_RUN_SHIM, ConfiguredProgramCommand, RUN_SHIM, TPENCommand
 from tpen_executor.tasks import ConfiguredRun, ConfiguredRunTable
@@ -36,6 +31,7 @@ def _program(**changes: str) -> ConfiguredProgram:
         "row": ROW,
         "output_root": str(ROOT / "outputs"),
         "output_contract": "attempt-core",
+        "load": {"mode": "fresh", "path": None},
     }
     values.update(changes)
     return ConfiguredProgram(**values)
@@ -208,32 +204,32 @@ def test_configured_run_rejects_unbound_prepared_inputs_before_spawn() -> None:
         ConfiguredRun("configured", "", ("runner.load.mode=train_resume",), _program())
 
 
-def test_leaf_request_refuses_configured_program_route_before_submission() -> None:
-    fence = SimpleNamespace(allocation_id="allocation", task_id="configured")
-    allocation = SimpleNamespace(allocation_id=SimpleNamespace(value="allocation"))
+def test_configured_command_for_attempt_carries_only_the_typed_delta(tmp_path: Path) -> None:
     configured = ConfiguredRun("configured", "", (), _program())
-    with pytest.raises(ConfiguredProgramRouteRefused, match="until C2.2"):
-        LeafRequest.for_attempt(fence, allocation, configured, None)  # type: ignore[arg-type]
+    command = configured.command_for_attempt(
+        str(tmp_path / "attempt"),
+        group_digest="g" * 64,
+        task_id="configured",
+        attempt_id="a1",
+    )
+    assert command.args[-2] == "--attempt-delta"
+    assert "run.root=" not in " ".join(command.args)
+    assert '"attempt_core_dir":"' + str(tmp_path / "attempt" / "core") + '"' in command.args[-1]
 
 
-def test_legacy_dispatch_unchanged_and_configured_dispatch_refuses_before_spawn(tmp_path: Path) -> None:
+def test_legacy_and_configured_attempt_bindings_are_separate(tmp_path: Path) -> None:
     config = str(tmp_path / "config.yaml")
     legacy = ConfiguredRun("legacy", config, ("run.seed=7",))
-    assert legacy.command().args == TPENCommand(config, ("run.seed=7",)).args
-    program = _program()
-    configured = ConfiguredRun("configured", "", (), program)
-    spec = ProgramSpecRef({}, digest({}))
-    group = ReadyGroup("group", (TaskSpec("configured", "configured", spec, digest("configured"), 1, "steps"),), digest({"plan": 1}))
-    calls: list[str] = []
-    worker = SimpleNamespace(materialize=lambda _env: calls.append("materialize"))
-    lifecycle = SimpleNamespace(
-        begin=lambda *args, **kwargs: calls.append("begin"),
-        finish=lambda *args, **kwargs: calls.append("finish"),
-        store=SimpleNamespace(root=str(tmp_path / "store"), manifest=lambda *args: None),
-    )
-    with pytest.raises(ConfiguredProgramRouteRefused, match="until C2.2"):
-        LocalDispatcher(worker).run(group, {"configured": configured}, lifecycle)
-    assert calls == []
+    legacy_args = legacy.command_for_attempt(str(tmp_path / "legacy"), group_digest="g", task_id="legacy", attempt_id="a").args
+    assert legacy_args == TPENCommand(
+        config, ("run.seed=7", f"run.root={tmp_path / 'legacy'}", "run.layout=flat", "run.run_id=core")
+    ).args
+    configured = ConfiguredRun("configured", "", (), _program())
+    configured_args = configured.command_for_attempt(
+        str(tmp_path / "configured"), group_digest="g", task_id="configured", attempt_id="a",
+    ).args
+    assert "--attempt-delta" in configured_args
+    assert not any(arg.startswith("run.") for arg in configured_args)
 
 
 def test_configured_shim_refuses_mismatched_attempt_output(tmp_path: Path) -> None:
@@ -309,18 +305,11 @@ MUTANTS = (
         "killer": "test_configured_shim_refuses_mismatched_attempt_output",
     },
     {
-        "id": "direct-dispatch-admits-configured",
-        "target": "executor/src/tpen_executor/dispatch/contract.py",
-        "old": "            if configured.program is not None:\n                raise ConfiguredProgramRouteRefused(\n                    \"configured program not supported on this route until C2.2\"\n                )\n",
-        "new": "            if False:\n                raise ConfiguredProgramRouteRefused(\n                    \"configured program not supported on this route until C2.2\"\n                )\n",
-        "killer": "test_legacy_dispatch_unchanged_and_configured_dispatch_refuses_before_spawn",
-    },
-    {
         "id": "parsl-admits-configured-before-dfk",
         "target": "executor/src/tpen_executor/dispatch/parsl.py",
         "old": "        super(ParslDispatcher, self).validate(group, runs, lifecycle, env, timeout)\n",
         "new": "        pass\n",
-        "killer": "test_configured_parsl_public_run_refuses_before_dfk_or_submission",
+        "killer": "test_configured_parsl_public_admission_accepts_typed_binding_before_dfk",
     },
 )
 
