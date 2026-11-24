@@ -1065,10 +1065,58 @@ def test_delayed_zero_to_nonzero_initializes_q_immediately_with_large_precond_fr
     assert float((p.detach() - p_adam.detach()).abs().max().item()) > 1e-4
 
 
+class _NonStridedGradParameter(nn.Parameter):
+    """``nn.Parameter`` subclass allowing a non-strided gradient override.
+
+    PyTorch's C++ ``Tensor.grad`` descriptor refuses direct assignment of a
+    ``sparse_csr`` tensor onto a dense strided parameter before
+    ``optimizer.step()`` is invoked. This test helper delegates normal
+    ``.grad`` reads, writes, and deletes to ``torch.Tensor.grad`` while
+    allowing tests to surface a non-strided gradient tensor directly into
+    ``SOAP._validate_gradients_before_step()``.
+    """
+
+    _custom_grad: torch.Tensor | None
+
+    def __new__(
+        cls,
+        data: torch.Tensor,
+        requires_grad: bool = True,
+    ) -> _NonStridedGradParameter:
+        param = super().__new__(cls, data, requires_grad=requires_grad)
+        object.__setattr__(param, "_custom_grad", None)
+        return param
+
+    @property
+    def grad(self) -> torch.Tensor | None:
+        """Return the override gradient if set, else delegate to ``Tensor.grad``."""
+
+        custom_grad = getattr(self, "_custom_grad", None)
+        if custom_grad is not None:
+            return custom_grad
+        # torch.Tensor.grad is a C++ getset_descriptor, not a Python property.
+        return torch.Tensor.grad.__get__(self, type(self))
+
+    @grad.setter
+    def grad(self, value: torch.Tensor | None) -> None:
+        object.__setattr__(self, "_custom_grad", None)
+        torch.Tensor.grad.__set__(self, value)
+
+    @grad.deleter
+    def grad(self) -> None:
+        object.__setattr__(self, "_custom_grad", None)
+        torch.Tensor.grad.__delete__(self)
+
+
 @pytest.mark.parametrize("bad_kind", ["nan", "pos_inf", "neg_inf", "sparse", "sparse_csr"])
 def test_atomic_refusal_on_nonfinite_or_sparse_gradient(bad_kind: str) -> None:
     p1 = nn.Parameter(torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float64))
-    p2 = nn.Parameter(torch.tensor([[5.0, 6.0], [7.0, 8.0]], dtype=torch.float64))
+    p2_data = torch.tensor([[5.0, 6.0], [7.0, 8.0]], dtype=torch.float64)
+    p2: nn.Parameter = (
+        _NonStridedGradParameter(p2_data)
+        if bad_kind == "sparse_csr"
+        else nn.Parameter(p2_data)
+    )
     opt = SOAP([p1, p2], lr=1e-2, precondition_frequency=2)
 
     # Take one valid step so state is populated before the bad step
@@ -1080,6 +1128,8 @@ def test_atomic_refusal_on_nonfinite_or_sparse_gradient(bad_kind: str) -> None:
     p2_before = p2.detach().clone()
     state_before = opt.state_dict()
 
+    # Prepare the invalid step-2 gradient outside pytest.raises so any setup
+    # failure fails the test immediately rather than masking opt.step().
     p1.grad = torch.tensor([[0.2, 0.1], [-0.1, 0.3]], dtype=torch.float64)
     if bad_kind == "nan":
         p2.grad = torch.tensor([[1.0, float("nan")], [0.0, 0.0]], dtype=torch.float64)
@@ -1088,17 +1138,26 @@ def test_atomic_refusal_on_nonfinite_or_sparse_gradient(bad_kind: str) -> None:
     elif bad_kind == "neg_inf":
         p2.grad = torch.tensor([[1.0, float("-inf")], [0.0, 0.0]], dtype=torch.float64)
     elif bad_kind == "sparse":
-        p2.grad = torch.sparse_coo_tensor(
-            torch.tensor([[0], [1]]),
-            torch.tensor([1.0], dtype=torch.float64),
-            size=(2, 2),
-        )
-    else:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            p2.grad = torch.tensor([[0.0, 1.0], [0.0, 0.0]], dtype=torch.float64).to_sparse_csr()
+            p2.grad = torch.sparse_coo_tensor(
+                torch.tensor([[0], [1]]),
+                torch.tensor([1.0], dtype=torch.float64),
+                size=(2, 2),
+            )
+    else:
+        assert isinstance(p2, _NonStridedGradParameter)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            p2._custom_grad = torch.tensor(
+                [[0.0, 1.0], [0.0, 0.0]], dtype=torch.float64
+            ).to_sparse_csr()
+        assert p2.grad is not None
+        assert not p2.grad.is_sparse
+        assert p2.grad.layout == torch.sparse_csr
 
-    with pytest.raises(RuntimeError):
+    expected_match = "sparse" if bad_kind in ("sparse", "sparse_csr") else "non-finite"
+    with pytest.raises(RuntimeError, match=expected_match):
         opt.step()
 
     assert torch.equal(p1.detach(), p1_before)
