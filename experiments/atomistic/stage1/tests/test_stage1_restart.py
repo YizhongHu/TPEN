@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -310,6 +311,15 @@ def _assert_checkpoint_payload_equal(left: Path, right: Path) -> None:
         if torch.is_tensor(actual) or torch.is_tensor(expected):
             assert torch.is_tensor(actual) and torch.is_tensor(expected), path
             assert torch.equal(actual, expected), path
+        elif dataclasses.is_dataclass(actual) or dataclasses.is_dataclass(expected):
+            assert dataclasses.is_dataclass(actual) and dataclasses.is_dataclass(expected), path
+            assert type(actual) is type(expected), path
+            for field in dataclasses.fields(actual):
+                compare(
+                    getattr(actual, field.name),
+                    getattr(expected, field.name),
+                    f"{path}.{field.name}",
+                )
         elif isinstance(actual, dict) or isinstance(expected, dict):
             assert isinstance(actual, dict) and isinstance(expected, dict), path
             assert actual.keys() == expected.keys(), path
