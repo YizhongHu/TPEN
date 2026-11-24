@@ -1583,6 +1583,27 @@ def _classify_bundle_reconciliation(
         not marker.matches_manifest or marker.manifest_sha256_verified is False
     ) and not marker_open_while_manifest_closed
 
+    # Independent invalid-marker and unsafe observer evidence takes precedence
+    # over an open manifest.  These signals cannot be explained by the benign
+    # manifest-before-marker crash window above.
+    if marker_tampered_or_invalid:
+        return (
+            "failed",
+            "unsafe",
+            "partial" if has_recovered_data else "unknown",
+            "unsafe",
+            marker.diagnostic_code or "invalid_lifecycle_marker",
+        )
+
+    if manifest.lifecycle_state == "unsafe" or any_unsafe_obs or any_helper_failure:
+        return (
+            "failed",
+            "unsafe",
+            "partial" if has_recovered_data else "unknown",
+            "unsafe",
+            "unsafe_lifecycle_state",
+        )
+
     # 1. Open / interrupted execution (manifest still open, mid-finalization
     # crash with open marker, open observer status, or torn JSONL tail).
     if (
@@ -1624,27 +1645,9 @@ def _classify_bundle_reconciliation(
             "missing_final_status",
         )
 
-    # 3. Failed or unsafe terminal bundle: tampered/invalid marker, unsafe
-    # lifecycle, failed application/invocation outcome, writer/helper failure,
+    # 3. Failed terminal bundle: failed application/invocation outcome,
+    # writer/helper failure,
     # interior corruption, or written-vs-read batch count discrepancy.
-    if marker_tampered_or_invalid:
-        return (
-            "failed",
-            "unsafe",
-            "partial" if has_recovered_data else "unknown",
-            "unsafe",
-            marker.diagnostic_code or "invalid_lifecycle_marker",
-        )
-
-    if manifest.lifecycle_state == "unsafe" or any_unsafe_obs or any_helper_failure:
-        return (
-            "failed",
-            "unsafe",
-            "partial" if has_recovered_data else "unknown",
-            "unsafe",
-            "unsafe_lifecycle_state",
-        )
-
     if any_count_mismatch:
         return (
             "failed",
@@ -2222,6 +2225,36 @@ def reconcile_run_observability(
     )
 
 
+def _escape_rendered_line_separators(value: str) -> str:
+    """Escape every separator recognized by :meth:`str.splitlines`."""
+
+    escaped: list[str] = []
+    for char in value:
+        if char == "\n":
+            escaped.append(r"\n")
+        elif char == "\r":
+            escaped.append(r"\r")
+        elif char == "\x0b":
+            escaped.append(r"\x0b")
+        elif char == "\x0c":
+            escaped.append(r"\x0c")
+        elif char == "\x1c":
+            escaped.append(r"\x1c")
+        elif char == "\x1d":
+            escaped.append(r"\x1d")
+        elif char == "\x1e":
+            escaped.append(r"\x1e")
+        elif char == "\x85":
+            escaped.append(r"\x85")
+        elif char == "\u2028":
+            escaped.append(r"\u2028")
+        elif char == "\u2029":
+            escaped.append(r"\u2029")
+        else:
+            escaped.append(char)
+    return "".join(escaped)
+
+
 def render_operator_summary(
     summary: BoundedOperatorSummary,
     *,
@@ -2358,6 +2391,10 @@ def render_operator_summary(
         raw_lines.append(
             f"truncated=true reasons={','.join(summary.truncation_reasons)}"
         )
+
+    # Apply physical-line normalization before either line or width limits;
+    # this affects display text only and leaves structured identity unchanged.
+    raw_lines = [_escape_rendered_line_separators(line) for line in raw_lines]
 
     dummy_reasons: list[str] = []
     if len(raw_lines) > line_cap:
