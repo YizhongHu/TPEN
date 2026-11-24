@@ -18,6 +18,7 @@ from omegaconf import OmegaConf
 
 import tpen.sampling.metropolis as metropolis
 import tpen.training.linear_method as linear_method
+from tpen.artifacts import ArtifactManager
 from tpen.run import load_config, run_from_config
 from tpen.training.linear_method import (
     LinearMethodMemoryLimitError,
@@ -203,6 +204,19 @@ def _qualification_config(tmp_path: Path) -> tuple[Any, Path]:
     return load_config(str(path)), path
 
 
+def _qualification_error_path(cfg: Any) -> Path:
+    """Resolve the failure artifact through the production run layout."""
+
+    manager = ArtifactManager(
+        OmegaConf.select(cfg, "run.root", default="outputs"),
+        OmegaConf.select(cfg, "experiment.name", default="experiment"),
+        OmegaConf.select(cfg, "experiment.sector", default="default"),
+        OmegaConf.select(cfg, "run.run_id"),
+        layout=OmegaConf.select(cfg, "run.layout", default="nested"),
+    )
+    return manager.path("error.json")
+
+
 def test_production_entrypoint_refuses_real_hi_shape_before_sampling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -223,6 +237,6 @@ def test_production_entrypoint_refuses_real_hi_shape_before_sampling(
 
     cfg, path = _qualification_config(tmp_path / "return-code")
     assert run_from_config(cfg, config_path=str(path), raise_exceptions=False) == 1
-    error = Path(cfg.run.dir) / "error.json"
+    error = _qualification_error_path(cfg)
     assert error.exists()
     assert "LinearMethodMemoryLimitError" in error.read_text(encoding="utf-8")
