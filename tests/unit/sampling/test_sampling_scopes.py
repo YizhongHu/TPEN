@@ -16,6 +16,7 @@ from tpen.sampling import MetropolisSampler
 from tpen.sampling.events import SamplerBurnIn, SamplerProduction
 from tpen.sampling.trajectory import collect_observable_trajectory
 from tpen.training.events import TrainingIteration, TrainingIterationCompleted
+from tests.unit.callback.support import RecordingContext
 
 
 class _LinearModel(torch.nn.Module):
@@ -144,6 +145,78 @@ def test_scopes_off_is_bit_exact_and_generator_state_is_unchanged() -> None:
         )
 
 
+def _collect_samples_c65_reference(
+    sampler: MetropolisSampler, model, *, reset: bool = False
+) -> tuple[object, object]:
+    """Run the frozen c65e35bd collection sequence without scope plumbing.
+
+    This deliberately mirrors the pre-PR public method, so a common-path RNG
+    draw can be distinguished from the current off/on comparison (where both
+    new paths would share the same accidental draw).
+    """
+
+    if reset or sampler._walkers is None:
+        sampler.reset()
+    else:
+        sampler._require_device(None)
+        with torch.no_grad():
+            sampler._walkers = sampler._walkers.update_cache(model)
+    if not sampler._has_burned_in and sampler.burn_in:
+        sampler._walkers = sampler.sample(model, sampler._walkers, sampler.burn_in)
+        sampler._has_burned_in = True
+    sampler._walkers = sampler.sample(model, sampler._walkers, sampler.n_steps)
+    return sampler._walkers, sampler.acceptance_rate
+
+
+def _assert_same_sampler_state(left: MetropolisSampler, right: MetropolisSampler) -> None:
+    left_walkers = left._walkers
+    right_walkers = right._walkers
+    assert left_walkers is not None and right_walkers is not None
+    assert torch.equal(left_walkers.positions, right_walkers.positions)
+    assert torch.equal(left_walkers.logabs, right_walkers.logabs)
+    assert torch.equal(left_walkers.sign, right_walkers.sign)
+    assert torch.equal(left_walkers.aux["accepted"], right_walkers.aux["accepted"])
+    if "log_accept_ratio" in left_walkers.aux or "log_accept_ratio" in right_walkers.aux:
+        assert torch.equal(
+            left_walkers.aux["log_accept_ratio"], right_walkers.aux["log_accept_ratio"]
+        )
+    assert left.acceptance_rate == right.acceptance_rate
+    assert torch.equal(
+        left.mcmc_state_dict()["generator_state"], right.mcmc_state_dict()["generator_state"]
+    )
+
+
+@pytest.mark.parametrize("emitter_mode", ["off", "recording"])
+def test_scopes_match_frozen_uninstrumented_reference_across_reset_and_restore(
+    emitter_mode: str,
+) -> None:
+    model = _LinearModel()
+    reference = _sampler(seed=41)
+    instrumented = _sampler(seed=41)
+    emitter = None if emitter_mode == "off" else _RecordingEmitter()
+
+    for reset in (False, False):
+        _collect_samples_c65_reference(reference, model)
+        instrumented.collect_samples(model, reset=reset, emitter=emitter)
+        _assert_same_sampler_state(reference, instrumented)
+
+    state = reference.mcmc_state_dict()
+    restored_reference = _sampler(seed=999)
+    restored_reference.load_mcmc_state_dict(state)
+    restored_instrumented = _sampler(seed=999)
+    restored_instrumented.load_mcmc_state_dict(state)
+    _collect_samples_c65_reference(restored_reference, model)
+    restored_instrumented.collect_samples(model, emitter=emitter)
+    _assert_same_sampler_state(restored_reference, restored_instrumented)
+
+    _collect_samples_c65_reference(reference, model, reset=True)
+    instrumented.collect_samples(model, reset=True, emitter=emitter)
+    _collect_samples_c65_reference(restored_reference, model, reset=True)
+    restored_instrumented.collect_samples(model, reset=True, emitter=emitter)
+    _assert_same_sampler_state(reference, instrumented)
+    _assert_same_sampler_state(restored_reference, restored_instrumented)
+
+
 def test_restore_is_production_only_and_reset_reburns() -> None:
     model = _LinearModel()
     source = _sampler()
@@ -175,6 +248,12 @@ def _deliver(callback, event, count: int, context: _MetricContext) -> None:
         callback.handle_occurrence_impl(
             Occurrence(event, count, monotonic_time=float(count)), context
         )
+
+
+def _deliver_public(callback, event, count: int, context: RecordingContext) -> None:
+    callback.handle_occurrence(
+        Occurrence(event, count, monotonic_time=float(count)), context
+    )
 
 
 def test_sampling_scope_timing_correlates_training_and_evaluation_and_cleans_up() -> None:
@@ -211,6 +290,70 @@ def test_sampling_scope_timing_correlates_training_and_evaluation_and_cleans_up(
     callback._reset_typed_state()
     with pytest.raises(RuntimeError, match="active training or evaluation parent"):
         _deliver(callback, Started(SamplerProduction(n_steps=1)), 5, context)
+
+
+def test_sampling_scope_timing_uses_occurrence_durations_not_zero_clock() -> None:
+    callback = SamplingScopeTiming(clock=lambda: -1.0)
+    context = RecordingContext()
+    iteration = TrainingIteration(step=7)
+
+    def _deliver_at(event, count, timestamp):
+        callback.handle_occurrence(
+            Occurrence(event, count, monotonic_time=timestamp), context
+        )
+
+    _deliver_at(Started(iteration), 1, 10.0)
+    _deliver_at(Started(SamplerBurnIn(n_steps=2)), 1, 11.0)
+    _deliver_at(Ended(SamplerBurnIn(n_steps=2)), 1, 14.0)
+    _deliver_at(Started(SamplerProduction(n_steps=2)), 1, 15.0)
+    _deliver_at(Ended(SamplerProduction(n_steps=2)), 1, 21.0)
+    _deliver_at(TrainingIterationCompleted(iteration), 1, 22.0)
+
+    assert context.records[-1]["metrics"] == {
+        "sampler_burn_in_time_sec": 3.0,
+        "sampler_production_time_sec": 6.0,
+    }
+
+
+def test_sampling_scope_timing_restores_training_parent_after_nested_evaluation() -> None:
+    callback = SamplingScopeTiming(clock=lambda: 0.0)
+    context = RecordingContext()
+    iteration = TrainingIteration(step=8)
+    task_a = EvaluationTaskRun("a", "a", Path("/tmp/a"))
+
+    _deliver_public(callback, Started(iteration), 1, context)
+    _deliver_public(callback, Started(task_a), 1, context)
+    _deliver_public(callback, Started(SamplerProduction(n_steps=1)), 2, context)
+    _deliver_public(callback, Ended(SamplerProduction(n_steps=1)), 2, context)
+    _deliver_public(callback, Ended(task_a), 1, context)
+
+    _deliver_public(callback, Started(SamplerProduction(n_steps=1)), 3, context)
+    _deliver_public(callback, Ended(SamplerProduction(n_steps=1)), 3, context)
+    _deliver_public(callback, TrainingIterationCompleted(iteration), 1, context)
+
+    assert [record["namespace"] for record in context.records] == [
+        "eval/perf/a", "train/perf"
+    ]
+
+
+def test_sampling_scope_timing_restores_outer_evaluation_parent() -> None:
+    callback = SamplingScopeTiming(clock=lambda: 0.0)
+    context = RecordingContext()
+    task_a = EvaluationTaskRun("a", "a", Path("/tmp/a"))
+    task_b = EvaluationTaskRun("b", "b", Path("/tmp/b"))
+
+    _deliver_public(callback, Started(task_a), 1, context)
+    _deliver_public(callback, Started(task_b), 2, context)
+    _deliver_public(callback, Started(SamplerProduction(n_steps=1)), 3, context)
+    _deliver_public(callback, Ended(SamplerProduction(n_steps=1)), 3, context)
+    _deliver_public(callback, Ended(task_b), 2, context)
+    _deliver_public(callback, Started(SamplerProduction(n_steps=1)), 4, context)
+    _deliver_public(callback, Ended(SamplerProduction(n_steps=1)), 4, context)
+    _deliver_public(callback, Ended(task_a), 1, context)
+
+    assert [record["namespace"] for record in context.records] == [
+        "eval/perf/b", "eval/perf/a"
+    ]
 
 
 def test_emitter_keyword_is_required_on_sampler_and_trajectory_protocol() -> None:
