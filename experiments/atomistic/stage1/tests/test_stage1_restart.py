@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 import dataclasses
 import json
 import os
@@ -299,45 +300,130 @@ def _real_restart_row(tmp_path: Path, *, run_id: str) -> dict[str, object]:
     return row
 
 
-def _assert_checkpoint_payload_equal(left: Path, right: Path) -> None:
-    """Compare serialized tensor/state payloads, not archive container bytes."""
+def _assert_nested_state_equal(actual: object, expected: object, *, path: str = "$") -> None:
+    """Compare nested checkpoint state with a path to the first difference."""
 
     import numpy as np
     import torch
 
+    def mismatch(message: str) -> None:
+        raise AssertionError(f"{path}: {message}")
+
+    if torch.is_tensor(actual) or torch.is_tensor(expected):
+        if not torch.is_tensor(actual) or not torch.is_tensor(expected):
+            mismatch("one value is a tensor and the other is not")
+        if actual.dtype != expected.dtype:
+            mismatch(f"dtype differs ({actual.dtype!s} != {expected.dtype!s})")
+        if actual.device != expected.device:
+            mismatch(f"device differs ({actual.device!s} != {expected.device!s})")
+        if actual.shape != expected.shape:
+            mismatch(f"shape differs ({tuple(actual.shape)!r} != {tuple(expected.shape)!r})")
+        if not torch.equal(actual, expected):
+            mismatch("tensor values differ")
+        return
+
+    if isinstance(actual, np.ndarray) or isinstance(expected, np.ndarray):
+        if not isinstance(actual, np.ndarray) or not isinstance(expected, np.ndarray):
+            mismatch("one value is a NumPy array and the other is not")
+        if actual.dtype != expected.dtype:
+            mismatch(f"dtype differs ({actual.dtype!s} != {expected.dtype!s})")
+        if actual.shape != expected.shape:
+            mismatch(f"shape differs ({actual.shape!r} != {expected.shape!r})")
+        if not np.array_equal(actual, expected):
+            mismatch("NumPy array values differ")
+        return
+
+    if dataclasses.is_dataclass(actual) or dataclasses.is_dataclass(expected):
+        if not dataclasses.is_dataclass(actual) or not dataclasses.is_dataclass(expected):
+            mismatch("one value is a dataclass and the other is not")
+        if type(actual) is not type(expected):
+            mismatch(f"types differ ({type(actual)!r} != {type(expected)!r})")
+        for field in dataclasses.fields(actual):
+            _assert_nested_state_equal(
+                getattr(actual, field.name),
+                getattr(expected, field.name),
+                path=f"{path}.{field.name}",
+            )
+        return
+
+    if isinstance(actual, Mapping) or isinstance(expected, Mapping):
+        if not isinstance(actual, Mapping) or not isinstance(expected, Mapping):
+            mismatch("one value is a mapping and the other is not")
+        if actual.keys() != expected.keys():
+            mismatch(f"keys differ ({list(actual)!r} != {list(expected)!r})")
+        for key in actual:
+            _assert_nested_state_equal(
+                actual[key], expected[key], path=f"{path}[{key!r}]"
+            )
+        return
+
+    if isinstance(actual, bytes) or isinstance(expected, bytes):
+        if type(actual) is not type(expected) or actual != expected:
+            mismatch("bytes differ")
+        return
+
+    if (
+        (isinstance(actual, Sequence) and not isinstance(actual, (str, bytes)))
+        or (isinstance(expected, Sequence) and not isinstance(expected, (str, bytes)))
+    ):
+        if not isinstance(actual, Sequence) or not isinstance(expected, Sequence):
+            mismatch("one value is a sequence and the other is not")
+        if type(actual) is not type(expected):
+            mismatch(f"types differ ({type(actual)!r} != {type(expected)!r})")
+        if len(actual) != len(expected):
+            mismatch(f"lengths differ ({len(actual)} != {len(expected)})")
+        for index, (actual_item, expected_item) in enumerate(zip(actual, expected)):
+            _assert_nested_state_equal(
+                actual_item, expected_item, path=f"{path}[{index}]"
+            )
+        return
+
+    if type(actual) is not type(expected):
+        mismatch(f"types differ ({type(actual)!r} != {type(expected)!r})")
+    try:
+        equal = actual == expected
+    except Exception as exc:  # pragma: no cover - defensive diagnostic path
+        mismatch(f"comparison raised {type(exc).__name__}: {exc}")
+    if not isinstance(equal, (bool, np.bool_)) or not bool(equal):
+        mismatch(f"values differ ({actual!r} != {expected!r})")
+
+
+def _assert_checkpoint_payload_equal(left: Path, right: Path) -> None:
+    """Compare serialized tensor/state payloads, not archive container bytes."""
+
+    import torch
+
     left_payload = torch.load(left, map_location="cpu", weights_only=False)
     right_payload = torch.load(right, map_location="cpu", weights_only=False)
+    _assert_nested_state_equal(left_payload, right_payload, path=left.name)
 
-    def compare(actual: object, expected: object, path: str) -> None:
-        if torch.is_tensor(actual) or torch.is_tensor(expected):
-            assert torch.is_tensor(actual) and torch.is_tensor(expected), path
-            assert torch.equal(actual, expected), path
-        elif isinstance(actual, np.ndarray) or isinstance(expected, np.ndarray):
-            assert isinstance(actual, np.ndarray) and isinstance(expected, np.ndarray), path
-            assert np.array_equal(actual, expected), path
-        elif dataclasses.is_dataclass(actual) or dataclasses.is_dataclass(expected):
-            assert dataclasses.is_dataclass(actual) and dataclasses.is_dataclass(expected), path
-            assert type(actual) is type(expected), path
-            for field in dataclasses.fields(actual):
-                compare(
-                    getattr(actual, field.name),
-                    getattr(expected, field.name),
-                    f"{path}.{field.name}",
-                )
-        elif isinstance(actual, dict) or isinstance(expected, dict):
-            assert isinstance(actual, dict) and isinstance(expected, dict), path
-            assert actual.keys() == expected.keys(), path
-            for key in actual:
-                compare(actual[key], expected[key], f"{path}[{key!r}]")
-        elif isinstance(actual, (list, tuple)) or isinstance(expected, (list, tuple)):
-            assert type(actual) is type(expected), path
-            assert len(actual) == len(expected), path
-            for index, (actual_item, expected_item) in enumerate(zip(actual, expected)):
-                compare(actual_item, expected_item, f"{path}[{index}]")
-        else:
-            assert actual == expected, path
 
-    compare(left_payload, right_payload, left.name)
+def test_nested_state_equal_handles_checkpoint_like_payload() -> None:
+    """The parity helper handles every container kind used by checkpoint state."""
+
+    import numpy as np
+    import torch
+
+    @dataclasses.dataclass(frozen=True)
+    class SamplerState:
+        positions: object
+
+    expected = {
+        "numpy": ("MT19937", np.array([1, 2, 3], dtype=np.uint32)),
+        "torch": torch.tensor([1.0, 2.0], dtype=torch.float64),
+        "dataclass": SamplerState(positions=(b"state", None)),
+    }
+    actual = {
+        "numpy": ("MT19937", np.array([1, 2, 3], dtype=np.uint32)),
+        "torch": torch.tensor([1.0, 2.0], dtype=torch.float64),
+        "dataclass": SamplerState(positions=(b"state", None)),
+    }
+
+    _assert_nested_state_equal(actual, expected, path="payload")
+
+    actual["numpy"] = ("MT19937", np.array([1, 9, 3], dtype=np.uint32))
+    with pytest.raises(AssertionError, match=r"payload\['numpy'\]\[1\]"):
+        _assert_nested_state_equal(actual, expected, path="payload")
 
 
 def _real_restart_child() -> None:
