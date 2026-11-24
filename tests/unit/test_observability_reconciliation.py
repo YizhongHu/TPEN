@@ -1639,6 +1639,10 @@ def test_checkpoint_save_and_restore_cannot_reactivate_observability_and_isolate
 
     # --- Invocation 2: restore checkpoint WITHOUT observability -> zero reactivation ---
     ctx2 = _make_context(tmp_path, run_id="ckpt-restored-no-obs", device="cpu")
+    # ``restore_checkpoint`` consumes an already-admitted run context; the
+    # public run path creates this successor directory in
+    # ``prepare_run_context`` before reaching the restore boundary.
+    ctx2.artifact_manager.make_dirs()
     assert ctx2.invocation_id != ctx1.invocation_id
     model2 = _ToyModel()
     opt2 = torch.optim.SGD(model2.parameters(), lr=0.1)
