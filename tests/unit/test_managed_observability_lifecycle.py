@@ -17,11 +17,14 @@ from __future__ import annotations
 import ast
 from collections.abc import Iterator
 from contextlib import contextmanager
+import gc
 import json
+import logging
 import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
@@ -281,6 +284,8 @@ class _ManagedScopeCM:
         self.owner.enter_invocation_ids.append(self.context.invocation_id)
         self.owner.trace.append(f"enter:{self.owner.name}")
         if self.owner.fail_on_enter:
+            if self.owner.leave_active_on_enter_failure:
+                self.owner._active = True
             raise RuntimeError(f"enter boom: {self.owner.name}")
         self.owner._active = True
         self.owner.activated_token = f"active-{self.owner.reset_count}"
@@ -330,6 +335,7 @@ class _ManagedTestCallback(Callback):
         return_invalid_handle: bool = False,
         return_none_handle: bool = False,
         arrive_active: bool = False,
+        leave_active_on_enter_failure: bool = False,
         leave_active_on_exit: bool = False,
         probability: float = 1.0,
         trace: list[str] | None = None,
@@ -363,6 +369,7 @@ class _ManagedTestCallback(Callback):
         self.return_invalid_handle = return_invalid_handle
         self.return_none_handle = return_none_handle
         self._active = arrive_active
+        self.leave_active_on_enter_failure = leave_active_on_enter_failure
         self.leave_active_on_exit = leave_active_on_exit
         self.trace = [] if trace is None else trace
         self.handles: list[_RecordingHandle] = []
@@ -400,6 +407,32 @@ class _ManagedTestCallback(Callback):
         event_name = type(occurrence.event).__name__
         self.events.append((event_name, self.activated_token))
         self.trace.append(f"event:{self.name}:{event_name}")
+
+
+def _build_managed_callback(name: str = "from_factory") -> _ManagedTestCallback:
+    """Module-level factory returning a managed callback for Hydra _target_ tests."""
+
+    return _ManagedTestCallback(name=name)
+
+
+class _BadScopeAttrCallback(Callback):
+    """Module-level callback with a non-callable run_scope attribute."""
+
+    run_scope = "not-callable"  # type: ignore[assignment]
+
+
+class _GcProbingManagedCallback(_ManagedTestCallback):
+    """Managed callback that triggers cyclic GC on its first active-state check."""
+
+    def __init__(self, *, name: str = "gc_probe") -> None:
+        super().__init__(name=name)
+        self._trigger_gc_once = True
+
+    def is_managed_scope_active(self) -> bool:
+        if self._trigger_gc_once:
+            self._trigger_gc_once = False
+            gc.collect()
+        return super().is_managed_scope_active()
 
 
 class _OpaqueAllocatorProbe:
@@ -1567,3 +1600,311 @@ def test_open_run_context_managed_and_unmanaged_and_prepare_refusal(tmp_path: Pa
         assert ord_cb in ctx_plain.callbacks
     assert ctx_plain.readiness is RunContextReadiness.CLOSED
     assert _RecordingLogger.instances[0].finished == 1
+
+
+# ---------------------------------------------------------------------------
+# 12. T2 review discriminating tests (Findings 1-6)
+# ---------------------------------------------------------------------------
+
+
+def test_unsafe_callback_gc_during_registry_lock_does_not_deadlock(tmp_path: Path) -> None:
+    """Collecting an unsafe callback weakref during registry lock acquisition must not deadlock."""
+
+    _ManagedTestCallback.instances.clear()
+    rc1 = run_from_config(
+        _base_cfg(
+            tmp_path / "r1",
+            callbacks=[
+                {
+                    "_target_": f"{__name__}._ManagedTestCallback",
+                    "name": "cfg_unsafe",
+                    "fail_on_exit": True,
+                }
+            ],
+        ),
+        raise_exceptions=False,
+    )
+    assert rc1 == 1
+    assert len(_ManagedTestCallback.instances) == 1
+
+    old_threshold = gc.get_threshold()
+    was_enabled = gc.isenabled()
+    result: list[int] = []
+    errors: list[BaseException] = []
+
+    def _run_second() -> None:
+        try:
+            gc.set_threshold(1, 1, 1)
+            rc2 = run_from_config(
+                _base_cfg(tmp_path / "r2"),
+                runtime_callbacks=[_GcProbingManagedCallback(name="ok")],
+            )
+            result.append(rc2)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+        finally:
+            gc.set_threshold(*old_threshold)
+
+    # Pause automatic GC before dropping the last external strong reference so
+    # the cfg_unsafe <-> RunContext cycle stays alive until cyclic GC runs
+    # while _MANAGED_LIFECYCLE_REGISTRY._lock is held in Run 2.
+    gc.disable()
+    try:
+        _ManagedTestCallback.instances.clear()
+        thread = threading.Thread(target=_run_second, daemon=True)
+        thread.start()
+        thread.join(timeout=3.0)
+    finally:
+        gc.set_threshold(*old_threshold)
+        if was_enabled:
+            gc.enable()
+
+    assert not thread.is_alive(), (
+        "Run 2 deadlocked inside _MANAGED_LIFECYCLE_REGISTRY._lock while collecting "
+        "an unsafe callback weakref during cyclic GC"
+    )
+    assert errors == [], f"unexpected exception in worker thread: {errors!r}"
+    assert result == [0]
+
+
+def test_interpolated_callback_list_entry_uses_managed_session(tmp_path: Path) -> None:
+    """Interpolated callback list entries (callbacks: ['${obs_cb}']) must enter managed session."""
+
+    _ManagedTestCallback.instances.clear()
+    cfg = _base_cfg(
+        tmp_path / "run",
+        obs_cb={
+            "_target_": f"{__name__}._ManagedTestCallback",
+            "name": "interp_cb",
+        },
+        callbacks=["${obs_cb}"],
+    )
+    rc = run_from_config(cfg, raise_exceptions=True)
+    assert rc == 0
+    assert len(_ManagedTestCallback.instances) == 1
+    managed = _ManagedTestCallback.instances[0]
+    assert managed.name == "interp_cb"
+    assert managed.enter_readiness == [RunContextReadiness.PREPARING]
+    assert [name for name, _ in managed.events] == ["RunStarted", "RunCompleted"]
+    assert len(managed.handles) == 1
+    assert managed.handles[0].stop_requests == 1
+    assert managed.exit_readiness == [RunContextReadiness.FINALIZING]
+
+    _ManagedTestCallback.instances.clear()
+    cfg2 = _base_cfg(
+        tmp_path / "open",
+        obs_cb={
+            "_target_": f"{__name__}._ManagedTestCallback",
+            "name": "interp_open",
+        },
+        callbacks=["${obs_cb}"],
+    )
+    with open_run_context(cfg2) as ctx:
+        assert ctx.readiness is RunContextReadiness.READY
+        assert len(_ManagedTestCallback.instances) == 1
+        managed2 = _ManagedTestCallback.instances[0]
+        assert managed2.name == "interp_open"
+        assert managed2.enter_readiness == [RunContextReadiness.PREPARING]
+        assert managed2.is_managed_scope_active() is True
+    assert ctx.readiness is RunContextReadiness.CLOSED
+    assert managed2.handles[0].stop_requests == 1
+    assert managed2.exit_readiness == [RunContextReadiness.FINALIZING]
+    assert managed2.is_managed_scope_active() is False
+
+
+def test_factory_target_returning_managed_callback_refused_by_prepare_run_context(
+    tmp_path: Path,
+) -> None:
+    """Factory function _target_ returning a ManagedCallback must be refused by prepare_run_context."""
+
+    cfg = _base_cfg(
+        tmp_path,
+        callbacks=[
+            {
+                "_target_": f"{__name__}._build_managed_callback",
+                "name": "fac",
+            }
+        ],
+    )
+    with pytest.raises(ManagedLifecycleError):
+        prepare_run_context(cfg)
+
+
+def test_routed_preflight_refusal_does_not_mutate_active_or_conflicting_runtime_managed_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Routed preflight refusal must not mutate sink fields on active or conflicting callbacks."""
+
+    qualified_managed = f"{_ManagedTestCallback.__module__}.{_ManagedTestCallback.__qualname__}"
+    monkeypatch.setitem(run_mod._ARTIFACT_SINK_FIELDS, qualified_managed, ("output_path",))
+
+    logical_root = tmp_path / "logical"
+    cfg = _base_cfg(
+        tmp_path,
+        run={"root": str(logical_root), "run_id": "run_001", "dir": None},
+    )
+    logical_out = logical_root / "obs" / "unit" / "run_001" / "m.out"
+
+    # Case A: active re-entry refusal must not mutate output_path of live callback.
+    m = _ManagedTestCallback(name="live", output_path=logical_out)
+    with open_run_context(cfg, runtime_callbacks=[m]):
+        with pytest.raises(ManagedLifecycleError, match="already active"):
+            with open_run_context(
+                cfg,
+                artifact_destination=ArtifactDestination(physical_root=tmp_path / "dest_nested"),
+                runtime_callbacks=[m],
+            ):
+                pass
+        assert m.output_path == logical_out
+
+    # Case B: ownership conflict refusal must not mutate output_path before acquire().
+    m1 = _ManagedTestCallback(
+        name="p1",
+        output_path=logical_out,
+        claims=[ResourceOwnershipClaim("torch_profiler", "process")],
+    )
+    m2 = _ManagedTestCallback(
+        name="p2",
+        claims=[ResourceOwnershipClaim("torch_profiler", "process")],
+    )
+    with pytest.raises(ResourceOwnershipConflictError):
+        run_from_config(
+            cfg,
+            raise_exceptions=True,
+            artifact_destination=ArtifactDestination(physical_root=tmp_path / "dest_conflict"),
+            runtime_callbacks=[m1, m2],
+        )
+    assert m1.output_path == logical_out
+
+    dest_ok = tmp_path / "dest_ok"
+    rc = run_from_config(
+        cfg,
+        raise_exceptions=True,
+        artifact_destination=ArtifactDestination(physical_root=dest_ok),
+        runtime_callbacks=[m1],
+    )
+    assert rc == 0
+    assert m1.output_path == dest_ok / "m.out"
+
+
+def test_failed_enter_leaving_callback_active_retains_unsafe_ownership_claims(
+    tmp_path: Path,
+) -> None:
+    """Failed __enter__ leaving is_managed_scope_active() True must retain unsafe claims."""
+
+    m1 = _ManagedTestCallback(
+        name="half_enter",
+        fail_on_enter=True,
+        leave_active_on_enter_failure=True,
+        claims=[ResourceOwnershipClaim("torch_profiler", "process")],
+    )
+    with pytest.raises(RuntimeError, match="enter boom: half_enter"):
+        with open_run_context(_base_cfg(tmp_path / "r1"), runtime_callbacks=[m1]):
+            pass
+    assert m1.is_managed_scope_active() is True
+
+    m2 = _ManagedTestCallback(
+        name="second_prof",
+        claims=[ResourceOwnershipClaim("torch_profiler", "process")],
+    )
+    with pytest.raises(ResourceOwnershipConflictError, match="unsafe prior claim"):
+        with open_run_context(_base_cfg(tmp_path / "r2"), runtime_callbacks=[m2]):
+            pass
+
+
+def test_preflight_destination_freshness_and_ordinary_target_import_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Destination freshness precedes target imports, and ordinary targets wait for managed scope."""
+
+    # Case A: non-fresh destination must raise ArtifactRoutingError before importing callback targets.
+    dest = tmp_path / "non_fresh"
+    dest.mkdir()
+    (dest / "stale.txt").write_text("old", encoding="utf-8")
+    cfg_a = _base_cfg(
+        tmp_path / "a",
+        callbacks=[{"_target_": f"{__name__}._BadScopeAttrCallback"}],
+    )
+    with pytest.raises(ArtifactRoutingError):
+        run_from_config(
+            cfg_a,
+            raise_exceptions=True,
+            artifact_destination=ArtifactDestination(physical_root=dest),
+        )
+    with pytest.raises(ArtifactRoutingError):
+        with open_run_context(
+            cfg_a,
+            artifact_destination=ArtifactDestination(physical_root=dest),
+        ):
+            pass
+
+    # Case B: shipped ordinary callback targets must not be imported via get_class before run_scope enters.
+    real_get_class = run_mod.get_class
+    trace: list[str] = []
+
+    def _spy_get_class(path: str) -> Any:
+        trace.append(f"get_class:{path}")
+        return real_get_class(path)
+
+    monkeypatch.setattr(run_mod, "get_class", _spy_get_class)
+    managed = _ManagedTestCallback(name="m", trace=trace)
+    with open_run_context(
+        _base_cfg(
+            tmp_path / "b",
+            callbacks=[
+                {
+                    "_target_": "tpen.callback.Status",
+                    "output_path": "${run.dir}/status.json",
+                }
+            ],
+        ),
+        runtime_callbacks=[managed],
+    ):
+        pass
+    enter_idx = trace.index("enter:m")
+    status_indices = [
+        idx for idx, item in enumerate(trace) if item == "get_class:tpen.callback.Status"
+    ]
+    assert not any(idx < enter_idx for idx in status_indices), (
+        f"ordinary callback target imported before managed scope entered: {trace}"
+    )
+
+
+def test_secondary_cleanup_errors_logged_in_open_run_context_and_on_keyboard_interrupt(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Secondary cleanup errors must be logged on tpen.bootstrap in open_run_context and on KeyboardInterrupt."""
+
+    bootstrap_logger = logging.getLogger("tpen.bootstrap")
+    bootstrap_logger.addHandler(caplog.handler)
+    try:
+        # Case A: open_run_context body raises ValueError while managed __exit__ raises.
+        with caplog.at_level(logging.ERROR, logger="tpen.bootstrap"):
+            with pytest.raises(ValueError, match="body boom"):
+                with open_run_context(
+                    _base_cfg(tmp_path / "open"),
+                    runtime_callbacks=[_ManagedTestCallback(name="m_open", fail_on_exit=True)],
+                ):
+                    raise ValueError("body boom")
+            assert any("exit boom: m_open" in rec.getMessage() for rec in caplog.records), (
+                f"expected secondary cleanup error in tpen.bootstrap logs, got "
+                f"{[rec.getMessage() for rec in caplog.records]!r}"
+            )
+
+        # Case B: run_from_config runner raises KeyboardInterrupt while managed __exit__ raises.
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="tpen.bootstrap"):
+            with pytest.raises(KeyboardInterrupt, match="user interrupt"):
+                run_from_config(
+                    _base_cfg(
+                        tmp_path / "kb",
+                        runner={"_target_": f"{__name__}._KeyboardInterruptRunner"},
+                    ),
+                    runtime_callbacks=[_ManagedTestCallback(name="m_kb", fail_on_exit=True)],
+                )
+            assert any("exit boom: m_kb" in rec.getMessage() for rec in caplog.records), (
+                f"expected secondary cleanup error on KeyboardInterrupt in tpen.bootstrap logs, "
+                f"got {[rec.getMessage() for rec in caplog.records]!r}"
+            )
+    finally:
+        bootstrap_logger.removeHandler(caplog.handler)
