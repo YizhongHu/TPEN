@@ -15,6 +15,7 @@ import pytest
 import torch
 import torch.nn as nn
 import typeguard
+from omegaconf import OmegaConf
 from typeguard import TypeCheckError
 
 import tpen.training as training_pkg
@@ -340,10 +341,15 @@ def _build_rich_tpen_model(
             implementation=MixingImplementation.VECTORIZED,
             initial_weight=0.25,
         )
+        tp_paths = tuple(
+            path
+            for order in orders
+            for path in tp_meta.paths_for_output_order(order)
+        )
         tp_mix = EquivariantMixing(
             max_order=max_order,
             max_virtual_order=max_virtual_order,
-            paths=tp_meta,
+            paths=tp_paths,
             channels=channels,
             aggregation=aggregation,
             implementation=MixingImplementation.VECTORIZED,
@@ -601,13 +607,20 @@ def test_embedding_and_channel_mlp_distinct_tuple_masking_and_zero_support() -> 
     # Mutant killer: removing repeated-particle masking would yield A_unmasked_ref != A_masked_ref.
     assert float((A_masked_ref - A_unmasked_ref).abs().max().item()) > 1e-2
 
-    # ChannelPreservingMLPActivation inside CompositeMixing (tuple_axes_start=3) order 2 has P * 2 distinct locations.
+    # ChannelPreservingMLPActivation inside CompositeMixing (tuple_axes_start=3) order 2 has P * 2 distinct locations,
+    # and inside PathAggregation (tuple_axes_start=2) order 2 has 2 distinct locations.
     mix_mlp_o2 = model.stack.layers[0].mixing.activation.mlps[1].layers[0]
     blk_mix_mlp_o2 = next(
         b for b in packet.kronecker_blocks if b.parameter_ordinals[0] == id_to_ord[id(mix_mlp_o2.weight)]
     )
     n_paths_o2 = model.layout.count_for_order(2)
     assert blk_mix_mlp_o2.active_locations == n_paths_o2 * 2
+
+    agg_mlp_o2 = model.stack.layers[0].path_aggregation.activation.mlps[1].layers[0]
+    blk_agg_mlp_o2 = next(
+        b for b in packet.kronecker_blocks if b.parameter_ordinals[0] == id_to_ord[id(agg_mlp_o2.weight)]
+    )
+    assert blk_agg_mlp_o2.active_locations == 2
 
     # 3-body EquivariantMixing paths (s=3) at n=2 have V == 0 -> exact zero (A, G), no NaN.
     tp_producer = model.stack.layers[0].mixing.producers[1]
@@ -1352,13 +1365,15 @@ def test_step_request_protocol_and_plain_sgd_guards() -> None:
 def _checkpoint_context(tmp_path: Path, method_tag: str) -> Any:
     from types import SimpleNamespace
 
-    cfg = {
-        "model": {"tag": "tiny_kfac"},
-        "hamiltonian_terms": {"tag": "tiny_ham"},
-        "optimizer": {"tag": method_tag},
-        "trainer": {"tag": method_tag},
-        "sampler": {"tag": "tiny_seq"},
-    }
+    cfg = OmegaConf.create(
+        {
+            "model": {"tag": "tiny_kfac"},
+            "hamiltonian_terms": {"tag": "tiny_ham"},
+            "optimizer": {"tag": method_tag},
+            "trainer": {"tag": method_tag},
+            "sampler": {"tag": "tiny_seq"},
+        }
+    )
     metadata = SimpleNamespace(
         device="cpu",
         dtype="float64",
