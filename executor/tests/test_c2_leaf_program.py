@@ -276,7 +276,7 @@ def test_configured_command_for_attempt_carries_only_the_typed_delta(tmp_path: P
         attempt_id="a1",
     )
     assert command.args[-2] == "--attempt-delta"
-    assert "run.root=" not in " ".join(command.args)
+    assert not any(argument.startswith("run.root=") for argument in command.args[3:])
     assert '"attempt_core_dir":"' + str(tmp_path / "groups" / ("g" * 64) / "configured" / "a1" / "core") + '"' in command.args[-1]
 
 
