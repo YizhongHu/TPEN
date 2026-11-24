@@ -14,7 +14,7 @@ import binascii
 import copy
 import math
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -165,7 +165,17 @@ def overlay_sha256(overlay: str | Path) -> str:
     path = resolve_overlay_path(overlay)
     if not path.is_file():
         raise ProtocolError(f"overlay file does not exist: {path}")
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return _sha256_file(path)
+
+
+def _sha256_file(path: Path) -> str:
+    """Hash one admitted file's exact bytes without loading it all at once."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def overlay_path_for_system(system: str) -> str:
@@ -966,6 +976,7 @@ def _canonical_override_key(key: str, *, reject_noncanonical: bool) -> str:
 
 def validate_gateway_binding(*, binding: str, config: str | None = None,
                              overrides: list[str] | None = None, kind: str | None = None,
+                             expected_kinds: Collection[str] | None = None,
                              expected_checkpoint_sha256: str | None = None,
                              overlay: str | None = None,
                              overlay_sha256: str | None = None) -> dict[str, Any]:
@@ -981,6 +992,11 @@ def validate_gateway_binding(*, binding: str, config: str | None = None,
     effective_kind = row.get("kind")
     if effective_kind not in KINDS:
         raise ProtocolError("manifest row has an invalid kind")
+    if expected_kinds is not None and effective_kind not in expected_kinds:
+        expected = ", ".join(sorted(expected_kinds))
+        raise ProtocolError(
+            f"gateway expected kind in {{{expected}}}, actual kind {effective_kind!r}"
+        )
     if kind is not None and effective_kind != kind:
         raise ProtocolError("binding kind does not match gateway")
     row_config = row.get("config")
@@ -1034,7 +1050,21 @@ def validate_gateway_binding(*, binding: str, config: str | None = None,
         expected.add(f"runtime.device={device}")
     if effective_kind == "eval":
         checkpoint_dir, checkpoint_file = _checkpoint_binding(row)
-        _require_sha(row.get("checkpoint_sha256"), length=64, field="checkpoint_sha256")
+        expected_checkpoint_digest = _require_sha(
+            row.get("checkpoint_sha256"), length=64, field="checkpoint_sha256"
+        )
+        if expected_kinds is not None:
+            # The row-only gateways use this admission path.  The legacy
+            # restart adapter continues to validate its historical override
+            # contract here, while its restart lifecycle owns checkpoint I/O.
+            if not checkpoint_file.is_file():
+                raise ProtocolError(f"checkpoint file does not exist: {checkpoint_file}")
+            actual_checkpoint_digest = _sha256_file(checkpoint_file)
+            if actual_checkpoint_digest != expected_checkpoint_digest:
+                raise ProtocolError(
+                    "checkpoint file sha256 does not match row checkpoint_sha256: "
+                    f"actual={actual_checkpoint_digest}, expected={expected_checkpoint_digest}"
+                )
         expected.update({
             f"evaluation_sampler.n_walkers={row['walkers']}",
             f"evaluation_tasks.mcmc_energy.generator.n_draws={row['draws']}",
@@ -1046,7 +1076,7 @@ def validate_gateway_binding(*, binding: str, config: str | None = None,
             _require_sha(expected_checkpoint_sha256, length=64,
                          field="expected_checkpoint_sha256")
         if (expected_checkpoint_sha256 is not None
-                and expected_checkpoint_sha256 != row.get("checkpoint_sha256")):
+                and expected_checkpoint_sha256 != expected_checkpoint_digest):
             raise ProtocolError("expected checkpoint sha256 does not match binding")
     else:
         expected.update({f"sampler.n_walkers={row['walkers']}",

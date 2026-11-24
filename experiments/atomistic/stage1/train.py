@@ -124,7 +124,9 @@ def main() -> int:
         help="run the admitted row through the Stage-1 restart protocol",
     )
     args = parser.parse_args()
-    row = validate_gateway_binding(binding=args.binding)
+    row = validate_gateway_binding(
+        binding=args.binding, expected_kinds={"smoke", "train"}
+    )
     cfg = build_train_config(row)
     config_path = resolve_config_path(str(row["config"]))
     if args.restart:

@@ -164,7 +164,9 @@ def _phase1_rows(*, system: str, science: bool = False) -> list[dict[str, object
     )
 
 
-def _phase2_eval_row(system: str) -> dict[str, object]:
+def _phase2_eval_row(
+    system: str, *, checkpoint_root: Path | None = None,
+) -> dict[str, object]:
     """Build one real eval row with a checkpoint binding."""
 
     rows = build_manifest(
@@ -181,7 +183,17 @@ def _phase2_eval_row(system: str) -> dict[str, object]:
         expected_physical_system_id=planned_physical_system_ids(),
         device="cpu",
     )
-    return next(row for row in rows if row["kind"] == "eval")
+    row = next(row for row in rows if row["kind"] == "eval")
+    if checkpoint_root is not None:
+        checkpoint_dir = checkpoint_root / system / "step_000000"
+        checkpoint_dir.mkdir(parents=True)
+        checkpoint_file = checkpoint_dir / "model.pt"
+        payload = b"matching checkpoint bytes"
+        checkpoint_file.write_bytes(payload)
+        row["checkpoint_dir"] = str(checkpoint_dir.resolve())
+        row["checkpoint_file"] = str(checkpoint_file.resolve())
+        row["checkpoint_sha256"] = hashlib.sha256(payload).hexdigest()
+    return row
 
 
 @pytest.mark.parametrize("system", SYSTEMS)
@@ -213,13 +225,15 @@ def test_real_hooke_overlay_roster_is_admitted(system: str) -> None:
 
 
 @pytest.mark.parametrize("system", SYSTEMS)
-def test_real_train_and_eval_builders_compose_roster_rows(system: str) -> None:
+def test_real_train_and_eval_builders_compose_roster_rows(
+    system: str, tmp_path: Path,
+) -> None:
     """Both real builders consume the admitted train/eval row populations."""
 
     train = next(row for row in _phase1_rows(system=system) if row["kind"] == "train")
     train_cfg = stage1_train.build_train_config(train)
     assert OmegaConf.select(train_cfg, "run.run_id") == train["run_id"]
-    eval_row = _phase2_eval_row(system)
+    eval_row = _phase2_eval_row(system, checkpoint_root=tmp_path)
     validate_gateway_binding(binding=_binding_token(eval_row))
     eval_cfg = stage1_eval.build_eval_config(eval_row)
     assert OmegaConf.select(eval_cfg, "load.mode") == "model_only"
@@ -281,7 +295,7 @@ def test_valid_binding_control_reaches_core_spy(
     """A matching binding reaches only the substituted core call."""
 
     row = (next(row for row in _phase1_rows(system="he") if row["kind"] == "train")
-           if gateway == "train" else _phase2_eval_row("he"))
+           if gateway == "train" else _phase2_eval_row("he", checkpoint_root=tmp_path))
     row["results_root"] = str(tmp_path / "results")
     module = stage1_train if gateway == "train" else stage1_eval
     reached: list[object] = []
@@ -303,7 +317,7 @@ def test_gateway_rejects_cross_kind_binding_before_core(
     """A valid row for the other gateway must never reach core construction."""
 
     train_row = next(row for row in _phase1_rows(system="he") if row["kind"] == "train")
-    eval_row = _phase2_eval_row("he")
+    eval_row = _phase2_eval_row("he", checkpoint_root=tmp_path)
     row = eval_row if gateway == "train" else train_row
     row["results_root"] = str(tmp_path / "results")
     module = stage1_train if gateway == "train" else stage1_eval

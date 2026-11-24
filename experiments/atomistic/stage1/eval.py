@@ -100,7 +100,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binding", required=True)
     args = parser.parse_args()
-    row = validate_gateway_binding(binding=args.binding)
+    row = validate_gateway_binding(binding=args.binding, expected_kinds={"eval"})
     cfg = build_eval_config(row)
     config_path = resolve_config_path(str(row["config"]))
     _refuse_existing_eval_run(cfg)
