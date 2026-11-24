@@ -298,6 +298,34 @@ def _real_restart_row(tmp_path: Path, *, run_id: str) -> dict[str, object]:
     return row
 
 
+def _assert_checkpoint_payload_equal(left: Path, right: Path) -> None:
+    """Compare serialized tensor/state payloads, not archive container bytes."""
+
+    import torch
+
+    left_payload = torch.load(left, map_location="cpu")
+    right_payload = torch.load(right, map_location="cpu")
+
+    def compare(actual: object, expected: object, path: str) -> None:
+        if torch.is_tensor(actual) or torch.is_tensor(expected):
+            assert torch.is_tensor(actual) and torch.is_tensor(expected), path
+            assert torch.equal(actual, expected), path
+        elif isinstance(actual, dict) or isinstance(expected, dict):
+            assert isinstance(actual, dict) and isinstance(expected, dict), path
+            assert actual.keys() == expected.keys(), path
+            for key in actual:
+                compare(actual[key], expected[key], f"{path}[{key!r}]")
+        elif isinstance(actual, (list, tuple)) or isinstance(expected, (list, tuple)):
+            assert type(actual) is type(expected), path
+            assert len(actual) == len(expected), path
+            for index, (actual_item, expected_item) in enumerate(zip(actual, expected)):
+                compare(actual_item, expected_item, f"{path}[{index}]")
+        else:
+            assert actual == expected, path
+
+    compare(left_payload, right_payload, left.name)
+
+
 def _real_restart_child() -> None:
     """Run one fresh, resumed, or uninterrupted phase in a new interpreter."""
 
@@ -488,5 +516,8 @@ def test_real_fresh_process_restore_parity_with_checkpoint_zero_and_overlay(
 
     resumed_checkpoint = resumed_dir / "checkpoints" / "step_000002"
     reference_checkpoint = reference_dir / "checkpoints" / "step_000002"
-    for name in ("model.pt", "optimizer.pt", "trainer.json", "sampler.pt", "rng.pt"):
-        assert (resumed_checkpoint / name).read_bytes() == (reference_checkpoint / name).read_bytes()
+    for name in ("model.pt", "optimizer.pt", "sampler.pt", "rng.pt"):
+        _assert_checkpoint_payload_equal(resumed_checkpoint / name, reference_checkpoint / name)
+    assert json.loads((resumed_checkpoint / "trainer.json").read_text(encoding="utf-8")) == json.loads(
+        (reference_checkpoint / "trainer.json").read_text(encoding="utf-8")
+    )
