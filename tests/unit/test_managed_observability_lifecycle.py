@@ -26,6 +26,7 @@ from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 import pytest
+from typeguard import TypeCheckError, suppress_type_checks
 
 import tpen.artifacts as artifacts_mod
 from tpen.artifacts import (
@@ -41,6 +42,7 @@ from tpen.artifacts import (
     build_run_metadata,
 )
 from tpen.callback import (
+    Cadence,
     Callback,
     ManagedLifecycleError,
     ResourceOwnershipClaim,
@@ -340,7 +342,8 @@ class _ManagedTestCallback(Callback):
                         Subscription.of(RunStarted),
                         Subscription.of(RunCompleted),
                         Subscription.of(RunFailed),
-                    )
+                    ),
+                    cadence=None if probability == 1.0 else Cadence(probability=probability),
                 ),
             ),
         )
@@ -584,7 +587,7 @@ def test_run_context_readiness_transitions_and_gating(tmp_path: Path) -> None:
     aborted._transition_readiness(RunContextReadiness.FINALIZING)
     aborted._transition_readiness(RunContextReadiness.CLOSED)
 
-    with pytest.raises(TypeError):
+    with pytest.raises((TypeError, TypeCheckError)):
         RunContext(
             cfg=ctx.cfg,
             source_cfg=ctx.source_cfg,
@@ -593,6 +596,16 @@ def test_run_context_readiness_transitions_and_gating(tmp_path: Path) -> None:
             clock=ctx.clock,
             initial_readiness="ready",  # type: ignore[arg-type]
         )
+    with suppress_type_checks():
+        with pytest.raises(TypeError):
+            RunContext(
+                cfg=ctx.cfg,
+                source_cfg=ctx.source_cfg,
+                artifact_manager=ctx.artifact_manager,
+                metadata=ctx.metadata,
+                clock=ctx.clock,
+                initial_readiness="ready",  # type: ignore[arg-type]
+            )
     with pytest.raises(ValueError):
         RunContext(
             cfg=ctx.cfg,
