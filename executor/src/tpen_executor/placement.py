@@ -357,7 +357,7 @@ class ChildPlacementObservation:
     group_digest: str
     allocation_id: str
     backend_job_id: str
-    slot_id: str
+    slot_id: str | None
     payload_digest: str
     output_dir: str
     host: str
@@ -370,10 +370,12 @@ class ChildPlacementObservation:
     refusal: dict[str, str] | None
 
     def __post_init__(self) -> None:
-        for name in (
-            "task_id", "attempt_id", "allocation_id", "backend_job_id", "slot_id", "output_dir", "host",
-        ):
+        for name in ("task_id", "attempt_id", "allocation_id", "backend_job_id", "output_dir", "host"):
             object.__setattr__(self, name, text(getattr(self, name), name))
+        if self.slot_id == "":
+            object.__setattr__(self, "slot_id", None)
+        elif self.slot_id is not None:
+            object.__setattr__(self, "slot_id", text(self.slot_id, "slot_id"))
         object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
         object.__setattr__(self, "payload_digest", sha256_text(self.payload_digest, "payload_digest"))
         if type(self.pid) is not int or isinstance(self.pid, bool) or self.pid <= 0:
@@ -429,8 +431,10 @@ class ChildPlacementObservation:
             "cuda_visible_devices", "observed_at_utc", "refusal",
         }
         fields(data, expected, cls.schema, "ChildPlacementObservation")
-        if any(type(data[key]) is not str for key in expected - {"pid", "proc_start_ticks", "affinity", "thread_settings", "cuda_visible_devices", "refusal", "schema"}):
+        if any(type(data[key]) is not str for key in expected - {"pid", "proc_start_ticks", "affinity", "thread_settings", "cuda_visible_devices", "refusal", "schema", "slot_id"}):
             raise TypeError("child placement identity fields must be strings")
+        if data["slot_id"] is not None and type(data["slot_id"]) is not str:
+            raise TypeError("child placement slot_id must be a string or null")
         return cls(
             data["task_id"], data["attempt_id"], data["group_digest"], data["allocation_id"], data["backend_job_id"],
             data["slot_id"], data["payload_digest"], data["output_dir"], data["host"], data["pid"],

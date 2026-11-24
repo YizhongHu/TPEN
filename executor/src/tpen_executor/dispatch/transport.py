@@ -55,7 +55,7 @@ from ..configured_program import AttemptDelta, ConfiguredProgram
 from .._records import frozen_record
 from ..environments import PreparedPythonEnvironment, SourceScript
 from ..gpu_sampler import GPU_SAMPLER_OUTPUT_ENV, SLOT_QUARANTINE_ENV, slot_quarantine_dir
-from ..placement import PLACEMENT_OUTPUT_ENV, PLACEMENT_REFUSAL_ENV, PlacementRefusal, parse_cpu_set
+from ..placement import PLACEMENT_REFUSAL_ENV, PlacementRefusal, parse_cpu_set
 from ..runners import CoreRunEvidence, EvidenceUnavailable, TPENEvidence
 from ..tasks import ConfiguredRun
 from ..workers import SubprocessWorker
@@ -65,6 +65,7 @@ from .contract import (
     _admit_slot,
     _child_precore_refusal,
     _evidence_payload,
+    _fence_placement_overlay,
     _inside,
     _member_paths,
     _without_gpu_sampler,
@@ -398,6 +399,8 @@ class LeafRequest:
             _text(getattr(self, name), name)
         if self.slot_id is not None:
             _text(self.slot_id, "slot_id")
+        if self.slot_id == "":
+            object.__setattr__(self, "slot_id", None)
         if self.program is not None and type(self.program) is not ConfiguredProgram:
             raise TypeError("program must be ConfiguredProgram or None")
         if self.attempt_delta is not None and type(self.attempt_delta) is not AttemptDelta:
@@ -446,7 +449,16 @@ class LeafRequest:
         # Same digest as the controller placement overlay and receipts.
         if self.payload_digest != expected_payload:
             raise ValueError("payload_digest does not match the configured payload")
-        values = self.environment.env
+        values = dict(self.environment.env)
+        if not values.get("TPEN_SLOT_ID"):
+            values.pop("TPEN_SLOT_ID", None)
+            values.pop("TPEN_PLACEMENT_SLOT_ID", None)
+            object.__setattr__(
+                self,
+                "environment",
+                PreparedPythonEnvironment(self.environment.python, self.environment.setup, values),
+            )
+            values = self.environment.env
         if values.get("TPEN_SLOT_ID") != self.slot_id:
             raise ValueError("slot_id does not match the prepared environment TPEN_SLOT_ID")
         if PLACEMENT_REFUSAL_ENV in values:
@@ -539,24 +551,18 @@ class LeafRequest:
             config = ""
             overrides = ()
             values = dict(environment.env)
-            values.update({
-                PLACEMENT_OUTPUT_ENV: os.path.join(fence.output_dir, "child-placement.json"),
-                "TPEN_PLACEMENT_OUTPUT_DIR": fence.output_dir,
-                "TPEN_PLACEMENT_TASK_ID": fence.task_id,
-                "TPEN_PLACEMENT_ATTEMPT_ID": fence.attempt_id.value,
-                "TPEN_PLACEMENT_GROUP_DIGEST": fence.group_digest,
-                "TPEN_PLACEMENT_ALLOCATION_ID": allocation.allocation_id.value,
-                "TPEN_PLACEMENT_BACKEND_JOB_ID": allocation.backend_job_id.value,
-                "TPEN_SLOT_ID": environment.env.get("TPEN_SLOT_ID", ""),
-                "TPEN_PLACEMENT_SLOT_ID": environment.env.get("TPEN_SLOT_ID", ""),
-                "TPEN_PLACEMENT_PAYLOAD_DIGEST": configured.attempt_binding_digest(
-                    fence.output_dir,
-                    root=fence.root,
-                    group_digest=fence.group_digest,
-                    task_id=fence.task_id,
-                    attempt_id=fence.attempt_id.value,
-                ),
-            })
+            carried_slot_id = values.get("TPEN_SLOT_ID") or None
+            values.pop("TPEN_SLOT_ID", None)
+            values.pop("TPEN_PLACEMENT_SLOT_ID", None)
+            values.update(_fence_placement_overlay(
+                fence,
+                allocation,
+                configured,
+                group_digest=fence.group_digest,
+                task_id=fence.task_id,
+                attempt_id=fence.attempt_id.value,
+                slot_id=carried_slot_id,
+            ))
             environment = PreparedPythonEnvironment(environment.python, environment.setup, values)
         return cls(
             fence.group_digest,
@@ -564,7 +570,7 @@ class LeafRequest:
             fence.attempt_id.value,
             allocation.allocation_id.value,
             allocation.backend_job_id.value,
-            environment.env.get("TPEN_SLOT_ID"),
+            environment.env.get("TPEN_SLOT_ID") or None,
             config,
             overrides,
             program,

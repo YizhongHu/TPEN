@@ -15,8 +15,10 @@ from tpen_executor._codec import digest
 from tpen_executor.configured_program import CONFIGURED_PROGRAM_ALLOWLIST, AttemptDelta, ConfiguredLoad, ConfiguredProgram
 from tpen_executor.dispatch import LocalDispatcher
 from tpen_executor.dispatch import parsl as parsl_dispatch
-from tpen_executor.dispatch.transport import LeafRequest, run_leaf
+from tpen_executor.dispatch.contract import _fence_placement_overlay
+from tpen_executor.dispatch.transport import LeafRequest, LeafResult, run_leaf, validate_leaf_result
 from tpen_executor.environments import PreparedPythonEnvironment
+from tpen_executor.gpu_sampler import acquire_slot_lease, settle_slot_lease
 from tpen_executor.placement import PLACEMENT_OUTPUT_ENV
 from tpen_executor.tasks import ConfiguredRun
 from tpen_executor.workers import ProcessOutcome, SubprocessWorker
@@ -135,6 +137,7 @@ def test_serialized_leaf_carries_delta_and_rejects_crossed_output(tmp_path: Path
     payload = request.to_dict()
     payload["attempt_delta"] = foreign.to_dict()
     payload["payload_digest"] = digest({"program_digest": request.program.program_digest, "attempt_delta_digest": foreign.digest})
+    payload["environment"]["env"]["TPEN_PLACEMENT_PAYLOAD_DIGEST"] = payload["payload_digest"]
     with pytest.raises(ValueError, match="attempt delta does not bind"):
         LeafRequest.from_mapping(payload)
 
@@ -158,8 +161,10 @@ def test_no_slot_configured_local_delivers_placement_output(tmp_path: Path, monk
     attempt = manifest.attempts[0]
     output_dir = Path(lifecycle.store.root) / "groups" / group.identity / "member" / attempt.attempt_id.value
     assert payload["env"]["TPEN_PLACEMENT_OUTPUT"] == str(output_dir / "child-placement.json")
-    assert payload["env"]["TPEN_PLACEMENT_SLOT_ID"] == ""
+    assert payload["env"]["TPEN_PLACEMENT_SLOT_ID"] is None
     assert (output_dir / "child-placement.json").is_file()
+    assert manifest.attempts[0].outcome_receipt.status == "completed"
+    assert manifest.attempts[0].placement_receipt.slot_id is None
 
 
 def test_no_slot_configured_parsl_delivers_placement_output(
@@ -179,6 +184,8 @@ def test_no_slot_configured_parsl_delivers_placement_output(
     assert payload["env"]["TPEN_PLACEMENT_OUTPUT"] == str(output_dir / "child-placement.json")
     records = [record for record in fake_parsl.submissions if record["function"] == "_run_parsl_child_captured"]
     assert records and records[0]["args"][2]["TPEN_PLACEMENT_OUTPUT"] == str(output_dir / "child-placement.json")
+    assert manifest.attempts[0].outcome_receipt.status == "completed"
+    assert manifest.attempts[0].placement_receipt.slot_id is None
 
 
 def test_no_slot_configured_leaf_delivers_placement_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -198,10 +205,55 @@ def test_no_slot_configured_leaf_delivers_placement_output(tmp_path: Path, monke
     environment = _worker(tmp_path).materialize(None)["environment"]
     request = LeafRequest.for_attempt(fence, allocation, configured, environment, 60)
     assert request.environment.env[PLACEMENT_OUTPUT_ENV] == str(output / "child-placement.json")
-    run_leaf(request.encode())
+    assert request.slot_id is None
+    result = LeafResult.decode(run_leaf(request.encode()))
+    assert validate_leaf_result(request, result) is result
+    assert result.slot_id is None
     payload = json.loads(marker.read_text(encoding="utf-8"))
     assert payload["env"]["TPEN_PLACEMENT_OUTPUT"] == str(output / "child-placement.json")
+    assert payload["env"]["TPEN_PLACEMENT_SLOT_ID"] is None
     assert (output / "child-placement.json").is_file()
+
+
+def test_no_slot_fallback_preserves_held_slot_and_runs_after_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real no-slot fallback honors a carried lease, then admits its control."""
+
+    configured, marker = _marker_run(tmp_path, monkeypatch)
+    slot = "c22-held-no-slot"
+    lease = acquire_slot_lease(slot, None, {"test": "c22 no-slot fallback"})
+    group = _group("c22-held-no-slot-group", "member")
+    lifecycle = _lifecycle(tmp_path)
+    try:
+        manifest = LocalDispatcher(_worker(tmp_path)).run(
+            group, {"member": configured}, lifecycle, env={"TPEN_SLOT_ID": slot}, timeout=60,
+        )
+        assert manifest.attempts[0].outcome_receipt.status == "launch_failed"
+        assert not marker.exists()
+    finally:
+        settle_slot_lease(lease, None, group_reaped=True)
+    control_group = _group("c22-unheld-no-slot-group", "member")
+    control_lifecycle = _lifecycle(tmp_path, "control-store")
+    manifest = LocalDispatcher(_worker(tmp_path)).run(
+        control_group, {"member": configured}, control_lifecycle, env={"TPEN_SLOT_ID": slot}, timeout=60,
+    )
+    assert marker.exists()
+    assert manifest.attempts[0].outcome_receipt.status == "completed"
+
+
+def test_fence_overlay_omits_slot_keys_without_a_slot(tmp_path: Path) -> None:
+    configured = _configured(tmp_path)
+    root = tmp_path / "store"
+    output = root / "groups" / GROUP / "task" / "attempt"
+    fence = SimpleNamespace(root=str(root), output_dir=str(output))
+    allocation = SimpleNamespace(
+        allocation_id=SimpleNamespace(value="allocation"), backend_job_id=SimpleNamespace(value="job"),
+    )
+    overlay = _fence_placement_overlay(
+        fence, allocation, configured, group_digest=GROUP, task_id="task", attempt_id="attempt",
+    )
+    assert "TPEN_SLOT_ID" not in overlay and "TPEN_PLACEMENT_SLOT_ID" not in overlay
 
 
 @pytest.mark.parametrize("carrier", ["local", "parsl"])
@@ -211,17 +263,30 @@ def test_actual_dispatchers_refuse_crossed_identity_before_child(
 ) -> None:
     """Actual dispatchers reject each crossed identity before process/submission."""
 
-    root = tmp_path / "store"
-    values = {"group": GROUP, "task": "member", "attempt": "attempt"}
-    values[crossed] = {"group": "foreign-group", "task": "foreign-task", "attempt": "foreign-attempt"}[crossed]
-    crossed_output = root / "groups" / values["group"] / values["task"] / values["attempt"]
     configured = _configured(tmp_path, task_id="member")
     original = ConfiguredRun.command_for_attempt
+    seam_calls: list[tuple[str, dict[str, str]]] = []
+    refusal_reasons: list[str] = []
 
     def crossed_command(self, output_dir, **kwargs):
         if self.program is not None and self.id == "member":
-            output_dir = str(crossed_output)
-        return original(self, output_dir, **kwargs)
+            seam_calls.append((output_dir, dict(kwargs)))
+            kwargs = dict(kwargs)
+            actual_path = Path(output_dir)
+            actual_identity = {
+                "group": actual_path.parent.parent.name,
+                "task": actual_path.parent.name,
+                "attempt": actual_path.name,
+            }
+            assert {
+                "group": kwargs["group_digest"], "task": kwargs["task_id"], "attempt": kwargs["attempt_id"],
+            } == actual_identity
+            kwargs[crossed] = f"foreign-{actual_identity[crossed]}"
+        try:
+            return original(self, output_dir, **kwargs)
+        except ValueError as error:
+            refusal_reasons.append(str(error))
+            raise
 
     monkeypatch.setattr(ConfiguredRun, "command_for_attempt", crossed_command)
     group = _group(f"c22-crossed-{carrier}-{crossed}", "member")
@@ -242,6 +307,8 @@ def test_actual_dispatchers_refuse_crossed_identity_before_child(
             group, {"member": configured}, lifecycle, timeout=60,
         )
         assert not [record for record in fake_parsl.submissions if record["function"] == "_run_parsl_child_captured"]
+    assert len(seam_calls) == 1
+    assert refusal_reasons == ["configured attempt output does not bind the placement fence"]
 
 
 @pytest.mark.parametrize("carrier", ["local", "parsl"])
@@ -334,8 +401,8 @@ MUTANTS = (
     {
         "id": "no-slot-placement-output",
         "target": "executor/src/tpen_executor/dispatch/contract.py",
-        "old": "                        PLACEMENT_OUTPUT_ENV: os.path.join(fence.output_dir, \"child-placement.json\"),\n                        \"TPEN_PLACEMENT_OUTPUT_DIR\": fence.output_dir,\n                        \"TPEN_PLACEMENT_TASK_ID\": member.task_id,\n",
-        "new": "                        PLACEMENT_OUTPUT_ENV: \"\",\n                        \"TPEN_PLACEMENT_OUTPUT_DIR\": fence.output_dir,\n                        \"TPEN_PLACEMENT_TASK_ID\": member.task_id,\n",
+        "old": "        PLACEMENT_OUTPUT_ENV: os.path.join(fence.output_dir, \"child-placement.json\"),\n        \"TPEN_PLACEMENT_OUTPUT_DIR\": fence.output_dir,\n        \"TPEN_PLACEMENT_TASK_ID\": task_id,\n",
+        "new": "        PLACEMENT_OUTPUT_ENV: \"\",\n        \"TPEN_PLACEMENT_OUTPUT_DIR\": fence.output_dir,\n        \"TPEN_PLACEMENT_TASK_ID\": task_id,\n",
         "killer": "test_no_slot_configured_local_delivers_placement_output",
     },
     {
@@ -358,6 +425,41 @@ MUTANTS = (
         "old": "        return configured.command_for_attempt(\n            output_dir,\n            root=self.root if self.program is not None else None,\n            group_digest=self.group_digest if self.program is not None else None,\n            task_id=self.task_id if self.program is not None else None,\n            attempt_id=self.attempt_id if self.program is not None else None,\n        ).args\n",
         "new": "        return configured.command_for_attempt(\n            output_dir,\n            root=self.root if self.program is not None else None,\n            group_digest=self.group_digest if self.program is not None else None,\n            task_id=self.task_id if self.program is not None else None,\n            attempt_id=self.attempt_id if self.program is not None else None,\n        ).args + (f\"run.root={output_dir}\", \"run.layout=flat\", \"run.run_id=core\")\n",
         "killer": "test_serialized_leaf_carries_delta_and_rejects_crossed_output",
+    },
+    {
+        "id": "no-slot-blank-carried-slot-id",
+        "target": "executor/src/tpen_executor/dispatch/contract.py",
+        "old": "        values[\"TPEN_SLOT_ID\"] = slot_id\n",
+        "new": "        values[\"TPEN_SLOT_ID\"] = \"\"\n",
+        "killer": "test_no_slot_fallback_preserves_held_slot_and_runs_after_release",
+    },
+    {
+        "id": "no-slot-emits-empty-slot-keys",
+        "target": "executor/src/tpen_executor/dispatch/contract.py",
+        "old": "    return values\n\n\ndef _status",
+        "new": "    values[\"TPEN_SLOT_ID\"] = \"\"\n    values[\"TPEN_PLACEMENT_SLOT_ID\"] = \"\"\n    return values\n\n\ndef _status",
+        "killer": "test_fence_overlay_omits_slot_keys_without_a_slot",
+    },
+    {
+        "id": "crossed-group-check",
+        "target": "executor/src/tpen_executor/tasks.py",
+        "old": "        if os.path.basename(task_parent) != group_digest:\n            raise ValueError(\"configured attempt output does not bind the placement fence\")\n",
+        "new": "        if False:\n            raise ValueError(\"configured attempt output does not bind the placement fence\")\n",
+        "killer": "test_actual_dispatchers_refuse_crossed_identity_before_child[group]",
+    },
+    {
+        "id": "crossed-task-check",
+        "target": "executor/src/tpen_executor/tasks.py",
+        "old": "        if os.path.basename(attempt_parent) != task_id:\n            raise ValueError(\"configured attempt output does not bind the placement fence\")\n",
+        "new": "        if False:\n            raise ValueError(\"configured attempt output does not bind the placement fence\")\n",
+        "killer": "test_actual_dispatchers_refuse_crossed_identity_before_child[task]",
+    },
+    {
+        "id": "crossed-attempt-check",
+        "target": "executor/src/tpen_executor/tasks.py",
+        "old": "        if os.path.basename(output_dir) != attempt_id:\n            raise ValueError(\"configured attempt output does not bind the placement fence\")\n",
+        "new": "        if False:\n            raise ValueError(\"configured attempt output does not bind the placement fence\")\n",
+        "killer": "test_actual_dispatchers_refuse_crossed_identity_before_child[attempt]",
     },
     {
         "id": "cross-output-dir",

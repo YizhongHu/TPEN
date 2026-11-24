@@ -77,8 +77,19 @@ class ConfiguredRun:
             raise ValueError("configured run does not belong to the attempt task")
         if type(root) is not str or not os.path.isabs(root) or os.path.normpath(root) != root:
             raise ValueError("configured attempt binding requires a normalized absolute root")
-        expected_output = os.path.join(root, "groups", group_digest, task_id, attempt_id)
-        if output_dir != os.path.normpath(output_dir) or output_dir != expected_output:
+        normalized_output = os.path.normpath(output_dir)
+        if output_dir != normalized_output:
+            raise ValueError("configured attempt output does not bind the placement fence")
+        attempt_parent = os.path.dirname(output_dir)
+        task_parent = os.path.dirname(attempt_parent)
+        group_parent = os.path.dirname(task_parent)
+        if os.path.basename(group_parent) != "groups" or os.path.dirname(group_parent) != root:
+            raise ValueError("configured attempt output does not bind the placement fence")
+        if os.path.basename(task_parent) != group_digest:
+            raise ValueError("configured attempt output does not bind the placement fence")
+        if os.path.basename(attempt_parent) != task_id:
+            raise ValueError("configured attempt output does not bind the placement fence")
+        if os.path.basename(output_dir) != attempt_id:
             raise ValueError("configured attempt output does not bind the placement fence")
         return AttemptDelta(
             os.path.join(output_dir, "core"), self.program.load,
