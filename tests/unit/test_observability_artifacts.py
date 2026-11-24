@@ -1370,6 +1370,50 @@ def test_negative_schema_validation_rules() -> None:
     with pytest.raises(ObservabilitySchemaError):
         ObservabilitySample.from_mapping(bad_sample)
 
+    # Non-mapping untrusted inputs and non-string mapping keys rejected across
+    # all boundary deserializers without tripping runtime Typeguard checks.
+    for non_mapping in (None, 123, [], {1: "bad"}):
+        with pytest.raises(ObservabilitySchemaError):
+            parse_observability_record(non_mapping)
+        for cls in (
+            ObservabilityReading,
+            QuantityDescriptor,
+            ObservabilityArtifactRef,
+            ObservabilityManifest,
+            ObservabilityInventory,
+            ObservabilityDescriptorSet,
+            ObservabilitySample,
+            ObservabilityStatus,
+            ObservabilityProfileStatus,
+            ObservabilityProfileSummary,
+        ):
+            with pytest.raises(ObservabilitySchemaError):
+                cls.from_mapping(non_mapping)
+
+    # Nested non-mapping elements inside manifest.artifacts,
+    # descriptors.quantities, profile_status.artifacts, and non-sequence
+    # descriptor.quality raise ObservabilitySchemaError cleanly.
+    bad_manifest_artifacts = _appendix_a_manifest()
+    bad_manifest_artifacts["artifacts"] = [None]
+    with pytest.raises(ObservabilitySchemaError):
+        ObservabilityManifest.from_mapping(bad_manifest_artifacts)
+
+    bad_descriptors = _appendix_a_descriptors()
+    bad_descriptors["quantities"] = {"x": None}
+    with pytest.raises(ObservabilitySchemaError):
+        ObservabilityDescriptorSet.from_mapping(bad_descriptors)
+
+    for bad_quality in (None, 123, "approximate_rss"):
+        bad_qty_desc = copy.deepcopy(_appendix_a_descriptors()["quantities"]["rss_current_b"])
+        bad_qty_desc["quality"] = bad_quality
+        with pytest.raises(ObservabilitySchemaError):
+            QuantityDescriptor.from_mapping(bad_qty_desc)
+
+    bad_profile_artifacts = _appendix_d_profile_status()
+    bad_profile_artifacts["artifacts"] = [None]
+    with pytest.raises(ObservabilitySchemaError):
+        ObservabilityProfileStatus.from_mapping(bad_profile_artifacts)
+
     # read_end_ns < read_start_ns and negative/bool sequence rejected.
     bad_time = _appendix_a_samples()[0]
     bad_time["read_end_ns"] = bad_time["read_start_ns"] - 1
@@ -1526,6 +1570,32 @@ def test_reader_rejects_on_disk_nan_and_unsupported_schema(tmp_path: Path) -> No
     )
     with pytest.raises(ObservabilitySchemaError, match="non-finite JSON constant"):
         inspect_observability_bundle(writer.bundle_dir)
+
+    # Unsupported major schema on disk is rejected with ObservabilitySchemaError.
+    manifest_path.write_text(
+        raw.replace(RUN_OBSERVABILITY_SCHEMA, "tpen.run-observability/v2"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ObservabilitySchemaError, match="unsupported manifest schema"):
+        inspect_observability_bundle(writer.bundle_dir)
+
+    # Non-object top-level JSON on disk ([], "str", 123) is rejected with ObservabilitySchemaError.
+    for non_object_json in ("[]\n", '"str"\n', "123\n"):
+        manifest_path.write_text(non_object_json, encoding="utf-8")
+        with pytest.raises(ObservabilitySchemaError, match="must contain a JSON object"):
+            inspect_observability_bundle(writer.bundle_dir)
+
+    # Restore valid open manifest and verify a non-object JSON interior line
+    # in a sample JSONL stream is isolated as invalid_interior_record rather
+    # than crashing with a runtime type error.
+    manifest_path.write_text(raw, encoding="utf-8")
+    resources_dir = writer.bundle_dir / "resources"
+    resources_dir.mkdir(parents=True, exist_ok=True)
+    (resources_dir / "resources-example.jsonl").write_text("[]\n", encoding="utf-8")
+    bundle = inspect_observability_bundle(writer.bundle_dir)
+    assert len(bundle.interior_errors) == 1
+    assert bundle.interior_errors[0].code == "invalid_interior_record"
+    assert bundle.interior_errors[0].line_number == 1
 
 
 # ---------------------------------------------------------------------------

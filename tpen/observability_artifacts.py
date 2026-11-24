@@ -179,6 +179,11 @@ def _require_mapping(value: object, name: str) -> Mapping[str, Any]:
         raise ObservabilitySchemaError(
             f"{name} must be a mapping, got {type(value).__name__}"
         )
+    for key in value:
+        if type(key) is not str:
+            raise ObservabilitySchemaError(
+                f"{name} mapping keys must be strings, got {type(key).__name__}"
+            )
     return value
 
 
@@ -607,7 +612,7 @@ class ObservabilityReading:
         return data
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> ObservabilityReading:
+    def from_mapping(cls, data: Any) -> ObservabilityReading:
         """Validate and construct an :class:`ObservabilityReading` from a mapping."""
 
         mapping = _require_mapping(data, "reading")
@@ -705,7 +710,7 @@ class QuantityDescriptor:
         return data
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> QuantityDescriptor:
+    def from_mapping(cls, data: Any) -> QuantityDescriptor:
         """Validate and construct a :class:`QuantityDescriptor` from a mapping."""
 
         mapping = _require_mapping(data, "descriptor")
@@ -724,6 +729,7 @@ class QuantityDescriptor:
             optional={"quality"},
             context="descriptor",
         )
+        raw_quality = mapping.get("quality", ())
         return cls(
             source_id=mapping["source_id"],
             unit=mapping["unit"],
@@ -733,7 +739,11 @@ class QuantityDescriptor:
             native_name=mapping["native_name"],
             native_unit=mapping["native_unit"],
             conversion=mapping["conversion"],
-            quality=tuple(mapping.get("quality", ())),
+            quality=(
+                tuple(raw_quality)
+                if isinstance(raw_quality, (list, tuple))
+                else raw_quality
+            ),
         )
 
 
@@ -786,7 +796,7 @@ class ObservabilityArtifactRef:
         return data
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> ObservabilityArtifactRef:
+    def from_mapping(cls, data: Any) -> ObservabilityArtifactRef:
         """Validate and construct an :class:`ObservabilityArtifactRef`."""
 
         mapping = _require_mapping(data, "artifact")
@@ -964,7 +974,7 @@ class ObservabilityManifest:
         }
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> ObservabilityManifest:
+    def from_mapping(cls, data: Any) -> ObservabilityManifest:
         """Validate and construct an :class:`ObservabilityManifest`."""
 
         mapping = _require_mapping(data, "manifest")
@@ -1189,7 +1199,7 @@ class ObservabilityInventory:
         }
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> ObservabilityInventory:
+    def from_mapping(cls, data: Any) -> ObservabilityInventory:
         """Validate and construct an :class:`ObservabilityInventory`."""
 
         mapping = _require_mapping(data, "inventory")
@@ -1271,7 +1281,7 @@ class ObservabilityDescriptorSet:
         }
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> ObservabilityDescriptorSet:
+    def from_mapping(cls, data: Any) -> ObservabilityDescriptorSet:
         """Validate and construct an :class:`ObservabilityDescriptorSet`."""
 
         mapping = _require_mapping(data, "descriptors")
@@ -1384,7 +1394,7 @@ class ObservabilitySample:
         }
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> ObservabilitySample:
+    def from_mapping(cls, data: Any) -> ObservabilitySample:
         """Validate and construct an :class:`ObservabilitySample`."""
 
         mapping = _require_mapping(data, "sample")
@@ -1627,7 +1637,7 @@ class ObservabilityStatus:
         return data
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> ObservabilityStatus:
+    def from_mapping(cls, data: Any) -> ObservabilityStatus:
         """Validate and construct an :class:`ObservabilityStatus`."""
 
         mapping = _require_mapping(data, "status")
@@ -1988,7 +1998,7 @@ class ObservabilityProfileStatus:
         return data
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> ObservabilityProfileStatus:
+    def from_mapping(cls, data: Any) -> ObservabilityProfileStatus:
         """Validate and construct an :class:`ObservabilityProfileStatus`."""
 
         mapping = _require_mapping(data, "profile_status")
@@ -2213,7 +2223,7 @@ class ObservabilityProfileSummary:
         return data
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> ObservabilityProfileSummary:
+    def from_mapping(cls, data: Any) -> ObservabilityProfileSummary:
         """Validate and construct an :class:`ObservabilityProfileSummary`."""
 
         mapping = _require_mapping(data, "profile_summary")
@@ -2256,7 +2266,7 @@ class ObservabilityProfileSummary:
 
 
 def parse_observability_record(
-    data: Mapping[str, Any],
+    data: Any,
 ) -> (
     ObservabilityManifest
     | ObservabilityInventory
