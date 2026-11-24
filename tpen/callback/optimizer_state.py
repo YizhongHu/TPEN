@@ -33,10 +33,13 @@ class OptimizerState(StatefulCallback[TrainerState]):
     Notes
     -----
     This is an observational callback. It supports only the nominal
-    :class:`LegacyAutogradUpdate` method with an Adam or AdamW carrier and
-    refuses other update methods rather than inferring equivalent semantics
-    from a carrier optimizer. Missing state is expected before the first
-    Adam step and is counted per parameter.
+    :class:`LegacyAutogradUpdate` method with an Adam, AdamW, or
+    :class:`~tpen.training.soap.SOAP` carrier and refuses other update methods
+    rather than inferring equivalent semantics from a carrier optimizer.
+    Missing state is expected before the first optimizer step and is counted
+    per parameter. For :class:`~tpen.training.soap.SOAP`, ``exp_avg`` is stored
+    in original parameter coordinates while ``exp_avg_sq`` tracks the
+    eigenbasis-rotated second moment.
     """
 
     state_type: ClassVar[type[DomainState]] = TrainerState
@@ -105,11 +108,14 @@ def _validate_update_method(state: TrainerState) -> None:
             "OptimizerState supports only LegacyAutogradUpdate with Adam-style state; "
             f"got {type(method).__name__}"
         )
+    torch = require_torch(feature="OptimizerState callback")
+    from tpen.training.soap import SOAP
+
     optimizer = state.update_state.optimizer if state.update_state is not None else None
-    if optimizer is None or type(optimizer).__name__ not in {"Adam", "AdamW"}:
+    if not isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW, SOAP)):
         name = type(optimizer).__name__ if optimizer is not None else "None"
         raise ValueError(
-            "OptimizerState supports only Adam or AdamW optimizer state; got " + name
+            "OptimizerState supports only Adam, AdamW, or SOAP optimizer state; got " + name
         )
 
 
