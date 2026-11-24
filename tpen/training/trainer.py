@@ -1323,7 +1323,7 @@ class VMCTrainer:
 
                 with context.scope(CollectSamples(step=step), state=state):
                     walkers, sampler_stats = sampler.collect_samples(
-                        model, device=context.metadata.device
+                        model, device=context.metadata.device, emitter=context
                     )
                 with context.scope(BuildBatch(step=step), state=state):
                     batch = walkers.make_batch()

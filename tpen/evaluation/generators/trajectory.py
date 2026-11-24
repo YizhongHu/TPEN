@@ -51,6 +51,7 @@ from tpen.physics.hamiltonian import (
 from tpen.physics.system import SystemDescriptor
 from tpen.physics.receipt import ExecutionReceipt, decode_ordered_contribution_sequence
 from tpen.sampling.trajectory import collect_observable_trajectory_with_diagnostics
+from tpen.sampling.protocols import SamplingCollector
 
 TRAJECTORY_METADATA_KEY = "observable_trajectory"
 """Metadata key under which the collected trajectory is published."""
@@ -128,7 +129,7 @@ class TrajectoryMCMCGenerator:
     def __init__(
         self,
         *,
-        sampler: object,
+        sampler: SamplingCollector,
         hamiltonian_terms: Sequence[HamiltonianTerm] | Mapping[str, HamiltonianTerm],
         n_draws: int,
         discard_draws: int = 0,
@@ -181,13 +182,6 @@ class TrajectoryMCMCGenerator:
 
         if model is None:
             raise TypeError("TrajectoryMCMCGenerator requires a model to evaluate the observable")
-        collect = getattr(self.sampler, "collect_samples", None)
-        if not callable(collect):
-            raise TypeError(
-                "TrajectoryMCMCGenerator sampler must expose "
-                "collect_samples(model, *, reset=..., device=...)"
-            )
-
         evaluation_index = 0
         final_walkers: Walkers | None = None
         record_stream: TrajectoryRecordStreamWriter | None = None
@@ -277,6 +271,7 @@ class TrajectoryMCMCGenerator:
                     device=context.device,
                     reset=self.reset,
                     verify_model_unchanged=self.verify_model_unchanged,
+                    emitter=context.emitter,
                 )
             )
             trajectory_records = (

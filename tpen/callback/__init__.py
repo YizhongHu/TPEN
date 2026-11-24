@@ -89,6 +89,9 @@ _KNOWN_NON_MANAGED_CALLBACK_TARGETS: frozenset[str] = frozenset(
         "tpen.callback.timing.train_phase_timing.TrainPhaseTiming",
         "tpen.callback.TrainStepTiming",
         "tpen.callback.timing.TrainStepTiming",
+        "tpen.callback.SamplingScopeTiming",
+        "tpen.callback.timing.SamplingScopeTiming",
+        "tpen.callback.timing.sampling_timing.SamplingScopeTiming",
         "tpen.callback.timing.train_step_timing.TrainStepTiming",
         "tpen.callback.TrainingBatchRecorder",
         "tpen.callback.raw_training_batch_recorder.TrainingBatchRecorder",
@@ -219,6 +222,10 @@ def __getattr__(name: str) -> object:
         from .timing import TrainStepTiming
 
         return TrainStepTiming
+    if name == "SamplingScopeTiming":
+        from .timing import SamplingScopeTiming
+
+        return SamplingScopeTiming
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -269,6 +276,7 @@ __all__ = [
     "SubscriptionGroup",
     "TrainPhaseTiming",
     "TrainStepTiming",
+    "SamplingScopeTiming",
     "TrainingBatchRecorder",
     "canonicalize_allocator_reset_scope",
     "claims_conflict",

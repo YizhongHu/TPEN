@@ -79,7 +79,8 @@ class _VacuumWalkers:
 class _VacuumSampler:
     """Sampler stand-in returning one fixed zero-electron walker set."""
 
-    def collect_samples(self, model, *, device=None):
+    def collect_samples(self, model, *, device=None, emitter=None):
+        del emitter
         del model, device
         walkers = _VacuumWalkers()
         stats = SamplerStats(
@@ -426,7 +427,8 @@ def test_vmc_trainer_step_end_failure_skips_completion_but_ends_iteration() -> N
     model = build_tiny_spenn()
 
     class _FailingSampler:
-        def collect_samples(self, model, *, device=None):
+        def collect_samples(self, model, *, device=None, emitter=None):
+            del emitter
             del model, device
             raise RuntimeError("sample collection failed")
 

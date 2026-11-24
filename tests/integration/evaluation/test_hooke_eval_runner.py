@@ -827,7 +827,8 @@ class _StaticSampler:
         self.positions = positions
         self.calls = 0
 
-    def collect_samples(self, model, *, device: str | torch.device | None = None):
+    def collect_samples(self, model, *, device: str | torch.device | None = None, emitter=None):
+        del emitter
         self.calls += 1
         positions = self.positions.to(device=device)
         stats = SamplerStats(

@@ -38,9 +38,10 @@ class FakeSampler:
         *,
         reset: bool,
         device: torch.device | str | None,
+        emitter=None,
     ) -> tuple[Walkers, SamplerStats]:
         """Return real typed records with deterministic, varying walker values."""
-        self.calls.append({"reset": reset, "device": device})
+        self.calls.append({"reset": reset, "device": device, "emitter": emitter})
         draw = self.draw_index
         self.draw_index += 1
         positions = torch.arange(self.n_walkers, dtype=torch.float32).reshape(self.n_walkers, 1, 1)
@@ -270,6 +271,7 @@ class AtomicDrawSampler:
         *,
         reset: bool,
         device: torch.device | str | None,
+        emitter=None,
     ) -> tuple[Walkers, SamplerStats]:
         radius = self.states[self.index]
         acceptance_rate = self.acceptance_rates[self.index]
@@ -344,8 +346,9 @@ class WrongWalkerCountSampler(FakeSampler):
         *,
         reset: bool,
         device: torch.device | str | None,
+        emitter=None,
     ) -> tuple[Walkers, SamplerStats]:
-        walkers, stats = super().collect_samples(model, reset=reset, device=device)
+        walkers, stats = super().collect_samples(model, reset=reset, device=device, emitter=emitter)
         return walkers, _stats(walkers.batch_size + 1, stats.n_steps)
 
 

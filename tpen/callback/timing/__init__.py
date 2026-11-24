@@ -7,6 +7,7 @@ from .evaluation_timing import EvaluationTiming
 from .run_timing import RunTiming
 from .train_phase_timing import TrainPhaseTiming
 from .train_step_timing import TrainStepTiming
+from .sampling_timing import SamplingScopeTiming
 
 
 def __getattr__(name: str) -> object:
@@ -34,4 +35,5 @@ __all__ = [
     "RunTiming",
     "TrainPhaseTiming",
     "TrainStepTiming",
+    "SamplingScopeTiming",
 ]

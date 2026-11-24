@@ -12,6 +12,7 @@ import torch
 from tpen.evaluation.bundle import EvaluationBundle, GeneratedConfigurations
 from tpen.evaluation.results import SummaryResult
 from tpen.evaluation.task import ArtifactLevel, FailurePolicy
+from tpen.events import EventEmitter
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class EvaluationContext:
     resolved_config_identity: Mapping[str, str] | None = None
     model_provenance: str = "constructed"
     checkpoint_sha256: str | None = None
+    emitter: EventEmitter | None = None
 
 
 class Generator(Protocol):
