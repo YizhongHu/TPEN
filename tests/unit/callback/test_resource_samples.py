@@ -3957,3 +3957,446 @@ def test_o5_live_linux_tree_and_cgroup_roundtrip_in_resource_samples(tmp_path: P
         assert cg_samples[0].readings["cgroup.memory.current_bytes"].value is None
 
 
+# ---------------------------------------------------------------------------
+# O5 T2 Round-1 review tests (F1, F2b, F4 defect checks + T7b coverage)
+# ---------------------------------------------------------------------------
+
+
+def test_o5_review_f1_cgroup_cpu_counter_reduction_survives_comember_and_limit_provenance_changes(
+    tmp_path: Path,
+) -> None:
+    """F1: cgroup.cpu.* counter reduction must survive co-member changes in the same cgroup."""
+
+    root_pid = os.getpid()
+
+    # Sub-case B (positive control): actual cgroup migration between job_a and job_b MUST break interval.
+    proc_mig, cg_mig = _write_o5_proc_and_cgroup_fixture(
+        tmp_path / "f1_mig",
+        root_pid=root_pid,
+        child_pids=[],
+        cgroup_rel_path="/slurm/uid_1000/job_a",
+    )
+    job_b = cg_mig / "slurm" / "uid_1000" / "job_b"
+    job_b.mkdir(parents=True, exist_ok=True)
+    (job_b / "memory.current").write_text("67108864\n", encoding="utf-8")
+    (job_b / "memory.peak").write_text("134217728\n", encoding="utf-8")
+    (job_b / "memory.max").write_text("4294967296\n", encoding="utf-8")
+    (job_b / "cpu.stat").write_text(
+        "usage_usec 5000000\nuser_usec 4000000\nsystem_usec 1000000\n"
+        "nr_throttled 5\nthrottled_usec 90000\n",
+        encoding="utf-8",
+    )
+    (job_b / "cpu.max").write_text("400000 100000\n", encoding="utf-8")
+    (job_b / "cpuset.cpus.effective").write_text("0-3,6\n", encoding="utf-8")
+    (job_b / "cgroup.procs").write_text(f"{root_pid}\n", encoding="utf-8")
+
+    cb_mig = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        linux_cgroup=LinuxCgroupV2Source(enabled=True, proc_root=proc_mig),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_f1_mig"), runtime_callbacks=[cb_mig]
+    ) as ctx:
+        mig_dir = ctx.run_dir
+        (proc_mig / str(root_pid) / "cgroup").write_text(
+            "0::/slurm/uid_1000/job_b\n", encoding="utf-8"
+        )
+
+    mig_bundle = inspect_run_observability(mig_dir).invocations[0]
+    mig_cpu = mig_bundle.summary.quantity(
+        LINUX_CGROUP_V2_SOURCE_ID, "cgroup.cpu.usage_seconds"
+    )
+    assert mig_cpu is not None
+    assert mig_cpu.valid_interval_count == 0
+    assert mig_cpu.broken_interval_count == 1
+    assert any(d.code == "generation_change" for d in mig_bundle.diagnostics)
+
+    # Sub-case A: adding a co-member in the exact same cgroup must NOT break counter reduction.
+    proc_root, cg_mount = _write_o5_proc_and_cgroup_fixture(
+        tmp_path / "f1_comember",
+        root_pid=root_pid,
+        child_pids=[],
+    )
+    leaf = cg_mount / "slurm" / "uid_1000" / "job_99"
+    cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        linux_cgroup=LinuxCgroupV2Source(enabled=True, proc_root=proc_root),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_f1_comember"), runtime_callbacks=[cb]
+    ) as ctx:
+        run_dir = ctx.run_dir
+        (leaf / "cgroup.procs").write_text(
+            f"{root_pid}\n{root_pid + 4001}\n", encoding="utf-8"
+        )
+        (leaf / "cpu.stat").write_text(
+            "usage_usec 4500000\nuser_usec 3600000\nsystem_usec 900000\n"
+            "nr_throttled 3\nthrottled_usec 70000\n",
+            encoding="utf-8",
+        )
+
+    bundle = inspect_run_observability(run_dir).invocations[0]
+    cg_samples = [
+        s
+        for s in bundle.samples["resource-samples"]
+        if s.source_id == LINUX_CGROUP_V2_SOURCE_ID
+    ]
+    assert len(cg_samples) == 2
+    assert cg_samples[0].subject["cgroup_path"] == "/slurm/uid_1000/job_99"
+    assert cg_samples[1].subject["cgroup_path"] == "/slurm/uid_1000/job_99"
+    assert cg_samples[0].subject["mount_root"] == cg_samples[1].subject["mount_root"]
+    assert (
+        cg_samples[0].subject["target_generation"]
+        == cg_samples[1].subject["target_generation"]
+    )
+    assert cg_samples[0].subject["observed_member_count"] == 1
+    assert cg_samples[1].subject["observed_member_count"] == 2
+    assert cg_samples[0].subject["includes_other_tasks"] is False
+    assert cg_samples[1].subject["includes_other_tasks"] is True
+
+    cg_cpu = bundle.summary.quantity(
+        LINUX_CGROUP_V2_SOURCE_ID, "cgroup.cpu.usage_seconds"
+    )
+    assert cg_cpu is not None
+    assert cg_cpu.valid_interval_count == 1
+    assert cg_cpu.broken_interval_count == 0
+    assert cg_cpu.valid_delta_total == pytest.approx(1.5)
+    assert cg_cpu.valid_rate_per_second is not None and cg_cpu.valid_rate_per_second > 0.0
+    assert not any(d.code == "generation_change" for d in bundle.diagnostics)
+
+
+def test_o5_review_f2b_resource_samples_resolve_cgroup_identity_none_unavailable_and_exception_semantics(
+    tmp_path: Path,
+) -> None:
+    """F2b: resolve_cgroup_identity() None, plain ResourceUnavailable, and exception handling."""
+
+    gen = LinuxProcessGeneration(pid=os.getpid(), start_ticks=4242)
+    unavail_field = LinuxMemoryUnavailable(
+        reason="no v2", reason_code="cgroup_v2_not_mounted_or_v1_only", status="unavailable"
+    )
+
+    def _make_unavail_reading() -> LinuxCgroupV2Reading:
+        return LinuxCgroupV2Reading(
+            status="unavailable",
+            memory_current_bytes=unavail_field,
+            memory_peak_bytes=unavail_field,
+            memory_max_bytes=unavail_field,
+            cpu_usage_seconds=unavail_field,
+            cpu_user_seconds=unavail_field,
+            cpu_system_seconds=unavail_field,
+            cpu_throttled_seconds=unavail_field,
+            cpu_nr_throttled=unavail_field,
+            cpu_max_cores=unavail_field,
+            cpuset_effective_cpus=unavail_field,
+            read_start_ns=10,
+            read_end_ns=20,
+            reason_code="cgroup_v2_not_mounted_or_v1_only",
+            detail="no v2",
+            target_generation=gen,
+            observed_generation_before=gen,
+            observed_generation_after=gen,
+        )
+
+    def _make_ok_reading() -> LinuxCgroupV2Reading:
+        return LinuxCgroupV2Reading(
+            status="ok",
+            memory_current_bytes=1024,
+            memory_peak_bytes=2048,
+            memory_max_bytes=4096,
+            cpu_usage_seconds=1.0,
+            cpu_user_seconds=0.8,
+            cpu_system_seconds=0.2,
+            cpu_throttled_seconds=0.0,
+            cpu_nr_throttled=0,
+            cpu_max_cores=2.0,
+            cpuset_effective_cpus=4,
+            read_start_ns=10,
+            read_end_ns=20,
+            cgroup_identity=LinuxCgroupV2Identity(
+                mount_root="/sys/fs/cgroup", cgroup_path="/job_ok"
+            ),
+            target_generation=gen,
+            observed_generation_before=gen,
+            observed_generation_after=gen,
+        )
+
+    failures: list[str] = []
+
+    # Sub-case A: resolve_cgroup_identity() returns None or plain ResourceUnavailable("no v2").
+    for label, resolve_return in (
+        ("none", None),
+        ("resource_unavailable", ResourceUnavailable("no v2")),
+    ):
+
+        class _UnavailResolveProbe:
+            def bind_target(self) -> LinuxProcessGeneration:
+                return gen
+
+            def resolve_cgroup_identity(self) -> Any:
+                return resolve_return
+
+            def read(self) -> LinuxCgroupV2Reading:
+                return _make_unavail_reading()
+
+        cb_a = ResourceSamples(
+            interval_seconds=60.0,
+            linux_cgroup=LinuxCgroupV2Source(
+                enabled=True, probe=_UnavailResolveProbe()
+            ),
+        )
+        with open_run_context(
+            _base_cfg(tmp_path / f"f2b_{label}"), runtime_callbacks=[cb_a]
+        ) as ctx:
+            run_dir_a = ctx.run_dir
+
+        bundle_a = inspect_run_observability(run_dir_a).invocations[0]
+        assert bundle_a.inventory is not None
+        inv_a = bundle_a.inventory.sources[LINUX_CGROUP_V2_SOURCE_ID]
+        if inv_a.get("capability") != "unavailable":
+            failures.append(
+                f"Sub-case A ({label}): expected capability='unavailable', got {inv_a.get('capability')!r}"
+            )
+        if "unavailable_reason_code" not in inv_a:
+            failures.append(
+                f"Sub-case A ({label}): expected 'unavailable_reason_code' in inventory entry {inv_a!r}"
+            )
+
+    # Sub-case B: resolve_cgroup_identity() raises RuntimeError -> must latch and never poll read().
+    class _ExplodingResolveProbe:
+        def __init__(self) -> None:
+            self.read_calls = 0
+
+        def bind_target(self) -> LinuxProcessGeneration:
+            return gen
+
+        def resolve_cgroup_identity(self) -> Any:
+            raise RuntimeError("resolve boom")
+
+        def read(self) -> LinuxCgroupV2Reading:
+            self.read_calls += 1
+            return _make_ok_reading()
+
+    probe_exc = _ExplodingResolveProbe()
+    cb_b = ResourceSamples(
+        interval_seconds=60.0,
+        linux_cgroup=LinuxCgroupV2Source(enabled=True, probe=probe_exc),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "f2b_exc"), runtime_callbacks=[cb_b]
+    ) as ctx:
+        run_dir_b = ctx.run_dir
+
+    bundle_b = inspect_run_observability(run_dir_b).invocations[0]
+    assert bundle_b.inventory is not None
+    inv_b = bundle_b.inventory.sources[LINUX_CGROUP_V2_SOURCE_ID]
+    status_b = bundle_b.statuses["resource-samples"]
+    cg_samples_b = [
+        s
+        for s in bundle_b.samples["resource-samples"]
+        if s.source_id == LINUX_CGROUP_V2_SOURCE_ID
+    ]
+
+    if probe_exc.read_calls != 0:
+        failures.append(
+            f"Sub-case B (exception): expected probe_exc.read_calls == 0, got {probe_exc.read_calls}"
+        )
+    if (
+        inv_b.get("capability") != "unavailable"
+        or inv_b.get("unavailable_reason_code") != "cgroup_resolve_failed"
+    ):
+        failures.append(
+            "Sub-case B (exception): expected inventory capability='unavailable' and "
+            f"unavailable_reason_code='cgroup_resolve_failed', got {inv_b!r}"
+        )
+    if status_b.source_status.get(LINUX_CGROUP_V2_SOURCE_ID) != "unavailable":
+        failures.append(
+            "Sub-case B (exception): expected source_status['linux-cgroup-v2']=='unavailable', "
+            f"got {status_b.source_status.get(LINUX_CGROUP_V2_SOURCE_ID)!r}"
+        )
+    if bundle_b.derived_data_completeness == "complete":
+        failures.append(
+            "Sub-case B (exception): expected derived_data_completeness != 'complete', got 'complete'"
+        )
+    if not any(
+        "cgroup_resolve" in d or "resolve" in d for d in (status_b.diagnostics or ())
+    ):
+        failures.append(
+            "Sub-case B (exception): expected resolve diagnostic in status.diagnostics, "
+            f"got {status_b.diagnostics!r}"
+        )
+    if not cg_samples_b:
+        failures.append("Sub-case B (exception): expected written error samples, got none")
+    else:
+        bad_readings = [
+            (s.sequence, qty, r.status, r.reason_code, r.value)
+            for s in cg_samples_b
+            for qty, r in s.readings.items()
+            if not (
+                r.status == "error"
+                and r.reason_code == "cgroup_resolve_failed"
+                and r.value is None
+            )
+        ]
+        if bad_readings:
+            failures.append(
+                "Sub-case B (exception): expected all written readings to be "
+                f"error/cgroup_resolve_failed/None, got sample mismatches: {bad_readings[:3]!r}"
+            )
+
+    assert failures == [], "; ".join(failures)
+
+
+def test_o5_review_f4_linux_tree_quantity_subset_without_cpu_deltas_reports_available_complete(
+    tmp_path: Path,
+) -> None:
+    """F4: linux_tree subset omitting CPU deltas must report available/complete when membership is complete."""
+
+    root_pid = os.getpid()
+    proc_root, _ = _write_o5_proc_and_cgroup_fixture(
+        tmp_path / "f4_subset",
+        root_pid=root_pid,
+        child_pids=[root_pid + 5001, root_pid + 5002],
+    )
+    selected = ("descendants.live_member_count", "descendants.sum_rss_bytes")
+
+    # Sub-case B (positive control): hitting max_observed_members=1 with same 2-quantity subset stays partial.
+    cb_cap = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        linux_tree=LinuxProcessTreeSource(
+            enabled=True,
+            quantities=selected,
+            max_observed_members=1,
+            proc_root=proc_root,
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_f4_cap"), runtime_callbacks=[cb_cap]
+    ) as ctx:
+        cap_dir = ctx.run_dir
+
+    cap_bundle = inspect_run_observability(cap_dir).invocations[0]
+    cap_status = cap_bundle.statuses["resource-samples"]
+    assert cap_status.source_status[LINUX_PROCESS_TREE_SOURCE_ID] == "partial"
+    assert cap_bundle.derived_data_completeness == "partial"
+
+    # Sub-case A: healthy 2-quantity subset omitting CPU deltas must be available and complete.
+    cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        linux_tree=LinuxProcessTreeSource(
+            enabled=True,
+            quantities=selected,
+            proc_root=proc_root,
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_f4_ok"), runtime_callbacks=[cb]
+    ) as ctx:
+        ok_dir = ctx.run_dir
+
+    bundle = inspect_run_observability(ok_dir).invocations[0]
+    samples = [
+        s
+        for s in bundle.samples["resource-samples"]
+        if s.source_id == LINUX_PROCESS_TREE_SOURCE_ID
+    ]
+    assert len(samples) >= 2
+    for sample in samples:
+        assert set(sample.readings.keys()) == set(selected)
+        assert all(r.status == "ok" for r in sample.readings.values())
+        assert sample.subject["membership_complete"] is True
+        assert sample.subject["partial_reasons"] == []
+
+    status = bundle.statuses["resource-samples"]
+    assert status.source_status[LINUX_PROCESS_TREE_SOURCE_ID] == "available"
+    assert status.data_completeness == "complete"
+    assert bundle.derived_data_completeness == "complete"
+    assert status.unavailable_fields is None
+    assert status.truncation_reasons == ()
+
+
+def test_o5_review_t7b_o5_plain_mapping_yaml_and_native_recovery_profile_refusal(
+    tmp_path: Path,
+) -> None:
+    """T7b: plain-mapping YAML (no nested _target_) configures O5 sources and refuses NATIVE_RECOVERY_PROFILE."""
+
+    root_pid = os.getpid()
+    obs_pid = root_pid + 6001
+    worker_pid = root_pid + 6002
+    proc_root, _ = _write_o5_proc_and_cgroup_fixture(
+        tmp_path / "t7b_plain",
+        root_pid=root_pid,
+        child_pids=[obs_pid, worker_pid],
+    )
+    out_root = tmp_path / "t7b_out" / "outputs"
+    yaml_text = f"""
+experiment:
+  name: o5_plain_yaml
+  sector: unit
+run:
+  root: {json.dumps(str(out_root))}
+  layout: flat
+  run_id: o5-plain-run
+  timezone: UTC
+runtime:
+  device: cpu
+  dtype: float64
+callbacks:
+  - _target_: tpen.callback.ResourceSamples
+    interval_seconds: 60.0
+    max_pending_envelopes: 16
+    linux_tree:
+      enabled: true
+      observer_pids:
+        - {obs_pid}
+      quantities:
+        - descendants.live_member_count
+        - descendants.sum_rss_bytes
+      proc_root: {json.dumps(str(proc_root))}
+    linux_cgroup:
+      enabled: true
+      max_mountinfo_bytes: 524288
+      proc_root: {json.dumps(str(proc_root))}
+loggers: []
+runner:
+  _target_: {__name__}._NoopRunner
+"""
+    cfg = OmegaConf.create(yaml_text)
+    assert run_from_config(cfg, raise_exceptions=True) == 0
+
+    bundle = inspect_run_observability(out_root / "o5-plain-run").invocations[0]
+    assert bundle.derived_lifecycle_state == "closed"
+    assert bundle.inventory is not None
+    assert (
+        bundle.inventory.sources[LINUX_CGROUP_V2_SOURCE_ID]["max_mountinfo_bytes"]
+        == 524288
+    )
+    assert bundle.inventory.sources[LINUX_PROCESS_TREE_SOURCE_ID]["observer_pids"] == [
+        obs_pid
+    ]
+
+    samples = bundle.samples["resource-samples"]
+    tree_samples = [s for s in samples if s.source_id == LINUX_PROCESS_TREE_SOURCE_ID]
+    cg_samples = [s for s in samples if s.source_id == LINUX_CGROUP_V2_SOURCE_ID]
+    assert len(tree_samples) >= 2
+    assert len(cg_samples) >= 2
+    assert set(tree_samples[0].readings.keys()) == {
+        "descendants.live_member_count",
+        "descendants.sum_rss_bytes",
+    }
+    assert tree_samples[0].readings["descendants.live_member_count"].value == 2
+    roles = {m["pid"]: m["role"] for m in tree_samples[0].subject["members"]}
+    assert roles == {obs_pid: "observer", worker_pid: "descendant"}
+    assert cg_samples[0].readings["cgroup.memory.current_bytes"].status == "ok"
+    assert cg_samples[0].readings["cgroup.memory.current_bytes"].value == 67108864
+
+    profile_check = check_profile(cfg, NATIVE_RECOVERY_PROFILE)
+    assert profile_check.verdict == "refused"
+    assert profile_check.refusal is not None
+    assert profile_check.refusal["code"] == "unsupported-callback"
+
+
+

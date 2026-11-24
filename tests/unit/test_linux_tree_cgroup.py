@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import threading
@@ -27,6 +28,7 @@ from tpen.process_resources import (
     LinuxCgroupV2Reading,
     LinuxMemoryUnavailable,
     LinuxProcessGeneration,
+    LinuxProcessMemoryProbe,
     LinuxProcessTreeMember,
     LinuxProcessTreeProbe,
     LinuxProcessTreeReading,
@@ -1136,3 +1138,522 @@ def test_live_linux_tree_and_cgroup_v2_probes_on_real_procfs() -> None:
                 isinstance(field_val, LinuxMemoryUnavailable)
                 and field_val.status == "error"
             )
+
+
+# ---------------------------------------------------------------------------
+# O5 T2 Round-1 review tests (F2a, F3, F5 defect checks + T6, T7a coverage)
+# ---------------------------------------------------------------------------
+
+
+def test_o5_review_f2a_resolve_cgroup_identity_enforces_target_generation_and_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F2a: resolve_cgroup_identity() must enforce bound generation and max_read_seconds."""
+
+    failures: list[str] = []
+
+    # Sub-case A: PID reuse before resolve_cgroup_identity() must fail closed with generation_changed.
+    proc_root, cg_mount = _setup_cgroup_v2_fixture(
+        tmp_path / "f2a_reuse",
+        pid=2500,
+        start_ticks=5000,
+        cgroup_rel_path="/slurm/uid_1000/job_old",
+    )
+    probe = LinuxCgroupV2Probe(pid=2500, proc_root=proc_root, host_id="node-cg")
+    bound = probe.bind_target()
+    assert bound is not None and bound.start_ticks == 5000
+
+    # Simulate PID reuse: new start_ticks and different cgroup path.
+    (proc_root / "2500" / "stat").write_text(
+        _make_stat_line(2500, ppid=1, start_ticks=9999), encoding="utf-8"
+    )
+    (proc_root / "2500" / "cgroup").write_text(
+        "0::/slurm/uid_1000/job_reused\n", encoding="utf-8"
+    )
+    (cg_mount / "slurm" / "uid_1000" / "job_reused").mkdir(parents=True, exist_ok=True)
+
+    res = probe.resolve_cgroup_identity()
+    if not (
+        isinstance(res, LinuxMemoryUnavailable)
+        and res.status == "unavailable"
+        and res.reason_code == "generation_changed"
+    ):
+        failures.append(
+            "Sub-case A (PID reuse before resolve_cgroup_identity): expected "
+            f"LinuxMemoryUnavailable(status='unavailable', reason_code='generation_changed'), got {res!r}"
+        )
+
+    # Sub-case B: max_read_seconds timeout enforcement on small (<16 KiB) files in resolve_cgroup_identity().
+    proc_t, _ = _setup_cgroup_v2_fixture(
+        tmp_path / "f2a_timeout",
+        pid=2501,
+        start_ticks=5001,
+        cgroup_rel_path="/slurm/uid_1000/job_t",
+    )
+    mountinfo_path = proc_t / "2501" / "mountinfo"
+    now_ns = [1_000_000_000]
+    real_open = Path.open
+
+    class _ClockAdvancingHandle:
+        """Proxy file handle that advances the test clock past deadline after mountinfo is read."""
+
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def __enter__(self) -> _ClockAdvancingHandle:
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+            try:
+                return self._inner.__exit__(exc_type, exc, tb)
+            finally:
+                # Advance clock 5s (> max_read_seconds=0.1s) after mountinfo finishes reading.
+                now_ns[0] = 6_000_000_000
+
+        def read(self, *args: Any, **kwargs: Any) -> Any:
+            return self._inner.read(*args, **kwargs)
+
+        def fileno(self) -> int:
+            return self._inner.fileno()
+
+    def _open_with_timeout_hook(self: Path, *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(self, *args, **kwargs)
+        if self == mountinfo_path:
+            return _ClockAdvancingHandle(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "open", _open_with_timeout_hook)
+    try:
+        probe_t = LinuxCgroupV2Probe(
+            pid=2501,
+            proc_root=proc_t,
+            host_id="node-cg",
+            max_read_seconds=0.1,
+            monotonic_ns=lambda: now_ns[0],
+        )
+        res_t = probe_t.resolve_cgroup_identity()
+    finally:
+        monkeypatch.setattr(Path, "open", real_open)
+
+    if not (
+        isinstance(res_t, LinuxMemoryUnavailable)
+        and res_t.status == "error"
+        and res_t.reason_code == "read_timeout"
+    ):
+        failures.append(
+            "Sub-case B (max_read_seconds timeout in resolve_cgroup_identity): expected "
+            f"LinuxMemoryUnavailable(status='error', reason_code='read_timeout'), got {res_t!r}"
+        )
+
+    assert failures == [], "; ".join(failures)
+
+
+def test_o5_review_f3_expected_generation_with_default_host_id_none_matches_like_o4(
+    tmp_path: Path,
+) -> None:
+    """F3: expected_generation with default host_id=None matches in O5 probes just like O4."""
+
+    proc_root, _ = _setup_cgroup_v2_fixture(
+        tmp_path / "f3_host_id", pid=2600, start_ticks=5000
+    )
+    _write_proc_entry(
+        proc_root, pid=2601, ppid=2600, start_ticks=5100, vm_rss_kib=1024
+    )
+    gen_default_host = LinuxProcessGeneration(
+        pid=2600,
+        start_ticks=5000,
+        boot_id="00000000-0000-4000-8000-000000000002",
+        pid_ns_inode="pid:[4026531836]",
+    )
+    assert gen_default_host.host_id is None
+
+    # Confirm O4 parity: LinuxProcessMemoryProbe accepts default host_id=None.
+    o4_reading = LinuxProcessMemoryProbe(
+        expected_generation=gen_default_host, proc_root=proc_root
+    ).read()
+    assert o4_reading.status == "ok"
+
+    failures: list[str] = []
+
+    # Tree probe with default host_id=None must match rather than fail with generation_changed.
+    tp = LinuxProcessTreeProbe(
+        expected_generation=gen_default_host, proc_root=proc_root
+    )
+    tr1 = tp.read()
+    if not (
+        tr1.status == "partial"
+        and tr1.reason_code == "baseline_pending"
+        and tr1.live_member_count == 1
+    ):
+        failures.append(
+            "Tree probe scan 1 with host_id=None: expected status='partial', "
+            f"reason_code='baseline_pending', live_member_count=1; got "
+            f"status={tr1.status!r}, reason_code={tr1.reason_code!r}, "
+            f"live_member_count={tr1.live_member_count!r}"
+        )
+    tr2 = tp.read()
+    if not (tr2.status == "ok" and tr2.live_member_count == 1):
+        failures.append(
+            "Tree probe scan 2 with host_id=None: expected status='ok', "
+            f"live_member_count=1; got status={tr2.status!r}, "
+            f"reason_code={tr2.reason_code!r}, live_member_count={tr2.live_member_count!r}"
+        )
+
+    # Cgroup probe with default host_id=None must match rather than fail with generation_changed.
+    cp = LinuxCgroupV2Probe(expected_generation=gen_default_host, proc_root=proc_root)
+    cr = cp.read()
+    if not (cr.status == "ok" and cr.memory_current_bytes == 104_857_600):
+        failures.append(
+            "Cgroup probe with host_id=None: expected status='ok', "
+            f"memory_current_bytes=104857600; got status={cr.status!r}, "
+            f"reason_code={cr.reason_code!r}, memory_current_bytes={cr.memory_current_bytes!r}"
+        )
+
+    # Positive control: explicit mismatched host_id must still fail with generation_changed.
+    gen_wrong_host = LinuxProcessGeneration(
+        pid=2600,
+        start_ticks=5000,
+        boot_id="00000000-0000-4000-8000-000000000002",
+        pid_ns_inode="pid:[4026531836]",
+        host_id="different-host-xyz",
+    )
+    tr_wrong = LinuxProcessTreeProbe(
+        expected_generation=gen_wrong_host, proc_root=proc_root
+    ).read()
+    if not (
+        tr_wrong.status == "unavailable"
+        and tr_wrong.reason_code == "generation_changed"
+    ):
+        failures.append(
+            "Positive control tree probe with wrong host_id: expected "
+            f"unavailable/generation_changed, got {tr_wrong.status!r}/{tr_wrong.reason_code!r}"
+        )
+    cr_wrong = LinuxCgroupV2Probe(
+        expected_generation=gen_wrong_host, proc_root=proc_root
+    ).read()
+    if not (
+        cr_wrong.status == "unavailable"
+        and cr_wrong.reason_code == "generation_changed"
+    ):
+        failures.append(
+            "Positive control cgroup probe with wrong host_id: expected "
+            f"unavailable/generation_changed, got {cr_wrong.status!r}/{cr_wrong.reason_code!r}"
+        )
+
+    assert failures == [], "; ".join(failures)
+
+
+def test_o5_review_f5_tree_probe_unavailable_incomplete_scan_does_not_fabricate_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F5: an unavailable incomplete scan must not commit _has_baseline_scan=True."""
+
+    proc_root = _init_proc_root(tmp_path / "f5_baseline")
+    _write_proc_entry(proc_root, pid=400, ppid=1, start_ticks=1000)
+    _write_proc_entry(proc_root, pid=401, ppid=400, start_ticks=1100)
+
+    probe = LinuxProcessTreeProbe(pid=400, proc_root=proc_root)
+    denied_stat = proc_root / "401" / "stat"
+    real_open = Path.open
+
+    def _deny_401(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self == denied_stat:
+            raise PermissionError("EACCES")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", _deny_401)
+    try:
+        r1 = probe.read()
+    finally:
+        monkeypatch.setattr(Path, "open", real_open)
+
+    assert r1.status == "unavailable"
+    assert r1.reason_code == "permission_denied"
+    assert r1.membership_complete is False
+    assert r1.observed_member_count == 0
+
+    # Remove PID 401 so Scan 2 has 0 live descendants and membership_complete=True.
+    shutil.rmtree(proc_root / "401")
+
+    r2 = probe.read()
+    assert r2.status == "partial"
+    assert r2.reason_code == "baseline_pending"
+    assert r2.live_member_count == 0
+    assert isinstance(r2.matched_cpu_user_delta_seconds, LinuxMemoryUnavailable)
+    assert r2.matched_cpu_user_delta_seconds.reason_code == "baseline_pending"
+    assert isinstance(r2.matched_cpu_system_delta_seconds, LinuxMemoryUnavailable)
+    assert r2.matched_cpu_system_delta_seconds.reason_code == "baseline_pending"
+
+    r3 = probe.read()
+    assert r3.status == "ok"
+    assert r3.live_member_count == 0
+    assert r3.matched_cpu_user_delta_seconds == 0.0
+    assert r3.matched_cpu_system_delta_seconds == 0.0
+
+
+def test_o5_review_t6_cgroup_ancestor_fail_closed_depth_cap_and_mountinfo_escaping_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T6: ancestor limit fail-closed, depth cap, octal-escaped mountinfo, root mount precedence."""
+
+    # Sub-case A: ancestor memory.max raises PermissionError -> fails closed (not leaf's looser 4 GiB).
+    proc_a, cg_a = _setup_cgroup_v2_fixture(
+        tmp_path / "t6_perm",
+        pid=2700,
+        cgroup_rel_path="/slurm/uid_1000/job_42",
+        memory_max_by_rel={
+            "/slurm/uid_1000": "2147483648",
+            "/slurm/uid_1000/job_42": "4294967296",
+        },
+    )
+    denied_anc_mem = cg_a / "slurm" / "uid_1000" / "memory.max"
+    real_open = Path.open
+
+    def _deny_anc_mem(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self == denied_anc_mem:
+            raise PermissionError("EACCES ancestor memory.max")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", _deny_anc_mem)
+    try:
+        r_a = LinuxCgroupV2Probe(pid=2700, proc_root=proc_a).read()
+    finally:
+        monkeypatch.setattr(Path, "open", real_open)
+
+    assert r_a.status == "partial"
+    assert isinstance(r_a.memory_max_bytes, LinuxMemoryUnavailable)
+    assert r_a.memory_max_bytes.status == "unavailable"
+    assert r_a.memory_max_bytes.reason_code == "permission_denied"
+    assert r_a.cgroup_identity is not None
+    assert r_a.cgroup_identity.effective_memory_limit_path is None
+    assert r_a.memory_current_bytes == 104_857_600
+    assert r_a.cpu_max_cores == pytest.approx(4.0)
+
+    # Sub-case B: malformed ancestor cpu.max -> fails closed (not leaf's looser 4.0).
+    proc_b, _ = _setup_cgroup_v2_fixture(
+        tmp_path / "t6_malformed_cpu",
+        pid=2701,
+        cgroup_rel_path="/slurm/uid_1000/job_42",
+        cpu_max_by_rel={
+            "/slurm/uid_1000": "not-a-quota 100000",
+            "/slurm/uid_1000/job_42": "400000 100000",
+        },
+    )
+    r_b = LinuxCgroupV2Probe(pid=2701, proc_root=proc_b).read()
+    assert r_b.status == "partial"
+    assert isinstance(r_b.cpu_max_cores, LinuxMemoryUnavailable)
+    assert r_b.cpu_max_cores.status == "error"
+    assert r_b.cpu_max_cores.reason_code == "malformed_cgroup"
+    assert r_b.cgroup_identity is not None
+    assert r_b.cgroup_identity.effective_cpu_limit_path is None
+    assert r_b.memory_current_bytes == 104_857_600
+
+    # Sub-case C: symlinked ancestor memory.max -> fails closed with unsafe_cgroup_path.
+    proc_c, cg_c = _setup_cgroup_v2_fixture(
+        tmp_path / "t6_symlink_mem",
+        pid=2702,
+        cgroup_rel_path="/slurm/uid_1000/job_42",
+        memory_max_by_rel={"/slurm/uid_1000/job_42": "4294967296"},
+    )
+    outside_mem = tmp_path / "t6_outside_memory.max"
+    outside_mem.write_text("1073741824\n", encoding="utf-8")
+    os.symlink(outside_mem, cg_c / "slurm" / "uid_1000" / "memory.max")
+    r_c = LinuxCgroupV2Probe(pid=2702, proc_root=proc_c).read()
+    assert r_c.status == "partial"
+    assert isinstance(r_c.memory_max_bytes, LinuxMemoryUnavailable)
+    assert r_c.memory_max_bytes.status == "error"
+    assert r_c.memory_max_bytes.reason_code == "unsafe_cgroup_path"
+    assert r_c.cgroup_identity is not None
+    assert r_c.cgroup_identity.effective_memory_limit_path is None
+    assert r_c.memory_current_bytes == 104_857_600
+
+    # Sub-case D: max_ancestor_depth=2 with 3-segment cgroup path -> ancestor_depth_exceeded.
+    proc_d, _ = _setup_cgroup_v2_fixture(
+        tmp_path / "t6_depth",
+        pid=2703,
+        cgroup_rel_path="/slurm/uid_1000/job_42",
+    )
+    r_d = LinuxCgroupV2Probe(pid=2703, proc_root=proc_d, max_ancestor_depth=2).read()
+    assert r_d.status == "error"
+    assert r_d.reason_code == "ancestor_depth_exceeded"
+
+    # Sub-case E: octal-escaped space (\040) in mountinfo + root mount ('/') precedes non-root ('/sub').
+    mi_esc = _make_mountinfo_line(
+        "/mnt/sub\\040cg", fs_type="cgroup2", fs_root="/sub", mount_id=35
+    ) + _make_mountinfo_line(
+        "/mnt/cg\\040mount", fs_type="cgroup2", fs_root="/", mount_id=36
+    )
+    assert parse_proc_mountinfo_cgroup2(mi_esc) == ("/mnt/cg mount", "/mnt/sub cg")
+
+    base_e = tmp_path / "t6_esc"
+    proc_e = _init_proc_root(base_e / "proc")
+    pid_dir_e = _write_proc_entry(proc_e, pid=2704, ppid=1, start_ticks=5000)
+    sub_mount = base_e / "sub mount"
+    sub_mount.mkdir(parents=True, exist_ok=True)
+    root_mount = base_e / "cg mount"
+    leaf_e = root_mount / "job_esc"
+    leaf_e.mkdir(parents=True, exist_ok=True)
+    (leaf_e / "memory.current").write_text("104857600\n", encoding="utf-8")
+    (leaf_e / "memory.peak").write_text("209715200\n", encoding="utf-8")
+    (leaf_e / "memory.max").write_text("4294967296\n", encoding="utf-8")
+    (leaf_e / "cpu.stat").write_text(
+        "usage_usec 2500000\nuser_usec 2000000\nsystem_usec 500000\n"
+        "nr_throttled 3\nthrottled_usec 150000\n",
+        encoding="utf-8",
+    )
+    (leaf_e / "cpu.max").write_text("400000 100000\n", encoding="utf-8")
+    (leaf_e / "cpuset.cpus.effective").write_text("0-3,6\n", encoding="utf-8")
+    (leaf_e / "cgroup.procs").write_text("2704\n", encoding="utf-8")
+    (pid_dir_e / "cgroup").write_text("0::/job_esc\n", encoding="utf-8")
+    (pid_dir_e / "mountinfo").write_text(
+        _make_mountinfo_line(
+            str(sub_mount).replace(" ", "\\040"),
+            fs_type="cgroup2",
+            fs_root="/sub",
+            mount_id=35,
+        )
+        + _make_mountinfo_line(
+            str(root_mount).replace(" ", "\\040"),
+            fs_type="cgroup2",
+            fs_root="/",
+            mount_id=36,
+        ),
+        encoding="utf-8",
+    )
+    r_e = LinuxCgroupV2Probe(pid=2704, proc_root=proc_e).read()
+    assert r_e.status == "ok"
+    assert r_e.cgroup_identity is not None
+    assert r_e.cgroup_identity.mount_root == str(root_mount)
+    assert r_e.cgroup_identity.cgroup_path == "/job_esc"
+    assert r_e.memory_current_bytes == 104_857_600
+
+
+def test_o5_review_t7a_mid_read_cgroup_changed_and_post_read_generation_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T7a: mid-read cgroup migration and post-read generation drift fail closed without committing state."""
+
+    real_open = Path.open
+
+    # Sub-case A: mid-read cgroup migration in LinuxCgroupV2Probe.read() -> cgroup_changed.
+    proc_a, cg_a = _setup_cgroup_v2_fixture(
+        tmp_path / "t7a_cg_mig",
+        pid=2800,
+        start_ticks=5000,
+        cgroup_rel_path="/slurm/uid_1000/job_orig",
+    )
+    probe_a = LinuxCgroupV2Probe(pid=2800, proc_root=proc_a, host_id="node-cg")
+    r_a0 = probe_a.read()
+    assert r_a0.status == "ok"
+    assert probe_a.cgroup_identity is not None
+    assert probe_a.cgroup_identity.cgroup_path == "/slurm/uid_1000/job_orig"
+
+    mem_cur_a = cg_a / "slurm" / "uid_1000" / "job_orig" / "memory.current"
+
+    def _mutate_cgroup_on_mem_current(self: Path, *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(self, *args, **kwargs)
+        if self == mem_cur_a:
+            (proc_a / "2800" / "cgroup").write_text(
+                "0::/slurm/uid_1000/job_other\n", encoding="utf-8"
+            )
+        return handle
+
+    monkeypatch.setattr(Path, "open", _mutate_cgroup_on_mem_current)
+    try:
+        r_a = probe_a.read()
+    finally:
+        monkeypatch.setattr(Path, "open", real_open)
+
+    assert r_a.status == "unavailable"
+    assert r_a.reason_code == "cgroup_changed"
+    for cg_field in (
+        r_a.memory_current_bytes,
+        r_a.memory_peak_bytes,
+        r_a.memory_max_bytes,
+        r_a.cpu_usage_seconds,
+        r_a.cpu_user_seconds,
+        r_a.cpu_system_seconds,
+        r_a.cpu_throttled_seconds,
+        r_a.cpu_nr_throttled,
+        r_a.cpu_max_cores,
+        r_a.cpuset_effective_cpus,
+    ):
+        assert isinstance(cg_field, LinuxMemoryUnavailable)
+    assert probe_a.cgroup_identity is not None
+    assert probe_a.cgroup_identity.cgroup_path == "/slurm/uid_1000/job_orig"
+
+    # Sub-case B: post-read target generation drift in LinuxCgroupV2Probe.read() -> generation_changed.
+    proc_b, cg_b = _setup_cgroup_v2_fixture(
+        tmp_path / "t7a_cg_gen",
+        pid=2801,
+        start_ticks=5000,
+        cgroup_rel_path="/slurm/uid_1000/job_gen",
+    )
+    probe_b = LinuxCgroupV2Probe(pid=2801, proc_root=proc_b, host_id="node-cg")
+    mem_cur_b = cg_b / "slurm" / "uid_1000" / "job_gen" / "memory.current"
+
+    def _mutate_stat_on_mem_current(self: Path, *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(self, *args, **kwargs)
+        if self == mem_cur_b:
+            (proc_b / "2801" / "stat").write_text(
+                _make_stat_line(2801, ppid=1, start_ticks=9999), encoding="utf-8"
+            )
+        return handle
+
+    monkeypatch.setattr(Path, "open", _mutate_stat_on_mem_current)
+    try:
+        r_b = probe_b.read()
+    finally:
+        monkeypatch.setattr(Path, "open", real_open)
+
+    assert r_b.status == "unavailable"
+    assert r_b.reason_code == "generation_changed"
+    for cg_field in (
+        r_b.memory_current_bytes,
+        r_b.memory_peak_bytes,
+        r_b.memory_max_bytes,
+        r_b.cpu_usage_seconds,
+        r_b.cpu_user_seconds,
+        r_b.cpu_system_seconds,
+        r_b.cpu_throttled_seconds,
+        r_b.cpu_nr_throttled,
+        r_b.cpu_max_cores,
+        r_b.cpuset_effective_cpus,
+    ):
+        assert isinstance(cg_field, LinuxMemoryUnavailable)
+
+    # Sub-case C: post-scan root generation drift in LinuxProcessTreeProbe.read() -> generation_changed
+    # without committing baseline state.
+    proc_c = _init_proc_root(tmp_path / "t7a_tree_gen")
+    _write_proc_entry(proc_c, pid=2810, ppid=1, start_ticks=5000)
+    _write_proc_entry(proc_c, pid=2811, ppid=2810, start_ticks=5100)
+    probe_c = LinuxProcessTreeProbe(pid=2810, proc_root=proc_c, host_id="node-cg")
+    child_status = proc_c / "2811" / "status"
+
+    def _mutate_root_stat_on_child_status(self: Path, *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(self, *args, **kwargs)
+        if self == child_status:
+            (proc_c / "2810" / "stat").write_text(
+                _make_stat_line(2810, ppid=1, start_ticks=9999), encoding="utf-8"
+            )
+        return handle
+
+    monkeypatch.setattr(Path, "open", _mutate_root_stat_on_child_status)
+    try:
+        r_c = probe_c.read()
+    finally:
+        monkeypatch.setattr(Path, "open", real_open)
+
+    assert r_c.status == "unavailable"
+    assert r_c.reason_code == "generation_changed"
+    for tree_field in (
+        r_c.live_member_count,
+        r_c.sum_rss_bytes,
+        r_c.matched_cpu_user_delta_seconds,
+        r_c.matched_cpu_system_delta_seconds,
+    ):
+        assert isinstance(tree_field, LinuxMemoryUnavailable)
+    assert probe_c._has_baseline_scan is False
+    assert probe_c._member_baselines == {}
+
