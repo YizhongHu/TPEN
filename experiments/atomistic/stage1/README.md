@@ -108,20 +108,19 @@ The supported submission directory is the repository root. `render` and the
 CLI require an explicit absolute `checkout_root`/`--checkout-root`: this is the
 exact execution checkout staged for the job, and it owns the driver,
 `experiments` protocol, configs, and source identity. The checkout used to
-render the command may be different. When `render` is called with the
-repository-relative driver path, it emits commands of this form, with the
-row's relative config preserved:
+render the command may be different. The row's kind selects the fixed driver;
+the encoded row binding supplies config, identity, overlays, and checkpoint
+provenance:
 
 ```text
-/absolute/path/to/python /absolute/execution/checkout/experiments/atomistic/stage1/train.py --config configs/he/train.yaml --kind smoke <row overrides> --binding <row token>
+/absolute/path/to/python /absolute/execution/checkout/experiments/atomistic/stage1/train.py --binding <row token>
 ```
 
-The Stage-1 drivers resolve relative configs against this directory, not the
-process cwd. An absolute `--config` path is accepted when it names the same
-bound config. The eval driver emits the corresponding absolute driver path and
-its strict-checkpoint arguments. A CLI caller rendering from the repository
-root for a staged checkout passes `--checkout-root /path/to/staged/checkout`;
-it must not rely on the launch module's own location or the submission cwd.
+The Stage-1 drivers resolve the bound config against this directory, not the
+process cwd. The eval driver applies its strict model-only checkpoint binding
+from the same row. A CLI caller rendering from the repository root for a
+staged checkout passes `--checkout-root /path/to/staged/checkout`; it must not
+rely on the launch module's own location or the submission cwd.
 
 Smoke rows use the same `configs/<system>/train.yaml` files as train rows. Their
 smoke-ness is only the bounded budget supplied by `launch.row_overrides`:

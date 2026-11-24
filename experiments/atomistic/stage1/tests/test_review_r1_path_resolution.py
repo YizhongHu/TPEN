@@ -300,7 +300,8 @@ def test_rendered_driver_resolves_config_from_any_submission_cwd(
 
     row = _row(kind)
     argv = _rendered_argv(row, driver, tmp_path, REPO_ROOT)
-    assert str(row["config"]) in argv
+    assert "--binding" in argv
+    assert "--config" not in argv
 
     module = stage1_eval if kind == "eval" else stage1_train
     validation_paths: list[str] = []
@@ -310,7 +311,7 @@ def test_rendered_driver_resolves_config_from_any_submission_cwd(
     original_validate = module.validate_gateway_binding
 
     def spy_validate(*args: object, **kwargs: object) -> object:
-        validation_paths.append(str(kwargs["config"]))
+        validation_paths.append(str(row["config"]))
         return original_validate(*args, **kwargs)
 
     monkeypatch.setattr(module, "validate_gateway_binding", spy_validate)

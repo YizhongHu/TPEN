@@ -413,8 +413,7 @@ def test_zero_and_positive_checkpoint_real_producer_chain(
         ]
         monkeypatch.setattr(
             sys, "argv", [
-                "stage1-train", "--config", str(CONFIG_ROOT / "he" / "train.yaml"),
-                "--kind", "train", *train_overrides,
+                "stage1-train",
                 "--binding", _binding_token(train_row),
             ],
         )
@@ -459,10 +458,8 @@ def test_zero_and_positive_checkpoint_real_producer_chain(
         ]
         monkeypatch.setattr(
             sys, "argv", [
-                "stage1-eval", "--config", str(CONFIG_ROOT / "he" / "eval.yaml"),
-                "--kind", "eval", *overrides,
+                "stage1-eval",
                 "--binding", _binding_token(row),
-                "--expected-checkpoint-sha256", str(row["checkpoint_sha256"]),
             ],
         )
         assert stage1_eval.main() == 0

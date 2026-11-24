@@ -19,6 +19,7 @@ from tpen.run import run_from_config
 from experiments.atomistic.stage1.protocol import (
     compose_train_overlay,
     resolve_config_path,
+    row_config_values,
     validate_resolved_train_config,
     validate_gateway_binding,
 )
@@ -71,16 +72,12 @@ def build_train_config(
             cfg, overlay=str(selected_overlay), expected_sha256=str(selected_overlay_sha),
         )
 
-    if overrides is None:
-        # Keep launch.py's existing wire representation for this intermediate
-        # PR; the application builder owns the actual row-to-config merge.
-        from experiments.atomistic.stage1.launch import row_overrides
-
-        selected_overrides = row_overrides(row)
-    else:
-        selected_overrides = list(overrides)
-    if selected_overrides:
-        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(selected_overrides))
+    cfg = OmegaConf.merge(cfg, OmegaConf.create(row_config_values(row)))
+    # The optional dotlist remains only for the pinned restart adapter.  The
+    # real gateway has no positional override channel and never reaches this
+    # branch.
+    if overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(overrides)))
     # A caller-supplied compatibility override must not redirect artifacts.
     _bind_output_identity(cfg, row)
     if row.get("science_profile") == "hooke-hv2-v1":
@@ -121,29 +118,15 @@ def main() -> int:
     """Run one configured training job through TPEN's public gateway."""
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
-    parser.add_argument("overrides", nargs="*")
     parser.add_argument("--binding", required=True)
-    parser.add_argument("--kind", choices=("smoke", "train"), required=True)
-    parser.add_argument("--overlay")
-    parser.add_argument("--overlay-sha256")
     parser.add_argument(
         "--restart", action="store_true",
         help="run the admitted row through the Stage-1 restart protocol",
     )
-    # The existing compatibility CLI keeps free-form OmegaConf overrides;
-    # allow the named binding flags to appear on either side of that list in
-    # rendered scheduler commands.
-    args = parser.parse_intermixed_args()
-    config_path = resolve_config_path(args.config)
-    row = validate_gateway_binding(
-        binding=args.binding, config=str(config_path), overrides=args.overrides,
-        kind=args.kind, overlay=args.overlay, overlay_sha256=args.overlay_sha256,
-    )
-    cfg = build_train_config(
-        row, config_path=config_path, overrides=args.overrides,
-        overlay=args.overlay, overlay_sha256=args.overlay_sha256,
-    )
+    args = parser.parse_args()
+    row = validate_gateway_binding(binding=args.binding)
+    cfg = build_train_config(row)
+    config_path = resolve_config_path(str(row["config"]))
     if args.restart:
         from experiments.atomistic.stage1.restart import execute_restart
 

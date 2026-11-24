@@ -89,7 +89,7 @@ def _run_real_config(*, row: dict[str, object], config_path: Path,
     # command_for_row is the launcher's rendered command contract.  The test
     # invokes its public run_from_config equivalent directly so no scheduler or
     # shell is needed inside pytest.
-    assert str(row["config"]) in command_for_row(
+    assert "--binding" in command_for_row(
         row, python=sys.executable, driver="experiments/atomistic/stage1/train.py"
         if row["kind"] == "train" else "experiments/atomistic/stage1/eval.py"
     )
@@ -319,11 +319,7 @@ def test_bounded_real_hooke_overlay_chain_preserves_diagnostics_and_readout(
         if row["kind"] == "train" and row["lineage"] == 0
     )
     train_argv = [
-        "stage1-train", "--config", str(train_row["config"]), "--kind", "train",
-        *row_overrides(train_row), "sampler.burn_in=1", "sampler.n_steps=1",
-        "--binding", _binding_token(train_row),
-        "--overlay", str(train_row["overlay"]),
-        "--overlay-sha256", str(train_row["overlay_sha256"]),
+        "stage1-train", "--binding", _binding_token(train_row),
     ]
     with monkeypatch.context() as isolated:
         isolated.setattr(sys, "argv", train_argv)
