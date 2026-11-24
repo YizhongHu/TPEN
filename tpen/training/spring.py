@@ -570,11 +570,7 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
     def _trust_scale(self, direction_norm: float) -> float:
         """Return the base policy's factor capping applied displacement."""
 
-        cap = self.policy.base.max_update_norm
-        if cap is None or direction_norm == 0.0:
-            return 1.0
-        proposed = self.policy.base.learning_rate * direction_norm
-        return 1.0 if proposed <= cap else cap / proposed
+        return self.policy.base.trust_scale(direction_norm=direction_norm)
 
     def _apply(self, direction: Any) -> None:
         """Write the applied direction into ``.grad`` and step plain SGD."""

@@ -21,10 +21,14 @@ from tpen.training.score_geometry import (
     unflatten_to_layout,
 )
 from tpen.training.sr import (
+    SR_GRID_FACTOR_KEYS,
     SR_STATE_VERSION,
+    SRGridHyperparameters,
     SRPolicy,
     SRTelemetry,
     StochasticReconfigurationUpdate,
+    build_sr_update_from_factors,
+    sr_policy_from_factors,
 )
 from tpen.training.state import TrainerState, TrainingTiming
 from tpen.training.statistics import (
@@ -91,15 +95,19 @@ __all__ = [
     "serialize_parameter_layout",
     "SCORE_CONVENTION_VERSION",
     "SOAP",
+    "SR_GRID_FACTOR_KEYS",
     "SR_STATE_VERSION",
     "DampingPolicy",
     "QGTOperator",
+    "SRGridHyperparameters",
     "SRPolicy",
     "SRTelemetry",
     "ScoreConventions",
     "ScoreGeometry",
     "SolveDiagnostics",
     "StochasticReconfigurationUpdate",
+    "build_sr_update_from_factors",
+    "sr_policy_from_factors",
     "build_energy_residual",
     "build_score_geometry",
     "build_score_geometry_from_rows",
