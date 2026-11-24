@@ -223,14 +223,23 @@ def _set_optional_execution_seeds(cfg: DictConfig, streams: Mapping[str, Any]) -
                     )
 
 
-def _optimizer_entry(cell: Any) -> Any:
-    """Resolve the cell's optimizer through the live build-time roster."""
+def _optimizer_entry(
+    manifest: Mapping[str, Any], availability: Mapping[str, Any]
+) -> Any:
+    """Resolve an owned manifest's optimizer through the build-time roster.
 
-    manifest = _mapping(cell.manifest, "manifest")
+    Parameters
+    ----------
+    manifest
+        Resolver-owned, validated manifest snapshot.
+    availability
+        Separately captured, validated runnability metadata; it must not be
+        inferred when absent.
+    """
+
     identity = _mapping(manifest.get("scientific_identity"), "scientific_identity")
     optimizer_cell = _mapping(identity.get("optimizer_cell"), "scientific_identity.optimizer_cell")
     method = optimizer_cell.get("method")
-    availability = _mapping(getattr(cell, "availability", None), "cell.availability")
     status = availability.get("status")
     if not isinstance(method, str) or not method:
         raise TrainConfigResolutionError("optimizer cell must declare a method")
@@ -640,7 +649,9 @@ def resolve_train_config(
             "cell output_path must bind its leaf hash and stage to the manifest"
         )
 
-    optimizer_entry = _optimizer_entry(cell)
+    # Keep availability beside, rather than inside, the authenticated snapshot.
+    availability = _mapping(getattr(cell, "availability", None), "cell.availability")
+    optimizer_entry = _optimizer_entry(manifest, availability)
     context_name = _consumed_context(manifest)
     levels = _declared_adam_levels(manifest)
     optimizer_identity = _mapping(manifest["scientific_identity"].get("optimizer"), "scientific_identity.optimizer")
