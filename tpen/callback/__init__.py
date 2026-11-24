@@ -193,7 +193,9 @@ def __getattr__(name: str) -> object:
         return ResourceUsage
     if name in {
         "AllocatorSource",
+        "LinuxCgroupV2Source",
         "LinuxMemorySource",
+        "LinuxProcessTreeSource",
         "RUsageSource",
         "ResourceSamples",
     }:
@@ -238,7 +240,9 @@ __all__ = [
     "FactorScalars",
     "GradientStats",
     "InitialCheckpoint",
+    "LinuxCgroupV2Source",
     "LinuxMemorySource",
+    "LinuxProcessTreeSource",
     "ManagedCallback",
     "ManagedLifecycleError",
     "Metadata",

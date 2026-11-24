@@ -77,12 +77,24 @@ from tpen.observability_artifacts import (
     validate_identifier,
 )
 from tpen.process_resources import (
+    DEFAULT_LINUX_CGROUP_MAX_ANCESTOR_DEPTH,
+    DEFAULT_LINUX_CGROUP_MAX_READ_BYTES,
+    DEFAULT_LINUX_CGROUP_MAX_READ_SECONDS,
     DEFAULT_LINUX_MEMORY_MAX_READ_BYTES,
     DEFAULT_LINUX_MEMORY_MAX_READ_SECONDS,
+    DEFAULT_LINUX_TREE_MAX_ENUMERATED_CANDIDATES,
+    DEFAULT_LINUX_TREE_MAX_OBSERVED_MEMBERS,
+    DEFAULT_LINUX_TREE_MAX_READ_BYTES,
+    DEFAULT_LINUX_TREE_MAX_SCAN_SECONDS,
+    LinuxCgroupV2Identity,
+    LinuxCgroupV2Probe,
+    LinuxCgroupV2Reading,
     LinuxMemoryUnavailable,
     LinuxProcessGeneration,
     LinuxProcessMemoryProbe,
     LinuxProcessMemoryReading,
+    LinuxProcessTreeProbe,
+    LinuxProcessTreeReading,
     ProcessRUsageProbe,
     ProcessResourceBaseline,
     ResourceUnavailable,
@@ -95,14 +107,19 @@ if TYPE_CHECKING:
 
 _BYTES_PER_MIB = 1024 * 1024
 _NS_PER_SECOND = 1_000_000_000
+_DEFAULT_DESCENDANT_SAMPLE_RECORD_BUDGET_BYTES = 262_144
 
 RUSAGE_SOURCE_ID = "self-rusage"
 ALLOCATOR_SOURCE_ID = "torch-allocator"
 LINUX_MEMORY_SOURCE_ID = "linux-memory"
+LINUX_PROCESS_TREE_SOURCE_ID = "linux-process-tree"
+LINUX_CGROUP_V2_SOURCE_ID = "linux-cgroup-v2"
 
 RUSAGE_EXECUTION_MODE = "in_process_thread"
 ALLOCATOR_EXECUTION_MODE = "in_process_cooperative"
 LINUX_MEMORY_EXECUTION_MODE = "in_process_thread"
+LINUX_PROCESS_TREE_EXECUTION_MODE = "in_process_thread"
+LINUX_CGROUP_V2_EXECUTION_MODE = "in_process_thread"
 
 RUSAGE_QUANTITY_IDS: tuple[str, ...] = (
     "process.rusage.user_cpu_seconds",
@@ -121,6 +138,28 @@ LINUX_MEMORY_QUANTITY_IDS: tuple[str, ...] = (
     "process.memory.thread_count",
 )
 DEFAULT_LINUX_MEMORY_QUANTITIES: tuple[str, ...] = LINUX_MEMORY_QUANTITY_IDS
+
+LINUX_PROCESS_TREE_QUANTITY_IDS: tuple[str, ...] = (
+    "descendants.live_member_count",
+    "descendants.sum_rss_bytes",
+    "descendants.matched_cpu_user_delta_seconds",
+    "descendants.matched_cpu_system_delta_seconds",
+)
+DEFAULT_LINUX_PROCESS_TREE_QUANTITIES: tuple[str, ...] = LINUX_PROCESS_TREE_QUANTITY_IDS
+
+LINUX_CGROUP_V2_QUANTITY_IDS: tuple[str, ...] = (
+    "cgroup.memory.current_bytes",
+    "cgroup.memory.peak_bytes",
+    "cgroup.memory.max_bytes",
+    "cgroup.cpu.usage_seconds",
+    "cgroup.cpu.user_seconds",
+    "cgroup.cpu.system_seconds",
+    "cgroup.cpu.throttled_seconds",
+    "cgroup.cpu.nr_throttled",
+    "cgroup.cpu.max_cores",
+    "cgroup.cpuset.effective_cpus",
+)
+DEFAULT_LINUX_CGROUP_V2_QUANTITIES: tuple[str, ...] = LINUX_CGROUP_V2_QUANTITY_IDS
 
 ALLOCATOR_CURRENT_QUANTITY_IDS: tuple[str, ...] = (
     "allocator.current.allocated_bytes",
@@ -583,6 +622,410 @@ class LinuxMemorySource:
 
 
 @dataclass(frozen=True)
+class LinuxProcessTreeSource:
+    """Configuration for bounded Linux procfs descendant-tree sampling.
+
+    Runs strictly in-process on a bounded TPEN-owned sampling thread, targeting
+    the live self process generation bound at scope activation (never freezing
+    ``os.getpid()`` at construction and never targeting a foreign PID).
+    """
+
+    enabled: bool = True
+    source_id: str = LINUX_PROCESS_TREE_SOURCE_ID
+    execution_mode: str = LINUX_PROCESS_TREE_EXECUTION_MODE
+    interval_seconds: float | None = None
+    quantities: tuple[str, ...] = DEFAULT_LINUX_PROCESS_TREE_QUANTITIES
+    max_scan_seconds: float = DEFAULT_LINUX_TREE_MAX_SCAN_SECONDS
+    max_observed_members: int = DEFAULT_LINUX_TREE_MAX_OBSERVED_MEMBERS
+    max_enumerated_candidates: int = DEFAULT_LINUX_TREE_MAX_ENUMERATED_CANDIDATES
+    max_read_bytes: int = DEFAULT_LINUX_TREE_MAX_READ_BYTES
+    observer_pids: tuple[int, ...] = ()
+    pid: int | None = None
+    probe: Any = None
+    proc_root: str | Path | None = None
+
+    def __post_init__(self) -> None:
+        _require_bool(self.enabled, "LinuxProcessTreeSource.enabled")
+        validate_identifier(self.source_id, "LinuxProcessTreeSource.source_id")
+        if (
+            type(self.execution_mode) is not str
+            or self.execution_mode != LINUX_PROCESS_TREE_EXECUTION_MODE
+        ):
+            raise ValueError(
+                f"LinuxProcessTreeSource.execution_mode must be "
+                f"{LINUX_PROCESS_TREE_EXECUTION_MODE!r}, got {self.execution_mode!r}"
+            )
+        if self.interval_seconds is not None:
+            object.__setattr__(
+                self,
+                "interval_seconds",
+                _require_positive_finite(
+                    self.interval_seconds, "LinuxProcessTreeSource.interval_seconds"
+                ),
+            )
+        if isinstance(self.quantities, (str, bytes)) or not isinstance(
+            self.quantities, Sequence
+        ):
+            raise TypeError(
+                "LinuxProcessTreeSource.quantities must be a sequence of quantity IDs"
+            )
+        selected = tuple(self.quantities)
+        if not selected:
+            raise ValueError("LinuxProcessTreeSource.quantities must be nonempty")
+        seen: set[str] = set()
+        allowed = frozenset(LINUX_PROCESS_TREE_QUANTITY_IDS)
+        for qty_id in selected:
+            if type(qty_id) is not str or qty_id not in allowed:
+                raise ValueError(
+                    f"unsupported LinuxProcessTreeSource quantity {qty_id!r}; "
+                    f"expected subset of {LINUX_PROCESS_TREE_QUANTITY_IDS}"
+                )
+            if qty_id in seen:
+                raise ValueError(f"duplicate LinuxProcessTreeSource quantity {qty_id!r}")
+            seen.add(qty_id)
+        object.__setattr__(self, "quantities", selected)
+
+        object.__setattr__(
+            self,
+            "max_scan_seconds",
+            _require_positive_finite(
+                self.max_scan_seconds, "LinuxProcessTreeSource.max_scan_seconds"
+            ),
+        )
+        _require_positive_int(
+            self.max_observed_members, "LinuxProcessTreeSource.max_observed_members"
+        )
+        _require_positive_int(
+            self.max_enumerated_candidates,
+            "LinuxProcessTreeSource.max_enumerated_candidates",
+        )
+        _require_positive_int(self.max_read_bytes, "LinuxProcessTreeSource.max_read_bytes")
+
+        if isinstance(self.observer_pids, (str, bytes)) or not isinstance(
+            self.observer_pids, Sequence
+        ):
+            raise TypeError(
+                "LinuxProcessTreeSource.observer_pids must be a sequence of positive ints"
+            )
+        obs_seen: set[int] = set()
+        obs_tuple: list[int] = []
+        for raw_pid in self.observer_pids:
+            valid_pid = _require_positive_int(
+                raw_pid, "LinuxProcessTreeSource.observer_pids[]"
+            )
+            if valid_pid not in obs_seen:
+                obs_seen.add(valid_pid)
+                obs_tuple.append(valid_pid)
+        object.__setattr__(self, "observer_pids", tuple(obs_tuple))
+
+        if self.pid is not None:
+            pid = _require_positive_int(self.pid, "LinuxProcessTreeSource.pid")
+            current_pid = os.getpid()
+            if pid != current_pid:
+                raise ValueError(
+                    f"LinuxProcessTreeSource targets only the current self process and "
+                    f"cannot target foreign PID {pid} (current process PID is {current_pid})"
+                )
+        if self.probe is not None and not callable(getattr(self.probe, "read", None)):
+            raise TypeError("LinuxProcessTreeSource.probe must expose callable read()")
+        if self.proc_root is not None:
+            if isinstance(self.proc_root, Path):
+                pass
+            elif type(self.proc_root) is str:
+                if not self.proc_root.strip():
+                    raise ValueError(
+                        "LinuxProcessTreeSource.proc_root must be a nonempty path or None"
+                    )
+                object.__setattr__(self, "proc_root", Path(self.proc_root))
+            else:
+                raise TypeError(
+                    "LinuxProcessTreeSource.proc_root must be str, Path, or None, "
+                    f"got {type(self.proc_root).__name__}"
+                )
+
+    def descriptors(self) -> dict[str, QuantityDescriptor]:
+        """Return immutable :class:`QuantityDescriptor` map for selected quantities."""
+
+        catalog: dict[str, QuantityDescriptor] = {
+            "descendants.live_member_count": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="1",
+                statistic="gauge",
+                subject_kind="descendant_set",
+                window="scan_interval",
+                native_name="descendant_live_member_count",
+                native_unit="1",
+                conversion="identity",
+                quality=("bounded_procfs_scan_not_atomic",),
+            ),
+            "descendants.sum_rss_bytes": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="B",
+                statistic="gauge",
+                subject_kind="descendant_set",
+                window="scan_interval",
+                native_name="sum_VmRSS",
+                native_unit="KiB",
+                conversion="multiply_by_1024",
+                quality=(
+                    "approximate_rss",
+                    "sum_rss_double_counts_shared_pages",
+                    "bounded_procfs_scan_not_atomic",
+                ),
+            ),
+            "descendants.matched_cpu_user_delta_seconds": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="s",
+                statistic="gauge",
+                subject_kind="descendant_set",
+                window="scan_interval",
+                native_name="matched_delta_utime",
+                native_unit="clock_ticks",
+                conversion="divide_by_clock_ticks_per_second",
+                quality=(
+                    "matched_generation_scan_delta_only",
+                    "excludes_reaped_children",
+                ),
+            ),
+            "descendants.matched_cpu_system_delta_seconds": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="s",
+                statistic="gauge",
+                subject_kind="descendant_set",
+                window="scan_interval",
+                native_name="matched_delta_stime",
+                native_unit="clock_ticks",
+                conversion="divide_by_clock_ticks_per_second",
+                quality=(
+                    "matched_generation_scan_delta_only",
+                    "excludes_reaped_children",
+                ),
+            ),
+        }
+        return {qty_id: catalog[qty_id] for qty_id in self.quantities}
+
+
+@dataclass(frozen=True)
+class LinuxCgroupV2Source:
+    """Configuration for read-only Linux cgroup v2 membership and limit sampling.
+
+    Strictly read-only and Torch-free: never guesses cgroup paths from
+    scheduler job IDs, never writes or resets ``memory.peak``, refuses cgroup
+    v1 pretending to be v2, and records explicit shared-scope provenance.
+    """
+
+    enabled: bool = True
+    source_id: str = LINUX_CGROUP_V2_SOURCE_ID
+    execution_mode: str = LINUX_CGROUP_V2_EXECUTION_MODE
+    interval_seconds: float | None = None
+    quantities: tuple[str, ...] = DEFAULT_LINUX_CGROUP_V2_QUANTITIES
+    max_read_bytes: int = DEFAULT_LINUX_CGROUP_MAX_READ_BYTES
+    max_read_seconds: float = DEFAULT_LINUX_CGROUP_MAX_READ_SECONDS
+    max_ancestor_depth: int = DEFAULT_LINUX_CGROUP_MAX_ANCESTOR_DEPTH
+    pid: int | None = None
+    probe: Any = None
+    proc_root: str | Path | None = None
+    cgroup_root: str | Path | None = None
+
+    def __post_init__(self) -> None:
+        _require_bool(self.enabled, "LinuxCgroupV2Source.enabled")
+        validate_identifier(self.source_id, "LinuxCgroupV2Source.source_id")
+        if (
+            type(self.execution_mode) is not str
+            or self.execution_mode != LINUX_CGROUP_V2_EXECUTION_MODE
+        ):
+            raise ValueError(
+                f"LinuxCgroupV2Source.execution_mode must be "
+                f"{LINUX_CGROUP_V2_EXECUTION_MODE!r}, got {self.execution_mode!r}"
+            )
+        if self.interval_seconds is not None:
+            object.__setattr__(
+                self,
+                "interval_seconds",
+                _require_positive_finite(
+                    self.interval_seconds, "LinuxCgroupV2Source.interval_seconds"
+                ),
+            )
+        if isinstance(self.quantities, (str, bytes)) or not isinstance(
+            self.quantities, Sequence
+        ):
+            raise TypeError(
+                "LinuxCgroupV2Source.quantities must be a sequence of quantity IDs"
+            )
+        selected = tuple(self.quantities)
+        if not selected:
+            raise ValueError("LinuxCgroupV2Source.quantities must be nonempty")
+        seen: set[str] = set()
+        allowed = frozenset(LINUX_CGROUP_V2_QUANTITY_IDS)
+        for qty_id in selected:
+            if type(qty_id) is not str or qty_id not in allowed:
+                raise ValueError(
+                    f"unsupported LinuxCgroupV2Source quantity {qty_id!r}; "
+                    f"expected subset of {LINUX_CGROUP_V2_QUANTITY_IDS}"
+                )
+            if qty_id in seen:
+                raise ValueError(f"duplicate LinuxCgroupV2Source quantity {qty_id!r}")
+            seen.add(qty_id)
+        object.__setattr__(self, "quantities", selected)
+
+        _require_positive_int(self.max_read_bytes, "LinuxCgroupV2Source.max_read_bytes")
+        object.__setattr__(
+            self,
+            "max_read_seconds",
+            _require_positive_finite(
+                self.max_read_seconds, "LinuxCgroupV2Source.max_read_seconds"
+            ),
+        )
+        _require_positive_int(
+            self.max_ancestor_depth, "LinuxCgroupV2Source.max_ancestor_depth"
+        )
+
+        if self.pid is not None:
+            pid = _require_positive_int(self.pid, "LinuxCgroupV2Source.pid")
+            current_pid = os.getpid()
+            if pid != current_pid:
+                raise ValueError(
+                    f"LinuxCgroupV2Source targets only the current self process and "
+                    f"cannot target foreign PID {pid} (current process PID is {current_pid})"
+                )
+        if self.probe is not None and not callable(getattr(self.probe, "read", None)):
+            raise TypeError("LinuxCgroupV2Source.probe must expose callable read()")
+        for attr_name in ("proc_root", "cgroup_root"):
+            raw_path = getattr(self, attr_name)
+            if raw_path is None or isinstance(raw_path, Path):
+                continue
+            if type(raw_path) is str:
+                if not raw_path.strip():
+                    raise ValueError(
+                        f"LinuxCgroupV2Source.{attr_name} must be a nonempty path or None"
+                    )
+                object.__setattr__(self, attr_name, Path(raw_path))
+            else:
+                raise TypeError(
+                    f"LinuxCgroupV2Source.{attr_name} must be str, Path, or None, "
+                    f"got {type(raw_path).__name__}"
+                )
+
+    def descriptors(self) -> dict[str, QuantityDescriptor]:
+        """Return immutable :class:`QuantityDescriptor` map for selected quantities."""
+
+        shared_q = "shared_cgroup_scope_not_exclusive_entitlement"
+        catalog: dict[str, QuantityDescriptor] = {
+            "cgroup.memory.current_bytes": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="B",
+                statistic="gauge",
+                subject_kind="cgroup",
+                window="cgroup_read_interval",
+                native_name="memory.current",
+                native_unit="B",
+                conversion="identity",
+                quality=("cgroup_scope_not_sum_rss", shared_q),
+            ),
+            "cgroup.memory.peak_bytes": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="B",
+                statistic="high_water",
+                subject_kind="cgroup",
+                window="cgroup_lifetime",
+                native_name="memory.peak",
+                native_unit="B",
+                conversion="identity",
+                quality=("cgroup_lifetime_high_water_not_reset_per_run", shared_q),
+            ),
+            "cgroup.memory.max_bytes": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="B",
+                statistic="capacity",
+                subject_kind="cgroup",
+                window="cgroup_read_interval",
+                native_name="memory.max",
+                native_unit="B",
+                conversion="identity",
+                quality=("hierarchical_effective_limit", shared_q),
+            ),
+            "cgroup.cpu.usage_seconds": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="s",
+                statistic="counter",
+                subject_kind="cgroup",
+                window="cgroup_lifetime",
+                native_name="cpu.stat.usage_usec",
+                native_unit="us",
+                conversion="divide_by_1000000",
+                quality=(shared_q,),
+            ),
+            "cgroup.cpu.user_seconds": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="s",
+                statistic="counter",
+                subject_kind="cgroup",
+                window="cgroup_lifetime",
+                native_name="cpu.stat.user_usec",
+                native_unit="us",
+                conversion="divide_by_1000000",
+                quality=(shared_q,),
+            ),
+            "cgroup.cpu.system_seconds": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="s",
+                statistic="counter",
+                subject_kind="cgroup",
+                window="cgroup_lifetime",
+                native_name="cpu.stat.system_usec",
+                native_unit="us",
+                conversion="divide_by_1000000",
+                quality=(shared_q,),
+            ),
+            "cgroup.cpu.throttled_seconds": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="s",
+                statistic="counter",
+                subject_kind="cgroup",
+                window="cgroup_lifetime",
+                native_name="cpu.stat.throttled_usec",
+                native_unit="us",
+                conversion="divide_by_1000000",
+                quality=(shared_q,),
+            ),
+            "cgroup.cpu.nr_throttled": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="1",
+                statistic="counter",
+                subject_kind="cgroup",
+                window="cgroup_lifetime",
+                native_name="cpu.stat.nr_throttled",
+                native_unit="1",
+                conversion="identity",
+                quality=(shared_q,),
+            ),
+            "cgroup.cpu.max_cores": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="1",
+                statistic="capacity",
+                subject_kind="cgroup",
+                window="cgroup_read_interval",
+                native_name="cpu.max",
+                native_unit="quota_over_period",
+                conversion="quota_divided_by_period",
+                quality=("hierarchical_effective_limit", shared_q),
+            ),
+            "cgroup.cpuset.effective_cpus": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="1",
+                statistic="capacity",
+                subject_kind="cgroup",
+                window="cgroup_read_interval",
+                native_name="cpuset.cpus.effective",
+                native_unit="cpu_list",
+                conversion="count_cpu_list_members",
+                quality=(shared_q,),
+            ),
+        }
+        return {qty_id: catalog[qty_id] for qty_id in self.quantities}
+
+
+@dataclass(frozen=True)
 class AllocatorSource:
     """Configuration for configured-device PyTorch allocator observations.
 
@@ -865,6 +1308,172 @@ def _linux_memory_reading_to_readings(
     return out
 
 
+def _linux_tree_reading_to_readings(
+    reading: LinuxProcessTreeReading,
+    quantities: Sequence[str],
+) -> dict[str, ObservabilityReading]:
+    """Convert one :class:`LinuxProcessTreeReading` into tagged v1 readings."""
+
+    field_specs: dict[str, tuple[str, str]] = {
+        "descendants.live_member_count": ("live_member_count", "int"),
+        "descendants.sum_rss_bytes": ("sum_rss_bytes", "int"),
+        "descendants.matched_cpu_user_delta_seconds": (
+            "matched_cpu_user_delta_seconds",
+            "float",
+        ),
+        "descendants.matched_cpu_system_delta_seconds": (
+            "matched_cpu_system_delta_seconds",
+            "float",
+        ),
+    }
+    fallback_status = "error" if getattr(reading, "status", None) == "error" else "unavailable"
+    fallback_code = getattr(reading, "reason_code", None) or "linux_tree_unavailable"
+    fallback_detail = getattr(reading, "detail", None) or "linux process tree unavailable"
+
+    out: dict[str, ObservabilityReading] = {}
+    for qty_id in quantities:
+        attr_name, mode = field_specs[qty_id]
+        raw = getattr(reading, attr_name)
+        if isinstance(raw, LinuxMemoryUnavailable):
+            out[qty_id] = ObservabilityReading(
+                status=raw.status,
+                reason_code=raw.reason_code,
+                detail=raw.reason,
+            )
+            continue
+        if isinstance(raw, ResourceUnavailable):
+            out[qty_id] = ObservabilityReading(
+                status=fallback_status,
+                reason_code=fallback_code,
+                detail=raw.reason or fallback_detail,
+            )
+            continue
+        if mode == "int":
+            if type(raw) is not int:
+                out[qty_id] = ObservabilityReading(
+                    status="error",
+                    reason_code="invalid_reading",
+                    detail=f"unexpected {attr_name} type {type(raw).__name__}",
+                )
+                continue
+            if raw < 0:
+                out[qty_id] = ObservabilityReading(
+                    status="error",
+                    reason_code="negative_reading",
+                    detail=f"{attr_name} was negative ({raw!r})",
+                )
+                continue
+            out[qty_id] = ObservabilityReading(status="ok", value=raw)
+        else:
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                out[qty_id] = ObservabilityReading(
+                    status="error",
+                    reason_code="invalid_reading",
+                    detail=f"unexpected {attr_name} type {type(raw).__name__}",
+                )
+                continue
+            fval = float(raw)
+            if not math.isfinite(fval):
+                out[qty_id] = ObservabilityReading(
+                    status="error",
+                    reason_code="non_finite_reading",
+                    detail=f"{attr_name} was non-finite ({raw!r})",
+                )
+                continue
+            if fval < 0.0:
+                out[qty_id] = ObservabilityReading(
+                    status="error",
+                    reason_code="negative_reading",
+                    detail=f"{attr_name} was negative ({raw!r})",
+                )
+                continue
+            out[qty_id] = ObservabilityReading(status="ok", value=fval)
+    return out
+
+
+def _linux_cgroup_reading_to_readings(
+    reading: LinuxCgroupV2Reading,
+    quantities: Sequence[str],
+) -> dict[str, ObservabilityReading]:
+    """Convert one :class:`LinuxCgroupV2Reading` into tagged v1 readings."""
+
+    field_specs: dict[str, tuple[str, str]] = {
+        "cgroup.memory.current_bytes": ("memory_current_bytes", "int"),
+        "cgroup.memory.peak_bytes": ("memory_peak_bytes", "int"),
+        "cgroup.memory.max_bytes": ("memory_max_bytes", "int"),
+        "cgroup.cpu.usage_seconds": ("cpu_usage_seconds", "float"),
+        "cgroup.cpu.user_seconds": ("cpu_user_seconds", "float"),
+        "cgroup.cpu.system_seconds": ("cpu_system_seconds", "float"),
+        "cgroup.cpu.throttled_seconds": ("cpu_throttled_seconds", "float"),
+        "cgroup.cpu.nr_throttled": ("cpu_nr_throttled", "int"),
+        "cgroup.cpu.max_cores": ("cpu_max_cores", "float"),
+        "cgroup.cpuset.effective_cpus": ("cpuset_effective_cpus", "int"),
+    }
+    fallback_status = "error" if getattr(reading, "status", None) == "error" else "unavailable"
+    fallback_code = getattr(reading, "reason_code", None) or "linux_cgroup_unavailable"
+    fallback_detail = getattr(reading, "detail", None) or "linux cgroup v2 unavailable"
+
+    out: dict[str, ObservabilityReading] = {}
+    for qty_id in quantities:
+        attr_name, mode = field_specs[qty_id]
+        raw = getattr(reading, attr_name)
+        if isinstance(raw, LinuxMemoryUnavailable):
+            out[qty_id] = ObservabilityReading(
+                status=raw.status,
+                reason_code=raw.reason_code,
+                detail=raw.reason,
+            )
+            continue
+        if isinstance(raw, ResourceUnavailable):
+            out[qty_id] = ObservabilityReading(
+                status=fallback_status,
+                reason_code=fallback_code,
+                detail=raw.reason or fallback_detail,
+            )
+            continue
+        if mode == "int":
+            if type(raw) is not int:
+                out[qty_id] = ObservabilityReading(
+                    status="error",
+                    reason_code="invalid_reading",
+                    detail=f"unexpected {attr_name} type {type(raw).__name__}",
+                )
+                continue
+            if raw < 0:
+                out[qty_id] = ObservabilityReading(
+                    status="error",
+                    reason_code="negative_reading",
+                    detail=f"{attr_name} was negative ({raw!r})",
+                )
+                continue
+            out[qty_id] = ObservabilityReading(status="ok", value=raw)
+        else:
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                out[qty_id] = ObservabilityReading(
+                    status="error",
+                    reason_code="invalid_reading",
+                    detail=f"unexpected {attr_name} type {type(raw).__name__}",
+                )
+                continue
+            fval = float(raw)
+            if not math.isfinite(fval):
+                out[qty_id] = ObservabilityReading(
+                    status="error",
+                    reason_code="non_finite_reading",
+                    detail=f"{attr_name} was non-finite ({raw!r})",
+                )
+                continue
+            if fval < 0.0:
+                out[qty_id] = ObservabilityReading(
+                    status="error",
+                    reason_code="negative_reading",
+                    detail=f"{attr_name} was negative ({raw!r})",
+                )
+                continue
+            out[qty_id] = ObservabilityReading(status="ok", value=fval)
+    return out
+
+
 def _allocator_bytes_reading(
     value: object,
     *,
@@ -993,6 +1602,7 @@ class _ResourceSamplesSession:
         self._source_windows_ns: dict[str, list[int]] = {}
         self._source_ok_counts: dict[str, int] = {}
         self._source_non_ok_counts: dict[str, int] = {}
+        self._source_partial_flags: set[str] = set()
         self._source_unavailable_fields: set[str] = set()
         self._truncation_reasons: list[str] = []
         self._diagnostics: list[str] = []
@@ -1019,6 +1629,22 @@ class _ResourceSamplesSession:
         self._linux_memory_interval_ns = 0
         self._linux_memory_thread: threading.Thread | None = None
         self._linux_memory_thread_started = False
+
+        self._linux_tree_probe: Any = None
+        self._linux_tree_init_error: LinuxMemoryUnavailable | None = None
+        self._linux_tree_target_generation: LinuxProcessGeneration | None = None
+        self._linux_tree_subject: dict[str, Any] = {}
+        self._linux_tree_interval_ns = 0
+        self._linux_tree_thread: threading.Thread | None = None
+        self._linux_tree_thread_started = False
+
+        self._linux_cgroup_probe: Any = None
+        self._linux_cgroup_init_error: LinuxMemoryUnavailable | None = None
+        self._linux_cgroup_target_generation: LinuxProcessGeneration | None = None
+        self._linux_cgroup_subject: dict[str, Any] = {}
+        self._linux_cgroup_interval_ns = 0
+        self._linux_cgroup_thread: threading.Thread | None = None
+        self._linux_cgroup_thread_started = False
 
         self._drain_thread: threading.Thread | None = None
         self._drain_thread_started = False
@@ -1186,6 +1812,262 @@ class _ResourceSamplesSession:
             selected_sources[lm_cfg.source_id] = list(lm_cfg.quantities)
             sources_inventory[lm_cfg.source_id] = lm_inventory_entry
 
+        if self._callback.linux_tree.enabled:
+            lt_cfg = self._callback.linux_tree
+            self._linux_tree_probe = (
+                LinuxProcessTreeProbe(
+                    pid=self._pid,
+                    observer_pids=lt_cfg.observer_pids,
+                    proc_root=lt_cfg.proc_root,
+                    max_scan_seconds=lt_cfg.max_scan_seconds,
+                    max_observed_members=lt_cfg.max_observed_members,
+                    max_enumerated_candidates=lt_cfg.max_enumerated_candidates,
+                    max_read_bytes=lt_cfg.max_read_bytes,
+                    host_id=self._host_id,
+                )
+                if lt_cfg.probe is None
+                else lt_cfg.probe
+            )
+            lt_interval = (
+                self._callback.interval_seconds
+                if lt_cfg.interval_seconds is None
+                else lt_cfg.interval_seconds
+            )
+            self._linux_tree_interval_ns = max(
+                1, int(round(lt_interval * _NS_PER_SECOND))
+            )
+
+            lt_bound_gen: LinuxProcessGeneration | None = None
+            lt_bind_error: LinuxMemoryUnavailable | None = None
+            lt_bind_fn = getattr(self._linux_tree_probe, "bind_target", None)
+            if callable(lt_bind_fn):
+                try:
+                    lt_bound_gen = lt_bind_fn()
+                except Exception as exc:
+                    lt_bind_error = LinuxMemoryUnavailable(
+                        reason=f"{type(exc).__name__}: {exc}",
+                        reason_code="probe_init_failed",
+                        status="error",
+                    )
+                    self._linux_tree_init_error = lt_bind_error
+                    self._linux_tree_probe = None
+                    self._diagnostics.append(
+                        f"{lt_cfg.source_id} bind_target failed: {type(exc).__name__}: {exc}"
+                    )
+                else:
+                    if lt_bound_gen is None:
+                        raw_err = getattr(self._linux_tree_probe, "bind_error", None)
+                        if isinstance(raw_err, LinuxMemoryUnavailable):
+                            lt_bind_error = raw_err
+                        elif isinstance(raw_err, ResourceUnavailable):
+                            lt_bind_error = LinuxMemoryUnavailable(
+                                reason=raw_err.reason or f"{lt_cfg.source_id} bind_target failed",
+                                reason_code="target_bind_failed",
+                                status="unavailable",
+                            )
+                        else:
+                            lt_bind_error = LinuxMemoryUnavailable(
+                                reason=f"{lt_cfg.source_id} bind_target returned None",
+                                reason_code="target_bind_failed",
+                                status="unavailable",
+                            )
+                        self._linux_tree_init_error = lt_bind_error
+                        self._linux_tree_probe = None
+            else:
+                candidate_gen = getattr(
+                    self._linux_tree_probe, "target_generation", None
+                )
+                if isinstance(candidate_gen, LinuxProcessGeneration):
+                    lt_bound_gen = candidate_gen
+
+            self._linux_tree_target_generation = lt_bound_gen
+            root_sub = (
+                lt_bound_gen.to_subject_dict(
+                    host_id=self._host_id,
+                    invocation_token=self._invocation_id,
+                )
+                if lt_bound_gen is not None
+                else {
+                    "kind": "process",
+                    "host_id": self._host_id,
+                    "pid": self._pid,
+                    "invocation_token": self._invocation_id,
+                }
+            )
+            self._linux_tree_subject = {
+                "kind": "descendant_set",
+                "root": root_sub,
+                "members": [],
+                "membership_complete": False,
+                "partial_reasons": (
+                    [lt_bind_error.reason_code] if lt_bind_error is not None else []
+                ),
+                "enumerated_candidates": 0,
+                "observed_member_count": 0,
+                "matched_delta_member_count": 0,
+                "permission_denied_count": 0,
+                "excluded_count": 0,
+            }
+
+            lt_capability = "unavailable" if lt_bind_error is not None else "available"
+            lt_inventory_entry: dict[str, Any] = {
+                "producer": "tpen.process_resources.LinuxProcessTreeProbe",
+                "source_version": "1",
+                "execution": lt_cfg.execution_mode,
+                "selected_quantities": list(lt_cfg.quantities),
+                "interval_seconds": lt_interval,
+                "max_scan_seconds": lt_cfg.max_scan_seconds,
+                "max_observed_members": lt_cfg.max_observed_members,
+                "max_enumerated_candidates": lt_cfg.max_enumerated_candidates,
+                "max_read_bytes": lt_cfg.max_read_bytes,
+                "observer_pids": list(lt_cfg.observer_pids),
+                "capability": lt_capability,
+            }
+            if lt_bound_gen is not None:
+                lt_inventory_entry["target_generation"] = lt_bound_gen.to_dict()
+            if lt_bind_error is not None:
+                lt_inventory_entry["unavailable_reason_code"] = lt_bind_error.reason_code
+
+            descriptors_map.update(lt_cfg.descriptors())
+            selected_sources[lt_cfg.source_id] = list(lt_cfg.quantities)
+            sources_inventory[lt_cfg.source_id] = lt_inventory_entry
+
+        if self._callback.linux_cgroup.enabled:
+            lc_cfg = self._callback.linux_cgroup
+            self._linux_cgroup_probe = (
+                LinuxCgroupV2Probe(
+                    pid=self._pid,
+                    proc_root=lc_cfg.proc_root,
+                    cgroup_root=lc_cfg.cgroup_root,
+                    max_read_bytes=lc_cfg.max_read_bytes,
+                    max_read_seconds=lc_cfg.max_read_seconds,
+                    max_ancestor_depth=lc_cfg.max_ancestor_depth,
+                    host_id=self._host_id,
+                )
+                if lc_cfg.probe is None
+                else lc_cfg.probe
+            )
+            lc_interval = (
+                self._callback.interval_seconds
+                if lc_cfg.interval_seconds is None
+                else lc_cfg.interval_seconds
+            )
+            self._linux_cgroup_interval_ns = max(
+                1, int(round(lc_interval * _NS_PER_SECOND))
+            )
+
+            lc_bound_gen: LinuxProcessGeneration | None = None
+            lc_bind_error: LinuxMemoryUnavailable | None = None
+            lc_bind_fn = getattr(self._linux_cgroup_probe, "bind_target", None)
+            if callable(lc_bind_fn):
+                try:
+                    lc_bound_gen = lc_bind_fn()
+                except Exception as exc:
+                    lc_bind_error = LinuxMemoryUnavailable(
+                        reason=f"{type(exc).__name__}: {exc}",
+                        reason_code="probe_init_failed",
+                        status="error",
+                    )
+                    self._linux_cgroup_init_error = lc_bind_error
+                    self._linux_cgroup_probe = None
+                    self._diagnostics.append(
+                        f"{lc_cfg.source_id} bind_target failed: {type(exc).__name__}: {exc}"
+                    )
+                else:
+                    if lc_bound_gen is None:
+                        raw_err = getattr(self._linux_cgroup_probe, "bind_error", None)
+                        if isinstance(raw_err, LinuxMemoryUnavailable):
+                            lc_bind_error = raw_err
+                        elif isinstance(raw_err, ResourceUnavailable):
+                            lc_bind_error = LinuxMemoryUnavailable(
+                                reason=raw_err.reason or f"{lc_cfg.source_id} bind_target failed",
+                                reason_code="target_bind_failed",
+                                status="unavailable",
+                            )
+                        else:
+                            lc_bind_error = LinuxMemoryUnavailable(
+                                reason=f"{lc_cfg.source_id} bind_target returned None",
+                                reason_code="target_bind_failed",
+                                status="unavailable",
+                            )
+                        self._linux_cgroup_init_error = lc_bind_error
+                        self._linux_cgroup_probe = None
+            else:
+                candidate_gen = getattr(
+                    self._linux_cgroup_probe, "target_generation", None
+                )
+                if isinstance(candidate_gen, LinuxProcessGeneration):
+                    lc_bound_gen = candidate_gen
+
+            self._linux_cgroup_target_generation = lc_bound_gen
+            lc_identity: LinuxCgroupV2Identity | None = None
+            lc_cgroup_issue: LinuxMemoryUnavailable | None = None
+            if lc_bind_error is None and self._linux_cgroup_probe is not None:
+                resolve_fn = getattr(
+                    self._linux_cgroup_probe, "resolve_cgroup_identity", None
+                )
+                if callable(resolve_fn):
+                    try:
+                        resolved = resolve_fn()
+                    except Exception as exc:
+                        lc_cgroup_issue = LinuxMemoryUnavailable(
+                            reason=f"{type(exc).__name__}: {exc}",
+                            reason_code="cgroup_resolve_failed",
+                            status="error",
+                        )
+                    else:
+                        if isinstance(resolved, LinuxCgroupV2Identity):
+                            lc_identity = resolved
+                        elif isinstance(resolved, LinuxMemoryUnavailable):
+                            lc_cgroup_issue = resolved
+
+            if lc_identity is not None:
+                self._linux_cgroup_subject = lc_identity.to_subject_dict(
+                    target_generation=lc_bound_gen
+                )
+            else:
+                fallback_cg_sub: dict[str, Any] = {
+                    "kind": "cgroup",
+                    "cgroup_version": 2,
+                    "mount_root": None,
+                    "cgroup_path": None,
+                    "effective_memory_limit_path": None,
+                    "effective_cpu_limit_path": None,
+                    "observed_member_count": None,
+                    "includes_other_tasks": None,
+                    "shared_scope_not_exclusive": True,
+                }
+                if lc_bound_gen is not None:
+                    fallback_cg_sub["target_generation"] = lc_bound_gen.to_dict()
+                self._linux_cgroup_subject = fallback_cg_sub
+
+            lc_issue = lc_bind_error if lc_bind_error is not None else lc_cgroup_issue
+            lc_capability = "unavailable" if lc_issue is not None else "available"
+            lc_inventory_entry: dict[str, Any] = {
+                "producer": "tpen.process_resources.LinuxCgroupV2Probe",
+                "source_version": "1",
+                "execution": lc_cfg.execution_mode,
+                "selected_quantities": list(lc_cfg.quantities),
+                "interval_seconds": lc_interval,
+                "max_read_bytes": lc_cfg.max_read_bytes,
+                "max_read_seconds": lc_cfg.max_read_seconds,
+                "max_ancestor_depth": lc_cfg.max_ancestor_depth,
+                "cgroup_version": 2,
+                "shared_scope_not_exclusive": True,
+                "capability": lc_capability,
+            }
+            if lc_bound_gen is not None:
+                lc_inventory_entry["target_generation"] = lc_bound_gen.to_dict()
+            if lc_identity is not None:
+                lc_inventory_entry["mount_root"] = lc_identity.mount_root
+                lc_inventory_entry["cgroup_path"] = lc_identity.cgroup_path
+            if lc_issue is not None:
+                lc_inventory_entry["unavailable_reason_code"] = lc_issue.reason_code
+
+            descriptors_map.update(lc_cfg.descriptors())
+            selected_sources[lc_cfg.source_id] = list(lc_cfg.quantities)
+            sources_inventory[lc_cfg.source_id] = lc_inventory_entry
+
         if self._callback.allocator.enabled:
             alloc_cfg = self._callback.allocator
             self._activate_allocator_source(alloc_cfg)
@@ -1260,8 +2142,13 @@ class _ResourceSamplesSession:
             "pid": self._pid,
             "invocation_token": self._invocation_id,
         }
-        if self._linux_memory_target_generation is not None:
-            gen = self._linux_memory_target_generation
+        bound_linux_gen = (
+            self._linux_memory_target_generation
+            or self._linux_tree_target_generation
+            or self._linux_cgroup_target_generation
+        )
+        if bound_linux_gen is not None:
+            gen = bound_linux_gen
             if gen.boot_id is not None:
                 host_inventory["boot_id"] = gen.boot_id
             if gen.pid == self._pid:
@@ -1353,6 +2240,28 @@ class _ResourceSamplesSession:
                 )
                 self._linux_memory_thread.start()
                 self._linux_memory_thread_started = True
+
+        if self._callback.linux_tree.enabled:
+            self._sample_linux_tree()
+            if self._linux_tree_init_error is None:
+                self._linux_tree_thread = threading.Thread(
+                    target=self._linux_tree_loop,
+                    name=f"tpen-obs-linux-tree-{self._observer_id}",
+                    daemon=True,
+                )
+                self._linux_tree_thread.start()
+                self._linux_tree_thread_started = True
+
+        if self._callback.linux_cgroup.enabled:
+            self._sample_linux_cgroup()
+            if self._linux_cgroup_init_error is None:
+                self._linux_cgroup_thread = threading.Thread(
+                    target=self._linux_cgroup_loop,
+                    name=f"tpen-obs-linux-cgroup-{self._observer_id}",
+                    daemon=True,
+                )
+                self._linux_cgroup_thread.start()
+                self._linux_cgroup_thread_started = True
 
         if self._callback.allocator.enabled:
             read_end_ns = self._sample_allocator()
@@ -1678,6 +2587,329 @@ class _ResourceSamplesSession:
 
         try:
             readings = _linux_memory_reading_to_readings(reading, lm_cfg.quantities)
+        except Exception as exc:
+            with self._lock:
+                self._attempted += 1
+                self._failed += 1
+                self._diagnostics.append(
+                    f"{source_id} reading conversion error: {type(exc).__name__}: {exc}"
+                )
+            return
+
+        self._enqueue_reading_packet(
+            source_id=source_id,
+            subject=subject,
+            read_start_ns=read_start_ns,
+            read_end_ns=read_end_ns,
+            readings=readings,
+        )
+
+    def _descendant_record_budget_bytes(self) -> int:
+        sink = self._callback.sink
+        candidates = [
+            sink.max_sample_bytes,
+            sink.max_pending_bytes,
+            _DEFAULT_DESCENDANT_SAMPLE_RECORD_BUDGET_BYTES,
+        ]
+        raw_record_cap = getattr(sink, "max_record_bytes", None)
+        if type(raw_record_cap) is int and raw_record_cap >= 1:
+            candidates.append(raw_record_cap)
+        return max(1, min(candidates))
+
+    def _build_bounded_descendant_subject(
+        self,
+        reading: LinuxProcessTreeReading,
+        *,
+        source_id: str,
+        read_start_ns: int,
+        read_end_ns: int,
+        readings: Mapping[str, ObservabilityReading],
+    ) -> dict[str, Any]:
+        """Build O2 ``descendant_set`` subject bounded cleanly within the record budget."""
+
+        full_subject = reading.to_subject_dict(
+            host_id=self._host_id,
+            invocation_token=self._invocation_id,
+            fallback_pid=self._pid,
+        )
+        member_count = len(reading.members)
+        if member_count == 0:
+            return full_subject
+
+        budget = self._descendant_record_budget_bytes()
+        probe_sample = ObservabilitySample(
+            invocation_id=self._invocation_id,
+            observer_id=self._observer_id,
+            source_id=source_id,
+            descriptor_set_id=self._descriptor_set_id,
+            sequence=0,
+            clock_domain_id=self._clock_domain_id,
+            subject=full_subject,
+            read_start_ns=read_start_ns,
+            read_end_ns=read_end_ns,
+            readings=readings,
+        )
+        # Reserve a small margin for larger sequence integers.
+        margin = 32
+        if _encode_sample_line_bytes(probe_sample) + margin <= budget:
+            return full_subject
+
+        # Binary search largest prefix of members that fits cleanly within budget.
+        lo, hi = 0, member_count - 1
+        best_k = 0
+        best_subject = reading.to_subject_dict(
+            host_id=self._host_id,
+            invocation_token=self._invocation_id,
+            fallback_pid=self._pid,
+            max_members=0,
+        )
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            cand_subject = reading.to_subject_dict(
+                host_id=self._host_id,
+                invocation_token=self._invocation_id,
+                fallback_pid=self._pid,
+                max_members=mid,
+            )
+            cand_sample = ObservabilitySample(
+                invocation_id=self._invocation_id,
+                observer_id=self._observer_id,
+                source_id=source_id,
+                descriptor_set_id=self._descriptor_set_id,
+                sequence=0,
+                clock_domain_id=self._clock_domain_id,
+                subject=cand_subject,
+                read_start_ns=read_start_ns,
+                read_end_ns=read_end_ns,
+                readings=readings,
+            )
+            if _encode_sample_line_bytes(cand_sample) + margin <= budget:
+                best_k = mid
+                best_subject = cand_subject
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        with self._lock:
+            _append_unique(self._truncation_reasons, "descendant_members_truncated")
+        if best_k < member_count:
+            best_subject["members_truncated_for_record_budget"] = True
+            best_subject["serialized_member_count"] = best_k
+        return best_subject
+
+    def _linux_tree_loop(self) -> None:
+        """Monotonic-deadline sampling loop for bounded Linux descendant scans."""
+
+        next_due_ns = int(self._monotonic_ns()) + self._linux_tree_interval_ns
+        while not self._stop_event.is_set():
+            now_ns = int(self._monotonic_ns())
+            wait_ns = next_due_ns - now_ns
+            if wait_ns > 0:
+                if self._stop_event.wait(timeout=wait_ns / _NS_PER_SECOND):
+                    break
+                now_ns = int(self._monotonic_ns())
+                if now_ns < next_due_ns:
+                    continue
+            if self._stop_event.is_set():
+                break
+            lag_ns = now_ns - next_due_ns
+            if lag_ns >= self._linux_tree_interval_ns:
+                missed = lag_ns // self._linux_tree_interval_ns
+                with self._lock:
+                    self._missed_deadlines += int(missed)
+                next_due_ns = now_ns + self._linux_tree_interval_ns
+            else:
+                next_due_ns += self._linux_tree_interval_ns
+            self._sample_linux_tree()
+
+    def _sample_linux_tree(self) -> None:
+        """Capture one bounded Linux descendant-tree sample and enqueue nonblockingly."""
+
+        lt_cfg = self._callback.linux_tree
+        source_id = lt_cfg.source_id
+        read_start_ns = int(self._monotonic_ns())
+        init_error = self._linux_tree_init_error
+        if init_error is not None or self._linux_tree_probe is None:
+            issue = (
+                init_error
+                if init_error is not None
+                else LinuxMemoryUnavailable(
+                    reason=f"{source_id} probe unavailable",
+                    reason_code="probe_init_failed",
+                    status="error",
+                )
+            )
+            read_end_ns = max(int(self._monotonic_ns()), read_start_ns)
+            readings = {
+                qty_id: ObservabilityReading(
+                    status=issue.status,
+                    reason_code=issue.reason_code,
+                    detail=issue.reason,
+                )
+                for qty_id in lt_cfg.quantities
+            }
+            self._enqueue_reading_packet(
+                source_id=source_id,
+                subject=self._linux_tree_subject,
+                read_start_ns=read_start_ns,
+                read_end_ns=read_end_ns,
+                readings=readings,
+            )
+            return
+
+        try:
+            reading = self._linux_tree_probe.read()
+        except Exception as exc:
+            with self._lock:
+                self._attempted += 1
+                self._failed += 1
+                self._diagnostics.append(
+                    f"{source_id} read failed: {type(exc).__name__}: {exc}"
+                )
+            return
+        read_end_ns = max(int(self._monotonic_ns()), read_start_ns)
+
+        try:
+            readings = _linux_tree_reading_to_readings(reading, lt_cfg.quantities)
+        except Exception as exc:
+            with self._lock:
+                self._attempted += 1
+                self._failed += 1
+                self._diagnostics.append(
+                    f"{source_id} reading conversion error: {type(exc).__name__}: {exc}"
+                )
+            return
+
+        if isinstance(reading, LinuxProcessTreeReading):
+            if (
+                reading.status == "partial"
+                or not reading.membership_complete
+                or bool(reading.partial_reasons)
+            ):
+                with self._lock:
+                    self._source_partial_flags.add(source_id)
+            target_gen = reading.target_generation
+            if (
+                isinstance(target_gen, LinuxProcessGeneration)
+                and self._linux_tree_target_generation is None
+            ):
+                self._linux_tree_target_generation = target_gen
+            try:
+                subject = self._build_bounded_descendant_subject(
+                    reading,
+                    source_id=source_id,
+                    read_start_ns=read_start_ns,
+                    read_end_ns=read_end_ns,
+                    readings=readings,
+                )
+            except Exception as exc:
+                with self._lock:
+                    self._attempted += 1
+                    self._failed += 1
+                    self._diagnostics.append(
+                        f"{source_id} subject encoding error: {type(exc).__name__}: {exc}"
+                    )
+                return
+        else:
+            subject = self._linux_tree_subject
+
+        self._enqueue_reading_packet(
+            source_id=source_id,
+            subject=subject,
+            read_start_ns=read_start_ns,
+            read_end_ns=read_end_ns,
+            readings=readings,
+        )
+
+    def _linux_cgroup_loop(self) -> None:
+        """Monotonic-deadline sampling loop for read-only Linux cgroup v2."""
+
+        next_due_ns = int(self._monotonic_ns()) + self._linux_cgroup_interval_ns
+        while not self._stop_event.is_set():
+            now_ns = int(self._monotonic_ns())
+            wait_ns = next_due_ns - now_ns
+            if wait_ns > 0:
+                if self._stop_event.wait(timeout=wait_ns / _NS_PER_SECOND):
+                    break
+                now_ns = int(self._monotonic_ns())
+                if now_ns < next_due_ns:
+                    continue
+            if self._stop_event.is_set():
+                break
+            lag_ns = now_ns - next_due_ns
+            if lag_ns >= self._linux_cgroup_interval_ns:
+                missed = lag_ns // self._linux_cgroup_interval_ns
+                with self._lock:
+                    self._missed_deadlines += int(missed)
+                next_due_ns = now_ns + self._linux_cgroup_interval_ns
+            else:
+                next_due_ns += self._linux_cgroup_interval_ns
+            self._sample_linux_cgroup()
+
+    def _sample_linux_cgroup(self) -> None:
+        """Capture one read-only Linux cgroup v2 sample and enqueue nonblockingly."""
+
+        lc_cfg = self._callback.linux_cgroup
+        source_id = lc_cfg.source_id
+        read_start_ns = int(self._monotonic_ns())
+        init_error = self._linux_cgroup_init_error
+        if init_error is not None or self._linux_cgroup_probe is None:
+            issue = (
+                init_error
+                if init_error is not None
+                else LinuxMemoryUnavailable(
+                    reason=f"{source_id} probe unavailable",
+                    reason_code="probe_init_failed",
+                    status="error",
+                )
+            )
+            read_end_ns = max(int(self._monotonic_ns()), read_start_ns)
+            readings = {
+                qty_id: ObservabilityReading(
+                    status=issue.status,
+                    reason_code=issue.reason_code,
+                    detail=issue.reason,
+                )
+                for qty_id in lc_cfg.quantities
+            }
+            self._enqueue_reading_packet(
+                source_id=source_id,
+                subject=self._linux_cgroup_subject,
+                read_start_ns=read_start_ns,
+                read_end_ns=read_end_ns,
+                readings=readings,
+            )
+            return
+
+        try:
+            reading = self._linux_cgroup_probe.read()
+        except Exception as exc:
+            with self._lock:
+                self._attempted += 1
+                self._failed += 1
+                self._diagnostics.append(
+                    f"{source_id} read failed: {type(exc).__name__}: {exc}"
+                )
+            return
+        read_end_ns = max(int(self._monotonic_ns()), read_start_ns)
+
+        target_gen = getattr(reading, "target_generation", None)
+        cg_ident = getattr(reading, "cgroup_identity", None)
+        if isinstance(cg_ident, LinuxCgroupV2Identity):
+            subject = cg_ident.to_subject_dict(target_generation=target_gen)
+            self._linux_cgroup_subject = subject
+        else:
+            subject = dict(self._linux_cgroup_subject)
+            if isinstance(target_gen, LinuxProcessGeneration):
+                subject["target_generation"] = target_gen.to_dict()
+        if (
+            isinstance(target_gen, LinuxProcessGeneration)
+            and self._linux_cgroup_target_generation is None
+        ):
+            self._linux_cgroup_target_generation = target_gen
+
+        try:
+            readings = _linux_cgroup_reading_to_readings(reading, lc_cfg.quantities)
         except Exception as exc:
             with self._lock:
                 self._attempted += 1
@@ -2050,7 +3282,28 @@ class _ResourceSamplesSession:
             self._linux_memory_thread.join(timeout=remaining)
             linux_memory_stopped = not self._linux_memory_thread.is_alive()
 
-        producer_stopped = rusage_stopped and linux_memory_stopped
+        linux_tree_stopped = True
+        if self._linux_tree_thread is not None and self._linux_tree_thread_started:
+            remaining = max(
+                0.0, (producer_deadline_ns - time.monotonic_ns()) / _NS_PER_SECOND
+            )
+            self._linux_tree_thread.join(timeout=remaining)
+            linux_tree_stopped = not self._linux_tree_thread.is_alive()
+
+        linux_cgroup_stopped = True
+        if self._linux_cgroup_thread is not None and self._linux_cgroup_thread_started:
+            remaining = max(
+                0.0, (producer_deadline_ns - time.monotonic_ns()) / _NS_PER_SECOND
+            )
+            self._linux_cgroup_thread.join(timeout=remaining)
+            linux_cgroup_stopped = not self._linux_cgroup_thread.is_alive()
+
+        producer_stopped = (
+            rusage_stopped
+            and linux_memory_stopped
+            and linux_tree_stopped
+            and linux_cgroup_stopped
+        )
 
         # 2. Stop and join the drain thread within the SAME remaining deadline
         # before taking final captures so earlier queued samples never compete
@@ -2087,6 +3340,28 @@ class _ResourceSamplesSession:
                 ):
                     self._sample_linux_memory()
                     self._drain_pending_until(deadline_ns)
+            if linux_tree_stopped and time.monotonic_ns() < deadline_ns:
+                if (
+                    self._callback.linux_tree.enabled
+                    and (
+                        self._linux_tree_probe is not None
+                        or self._linux_tree_init_error is not None
+                    )
+                    and self._writer is not None
+                ):
+                    self._sample_linux_tree()
+                    self._drain_pending_until(deadline_ns)
+            if linux_cgroup_stopped and time.monotonic_ns() < deadline_ns:
+                if (
+                    self._callback.linux_cgroup.enabled
+                    and (
+                        self._linux_cgroup_probe is not None
+                        or self._linux_cgroup_init_error is not None
+                    )
+                    and self._writer is not None
+                ):
+                    self._sample_linux_cgroup()
+                    self._drain_pending_until(deadline_ns)
             if time.monotonic_ns() < deadline_ns:
                 if (
                     self._callback.allocator.enabled
@@ -2109,6 +3384,14 @@ class _ResourceSamplesSession:
                 if not linux_memory_stopped:
                     self._diagnostics.append(
                         "linux-memory sampling thread failed to stop within close_timeout_seconds"
+                    )
+                if not linux_tree_stopped:
+                    self._diagnostics.append(
+                        "linux-process-tree sampling thread failed to stop within close_timeout_seconds"
+                    )
+                if not linux_cgroup_stopped:
+                    self._diagnostics.append(
+                        "linux-cgroup-v2 sampling thread failed to stop within close_timeout_seconds"
                     )
                 if not drain_stopped:
                     self._diagnostics.append(
@@ -2166,40 +3449,25 @@ class _ResourceSamplesSession:
                 diagnostics = tuple(self._diagnostics)
                 source_ok_counts = dict(self._source_ok_counts)
                 source_non_ok_counts = dict(self._source_non_ok_counts)
+                source_partial_flags = set(self._source_partial_flags)
                 writer_had_error = self._writer_had_error
 
             source_status: dict[str, str] = {}
-            if self._callback.rusage.enabled:
-                sid = self._callback.rusage.source_id
+            for enabled_flag, sid in (
+                (self._callback.rusage.enabled, self._callback.rusage.source_id),
+                (self._callback.linux_memory.enabled, self._callback.linux_memory.source_id),
+                (self._callback.linux_tree.enabled, self._callback.linux_tree.source_id),
+                (self._callback.linux_cgroup.enabled, self._callback.linux_cgroup.source_id),
+                (self._callback.allocator.enabled, self._callback.allocator.source_id),
+            ):
+                if not enabled_flag:
+                    continue
                 ok_c = source_ok_counts.get(sid, 0)
                 non_ok_c = source_non_ok_counts.get(sid, 0)
-                if ok_c > 0 and non_ok_c == 0:
+                is_partial = sid in source_partial_flags
+                if ok_c > 0 and non_ok_c == 0 and not is_partial:
                     source_status[sid] = "available"
-                elif ok_c > 0 and non_ok_c > 0:
-                    source_status[sid] = "partial"
-                elif non_ok_c > 0:
-                    source_status[sid] = "unavailable"
-                else:
-                    source_status[sid] = "unavailable"
-
-            if self._callback.linux_memory.enabled:
-                sid = self._callback.linux_memory.source_id
-                ok_c = source_ok_counts.get(sid, 0)
-                non_ok_c = source_non_ok_counts.get(sid, 0)
-                if ok_c > 0 and non_ok_c == 0:
-                    source_status[sid] = "available"
-                elif ok_c > 0 and non_ok_c > 0:
-                    source_status[sid] = "partial"
-                else:
-                    source_status[sid] = "unavailable"
-
-            if self._callback.allocator.enabled:
-                sid = self._callback.allocator.source_id
-                ok_c = source_ok_counts.get(sid, 0)
-                non_ok_c = source_non_ok_counts.get(sid, 0)
-                if ok_c > 0 and non_ok_c == 0:
-                    source_status[sid] = "available"
-                elif ok_c > 0 and non_ok_c > 0:
+                elif ok_c > 0 and (non_ok_c > 0 or is_partial):
                     source_status[sid] = "partial"
                 else:
                     source_status[sid] = "unavailable"
@@ -2252,7 +3520,10 @@ class _ResourceSamplesSession:
                 invocation_outcome = "completed"
 
             any_producer_started = (
-                self._rusage_thread_started or self._linux_memory_thread_started
+                self._rusage_thread_started
+                or self._linux_memory_thread_started
+                or self._linux_tree_thread_started
+                or self._linux_cgroup_thread_started
             )
             if not any_producer_started:
                 helper_state = "not_started"
@@ -2433,6 +3704,48 @@ def _coerce_linux_memory_source(
     )
 
 
+def _coerce_linux_tree_source(
+    raw: LinuxProcessTreeSource | Mapping[str, Any] | None,
+) -> LinuxProcessTreeSource | None:
+    if raw is None:
+        return None
+    if type(raw) is LinuxProcessTreeSource:
+        return raw
+    if isinstance(raw, LinuxProcessTreeSource):
+        raise TypeError(
+            f"linux_tree must be exact LinuxProcessTreeSource, mapping, or None; "
+            f"got subclass {type(raw).__name__}"
+        )
+    if isinstance(raw, Mapping):
+        _reject_forbidden_selector_keys(raw, owner="LinuxProcessTreeSource")
+        return LinuxProcessTreeSource(**dict(raw))
+    raise TypeError(
+        f"linux_tree must be LinuxProcessTreeSource, mapping, or None; "
+        f"got {type(raw).__name__}"
+    )
+
+
+def _coerce_linux_cgroup_source(
+    raw: LinuxCgroupV2Source | Mapping[str, Any] | None,
+) -> LinuxCgroupV2Source | None:
+    if raw is None:
+        return None
+    if type(raw) is LinuxCgroupV2Source:
+        return raw
+    if isinstance(raw, LinuxCgroupV2Source):
+        raise TypeError(
+            f"linux_cgroup must be exact LinuxCgroupV2Source, mapping, or None; "
+            f"got subclass {type(raw).__name__}"
+        )
+    if isinstance(raw, Mapping):
+        _reject_forbidden_selector_keys(raw, owner="LinuxCgroupV2Source")
+        return LinuxCgroupV2Source(**dict(raw))
+    raise TypeError(
+        f"linux_cgroup must be LinuxCgroupV2Source, mapping, or None; "
+        f"got {type(raw).__name__}"
+    )
+
+
 def _coerce_sink(raw: RunArtifactSink | Mapping[str, Any] | None) -> RunArtifactSink:
     if raw is None:
         return RunArtifactSink()
@@ -2483,6 +3796,12 @@ class ResourceSamples(Callback):
     linux_memory : LinuxMemorySource or mapping or None, optional
         Linux self-process current-memory procfs source configuration. Defaults
         to disabled when omitted.
+    linux_tree : LinuxProcessTreeSource or mapping or None, optional
+        Bounded Linux procfs descendant-tree source configuration. Defaults to
+        disabled when omitted.
+    linux_cgroup : LinuxCgroupV2Source or mapping or None, optional
+        Read-only Linux cgroup v2 source configuration. Defaults to disabled
+        when omitted.
     sink : RunArtifactSink or mapping or None, optional
         Pure destination and byte/text budget configuration routed through
         :class:`tpen.artifacts.ArtifactManager`.
@@ -2501,6 +3820,8 @@ class ResourceSamples(Callback):
         rusage: RUsageSource | Mapping[str, Any] | None = None,
         allocator: AllocatorSource | Mapping[str, Any] | None = None,
         linux_memory: LinuxMemorySource | Mapping[str, Any] | None = None,
+        linux_tree: LinuxProcessTreeSource | Mapping[str, Any] | None = None,
+        linux_cgroup: LinuxCgroupV2Source | Mapping[str, Any] | None = None,
         sink: RunArtifactSink | Mapping[str, Any] | None = None,
         monotonic_ns: Callable[[], int] | None = None,
         **kwargs: Any,
@@ -2529,14 +3850,20 @@ class ResourceSamples(Callback):
         coerced_rusage = _coerce_rusage_source(rusage)
         coerced_allocator = _coerce_allocator_source(allocator)
         coerced_linux_memory = _coerce_linux_memory_source(linux_memory)
+        coerced_linux_tree = _coerce_linux_tree_source(linux_tree)
+        coerced_linux_cgroup = _coerce_linux_cgroup_source(linux_cgroup)
         if (
             coerced_rusage is None
             and coerced_allocator is None
             and coerced_linux_memory is None
+            and coerced_linux_tree is None
+            and coerced_linux_cgroup is None
         ):
             coerced_rusage = RUsageSource(enabled=True)
             coerced_allocator = AllocatorSource(enabled=False, reset_peaks=False)
             coerced_linux_memory = LinuxMemorySource(enabled=False)
+            coerced_linux_tree = LinuxProcessTreeSource(enabled=False)
+            coerced_linux_cgroup = LinuxCgroupV2Source(enabled=False)
         else:
             if coerced_rusage is None:
                 coerced_rusage = RUsageSource(enabled=False)
@@ -2544,10 +3871,16 @@ class ResourceSamples(Callback):
                 coerced_allocator = AllocatorSource(enabled=False, reset_peaks=False)
             if coerced_linux_memory is None:
                 coerced_linux_memory = LinuxMemorySource(enabled=False)
+            if coerced_linux_tree is None:
+                coerced_linux_tree = LinuxProcessTreeSource(enabled=False)
+            if coerced_linux_cgroup is None:
+                coerced_linux_cgroup = LinuxCgroupV2Source(enabled=False)
 
         self.rusage = coerced_rusage
         self.allocator = coerced_allocator
         self.linux_memory = coerced_linux_memory
+        self.linux_tree = coerced_linux_tree
+        self.linux_cgroup = coerced_linux_cgroup
         self.sink = _coerce_sink(sink)
 
         enabled_sources: list[tuple[str, str]] = []
@@ -2557,11 +3890,16 @@ class ResourceSamples(Callback):
             enabled_sources.append(("allocator", self.allocator.source_id))
         if self.linux_memory.enabled:
             enabled_sources.append(("linux_memory", self.linux_memory.source_id))
+        if self.linux_tree.enabled:
+            enabled_sources.append(("linux_tree", self.linux_tree.source_id))
+        if self.linux_cgroup.enabled:
+            enabled_sources.append(("linux_cgroup", self.linux_cgroup.source_id))
 
         if self.enabled and not enabled_sources:
             raise ValueError(
                 "ResourceSamples requires at least one enabled source "
-                "(rusage, allocator, or linux_memory) when enabled=True"
+                "(rusage, allocator, linux_memory, linux_tree, or linux_cgroup) "
+                "when enabled=True"
             )
         seen_source_ids: dict[str, str] = {}
         for source_name, source_id in enabled_sources:
@@ -2791,16 +4129,26 @@ __all__ = [
     "ALLOCATOR_EXECUTION_MODE",
     "ALLOCATOR_PEAK_QUANTITY_IDS",
     "ALLOCATOR_SOURCE_ID",
+    "DEFAULT_LINUX_CGROUP_V2_QUANTITIES",
     "DEFAULT_LINUX_MEMORY_QUANTITIES",
+    "DEFAULT_LINUX_PROCESS_TREE_QUANTITIES",
     "DEFAULT_RUSAGE_QUANTITIES",
+    "LINUX_CGROUP_V2_EXECUTION_MODE",
+    "LINUX_CGROUP_V2_QUANTITY_IDS",
+    "LINUX_CGROUP_V2_SOURCE_ID",
     "LINUX_MEMORY_EXECUTION_MODE",
     "LINUX_MEMORY_QUANTITY_IDS",
     "LINUX_MEMORY_SOURCE_ID",
+    "LINUX_PROCESS_TREE_EXECUTION_MODE",
+    "LINUX_PROCESS_TREE_QUANTITY_IDS",
+    "LINUX_PROCESS_TREE_SOURCE_ID",
     "RUSAGE_EXECUTION_MODE",
     "RUSAGE_QUANTITY_IDS",
     "RUSAGE_SOURCE_ID",
     "AllocatorSource",
+    "LinuxCgroupV2Source",
     "LinuxMemorySource",
+    "LinuxProcessTreeSource",
     "RUsageSource",
     "ResourceSamples",
 ]
