@@ -99,7 +99,10 @@ class ConfiguredRunTable:
     runs: tuple[ConfiguredRun, ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
+        if len(self.group_digest) == 64 and all(char in "0123456789abcdef" for char in self.group_digest):
+            sha256_text(self.group_digest, "group_digest")
+        else:
+            object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
         if isinstance(self.runs, (str, bytes, bytearray)) or not isinstance(self.runs, Sequence):
             raise TypeError("runs must be a sequence")
         runs = tuple(self.runs)

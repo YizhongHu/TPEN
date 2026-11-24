@@ -1,4 +1,9 @@
-"""Hydra-free configured leaf-program records."""
+"""Hydra-free configured leaf-program records.
+
+C2.1 configured programs are supported only from a TPEN source checkout or
+editable checkout.  Installed-package launches are intentionally fail-closed
+until a separate trusted-checkout binding is available.
+"""
 
 from __future__ import annotations
 
@@ -61,8 +66,6 @@ class ConfiguredProgram:
         if not stat.S_ISREG(os.stat(script_path, follow_symlinks=False).st_mode):
             raise ValueError("configured program script_path must be a regular file")
         manifest = _absolute_path(self.manifest, "manifest")
-        if Path(manifest).name != "o1_scan_manifest_v1.json":
-            raise ValueError("manifest is not the Stage-Q scan manifest")
         try:
             manifest_stat = os.stat(manifest, follow_symlinks=False)
         except OSError as error:
@@ -120,7 +123,8 @@ class ConfiguredProgram:
         """Decode a strict configured-program mapping."""
 
         expected = {"schema", "entrypoint", "script_path", "manifest", "row", "output_root", "output_contract"}
-        if set(data) not in {expected, expected | {"manifest_sha256"}} or data.get("schema") != cls.schema:
+        keys = set(data)
+        if (keys != expected and keys != expected | {"manifest_sha256"}) or data.get("schema") != cls.schema:
             raise ValueError("ConfiguredProgram keys or schema differ")
         return cls(
             data["entrypoint"], data["script_path"], data["manifest"],

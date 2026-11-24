@@ -63,6 +63,14 @@ from ..tasks import ConfiguredRun
 _ACTIVE_DISPATCH: ContextVar[bool] = ContextVar("tpen_executor_dispatch", default=False)
 
 
+class LeafRefused(RuntimeError):
+    """Raised when a leaf refuses to launch science for a request."""
+
+
+class ConfiguredProgramRouteRefused(LeafRefused):
+    """Configured leaf entries await faithful C2.2 dispatcher binding."""
+
+
 def _lexical(path: str | os.PathLike[str]) -> str:
     """Return an absolute normalized path without resolving symlinks."""
 
@@ -1444,6 +1452,10 @@ class DispatcherContract:
                 raise TypeError("runs values must be ConfiguredRun records")
             if configured.id != task_id:
                 raise ValueError("ConfiguredRun.id must match its mapping task ID")
+            if configured.program is not None:
+                raise ConfiguredProgramRouteRefused(
+                    "configured program not supported on this route until C2.2"
+                )
 
 
-__all__ = ["DispatcherContract"]
+__all__ = ["ConfiguredProgramRouteRefused", "DispatcherContract", "LeafRefused"]

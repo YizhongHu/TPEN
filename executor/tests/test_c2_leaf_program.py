@@ -10,10 +10,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from tpen_executor.dispatch.transport import ConfiguredProgramRouteRefused, LeafRequest
+from tpen_executor._codec import digest
+from tpen_executor.contracts import ProgramSpecRef, ReadyGroup, TaskSpec
+from tpen_executor.dispatch import LocalDispatcher
+from tpen_executor.dispatch.contract import ConfiguredProgramRouteRefused
+from tpen_executor.dispatch.parsl import ParslDispatcher
+from tpen_executor.dispatch.transport import LeafRequest
 from tpen_executor.programs import ConfiguredProgram
 from tpen_executor.runners import CONFIGURED_RUN_SHIM, ConfiguredProgramCommand, RUN_SHIM, TPENCommand
-from tpen_executor.tasks import ConfiguredRun
+from tpen_executor.tasks import ConfiguredRun, ConfiguredRunTable
 
 
 ROOT = Path(__file__).parents[2]
@@ -87,6 +92,50 @@ def test_real_program_and_run_variants_have_distinct_digests(tmp_path: Path) -> 
     assert legacy_a.program_digest != legacy_b.program_digest
 
 
+def test_manifest_content_change_at_one_path_changes_program_and_run_digests(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(b'{"row":0}\n')
+    first = _program(manifest=str(manifest))
+    manifest.write_bytes(b'{ "row": 0 }\n')
+    second = _program(manifest=str(manifest))
+    assert first.manifest == second.manifest
+    assert first.program_digest != second.program_digest
+    first_run = ConfiguredRun("configured", "", (), first)
+    second_run = ConfiguredRun("configured", "", (), second)
+    assert first_run.program_digest != second_run.program_digest
+
+
+def test_public_configured_decoders_round_trip_and_refuse_bad_payloads(tmp_path: Path) -> None:
+    program = _program()
+    decoded = ConfiguredProgram.from_mapping(program.to_dict())
+    assert decoded.to_dict() == program.to_dict()
+    assert decoded.program_digest == program.program_digest
+    legacy_payload = program.to_dict()
+    legacy_payload.pop("manifest_sha256")
+    assert ConfiguredProgram.from_mapping(legacy_payload).program_digest == program.program_digest
+
+    table = ConfiguredRunTable("group", (ConfiguredRun("configured", "", (), program),))
+    table_decoded = ConfiguredRunTable.from_mapping(table.to_dict())
+    assert table_decoded.to_dict() == table.to_dict()
+    assert table_decoded.runs[0].program_digest == program.program_digest
+
+    malformed = program.to_dict()
+    malformed.pop("script_path")
+    with pytest.raises(ValueError, match="keys"):
+        ConfiguredProgram.from_mapping(malformed)
+    foreign = tmp_path / "foreign" / "experiments" / "atomistic" / "he-importance" / "run_stage_q.py"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("raise SystemExit(0)\n", encoding="utf-8")
+    link = tmp_path / "link" / "experiments" / "atomistic" / "he-importance" / "run_stage_q.py"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(foreign)
+    for candidate in (foreign, link):
+        payload = program.to_dict()
+        payload["script_path"] = str(candidate)
+        with pytest.raises(ValueError, match="trusted"):
+            ConfiguredProgram.from_mapping(payload)
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -128,15 +177,17 @@ def test_foreign_same_suffix_and_symlink_are_rejected_on_construction_and_decode
             _program(script_path=str(candidate))
         payload = _program().to_dict()
         payload["script_path"] = str(candidate)
-        decoded_fields = {
-            field: payload[field]
-            for field in (
-                "entrypoint", "script_path", "manifest", "row", "output_root",
-                "output_contract", "manifest_sha256",
-            )
-        }
         with pytest.raises(ValueError, match="trusted"):
-            ConfiguredProgram(**decoded_fields)
+            ConfiguredProgram.from_mapping(payload)
+
+
+def test_non_v1_manifest_name_is_accepted_and_content_bound(tmp_path: Path) -> None:
+    manifest = tmp_path / "o1_scan_manifest_v2.json"
+    content = b'{"schema":"stage-q-v2","rows":[]}\n'
+    manifest.write_bytes(content)
+    program = _program(manifest=str(manifest))
+    assert program.manifest == str(manifest)
+    assert program.manifest_sha256 == hashlib.sha256(content).hexdigest()
 
 
 def test_manifest_must_exist_be_regular_and_match_bound_sha256(tmp_path: Path) -> None:
@@ -164,6 +215,30 @@ def test_leaf_request_refuses_configured_program_route_before_submission() -> No
     configured = ConfiguredRun("configured", "", (), _program())
     with pytest.raises(ConfiguredProgramRouteRefused, match="until C2.2"):
         LeafRequest.for_attempt(fence, allocation, configured, None)  # type: ignore[arg-type]
+
+
+def test_legacy_dispatch_unchanged_and_configured_dispatch_refuses_before_spawn(tmp_path: Path) -> None:
+    config = str(tmp_path / "config.yaml")
+    legacy = ConfiguredRun("legacy", config, ("run.seed=7",))
+    assert legacy.command().args == TPENCommand(config, ("run.seed=7",)).args
+    program = _program()
+    configured = ConfiguredRun("configured", "", (), program)
+    spec = ProgramSpecRef({}, digest({}))
+    group = ReadyGroup("group", (TaskSpec("configured", "configured", spec, digest("configured"), 1, "steps"),), digest({"plan": 1}))
+    calls: list[str] = []
+    worker = SimpleNamespace(materialize=lambda _env: calls.append("materialize"))
+    lifecycle = SimpleNamespace(
+        begin=lambda *args, **kwargs: calls.append("begin"),
+        finish=lambda *args, **kwargs: calls.append("finish"),
+        store=SimpleNamespace(root=str(tmp_path / "store"), manifest=lambda *args: None),
+    )
+    with pytest.raises(ConfiguredProgramRouteRefused, match="until C2.2"):
+        LocalDispatcher(worker).run(group, {"configured": configured}, lifecycle)
+    assert calls == []
+    # Parsl's in-process route uses the same admission gate before DFK/app setup.
+    with pytest.raises(ConfiguredProgramRouteRefused, match="until C2.2"):
+        ParslDispatcher._validate_inputs(group, {"configured": configured}, lifecycle, None, None)
+    assert calls == []
 
 
 def test_configured_shim_refuses_mismatched_attempt_output(tmp_path: Path) -> None:
@@ -197,11 +272,25 @@ MUTANTS = (
         "killer": "test_foreign_same_suffix_and_symlink_are_rejected_on_construction_and_decode",
     },
     {
-        "id": "digest-drops-field",
+        "id": "manifest-hash-mismatch-guard",
         "target": "executor/src/tpen_executor/configured_program.py",
         "old": "if self.manifest_sha256 and self.manifest_sha256 != computed_manifest_sha256:",
         "new": "if False:",
         "killer": "test_manifest_must_exist_be_regular_and_match_bound_sha256",
+    },
+    {
+        "id": "decoder-set-of-sets",
+        "target": "executor/src/tpen_executor/configured_program.py",
+        "old": "if (keys != expected and keys != expected | {\"manifest_sha256\"}) or data.get(\"schema\") != cls.schema:",
+        "new": "if set(data) not in {expected, expected | {\"manifest_sha256\"}} or data.get(\"schema\") != cls.schema:",
+        "killer": "test_public_configured_decoders_round_trip_and_refuse_bad_payloads",
+    },
+    {
+        "id": "digest-drops-manifest-hash",
+        "target": "executor/src/tpen_executor/configured_program.py",
+        "old": "            \"manifest_sha256\": self.manifest_sha256,\n",
+        "new": "",
+        "killer": "test_manifest_content_change_at_one_path_changes_program_and_run_digests",
     },
     {
         "id": "legacy-argv-drift",
@@ -223,6 +312,13 @@ MUTANTS = (
         "old": "    \"    if any(path != declared_output for path in attempt_outputs) or any(arg.startswith('run.layout=') or arg.startswith('run.run_id=') for arg in script_args):\\n\"\n",
         "new": "    \"    if False:\\n\"\n",
         "killer": "test_configured_shim_refuses_mismatched_attempt_output",
+    },
+    {
+        "id": "direct-dispatch-admits-configured",
+        "target": "executor/src/tpen_executor/dispatch/contract.py",
+        "old": "            if configured.program is not None:\n                raise ConfiguredProgramRouteRefused(\n                    \"configured program not supported on this route until C2.2\"\n                )\n",
+        "new": "            if False:\n                raise ConfiguredProgramRouteRefused(\n                    \"configured program not supported on this route until C2.2\"\n                )\n",
+        "killer": "test_legacy_dispatch_unchanged_and_configured_dispatch_refuses_before_spawn",
     },
 )
 

@@ -58,6 +58,8 @@ from ..placement import PLACEMENT_REFUSAL_ENV, PlacementRefusal, parse_cpu_set
 from ..runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
 from ..workers import SubprocessWorker
 from .contract import (
+    ConfiguredProgramRouteRefused,
+    LeafRefused,
     _admit_slot,
     _child_precore_refusal,
     _evidence_payload,
@@ -105,14 +107,6 @@ INSPECTION_STATES = frozenset({"not-run", "evidence", "unavailable", "error"})
 WORKER_AFFINITY_REFUSAL_CODES = frozenset(
     {"placement-cpu-outside-worker-affinity", "placement-worker-affinity-unavailable"}
 )
-
-
-class LeafRefused(RuntimeError):
-    """Raised inside a leaf that refuses to launch science for a request."""
-
-
-class ConfiguredProgramRouteRefused(LeafRefused):
-    """Configured leaf entries await faithful C2.2 request binding."""
 
 
 class LeafPlacementRefused(LeafRefused):
