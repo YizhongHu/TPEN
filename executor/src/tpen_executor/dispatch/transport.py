@@ -55,8 +55,8 @@ from ..configured_program import AttemptDelta, ConfiguredProgram
 from .._records import frozen_record
 from ..environments import PreparedPythonEnvironment, SourceScript
 from ..gpu_sampler import GPU_SAMPLER_OUTPUT_ENV, SLOT_QUARANTINE_ENV, slot_quarantine_dir
-from ..placement import PLACEMENT_REFUSAL_ENV, PlacementRefusal, parse_cpu_set
-from ..runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
+from ..placement import PLACEMENT_OUTPUT_ENV, PLACEMENT_REFUSAL_ENV, PlacementRefusal, parse_cpu_set
+from ..runners import CoreRunEvidence, EvidenceUnavailable, TPENEvidence
 from ..tasks import ConfiguredRun
 from ..workers import SubprocessWorker
 from .contract import (
@@ -538,6 +538,26 @@ class LeafRequest:
             )
             config = ""
             overrides = ()
+            values = dict(environment.env)
+            values.update({
+                PLACEMENT_OUTPUT_ENV: os.path.join(fence.output_dir, "child-placement.json"),
+                "TPEN_PLACEMENT_OUTPUT_DIR": fence.output_dir,
+                "TPEN_PLACEMENT_TASK_ID": fence.task_id,
+                "TPEN_PLACEMENT_ATTEMPT_ID": fence.attempt_id.value,
+                "TPEN_PLACEMENT_GROUP_DIGEST": fence.group_digest,
+                "TPEN_PLACEMENT_ALLOCATION_ID": allocation.allocation_id.value,
+                "TPEN_PLACEMENT_BACKEND_JOB_ID": allocation.backend_job_id.value,
+                "TPEN_SLOT_ID": environment.env.get("TPEN_SLOT_ID", ""),
+                "TPEN_PLACEMENT_SLOT_ID": environment.env.get("TPEN_SLOT_ID", ""),
+                "TPEN_PLACEMENT_PAYLOAD_DIGEST": configured.attempt_binding_digest(
+                    fence.output_dir,
+                    root=fence.root,
+                    group_digest=fence.group_digest,
+                    task_id=fence.task_id,
+                    attempt_id=fence.attempt_id.value,
+                ),
+            })
+            environment = PreparedPythonEnvironment(environment.python, environment.setup, values)
         return cls(
             fence.group_digest,
             fence.task_id,
@@ -585,15 +605,14 @@ class LeafRequest:
         """
 
         output_dir = self.paths()[0]
-        if self.program is not None:
-            return ConfiguredRun(self.task_id, "", (), self.program).command_for_attempt(
-                output_dir,
-                root=self.root,
-                group_digest=self.group_digest,
-                task_id=self.task_id,
-                attempt_id=self.attempt_id,
-            ).args
-        return (*TPENCommand(self.config, self.overrides).args, f"run.root={output_dir}", "run.layout=flat", "run.run_id=core")
+        configured = ConfiguredRun(self.task_id, self.config, self.overrides, self.program)
+        return configured.command_for_attempt(
+            output_dir,
+            root=self.root if self.program is not None else None,
+            group_digest=self.group_digest if self.program is not None else None,
+            task_id=self.task_id if self.program is not None else None,
+            attempt_id=self.attempt_id if self.program is not None else None,
+        ).args
 
     def to_dict(self) -> dict[str, Any]:
         """Return the strict wire representation."""

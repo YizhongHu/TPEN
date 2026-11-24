@@ -280,6 +280,27 @@ def _with_child_placement(
             if not strict_host:
                 # Legacy/no-slot requests also carry only controller policy.
                 values.pop(ROUTED_STRICT_HOST_ENV, None)
+                if configured.program is not None:
+                    # Configured children still need the fence-derived leaf
+                    # for the placement prelude, even without declared CPUs.
+                    values.update({
+                        PLACEMENT_OUTPUT_ENV: os.path.join(fence.output_dir, "child-placement.json"),
+                        "TPEN_PLACEMENT_OUTPUT_DIR": fence.output_dir,
+                        "TPEN_PLACEMENT_TASK_ID": member.task_id,
+                        "TPEN_PLACEMENT_ATTEMPT_ID": fence.attempt_id.value,
+                        "TPEN_PLACEMENT_GROUP_DIGEST": group.identity,
+                        "TPEN_PLACEMENT_ALLOCATION_ID": allocation.allocation_id.value,
+                        "TPEN_PLACEMENT_BACKEND_JOB_ID": allocation.backend_job_id.value,
+                        "TPEN_SLOT_ID": "",
+                        "TPEN_PLACEMENT_SLOT_ID": "",
+                        "TPEN_PLACEMENT_PAYLOAD_DIGEST": configured.attempt_binding_digest(
+                            fence.output_dir,
+                            root=fence.root,
+                            group_digest=group.identity,
+                            task_id=member.task_id,
+                            attempt_id=fence.attempt_id.value,
+                        ),
+                    })
                 environment = PreparedPythonEnvironment(environment.python, environment.setup, values)
             return _without_gpu_sampler(environment)
         slot = slots[0]
