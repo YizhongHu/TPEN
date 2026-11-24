@@ -594,7 +594,11 @@ def test_qr_refresh_rank_deficient_stability_and_nullspace_preservation() -> Non
     q_new1, sort_idx1 = _qr_refresh_basis(sym_rank1, q_old)
     assert int(sort_idx1[0].item()) == 0
     assert torch.allclose(q_new1.T @ q_new1, eye5, atol=1e-13, rtol=1e-13)
-    assert torch.allclose(q_new1, q_old.index_select(1, sort_idx1), atol=1e-12, rtol=1e-12)
+    assert torch.allclose(q_new1[:, 0], q_old[:, 0], atol=1e-12, rtol=1e-12)
+    # Shift c = max_eig * sqrt(eps_f64) gives kappa(M) = 1 / sqrt(eps_f64) ~= 6.7e7;
+    # O(max_eig * eps_f64) ULP roundoff in sym @ q_sorted yields O(sqrt(eps_f64))
+    # ~= 1.5e-8 backward error in nullspace columns (vs O(1) drift without shift).
+    assert torch.allclose(q_new1, q_old.index_select(1, sort_idx1), atol=1e-6, rtol=1e-6)
 
     noise = torch.randn(5, 5, generator=gen, dtype=torch.float64)
     sym_noise = 0.5 * (noise + noise.T)
@@ -602,23 +606,27 @@ def test_qr_refresh_rank_deficient_stability_and_nullspace_preservation() -> Non
     q_pert1, sort_idx_pert1 = _qr_refresh_basis(sym_rank1_pert, q_old)
     assert int(sort_idx_pert1[0].item()) == 0
     assert torch.allclose(q_pert1.T @ q_pert1, eye5, atol=1e-13, rtol=1e-13)
+    assert torch.allclose(q_pert1[:, 0], q_old[:, 0], atol=1e-12, rtol=1e-12)
     assert torch.allclose(
         q_pert1, q_old.index_select(1, sort_idx_pert1), atol=1e-6, rtol=1e-6
     )
 
     # 2. Rank-2 matrix in 5D (3D nullspace) with distinct Rayleigh quotients:
-    #    1e-15 symmetric noise produces O(1e-15 / shift) ~ 1e-8 drift instead
-    #    of O(1) arbitrary nullspace rotation.
+    #    min gap ~ 0.034 >> 1e-15 preserves sort order, and 1e-15 symmetric
+    #    noise produces O(1e-15 / shift) ~ 1.5e-7 drift instead of O(1) arbitrary
+    #    nullspace rotation (atol=1e-5 gives ~60x margin).
     coeffs = torch.tensor([0.2, 0.7, 0.5, 0.4, 0.3], dtype=torch.float64)
     u2 = q_old @ (coeffs / coeffs.norm())
     sym_rank2 = 2.0 * torch.outer(q_old[:, 0], q_old[:, 0]) + 0.5 * torch.outer(u2, u2)
     sym_rank2 = 0.5 * (sym_rank2 + sym_rank2.T)
+    est_r2 = (q_old * (sym_rank2 @ q_old)).sum(dim=0)
+    assert float((est_r2[:-1] - est_r2[1:]).min().item()) > 0.03
     q_r2, sort_r2 = _qr_refresh_basis(sym_rank2, q_old)
     q_r2_pert, sort_r2_pert = _qr_refresh_basis(sym_rank2 + 1e-15 * sym_noise, q_old)
     assert torch.equal(sort_r2, sort_r2_pert)
     assert torch.allclose(q_r2.T @ q_r2, eye5, atol=1e-13, rtol=1e-13)
     assert torch.allclose(q_r2_pert.T @ q_r2_pert, eye5, atol=1e-13, rtol=1e-13)
-    assert torch.allclose(q_r2, q_r2_pert, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(q_r2, q_r2_pert, atol=1e-5, rtol=1e-5)
 
     # 3. Float32 small-gradient scale invariance: max_eig=1e-8 must NOT be swamped
     #    by float32 eps (~1.19e-7), so active subspace tracking and scale invariance
