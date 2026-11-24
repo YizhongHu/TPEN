@@ -1,12 +1,17 @@
-"""Opt-in managed callback for single-process RUSAGE and Torch allocator samples.
+"""Opt-in managed callback for single-process RUSAGE, Linux memory, and Torch allocator samples.
 
-This module implements the O3 foundation of TPEN's ``tpen.run-observability/v1``
-resource observability contract:
+This module implements TPEN's ``tpen.run-observability/v1`` single-process
+resource observability sources:
 
 * :class:`RUsageSource` — self-process ``RUSAGE_SELF`` readings adapted from
   :class:`tpen.process_resources.ProcessRUsageProbe`, running strictly
   in-process on a bounded TPEN-owned sampling thread (never relocated to a
   helper subprocess or targeted at a foreign PID).
+* :class:`LinuxMemorySource` — self-process Linux ``/proc/<pid>/status``
+  current-memory gauges (``VmRSS``, ``VmSize``, ``Threads``) adapted from
+  :class:`tpen.process_resources.LinuxProcessMemoryProbe` with exact target
+  generation / PID-reuse defense and bounded input/time limits, running
+  in-process on a bounded TPEN-owned sampling thread.
 * :class:`AllocatorSource` — configured-device PyTorch allocator current and
   peak readings (:class:`tpen.accelerator.TorchAllocatorCurrentProbe` and
   :class:`tpen.accelerator.TorchAllocatorPeakProbe`), deferred strictly until
@@ -33,6 +38,7 @@ import hashlib
 import json
 import math
 import os
+from pathlib import Path
 import platform
 import re
 import socket
@@ -71,6 +77,12 @@ from tpen.observability_artifacts import (
     validate_identifier,
 )
 from tpen.process_resources import (
+    DEFAULT_LINUX_MEMORY_MAX_READ_BYTES,
+    DEFAULT_LINUX_MEMORY_MAX_READ_SECONDS,
+    LinuxMemoryUnavailable,
+    LinuxProcessGeneration,
+    LinuxProcessMemoryProbe,
+    LinuxProcessMemoryReading,
     ProcessRUsageProbe,
     ProcessResourceBaseline,
     ResourceUnavailable,
@@ -86,9 +98,11 @@ _NS_PER_SECOND = 1_000_000_000
 
 RUSAGE_SOURCE_ID = "self-rusage"
 ALLOCATOR_SOURCE_ID = "torch-allocator"
+LINUX_MEMORY_SOURCE_ID = "linux-memory"
 
 RUSAGE_EXECUTION_MODE = "in_process_thread"
 ALLOCATOR_EXECUTION_MODE = "in_process_cooperative"
+LINUX_MEMORY_EXECUTION_MODE = "in_process_thread"
 
 RUSAGE_QUANTITY_IDS: tuple[str, ...] = (
     "process.rusage.user_cpu_seconds",
@@ -100,6 +114,13 @@ RUSAGE_QUANTITY_IDS: tuple[str, ...] = (
     "process.rusage.max_rss_bytes",
 )
 DEFAULT_RUSAGE_QUANTITIES: tuple[str, ...] = RUSAGE_QUANTITY_IDS
+
+LINUX_MEMORY_QUANTITY_IDS: tuple[str, ...] = (
+    "process.memory.rss_bytes",
+    "process.memory.virtual_bytes",
+    "process.memory.thread_count",
+)
+DEFAULT_LINUX_MEMORY_QUANTITIES: tuple[str, ...] = LINUX_MEMORY_QUANTITY_IDS
 
 ALLOCATOR_CURRENT_QUANTITY_IDS: tuple[str, ...] = (
     "allocator.current.allocated_bytes",
@@ -396,6 +417,172 @@ class RUsageSource:
 
 
 @dataclass(frozen=True)
+class LinuxMemorySource:
+    """Configuration for Linux self-process current-memory procfs sampling.
+
+    Reads ``VmRSS``, ``VmSize``, and ``Threads`` from ``/proc/<pid>/status``
+    while bracketing every read with exact target-generation verification
+    (``pid``, ``start_ticks``, ``boot_id``, ``pid_ns_inode``) to defend against
+    PID reuse. Unlike ``RUsageSource`` (which reports process-lifetime RSS
+    high-water marks), ``LinuxMemorySource`` reports current-memory gauges
+    (``statistic="gauge"``, ``window="read_interval"``) with explicit
+    ``"approximate_rss"`` quality provenance.
+
+    Construction is strictly pure and Torch-free: it performs zero filesystem
+    I/O and never freezes ``os.getpid()`` when ``pid=None``.
+
+    Parameters
+    ----------
+    enabled : bool, optional
+        Whether this source is active (default ``True``).
+    source_id : str, optional
+        Stable source identifier written into descriptors and samples.
+    execution_mode : str, optional
+        Must be ``"in_process_thread"``.
+    interval_seconds : float or None, optional
+        Optional per-source sampling interval in seconds. ``None`` inherits
+        :attr:`ResourceSamples.interval_seconds`.
+    quantities : sequence of str, optional
+        Subset of :data:`LINUX_MEMORY_QUANTITY_IDS` to collect.
+    max_read_bytes : int, optional
+        Maximum bytes allowed per procfs file read (default ``65536``).
+    max_read_seconds : float, optional
+        Maximum monotonic seconds allowed per procfs read (default ``1.0``).
+    pid : int or None, optional
+        Optional explicit PID assertion. Only ``None`` or the current process
+        PID (``os.getpid()``) is accepted; any foreign PID is refused.
+    probe : LinuxProcessMemoryProbe or object or None, optional
+        Optional injected probe exposing callable ``read()`` for tests.
+    proc_root : str or pathlib.Path or None, optional
+        Optional procfs root directory override for deterministic tests.
+    """
+
+    enabled: bool = True
+    source_id: str = LINUX_MEMORY_SOURCE_ID
+    execution_mode: str = LINUX_MEMORY_EXECUTION_MODE
+    interval_seconds: float | None = None
+    quantities: tuple[str, ...] = DEFAULT_LINUX_MEMORY_QUANTITIES
+    max_read_bytes: int = DEFAULT_LINUX_MEMORY_MAX_READ_BYTES
+    max_read_seconds: float = DEFAULT_LINUX_MEMORY_MAX_READ_SECONDS
+    pid: int | None = None
+    probe: Any = None
+    proc_root: str | Path | None = None
+
+    def __post_init__(self) -> None:
+        _require_bool(self.enabled, "LinuxMemorySource.enabled")
+        validate_identifier(self.source_id, "LinuxMemorySource.source_id")
+        if (
+            type(self.execution_mode) is not str
+            or self.execution_mode != LINUX_MEMORY_EXECUTION_MODE
+        ):
+            raise ValueError(
+                f"LinuxMemorySource.execution_mode must be "
+                f"{LINUX_MEMORY_EXECUTION_MODE!r}, got {self.execution_mode!r}"
+            )
+        if self.interval_seconds is not None:
+            object.__setattr__(
+                self,
+                "interval_seconds",
+                _require_positive_finite(
+                    self.interval_seconds, "LinuxMemorySource.interval_seconds"
+                ),
+            )
+        if isinstance(self.quantities, (str, bytes)) or not isinstance(
+            self.quantities, Sequence
+        ):
+            raise TypeError(
+                "LinuxMemorySource.quantities must be a sequence of quantity IDs"
+            )
+        selected = tuple(self.quantities)
+        if not selected:
+            raise ValueError("LinuxMemorySource.quantities must be nonempty")
+        seen: set[str] = set()
+        allowed = frozenset(LINUX_MEMORY_QUANTITY_IDS)
+        for qty_id in selected:
+            if type(qty_id) is not str or qty_id not in allowed:
+                raise ValueError(
+                    f"unsupported LinuxMemorySource quantity {qty_id!r}; "
+                    f"expected subset of {LINUX_MEMORY_QUANTITY_IDS}"
+                )
+            if qty_id in seen:
+                raise ValueError(f"duplicate LinuxMemorySource quantity {qty_id!r}")
+            seen.add(qty_id)
+        object.__setattr__(self, "quantities", selected)
+
+        _require_positive_int(self.max_read_bytes, "LinuxMemorySource.max_read_bytes")
+        object.__setattr__(
+            self,
+            "max_read_seconds",
+            _require_positive_finite(
+                self.max_read_seconds, "LinuxMemorySource.max_read_seconds"
+            ),
+        )
+
+        if self.pid is not None:
+            pid = _require_positive_int(self.pid, "LinuxMemorySource.pid")
+            current_pid = os.getpid()
+            if pid != current_pid:
+                raise ValueError(
+                    f"LinuxMemorySource targets only the current self process and "
+                    f"cannot target foreign PID {pid} (current process PID is {current_pid})"
+                )
+        if self.probe is not None and not callable(getattr(self.probe, "read", None)):
+            raise TypeError("LinuxMemorySource.probe must expose callable read()")
+        if self.proc_root is not None:
+            if isinstance(self.proc_root, Path):
+                pass
+            elif type(self.proc_root) is str:
+                if not self.proc_root.strip():
+                    raise ValueError(
+                        "LinuxMemorySource.proc_root must be a nonempty path or None"
+                    )
+                object.__setattr__(self, "proc_root", Path(self.proc_root))
+            else:
+                raise TypeError(
+                    "LinuxMemorySource.proc_root must be str, Path, or None, "
+                    f"got {type(self.proc_root).__name__}"
+                )
+
+    def descriptors(self) -> dict[str, QuantityDescriptor]:
+        """Return immutable :class:`QuantityDescriptor` map for selected quantities."""
+
+        catalog: dict[str, QuantityDescriptor] = {
+            "process.memory.rss_bytes": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="B",
+                statistic="gauge",
+                subject_kind="process",
+                window="read_interval",
+                native_name="VmRSS",
+                native_unit="KiB",
+                conversion="multiply_by_1024",
+                quality=("approximate_rss",),
+            ),
+            "process.memory.virtual_bytes": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="B",
+                statistic="gauge",
+                subject_kind="process",
+                window="read_interval",
+                native_name="VmSize",
+                native_unit="KiB",
+                conversion="multiply_by_1024",
+            ),
+            "process.memory.thread_count": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="1",
+                statistic="gauge",
+                subject_kind="process",
+                window="read_interval",
+                native_name="Threads",
+                native_unit="1",
+                conversion="identity",
+            ),
+        }
+        return {qty_id: catalog[qty_id] for qty_id in self.quantities}
+
+
+@dataclass(frozen=True)
 class AllocatorSource:
     """Configuration for configured-device PyTorch allocator observations.
 
@@ -626,6 +813,58 @@ def _rusage_baseline_to_readings(
     return readings
 
 
+def _linux_memory_reading_to_readings(
+    reading: LinuxProcessMemoryReading,
+    quantities: Sequence[str],
+) -> dict[str, ObservabilityReading]:
+    """Convert one :class:`LinuxProcessMemoryReading` into tagged v1 readings."""
+
+    field_map: dict[str, str] = {
+        "process.memory.rss_bytes": "rss_bytes",
+        "process.memory.virtual_bytes": "virtual_bytes",
+        "process.memory.thread_count": "thread_count",
+    }
+    fallback_status = "error" if getattr(reading, "status", None) == "error" else "unavailable"
+    fallback_code = getattr(reading, "reason_code", None) or "linux_memory_unavailable"
+    fallback_detail = getattr(reading, "detail", None) or "linux memory unavailable"
+
+    out: dict[str, ObservabilityReading] = {}
+    for qty_id in quantities:
+        attr_name = field_map[qty_id]
+        raw = getattr(reading, attr_name)
+        if isinstance(raw, LinuxMemoryUnavailable):
+            out[qty_id] = ObservabilityReading(
+                status=raw.status,
+                reason_code=raw.reason_code,
+                detail=raw.reason,
+            )
+            continue
+        if isinstance(raw, ResourceUnavailable):
+            out[qty_id] = ObservabilityReading(
+                status=fallback_status,
+                reason_code=fallback_code,
+                detail=raw.reason or fallback_detail,
+            )
+            continue
+        if type(raw) is not int:
+            out[qty_id] = ObservabilityReading(
+                status="error",
+                reason_code="invalid_reading",
+                detail=f"unexpected {attr_name} type {type(raw).__name__}",
+            )
+            continue
+        if raw < 0:
+            out[qty_id] = ObservabilityReading(
+                status="error",
+                reason_code="negative_reading",
+                detail=f"{attr_name} was negative ({raw!r})",
+            )
+            continue
+        # Legitimate 0 bytes or 0 count is preserved strictly as status='ok'.
+        out[qty_id] = ObservabilityReading(status="ok", value=raw)
+    return out
+
+
 def _allocator_bytes_reading(
     value: object,
     *,
@@ -773,6 +1012,14 @@ class _ResourceSamplesSession:
         self._rusage_thread: threading.Thread | None = None
         self._rusage_thread_started = False
 
+        self._linux_memory_probe: Any = None
+        self._linux_memory_init_error: LinuxMemoryUnavailable | None = None
+        self._linux_memory_target_generation: LinuxProcessGeneration | None = None
+        self._linux_memory_subject: dict[str, Any] = {}
+        self._linux_memory_interval_ns = 0
+        self._linux_memory_thread: threading.Thread | None = None
+        self._linux_memory_thread_started = False
+
         self._drain_thread: threading.Thread | None = None
         self._drain_thread_started = False
 
@@ -843,6 +1090,102 @@ class _ResourceSamplesSession:
                 "capability": "available",
             }
 
+        if self._callback.linux_memory.enabled:
+            lm_cfg = self._callback.linux_memory
+            self._linux_memory_probe = (
+                LinuxProcessMemoryProbe(
+                    pid=self._pid,
+                    proc_root=lm_cfg.proc_root,
+                    max_read_bytes=lm_cfg.max_read_bytes,
+                    max_read_seconds=lm_cfg.max_read_seconds,
+                    host_id=self._host_id,
+                )
+                if lm_cfg.probe is None
+                else lm_cfg.probe
+            )
+            lm_interval = (
+                self._callback.interval_seconds
+                if lm_cfg.interval_seconds is None
+                else lm_cfg.interval_seconds
+            )
+            self._linux_memory_interval_ns = max(
+                1, int(round(lm_interval * _NS_PER_SECOND))
+            )
+
+            # Bind live target generation at scope activation (never at construction).
+            bound_generation: LinuxProcessGeneration | None = None
+            bind_error: ResourceUnavailable | None = None
+            bind_fn = getattr(self._linux_memory_probe, "bind_target", None)
+            if callable(bind_fn):
+                try:
+                    bound_generation = bind_fn()
+                except Exception as exc:
+                    bind_error = LinuxMemoryUnavailable(
+                        reason=f"{type(exc).__name__}: {exc}",
+                        reason_code="probe_init_failed",
+                        status="error",
+                    )
+                    self._linux_memory_init_error = bind_error
+                    self._linux_memory_probe = None
+                    self._diagnostics.append(
+                        f"{lm_cfg.source_id} bind_target failed: {type(exc).__name__}: {exc}"
+                    )
+                else:
+                    if bound_generation is None:
+                        raw_bind_error = getattr(
+                            self._linux_memory_probe, "bind_error", None
+                        )
+                        if isinstance(raw_bind_error, ResourceUnavailable):
+                            bind_error = raw_bind_error
+                        else:
+                            bind_error = LinuxMemoryUnavailable(
+                                reason=f"{lm_cfg.source_id} bind_target returned None",
+                                reason_code="target_bind_failed",
+                                status="unavailable",
+                            )
+            else:
+                candidate_gen = getattr(
+                    self._linux_memory_probe, "target_generation", None
+                )
+                if isinstance(candidate_gen, LinuxProcessGeneration):
+                    bound_generation = candidate_gen
+
+            self._linux_memory_target_generation = bound_generation
+            if bound_generation is not None:
+                self._linux_memory_subject = bound_generation.to_subject_dict(
+                    host_id=self._host_id,
+                    invocation_token=self._invocation_id,
+                )
+            else:
+                self._linux_memory_subject = {
+                    "kind": "process",
+                    "host_id": self._host_id,
+                    "pid": self._pid,
+                    "invocation_token": self._invocation_id,
+                }
+
+            lm_capability = "unavailable" if bind_error is not None else "available"
+            lm_inventory_entry: dict[str, Any] = {
+                "producer": "tpen.process_resources.LinuxProcessMemoryProbe",
+                "source_version": "1",
+                "execution": lm_cfg.execution_mode,
+                "selected_quantities": list(lm_cfg.quantities),
+                "interval_seconds": lm_interval,
+                "max_read_bytes": lm_cfg.max_read_bytes,
+                "max_read_seconds": lm_cfg.max_read_seconds,
+                "capability": lm_capability,
+            }
+            if bound_generation is not None:
+                lm_inventory_entry["target_generation"] = bound_generation.to_dict()
+            if bind_error is not None:
+                lm_inventory_entry["unavailable_reason_code"] = getattr(
+                    bind_error, "reason_code", "unavailable"
+                )
+
+            descriptors_map.update(lm_cfg.descriptors())
+            selected_sources[lm_cfg.source_id] = list(lm_cfg.quantities)
+            sources_inventory[lm_cfg.source_id] = lm_inventory_entry
+
         if self._callback.allocator.enabled:
             alloc_cfg = self._callback.allocator
             self._activate_allocator_source(alloc_cfg)
@@ -907,19 +1250,32 @@ class _ResourceSamplesSession:
             data_completeness="unknown",
             **self._manifest_base,
         )
+        host_inventory: dict[str, Any] = {
+            "host_id": self._host_id,
+            "platform": sys.platform,
+        }
+        process_inventory: dict[str, Any] = {
+            "kind": "process",
+            "host_id": self._host_id,
+            "pid": self._pid,
+            "invocation_token": self._invocation_id,
+        }
+        if self._linux_memory_target_generation is not None:
+            gen = self._linux_memory_target_generation
+            if gen.boot_id is not None:
+                host_inventory["boot_id"] = gen.boot_id
+            if gen.pid == self._pid:
+                process_inventory["start_ticks"] = gen.start_ticks
+                if gen.boot_id is not None:
+                    process_inventory["boot_id"] = gen.boot_id
+                if gen.pid_ns_inode is not None:
+                    process_inventory["pid_ns_inode"] = gen.pid_ns_inode
+
         inventory = ObservabilityInventory(
             invocation_id=self._invocation_id,
             inventory_id=self._inventory_id,
-            host={
-                "host_id": self._host_id,
-                "platform": sys.platform,
-            },
-            process={
-                "kind": "process",
-                "host_id": self._host_id,
-                "pid": self._pid,
-                "invocation_token": self._invocation_id,
-            },
+            host=host_inventory,
+            process=process_inventory,
             clock_domains=(
                 {
                     "clock_domain_id": self._clock_domain_id,
@@ -986,6 +1342,17 @@ class _ResourceSamplesSession:
             )
             self._rusage_thread.start()
             self._rusage_thread_started = True
+
+        if self._callback.linux_memory.enabled:
+            self._sample_linux_memory()
+            if self._linux_memory_init_error is None:
+                self._linux_memory_thread = threading.Thread(
+                    target=self._linux_memory_loop,
+                    name=f"tpen-obs-linux-memory-{self._observer_id}",
+                    daemon=True,
+                )
+                self._linux_memory_thread.start()
+                self._linux_memory_thread_started = True
 
         if self._callback.allocator.enabled:
             read_end_ns = self._sample_allocator()
@@ -1217,6 +1584,112 @@ class _ResourceSamplesSession:
         self._enqueue_reading_packet(
             source_id=source_id,
             subject=self._rusage_subject,
+            read_start_ns=read_start_ns,
+            read_end_ns=read_end_ns,
+            readings=readings,
+        )
+
+    def _linux_memory_loop(self) -> None:
+        """Monotonic-deadline sampling loop for bounded Linux procfs current memory."""
+
+        next_due_ns = int(self._monotonic_ns()) + self._linux_memory_interval_ns
+        while not self._stop_event.is_set():
+            now_ns = int(self._monotonic_ns())
+            wait_ns = next_due_ns - now_ns
+            if wait_ns > 0:
+                if self._stop_event.wait(timeout=wait_ns / _NS_PER_SECOND):
+                    break
+                now_ns = int(self._monotonic_ns())
+                if now_ns < next_due_ns:
+                    continue
+            if self._stop_event.is_set():
+                break
+            # Advance deadline without a catch-up storm if scheduling fell behind.
+            lag_ns = now_ns - next_due_ns
+            if lag_ns >= self._linux_memory_interval_ns:
+                missed = lag_ns // self._linux_memory_interval_ns
+                with self._lock:
+                    self._missed_deadlines += int(missed)
+                next_due_ns = now_ns + self._linux_memory_interval_ns
+            else:
+                next_due_ns += self._linux_memory_interval_ns
+            self._sample_linux_memory()
+
+    def _sample_linux_memory(self) -> None:
+        """Capture one Linux procfs current-memory sample and enqueue nonblockingly."""
+
+        lm_cfg = self._callback.linux_memory
+        source_id = lm_cfg.source_id
+        # Bracket probe.read() on the session's clock domain so sample timestamps
+        # stay correlated with inventory.clock_domains and coverage windows.
+        read_start_ns = int(self._monotonic_ns())
+        init_error = self._linux_memory_init_error
+        if init_error is not None or self._linux_memory_probe is None:
+            issue = (
+                init_error
+                if init_error is not None
+                else LinuxMemoryUnavailable(
+                    reason=f"{source_id} probe unavailable",
+                    reason_code="probe_init_failed",
+                    status="error",
+                )
+            )
+            read_end_ns = max(int(self._monotonic_ns()), read_start_ns)
+            readings = {
+                qty_id: ObservabilityReading(
+                    status=issue.status,
+                    reason_code=issue.reason_code,
+                    detail=issue.reason,
+                )
+                for qty_id in lm_cfg.quantities
+            }
+            self._enqueue_reading_packet(
+                source_id=source_id,
+                subject=self._linux_memory_subject,
+                read_start_ns=read_start_ns,
+                read_end_ns=read_end_ns,
+                readings=readings,
+            )
+            return
+
+        try:
+            reading = self._linux_memory_probe.read()
+        except Exception as exc:
+            with self._lock:
+                self._attempted += 1
+                self._failed += 1
+                self._diagnostics.append(
+                    f"{source_id} read failed: {type(exc).__name__}: {exc}"
+                )
+            return
+        read_end_ns = max(int(self._monotonic_ns()), read_start_ns)
+
+        target_gen = getattr(reading, "target_generation", None)
+        if isinstance(target_gen, LinuxProcessGeneration):
+            subject = target_gen.to_subject_dict(
+                host_id=self._host_id,
+                invocation_token=self._invocation_id,
+            )
+            if self._linux_memory_target_generation is None:
+                self._linux_memory_target_generation = target_gen
+                self._linux_memory_subject = subject
+        else:
+            subject = self._linux_memory_subject
+
+        try:
+            readings = _linux_memory_reading_to_readings(reading, lm_cfg.quantities)
+        except Exception as exc:
+            with self._lock:
+                self._attempted += 1
+                self._failed += 1
+                self._diagnostics.append(
+                    f"{source_id} reading conversion error: {type(exc).__name__}: {exc}"
+                )
+            return
+
+        self._enqueue_reading_packet(
+            source_id=source_id,
+            subject=subject,
             read_start_ns=read_start_ns,
             read_end_ns=read_end_ns,
             readings=readings,
@@ -1550,19 +2023,34 @@ class _ResourceSamplesSession:
         # Enforce one shared real monotonic close deadline for thread joins and
         # queue draining even when sample timestamps use an injected test clock.
         total_timeout_s = self._callback.close_timeout_seconds
-        deadline_ns = time.monotonic_ns() + int(round(total_timeout_s * _NS_PER_SECOND))
+        start_close_ns = time.monotonic_ns()
+        deadline_ns = start_close_ns + int(round(total_timeout_s * _NS_PER_SECOND))
+        producer_deadline_ns = start_close_ns + int(
+            round(total_timeout_s * 0.75 * _NS_PER_SECOND)
+        )
         self._stop_event.set()
         self._drain_wake_event.set()
 
-        # 1. Join the RUSAGE producer thread within the shared close deadline,
+        # 1. Join all periodic producer threads within the shared close deadline,
         # reserving a small fraction of the same total budget so drain/status
-        # finalization can still complete if the producer hangs.
-        producer_stopped = True
+        # finalization can still complete if any producer hangs.
+        rusage_stopped = True
         if self._rusage_thread is not None and self._rusage_thread_started:
-            remaining = max(0.0, (deadline_ns - time.monotonic_ns()) / _NS_PER_SECOND)
-            producer_budget = min(remaining, total_timeout_s * 0.75)
-            self._rusage_thread.join(timeout=producer_budget)
-            producer_stopped = not self._rusage_thread.is_alive()
+            remaining = max(
+                0.0, (producer_deadline_ns - time.monotonic_ns()) / _NS_PER_SECOND
+            )
+            self._rusage_thread.join(timeout=remaining)
+            rusage_stopped = not self._rusage_thread.is_alive()
+
+        linux_memory_stopped = True
+        if self._linux_memory_thread is not None and self._linux_memory_thread_started:
+            remaining = max(
+                0.0, (producer_deadline_ns - time.monotonic_ns()) / _NS_PER_SECOND
+            )
+            self._linux_memory_thread.join(timeout=remaining)
+            linux_memory_stopped = not self._linux_memory_thread.is_alive()
+
+        producer_stopped = rusage_stopped and linux_memory_stopped
 
         # 2. Stop and join the drain thread within the SAME remaining deadline
         # before taking final captures so earlier queued samples never compete
@@ -1580,13 +2068,24 @@ class _ResourceSamplesSession:
         # immediately within the same single close deadline.
         if drain_stopped:
             self._drain_pending_until(deadline_ns)
-            if producer_stopped and time.monotonic_ns() < deadline_ns:
+            if rusage_stopped and time.monotonic_ns() < deadline_ns:
                 if (
                     self._callback.rusage.enabled
                     and self._rusage_probe is not None
                     and self._writer is not None
                 ):
                     self._sample_rusage()
+                    self._drain_pending_until(deadline_ns)
+            if linux_memory_stopped and time.monotonic_ns() < deadline_ns:
+                if (
+                    self._callback.linux_memory.enabled
+                    and (
+                        self._linux_memory_probe is not None
+                        or self._linux_memory_init_error is not None
+                    )
+                    and self._writer is not None
+                ):
+                    self._sample_linux_memory()
                     self._drain_pending_until(deadline_ns)
             if time.monotonic_ns() < deadline_ns:
                 if (
@@ -1603,9 +2102,13 @@ class _ResourceSamplesSession:
             with self._lock:
                 self._accepting_writes = False
                 _append_unique(self._truncation_reasons, "close_timeout")
-                if not producer_stopped:
+                if not rusage_stopped:
                     self._diagnostics.append(
                         "rusage sampling thread failed to stop within close_timeout_seconds"
+                    )
+                if not linux_memory_stopped:
+                    self._diagnostics.append(
+                        "linux-memory sampling thread failed to stop within close_timeout_seconds"
                     )
                 if not drain_stopped:
                     self._diagnostics.append(
@@ -1679,6 +2182,17 @@ class _ResourceSamplesSession:
                 else:
                     source_status[sid] = "unavailable"
 
+            if self._callback.linux_memory.enabled:
+                sid = self._callback.linux_memory.source_id
+                ok_c = source_ok_counts.get(sid, 0)
+                non_ok_c = source_non_ok_counts.get(sid, 0)
+                if ok_c > 0 and non_ok_c == 0:
+                    source_status[sid] = "available"
+                elif ok_c > 0 and non_ok_c > 0:
+                    source_status[sid] = "partial"
+                else:
+                    source_status[sid] = "unavailable"
+
             if self._callback.allocator.enabled:
                 sid = self._callback.allocator.source_id
                 ok_c = source_ok_counts.get(sid, 0)
@@ -1737,7 +2251,10 @@ class _ResourceSamplesSession:
             else:
                 invocation_outcome = "completed"
 
-            if not self._rusage_thread_started:
+            any_producer_started = (
+                self._rusage_thread_started or self._linux_memory_thread_started
+            )
+            if not any_producer_started:
                 helper_state = "not_started"
             elif producer_stopped:
                 helper_state = "confirmed_stopped"
@@ -1895,6 +2412,27 @@ def _coerce_allocator_source(
     )
 
 
+def _coerce_linux_memory_source(
+    raw: LinuxMemorySource | Mapping[str, Any] | None,
+) -> LinuxMemorySource | None:
+    if raw is None:
+        return None
+    if type(raw) is LinuxMemorySource:
+        return raw
+    if isinstance(raw, LinuxMemorySource):
+        raise TypeError(
+            f"linux_memory must be exact LinuxMemorySource, mapping, or None; "
+            f"got subclass {type(raw).__name__}"
+        )
+    if isinstance(raw, Mapping):
+        _reject_forbidden_selector_keys(raw, owner="LinuxMemorySource")
+        return LinuxMemorySource(**dict(raw))
+    raise TypeError(
+        f"linux_memory must be LinuxMemorySource, mapping, or None; "
+        f"got {type(raw).__name__}"
+    )
+
+
 def _coerce_sink(raw: RunArtifactSink | Mapping[str, Any] | None) -> RunArtifactSink:
     if raw is None:
         return RunArtifactSink()
@@ -1937,11 +2475,14 @@ class ResourceSamples(Callback):
         Maximum queued unpersisted sample packets before nonblocking drops.
     rusage : RUsageSource or mapping or None, optional
         Self-process ``RUSAGE_SELF`` source configuration. Defaults to enabled
-        when both ``rusage`` and ``allocator`` are omitted.
+        when ``rusage``, ``allocator``, and ``linux_memory`` are all omitted.
     allocator : AllocatorSource or mapping or None, optional
         Configured-device Torch allocator source configuration. Defaults to
         disabled when omitted so default construction never claims
         ``allocator_reset`` or imports Torch.
+    linux_memory : LinuxMemorySource or mapping or None, optional
+        Linux self-process current-memory procfs source configuration. Defaults
+        to disabled when omitted.
     sink : RunArtifactSink or mapping or None, optional
         Pure destination and byte/text budget configuration routed through
         :class:`tpen.artifacts.ArtifactManager`.
@@ -1959,6 +2500,7 @@ class ResourceSamples(Callback):
         max_pending_envelopes: int = 2,
         rusage: RUsageSource | Mapping[str, Any] | None = None,
         allocator: AllocatorSource | Mapping[str, Any] | None = None,
+        linux_memory: LinuxMemorySource | Mapping[str, Any] | None = None,
         sink: RunArtifactSink | Mapping[str, Any] | None = None,
         monotonic_ns: Callable[[], int] | None = None,
         **kwargs: Any,
@@ -1986,32 +2528,49 @@ class ResourceSamples(Callback):
 
         coerced_rusage = _coerce_rusage_source(rusage)
         coerced_allocator = _coerce_allocator_source(allocator)
-        if coerced_rusage is None and coerced_allocator is None:
+        coerced_linux_memory = _coerce_linux_memory_source(linux_memory)
+        if (
+            coerced_rusage is None
+            and coerced_allocator is None
+            and coerced_linux_memory is None
+        ):
             coerced_rusage = RUsageSource(enabled=True)
             coerced_allocator = AllocatorSource(enabled=False, reset_peaks=False)
-        elif coerced_rusage is None:
-            coerced_rusage = RUsageSource(enabled=False)
-        elif coerced_allocator is None:
-            coerced_allocator = AllocatorSource(enabled=False, reset_peaks=False)
+            coerced_linux_memory = LinuxMemorySource(enabled=False)
+        else:
+            if coerced_rusage is None:
+                coerced_rusage = RUsageSource(enabled=False)
+            if coerced_allocator is None:
+                coerced_allocator = AllocatorSource(enabled=False, reset_peaks=False)
+            if coerced_linux_memory is None:
+                coerced_linux_memory = LinuxMemorySource(enabled=False)
 
         self.rusage = coerced_rusage
         self.allocator = coerced_allocator
+        self.linux_memory = coerced_linux_memory
         self.sink = _coerce_sink(sink)
 
-        if self.enabled and not (self.rusage.enabled or self.allocator.enabled):
+        enabled_sources: list[tuple[str, str]] = []
+        if self.rusage.enabled:
+            enabled_sources.append(("rusage", self.rusage.source_id))
+        if self.allocator.enabled:
+            enabled_sources.append(("allocator", self.allocator.source_id))
+        if self.linux_memory.enabled:
+            enabled_sources.append(("linux_memory", self.linux_memory.source_id))
+
+        if self.enabled and not enabled_sources:
             raise ValueError(
-                "ResourceSamples requires at least one enabled source (rusage or allocator) "
-                "when enabled=True"
+                "ResourceSamples requires at least one enabled source "
+                "(rusage, allocator, or linux_memory) when enabled=True"
             )
-        if (
-            self.rusage.enabled
-            and self.allocator.enabled
-            and self.rusage.source_id == self.allocator.source_id
-        ):
-            raise ValueError(
-                f"rusage and allocator sources must use distinct source_id values, "
-                f"got {self.rusage.source_id!r}"
-            )
+        seen_source_ids: dict[str, str] = {}
+        for source_name, source_id in enabled_sources:
+            if source_id in seen_source_ids:
+                raise ValueError(
+                    f"{seen_source_ids[source_id]} and {source_name} sources must use "
+                    f"distinct source_id values, got {source_id!r}"
+                )
+            seen_source_ids[source_id] = source_name
 
         if monotonic_ns is not None and not callable(monotonic_ns):
             raise TypeError("ResourceSamples.monotonic_ns must be callable or None")
@@ -2232,11 +2791,16 @@ __all__ = [
     "ALLOCATOR_EXECUTION_MODE",
     "ALLOCATOR_PEAK_QUANTITY_IDS",
     "ALLOCATOR_SOURCE_ID",
+    "DEFAULT_LINUX_MEMORY_QUANTITIES",
     "DEFAULT_RUSAGE_QUANTITIES",
+    "LINUX_MEMORY_EXECUTION_MODE",
+    "LINUX_MEMORY_QUANTITY_IDS",
+    "LINUX_MEMORY_SOURCE_ID",
     "RUSAGE_EXECUTION_MODE",
     "RUSAGE_QUANTITY_IDS",
     "RUSAGE_SOURCE_ID",
     "AllocatorSource",
+    "LinuxMemorySource",
     "RUsageSource",
     "ResourceSamples",
 ]
