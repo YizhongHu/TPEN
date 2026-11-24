@@ -555,6 +555,7 @@ def test_state_envelope_rejects_missing_policy_without_mutating_state() -> None:
     method = _method(parameter)
     method.completed_updates = 7
     state = dict(method.method_state_dict())
+    state["completed_updates"] = 11
     state.pop("policy")
 
     with pytest.raises(ValueError, match="SR checkpoint policy does not match"):
