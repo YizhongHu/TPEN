@@ -11,6 +11,8 @@ import math
 import os
 from pathlib import Path
 import random
+import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -29,6 +31,10 @@ from tpen.accelerator import (
     AllocatorCurrentUsage,
     AllocatorUnavailable,
     AllocatorUsage,
+    NvidiaDeviceCommandResult,
+    NvidiaDeviceReading,
+    NvidiaDeviceUnavailable,
+    NvidiaSmiDeviceProbe,
 )
 from tpen.artifacts import (
     ArtifactDestination,
@@ -44,6 +50,7 @@ from tpen.callback import (
     LinuxMemorySource,
     LinuxProcessTreeSource,
     ManagedLifecycleError,
+    NvidiaDeviceSource,
     RUsageSource,
     ResourceOwnershipConflictError,
     ResourceSamples,
@@ -62,6 +69,9 @@ from tpen.callback.resource_samples import (
     LINUX_MEMORY_SOURCE_ID,
     LINUX_PROCESS_TREE_QUANTITY_IDS,
     LINUX_PROCESS_TREE_SOURCE_ID,
+    NVIDIA_DEVICE_EXECUTION_MODE,
+    NVIDIA_DEVICE_QUANTITY_IDS,
+    NVIDIA_DEVICE_SOURCE_ID,
     RUSAGE_QUANTITY_IDS,
     RUSAGE_SOURCE_ID,
 )
@@ -4397,6 +4407,1041 @@ runner:
     assert profile_check.verdict == "refused"
     assert profile_check.refusal is not None
     assert profile_check.refusal["code"] == "unsupported-callback"
+
+
+# ---------------------------------------------------------------------------
+# O6: Explicit NVIDIA physical-device probe & NvidiaDeviceSource tests
+# ---------------------------------------------------------------------------
+
+_O6_RAW_UUID = "97933565-57cb-fec7-c442-188c7b300fd3"
+_O6_CANONICAL_UUID = f"GPU-{_O6_RAW_UUID}"
+
+
+def test_o6_nvidia_device_source_validation_coercion_and_descriptors() -> None:
+    """Validate NvidiaDeviceSource constraints, mapping coercion, and O2 descriptors."""
+
+    src = NvidiaDeviceSource(
+        identity={"kind": "cuda", "index": 1, "uuid": _O6_RAW_UUID},
+        timeout_seconds=10.0,
+    )
+    assert src.enabled is True
+    assert src.source_id == NVIDIA_DEVICE_SOURCE_ID
+    assert src.execution_mode == NVIDIA_DEVICE_EXECUTION_MODE
+    assert src.quantities == NVIDIA_DEVICE_QUANTITY_IDS
+    assert src.identity == AcceleratorIdentity(AcceleratorKind.CUDA, 1, _O6_RAW_UUID)
+    assert src.timeout_seconds == 10.0
+
+    descs = src.descriptors()
+    assert set(descs.keys()) == set(NVIDIA_DEVICE_QUANTITY_IDS)
+
+    used_d = descs["device.framebuffer.used_bytes"]
+    assert used_d.unit == "B"
+    assert used_d.statistic == "gauge"
+    assert used_d.subject_kind == "physical_gpu"
+    assert used_d.window == "read_interval"
+    assert used_d.native_name == "memory.used"
+    assert used_d.native_unit == "MiB"
+    assert used_d.conversion == "multiply_by_1048576"
+    assert "shared_physical_device_not_per_process_attribution" in used_d.quality
+    assert "physical_gpu_scope_not_process_allocator" in used_d.quality
+
+    total_d = descs["device.framebuffer.total_bytes"]
+    assert total_d.unit == "B"
+    assert total_d.statistic == "capacity"
+    assert total_d.subject_kind == "physical_gpu"
+    assert total_d.window == "inventory_or_read_interval"
+    assert total_d.native_name == "memory.total"
+    assert total_d.native_unit == "MiB"
+    assert total_d.conversion == "multiply_by_1048576"
+    assert "shared_physical_device_not_per_process_attribution" in total_d.quality
+
+    busy_d = descs["device.busy_fraction"]
+    assert busy_d.unit == "1"
+    assert busy_d.statistic == "vendor_window_mean"
+    assert busy_d.subject_kind == "physical_gpu"
+    assert busy_d.window == "vendor_recent_window_unknown_bounds"
+    assert busy_d.native_name == "utilization.gpu"
+    assert busy_d.native_unit == "percent"
+    assert busy_d.conversion == "divide_by_100"
+    assert "shared_physical_device_not_per_process_attribution" in busy_d.quality
+    assert "vendor_recent_window_not_extrapolated_utilization" in busy_d.quality
+
+    # Hard <= 10.0 s timeout cap and strict validation
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        NvidiaDeviceSource(timeout_seconds=10.5)
+    with pytest.raises(ValueError, match="execution_mode"):
+        NvidiaDeviceSource(execution_mode="in_process_thread")
+    with pytest.raises(ValueError, match="unsupported key"):
+        NvidiaDeviceSource(identity={"kind": "cuda", "bogus": 1})
+    with pytest.raises(ValueError, match="unsupported NvidiaDeviceSource.identity.kind"):
+        NvidiaDeviceSource(identity={"kind": "tpu"})
+
+    # Reject subclass and forbidden selector keys via ResourceSamples coercion
+    class _SubNvidiaSource(NvidiaDeviceSource):
+        pass
+
+    with pytest.raises(TypeError, match="subclass"):
+        ResourceSamples(nvidia_device=_SubNvidiaSource())
+    with pytest.raises(ValueError, match="forbidden"):
+        ResourceSamples(nvidia_device={"enabled": True, "event_types": ["RunStarted"]})
+
+    # Default ResourceSamples() keeps nvidia_device disabled and rusage enabled.
+    default_cb = ResourceSamples()
+    assert default_cb.rusage.enabled is True
+    assert default_cb.nvidia_device.enabled is False
+
+
+def test_o6_nvidia_device_bundle_roundtrip_and_vendor_window_mean_reduction(
+    tmp_path: Path,
+) -> None:
+    """Full ResourceSamples -> ObservabilityBundleWriter -> inspect_observability_bundle round-trip."""
+
+    identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, _O6_RAW_UUID)
+    rows = iter(
+        (
+            f"{_O6_CANONICAL_UUID}, 2026/11/24 12:00:01.000, 1024, 40960, 20, Disabled\n",
+            f"{_O6_CANONICAL_UUID}, 2026/11/24 12:00:02.000, 2048, 40960, 80, Disabled\n",
+            f"{_O6_CANONICAL_UUID}, 2026/11/24 12:00:03.000, 1536, 40960, 50, Disabled\n",
+        )
+    )
+    last_row = f"{_O6_CANONICAL_UUID}, 2026/11/24 12:00:03.000, 1536, 40960, 50, Disabled\n"
+
+    def _runner(argv: list[str], **kwargs: Any) -> NvidiaDeviceCommandResult:
+        del argv, kwargs
+        row = next(rows, last_row)
+        return NvidiaDeviceCommandResult(returncode=0, stdout=row)
+
+    probe = NvidiaSmiDeviceProbe(identity=identity, command_runner=_runner)
+    cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity=identity,
+            probe=probe,
+        ),
+    )
+
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_ok", device="cuda:0"),
+        runtime_callbacks=[cb],
+    ) as ctx:
+        run_dir = ctx.run_dir
+
+    run_obs = inspect_run_observability(run_dir)
+    assert len(run_obs.invocations) == 1
+    bundle = inspect_observability_bundle(run_obs.invocations[0].bundle_dir)
+    assert bundle.derived_lifecycle_state == "closed"
+    assert bundle.derived_data_completeness == "complete"
+    assert bundle.inventory is not None
+
+    inv_src = bundle.inventory.sources[NVIDIA_DEVICE_SOURCE_ID]
+    assert inv_src["shared_device_not_exclusive"] is True
+    assert inv_src["per_process_attribution"] is False
+    assert inv_src["allocator_reset_authority"] == "none"
+    assert inv_src["selected_identity"] == {
+        "kind": "cuda",
+        "index": 0,
+        "uuid": _O6_RAW_UUID,
+    }
+    assert inv_src["capability"] == "available"
+
+    samples = [
+        s
+        for s in bundle.samples["resource-samples"]
+        if s.source_id == NVIDIA_DEVICE_SOURCE_ID
+    ]
+    assert len(samples) >= 2
+    assert samples[0].subject["kind"] == "physical_gpu"
+    assert samples[0].subject["device_uuid"] == _O6_CANONICAL_UUID
+    assert samples[0].subject["shared_device_not_exclusive"] is True
+    assert samples[0].subject["per_process_attribution"] is False
+    assert samples[0].subject["evidence"] == {
+        "vendor_timestamp": "2026/11/24 12:00:01.000",
+        "mig_mode": "disabled",
+        "mig_ambiguous": False,
+    }
+    assert samples[1].subject["evidence"]["vendor_timestamp"] == "2026/11/24 12:00:02.000"
+
+    assert bundle.summary is not None
+    by_qty = {q.quantity_id: q for q in bundle.summary.quantities}
+    busy_summary = by_qty["device.busy_fraction"]
+    assert busy_summary.statistic == "vendor_window_mean"
+    assert busy_summary.window == "vendor_recent_window_unknown_bounds"
+    assert busy_summary.continuous_window_integrated is False
+    assert busy_summary.observation_min == pytest.approx(0.20)
+    assert busy_summary.observation_max == pytest.approx(0.80)
+    assert busy_summary.observation_mean == pytest.approx(0.50)
+
+    used_summary = by_qty["device.framebuffer.used_bytes"]
+    assert used_summary.statistic == "gauge"
+    assert used_summary.sampled_min == 1024 * 1024 * 1024
+    assert used_summary.sampled_max == 2048 * 1024 * 1024
+    assert used_summary.sampled_max_is_lower_bound is True
+
+    total_summary = by_qty["device.framebuffer.total_bytes"]
+    assert total_summary.statistic == "capacity"
+    assert total_summary.latest_value == 40960 * 1024 * 1024
+
+    status = bundle.statuses["resource-samples"]
+    assert status.source_status[NVIDIA_DEVICE_SOURCE_ID] == "available"
+    assert status.data_completeness == "complete"
+    assert status.unavailable_fields is None
+
+
+def test_o6_partial_unselected_sibling_keeps_selected_subset_available_and_complete(
+    tmp_path: Path,
+) -> None:
+    """An unselected failing sibling field must not degrade selected quantities."""
+
+    identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, _O6_RAW_UUID)
+
+    def _partial_runner(argv: list[str], **kwargs: Any) -> NvidiaDeviceCommandResult:
+        del argv, kwargs
+        return NvidiaDeviceCommandResult(
+            returncode=0,
+            stdout=f"{_O6_CANONICAL_UUID}, 2026/11/24 12:05:00.000, 512, 40960, [Not Supported], Disabled\n",
+        )
+
+    # Subset excluding busy_fraction stays available & complete.
+    subset_cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            quantities=("device.framebuffer.used_bytes", "device.framebuffer.total_bytes"),
+            identity=identity,
+            probe=NvidiaSmiDeviceProbe(identity=identity, command_runner=_partial_runner),
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_subset", device="cuda:0"),
+        runtime_callbacks=[subset_cb],
+    ) as ctx:
+        subset_dir = ctx.run_dir
+
+    subset_bundle = inspect_run_observability(subset_dir).invocations[0]
+    assert subset_bundle.statuses["resource-samples"].source_status[NVIDIA_DEVICE_SOURCE_ID] == "available"
+    assert subset_bundle.derived_data_completeness == "complete"
+
+    # Full 3-quantity selection marks partial cleanly.
+    full_cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity=identity,
+            probe=NvidiaSmiDeviceProbe(identity=identity, command_runner=_partial_runner),
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_partial", device="cuda:0"),
+        runtime_callbacks=[full_cb],
+    ) as ctx:
+        full_dir = ctx.run_dir
+
+    full_bundle = inspect_run_observability(full_dir).invocations[0]
+    assert full_bundle.statuses["resource-samples"].source_status[NVIDIA_DEVICE_SOURCE_ID] == "partial"
+    assert full_bundle.derived_data_completeness == "partial"
+
+
+def test_o6_mig_ambiguity_and_unavailable_executable_persist_typed_unavailable(
+    tmp_path: Path,
+) -> None:
+    """MIG ambiguity and missing executable record typed unavailable evidence without crashing."""
+
+    identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, _O6_RAW_UUID)
+
+    def _mig_runner(argv: list[str], **kwargs: Any) -> NvidiaDeviceCommandResult:
+        del argv, kwargs
+        return NvidiaDeviceCommandResult(
+            returncode=0,
+            stdout=f"{_O6_CANONICAL_UUID}, 2026/11/24 12:10:00.000, 512, 40960, 40, Enabled\n",
+        )
+
+    mig_cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity=identity,
+            probe=NvidiaSmiDeviceProbe(identity=identity, command_runner=_mig_runner),
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_mig", device="cuda:0"),
+        runtime_callbacks=[mig_cb],
+    ) as ctx:
+        mig_dir = ctx.run_dir
+
+    mig_bundle = inspect_run_observability(mig_dir).invocations[0]
+    mig_samples = mig_bundle.samples["resource-samples"]
+    assert len(mig_samples) >= 2
+    assert mig_samples[0].subject["evidence"]["mig_mode"] == "enabled"
+    assert mig_samples[0].subject["evidence"]["mig_ambiguous"] is True
+    for qty_id in NVIDIA_DEVICE_QUANTITY_IDS:
+        r = mig_samples[0].readings[qty_id]
+        assert r.status == "unavailable"
+        assert r.reason_code == "mig_subdevice_ambiguous"
+        assert r.value is None
+    assert mig_bundle.statuses["resource-samples"].source_status[NVIDIA_DEVICE_SOURCE_ID] == "unavailable"
+
+    # Missing executable path
+    missing_cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity=identity,
+            executable=tmp_path / "no-such-nvidia-smi",
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_missing_exe", device="cuda:0"),
+        runtime_callbacks=[missing_cb],
+    ) as ctx:
+        missing_dir = ctx.run_dir
+
+    missing_bundle = inspect_run_observability(missing_dir).invocations[0]
+    assert missing_bundle.inventory is not None
+    assert (
+        missing_bundle.inventory.sources[NVIDIA_DEVICE_SOURCE_ID]["unavailable_reason_code"]
+        == "executable_unavailable"
+    )
+    missing_sample = missing_bundle.samples["resource-samples"][0]
+    for qty_id in NVIDIA_DEVICE_QUANTITY_IDS:
+        assert missing_sample.readings[qty_id].status == "unavailable"
+        assert missing_sample.readings[qty_id].reason_code == "executable_unavailable"
+
+
+def test_o6_allocator_current_peak_reset_ownership_and_nvidia_device_isolation(
+    tmp_path: Path,
+) -> None:
+    """NvidiaDeviceSource never claims allocator_reset or resets peaks; allocator keeps sole ownership."""
+
+    identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, _O6_RAW_UUID)
+
+    # 1. NvidiaDeviceSource alone emits ZERO allocator_reset claims.
+    nd_only = ResourceSamples(
+        nvidia_device=NvidiaDeviceSource(enabled=True, identity=identity),
+    )
+    nd_claims = nd_only.ownership_claims(
+        cfg=_base_cfg(tmp_path / "claims_only", device="cuda:0"),
+        run_dir=tmp_path / "claims_only",
+    )
+    assert all(c.kind != "allocator_reset" for c in nd_claims)
+
+    # 2. Combined with AllocatorSource(reset_peaks=True): exactly one reset from allocator,
+    #    and NvidiaDeviceSource reuses allocator's resolved identity without resetting peaks.
+    reset_calls: list[str] = []
+    seen_identities: list[str] = []
+
+    class _FakeCurrentProbe:
+        def __init__(self, device: Any) -> None:
+            self._device = device
+
+        def identity(self) -> AcceleratorIdentity:
+            return identity
+
+        def available(self) -> bool:
+            return True
+
+        def read(self) -> AllocatorCurrentUsage:
+            return AllocatorCurrentUsage(
+                identity=identity,
+                allocated_bytes=10 * 1024 * 1024,
+                reserved_bytes=20 * 1024 * 1024,
+                device_count=1,
+            )
+
+    class _FakePeakProbe:
+        def __init__(self, device: Any) -> None:
+            self._device = device
+
+        def identity(self) -> AcceleratorIdentity:
+            return identity
+
+        def available(self) -> bool:
+            return True
+
+        def reset(self) -> AcceleratorIdentity:
+            reset_calls.append(str(self._device))
+            return identity
+
+        def read(self) -> AllocatorUsage:
+            return AllocatorUsage(
+                identity=identity,
+                allocated_mb=32.0,
+                reserved_mb=64.0,
+                device_count=1,
+            )
+
+    def _runner(argv: list[str], **kwargs: Any) -> NvidiaDeviceCommandResult:
+        del kwargs
+        seen_identities.append(argv[2])
+        return NvidiaDeviceCommandResult(
+            returncode=0,
+            stdout=f"{_O6_CANONICAL_UUID}, 2026/11/24 12:15:00.000, 1024, 40960, 25, Disabled\n",
+        )
+
+    combined = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        allocator=AllocatorSource(
+            enabled=True,
+            include_current=True,
+            include_peak=True,
+            reset_peaks=True,
+            current_probe_factory=_FakeCurrentProbe,
+            peak_probe_factory=_FakePeakProbe,
+        ),
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            probe=NvidiaSmiDeviceProbe(identity=identity, command_runner=_runner),
+        ),
+    )
+    combined_claims = combined.ownership_claims(
+        cfg=_base_cfg(tmp_path / "claims_combined", device="cuda:0"),
+        run_dir=tmp_path / "claims_combined",
+    )
+    reset_claims = [c for c in combined_claims if c.kind == "allocator_reset"]
+    assert len(reset_claims) == 1
+
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_combined", device="cuda:0"),
+        runtime_callbacks=[combined],
+    ) as ctx:
+        combined_dir = ctx.run_dir
+
+    # Allocator peak reset occurred strictly once (never silently reset by nvidia-smi probe).
+    assert reset_calls == ["cuda:0"]
+    assert seen_identities and all(u == _O6_CANONICAL_UUID for u in seen_identities)
+
+    bundle = inspect_run_observability(combined_dir).invocations[0]
+    assert bundle.descriptors is not None
+    q_descs = bundle.descriptors.quantities
+    assert q_descs["allocator.current.allocated_bytes"].statistic == "gauge"
+    assert q_descs["allocator.current.allocated_bytes"].subject_kind == "process_allocator"
+    assert q_descs["allocator.peak.allocated_bytes"].statistic == "high_water"
+    assert q_descs["allocator.peak.allocated_bytes"].window == "allocator_reset_window"
+    assert q_descs["device.framebuffer.used_bytes"].statistic == "gauge"
+    assert q_descs["device.framebuffer.used_bytes"].subject_kind == "physical_gpu"
+    assert q_descs["device.busy_fraction"].statistic == "vendor_window_mean"
+
+    # 3. Verify NvidiaDeviceSource(identity=None, probe=None) reuses allocator's
+    #    resolved AcceleratorIdentity for the same device without calling Torch
+    #    again or resetting peaks.
+    fake_exe_impl = tmp_path / "reuse_nvidia_smi.impl.py"
+    fake_exe_impl.write_text(
+        "import sys\n"
+        f"assert sys.argv[1:3] == ['-i', {_O6_CANONICAL_UUID!r}], sys.argv\n"
+        f"print('{_O6_CANONICAL_UUID}, 2026/11/24 12:16:00.000, 256, 40960, 10, Disabled')\n",
+        encoding="utf-8",
+    )
+    fake_exe = tmp_path / "reuse_nvidia_smi.sh"
+    fake_exe.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(fake_exe_impl))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_exe.chmod(0o755)
+    reset_calls.clear()
+    reuse_cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        allocator=AllocatorSource(
+            enabled=True,
+            include_current=True,
+            include_peak=True,
+            reset_peaks=True,
+            current_probe_factory=_FakeCurrentProbe,
+            peak_probe_factory=_FakePeakProbe,
+        ),
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            executable=fake_exe,
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_reuse", device="cuda:0"),
+        runtime_callbacks=[reuse_cb],
+    ) as ctx:
+        reuse_dir = ctx.run_dir
+    assert reset_calls == ["cuda:0"]
+    reuse_bundle = inspect_run_observability(reuse_dir).invocations[0]
+    assert reuse_bundle.derived_data_completeness == "complete"
+    assert reuse_bundle.inventory is not None
+    assert reuse_bundle.inventory.sources[NVIDIA_DEVICE_SOURCE_ID]["selected_identity"] == {
+        "kind": "cuda",
+        "index": 0,
+        "uuid": _O6_RAW_UUID,
+    }
+
+    # 4. Verify identity_resolver errors are contained cleanly without crashing runs.
+    failing_resolver_cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity_resolver=lambda _dev: (_ for _ in ()).throw(
+                RuntimeError("boom resolver")
+            ),
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_bad_resolver", device="cuda:0"),
+        runtime_callbacks=[failing_resolver_cb],
+    ) as ctx:
+        bad_res_dir = ctx.run_dir
+    bad_bundle = inspect_run_observability(bad_res_dir).invocations[0]
+    assert bad_bundle.derived_lifecycle_state == "closed"
+    bad_sample = bad_bundle.samples["resource-samples"][0]
+    assert bad_sample.readings["device.busy_fraction"].status == "error"
+    assert bad_sample.readings["device.busy_fraction"].reason_code == "identity_resolution_failed"
+
+
+def test_o6_disabled_mode_plain_mapping_yaml_and_torch_free_imports(
+    tmp_path: Path,
+) -> None:
+    """Disabled mode emits nothing; plain-mapping YAML works; callback imports stay Torch-free."""
+
+    called = False
+
+    def _never_called(argv: list[str], **kwargs: Any) -> NvidiaDeviceCommandResult:
+        nonlocal called
+        called = True
+        raise AssertionError("disabled ResourceSamples must not invoke nvidia-smi")
+
+    identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, _O6_RAW_UUID)
+    disabled_cb = ResourceSamples(
+        enabled=False,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity=identity,
+            probe=NvidiaSmiDeviceProbe(identity=identity, command_runner=_never_called),
+        ),
+    )
+    assert disabled_cb.ownership_claims(run_dir=tmp_path / "disabled") == []
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_disabled", device="cuda:0"),
+        runtime_callbacks=[disabled_cb],
+    ) as ctx:
+        disabled_dir = ctx.run_dir
+    assert not called
+    assert inspect_run_observability(disabled_dir).invocations == ()
+
+    # Plain-mapping YAML with fake executable script
+    fake_exe_impl = tmp_path / "yaml_nvidia_smi.impl.py"
+    fake_exe_impl.write_text(
+        f"print('{_O6_CANONICAL_UUID}, 2026/11/24 12:20:00.000, 4096, 81920, 75, Disabled')\n",
+        encoding="utf-8",
+    )
+    fake_exe = tmp_path / "yaml_nvidia_smi.sh"
+    fake_exe.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(fake_exe_impl))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_exe.chmod(0o755)
+    out_root = tmp_path / "yaml_out" / "outputs"
+    yaml_text = f"""
+experiment:
+  name: o6_plain_yaml
+  sector: unit
+run:
+  root: {json.dumps(str(out_root))}
+  layout: flat
+  run_id: o6-plain-run
+  timezone: UTC
+runtime:
+  device: cpu
+  dtype: float64
+callbacks:
+  - _target_: tpen.callback.ResourceSamples
+    interval_seconds: 60.0
+    max_pending_envelopes: 16
+    nvidia_device:
+      enabled: true
+      timeout_seconds: 5.0
+      executable: {json.dumps(str(fake_exe))}
+      identity:
+        kind: cuda
+        index: 0
+        uuid: {json.dumps(_O6_RAW_UUID)}
+loggers: []
+runner:
+  _target_: {__name__}._NoopRunner
+"""
+    cfg = OmegaConf.create(yaml_text)
+    assert run_from_config(cfg, raise_exceptions=True) == 0
+
+    bundle = inspect_run_observability(out_root / "o6-plain-run").invocations[0]
+    assert bundle.derived_lifecycle_state == "closed"
+    assert bundle.derived_data_completeness == "complete"
+    nd_samples = [
+        s
+        for s in bundle.samples["resource-samples"]
+        if s.source_id == NVIDIA_DEVICE_SOURCE_ID
+    ]
+    assert len(nd_samples) >= 2
+    assert nd_samples[0].readings["device.framebuffer.used_bytes"].value == 4096 * 1024 * 1024
+    assert nd_samples[0].readings["device.busy_fraction"].value == pytest.approx(0.75)
+
+    profile_check = check_profile(cfg, NATIVE_RECOVERY_PROFILE)
+    assert profile_check.verdict == "refused"
+    assert profile_check.refusal is not None
+    assert profile_check.refusal["code"] == "unsupported-callback"
+
+    # Fresh-subprocess Torch-free and psutil-free import check
+    code = (
+        "import sys\n"
+        "import tpen._nvidia_smi\n"
+        "import tpen.accelerator\n"
+        "import tpen.callback\n"
+        "from tpen.callback import NvidiaDeviceSource, ResourceSamples\n"
+        "import tpen.callback.resource_samples\n"
+        "cb = ResourceSamples(nvidia_device=NvidiaDeviceSource(enabled=True))\n"
+        "assert 'torch' not in sys.modules, 'torch imported'\n"
+        "assert 'psutil' not in sys.modules, 'psutil imported'\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+
+
+def test_o6_review_t2_normal_teardown_cancel_of_healthy_inflight_poll_stays_complete(
+    tmp_path: Path,
+) -> None:
+    """T2 (F2): cancelling an in-flight healthy background poll during normal close() must stay complete."""
+
+    identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, _O6_RAW_UUID)
+    call_lock = threading.Lock()
+    call_count = 0
+    inflight_entered = threading.Event()
+
+    def _runner(argv: list[str], **kwargs: Any) -> NvidiaDeviceCommandResult:
+        nonlocal call_count
+        del argv
+        with call_lock:
+            call_count += 1
+            seq = call_count
+        cancel_event = kwargs.get("cancel_event")
+        if seq == 1:
+            return NvidiaDeviceCommandResult(
+                returncode=0,
+                stdout=(
+                    f"{_O6_CANONICAL_UUID}, 2026/11/24 12:50:01.000, "
+                    "1024, 40960, 20, Disabled\n"
+                ),
+            )
+        if seq == 2:
+            inflight_entered.set()
+            if cancel_event is not None:
+                cancel_event.wait(timeout=5.0)
+                if cancel_event.is_set():
+                    return NvidiaDeviceCommandResult(
+                        returncode=None,
+                        stdout="",
+                        cancelled=True,
+                        error_reason_code="read_cancelled",
+                        error_detail="nvidia-smi read cancelled during execution",
+                    )
+            return NvidiaDeviceCommandResult(
+                returncode=0,
+                stdout=(
+                    f"{_O6_CANONICAL_UUID}, 2026/11/24 12:50:02.000, "
+                    "1536, 40960, 30, Disabled\n"
+                ),
+            )
+        return NvidiaDeviceCommandResult(
+            returncode=0,
+            stdout=(
+                f"{_O6_CANONICAL_UUID}, 2026/11/24 12:50:03.000, "
+                "2048, 40960, 40, Disabled\n"
+            ),
+        )
+
+    probe = NvidiaSmiDeviceProbe(identity=identity, command_runner=_runner)
+    cb = ResourceSamples(
+        interval_seconds=0.02,
+        max_pending_envelopes=16,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity=identity,
+            probe=probe,
+        ),
+    )
+
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_t2", device="cuda:0"),
+        runtime_callbacks=[cb],
+    ) as ctx:
+        run_dir = ctx.run_dir
+        assert inflight_entered.wait(timeout=5.0)
+
+    bundle = inspect_observability_bundle(
+        inspect_run_observability(run_dir).invocations[0].bundle_dir
+    )
+    assert bundle.derived_lifecycle_state == "closed"
+    assert (
+        bundle.statuses["resource-samples"].source_status[NVIDIA_DEVICE_SOURCE_ID]
+        == "available"
+    )
+    assert bundle.derived_data_completeness == "complete"
+    assert bundle.statuses["resource-samples"].unavailable_fields is None
+    nd_samples = [
+        s
+        for s in bundle.samples["resource-samples"]
+        if s.source_id == NVIDIA_DEVICE_SOURCE_ID
+    ]
+    assert len(nd_samples) >= 2
+    for sample in nd_samples:
+        assert all(r.status == "ok" for r in sample.readings.values())
+
+
+def test_o6_review_t5_injected_probe_identity_not_overridden_by_allocator_reuse(
+    tmp_path: Path,
+) -> None:
+    """T5 (F5): injected probe.identity must take precedence over allocator's resolved CPU identity."""
+
+    cuda_identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, _O6_RAW_UUID)
+
+    def _ok_runner(argv: list[str], **kwargs: Any) -> NvidiaDeviceCommandResult:
+        del argv, kwargs
+        return NvidiaDeviceCommandResult(
+            returncode=0,
+            stdout=(
+                f"{_O6_CANONICAL_UUID}, 2026/11/24 12:52:00.000, "
+                "1024, 40960, 35, Disabled\n"
+            ),
+        )
+
+    cb = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        allocator=AllocatorSource(
+            enabled=True,
+            include_current=True,
+            include_peak=False,
+            reset_peaks=False,
+        ),
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            probe=NvidiaSmiDeviceProbe(
+                identity=cuda_identity,
+                command_runner=_ok_runner,
+            ),
+        ),
+    )
+
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_t5", device="cpu"),
+        runtime_callbacks=[cb],
+    ) as ctx:
+        run_dir = ctx.run_dir
+
+    bundle = inspect_observability_bundle(
+        inspect_run_observability(run_dir).invocations[0].bundle_dir
+    )
+    assert bundle.inventory is not None
+    assert bundle.inventory.sources[NVIDIA_DEVICE_SOURCE_ID]["selected_identity"] == {
+        "kind": "cuda",
+        "index": 0,
+        "uuid": _O6_RAW_UUID,
+    }
+    nd_samples = [
+        s
+        for s in bundle.samples["resource-samples"]
+        if s.source_id == NVIDIA_DEVICE_SOURCE_ID
+    ]
+    assert len(nd_samples) >= 2
+    for sample in nd_samples:
+        assert sample.subject["backend"] == "cuda"
+        assert sample.subject["device_index"] == 0
+        assert sample.subject["device_uuid"] == _O6_CANONICAL_UUID
+
+
+def test_o6_review_t7_differing_devices_close_timeout_yaml_subset_and_mig_summary_coverage(
+    tmp_path: Path,
+) -> None:
+    """T7: cover differing devices, close_timeout teardown, YAML quantity subset, and MIG summary non-fabrication."""
+
+    # (a) Differing allocator.device ("cuda:0") vs nvidia_device.device ("cuda:1")
+    gpu_a_raw = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    gpu_b_raw = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    gpu_b_canonical = f"GPU-{gpu_b_raw}"
+    id_a = AcceleratorIdentity(AcceleratorKind.CUDA, 0, gpu_a_raw)
+    id_b = AcceleratorIdentity(AcceleratorKind.CUDA, 1, gpu_b_raw)
+
+    class _FakeCurrentA:
+        def __init__(self, device: Any) -> None:
+            self._device = device
+
+        def identity(self) -> AcceleratorIdentity:
+            return id_a
+
+        def available(self) -> bool:
+            return True
+
+        def read(self) -> AllocatorCurrentUsage:
+            return AllocatorCurrentUsage(
+                identity=id_a,
+                allocated_bytes=16 * 1024 * 1024,
+                reserved_bytes=32 * 1024 * 1024,
+                device_count=2,
+            )
+
+    seen_resolver_devices: list[str] = []
+
+    def _resolve_b(device: str) -> AcceleratorIdentity:
+        seen_resolver_devices.append(device)
+        assert device == "cuda:1"
+        return id_b
+
+    fake_exe_b_impl = tmp_path / "t7a_gpu_b.impl.py"
+    fake_exe_b_impl.write_text(
+        (
+            "import sys\n"
+            f"assert sys.argv[1:3] == ['-i', {gpu_b_canonical!r}], sys.argv\n"
+            f"print('{gpu_b_canonical}, 2026/11/24 12:55:00.000, 512, 40960, 30, Disabled')\n"
+        ),
+        encoding="utf-8",
+    )
+    fake_exe_b = tmp_path / "t7a_gpu_b.sh"
+    fake_exe_b.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -S {shlex.quote(str(fake_exe_b_impl))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_exe_b.chmod(0o755)
+
+    cb_a = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        allocator=AllocatorSource(
+            enabled=True,
+            device="cuda:0",
+            include_current=True,
+            include_peak=False,
+            reset_peaks=False,
+            current_probe_factory=_FakeCurrentA,
+        ),
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            device="cuda:1",
+            identity_resolver=_resolve_b,
+            executable=fake_exe_b,
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_t7a", device="cuda:0"),
+        runtime_callbacks=[cb_a],
+    ) as ctx:
+        dir_a = ctx.run_dir
+
+    assert seen_resolver_devices == ["cuda:1"]
+    bundle_a = inspect_observability_bundle(
+        inspect_run_observability(dir_a).invocations[0].bundle_dir
+    )
+    assert bundle_a.inventory is not None
+    assert bundle_a.inventory.sources[NVIDIA_DEVICE_SOURCE_ID]["selected_identity"] == {
+        "kind": "cuda",
+        "index": 1,
+        "uuid": gpu_b_raw,
+    }
+    nd_samples_a = [
+        s
+        for s in bundle_a.samples["resource-samples"]
+        if s.source_id == NVIDIA_DEVICE_SOURCE_ID
+    ]
+    assert len(nd_samples_a) >= 2
+    for sample in nd_samples_a:
+        assert sample.subject["device_uuid"] == gpu_b_canonical
+        assert sample.subject["device_index"] == 1
+
+    # (b) Bounded close_timeout_seconds teardown on hanging final nvidia-smi read
+    cuda_identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, _O6_RAW_UUID)
+    marker_file = tmp_path / "t7b_first_done.marker"
+    sleep_pid_file = tmp_path / "t7b_sleep.pid"
+    sleep_pid_tmp = tmp_path / "t7b_sleep.pid.tmp"
+    hang_impl = tmp_path / "t7b_hang_second.impl.py"
+    hang_impl.write_text(
+        (
+            "import os, time\n"
+            f"marker = {str(marker_file)!r}\n"
+            "if not os.path.exists(marker):\n"
+            "    with open(marker, 'w', encoding='utf-8') as f:\n"
+            "        f.write('1')\n"
+            f"    print('{_O6_CANONICAL_UUID}, 2026/11/24 12:56:00.000, 1024, 40960, 15, Disabled')\n"
+            "else:\n"
+            f"    with open({str(sleep_pid_tmp)!r}, 'w', encoding='utf-8') as f:\n"
+            "        f.write(str(os.getpid()))\n"
+            "        f.flush()\n"
+            "        os.fsync(f.fileno())\n"
+            f"    os.replace({str(sleep_pid_tmp)!r}, {str(sleep_pid_file)!r})\n"
+            "    time.sleep(30.0)\n"
+        ),
+        encoding="utf-8",
+    )
+    hang_script = tmp_path / "t7b_hang_second.sh"
+    hang_script.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -S {shlex.quote(str(hang_impl))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    hang_script.chmod(0o755)
+
+    cb_b = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        close_timeout_seconds=0.6,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity=cuda_identity,
+            executable=hang_script,
+            timeout_seconds=5.0,
+        ),
+    )
+    sleep_pid: int | None = None
+    try:
+        with open_run_context(
+            _base_cfg(tmp_path / "run_o6_t7b", device="cuda:0"),
+            runtime_callbacks=[cb_b],
+        ) as ctx:
+            dir_b = ctx.run_dir
+            t_close_start = time.monotonic()
+        close_elapsed = time.monotonic() - t_close_start
+        assert close_elapsed < 3.5
+        assert sleep_pid_file.exists()
+        sleep_pid = int(sleep_pid_file.read_text(encoding="utf-8").strip())
+        with pytest.raises(ProcessLookupError):
+            os.kill(sleep_pid, 0)
+    finally:
+        if sleep_pid is None and sleep_pid_file.exists():
+            raw = sleep_pid_file.read_text(encoding="utf-8").strip()
+            if raw.isdigit():
+                sleep_pid = int(raw)
+        if sleep_pid is not None:
+            try:
+                os.kill(sleep_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    bundle_b = inspect_observability_bundle(
+        inspect_run_observability(dir_b).invocations[0].bundle_dir
+    )
+    assert bundle_b.derived_lifecycle_state == "closed"
+
+    # (c) Plain-mapping Hydra YAML with quantities list subset under Typeguard
+    yaml_exe_impl = tmp_path / "t7c_yaml.impl.py"
+    yaml_exe_impl.write_text(
+        f"print('{_O6_CANONICAL_UUID}, 2026/11/24 12:57:00.000, 2048, 81920, 45, Disabled')\n",
+        encoding="utf-8",
+    )
+    yaml_exe = tmp_path / "t7c_yaml.sh"
+    yaml_exe.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -S {shlex.quote(str(yaml_exe_impl))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    yaml_exe.chmod(0o755)
+    yaml_out_root = tmp_path / "t7c_out" / "outputs"
+    yaml_text = f"""
+experiment:
+  name: o6_t7c_yaml_subset
+  sector: unit
+run:
+  root: {json.dumps(str(yaml_out_root))}
+  layout: flat
+  run_id: o6-t7c-run
+  timezone: UTC
+runtime:
+  device: cpu
+  dtype: float64
+callbacks:
+  - _target_: tpen.callback.ResourceSamples
+    interval_seconds: 60.0
+    max_pending_envelopes: 16
+    nvidia_device:
+      enabled: true
+      timeout_seconds: 5.0
+      executable: {json.dumps(str(yaml_exe))}
+      quantities:
+        - device.framebuffer.used_bytes
+        - device.busy_fraction
+      identity:
+        kind: cuda
+        index: 0
+        uuid: {json.dumps(_O6_RAW_UUID)}
+loggers: []
+runner:
+  _target_: {__name__}._NoopRunner
+"""
+    cfg_c = OmegaConf.create(yaml_text)
+    assert run_from_config(cfg_c, raise_exceptions=True) == 0
+    bundle_c = inspect_observability_bundle(
+        inspect_run_observability(yaml_out_root / "o6-t7c-run").invocations[0].bundle_dir
+    )
+    assert bundle_c.derived_lifecycle_state == "closed"
+    assert bundle_c.derived_data_completeness == "complete"
+    nd_samples_c = [
+        s
+        for s in bundle_c.samples["resource-samples"]
+        if s.source_id == NVIDIA_DEVICE_SOURCE_ID
+    ]
+    assert len(nd_samples_c) >= 2
+    expected_subset = {"device.framebuffer.used_bytes", "device.busy_fraction"}
+    for sample in nd_samples_c:
+        assert set(sample.readings.keys()) == expected_subset
+        assert all(r.status == "ok" for r in sample.readings.values())
+
+    # (d) O2 summary non-fabrication on MIG ambiguity
+    def _mig_runner(argv: list[str], **kwargs: Any) -> NvidiaDeviceCommandResult:
+        del argv, kwargs
+        return NvidiaDeviceCommandResult(
+            returncode=0,
+            stdout=(
+                f"{_O6_CANONICAL_UUID}, 2026/11/24 12:58:00.000, "
+                "512, 40960, 40, Enabled\n"
+            ),
+        )
+
+    cb_d = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        nvidia_device=NvidiaDeviceSource(
+            enabled=True,
+            identity=cuda_identity,
+            probe=NvidiaSmiDeviceProbe(
+                identity=cuda_identity,
+                command_runner=_mig_runner,
+            ),
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_o6_t7d", device="cuda:0"),
+        runtime_callbacks=[cb_d],
+    ) as ctx:
+        dir_d = ctx.run_dir
+
+    bundle_d = inspect_observability_bundle(
+        inspect_run_observability(dir_d).invocations[0].bundle_dir
+    )
+    assert bundle_d.summary is not None
+    for qty_id in NVIDIA_DEVICE_QUANTITY_IDS:
+        qty_summary = bundle_d.summary.quantity(NVIDIA_DEVICE_SOURCE_ID, qty_id)
+        assert qty_summary is not None
+        assert qty_summary.ok_count == 0
+        assert qty_summary.unavailable_count >= 2
+        assert qty_summary.reason_codes == ("mig_subdevice_ambiguous",)
+        assert qty_summary.observation_min is None
+        assert qty_summary.observation_max is None
+        assert qty_summary.observation_mean is None
+        assert qty_summary.sampled_min is None
+        assert qty_summary.sampled_max is None
+        assert qty_summary.latest_value is None
+
 
 
 

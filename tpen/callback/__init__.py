@@ -196,6 +196,7 @@ def __getattr__(name: str) -> object:
         "LinuxCgroupV2Source",
         "LinuxMemorySource",
         "LinuxProcessTreeSource",
+        "NvidiaDeviceSource",
         "RUsageSource",
         "ResourceSamples",
     }:
@@ -247,6 +248,7 @@ __all__ = [
     "ManagedLifecycleError",
     "Metadata",
     "ModuleNorms",
+    "NvidiaDeviceSource",
     "OptimizerState",
     "ParameterActivity",
     "RUsageSource",

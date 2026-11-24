@@ -35,6 +35,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -47,6 +48,18 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, ContextManager
 
+from tpen.accelerator import (
+    AcceleratorIdentity,
+    AcceleratorKind,
+    DEFAULT_NVIDIA_SMI_EXECUTABLE,
+    DEFAULT_NVIDIA_SMI_MAX_OUTPUT_BYTES,
+    DEFAULT_NVIDIA_SMI_TIMEOUT_SECONDS,
+    MAX_NVIDIA_SMI_TIMEOUT_SECONDS,
+    NvidiaDeviceReading,
+    NvidiaDeviceUnavailable,
+    NvidiaSmiDeviceProbe,
+    canonicalize_nvidia_device_uuid,
+)
 from tpen.artifacts import ArtifactRoutingError
 from tpen.callback.base import (
     Callback,
@@ -115,12 +128,14 @@ ALLOCATOR_SOURCE_ID = "torch-allocator"
 LINUX_MEMORY_SOURCE_ID = "linux-memory"
 LINUX_PROCESS_TREE_SOURCE_ID = "linux-process-tree"
 LINUX_CGROUP_V2_SOURCE_ID = "linux-cgroup-v2"
+NVIDIA_DEVICE_SOURCE_ID = "nvidia-smi-device"
 
 RUSAGE_EXECUTION_MODE = "in_process_thread"
 ALLOCATOR_EXECUTION_MODE = "in_process_cooperative"
 LINUX_MEMORY_EXECUTION_MODE = "in_process_thread"
 LINUX_PROCESS_TREE_EXECUTION_MODE = "in_process_thread"
 LINUX_CGROUP_V2_EXECUTION_MODE = "in_process_thread"
+NVIDIA_DEVICE_EXECUTION_MODE = "supervised_subprocess"
 
 RUSAGE_QUANTITY_IDS: tuple[str, ...] = (
     "process.rusage.user_cpu_seconds",
@@ -170,6 +185,13 @@ ALLOCATOR_PEAK_QUANTITY_IDS: tuple[str, ...] = (
     "allocator.peak.allocated_bytes",
     "allocator.peak.reserved_bytes",
 )
+
+NVIDIA_DEVICE_QUANTITY_IDS: tuple[str, ...] = (
+    "device.framebuffer.used_bytes",
+    "device.framebuffer.total_bytes",
+    "device.busy_fraction",
+)
+DEFAULT_NVIDIA_DEVICE_QUANTITIES: tuple[str, ...] = NVIDIA_DEVICE_QUANTITY_IDS
 
 _FORBIDDEN_SELECTOR_KWARGS: frozenset[str] = frozenset(
     {
@@ -1194,6 +1216,250 @@ class AllocatorSource:
         return out
 
 
+def _coerce_accelerator_identity(
+    raw: AcceleratorIdentity | Mapping[str, Any] | None,
+) -> AcceleratorIdentity | None:
+    """Strictly coerce an explicit ``AcceleratorIdentity`` or plain mapping."""
+
+    if raw is None:
+        return None
+    if type(raw) is AcceleratorIdentity:
+        if not isinstance(raw.kind, AcceleratorKind):
+            raise TypeError(
+                f"NvidiaDeviceSource.identity.kind must be AcceleratorKind, "
+                f"got {type(raw.kind).__name__}"
+            )
+        if raw.index is not None and (type(raw.index) is not int or raw.index < 0):
+            raise ValueError(
+                f"NvidiaDeviceSource.identity.index must be a non-negative int or None, "
+                f"got {raw.index!r}"
+            )
+        if raw.uuid is not None and type(raw.uuid) is not str:
+            raise TypeError(
+                f"NvidiaDeviceSource.identity.uuid must be str or None, "
+                f"got {type(raw.uuid).__name__}"
+            )
+        return raw
+    if isinstance(raw, AcceleratorIdentity):
+        raise TypeError(
+            "NvidiaDeviceSource.identity must be exact AcceleratorIdentity, "
+            f"mapping, or None; got subclass {type(raw).__name__}"
+        )
+    if not isinstance(raw, Mapping):
+        raise TypeError(
+            "NvidiaDeviceSource.identity must be AcceleratorIdentity, mapping, or None; "
+            f"got {type(raw).__name__}"
+        )
+    _reject_forbidden_selector_keys(raw, owner="NvidiaDeviceSource.identity")
+    allowed_keys = frozenset({"kind", "index", "uuid"})
+    raw_keys = set(raw.keys())
+    for key in raw_keys:
+        if type(key) is not str:
+            raise TypeError(
+                f"NvidiaDeviceSource.identity keys must be strings, got {type(key).__name__}"
+            )
+    extra = sorted(raw_keys - allowed_keys)
+    if extra:
+        raise ValueError(
+            f"NvidiaDeviceSource.identity has unsupported key(s): {extra}"
+        )
+    if "kind" not in raw:
+        raise ValueError("NvidiaDeviceSource.identity requires 'kind'")
+
+    raw_kind = raw["kind"]
+    if isinstance(raw_kind, AcceleratorKind):
+        kind = raw_kind
+    elif type(raw_kind) is str and raw_kind.strip():
+        try:
+            kind = AcceleratorKind(raw_kind.strip().lower())
+        except ValueError as exc:
+            raise ValueError(
+                f"unsupported NvidiaDeviceSource.identity.kind {raw_kind!r}; "
+                f"expected one of {[k.value for k in AcceleratorKind]}"
+            ) from exc
+    else:
+        raise TypeError(
+            "NvidiaDeviceSource.identity.kind must be AcceleratorKind or nonempty str, "
+            f"got {type(raw_kind).__name__}"
+        )
+
+    raw_index = raw.get("index")
+    if raw_index is not None:
+        if type(raw_index) is not int:
+            raise TypeError(
+                "NvidiaDeviceSource.identity.index must be int or None, "
+                f"got {type(raw_index).__name__}"
+            )
+        if raw_index < 0:
+            raise ValueError(
+                f"NvidiaDeviceSource.identity.index must be >= 0, got {raw_index}"
+            )
+    raw_uuid = raw.get("uuid")
+    if raw_uuid is not None:
+        if type(raw_uuid) is not str:
+            raise TypeError(
+                "NvidiaDeviceSource.identity.uuid must be str or None, "
+                f"got {type(raw_uuid).__name__}"
+            )
+        if not raw_uuid.strip():
+            raise ValueError(
+                "NvidiaDeviceSource.identity.uuid must be a nonempty string or None"
+            )
+    return AcceleratorIdentity(kind=kind, index=raw_index, uuid=raw_uuid)
+
+
+@dataclass(frozen=True)
+class NvidiaDeviceSource:
+    """Configuration for explicit, bounded NVIDIA physical-GPU ``nvidia-smi`` sampling.
+
+    Targets strictly the already-selected physical :class:`AcceleratorIdentity`
+    via a supervised bounded subprocess (``<= 10.0`` s maximum), recording
+    whole-device framebuffer usage/total and recent vendor-window busy fraction
+    with explicit shared-device caveats and MIG/subdevice ambiguity refusal.
+    Never claims ``allocator_reset`` authority and never resets allocator peaks.
+    """
+
+    enabled: bool = True
+    source_id: str = NVIDIA_DEVICE_SOURCE_ID
+    execution_mode: str = NVIDIA_DEVICE_EXECUTION_MODE
+    interval_seconds: float | None = None
+    quantities: tuple[str, ...] = DEFAULT_NVIDIA_DEVICE_QUANTITIES
+    device: str | None = None
+    identity: AcceleratorIdentity | Mapping[str, Any] | None = None
+    executable: str | Path = DEFAULT_NVIDIA_SMI_EXECUTABLE
+    timeout_seconds: float = DEFAULT_NVIDIA_SMI_TIMEOUT_SECONDS
+    max_output_bytes: int = DEFAULT_NVIDIA_SMI_MAX_OUTPUT_BYTES
+    probe: Any = None
+    identity_resolver: Callable[[Any], Any] | None = None
+
+    def __post_init__(self) -> None:
+        _require_bool(self.enabled, "NvidiaDeviceSource.enabled")
+        validate_identifier(self.source_id, "NvidiaDeviceSource.source_id")
+        if (
+            type(self.execution_mode) is not str
+            or self.execution_mode != NVIDIA_DEVICE_EXECUTION_MODE
+        ):
+            raise ValueError(
+                f"NvidiaDeviceSource.execution_mode must be "
+                f"{NVIDIA_DEVICE_EXECUTION_MODE!r}, got {self.execution_mode!r}"
+            )
+        if self.interval_seconds is not None:
+            object.__setattr__(
+                self,
+                "interval_seconds",
+                _require_positive_finite(
+                    self.interval_seconds, "NvidiaDeviceSource.interval_seconds"
+                ),
+            )
+        if isinstance(self.quantities, (str, bytes)) or not isinstance(
+            self.quantities, Sequence
+        ):
+            raise TypeError(
+                "NvidiaDeviceSource.quantities must be a sequence of quantity IDs"
+            )
+        selected = tuple(self.quantities)
+        if not selected:
+            raise ValueError("NvidiaDeviceSource.quantities must be nonempty")
+        seen: set[str] = set()
+        allowed = frozenset(NVIDIA_DEVICE_QUANTITY_IDS)
+        for qty_id in selected:
+            if type(qty_id) is not str or qty_id not in allowed:
+                raise ValueError(
+                    f"unsupported NvidiaDeviceSource quantity {qty_id!r}; "
+                    f"expected subset of {NVIDIA_DEVICE_QUANTITY_IDS}"
+                )
+            if qty_id in seen:
+                raise ValueError(f"duplicate NvidiaDeviceSource quantity {qty_id!r}")
+            seen.add(qty_id)
+        object.__setattr__(self, "quantities", selected)
+
+        if self.device is not None:
+            if type(self.device) is not str or not self.device.strip():
+                raise ValueError(
+                    "NvidiaDeviceSource.device must be a nonempty string or None"
+                )
+            object.__setattr__(self, "device", self.device.strip())
+
+        coerced_identity = _coerce_accelerator_identity(self.identity)
+        object.__setattr__(self, "identity", coerced_identity)
+
+        if isinstance(self.executable, Path):
+            exe_text = str(self.executable)
+        elif type(self.executable) is str:
+            exe_text = self.executable
+        else:
+            raise TypeError(
+                "NvidiaDeviceSource.executable must be str or Path, "
+                f"got {type(self.executable).__name__}"
+            )
+        if not exe_text.strip() or any(ord(ch) < 32 or ord(ch) == 127 for ch in exe_text):
+            raise ValueError(
+                "NvidiaDeviceSource.executable must be a nonempty executable name or path "
+                "without control characters"
+            )
+
+        timeout_val = _require_positive_finite(
+            self.timeout_seconds, "NvidiaDeviceSource.timeout_seconds"
+        )
+        if timeout_val > MAX_NVIDIA_SMI_TIMEOUT_SECONDS:
+            raise ValueError(
+                f"NvidiaDeviceSource.timeout_seconds must be <= "
+                f"{MAX_NVIDIA_SMI_TIMEOUT_SECONDS} s, got {self.timeout_seconds!r}"
+            )
+        object.__setattr__(self, "timeout_seconds", timeout_val)
+
+        _require_positive_int(
+            self.max_output_bytes, "NvidiaDeviceSource.max_output_bytes"
+        )
+        if self.probe is not None and not callable(getattr(self.probe, "read", None)):
+            raise TypeError("NvidiaDeviceSource.probe must expose callable read()")
+        if self.identity_resolver is not None and not callable(self.identity_resolver):
+            raise TypeError(
+                "NvidiaDeviceSource.identity_resolver must be callable or None"
+            )
+
+    def descriptors(self) -> dict[str, QuantityDescriptor]:
+        """Return immutable :class:`QuantityDescriptor` map for selected quantities."""
+
+        shared_q = "shared_physical_device_not_per_process_attribution"
+        catalog: dict[str, QuantityDescriptor] = {
+            "device.framebuffer.used_bytes": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="B",
+                statistic="gauge",
+                subject_kind="physical_gpu",
+                window="read_interval",
+                native_name="memory.used",
+                native_unit="MiB",
+                conversion="multiply_by_1048576",
+                quality=(shared_q, "physical_gpu_scope_not_process_allocator"),
+            ),
+            "device.framebuffer.total_bytes": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="B",
+                statistic="capacity",
+                subject_kind="physical_gpu",
+                window="inventory_or_read_interval",
+                native_name="memory.total",
+                native_unit="MiB",
+                conversion="multiply_by_1048576",
+                quality=(shared_q, "physical_gpu_scope_not_process_allocator"),
+            ),
+            "device.busy_fraction": QuantityDescriptor(
+                source_id=self.source_id,
+                unit="1",
+                statistic="vendor_window_mean",
+                subject_kind="physical_gpu",
+                window="vendor_recent_window_unknown_bounds",
+                native_name="utilization.gpu",
+                native_unit="percent",
+                conversion="divide_by_100",
+                quality=(shared_q, "vendor_recent_window_not_extrapolated_utilization"),
+            ),
+        }
+        return {qty_id: catalog[qty_id] for qty_id in self.quantities}
+
+
 # ---------------------------------------------------------------------------
 # Reading conversion helpers
 # ---------------------------------------------------------------------------
@@ -1519,6 +1785,82 @@ def _allocator_bytes_reading(
     return ObservabilityReading(status="ok", value=int(value))
 
 
+def _nvidia_device_reading_to_readings(
+    reading: NvidiaDeviceReading,
+    quantities: Sequence[str],
+) -> dict[str, ObservabilityReading]:
+    """Convert one :class:`NvidiaDeviceReading` into tagged v1 readings."""
+
+    field_specs: dict[str, tuple[str, str]] = {
+        "device.framebuffer.used_bytes": ("framebuffer_used_bytes", "int"),
+        "device.framebuffer.total_bytes": ("framebuffer_total_bytes", "int"),
+        "device.busy_fraction": ("busy_fraction", "fraction"),
+    }
+    fallback_status = "error" if getattr(reading, "status", None) == "error" else "unavailable"
+    fallback_code = getattr(reading, "reason_code", None) or "nvidia_smi_unavailable"
+    fallback_detail = getattr(reading, "detail", None) or "nvidia-smi device unavailable"
+
+    out: dict[str, ObservabilityReading] = {}
+    for qty_id in quantities:
+        attr_name, mode = field_specs[qty_id]
+        raw = getattr(reading, attr_name)
+        if isinstance(raw, NvidiaDeviceUnavailable):
+            out[qty_id] = ObservabilityReading(
+                status=raw.status,
+                reason_code=raw.reason_code,
+                detail=raw.reason,
+            )
+            continue
+        if isinstance(raw, ResourceUnavailable):
+            out[qty_id] = ObservabilityReading(
+                status=fallback_status,
+                reason_code=fallback_code,
+                detail=raw.reason or fallback_detail,
+            )
+            continue
+        if mode == "int":
+            if type(raw) is not int:
+                out[qty_id] = ObservabilityReading(
+                    status="error",
+                    reason_code="invalid_reading",
+                    detail=f"unexpected {attr_name} type {type(raw).__name__}",
+                )
+                continue
+            if raw < 0:
+                out[qty_id] = ObservabilityReading(
+                    status="error",
+                    reason_code="negative_reading",
+                    detail=f"{attr_name} was negative ({raw!r})",
+                )
+                continue
+            out[qty_id] = ObservabilityReading(status="ok", value=raw)
+        else:
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                out[qty_id] = ObservabilityReading(
+                    status="error",
+                    reason_code="invalid_reading",
+                    detail=f"unexpected {attr_name} type {type(raw).__name__}",
+                )
+                continue
+            fval = float(raw)
+            if not math.isfinite(fval):
+                out[qty_id] = ObservabilityReading(
+                    status="error",
+                    reason_code="non_finite_reading",
+                    detail=f"{attr_name} was non-finite ({raw!r})",
+                )
+                continue
+            if fval < 0.0 or fval > 1.0:
+                out[qty_id] = ObservabilityReading(
+                    status="error",
+                    reason_code="out_of_range_reading",
+                    detail=f"{attr_name} was outside [0.0, 1.0] ({raw!r})",
+                )
+                continue
+            out[qty_id] = ObservabilityReading(status="ok", value=fval)
+    return out
+
+
 def _encode_sample_line_bytes(sample: ObservabilitySample) -> int:
     """Return exact ASCII JSONL byte length (including trailing newline)."""
 
@@ -1665,7 +2007,19 @@ class _ResourceSamplesSession:
         self._allocator_reset_epoch_status = "not_requested"
         self._allocator_capability = "unavailable"
         self._allocator_configured_device = context.metadata.device
+        self._allocator_resolved_identity: AcceleratorIdentity | None = None
         self._allocator_owner_thread_id = threading.get_ident()
+
+        self._nvidia_device_probe: Any = None
+        self._nvidia_device_init_error: NvidiaDeviceUnavailable | None = None
+        self._nvidia_device_identity: AcceleratorIdentity | None = None
+        self._nvidia_device_configured_device = context.metadata.device
+        self._nvidia_device_subject_base: dict[str, Any] = {}
+        self._nvidia_device_interval_ns = 0
+        self._nvidia_device_thread: threading.Thread | None = None
+        self._nvidia_device_thread_started = False
+        self._nvidia_device_read_supports_cancel = False
+        self._nvidia_device_read_supports_deadline = False
 
     def start(self) -> RunResource:
         """Activate writer, publish immutable metadata, take initial samples, start threads."""
@@ -2140,6 +2494,13 @@ class _ResourceSamplesSession:
                 "capability": self._allocator_capability,
             }
 
+        if self._callback.nvidia_device.enabled:
+            nd_cfg = self._callback.nvidia_device
+            nd_inventory_entry = self._activate_nvidia_device_source(nd_cfg)
+            descriptors_map.update(nd_cfg.descriptors())
+            selected_sources[nd_cfg.source_id] = list(nd_cfg.quantities)
+            sources_inventory[nd_cfg.source_id] = nd_inventory_entry
+
         observer_entry: dict[str, Any] = {
             "observer_id": self._observer_id,
             "callback_type": f"{type(self._callback).__module__}.{type(self._callback).__qualname__}",
@@ -2314,6 +2675,17 @@ class _ResourceSamplesSession:
             read_end_ns = self._sample_allocator()
             self._allocator_next_due_ns = read_end_ns + self._allocator_interval_ns
 
+        if self._callback.nvidia_device.enabled:
+            self._sample_nvidia_device(cancel_event=self._stop_event)
+            if self._nvidia_device_init_error is None:
+                self._nvidia_device_thread = threading.Thread(
+                    target=self._nvidia_device_loop,
+                    name=f"tpen-obs-nvidia-device-{self._observer_id}",
+                    daemon=True,
+                )
+                self._nvidia_device_thread.start()
+                self._nvidia_device_thread_started = True
+
         return _ResourceSamplesHandle(self)
 
     def _activate_allocator_source(self, alloc_cfg: AllocatorSource) -> None:
@@ -2451,10 +2823,187 @@ class _ResourceSamplesSession:
         else:
             self._allocator_capability = "partial"
 
+        if isinstance(identity, AcceleratorIdentity):
+            self._allocator_resolved_identity = identity
         self._allocator_subject = self._build_allocator_subject(
             configured_device=configured_device,
             identity=identity,
         )
+
+    def _activate_nvidia_device_source(
+        self, nd_cfg: NvidiaDeviceSource
+    ) -> dict[str, Any]:
+        """Lazily resolve selected physical GPU identity and build NVIDIA probe."""
+
+        configured_device = nd_cfg.device or self._context.metadata.device
+        self._nvidia_device_configured_device = configured_device
+        nd_interval = (
+            self._callback.interval_seconds
+            if nd_cfg.interval_seconds is None
+            else nd_cfg.interval_seconds
+        )
+        self._nvidia_device_interval_ns = max(
+            1, int(round(nd_interval * _NS_PER_SECOND))
+        )
+
+        selected_identity: AcceleratorIdentity | None = None
+        init_error: NvidiaDeviceUnavailable | None = None
+
+        if nd_cfg.identity is not None:
+            selected_identity = nd_cfg.identity
+        elif nd_cfg.identity_resolver is not None:
+            try:
+                raw_identity = nd_cfg.identity_resolver(configured_device)
+                selected_identity = _coerce_accelerator_identity(raw_identity)
+            except OptionalDependencyError as exc:
+                init_error = NvidiaDeviceUnavailable(
+                    reason=str(exc) or "torch is not installed",
+                    reason_code="torch_unavailable",
+                    status="unavailable",
+                )
+            except Exception as exc:
+                init_error = NvidiaDeviceUnavailable(
+                    reason=f"{type(exc).__name__}: {exc}",
+                    reason_code="identity_resolution_failed",
+                    status="error",
+                )
+        elif nd_cfg.probe is not None:
+            candidate_identity = getattr(nd_cfg.probe, "identity", None)
+            if isinstance(candidate_identity, AcceleratorIdentity):
+                selected_identity = candidate_identity
+        elif (
+            self._callback.allocator.enabled
+            and self._allocator_resolved_identity is not None
+            and self._allocator_configured_device == configured_device
+        ):
+            selected_identity = self._allocator_resolved_identity
+        else:
+            try:
+                from tpen.accelerator import resolve_selected_accelerator_identity
+
+                selected_identity = resolve_selected_accelerator_identity(
+                    configured_device
+                )
+            except OptionalDependencyError as exc:
+                init_error = NvidiaDeviceUnavailable(
+                    reason=str(exc) or "torch is not installed",
+                    reason_code="torch_unavailable",
+                    status="unavailable",
+                )
+            except Exception as exc:
+                init_error = NvidiaDeviceUnavailable(
+                    reason=f"{type(exc).__name__}: {exc}",
+                    reason_code="identity_resolution_failed",
+                    status="error",
+                )
+
+        self._nvidia_device_identity = selected_identity
+        self._nvidia_device_init_error = init_error
+        self._nvidia_device_subject_base = self._build_nvidia_device_subject(
+            configured_device=configured_device,
+            identity=selected_identity,
+        )
+
+        preflight_issue: NvidiaDeviceUnavailable | None = init_error
+        if init_error is None:
+            if nd_cfg.probe is not None:
+                self._nvidia_device_probe = nd_cfg.probe
+            else:
+                # Always enforce subprocess wall-clock timeouts and close()
+                # deadlines on real monotonic time, even when sample timestamps
+                # use an injected test clock.
+                self._nvidia_device_probe = NvidiaSmiDeviceProbe(
+                    identity=selected_identity,
+                    executable=nd_cfg.executable,
+                    timeout_seconds=nd_cfg.timeout_seconds,
+                    max_output_bytes=nd_cfg.max_output_bytes,
+                )
+            read_fn = getattr(self._nvidia_device_probe, "read", None)
+            if callable(read_fn):
+                try:
+                    sig = inspect.signature(read_fn)
+                except (TypeError, ValueError):
+                    self._nvidia_device_read_supports_cancel = False
+                    self._nvidia_device_read_supports_deadline = False
+                else:
+                    params = sig.parameters
+                    has_var_kw = any(
+                        p.kind is inspect.Parameter.VAR_KEYWORD
+                        for p in params.values()
+                    )
+                    self._nvidia_device_read_supports_cancel = (
+                        has_var_kw or "cancel_event" in params
+                    )
+                    self._nvidia_device_read_supports_deadline = (
+                        has_var_kw or "deadline_ns" in params
+                    )
+            preflight_fn = getattr(self._nvidia_device_probe, "preflight_issue", None)
+            if callable(preflight_fn):
+                try:
+                    preflight_issue = preflight_fn()
+                except Exception:
+                    preflight_issue = None
+        else:
+            self._nvidia_device_probe = None
+            self._diagnostics.append(
+                f"{nd_cfg.source_id} identity resolution failed: {init_error.reason}"
+            )
+
+        capability = "unavailable" if preflight_issue is not None else "available"
+        entry: dict[str, Any] = {
+            "producer": "tpen.accelerator.NvidiaSmiDeviceProbe",
+            "source_version": "1",
+            "execution": nd_cfg.execution_mode,
+            "selected_quantities": list(nd_cfg.quantities),
+            "interval_seconds": nd_interval,
+            "configured_device": configured_device,
+            "timeout_seconds": nd_cfg.timeout_seconds,
+            "max_output_bytes": nd_cfg.max_output_bytes,
+            "shared_device_not_exclusive": True,
+            "per_process_attribution": False,
+            "allocator_reset_authority": "none",
+            "selected_identity": (
+                {
+                    "kind": _identity_kind_text(selected_identity),
+                    "index": selected_identity.index,
+                    "uuid": selected_identity.uuid,
+                }
+                if selected_identity is not None
+                else None
+            ),
+            "capability": capability,
+        }
+        if preflight_issue is not None:
+            entry["unavailable_reason_code"] = preflight_issue.reason_code
+        return entry
+
+    def _build_nvidia_device_subject(
+        self,
+        *,
+        configured_device: str,
+        identity: AcceleratorIdentity | None,
+    ) -> dict[str, Any]:
+        backend = _identity_kind_text(identity) if identity is not None else "unknown"
+        device_index: int | None = None
+        device_uuid: str | None = None
+        if identity is not None:
+            if type(identity.index) is int:
+                device_index = identity.index
+            if isinstance(identity.uuid, str) and identity.uuid:
+                canonical = canonicalize_nvidia_device_uuid(identity.uuid)
+                device_uuid = (
+                    canonical if isinstance(canonical, str) else identity.uuid
+                )
+        return {
+            "kind": "physical_gpu",
+            "host_id": self._host_id,
+            "backend": backend,
+            "configured_device": configured_device,
+            "device_index": device_index,
+            "device_uuid": device_uuid,
+            "shared_device_not_exclusive": True,
+            "per_process_attribution": False,
+        }
 
     def _build_allocator_subject(
         self,
@@ -3077,6 +3626,151 @@ class _ResourceSamplesSession:
         )
         return read_end_ns
 
+    def _nvidia_device_loop(self) -> None:
+        """Monotonic-deadline sampling loop for bounded ``nvidia-smi`` reads."""
+
+        next_due_ns = int(self._monotonic_ns()) + self._nvidia_device_interval_ns
+        while not self._stop_event.is_set():
+            now_ns = int(self._monotonic_ns())
+            wait_ns = next_due_ns - now_ns
+            if wait_ns > 0:
+                if self._stop_event.wait(timeout=wait_ns / _NS_PER_SECOND):
+                    break
+                now_ns = int(self._monotonic_ns())
+                if now_ns < next_due_ns:
+                    continue
+            if self._stop_event.is_set():
+                break
+            lag_ns = now_ns - next_due_ns
+            if lag_ns >= self._nvidia_device_interval_ns:
+                missed = lag_ns // self._nvidia_device_interval_ns
+                with self._lock:
+                    self._missed_deadlines += int(missed)
+                next_due_ns = now_ns + self._nvidia_device_interval_ns
+            else:
+                next_due_ns += self._nvidia_device_interval_ns
+            self._sample_nvidia_device(cancel_event=self._stop_event)
+
+    def _sample_nvidia_device(
+        self,
+        *,
+        cancel_event: threading.Event | None = None,
+        deadline_ns: int | None = None,
+    ) -> None:
+        """Capture one bounded physical-GPU ``nvidia-smi`` sample and enqueue."""
+
+        nd_cfg = self._callback.nvidia_device
+        source_id = nd_cfg.source_id
+        read_start_ns = int(self._monotonic_ns())
+        init_error = self._nvidia_device_init_error
+        if init_error is not None or self._nvidia_device_probe is None:
+            issue = (
+                init_error
+                if init_error is not None
+                else NvidiaDeviceUnavailable(
+                    reason=f"{source_id} probe unavailable",
+                    reason_code="probe_init_failed",
+                    status="error",
+                )
+            )
+            read_end_ns = max(int(self._monotonic_ns()), read_start_ns)
+            readings = {
+                qty_id: ObservabilityReading(
+                    status=issue.status,
+                    reason_code=issue.reason_code,
+                    detail=issue.reason,
+                )
+                for qty_id in nd_cfg.quantities
+            }
+            subject = dict(self._nvidia_device_subject_base)
+            subject["evidence"] = {
+                "vendor_timestamp": None,
+                "mig_mode": "unknown",
+                "mig_ambiguous": False,
+            }
+            self._enqueue_reading_packet(
+                source_id=source_id,
+                subject=subject,
+                read_start_ns=read_start_ns,
+                read_end_ns=read_end_ns,
+                readings=readings,
+            )
+            return
+
+        call_kwargs: dict[str, Any] = {}
+        if self._nvidia_device_read_supports_cancel:
+            call_kwargs["cancel_event"] = cancel_event
+        if self._nvidia_device_read_supports_deadline:
+            call_kwargs["deadline_ns"] = deadline_ns
+        try:
+            reading = self._nvidia_device_probe.read(**call_kwargs)
+        except Exception as exc:
+            with self._lock:
+                self._attempted += 1
+                self._failed += 1
+                self._source_partial_flags.add(source_id)
+                self._diagnostics.append(
+                    f"{source_id} read failed: {type(exc).__name__}: {exc}"
+                )
+            return
+        read_end_ns = max(int(self._monotonic_ns()), read_start_ns)
+
+        # Normal scope teardown cancels any in-flight periodic poll via
+        # ``self._stop_event`` and immediately follows with a bounded final
+        # capture (``cancel_event=None, deadline_ns=deadline_ns``). Discard a
+        # teardown-cancelled periodic poll cleanly so healthy runs stay
+        # available/complete without spurious unavailable packets.
+        if (
+            cancel_event is self._stop_event
+            and cancel_event.is_set()
+            and isinstance(reading, NvidiaDeviceReading)
+            and reading.status == "unavailable"
+            and reading.reason_code == "read_cancelled"
+        ):
+            return
+
+        try:
+            readings = _nvidia_device_reading_to_readings(reading, nd_cfg.quantities)
+        except Exception as exc:
+            with self._lock:
+                self._attempted += 1
+                self._failed += 1
+                self._source_partial_flags.add(source_id)
+                self._diagnostics.append(
+                    f"{source_id} reading conversion error: {type(exc).__name__}: {exc}"
+                )
+            return
+
+        # Only mark the source partial when a selected quantity is non-ok
+        # (never merely because an unselected sibling metric failed).
+        if any(item.status != "ok" for item in readings.values()):
+            with self._lock:
+                self._source_partial_flags.add(source_id)
+
+        subject = dict(self._nvidia_device_subject_base)
+        if isinstance(reading, NvidiaDeviceReading):
+            if subject.get("device_uuid") is None and reading.observed_uuid is not None:
+                subject["device_uuid"] = reading.observed_uuid
+            subject["evidence"] = {
+                "vendor_timestamp": reading.vendor_timestamp,
+                "mig_mode": reading.mig_mode,
+                "mig_ambiguous": reading.mig_ambiguous,
+            }
+        else:
+            subject["evidence"] = {
+                "vendor_timestamp": getattr(reading, "vendor_timestamp", None),
+                "mig_mode": getattr(reading, "mig_mode", "unknown"),
+                "mig_ambiguous": bool(getattr(reading, "mig_ambiguous", False)),
+            }
+
+        self._enqueue_reading_packet(
+            source_id=source_id,
+            subject=subject,
+            read_start_ns=read_start_ns,
+            read_end_ns=read_end_ns,
+            readings=readings,
+        )
+
     def _enqueue_reading_packet(
         self,
         *,
@@ -3341,11 +4035,20 @@ class _ResourceSamplesSession:
             self._linux_cgroup_thread.join(timeout=remaining)
             linux_cgroup_stopped = not self._linux_cgroup_thread.is_alive()
 
+        nvidia_device_stopped = True
+        if self._nvidia_device_thread is not None and self._nvidia_device_thread_started:
+            remaining = max(
+                0.0, (producer_deadline_ns - time.monotonic_ns()) / _NS_PER_SECOND
+            )
+            self._nvidia_device_thread.join(timeout=remaining)
+            nvidia_device_stopped = not self._nvidia_device_thread.is_alive()
+
         producer_stopped = (
             rusage_stopped
             and linux_memory_stopped
             and linux_tree_stopped
             and linux_cgroup_stopped
+            and nvidia_device_stopped
         )
 
         # 2. Stop and join the drain thread within the SAME remaining deadline
@@ -3413,6 +4116,19 @@ class _ResourceSamplesSession:
                 ):
                     self._sample_allocator()
                     self._drain_pending_until(deadline_ns)
+            if nvidia_device_stopped and time.monotonic_ns() < deadline_ns:
+                if (
+                    self._callback.nvidia_device.enabled
+                    and (
+                        self._nvidia_device_probe is not None
+                        or self._nvidia_device_init_error is not None
+                    )
+                    and self._writer is not None
+                ):
+                    self._sample_nvidia_device(
+                        cancel_event=None, deadline_ns=deadline_ns
+                    )
+                    self._drain_pending_until(deadline_ns)
 
         quiescent = producer_stopped and drain_stopped
         if not quiescent:
@@ -3435,6 +4151,10 @@ class _ResourceSamplesSession:
                 if not linux_cgroup_stopped:
                     self._diagnostics.append(
                         "linux-cgroup-v2 sampling thread failed to stop within close_timeout_seconds"
+                    )
+                if not nvidia_device_stopped:
+                    self._diagnostics.append(
+                        "nvidia-smi-device sampling thread failed to stop within close_timeout_seconds"
                     )
                 if not drain_stopped:
                     self._diagnostics.append(
@@ -3502,6 +4222,10 @@ class _ResourceSamplesSession:
                 (self._callback.linux_tree.enabled, self._callback.linux_tree.source_id),
                 (self._callback.linux_cgroup.enabled, self._callback.linux_cgroup.source_id),
                 (self._callback.allocator.enabled, self._callback.allocator.source_id),
+                (
+                    self._callback.nvidia_device.enabled,
+                    self._callback.nvidia_device.source_id,
+                ),
             ):
                 if not enabled_flag:
                     continue
@@ -3567,6 +4291,7 @@ class _ResourceSamplesSession:
                 or self._linux_memory_thread_started
                 or self._linux_tree_thread_started
                 or self._linux_cgroup_thread_started
+                or self._nvidia_device_thread_started
             )
             if not any_producer_started:
                 helper_state = "not_started"
@@ -3789,6 +4514,27 @@ def _coerce_linux_cgroup_source(
     )
 
 
+def _coerce_nvidia_device_source(
+    raw: NvidiaDeviceSource | Mapping[str, Any] | None,
+) -> NvidiaDeviceSource | None:
+    if raw is None:
+        return None
+    if type(raw) is NvidiaDeviceSource:
+        return raw
+    if isinstance(raw, NvidiaDeviceSource):
+        raise TypeError(
+            f"nvidia_device must be exact NvidiaDeviceSource, mapping, or None; "
+            f"got subclass {type(raw).__name__}"
+        )
+    if isinstance(raw, Mapping):
+        _reject_forbidden_selector_keys(raw, owner="NvidiaDeviceSource")
+        return NvidiaDeviceSource(**dict(raw))
+    raise TypeError(
+        f"nvidia_device must be NvidiaDeviceSource, mapping, or None; "
+        f"got {type(raw).__name__}"
+    )
+
+
 def _coerce_sink(raw: RunArtifactSink | Mapping[str, Any] | None) -> RunArtifactSink:
     if raw is None:
         return RunArtifactSink()
@@ -3845,6 +4591,10 @@ class ResourceSamples(Callback):
     linux_cgroup : LinuxCgroupV2Source or mapping or None, optional
         Read-only Linux cgroup v2 source configuration. Defaults to disabled
         when omitted.
+    nvidia_device : NvidiaDeviceSource or mapping or None, optional
+        Explicit, bounded NVIDIA physical-GPU ``nvidia-smi`` source
+        configuration. Defaults to disabled when omitted; never claims
+        ``allocator_reset`` authority or resets allocator peaks.
     sink : RunArtifactSink or mapping or None, optional
         Pure destination and byte/text budget configuration routed through
         :class:`tpen.artifacts.ArtifactManager`.
@@ -3865,6 +4615,7 @@ class ResourceSamples(Callback):
         linux_memory: LinuxMemorySource | Mapping[str, Any] | None = None,
         linux_tree: LinuxProcessTreeSource | Mapping[str, Any] | None = None,
         linux_cgroup: LinuxCgroupV2Source | Mapping[str, Any] | None = None,
+        nvidia_device: NvidiaDeviceSource | Mapping[str, Any] | None = None,
         sink: RunArtifactSink | Mapping[str, Any] | None = None,
         monotonic_ns: Callable[[], int] | None = None,
         **kwargs: Any,
@@ -3895,18 +4646,21 @@ class ResourceSamples(Callback):
         coerced_linux_memory = _coerce_linux_memory_source(linux_memory)
         coerced_linux_tree = _coerce_linux_tree_source(linux_tree)
         coerced_linux_cgroup = _coerce_linux_cgroup_source(linux_cgroup)
+        coerced_nvidia_device = _coerce_nvidia_device_source(nvidia_device)
         if (
             coerced_rusage is None
             and coerced_allocator is None
             and coerced_linux_memory is None
             and coerced_linux_tree is None
             and coerced_linux_cgroup is None
+            and coerced_nvidia_device is None
         ):
             coerced_rusage = RUsageSource(enabled=True)
             coerced_allocator = AllocatorSource(enabled=False, reset_peaks=False)
             coerced_linux_memory = LinuxMemorySource(enabled=False)
             coerced_linux_tree = LinuxProcessTreeSource(enabled=False)
             coerced_linux_cgroup = LinuxCgroupV2Source(enabled=False)
+            coerced_nvidia_device = NvidiaDeviceSource(enabled=False)
         else:
             if coerced_rusage is None:
                 coerced_rusage = RUsageSource(enabled=False)
@@ -3918,12 +4672,15 @@ class ResourceSamples(Callback):
                 coerced_linux_tree = LinuxProcessTreeSource(enabled=False)
             if coerced_linux_cgroup is None:
                 coerced_linux_cgroup = LinuxCgroupV2Source(enabled=False)
+            if coerced_nvidia_device is None:
+                coerced_nvidia_device = NvidiaDeviceSource(enabled=False)
 
         self.rusage = coerced_rusage
         self.allocator = coerced_allocator
         self.linux_memory = coerced_linux_memory
         self.linux_tree = coerced_linux_tree
         self.linux_cgroup = coerced_linux_cgroup
+        self.nvidia_device = coerced_nvidia_device
         self.sink = _coerce_sink(sink)
 
         enabled_sources: list[tuple[str, str]] = []
@@ -3937,12 +4694,14 @@ class ResourceSamples(Callback):
             enabled_sources.append(("linux_tree", self.linux_tree.source_id))
         if self.linux_cgroup.enabled:
             enabled_sources.append(("linux_cgroup", self.linux_cgroup.source_id))
+        if self.nvidia_device.enabled:
+            enabled_sources.append(("nvidia_device", self.nvidia_device.source_id))
 
         if self.enabled and not enabled_sources:
             raise ValueError(
                 "ResourceSamples requires at least one enabled source "
-                "(rusage, allocator, linux_memory, linux_tree, or linux_cgroup) "
-                "when enabled=True"
+                "(rusage, allocator, linux_memory, linux_tree, linux_cgroup, "
+                "or nvidia_device) when enabled=True"
             )
         seen_source_ids: dict[str, str] = {}
         for source_name, source_id in enabled_sources:
@@ -4175,6 +4934,7 @@ __all__ = [
     "DEFAULT_LINUX_CGROUP_V2_QUANTITIES",
     "DEFAULT_LINUX_MEMORY_QUANTITIES",
     "DEFAULT_LINUX_PROCESS_TREE_QUANTITIES",
+    "DEFAULT_NVIDIA_DEVICE_QUANTITIES",
     "DEFAULT_RUSAGE_QUANTITIES",
     "LINUX_CGROUP_V2_EXECUTION_MODE",
     "LINUX_CGROUP_V2_QUANTITY_IDS",
@@ -4185,6 +4945,9 @@ __all__ = [
     "LINUX_PROCESS_TREE_EXECUTION_MODE",
     "LINUX_PROCESS_TREE_QUANTITY_IDS",
     "LINUX_PROCESS_TREE_SOURCE_ID",
+    "NVIDIA_DEVICE_EXECUTION_MODE",
+    "NVIDIA_DEVICE_QUANTITY_IDS",
+    "NVIDIA_DEVICE_SOURCE_ID",
     "RUSAGE_EXECUTION_MODE",
     "RUSAGE_QUANTITY_IDS",
     "RUSAGE_SOURCE_ID",
@@ -4192,6 +4955,7 @@ __all__ = [
     "LinuxCgroupV2Source",
     "LinuxMemorySource",
     "LinuxProcessTreeSource",
+    "NvidiaDeviceSource",
     "RUsageSource",
     "ResourceSamples",
 ]
