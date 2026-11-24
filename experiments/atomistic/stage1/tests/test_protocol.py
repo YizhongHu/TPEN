@@ -97,6 +97,14 @@ def test_qualification_request_accepts_smallest_positive_retained_stop() -> None
     assert request["execution"] == {"stop_at": 1}
 
 
+def test_qualification_request_rejects_exact_horizon_stop() -> None:
+    row = next(row for row in _manifest() if row["kind"] == "train")
+    with pytest.raises(ProtocolError, match="stop_at"):
+        derive_smoke_request(
+            row, results_root="/external/stage1-qualification", stop_at=101,
+        )
+
+
 def test_seed_and_row_identity_are_injective_for_non_default_coordinates() -> None:
     coords = [(system, lineage, checkpoint, stream)
               for system in SYSTEMS
