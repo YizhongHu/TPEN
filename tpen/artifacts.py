@@ -1549,13 +1549,84 @@ def _collect_allowed_environment() -> dict[str, str]:
     return {key: os.environ[key] for key in RUN_START_ENV_ALLOWLIST if key in os.environ}
 
 
+_OBSERVABILITY_EXPORTS: frozenset[str] = frozenset(
+    {
+        "OBSERVABILITY_DATA_COMPLETENESS",
+        "OBSERVABILITY_LIFECYCLE_STATES",
+        "OBSERVABILITY_READING_STATUSES",
+        "OBSERVABILITY_RECORD_KINDS",
+        "OBSERVABILITY_STATISTICS",
+        "OBSERVABILITY_SUBJECT_KINDS",
+        "OBSERVABILITY_WINDOWS",
+        "RUN_OBSERVABILITY_SCHEMA",
+        "ObservabilityArtifactError",
+        "ObservabilityArtifactRef",
+        "ObservabilityBundleWriter",
+        "ObservabilityDescriptorSet",
+        "ObservabilityInventory",
+        "ObservabilityManifest",
+        "ObservabilityPathError",
+        "ObservabilityProfileStatus",
+        "ObservabilityProfileSummary",
+        "ObservabilityReading",
+        "ObservabilitySample",
+        "ObservabilitySchemaError",
+        "ObservabilityStatus",
+        "QuantityDescriptor",
+        "RunArtifactSink",
+        "SampleAppendResult",
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily re-export O2 observability artifact types without import cycles."""
+
+    if name in _OBSERVABILITY_EXPORTS:
+        from tpen import observability_artifacts
+
+        value = getattr(observability_artifacts, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Include lazy observability re-exports in ``dir(tpen.artifacts)``."""
+
+    return sorted(set(globals()) | set(__all__))
+
+
 __all__ = [
     "ArtifactDestination",
     "ArtifactManager",
     "ArtifactRoutingError",
     "DEFAULT_RUN_TIMEZONE",
     "MULTIPLICITY_ANNOUNCEMENT_KEYS",
+    "OBSERVABILITY_DATA_COMPLETENESS",
+    "OBSERVABILITY_LIFECYCLE_STATES",
+    "OBSERVABILITY_READING_STATUSES",
+    "OBSERVABILITY_RECORD_KINDS",
+    "OBSERVABILITY_STATISTICS",
+    "OBSERVABILITY_SUBJECT_KINDS",
+    "OBSERVABILITY_WINDOWS",
+    "ObservabilityArtifactError",
+    "ObservabilityArtifactRef",
+    "ObservabilityBundleWriter",
+    "ObservabilityDescriptorSet",
+    "ObservabilityInventory",
+    "ObservabilityManifest",
+    "ObservabilityPathError",
+    "ObservabilityProfileStatus",
+    "ObservabilityProfileSummary",
+    "ObservabilityReading",
+    "ObservabilitySample",
+    "ObservabilitySchemaError",
+    "ObservabilityStatus",
+    "QuantityDescriptor",
     "REQUIRED_RUN_DIRS",
+    "RUN_OBSERVABILITY_SCHEMA",
+    "RunArtifactSink",
     "RunClock",
     "RunContext",
     "RunContextReadiness",
@@ -1563,6 +1634,7 @@ __all__ = [
     "RunIdentityError",
     "RunMetadata",
     "RunResult",
+    "SampleAppendResult",
     "build_run_metadata",
     "collect_hardware_metadata",
     "collect_git_metadata",
