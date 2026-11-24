@@ -167,6 +167,14 @@ def _make_context(
             "experiment": {"name": "obs-o7", "sector": "unit", "run_name": run_id},
             "run": {"root": str(tmp_path / "outputs"), "run_id": run_id},
             "runtime": {"seed": 7, "device": device, "dtype": "float64"},
+            # Train-resume manifests bind these component configuration
+            # sections.  Keep them present, even for this small test model,
+            # so save and restore exercise the real hash contract.
+            "model": {},
+            "optimizer": {},
+            "trainer": {},
+            "sampler": {},
+            "hamiltonian_terms": {},
         }
     )
     kwargs: dict[str, Any] = {
@@ -1405,7 +1413,10 @@ def test_real_resource_samples_producer_to_reconciler_clean_and_failed(
 
             cb_fail.handle_occurrence(
                 Occurrence(
-                    event=RunFailed(error_type="RuntimeError", error_message="boom"),
+                    event=RunFailed(
+                        exception_type="RuntimeError",
+                        exception_message="boom",
+                    ),
                     count=1,
                 ),
                 ctx_fail,
