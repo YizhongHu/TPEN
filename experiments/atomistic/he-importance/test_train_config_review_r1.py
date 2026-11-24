@@ -107,6 +107,26 @@ def _literal(manifest: dict[str, Any]) -> dict[str, Any]:
     return manifest["scientific_identity"]["context"]["literal_configuration"]
 
 
+def _prechange_cell(cell: Any) -> Any:
+    """Build the legacy manifest view consumed only by the pinned oracle."""
+
+    manifest = stage_coordinate._thaw(cell.manifest)
+    identity = manifest["scientific_identity"]
+    optimizer_cell = dict(identity["optimizer_cell"])
+    optimizer_cell.update({"status": cell.availability["status"]})
+    reason = cell.availability.get("unavailable_reason")
+    if reason is not None:
+        optimizer_cell["unavailable_reason"] = reason
+    identity["optimizer_cell"] = optimizer_cell
+    digest = stage_coordinate.content_hash(manifest)
+    return replace(
+        cell,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=digest,
+        output_path=cell.output_path.parent / digest,
+    )
+
+
 # T1 ------------------------------------------------------------------------
 @pytest.mark.parametrize("axis", ("A", "B"))
 def test_resolver_forwards_exactly_the_package_labels_to_ab3(
@@ -306,7 +326,7 @@ def _assert_matches_prechange(cells: Any, resolver: Any, prechange: types.Module
 
     for cell in cells:
         try:
-            expected = prechange.resolve_train_config(cell)
+            expected = prechange.resolve_train_config(_prechange_cell(cell))
         except Exception as expected_error:  # noqa: BLE001
             try:
                 resolver(cell)

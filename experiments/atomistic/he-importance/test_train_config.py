@@ -224,6 +224,30 @@ def _canonical_resolved_config(config: object) -> str:
     )
 
 
+def _prechange_cell(cell: object) -> object:
+    """Build the legacy manifest view consumed only by the pinned oracle."""
+
+    manifest = stage_coordinate._thaw(cell.manifest)
+    identity = manifest["scientific_identity"]
+    optimizer_cell = dict(identity["optimizer_cell"])
+    optimizer_cell.update(
+        {
+            "status": cell.availability["status"],
+        }
+    )
+    reason = cell.availability.get("unavailable_reason")
+    if reason is not None:
+        optimizer_cell["unavailable_reason"] = reason
+    identity["optimizer_cell"] = optimizer_cell
+    digest = stage_coordinate.content_hash(manifest)
+    return replace(
+        cell,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=digest,
+        output_path=cell.output_path.parent / digest,
+    )
+
+
 def _assert_matches_prechange(
     cells: Sequence[object], resolver: object, prechange: types.ModuleType
 ) -> None:
@@ -231,7 +255,7 @@ def _assert_matches_prechange(
 
     for cell in cells:
         try:
-            expected = prechange.resolve_train_config(cell)
+            expected = prechange.resolve_train_config(_prechange_cell(cell))
         except Exception as expected_error:  # noqa: BLE001 - refusal is part of the oracle
             try:
                 resolver(cell)
