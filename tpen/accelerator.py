@@ -81,6 +81,28 @@ class AllocatorUsage:
     device_count: int | AllocatorUnavailable | None = None
 
 
+@dataclass(frozen=True)
+class AllocatorCurrentUsage:
+    """Point-in-time (current) allocator readings for one configured device.
+
+    Attributes
+    ----------
+    identity : AcceleratorIdentity
+        Backend classification and resolved device identity.
+    allocated_bytes : int or AllocatorUnavailable
+        Current bytes occupied by tensors on the configured device.
+    reserved_bytes : int or AllocatorUnavailable
+        Current bytes managed by the caching allocator on the configured device.
+    device_count : int or AllocatorUnavailable or None, optional
+        Visible backend device count when reported.
+    """
+
+    identity: AcceleratorIdentity
+    allocated_bytes: int | AllocatorUnavailable
+    reserved_bytes: int | AllocatorUnavailable
+    device_count: int | AllocatorUnavailable | None = None
+
+
 @runtime_checkable
 class AllocatorPeakProbe(Protocol):
     """Callback seam for a configured-device allocator probe."""
@@ -90,6 +112,14 @@ class AllocatorPeakProbe(Protocol):
 
     def read(self) -> AllocatorUsage:
         """Read peaks for the configured device."""
+
+
+@runtime_checkable
+class AllocatorCurrentProbe(Protocol):
+    """Callback seam for a configured-device point-in-time allocator probe."""
+
+    def read(self) -> AllocatorCurrentUsage:
+        """Read current allocated and reserved bytes for the configured device."""
 
 
 def _accelerator_kind(torch: Any, device_type: str) -> AcceleratorKind:
@@ -152,6 +182,11 @@ class TorchAllocatorPeakProbe:
 
         return self._identity()
 
+    def available(self) -> bool:
+        """Return whether the configured accelerator backend is available."""
+
+        return self._available()
+
     def _available(self) -> bool:
         """Return backend availability without allowing telemetry to fail a run."""
 
@@ -195,6 +230,119 @@ class TorchAllocatorPeakProbe:
         try:
             return float(counter(self.device)) / _BYTES_PER_MIB
         except (RuntimeError, AttributeError) as exc:
+            return AllocatorUnavailable(f"{type(exc).__name__}: {exc}")
+
+    def _read_device_count(self) -> int | AllocatorUnavailable:
+        try:
+            return int(self.module.device_count())
+        except (RuntimeError, AttributeError) as exc:
+            return AllocatorUnavailable(f"{type(exc).__name__}: {exc}")
+
+
+class TorchAllocatorCurrentProbe:
+    """Read point-in-time allocator counters for one configured torch device.
+
+    This probe queries ``memory_allocated(device)`` and
+    ``memory_reserved(device)`` cooperatively without issuing any extra
+    accelerator synchronization barriers. Like :class:`TorchAllocatorPeakProbe`,
+    an indexless non-CPU device is pinned once at construction so subsequent
+    reads target the same device.
+
+    Parameters
+    ----------
+    device : torch.device or str
+        Configured runtime device to inspect.
+    """
+
+    def __init__(self, device: Any) -> None:
+        torch = _torch("allocator current metrics")
+        self.device = torch.device(device)
+        self.module = device_module(self.device, feature="allocator current metrics")
+        self.kind = _accelerator_kind(torch, self.device.type)
+        if (
+            self.device.index is None
+            and self.kind is not AcceleratorKind.CPU
+            and self._available()
+        ):
+            # Resolve an indexless accelerator once so every read targets the
+            # same physical device even if another call shifts current_device().
+            try:
+                index = self.module.current_device()
+            except (AttributeError, RuntimeError):
+                index = None
+            if index is not None:
+                self.device = torch.device(self.device.type, index)
+
+    def _identity(self) -> AcceleratorIdentity:
+        index = self.device.index
+        uuid = None
+        try:
+            available = self.kind is not AcceleratorKind.CPU and self.module.is_available()
+        except (AttributeError, RuntimeError):
+            return AcceleratorIdentity(kind=self.kind, index=index, uuid=None)
+        if available and index is None:
+            try:
+                index = self.module.current_device()
+            except (AttributeError, RuntimeError):
+                return AcceleratorIdentity(kind=self.kind, index=None, uuid=None)
+        if available and index is not None:
+            try:
+                raw_uuid = self.module.get_device_properties(index).uuid
+                uuid = str(raw_uuid) if raw_uuid is not None else None
+            except (AttributeError, RuntimeError):
+                uuid = None
+        return AcceleratorIdentity(kind=self.kind, index=index, uuid=uuid)
+
+    def identity(self) -> AcceleratorIdentity:
+        """Return the resolved identity for the configured device."""
+
+        return self._identity()
+
+    def available(self) -> bool:
+        """Return whether the configured accelerator backend is available."""
+
+        return self._available()
+
+    def _available(self) -> bool:
+        """Return backend availability without letting telemetry fail a run."""
+
+        try:
+            return self.kind is not AcceleratorKind.CPU and self.module.is_available()
+        except (AttributeError, RuntimeError):
+            return False
+
+    def read(self) -> AllocatorCurrentUsage:
+        """Read current allocated and reserved bytes without synchronization.
+
+        Each counter is queried independently so one unsupported counter does
+        not erase the sibling reading.
+        """
+
+        identity = self._identity()
+        if self.kind is AcceleratorKind.CPU:
+            unavailable = AllocatorUnavailable(
+                "allocator current counters are unavailable on cpu"
+            )
+            return AllocatorCurrentUsage(identity, unavailable, unavailable, unavailable)
+        if not self._available():
+            unavailable = AllocatorUnavailable("configured accelerator is unavailable")
+            return AllocatorCurrentUsage(identity, unavailable, unavailable, unavailable)
+        allocated = self._read_bytes("memory_allocated")
+        reserved = self._read_bytes("memory_reserved")
+        device_count = self._read_device_count()
+        return AllocatorCurrentUsage(identity, allocated, reserved, device_count)
+
+    def _read_bytes(self, attr_name: str) -> int | AllocatorUnavailable:
+        try:
+            counter = getattr(self.module, attr_name)
+            raw = counter(self.device)
+            if isinstance(raw, bool):
+                return AllocatorUnavailable(f"{attr_name} returned invalid bool")
+            value = int(raw)
+            if value < 0:
+                return AllocatorUnavailable(f"{attr_name} returned negative value {value}")
+            return value
+        except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
             return AllocatorUnavailable(f"{type(exc).__name__}: {exc}")
 
     def _read_device_count(self) -> int | AllocatorUnavailable:
@@ -414,6 +562,8 @@ def seed_all(seed: int, *, feature: str = "seeded run") -> None:
 __all__ = [
     "AcceleratorIdentity",
     "AcceleratorKind",
+    "AllocatorCurrentProbe",
+    "AllocatorCurrentUsage",
     "AllocatorPeakProbe",
     "AllocatorUnavailable",
     "AllocatorUsage",
@@ -424,5 +574,6 @@ __all__ = [
     "device_module",
     "seed_all",
     "synchronize",
+    "TorchAllocatorCurrentProbe",
     "TorchAllocatorPeakProbe",
 ]

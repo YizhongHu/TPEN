@@ -191,6 +191,10 @@ def __getattr__(name: str) -> object:
         from .resource_usage import ResourceUsage
 
         return ResourceUsage
+    if name in {"AllocatorSource", "RUsageSource", "ResourceSamples"}:
+        from . import resource_samples
+
+        return getattr(resource_samples, name)
     if name in {"RawTrainingBatchRecorder", "TrainingBatchRecorder"}:
         from .raw_training_batch_recorder import RawTrainingBatchRecorder
 
@@ -210,6 +214,7 @@ def __getattr__(name: str) -> object:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
+    "AllocatorSource",
     "AmplitudeRiskFraction",
     "ArtifactIndex",
     "Cadence",
@@ -234,10 +239,12 @@ __all__ = [
     "ModuleNorms",
     "OptimizerState",
     "ParameterActivity",
+    "RUsageSource",
     "RawTrainingBatchRecorder",
     "ResolvedConfigSnapshot",
     "ResourceOwnershipClaim",
     "ResourceOwnershipConflictError",
+    "ResourceSamples",
     "ResourceUsage",
     "RunResource",
     "RunTiming",
