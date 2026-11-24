@@ -15,7 +15,10 @@ torch = pytest.importorskip("torch")
 from tpen.accelerator import (  # noqa: E402
     AcceleratorIdentity,
     AcceleratorKind,
+    AllocatorCurrentProbe,
+    AllocatorCurrentUsage,
     AllocatorUnavailable,
+    TorchAllocatorCurrentProbe,
     TorchAllocatorPeakProbe,
     canonical_device,
     current_accelerator_type,
@@ -392,3 +395,183 @@ def test_device_event_timer_rejects_unavailable_backend(monkeypatch: pytest.Monk
     monkeypatch.setattr(accelerator, "device_module", lambda *args, **kwargs: Backend)
     with pytest.raises(RuntimeError, match="available accelerator"):
         accelerator.device_event_timer()
+
+
+def test_allocator_current_probe_reads_exact_bytes_without_synchronization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TorchAllocatorCurrentProbe reads current bytes cooperatively with no sync."""
+
+    import tpen.accelerator as accelerator
+
+    calls: list[tuple[str, object]] = []
+
+    class Backend:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def get_device_properties(index: int):
+            calls.append(("properties", index))
+            return type("Properties", (), {"uuid": "GPU-CUR-1"})()
+
+        @staticmethod
+        def memory_allocated(device: object) -> int:
+            calls.append(("memory_allocated", device))
+            return 12_345_678
+
+        @staticmethod
+        def memory_reserved(device: object) -> int:
+            calls.append(("memory_reserved", device))
+            return 33_554_432
+
+        @staticmethod
+        def device_count() -> int:
+            calls.append(("device_count", None))
+            return 2
+
+        @staticmethod
+        def synchronize(*args: object, **kwargs: object) -> None:
+            raise AssertionError("current allocator probe must not synchronize")
+
+    class FakeTorch:
+        device = staticmethod(torch.device)
+        version = type("Version", (), {"hip": None})()
+
+    monkeypatch.setattr(accelerator, "_torch", lambda feature: FakeTorch)
+    monkeypatch.setattr(accelerator, "device_module", lambda *args, **kwargs: Backend)
+
+    probe = TorchAllocatorCurrentProbe(torch.device("cuda:1"))
+    assert isinstance(probe, AllocatorCurrentProbe)
+    usage = probe.read()
+
+    assert usage == AllocatorCurrentUsage(
+        identity=AcceleratorIdentity(AcceleratorKind.CUDA, 1, "GPU-CUR-1"),
+        allocated_bytes=12_345_678,
+        reserved_bytes=33_554_432,
+        device_count=2,
+    )
+    assert type(usage.allocated_bytes) is int
+    assert type(usage.reserved_bytes) is int
+    assert ("memory_allocated", torch.device("cuda:1")) in calls
+    assert ("memory_reserved", torch.device("cuda:1")) in calls
+
+
+def test_allocator_current_probe_pins_indexless_device_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An indexless device resolves once at construction and stays pinned."""
+
+    import tpen.accelerator as accelerator
+
+    current_devices = iter((0, 1))
+    calls: list[tuple[str, object]] = []
+
+    class Backend:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def current_device() -> int:
+            idx = next(current_devices)
+            calls.append(("current_device", idx))
+            return idx
+
+        @staticmethod
+        def memory_allocated(device: object) -> int:
+            calls.append(("memory_allocated", device))
+            return 0
+
+        @staticmethod
+        def memory_reserved(device: object) -> int:
+            calls.append(("memory_reserved", device))
+            return 4096
+
+        @staticmethod
+        def device_count() -> int:
+            return 2
+
+    class FakeTorch:
+        device = staticmethod(torch.device)
+        version = type("Version", (), {"hip": None})()
+
+    monkeypatch.setattr(accelerator, "_torch", lambda feature: FakeTorch)
+    monkeypatch.setattr(accelerator, "device_module", lambda *args, **kwargs: Backend)
+
+    probe = TorchAllocatorCurrentProbe("cuda")
+    first = probe.read()
+    second = probe.read()
+
+    expected = torch.device("cuda:0")
+    assert first.identity == AcceleratorIdentity(AcceleratorKind.CUDA, 0, None)
+    assert first.allocated_bytes == 0
+    assert first.reserved_bytes == 4096
+    assert second.identity == first.identity
+    assert calls == [
+        ("current_device", 0),
+        ("memory_allocated", expected),
+        ("memory_reserved", expected),
+        ("memory_allocated", expected),
+        ("memory_reserved", expected),
+    ]
+
+
+def test_allocator_current_probe_handles_cpu_unavailable_and_partial_counter_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CPU, unavailable backend, and partial counter errors yield typed evidence."""
+
+    import tpen.accelerator as accelerator
+
+    cpu_usage = TorchAllocatorCurrentProbe("cpu").read()
+    assert cpu_usage.identity == AcceleratorIdentity(AcceleratorKind.CPU, None, None)
+    assert isinstance(cpu_usage.allocated_bytes, AllocatorUnavailable)
+    assert isinstance(cpu_usage.reserved_bytes, AllocatorUnavailable)
+
+    class UnavailableBackend:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class FakeRocmTorch:
+        device = staticmethod(torch.device)
+        version = type("Version", (), {"hip": "6.2"})()
+
+    monkeypatch.setattr(accelerator, "_torch", lambda feature: FakeRocmTorch)
+    monkeypatch.setattr(accelerator, "device_module", lambda *args, **kwargs: UnavailableBackend)
+    rocm_usage = TorchAllocatorCurrentProbe("cuda:2").read()
+    assert rocm_usage.identity == AcceleratorIdentity(AcceleratorKind.ROCM, 2, None)
+    assert isinstance(rocm_usage.allocated_bytes, AllocatorUnavailable)
+    assert isinstance(rocm_usage.reserved_bytes, AllocatorUnavailable)
+
+    class PartialBackend:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def get_device_properties(index: int):
+            return type("Properties", (), {"uuid": f"GPU-{index}"})()
+
+        @staticmethod
+        def memory_allocated(device: object) -> int:
+            del device
+            return 2048
+
+        @staticmethod
+        def memory_reserved(device: object) -> int:
+            del device
+            raise RuntimeError("reserved query unsupported")
+
+        @staticmethod
+        def device_count() -> int:
+            return 1
+
+    monkeypatch.setattr(accelerator, "device_module", lambda *args, **kwargs: PartialBackend)
+    partial = TorchAllocatorCurrentProbe("cuda:0").read()
+    assert partial.allocated_bytes == 2048
+    assert isinstance(partial.reserved_bytes, AllocatorUnavailable)
+    assert "RuntimeError" in partial.reserved_bytes.reason
+    assert partial.device_count == 1
