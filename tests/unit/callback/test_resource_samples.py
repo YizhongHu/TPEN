@@ -15,11 +15,14 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from typing import Any
 
 from omegaconf import OmegaConf
 import pytest
 
+from tests.helpers.run_context import make_run_context
+import tpen.accelerator as accelerator_mod
 from tpen.accelerator import (
     AcceleratorIdentity,
     AcceleratorKind,
@@ -29,6 +32,7 @@ from tpen.accelerator import (
 )
 from tpen.artifacts import (
     ArtifactDestination,
+    ArtifactManager,
     ObservabilityBundleWriter,
     RunArtifactSink,
     RunContext,
@@ -42,6 +46,7 @@ from tpen.callback import (
     ResourceSamples,
     ResourceUsage,
     _KNOWN_NON_MANAGED_CALLBACK_TARGETS,
+    claims_conflict,
     is_managed_callback,
 )
 from tpen.callback.resource_samples import (
@@ -52,9 +57,12 @@ from tpen.callback.resource_samples import (
     RUSAGE_SOURCE_ID,
 )
 from tpen.checkpoint import TrainResume, save_checkpoint
+from tpen.checkpoint.hashing import resolved_config_identity
 from tpen.checkpoint.operational_slots import OPERATIONAL_SLOT_MANIFEST
+from tpen.checkpoint.profiles import NATIVE_RECOVERY_PROFILE, check_profile
 from tpen.distributed import ExecutionTopology
 from tpen.inspection import inspect_observability_bundle, inspect_run_observability
+from tpen.observability_artifacts import ObservabilityPathError
 from tpen.process_resources import ProcessResourceBaseline, ResourceUnavailable
 import tpen.run as run_mod
 from tpen.run import _ManagedLifecycleRegistry, open_run_context, run_from_config
@@ -1315,3 +1323,711 @@ def test_resource_samples_preserves_exact_scientific_and_sampler_rng_state(
     assert obs.status == "present"
     assert obs.invocations[0].derived_lifecycle_state == "closed"
     assert len(obs.invocations[0].samples["resource-samples"]) >= 2
+
+
+# ---------------------------------------------------------------------------
+# Review-test suite (T1-T9): defect-discriminating & coverage-gap tests
+# ---------------------------------------------------------------------------
+
+
+def test_close_drops_slow_writer_backlog_at_deadline_while_remaining_quiescent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T1 (F1): Close stops drain thread promptly and drops slow backlog at deadline cleanly."""
+
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    original_append = ObservabilityBundleWriter.append_sample
+    call_count = 0
+
+    def slow_append(self: ObservabilityBundleWriter, sample: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            writer_entered.set()
+            release_writer.wait(timeout=2.0)
+        time.sleep(0.04)
+        return original_append(self, sample)
+
+    monkeypatch.setattr(ObservabilityBundleWriter, "append_sample", slow_append)
+
+    identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, "GPU-T1")
+    current_probe = _FakeCurrentAllocatorProbe(
+        [AllocatorCurrentUsage(identity, 1024 * (i + 1), 4096 * (i + 1), 1) for i in range(16)]
+    )
+    clock = _SteppingClock(start_ns=1_000_000_000_000, step_ns=1_000_000_000)
+    cb = ResourceSamples(
+        interval_seconds=0.5,
+        max_pending_envelopes=16,
+        close_timeout_seconds=0.16,
+        rusage=RUsageSource(enabled=False),
+        allocator=AllocatorSource(
+            enabled=True,
+            include_current=True,
+            include_peak=False,
+            reset_peaks=False,
+            current_probe_factory=lambda _d: current_probe,
+        ),
+        monotonic_ns=clock,
+    )
+
+    run_dir: Path | None = None
+    try:
+        with open_run_context(_base_cfg(tmp_path), runtime_callbacks=[cb]) as ctx:
+            run_dir = ctx.run_dir
+            assert writer_entered.wait(timeout=2.0)
+            for _ in range(8):
+                assert ctx._checkpoint_hook is not None
+                ctx._checkpoint_hook()
+            release_writer.set()
+    finally:
+        release_writer.set()
+
+    assert run_dir is not None
+    assert cb.is_managed_scope_active() is False
+    bundle = inspect_run_observability(run_dir).invocations[0]
+    assert bundle.derived_lifecycle_state == "closed"
+    assert bundle.derived_data_completeness == "partial"
+    status = bundle.statuses["resource-samples"]
+    assert "close_timeout" in status.truncation_reasons
+    assert status.counts["written"] >= 1
+    assert status.counts["dropped"] >= 1
+    assert (
+        status.counts["attempted"]
+        == status.counts["written"] + status.counts["dropped"] + status.counts["failed"]
+    )
+
+
+def test_aborted_session_close_fails_closed_and_refuses_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T2 (F2): An unexpected abort inside session.close() fails closed and blocks reuse."""
+
+    probe = _BlockingRUsageProbe()
+    cb = ResourceSamples(
+        interval_seconds=0.01,
+        close_timeout_seconds=0.5,
+        rusage=RUsageSource(enabled=True, probe=probe),
+    )
+    ctx = make_run_context(tmp_path, run_id="t2-run")
+    session: Any = None
+    rusage_thread: threading.Thread | None = None
+    drain_thread: threading.Thread | None = None
+
+    def _abort_join(timeout: float | None = None) -> None:
+        del timeout
+        raise RuntimeError("injected close abort")
+
+    try:
+        with pytest.raises(RuntimeError, match="injected close abort"):
+            with cb.run_scope(ctx):
+                assert probe.blocked_in_second.wait(timeout=2.0)
+                session = cb._active_session
+                assert session is not None
+                rusage_thread = session._rusage_thread
+                drain_thread = session._drain_thread
+                assert rusage_thread is not None
+                monkeypatch.setattr(rusage_thread, "join", _abort_join)
+
+        assert cb.is_managed_scope_active() is True
+        with pytest.raises(ManagedLifecycleError):
+            with cb.run_scope(ctx):
+                pass
+    finally:
+        probe.release.set()
+        if session is not None:
+            session._stop_event.set()
+            session._drain_stop_event.set()
+            session._drain_wake_event.set()
+        if rusage_thread is not None and rusage_thread.is_alive():
+            threading.Thread.join(rusage_thread, timeout=2.0)
+        if drain_thread is not None and drain_thread.is_alive():
+            threading.Thread.join(drain_thread, timeout=2.0)
+
+
+def test_ownership_claims_detect_same_bundle_conflict_across_all_call_forms(
+    tmp_path: Path,
+) -> None:
+    """T3 (F3): Same-bundle artifact_writer conflict is detected in all three claim call forms."""
+
+    cb_a = ResourceSamples(
+        observer_id="obs-a", sink=RunArtifactSink(relative_dir="observability")
+    )
+    cb_b = ResourceSamples(
+        observer_id="obs-b", sink=RunArtifactSink(relative_dir="observability")
+    )
+    cb_other = ResourceSamples(
+        observer_id="obs-c", sink=RunArtifactSink(relative_dir="observability_other")
+    )
+    am = ArtifactManager(tmp_path / "outputs", "o3_test", "unit", "o3-run", layout="flat")
+
+    def _any_conflict(first: list[Any], second: list[Any]) -> bool:
+        return any(claims_conflict(a, b) for a in first for b in second)
+
+    forms = {
+        "artifact_manager": (
+            cb_a.ownership_claims(artifact_manager=am, invocation_id="inv-1"),
+            cb_b.ownership_claims(artifact_manager=am, invocation_id="inv-1"),
+            cb_other.ownership_claims(artifact_manager=am, invocation_id="inv-1"),
+        ),
+        "run_dir": (
+            cb_a.ownership_claims(run_dir=am.run_dir),
+            cb_b.ownership_claims(run_dir=am.run_dir),
+            cb_other.ownership_claims(run_dir=am.run_dir),
+        ),
+        "no_args": (
+            cb_a.ownership_claims(),
+            cb_b.ownership_claims(),
+            cb_other.ownership_claims(),
+        ),
+    }
+
+    other_bundle = {name: _any_conflict(a, c) for name, (a, _, c) in forms.items()}
+    same_bundle = {name: _any_conflict(a, b) for name, (a, b, _) in forms.items()}
+    assert other_bundle == {
+        "artifact_manager": False,
+        "run_dir": False,
+        "no_args": False,
+    }
+    assert same_bundle == {
+        "artifact_manager": True,
+        "run_dir": True,
+        "no_args": True,
+    }
+
+
+def test_resource_samples_rejects_subclasses_of_sink_and_source_configs() -> None:
+    """T4 (F4): Exact-type coercion refuses subclasses of RunArtifactSink, RUsageSource, AllocatorSource."""
+
+    class _SubSink(RunArtifactSink):
+        pass
+
+    class _SubRUsage(RUsageSource):
+        pass
+
+    class _SubAllocator(AllocatorSource):
+        pass
+
+    accepted: list[str] = []
+    for label, factory in (
+        ("sink", lambda: ResourceSamples(sink=_SubSink())),
+        ("rusage", lambda: ResourceSamples(rusage=_SubRUsage())),
+        (
+            "allocator",
+            lambda: ResourceSamples(
+                rusage=RUsageSource(enabled=False),
+                allocator=_SubAllocator(enabled=True, reset_peaks=False),
+            ),
+        ),
+    ):
+        try:
+            factory()
+        except TypeError:
+            continue
+        accepted.append(label)
+
+    assert accepted == [], (
+        f"ResourceSamples accepted subclass(es) instead of raising TypeError: {accepted}"
+    )
+
+
+def test_containment_refusal_in_start_writes_no_post_refusal_status_or_closed_manifest(
+    tmp_path: Path,
+) -> None:
+    """T5 (F5): Containment refusal during start() must not write status or a closed manifest."""
+
+    # Sub-case A: symlinked manifest.json
+    ctx_a = make_run_context(tmp_path / "case_a", run_id="case-a")
+    ctx_a.invocation_id = "inv-symlink-a"
+    bundle_a = ctx_a.run_dir / "observability" / "inv-symlink-a"
+    bundle_a.mkdir(parents=True, exist_ok=True)
+    (bundle_a / "manifest.json").symlink_to(tmp_path / "outside_manifest.json")
+
+    cb_a = ResourceSamples(interval_seconds=60.0)
+    with pytest.raises(ObservabilityPathError):
+        with cb_a.run_scope(ctx_a):
+            pass
+    assert cb_a.is_managed_scope_active() is False
+    a_status_exists = (bundle_a / "status" / "resource-samples.json").exists()
+
+    # Sub-case B: symlinked inventory.json
+    ctx_b = make_run_context(tmp_path / "case_b", run_id="case-b")
+    ctx_b.invocation_id = "inv-symlink-b"
+    bundle_b = ctx_b.run_dir / "observability" / "inv-symlink-b"
+    bundle_b.mkdir(parents=True, exist_ok=True)
+    (bundle_b / "inventory.json").symlink_to(tmp_path / "outside_inventory.json")
+
+    cb_b = ResourceSamples(interval_seconds=60.0)
+    with pytest.raises(ObservabilityPathError):
+        with cb_b.run_scope(ctx_b):
+            pass
+    assert cb_b.is_managed_scope_active() is False
+    b_status_exists = (bundle_b / "status" / "resource-samples.json").exists()
+    b_manifest_state: str | None = None
+    manifest_b = bundle_b / "manifest.json"
+    if manifest_b.exists():
+        b_manifest_state = json.loads(manifest_b.read_text(encoding="utf-8"))["lifecycle_state"]
+
+    failures: list[str] = []
+    if a_status_exists:
+        failures.append("sub-case A wrote status/resource-samples.json after manifest symlink refusal")
+    if b_status_exists:
+        failures.append("sub-case B wrote status/resource-samples.json after inventory symlink refusal")
+    if b_manifest_state == "closed":
+        failures.append("sub-case B overwrote manifest.json to lifecycle_state='closed' after inventory symlink refusal")
+    assert failures == [], "; ".join(failures)
+
+
+def test_allocator_provenance_honesty_on_unavailable_backend_reset_failure_and_dual_init_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T6 (F6): Inventory capability, reset_epoch_owner, and dual init error details stay honest."""
+
+    failures: list[str] = []
+
+    # Sub-case A: real TorchAllocatorCurrentProbe + TorchAllocatorPeakProbe on unavailable CUDA
+    class _FakeTorchDevice:
+        def __init__(self, spec: Any, index: int | None = None) -> None:
+            if isinstance(spec, _FakeTorchDevice):
+                self.type = spec.type
+                self.index = spec.index if index is None else index
+            else:
+                text = str(spec)
+                if ":" in text:
+                    dev_type, idx_str = text.split(":", 1)
+                    self.type = dev_type
+                    self.index = int(idx_str)
+                else:
+                    self.type = text
+                    self.index = index
+
+    class _UnavailableBackend:
+        def is_available(self) -> bool:
+            return False
+
+    fake_torch = types.SimpleNamespace(
+        device=_FakeTorchDevice,
+        version=types.SimpleNamespace(hip=None),
+        get_device_module=lambda _dev_type: _UnavailableBackend(),
+    )
+    with monkeypatch.context() as mp:
+        mp.setattr(accelerator_mod, "_torch", lambda _feature: fake_torch)
+        mp.setattr(
+            accelerator_mod,
+            "device_module",
+            lambda _device=None, *, feature="": _UnavailableBackend(),
+        )
+        cb_a = ResourceSamples(
+            interval_seconds=60.0,
+            rusage=RUsageSource(enabled=False),
+            allocator=AllocatorSource(enabled=True, device="cuda:0", reset_peaks=True),
+        )
+        with open_run_context(
+            _base_cfg(tmp_path / "unavail", device="cuda:0"), runtime_callbacks=[cb_a]
+        ) as ctx_a:
+            run_dir_a = ctx_a.run_dir
+
+    bundle_a = inspect_run_observability(run_dir_a).invocations[0]
+    assert bundle_a.inventory is not None
+    cap_a = bundle_a.inventory.sources[ALLOCATOR_SOURCE_ID]["capability"]
+    owner_a = bundle_a.samples["resource-samples"][0].subject["reset_epoch_owner"]
+    if cap_a != "unavailable":
+        failures.append(f"sub-case A capability={cap_a!r} (expected 'unavailable')")
+    if owner_a == "self":
+        failures.append(f"sub-case A reset_epoch_owner={owner_a!r} (expected != 'self')")
+
+    # Sub-case B: reset failure while current probe stays ok
+    identity_b = AcceleratorIdentity(AcceleratorKind.CUDA, 0, "GPU-F6B")
+    current_b = _FakeCurrentAllocatorProbe([AllocatorCurrentUsage(identity_b, 4096, 8192, 1)])
+    peak_b = _FakePeakAllocatorProbe(
+        [AllocatorUsage(identity_b, 2.0, 4.0, 1)],
+        reset_result=AllocatorUnavailable("driver refused reset"),
+    )
+    cb_b = ResourceSamples(
+        interval_seconds=60.0,
+        rusage=RUsageSource(enabled=False),
+        allocator=AllocatorSource(
+            enabled=True,
+            device="cuda:0",
+            include_current=True,
+            include_peak=True,
+            reset_peaks=True,
+            current_probe_factory=lambda _d: current_b,
+            peak_probe_factory=lambda _d: peak_b,
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "reset_fail", device="cuda:0"), runtime_callbacks=[cb_b]
+    ) as ctx_b:
+        run_dir_b = ctx_b.run_dir
+
+    bundle_b = inspect_run_observability(run_dir_b).invocations[0]
+    assert bundle_b.inventory is not None
+    cap_b = bundle_b.inventory.sources[ALLOCATOR_SOURCE_ID]["capability"]
+    owner_b = bundle_b.samples["resource-samples"][0].subject["reset_epoch_owner"]
+    if cap_b != "partial":
+        failures.append(f"sub-case B capability={cap_b!r} (expected 'partial')")
+    if owner_b == "self":
+        failures.append(f"sub-case B reset_epoch_owner={owner_b!r} (expected != 'self')")
+
+    # Sub-case C: both factories fail with distinct exceptions
+    def _fail_current(_dev: Any) -> Any:
+        raise RuntimeError("current-init-boom")
+
+    def _fail_peak(_dev: Any) -> Any:
+        raise RuntimeError("peak-init-boom")
+
+    cb_c = ResourceSamples(
+        interval_seconds=60.0,
+        rusage=RUsageSource(enabled=False),
+        allocator=AllocatorSource(
+            enabled=True,
+            device="cuda:0",
+            include_current=True,
+            include_peak=True,
+            reset_peaks=True,
+            current_probe_factory=_fail_current,
+            peak_probe_factory=_fail_peak,
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "dual_init", device="cuda:0"), runtime_callbacks=[cb_c]
+    ) as ctx_c:
+        run_dir_c = ctx_c.run_dir
+
+    bundle_c = inspect_run_observability(run_dir_c).invocations[0]
+    assert bundle_c.inventory is not None
+    sample_c = bundle_c.samples["resource-samples"][0]
+    cur_detail = sample_c.readings["allocator.current.allocated_bytes"].detail or ""
+    peak_detail = sample_c.readings["allocator.peak.allocated_bytes"].detail or ""
+    cap_c = bundle_c.inventory.sources[ALLOCATOR_SOURCE_ID]["capability"]
+    owner_c = sample_c.subject["reset_epoch_owner"]
+    if "current-init-boom" not in cur_detail:
+        failures.append(f"sub-case C current detail={cur_detail!r} missing 'current-init-boom'")
+    if "peak-init-boom" not in peak_detail:
+        failures.append(f"sub-case C peak detail={peak_detail!r} missing 'peak-init-boom'")
+    if cap_c != "unavailable":
+        failures.append(f"sub-case C capability={cap_c!r} (expected 'unavailable')")
+    if owner_c == "self":
+        failures.append(f"sub-case C reset_epoch_owner={owner_c!r} (expected != 'self')")
+
+    assert failures == [], "; ".join(failures)
+
+
+def test_yaml_hydra_nested_targets_plain_dicts_config_identity_and_profile_refusal(
+    tmp_path: Path,
+) -> None:
+    """T7: YAML nested targets, plain dicts, config identity sensitivity, and profile refusal."""
+
+    # Test A: Full YAML with nested _target_ entries and interpolation
+    yaml_a = f"""
+experiment:
+  name: o3_test
+  sector: unit
+run:
+  root: {json.dumps(str(tmp_path / "yaml_nested" / "outputs"))}
+  layout: flat
+  run_id: o3-run
+  timezone: UTC
+runtime:
+  device: cpu
+  dtype: float64
+callbacks:
+  - _target_: tpen.callback.ResourceSamples
+    interval_seconds: 60.0
+    rusage:
+      _target_: tpen.callback.RUsageSource
+      enabled: true
+      quantities:
+        - process.rusage.user_cpu_seconds
+        - process.rusage.max_rss_bytes
+    allocator:
+      _target_: tpen.callback.AllocatorSource
+      enabled: true
+      device: "${{runtime.device}}"
+      reset_peaks: false
+    sink:
+      _target_: tpen.artifacts.RunArtifactSink
+      relative_dir: observability
+loggers: []
+runner:
+  _target_: {__name__}._NoopRunner
+"""
+    cfg_a = OmegaConf.create(yaml_a)
+    assert run_from_config(cfg_a, raise_exceptions=True) == 0
+
+    bundle_a = inspect_run_observability(
+        tmp_path / "yaml_nested" / "outputs" / "o3-run"
+    ).invocations[0]
+    assert bundle_a.derived_lifecycle_state == "closed"
+    assert bundle_a.descriptors is not None
+    expected_rusage = {"process.rusage.user_cpu_seconds", "process.rusage.max_rss_bytes"}
+    expected_alloc = set(ALLOCATOR_CURRENT_QUANTITY_IDS + ALLOCATOR_PEAK_QUANTITY_IDS)
+    assert set(bundle_a.descriptors.quantities.keys()) == expected_rusage | expected_alloc
+
+    samples_a = bundle_a.samples["resource-samples"]
+    rusage_samples = [s for s in samples_a if s.source_id == RUSAGE_SOURCE_ID]
+    alloc_samples = [s for s in samples_a if s.source_id == ALLOCATOR_SOURCE_ID]
+    assert len(rusage_samples) >= 1
+    assert len(alloc_samples) >= 1
+    assert set(rusage_samples[0].readings.keys()) == expected_rusage
+    assert set(alloc_samples[0].readings.keys()) == expected_alloc
+
+    # Test B: Plain YAML mapping config (coerced dicts without nested _target_)
+    yaml_plain = f"""
+experiment:
+  name: o3_test
+  sector: unit
+run:
+  root: {json.dumps(str(tmp_path / "yaml_plain" / "outputs"))}
+  layout: flat
+  run_id: o3-run
+  timezone: UTC
+runtime:
+  device: cpu
+  dtype: float64
+callbacks:
+  - _target_: tpen.callback.ResourceSamples
+    interval_seconds: 60.0
+    rusage:
+      enabled: true
+      quantities:
+        - process.rusage.user_cpu_seconds
+    sink:
+      relative_dir: obs_plain
+loggers: []
+runner:
+  _target_: {__name__}._NoopRunner
+"""
+    cfg_plain = OmegaConf.create(yaml_plain)
+    assert run_from_config(cfg_plain, raise_exceptions=True) == 0
+    obs_plain = inspect_run_observability(
+        tmp_path / "yaml_plain" / "outputs" / "o3-run",
+        relative_dir="obs_plain",
+    )
+    assert obs_plain.status == "present"
+    assert obs_plain.invocations[0].derived_lifecycle_state == "closed"
+
+    # Test C: Observation config changes resolved_config_identity normally without error
+    cfg_b = OmegaConf.create(yaml_a.replace("interval_seconds: 60.0", "interval_seconds: 30.0"))
+    assert resolved_config_identity(cfg_a) != resolved_config_identity(cfg_b)
+
+    # Test D: Fail-closed native recovery profile admission refuses ResourceSamples
+    profile_check = check_profile(cfg_a, NATIVE_RECOVERY_PROFILE)
+    assert profile_check.verdict == "refused"
+    assert profile_check.refusal is not None
+    assert profile_check.refusal["code"] == "unsupported-callback"
+
+
+def test_pending_bytes_cap_reached_drops_nonblockingly_and_releases_reservations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T8: Pending byte cap drops nonblockingly and releases all reservations on exit."""
+
+    # Sub-case A: max_pending_bytes smaller than a single sample drops all samples cleanly
+    cb_tiny = ResourceSamples(
+        interval_seconds=60.0,
+        sink=RunArtifactSink(max_pending_bytes=64),
+    )
+    with open_run_context(_base_cfg(tmp_path / "tiny"), runtime_callbacks=[cb_tiny]) as ctx_tiny:
+        run_dir_tiny = ctx_tiny.run_dir
+
+    bundle_tiny = inspect_run_observability(run_dir_tiny).invocations[0]
+    assert bundle_tiny.derived_lifecycle_state == "closed"
+    assert bundle_tiny.derived_data_completeness == "none"
+    status_tiny = bundle_tiny.statuses["resource-samples"]
+    assert "pending_bytes_cap_reached" in status_tiny.truncation_reasons
+    assert status_tiny.counts["written"] == 0
+    assert status_tiny.counts["dropped"] >= 1
+    assert status_tiny.counts["attempted"] == status_tiny.counts["dropped"]
+
+    # Sub-case B: Stalled writer fills max_pending_bytes=1200, drops overflow, releases to 0
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    original_append = ObservabilityBundleWriter.append_sample
+    call_count = 0
+
+    def stalled_first_append(self: ObservabilityBundleWriter, sample: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            writer_entered.set()
+            release_writer.wait(timeout=2.0)
+        return original_append(self, sample)
+
+    monkeypatch.setattr(ObservabilityBundleWriter, "append_sample", stalled_first_append)
+
+    identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, "GPU-T8")
+    current_probe = _FakeCurrentAllocatorProbe(
+        [AllocatorCurrentUsage(identity, 1024 * (i + 1), 4096 * (i + 1), 1) for i in range(12)]
+    )
+    clock = _SteppingClock(start_ns=1_000_000_000_000, step_ns=1_000_000_000)
+    cb_stalled = ResourceSamples(
+        interval_seconds=0.5,
+        max_pending_envelopes=16,
+        rusage=RUsageSource(enabled=False),
+        allocator=AllocatorSource(
+            enabled=True,
+            include_current=True,
+            include_peak=False,
+            reset_peaks=False,
+            current_probe_factory=lambda _d: current_probe,
+        ),
+        sink=RunArtifactSink(max_pending_bytes=1200),
+        monotonic_ns=clock,
+    )
+
+    writer: ObservabilityBundleWriter | None = None
+    try:
+        with open_run_context(
+            _base_cfg(tmp_path / "stalled"), runtime_callbacks=[cb_stalled]
+        ) as ctx_stalled:
+            run_dir_stalled = ctx_stalled.run_dir
+            assert writer_entered.wait(timeout=2.0)
+            assert cb_stalled._active_session is not None
+            writer = cb_stalled._active_session._writer
+            for _ in range(5):
+                assert ctx_stalled._checkpoint_hook is not None
+                ctx_stalled._checkpoint_hook()
+            release_writer.set()
+    finally:
+        release_writer.set()
+
+    assert writer is not None
+    assert writer.pending_bytes("resource-samples") == 0
+    bundle_stalled = inspect_run_observability(run_dir_stalled).invocations[0]
+    assert bundle_stalled.derived_lifecycle_state == "closed"
+    status_stalled = bundle_stalled.statuses["resource-samples"]
+    assert "pending_bytes_cap_reached" in status_stalled.truncation_reasons
+    assert status_stalled.counts["written"] >= 1
+    assert status_stalled.counts["dropped"] >= 1
+    assert (
+        status_stalled.counts["attempted"]
+        == status_stalled.counts["written"]
+        + status_stalled.counts["dropped"]
+        + status_stalled.counts["failed"]
+    )
+
+
+def test_allocator_reset_ownership_conflicts_across_rocm_hip_injected_and_duplicate_resetters(
+    tmp_path: Path,
+) -> None:
+    """T9: Allocator reset conflicts cover cuda/cuda:0, hip:0/rocm, unknown probes, and distinct indices."""
+
+    # Conflict 1: Two ResourceSamples with distinct relative_dirs, cuda vs cuda:0
+    cb_c1a = ResourceSamples(
+        observer_id="obs-a",
+        rusage=RUsageSource(enabled=False),
+        allocator=AllocatorSource(enabled=True, device="cuda", reset_peaks=True),
+        sink=RunArtifactSink(relative_dir="obs_a"),
+    )
+    cb_c1b = ResourceSamples(
+        observer_id="obs-b",
+        rusage=RUsageSource(enabled=False),
+        allocator=AllocatorSource(enabled=True, device="cuda:0", reset_peaks=True),
+        sink=RunArtifactSink(relative_dir="obs_b"),
+    )
+    with pytest.raises(ResourceOwnershipConflictError):
+        run_from_config(
+            _base_cfg(tmp_path / "conflict_cuda"),
+            raise_exceptions=True,
+            runtime_callbacks=[cb_c1a, cb_c1b],
+        )
+    assert not (tmp_path / "conflict_cuda" / "outputs").exists()
+
+    # Conflict 2: Two ResourceSamples with distinct relative_dirs, hip:0 vs rocm
+    cb_c2a = ResourceSamples(
+        observer_id="obs-a",
+        rusage=RUsageSource(enabled=False),
+        allocator=AllocatorSource(enabled=True, device="hip:0", reset_peaks=True),
+        sink=RunArtifactSink(relative_dir="obs_a"),
+    )
+    cb_c2b = ResourceSamples(
+        observer_id="obs-b",
+        rusage=RUsageSource(enabled=False),
+        allocator=AllocatorSource(enabled=True, device="rocm", reset_peaks=True),
+        sink=RunArtifactSink(relative_dir="obs_b"),
+    )
+    with pytest.raises(ResourceOwnershipConflictError):
+        run_from_config(
+            _base_cfg(tmp_path / "conflict_rocm"),
+            raise_exceptions=True,
+            runtime_callbacks=[cb_c2a, cb_c2b],
+        )
+    assert not (tmp_path / "conflict_rocm" / "outputs").exists()
+
+    # Conflict 3: Resetting ResourceSamples vs ResourceUsage with unknown-target probe
+    class _UnknownResetProbe:
+        def reset(self) -> AcceleratorIdentity | AllocatorUnavailable:
+            return AcceleratorIdentity(AcceleratorKind.CUDA, 0, "GPU-UNK")
+
+        def read(self) -> AllocatorUsage:
+            identity = AcceleratorIdentity(AcceleratorKind.CUDA, 0, "GPU-UNK")
+            return AllocatorUsage(identity, 1.0, 2.0, 1)
+
+    cb_c3 = ResourceSamples(
+        rusage=RUsageSource(enabled=False),
+        allocator=AllocatorSource(enabled=True, device="cuda:0", reset_peaks=True),
+    )
+    ru_unknown = ResourceUsage(allocator_probe=_UnknownResetProbe())
+    with pytest.raises(ResourceOwnershipConflictError):
+        run_from_config(
+            _base_cfg(tmp_path / "conflict_unknown"),
+            raise_exceptions=True,
+            runtime_callbacks=[cb_c3, ru_unknown],
+        )
+    assert not (tmp_path / "conflict_unknown" / "outputs").exists()
+
+    # Coexistence: Two ResourceSamples with distinct relative_dirs and distinct indexed devices
+    id_0 = AcceleratorIdentity(AcceleratorKind.CUDA, 0, "GPU-0")
+    id_1 = AcceleratorIdentity(AcceleratorKind.CUDA, 1, "GPU-1")
+    cur_0 = _FakeCurrentAllocatorProbe([AllocatorCurrentUsage(id_0, 1024, 2048, 2)])
+    peak_0 = _FakePeakAllocatorProbe([AllocatorUsage(id_0, 1.0, 2.0, 2)])
+    cur_1 = _FakeCurrentAllocatorProbe([AllocatorCurrentUsage(id_1, 4096, 8192, 2)])
+    peak_1 = _FakePeakAllocatorProbe([AllocatorUsage(id_1, 3.0, 4.0, 2)])
+
+    cb_0 = ResourceSamples(
+        observer_id="obs-0",
+        interval_seconds=60.0,
+        rusage=RUsageSource(enabled=False),
+        allocator=AllocatorSource(
+            enabled=True,
+            device="cuda:0",
+            include_current=True,
+            include_peak=True,
+            reset_peaks=True,
+            current_probe_factory=lambda _d: cur_0,
+            peak_probe_factory=lambda _d: peak_0,
+        ),
+        sink=RunArtifactSink(relative_dir="obs_0"),
+    )
+    cb_1 = ResourceSamples(
+        observer_id="obs-1",
+        interval_seconds=60.0,
+        rusage=RUsageSource(enabled=False),
+        allocator=AllocatorSource(
+            enabled=True,
+            device="cuda:1",
+            include_current=True,
+            include_peak=True,
+            reset_peaks=True,
+            current_probe_factory=lambda _d: cur_1,
+            peak_probe_factory=lambda _d: peak_1,
+        ),
+        sink=RunArtifactSink(relative_dir="obs_1"),
+    )
+    exit_code = run_from_config(
+        _base_cfg(tmp_path / "coexist", device="cpu"),
+        raise_exceptions=True,
+        runtime_callbacks=[cb_0, cb_1],
+    )
+    assert exit_code == 0
+    assert peak_0.reset_calls == 1
+    assert peak_1.reset_calls == 1
+    run_dir = tmp_path / "coexist" / "outputs" / "o3-run"
+    obs_0 = inspect_run_observability(run_dir, relative_dir="obs_0")
+    obs_1 = inspect_run_observability(run_dir, relative_dir="obs_1")
+    assert obs_0.status == "present"
+    assert obs_1.status == "present"
+    assert obs_0.invocations[0].derived_lifecycle_state == "closed"
+    assert obs_1.invocations[0].derived_lifecycle_state == "closed"
