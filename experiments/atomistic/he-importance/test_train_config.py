@@ -214,14 +214,19 @@ def _load_prechange_resolver() -> types.ModuleType:
     return module
 
 
-def _canonical_resolved_config(config: object) -> str:
-    """Serialize one resolved config with a stable, sorted-key encoding."""
+def _canonical_resolved_config(
+    config: object, *, path_replacement: tuple[str, str] | None = None
+) -> str:
+    """Serialize one resolved config with stable keys and optional path normalization."""
 
-    return json.dumps(
+    serialized = json.dumps(
         OmegaConf.to_container(config, resolve=True),
         sort_keys=True,
         separators=(",", ":"),
     )
+    if path_replacement is not None:
+        serialized = serialized.replace(*path_replacement)
+    return serialized
 
 
 def _prechange_cell(cell: object) -> object:
@@ -254,8 +259,9 @@ def _assert_matches_prechange(
     """Compare current output or refusal with the mechanically loaded oracle."""
 
     for cell in cells:
+        legacy_cell = _prechange_cell(cell)
         try:
-            expected = prechange.resolve_train_config(_prechange_cell(cell))
+            expected = prechange.resolve_train_config(legacy_cell)
         except Exception as expected_error:  # noqa: BLE001 - refusal is part of the oracle
             try:
                 resolver(cell)
@@ -266,7 +272,10 @@ def _assert_matches_prechange(
                 raise AssertionError("current resolver accepted a prechange-refused cell")
         else:
             observed = resolver(cell)
-            assert _canonical_resolved_config(observed) == _canonical_resolved_config(expected)
+            assert _canonical_resolved_config(observed) == _canonical_resolved_config(
+                expected,
+                path_replacement=(str(legacy_cell.output_path), str(cell.output_path)),
+            )
 
 
 def _independent_initializer_paths(value: object, path: str = "") -> set[str]:
