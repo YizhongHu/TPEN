@@ -53,11 +53,12 @@ from tpen_executor import cli, composition
 from tpen_executor.contracts import AllocationId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
 from tpen_executor.dispatch import LocalDispatcher
 from tpen_executor.dispatch import parsl as parsl_dispatch
+from tpen_executor.dispatch.contract import ConfiguredProgramRouteRefused
 from tpen_executor.dispatch.transport import LeafRequest, LeafResult, LeafTeardownReceipt, run_leaf
 from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.placement import AllocationSlot, ChildPlacementObservation
-from tpen_executor.programs import WorkerProgram
+from tpen_executor.programs import ConfiguredProgram, WorkerProgram
 from tpen_executor.storage import DirectoryStore
 from tpen_executor.tasks import ConfiguredRun, ConfiguredRunTable
 
@@ -296,6 +297,18 @@ def _runs(tmp_path: Path, *task_ids: str, modes: dict[str, str] | None = None) -
         config.write_text(modes.get(task_id, "ok"), encoding="utf-8")
         result[task_id] = ConfiguredRun(task_id, str(config), (f"payload.task={task_id}",))
     return result
+
+
+def _configured_run(tmp_path: Path, task_id: str = "member") -> ConfiguredRun:
+    root = Path(__file__).parents[2]
+    program = ConfiguredProgram(
+        "stage-q",
+        str(root / "experiments/atomistic/he-importance/run_stage_q.py"),
+        str(root / "experiments/atomistic/he-importance/o1_scan_manifest_v1.json"),
+        "0" * 64,
+        str(tmp_path / "configured-output"),
+    )
+    return ConfiguredRun(task_id, "", (), program)
 
 
 def _make_fake_core(tmp_path: Path) -> Path:
@@ -1333,6 +1346,28 @@ def test_an_invalid_worker_mask_is_refused_before_science(
 
 
 # ------------------------------------------------------- unchanged routes
+
+
+def test_configured_parsl_public_run_refuses_before_dfk_or_submission(
+    tmp_path: Path, fake_parsl: _Parsl,
+) -> None:
+    """Configured in-process Parsl admission fails before any backend call."""
+
+    group = _group("s3b-configured-refuse", "member")
+    lifecycle = _lifecycle(tmp_path)
+    dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path), binding=BINDING)
+    with pytest.raises(ConfiguredProgramRouteRefused, match="until C2.2"):
+        dispatcher.run(group, {"member": _configured_run(tmp_path)}, lifecycle, timeout=60)
+    assert fake_parsl.dfks == []
+    assert fake_parsl.submissions == []
+    legacy_group = _group("s3b-configured-legacy", "member")
+    legacy = _runs(tmp_path, "member")
+    manifest = dispatcher.run(legacy_group, legacy, lifecycle, timeout=60)
+    assert _summary(manifest) == {"member": ("completed", False)}
+    process_submission = fake_parsl.submissions[-1]
+    launch_args = process_submission["args"][3]
+    expected_args = legacy["member"].command().args
+    assert launch_args[: len(expected_args)] == expected_args
 
 
 def test_threadpool_and_local_routes_never_build_a_leaf(tmp_path: Path, fake_parsl: _Parsl, monkeypatch: pytest.MonkeyPatch) -> None:

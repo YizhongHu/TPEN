@@ -45,7 +45,7 @@ from .._codec import canonical_bytes, digest
 from ..results import RunManifest
 from ..contracts import ReadyGroup
 from ..lifecycle.attached import AttachedAllocation
-from ..runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
+from ..runners import ConfiguredProgramCommand, CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
 from ..tasks import ConfiguredRun
 from ..workers import ProcessOutcome, SubprocessWorker
 from .contract import (
@@ -388,6 +388,8 @@ def _require_standard_worker(materialized: Any) -> None:
             value = materialized[name]
         except (KeyError, TypeError) as error:
             raise UnsupportedTransportError(f"remote worker program lacks its {name} slot") from error
+        if name == "runner" and type(value) is ConfiguredProgramCommand:
+            raise UnsupportedTransportError("configured program not supported on this route until C2.2")
         if type(value) is not kind:
             raise UnsupportedTransportError(
                 f"remote worker program {name} must be exactly {kind.__name__}, got {type(value).__name__}"

@@ -58,6 +58,8 @@ from ..placement import PLACEMENT_REFUSAL_ENV, PlacementRefusal, parse_cpu_set
 from ..runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
 from ..workers import SubprocessWorker
 from .contract import (
+    ConfiguredProgramRouteRefused,
+    LeafRefused,
     _admit_slot,
     _child_precore_refusal,
     _evidence_payload,
@@ -105,10 +107,6 @@ INSPECTION_STATES = frozenset({"not-run", "evidence", "unavailable", "error"})
 WORKER_AFFINITY_REFUSAL_CODES = frozenset(
     {"placement-cpu-outside-worker-affinity", "placement-worker-affinity-unavailable"}
 )
-
-
-class LeafRefused(RuntimeError):
-    """Raised inside a leaf that refuses to launch science for a request."""
 
 
 class LeafPlacementRefused(LeafRefused):
@@ -489,6 +487,10 @@ class LeafRequest:
             raise ValueError("fence allocation does not match the allocation")
         if configured.id != fence.task_id:
             raise ValueError("configured run does not belong to the fenced task")
+        if getattr(configured, "program", None) is not None:
+            raise ConfiguredProgramRouteRefused(
+                "configured program not supported on this route until C2.2"
+            )
         return cls(
             fence.group_digest,
             fence.task_id,
@@ -1214,6 +1216,7 @@ __all__ = [
     "LEAF_RESULT_SCHEMA",
     "TEARDOWN_SCHEMA",
     "LeafPlacementRefused",
+    "ConfiguredProgramRouteRefused",
     "LeafRefused",
     "LeafRequest",
     "LeafResult",

@@ -24,6 +24,7 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 from omegaconf.nodes import AnyNode
 
 from ._codec import digest, thaw
+from .configured_program import CONFIGURED_PROGRAM_ALLOWLIST, ConfiguredProgram, LeafProgram
 from .contracts import ProgramSpecRef
 from ._records import frozen_record
 
@@ -34,7 +35,6 @@ _PROGRAM_TARGETS = {
 }
 _HYDRA_RESERVED_KEYS = {"_target_", "_recursive_", "_convert_", "_partial_", "_args_"}
 _PROGRAM_MOUNT_KEY = "__program__"
-
 
 def _validate_slot_name(name: Any, path: str) -> None:
     """Validate one concrete slot name and identify its marker path."""

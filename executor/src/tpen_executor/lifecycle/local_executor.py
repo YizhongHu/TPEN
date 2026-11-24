@@ -49,6 +49,7 @@ from typing import Any
 from ..allocations import ConfiguredAllocation, MemberInvocationV2
 from ..contracts import ProgramSpecRef, ReadyGroupV2, TaskSpec
 from ..dispatch.contract import _with_child_context_keys, _with_child_placement
+from ..dispatch.contract import ConfiguredProgramRouteRefused
 from ..dispatch.transport import LeafRequest, LeafResult, LeafResultRejected, run_leaf, validate_leaf_result
 from ..environments import PreparedPythonEnvironment
 from ..placement import AllocationSlot, physical_slots_from_allocation
@@ -350,7 +351,7 @@ class LocalLeafExecutor:
                 self._active -= 1
                 if slot is not None:
                     self._free_slots.append(slot)
-            if isinstance(error, (InvocationMismatchError, CapacityExceededError, LeafSubmissionError)):
+            if isinstance(error, (InvocationMismatchError, CapacityExceededError, LeafSubmissionError, ConfiguredProgramRouteRefused)):
                 raise
             raise LeafSubmissionError(f"local leaf submission failed: {error}") from error
         handle = MemberLaunchHandle(request, invocation, future, slot, configured, environment)
