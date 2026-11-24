@@ -41,6 +41,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, ContextManager
 
+from tpen.artifacts import ArtifactRoutingError
 from tpen.callback.base import (
     Callback,
     CallbackContext,
@@ -198,6 +199,28 @@ def _identity_kind_text(identity: object) -> str:
     if isinstance(raw, str) and raw.strip():
         return raw.strip().lower()
     return "unknown"
+
+
+def _probe_is_available(probe: Any, fallback_identity: Any) -> bool:
+    """Return whether an allocator probe reports an available non-CPU backend."""
+
+    if probe is None:
+        return False
+    for attr in ("available", "_available"):
+        fn = getattr(probe, attr, None)
+        if callable(fn):
+            try:
+                return bool(fn())
+            except Exception:
+                return False
+    probe_identity = fallback_identity
+    id_fn = getattr(probe, "identity", None)
+    if callable(id_fn):
+        try:
+            probe_identity = id_fn()
+        except Exception:
+            probe_identity = fallback_identity
+    return _identity_kind_text(probe_identity) != "cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -739,6 +762,7 @@ class _ResourceSamplesSession:
         self._writer_had_error = False
         self._closed = False
         self._unsafe = False
+        self._start_refused = False
 
         self._writer: ObservabilityBundleWriter | None = None
         self._manifest_base: dict[str, Any] = {}
@@ -757,7 +781,8 @@ class _ResourceSamplesSession:
         self._allocator_subject: dict[str, Any] = {}
         self._allocator_interval_ns = 0
         self._allocator_next_due_ns = 0
-        self._allocator_init_unavailable_reason: tuple[str, str] | None = None
+        self._allocator_current_init_unavailable_reason: tuple[str, str] | None = None
+        self._allocator_peak_init_unavailable_reason: tuple[str, str] | None = None
         self._allocator_peak_reset_failure: str | None = None
         self._allocator_reset_epoch_status = "not_requested"
         self._allocator_capability = "unavailable"
@@ -767,12 +792,16 @@ class _ResourceSamplesSession:
     def start(self) -> RunResource:
         """Activate writer, publish immutable metadata, take initial samples, start threads."""
 
-        writer = ObservabilityBundleWriter(
-            self._context.artifact_manager,
-            self._invocation_id,
-            sink=self._callback.sink,
-        )
-        self._writer = writer
+        try:
+            writer = ObservabilityBundleWriter(
+                self._context.artifact_manager,
+                self._invocation_id,
+                sink=self._callback.sink,
+            )
+        except (ObservabilityPathError, ObservabilitySchemaError):
+            self._start_refused = True
+            self._writer = None
+            raise
 
         # Capture correlated monotonic + UTC clock anchor.
         bracket_start = int(self._monotonic_ns())
@@ -927,10 +956,15 @@ class _ResourceSamplesSession:
                 writer.write_inventory(inventory)
                 writer.write_descriptors(descriptor_set)
         except (ObservabilityPathError, ObservabilitySchemaError):
+            # Refuse containment/schema violations cleanly without emitting
+            # post-refusal status artifacts or closing manifest during rollback.
+            self._start_refused = True
+            self._writer = None
             raise
         except (OSError, ObservabilityArtifactError) as exc:
             # Advisory observability I/O failure is contained so science continues.
             self._record_writer_error(f"bundle initialization failed: {type(exc).__name__}: {exc}")
+        self._writer = writer
 
         # Start bounded background drain thread so sample persistence never
         # blocks the scientific thread.
@@ -976,16 +1010,21 @@ class _ResourceSamplesSession:
                     TorchAllocatorPeakProbe,
                 )
             except OptionalDependencyError as exc:
-                self._allocator_init_unavailable_reason = (
+                reason = (
                     "torch_unavailable",
                     str(exc) or "torch is not installed",
                 )
-                self._allocator_reset_epoch_status = "unavailable"
+                if alloc_cfg.include_current:
+                    self._allocator_current_init_unavailable_reason = reason
+                if alloc_cfg.include_peak:
+                    self._allocator_peak_init_unavailable_reason = reason
+                self._allocator_reset_epoch_status = (
+                    "unavailable" if alloc_cfg.reset_peaks else "not_requested"
+                )
                 self._allocator_capability = "unavailable"
                 self._allocator_subject = self._build_allocator_subject(
                     configured_device=configured_device,
                     identity=None,
-                    reset_peaks=alloc_cfg.reset_peaks,
                 )
                 return
             if alloc_cfg.include_current and current_factory is None:
@@ -998,12 +1037,12 @@ class _ResourceSamplesSession:
             try:
                 self._allocator_current_probe = current_factory(configured_device)
             except OptionalDependencyError as exc:
-                self._allocator_init_unavailable_reason = (
+                self._allocator_current_init_unavailable_reason = (
                     "torch_unavailable",
                     str(exc) or "torch is not installed",
                 )
             except Exception as exc:
-                self._allocator_init_unavailable_reason = (
+                self._allocator_current_init_unavailable_reason = (
                     "probe_init_failed",
                     f"{type(exc).__name__}: {exc}",
                 )
@@ -1019,17 +1058,19 @@ class _ResourceSamplesSession:
             try:
                 self._allocator_peak_probe = peak_factory(configured_device)
             except OptionalDependencyError as exc:
-                if self._allocator_init_unavailable_reason is None:
-                    self._allocator_init_unavailable_reason = (
-                        "torch_unavailable",
-                        str(exc) or "torch is not installed",
-                    )
+                self._allocator_peak_init_unavailable_reason = (
+                    "torch_unavailable",
+                    str(exc) or "torch is not installed",
+                )
+                if alloc_cfg.reset_peaks:
+                    self._allocator_reset_epoch_status = "unavailable"
             except Exception as exc:
-                if self._allocator_init_unavailable_reason is None:
-                    self._allocator_init_unavailable_reason = (
-                        "probe_init_failed",
-                        f"{type(exc).__name__}: {exc}",
-                    )
+                self._allocator_peak_init_unavailable_reason = (
+                    "probe_init_failed",
+                    f"{type(exc).__name__}: {exc}",
+                )
+                if alloc_cfg.reset_peaks:
+                    self._allocator_reset_epoch_status = "unavailable"
             else:
                 if alloc_cfg.reset_peaks:
                     try:
@@ -1070,18 +1111,26 @@ class _ResourceSamplesSession:
                 except Exception:
                     identity = None
 
-        if self._allocator_current_probe is not None or self._allocator_peak_probe is not None:
-            kind_text = _identity_kind_text(identity)
-            self._allocator_capability = (
-                "unavailable" if kind_text == "cpu" else "available"
-            )
-        else:
+        current_available = alloc_cfg.include_current and _probe_is_available(
+            self._allocator_current_probe, identity
+        )
+        peak_available = (
+            alloc_cfg.include_peak
+            and self._allocator_peak_reset_failure is None
+            and _probe_is_available(self._allocator_peak_probe, identity)
+        )
+        requested_parts = int(alloc_cfg.include_current) + int(alloc_cfg.include_peak)
+        available_parts = int(current_available) + int(peak_available)
+        if available_parts == 0:
             self._allocator_capability = "unavailable"
+        elif available_parts == requested_parts:
+            self._allocator_capability = "available"
+        else:
+            self._allocator_capability = "partial"
 
         self._allocator_subject = self._build_allocator_subject(
             configured_device=configured_device,
             identity=identity,
-            reset_peaks=alloc_cfg.reset_peaks,
         )
 
     def _build_allocator_subject(
@@ -1089,7 +1138,6 @@ class _ResourceSamplesSession:
         *,
         configured_device: str,
         identity: Any,
-        reset_peaks: bool,
     ) -> dict[str, Any]:
         backend = _identity_kind_text(identity) if identity is not None else "unknown"
         subject: dict[str, Any] = {
@@ -1099,7 +1147,9 @@ class _ResourceSamplesSession:
             "invocation_token": self._invocation_id,
             "configured_device": configured_device,
             "backend": backend,
-            "reset_epoch_owner": "self" if reset_peaks else "none",
+            "reset_epoch_owner": (
+                "self" if self._allocator_reset_epoch_status == "owned_reset" else "none"
+            ),
         }
         if identity is not None:
             index = getattr(identity, "index", None)
@@ -1184,8 +1234,8 @@ class _ResourceSamplesSession:
         if alloc_cfg.include_current:
             if self._allocator_current_probe is None:
                 reason_code, detail = (
-                    self._allocator_init_unavailable_reason
-                    if self._allocator_init_unavailable_reason is not None
+                    self._allocator_current_init_unavailable_reason
+                    if self._allocator_current_init_unavailable_reason is not None
                     else ("allocator_unavailable", "current allocator probe unavailable")
                 )
                 for qty_id in ALLOCATOR_CURRENT_QUANTITY_IDS:
@@ -1228,8 +1278,8 @@ class _ResourceSamplesSession:
                     )
             elif self._allocator_peak_probe is None:
                 reason_code, detail = (
-                    self._allocator_init_unavailable_reason
-                    if self._allocator_init_unavailable_reason is not None
+                    self._allocator_peak_init_unavailable_reason
+                    if self._allocator_peak_init_unavailable_reason is not None
                     else ("allocator_unavailable", "peak allocator probe unavailable")
                 )
                 for qty_id in ALLOCATOR_PEAK_QUANTITY_IDS:
@@ -1268,7 +1318,6 @@ class _ResourceSamplesSession:
             self._allocator_subject = self._build_allocator_subject(
                 configured_device=self._allocator_configured_device,
                 identity=observed_identity,
-                reset_peaks=alloc_cfg.reset_peaks,
             )
 
         self._enqueue_reading_packet(
@@ -1416,10 +1465,13 @@ class _ResourceSamplesSession:
         while True:
             item: tuple[ObservabilitySample, int] | None = None
             with self._lock:
+                # Honor stop signal before popping so close() hands any remaining
+                # backlog to _drain_pending_until(deadline_ns) after at most one
+                # in-flight write.
+                if self._drain_stop_event.is_set():
+                    return
                 if self._pending:
                     item = self._pending.popleft()
-                elif self._drain_stop_event.is_set():
-                    return
                 else:
                     self._drain_wake_event.clear()
             if item is not None:
@@ -1581,7 +1633,7 @@ class _ResourceSamplesSession:
         primary_exc: BaseException | None,
     ) -> None:
         writer = self._writer
-        if writer is None:
+        if writer is None or self._start_refused:
             return
         # Never deadlock waiting on a hung drain thread holding _writer_lock.
         acquired = self._writer_lock.acquire(blocking=drain_stopped)
@@ -1773,11 +1825,13 @@ class _ResourceSamplesScope(AbstractContextManager[RunResource | None]):
         try:
             handle = session.start()
         except BaseException as exc:
+            quiescent = False
             try:
                 quiescent = session.close(exc)
             except Exception:
                 quiescent = False
-            self._callback._end_session(session, quiescent=quiescent)
+            finally:
+                self._callback._end_session(session, quiescent=quiescent)
             raise
         self._session = session
         return handle
@@ -1793,11 +1847,11 @@ class _ResourceSamplesScope(AbstractContextManager[RunResource | None]):
             return False
         self._exited = True
         session = self._session
+        quiescent = False
         try:
             quiescent = session.close(exc_val)
         finally:
-            self._callback._end_session(session, quiescent=session._unsafe is False)
-        del quiescent
+            self._callback._end_session(session, quiescent=quiescent)
         # Never suppress a primary body exception or BaseException.
         return False
 
@@ -1810,8 +1864,12 @@ class _ResourceSamplesScope(AbstractContextManager[RunResource | None]):
 def _coerce_rusage_source(raw: RUsageSource | Mapping[str, Any] | None) -> RUsageSource | None:
     if raw is None:
         return None
-    if isinstance(raw, RUsageSource):
+    if type(raw) is RUsageSource:
         return raw
+    if isinstance(raw, RUsageSource):
+        raise TypeError(
+            f"rusage must be exact RUsageSource, mapping, or None; got subclass {type(raw).__name__}"
+        )
     if isinstance(raw, Mapping):
         _reject_forbidden_selector_keys(raw, owner="RUsageSource")
         return RUsageSource(**dict(raw))
@@ -1823,8 +1881,12 @@ def _coerce_allocator_source(
 ) -> AllocatorSource | None:
     if raw is None:
         return None
-    if isinstance(raw, AllocatorSource):
+    if type(raw) is AllocatorSource:
         return raw
+    if isinstance(raw, AllocatorSource):
+        raise TypeError(
+            f"allocator must be exact AllocatorSource, mapping, or None; got subclass {type(raw).__name__}"
+        )
     if isinstance(raw, Mapping):
         _reject_forbidden_selector_keys(raw, owner="AllocatorSource")
         return AllocatorSource(**dict(raw))
@@ -1836,8 +1898,12 @@ def _coerce_allocator_source(
 def _coerce_sink(raw: RunArtifactSink | Mapping[str, Any] | None) -> RunArtifactSink:
     if raw is None:
         return RunArtifactSink()
-    if isinstance(raw, RunArtifactSink):
+    if type(raw) is RunArtifactSink:
         return raw
+    if isinstance(raw, RunArtifactSink):
+        raise TypeError(
+            f"sink must be exact RunArtifactSink, mapping, or None; got subclass {type(raw).__name__}"
+        )
     if isinstance(raw, Mapping):
         _reject_forbidden_selector_keys(raw, owner="RunArtifactSink")
         return RunArtifactSink(**dict(raw))
@@ -2048,6 +2114,40 @@ class ResourceSamples(Callback):
                     artifact_manager, invocation_id, self.observer_id
                 )
             )
+            bundle_dir = self.sink.resolve_bundle_dir(artifact_manager, invocation_id)
+            valid_invocation = validate_identifier(invocation_id, "invocation_id")
+            manifest_rel = (
+                *self.sink.relative_dir.split("/"),
+                valid_invocation,
+                "manifest.json",
+            )
+            try:
+                manifest_path = artifact_manager.path(*manifest_rel)
+            except ArtifactRoutingError as exc:
+                raise ObservabilityPathError(str(exc)) from exc
+            logical_manifest = artifact_manager.run_dir.joinpath(*manifest_rel)
+            if manifest_path.is_symlink() or logical_manifest.is_symlink():
+                symlink_path = (
+                    manifest_path if manifest_path.is_symlink() else logical_manifest
+                )
+                raise ObservabilityPathError(
+                    f"refusing symlinked observability path {symlink_path!s}"
+                )
+            resolved_bundle = bundle_dir.resolve(strict=False)
+            resolved_manifest = manifest_path.resolve(strict=False)
+            try:
+                resolved_manifest.relative_to(resolved_bundle)
+            except ValueError as exc:
+                raise ObservabilityPathError(
+                    f"observability path {manifest_path!s} resolves to {resolved_manifest!s}, "
+                    f"outside contained root {resolved_bundle!s}"
+                ) from exc
+            claims.append(
+                ResourceOwnershipClaim(
+                    kind="artifact_writer",
+                    scope=str(resolved_manifest),
+                )
+            )
         elif run_dir is not None:
             from pathlib import Path
 
@@ -2067,6 +2167,12 @@ class ResourceSamples(Callback):
                 ResourceOwnershipClaim(
                     kind="artifact_writer",
                     scope=f"{self.sink.relative_dir}/resources/{self.observer_id}.jsonl",
+                )
+            )
+            claims.append(
+                ResourceOwnershipClaim(
+                    kind="artifact_writer",
+                    scope=f"{self.sink.relative_dir}/manifest.json",
                 )
             )
 

@@ -182,6 +182,11 @@ class TorchAllocatorPeakProbe:
 
         return self._identity()
 
+    def available(self) -> bool:
+        """Return whether the configured accelerator backend is available."""
+
+        return self._available()
+
     def _available(self) -> bool:
         """Return backend availability without allowing telemetry to fail a run."""
 
@@ -292,6 +297,11 @@ class TorchAllocatorCurrentProbe:
         """Return the resolved identity for the configured device."""
 
         return self._identity()
+
+    def available(self) -> bool:
+        """Return whether the configured accelerator backend is available."""
+
+        return self._available()
 
     def _available(self) -> bool:
         """Return backend availability without letting telemetry fail a run."""
