@@ -150,8 +150,8 @@ def _fence_placement_overlay(
             task_id=task_id,
             attempt_id=attempt_id,
         )
-        if configured.program is not None
-        else digest({"config": configured.config, "overrides": list(configured.overrides)})
+        if getattr(configured, "program", None) is not None
+        else digest({"config": getattr(configured, "config", ""), "overrides": list(getattr(configured, "overrides", ()))})
     )
     values = {
         PLACEMENT_OUTPUT_ENV: os.path.join(fence.output_dir, "child-placement.json"),
@@ -335,7 +335,7 @@ def _with_child_placement(
         )
     devices = values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "")
     resolve_slots = slot_resolver or physical_slots_from_allocation
-    if configured.program is not None:
+    if getattr(configured, "program", None) is not None:
         slot = _require_configured_physical_slot(allocation)
         slot_facts = _physical_slot_overlay(slot)
         slot_id = slot.slot_id
@@ -597,8 +597,8 @@ def _placement_receipt(
             task_id=member.task_id,
             attempt_id=fence.attempt_id.value,
         )
-        if configured.program is not None
-        else digest({"config": configured.config, "overrides": list(configured.overrides)})
+        if getattr(configured, "program", None) is not None
+        else digest({"config": getattr(configured, "config", ""), "overrides": list(getattr(configured, "overrides", ()))})
     )
     checks = {
         "task": observation.task_id == member.task_id,
@@ -873,7 +873,7 @@ def _placement_refusal_receipt(
         allocation.allocation_id.value,
         allocation.backend_job_id.value,
         values.get("TPEN_SLOT_ID", "unavailable"),
-        digest({"config": configured.config, "overrides": list(configured.overrides)}),
+        digest({"config": getattr(configured, "config", ""), "overrides": list(getattr(configured, "overrides", ())) }),
         fence.output_dir,
         {
             "host": values.get("TPEN_SLOT_NODE", "unknown") if not _placement_v2_requested(allocation, values) else "unavailable",
@@ -1012,7 +1012,7 @@ def _ensure_placement_refusal_environment(
         "TPEN_PLACEMENT_DECLARED_HOST": host,
         "TPEN_PLACEMENT_DECLARED_CPUS": ",".join(str(cpu) for cpu in declared_cpus),
         "TPEN_PLACEMENT_DECLARED_DEVICES": values.get("TPEN_PLACEMENT_DECLARED_DEVICES", ""),
-        "TPEN_PLACEMENT_PAYLOAD_DIGEST": digest({"config": configured.config, "overrides": list(configured.overrides)}),
+        "TPEN_PLACEMENT_PAYLOAD_DIGEST": digest({"config": getattr(configured, "config", ""), "overrides": list(getattr(configured, "overrides", ())) }),
         PLACEMENT_REFUSAL_ENV: json.dumps(refusal.to_dict(), sort_keys=True),
     }
     if v2_requested:

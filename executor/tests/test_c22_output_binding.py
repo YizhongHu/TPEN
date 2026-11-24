@@ -232,10 +232,7 @@ def test_no_slot_configured_serialized_for_attempt_refuses_before_leaf(tmp_path:
     configured = _configured(tmp_path, task_id="member")
     root = tmp_path / "store"
     output = root / "groups" / GROUP / "member" / "attempt"
-    allocation = SimpleNamespace(
-        allocation_id=SimpleNamespace(value="allocation"), backend_job_id=SimpleNamespace(value="job"),
-        facts={},
-    )
+    allocation = ConfiguredAllocation(AllocationId("allocation"), BackendJobId("job"), {})
     fence = SimpleNamespace(
         allocation_id="allocation", group_digest=GROUP, task_id="member",
         attempt_id=SimpleNamespace(value="attempt"), root=str(root), output_dir=str(output),
@@ -535,14 +532,14 @@ MUTANTS = (
     {
         "id": "configured-without-physical-slot-admitted",
         "target": "executor/src/tpen_executor/dispatch/contract.py",
-        "old": "    if configured.program is not None:\n",
+        "old": "    if getattr(configured, \"program\", None) is not None:\n",
         "new": "    if False:\n",
         "killer": "test_no_slot_configured_local_refuses_before_child",
     },
     {
         "id": "carried-id-only-admitted",
         "target": "executor/src/tpen_executor/dispatch/contract.py",
-        "old": "    if configured.program is not None:\n",
+        "old": "    if getattr(configured, \"program\", None) is not None:\n",
         "new": "    if configured.program is not None and not slot_id:\n",
         "killer": "test_carried_slot_id_without_cpus_refuses_before_child",
     },
