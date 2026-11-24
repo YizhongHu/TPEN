@@ -303,8 +303,8 @@ def _assert_checkpoint_payload_equal(left: Path, right: Path) -> None:
 
     import torch
 
-    left_payload = torch.load(left, map_location="cpu")
-    right_payload = torch.load(right, map_location="cpu")
+    left_payload = torch.load(left, map_location="cpu", weights_only=False)
+    right_payload = torch.load(right, map_location="cpu", weights_only=False)
 
     def compare(actual: object, expected: object, path: str) -> None:
         if torch.is_tensor(actual) or torch.is_tensor(expected):
