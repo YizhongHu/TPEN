@@ -75,11 +75,26 @@ def test_qualification_request_copies_train_recipe_and_adds_one_stop_datum() -> 
             assert request[key] == value
 
 
-@pytest.mark.parametrize("stop_at", [0, 8, 101])
+@pytest.mark.parametrize("stop_at", [-1, 0, 8, 101])
 def test_qualification_request_rejects_nonretained_or_terminal_stop(stop_at: int) -> None:
     row = next(row for row in _manifest() if row["kind"] == "train")
-    with pytest.raises(ProtocolError, match="stop_at"):
-        derive_smoke_request(row, results_root="/external/stage1-qualification", stop_at=stop_at)
+    # Exercise every invalid boundary from each parametrized killer, so a
+    # mutant that admits the already-reached zero boundary cannot hide behind
+    # the independent terminal-horizon guard.
+    for candidate in {stop_at, -1, 0, 8, 101}:
+        with pytest.raises(ProtocolError, match="stop_at"):
+            derive_smoke_request(
+                row, results_root="/external/stage1-qualification", stop_at=candidate,
+            )
+
+
+def test_qualification_request_accepts_smallest_positive_retained_stop() -> None:
+    row = next(row for row in _manifest() if row["kind"] == "train")
+    row["checkpoint_steps"] = [0, 1, 101]
+    request = derive_smoke_request(
+        row, results_root="/external/stage1-qualification", stop_at=1,
+    )
+    assert request["execution"] == {"stop_at": 1}
 
 
 def test_seed_and_row_identity_are_injective_for_non_default_coordinates() -> None:
