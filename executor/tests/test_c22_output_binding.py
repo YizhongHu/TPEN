@@ -505,7 +505,7 @@ MUTANTS = (
         "id": "parsl-duplicate-run-injection",
         "target": "executor/src/tpen_executor/dispatch/parsl.py",
         "old": "                args = configured.command_for_attempt(\n                    output_dir,\n                    root=fence.root,\n                    group_digest=group.identity,\n                    task_id=member.task_id,\n                    attempt_id=fence.attempt_id.value,\n                ).args\n",
-        "new": "                args = configured.command_for_attempt(\n                    output_dir,\n                    root=fence.root,\n                    group_digest=group.identity,\n                    task_id=member.task_id,\n                    attempt_id=fence.attempt_id.value,\n                ).args + (f\"run.root={output_dir}\", \"run.layout=flat\", \"run.run_id=core\")\n",
+        "new": "                args = configured.command_for_attempt(\n                    output_dir,\n                    root=fence.root,\n                    group_digest=group.identity,\n                    task_id=member.task_id,\n                    attempt_id=fence.attempt_id.value,\n                ).args + ((f\"run.root={output_dir}\", \"run.layout=flat\", \"run.run_id=core\") if configured.program is not None else ())\n",
         "killer": "test_actual_carriers_capture_matching_full_argv_and_environment",
     },
     {
