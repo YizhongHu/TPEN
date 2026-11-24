@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from pathlib import Path
 import re
+import stat
 from typing import Any, ClassVar
 
-from ._codec import digest, fields
+from ._codec import digest
 from ._records import frozen_record
 
 
@@ -15,7 +17,8 @@ from ._records import frozen_record
 # tracked script and a typed argument shape.
 CONFIGURED_PROGRAM_ALLOWLIST = {
     "stage-q": {
-        "script": "experiments/atomistic/he-importance/run_stage_q.py",
+        "trusted_root": os.path.realpath(Path(__file__).resolve().parents[3]),
+        "relative_path": "experiments/atomistic/he-importance/run_stage_q.py",
         "arguments": ("manifest", "row", "output_root"),
         "output_contract": "attempt-core",
     },
@@ -41,6 +44,7 @@ class ConfiguredProgram:
     row: str
     output_root: str
     output_contract: str = "attempt-core"
+    manifest_sha256: str = ""
 
     def __post_init__(self) -> None:
         if type(self.entrypoint) is not str or self.entrypoint not in CONFIGURED_PROGRAM_ALLOWLIST:
@@ -48,14 +52,29 @@ class ConfiguredProgram:
         if "." in self.entrypoint or not re.fullmatch(r"[a-z][a-z0-9-]*", self.entrypoint):
             raise ValueError("configured program entrypoint must be a closed simple name")
         script_path = _absolute_path(self.script_path, "script_path")
-        expected = CONFIGURED_PROGRAM_ALLOWLIST[self.entrypoint]["script"]
-        if tuple(Path(script_path).parts[-len(Path(expected).parts):]) != tuple(Path(expected).parts):
-            raise ValueError("script_path does not match the configured-program allowlist")
-        if not Path(script_path).is_file():
-            raise ValueError("configured program script_path must name a tracked file")
+        entry = CONFIGURED_PROGRAM_ALLOWLIST[self.entrypoint]
+        trusted_root = os.path.realpath(entry["trusted_root"])
+        expected = os.path.realpath(os.path.join(trusted_root, entry["relative_path"]))
+        resolved = os.path.realpath(script_path)
+        if os.path.commonpath((trusted_root, resolved)) != trusted_root or resolved != expected or resolved != script_path:
+            raise ValueError("script_path does not match the trusted configured-program allowlist")
+        if not stat.S_ISREG(os.stat(script_path, follow_symlinks=False).st_mode):
+            raise ValueError("configured program script_path must be a regular file")
         manifest = _absolute_path(self.manifest, "manifest")
         if Path(manifest).name != "o1_scan_manifest_v1.json":
             raise ValueError("manifest is not the Stage-Q scan manifest")
+        try:
+            manifest_stat = os.stat(manifest, follow_symlinks=False)
+        except OSError as error:
+            raise ValueError("manifest must exist before configured launch") from error
+        if not stat.S_ISREG(manifest_stat.st_mode):
+            raise ValueError("manifest must be a regular file")
+        try:
+            computed_manifest_sha256 = hashlib.sha256(Path(manifest).read_bytes()).hexdigest()
+        except OSError as error:
+            raise ValueError("manifest must be readable before configured launch") from error
+        if self.manifest_sha256 and self.manifest_sha256 != computed_manifest_sha256:
+            raise ValueError("manifest_sha256 does not match manifest bytes")
         if type(self.row) is not str or re.fullmatch(r"[0-9a-f]{64}", self.row) is None:
             raise ValueError("row must be a lowercase SHA-256 row identifier")
         output_root = _absolute_path(self.output_root, "output_root")
@@ -65,6 +84,7 @@ class ConfiguredProgram:
         object.__setattr__(self, "script_path", script_path)
         object.__setattr__(self, "manifest", manifest)
         object.__setattr__(self, "output_root", output_root)
+        object.__setattr__(self, "manifest_sha256", computed_manifest_sha256)
 
     @property
     def program_digest(self) -> str:
@@ -91,6 +111,7 @@ class ConfiguredProgram:
             "row": self.row,
             "output_root": self.output_root,
             "output_contract": self.output_contract,
+            "manifest_sha256": self.manifest_sha256,
         }
         return {"schema": self.schema, **value} if include_schema else value
 
@@ -98,10 +119,12 @@ class ConfiguredProgram:
     def from_mapping(cls, data: Any) -> "ConfiguredProgram":
         """Decode a strict configured-program mapping."""
 
-        fields(data, {"schema", "entrypoint", "script_path", "manifest", "row", "output_root", "output_contract"}, cls.schema, "ConfiguredProgram")
+        expected = {"schema", "entrypoint", "script_path", "manifest", "row", "output_root", "output_contract"}
+        if set(data) not in {expected, expected | {"manifest_sha256"}} or data.get("schema") != cls.schema:
+            raise ValueError("ConfiguredProgram keys or schema differ")
         return cls(
             data["entrypoint"], data["script_path"], data["manifest"],
-            data["row"], data["output_root"], data["output_contract"],
+            data["row"], data["output_root"], data["output_contract"], data.get("manifest_sha256", ""),
         )
 
 

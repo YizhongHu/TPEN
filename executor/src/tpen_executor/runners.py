@@ -112,13 +112,20 @@ RUN_SHIM = (
 # leaf gets the same placement/observation prelude plus a closed script-path
 # handoff, derived once here rather than maintaining a second copy.
 _CONFIGURED_SHIM_IMPORT = "from tpen.run import main\n"
+# C2.2 owns any future attempt-output rebinding; C2.1 refuses mismatches and
+# never silently strips run.* values from a configured command.
 _CONFIGURED_SHIM_BRANCH = (
     "if '--tpen-executor-script' in sys.argv[1:]:\n"
     "    import runpy\n"
     "    script_index = sys.argv.index('--tpen-executor-script')\n"
     "    script = sys.argv[script_index + 1]\n"
     "    script_args = sys.argv[script_index + 2:]\n"
-    "    script_args = [arg for arg in script_args if not arg.startswith('run.root=') and not arg.startswith('run.layout=') and not arg.startswith('run.run_id=')]\n"
+    "    output_index = script_args.index('--output-root') if '--output-root' in script_args else -1\n"
+    "    declared_output = script_args[output_index + 1] if output_index >= 0 and output_index + 1 < len(script_args) else None\n"
+    "    attempt_outputs = [arg.split('=', 1)[1] for arg in script_args if arg.startswith('run.root=')]\n"
+    "    if any(path != declared_output for path in attempt_outputs) or any(arg.startswith('run.layout=') or arg.startswith('run.run_id=') for arg in script_args):\n"
+    "        print('configured program output binding is not supported until C2.2', file=sys.stderr)\n"
+    "        raise SystemExit(2)\n"
     "    sys.argv = [script, *script_args]\n"
     "    runpy.run_path(script, run_name='__main__')\n"
     "    raise SystemExit(0)\n"

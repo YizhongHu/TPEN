@@ -34,13 +34,17 @@ class ConfiguredRun:
     def __post_init__(self) -> None:
         if type(self.id) is not str or not self.id.strip():
             raise TypeError("id must be a non-empty string")
-        if type(self.config) is not str or not os.path.isabs(self.config):
+        if type(self.config) is not str:
+            raise TypeError("config must be a string")
+        if self.program is None and not os.path.isabs(self.config):
             raise ValueError("config must be an absolute path")
         if isinstance(self.overrides, (str, bytes, bytearray)) or not isinstance(self.overrides, Sequence) or any(type(item) is not str for item in self.overrides):
             raise TypeError("overrides must be a sequence of strings")
         object.__setattr__(self, "overrides", tuple(self.overrides))
         if self.program is not None and type(self.program) is not ConfiguredProgram:
             raise TypeError("program must be ConfiguredProgram or None")
+        if self.program is not None and (self.config or self.overrides):
+            raise ValueError("configured program cannot carry an unbound config or overrides until C2.2")
 
     def command(self) -> TPENCommand | ConfiguredProgramCommand:
         """Return the executor command represented by this task."""
