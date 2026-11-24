@@ -7,7 +7,9 @@ training test.
 
 from __future__ import annotations
 
+import copy
 import importlib.util
+import json
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,8 @@ from omegaconf import OmegaConf
 
 import tpen.sampling.metropolis as metropolis
 import tpen.training.linear_method as linear_method
+import tpen.training.trainer as trainer
+from tpen.config_schema import ClosedSchemaError
 from tpen.artifacts import ArtifactManager
 from tpen.run import load_config, run_from_config
 from tpen.training.linear_method import (
@@ -125,15 +129,31 @@ def test_hi_dense_byte_envelope_is_exact(
 
 
 @pytest.mark.parametrize("context", ["O-raw", "O-composite"])
-@pytest.mark.parametrize("n_samples", [2048, 4096])
 def test_hi_constructor_refuses_before_prohibited_work(
-    models: dict[str, torch.nn.Module], context: str, n_samples: int, monkeypatch: pytest.MonkeyPatch
+    models: dict[str, torch.nn.Module], context: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Real bindings fail at constructor preflight, before any tangent work."""
 
     model = models[context]
     binding = ModelParameterBinding.from_parameters(tuple(model.parameters()))
     optimizer = torch.optim.SGD(binding.parameters, lr=1.0)
+    with torch.no_grad():
+        for index, parameter in enumerate(binding.parameters, start=1):
+            parameter.grad = torch.full_like(parameter, 0.125 * index)
+    parameter_values = tuple(parameter.detach().clone() for parameter in binding.parameters)
+    parameter_grads = tuple(parameter.grad.detach().clone() for parameter in binding.parameters)
+    optimizer_state = copy.deepcopy(optimizer.state_dict())
+    optimizer_groups = tuple(
+        {
+            **{
+                key: copy.deepcopy(value)
+                for key, value in group.items()
+                if key != "params"
+            },
+            "params": tuple(id(parameter) for parameter in group["params"]),
+        }
+        for group in optimizer.param_groups
+    )
 
     def fail_if_entered(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("dense LM refusal entered prohibited work")
@@ -143,9 +163,14 @@ def test_hi_constructor_refuses_before_prohibited_work(
         "flatten_local_energy_derivative_blocks",
         "assemble_dense_linear_method_matrices",
     ):
-        if hasattr(linear_method, name):
-            monkeypatch.setattr(linear_method, name, fail_if_entered)
+        monkeypatch.setattr(linear_method, name, fail_if_entered)
     monkeypatch.setattr(torch.linalg, "eig", fail_if_entered)
+    monkeypatch.setattr(metropolis.MetropolisSampler, "collect_samples", fail_if_entered)
+    monkeypatch.setattr(
+        trainer._TrainerStepProducer,
+        "produce_materialized_hamiltonian_tangent_step",
+        fail_if_entered,
+    )
 
     with pytest.raises(LinearMethodMemoryLimitError) as caught:
         LinearMethodUpdate(optimizer, model_parameters=binding)
@@ -154,7 +179,26 @@ def test_hi_constructor_refuses_before_prohibited_work(
     assert f"P={binding.layout.total_numel}" in message
     assert "estimated working set" in message
     assert "1073741824" in message
-    assert n_samples in (2048, 4096)  # both declared HI contexts are checked above.
+    assert all(
+        torch.equal(parameter.detach(), expected)
+        for parameter, expected in zip(binding.parameters, parameter_values)
+    )
+    assert all(
+        torch.equal(parameter.grad.detach(), expected)
+        for parameter, expected in zip(binding.parameters, parameter_grads)
+    )
+    assert optimizer.state_dict() == optimizer_state
+    assert optimizer_groups == tuple(
+        {
+            **{
+                key: copy.deepcopy(value)
+                for key, value in group.items()
+                if key != "params"
+            },
+            "params": tuple(id(parameter) for parameter in group["params"]),
+        }
+        for group in optimizer.param_groups
+    )
 
 
 def test_under_budget_control_constructs_without_work(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -167,7 +211,9 @@ def test_under_budget_control_constructs_without_work(monkeypatch: pytest.Monkey
     assert method.model_parameters.compare(binding)[0]
 
 
-def test_hi_schema_refuses_current_linear_method_before_core_guard() -> None:
+def test_hi_schema_refuses_current_linear_method_before_core_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The current HI-named config remains unavailable at its schema boundary."""
 
     cfg = load_config(str(HI_CONFIG))
@@ -175,8 +221,13 @@ def test_hi_schema_refuses_current_linear_method_before_core_guard() -> None:
         "_target_": "tpen.training.linear_method.LinearMethodUpdate",
         "_partial_": True,
     }
-    with pytest.raises(ValueError, match="not admitted|unavailable|linear_method"):
+    def fail_if_constructed(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("HI schema refusal entered Linear Method construction")
+
+    monkeypatch.setattr(LinearMethodUpdate, "__init__", fail_if_constructed)
+    with pytest.raises(ClosedSchemaError) as caught:
         run_from_config(cfg, config_path=str(HI_CONFIG), raise_exceptions=True)
+    assert any(rejection.rule == "unadmitted-update-method" for rejection in caught.value.rejections)
 
 
 def _qualification_config(tmp_path: Path) -> tuple[Any, Path]:
@@ -186,12 +237,14 @@ def _qualification_config(tmp_path: Path) -> tuple[Any, Path]:
     cfg = _model_config("O-raw")
     cfg.pop("schema", None)
     cfg.experiment.name = "linear_method_refusal_qualification"
+    cfg.experiment.sector = "atomistic"
     cfg.run.root = str(tmp_path / "runs")
     cfg.run.dir = str(tmp_path / "run")
     cfg.run.run_id = "qualification"
+    cfg.run.layout = "nested"
     cfg.runtime.device = "cpu"
     cfg.optimizer = {"_target_": "torch.optim.SGD", "_partial_": True, "lr": 1.0}
-    cfg.trainer.max_steps = 0
+    cfg.trainer.max_steps = 1
     cfg.trainer.update_method = {
         "_target_": "tpen.training.linear_method.LinearMethodUpdate",
         "_partial_": True,
@@ -208,11 +261,11 @@ def _qualification_error_path(cfg: Any) -> Path:
     """Resolve the failure artifact through the production run layout."""
 
     manager = ArtifactManager(
-        OmegaConf.select(cfg, "run.root", default="outputs"),
-        OmegaConf.select(cfg, "experiment.name", default="experiment"),
-        OmegaConf.select(cfg, "experiment.sector", default="default"),
-        OmegaConf.select(cfg, "run.run_id"),
-        layout=OmegaConf.select(cfg, "run.layout", default="nested"),
+        cfg.run.root,
+        cfg.experiment.name,
+        cfg.experiment.sector,
+        cfg.run.run_id,
+        layout=cfg.run.layout,
     )
     return manager.path("error.json")
 
@@ -223,13 +276,22 @@ def test_production_entrypoint_refuses_real_hi_shape_before_sampling(
     """Both public run_from_config surfaces preserve the typed refusal."""
 
     cfg, path = _qualification_config(tmp_path)
+    def fail_if_entered(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("production path entered prohibited work before refusal")
+
+    monkeypatch.setattr(metropolis.MetropolisSampler, "collect_samples", fail_if_entered)
     monkeypatch.setattr(
-        metropolis.MetropolisSampler,
-        "collect_samples",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("sampler entered before Linear Method refusal")
-        ),
+        trainer._TrainerStepProducer,
+        "produce_materialized_hamiltonian_tangent_step",
+        fail_if_entered,
     )
+    for name in (
+        "flatten_parameter_score_blocks",
+        "flatten_local_energy_derivative_blocks",
+        "assemble_dense_linear_method_matrices",
+    ):
+        monkeypatch.setattr(linear_method, name, fail_if_entered)
+    monkeypatch.setattr(torch.linalg, "eig", fail_if_entered)
     with pytest.raises(LinearMethodMemoryLimitError) as caught:
         run_from_config(cfg, config_path=str(path), raise_exceptions=True)
     assert type(caught.value) is LinearMethodMemoryLimitError
@@ -239,4 +301,5 @@ def test_production_entrypoint_refuses_real_hi_shape_before_sampling(
     assert run_from_config(cfg, config_path=str(path), raise_exceptions=False) == 1
     error = _qualification_error_path(cfg)
     assert error.exists()
-    assert "LinearMethodMemoryLimitError" in error.read_text(encoding="utf-8")
+    payload = json.loads(error.read_text(encoding="utf-8"))
+    assert payload["exception_type"] == "LinearMethodMemoryLimitError"
