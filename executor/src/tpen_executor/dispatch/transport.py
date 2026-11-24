@@ -68,6 +68,7 @@ from .contract import (
     _fence_placement_overlay,
     _inside,
     _member_paths,
+    _require_configured_physical_slot,
     _without_gpu_sampler,
 )
 
@@ -541,6 +542,7 @@ class LeafRequest:
         config = configured.config
         overrides = tuple(configured.overrides)
         if program is not None:
+            slot = _require_configured_physical_slot(allocation)
             attempt_delta = configured.attempt_delta(
                 fence.output_dir,
                 root=fence.root,
@@ -551,7 +553,7 @@ class LeafRequest:
             config = ""
             overrides = ()
             values = dict(environment.env)
-            carried_slot_id = values.get("TPEN_SLOT_ID") or None
+            values.update(slot.env)
             values.pop("TPEN_SLOT_ID", None)
             values.pop("TPEN_PLACEMENT_SLOT_ID", None)
             values.update(_fence_placement_overlay(
@@ -561,8 +563,15 @@ class LeafRequest:
                 group_digest=fence.group_digest,
                 task_id=fence.task_id,
                 attempt_id=fence.attempt_id.value,
-                slot_id=carried_slot_id,
+                slot_id=slot.slot_id,
             ))
+            values["TPEN_PLACEMENT_PAYLOAD_DIGEST"] = configured.attempt_binding_digest(
+                fence.output_dir,
+                root=fence.root,
+                group_digest=fence.group_digest,
+                task_id=fence.task_id,
+                attempt_id=fence.attempt_id.value,
+            )
             environment = PreparedPythonEnvironment(environment.python, environment.setup, values)
         return cls(
             fence.group_digest,

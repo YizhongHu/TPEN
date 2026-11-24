@@ -572,10 +572,8 @@ class SciencePlacementReceipt:
 
     Parameters
     ----------
-    task_id, group_digest, allocation_id, backend_job_id : str
+    task_id, group_digest, allocation_id, backend_job_id, slot_id : str
         Identities that bind the child to its fenced allocation slot.
-    slot_id : str or None
-        Optional physical slot identity; absent for an unplaced launch.
     attempt_id : AttemptId
         Store-owned attempt identity.
     payload_digest, output_dir : str
@@ -592,7 +590,7 @@ class SciencePlacementReceipt:
     group_digest: str
     allocation_id: str
     backend_job_id: str
-    slot_id: str | None
+    slot_id: str
     payload_digest: str
     output_dir: str
     child: dict[str, Any]
@@ -602,12 +600,8 @@ class SciencePlacementReceipt:
     refusal: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
-        for name in ("task_id", "allocation_id", "backend_job_id", "output_dir"):
+        for name in ("task_id", "allocation_id", "backend_job_id", "slot_id", "output_dir"):
             object.__setattr__(self, name, text(getattr(self, name), name))
-        if self.slot_id == "":
-            object.__setattr__(self, "slot_id", None)
-        elif self.slot_id is not None:
-            object.__setattr__(self, "slot_id", text(self.slot_id, "slot_id"))
         _identity(self.attempt_id, AttemptId, "attempt_id")
         object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
         object.__setattr__(self, "payload_digest", sha256_text(self.payload_digest, "payload_digest"))
@@ -648,8 +642,8 @@ class SciencePlacementReceipt:
         declared = self.declared
         if type(declared["host"]) is not str or not declared["host"]:
             raise TypeError("declared host must be non-empty text")
-        if isinstance(declared["cpus"], (str, bytes, bytearray)) or not isinstance(declared["cpus"], Sequence):
-            raise TypeError("declared cpus must be a sequence")
+        if isinstance(declared["cpus"], (str, bytes, bytearray)) or not isinstance(declared["cpus"], Sequence) or not declared["cpus"]:
+            raise TypeError("declared cpus must be a non-empty sequence")
         if any(type(cpu) is not int or cpu < 0 for cpu in declared["cpus"]):
             raise TypeError("declared cpus must contain nonnegative integers")
         if isinstance(declared["devices"], (str, bytes, bytearray)) or not isinstance(declared["devices"], Sequence) or any(type(device) is not str or not device for device in declared["devices"]):
@@ -717,11 +711,9 @@ class SciencePlacementReceipt:
         fields(data, expected, cls.schema, "SciencePlacementReceipt")
         if any(type(data[key]) is not str for key in (
             "task_id", "attempt_id", "group_digest", "allocation_id", "backend_job_id",
-            "payload_digest", "output_dir",
+            "slot_id", "payload_digest", "output_dir",
         )):
             raise TypeError("SciencePlacementReceipt identity fields must be strings")
-        if data["slot_id"] is not None and type(data["slot_id"]) is not str:
-            raise TypeError("SciencePlacementReceipt slot_id must be a string or null")
         if any(not isinstance(data[key], Mapping) for key in ("child", "declared", "gpu", "comparison")):
             raise TypeError("SciencePlacementReceipt evidence sections must be mappings")
         if data["refusal"] is not None and not isinstance(data["refusal"], Mapping):
