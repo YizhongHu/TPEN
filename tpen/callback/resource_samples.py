@@ -954,9 +954,8 @@ class _ResourceSamplesSession:
             self._rusage_thread_started = True
 
         if self._callback.allocator.enabled:
-            now_ns = int(self._monotonic_ns())
-            self._sample_allocator()
-            self._allocator_next_due_ns = now_ns + self._allocator_interval_ns
+            read_end_ns = self._sample_allocator()
+            self._allocator_next_due_ns = read_end_ns + self._allocator_interval_ns
 
         return _ResourceSamplesHandle(self)
 
@@ -1173,7 +1172,7 @@ class _ResourceSamplesSession:
             readings=readings,
         )
 
-    def _sample_allocator(self) -> None:
+    def _sample_allocator(self) -> int:
         """Capture one cooperative allocator sample on the owning thread."""
 
         alloc_cfg = self._callback.allocator
@@ -1279,6 +1278,7 @@ class _ResourceSamplesSession:
             read_end_ns=read_end_ns,
             readings=readings,
         )
+        return read_end_ns
 
     def _enqueue_reading_packet(
         self,
@@ -1447,13 +1447,38 @@ class _ResourceSamplesSession:
             self._allocator_next_due_ns = now_ns + self._allocator_interval_ns
         else:
             self._allocator_next_due_ns += self._allocator_interval_ns
-        self._sample_allocator()
+        read_end_ns = self._sample_allocator()
+        if read_end_ns >= self._allocator_next_due_ns:
+            # Avoid a back-to-back catch-up storm when a single probe read
+            # spans past the next scheduled deadline.
+            self._allocator_next_due_ns = read_end_ns + self._allocator_interval_ns
 
     def request_stop(self) -> None:
         """Signal nonblocking stop immediately without waiting or joining."""
 
         self._stop_event.set()
         self._drain_wake_event.set()
+
+    def _drain_pending_until(self, deadline_ns: int) -> None:
+        """Drain queued samples on the closing thread up to ``deadline_ns``."""
+
+        while True:
+            item: tuple[ObservabilitySample, int] | None = None
+            with self._lock:
+                if not self._pending:
+                    return
+                if time.monotonic_ns() >= deadline_ns:
+                    # Drop unpersisted pending packets cleanly on close timeout.
+                    while self._pending:
+                        _, reserved = self._pending.popleft()
+                        self._dropped += 1
+                        if self._writer is not None:
+                            self._writer.release_pending(self._observer_id, reserved)
+                    _append_unique(self._truncation_reasons, "close_timeout")
+                    return
+                item = self._pending.popleft()
+            if item is not None:
+                self._write_one_sample(item[0], item[1])
 
     def close(self, primary_exc: BaseException | None) -> bool:
         """Stop threads, drain within one total close deadline, and finalize bundle.
@@ -1487,18 +1512,9 @@ class _ResourceSamplesSession:
             self._rusage_thread.join(timeout=producer_budget)
             producer_stopped = not self._rusage_thread.is_alive()
 
-        # 2. Final reachable captures on owning thread if producer stopped and time remains.
-        if producer_stopped and time.monotonic_ns() < deadline_ns:
-            if self._callback.rusage.enabled:
-                self._sample_rusage()
-        if time.monotonic_ns() < deadline_ns:
-            if (
-                self._callback.allocator.enabled
-                and threading.get_ident() == self._allocator_owner_thread_id
-            ):
-                self._sample_allocator()
-
-        # 3. Stop and join the drain thread within the SAME remaining deadline.
+        # 2. Stop and join the drain thread within the SAME remaining deadline
+        # before taking final captures so earlier queued samples never compete
+        # with final captures under small max_pending_envelopes bounds.
         self._drain_stop_event.set()
         self._drain_wake_event.set()
         drain_stopped = True
@@ -1507,25 +1523,27 @@ class _ResourceSamplesSession:
             self._drain_thread.join(timeout=remaining)
             drain_stopped = not self._drain_thread.is_alive()
 
-        # 4. If drain thread stopped, drain remaining queued samples up to deadline.
+        # 3. If drain thread stopped, flush any remaining queued samples, then
+        # perform final reachable captures on the owning thread and drain each
+        # immediately within the same single close deadline.
         if drain_stopped:
-            while True:
-                item: tuple[ObservabilitySample, int] | None = None
-                with self._lock:
-                    if not self._pending:
-                        break
-                    if time.monotonic_ns() >= deadline_ns:
-                        # Drop unpersisted pending packets cleanly on close timeout.
-                        while self._pending:
-                            _, reserved = self._pending.popleft()
-                            self._dropped += 1
-                            if self._writer is not None:
-                                self._writer.release_pending(self._observer_id, reserved)
-                        _append_unique(self._truncation_reasons, "close_timeout")
-                        break
-                    item = self._pending.popleft()
-                if item is not None:
-                    self._write_one_sample(item[0], item[1])
+            self._drain_pending_until(deadline_ns)
+            if producer_stopped and time.monotonic_ns() < deadline_ns:
+                if (
+                    self._callback.rusage.enabled
+                    and self._rusage_probe is not None
+                    and self._writer is not None
+                ):
+                    self._sample_rusage()
+                    self._drain_pending_until(deadline_ns)
+            if time.monotonic_ns() < deadline_ns:
+                if (
+                    self._callback.allocator.enabled
+                    and self._writer is not None
+                    and threading.get_ident() == self._allocator_owner_thread_id
+                ):
+                    self._sample_allocator()
+                    self._drain_pending_until(deadline_ns)
 
         quiescent = producer_stopped and drain_stopped
         if not quiescent:

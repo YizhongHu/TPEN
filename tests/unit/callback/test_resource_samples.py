@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Iterator
+import contextlib
 import copy
 import json
 import math
@@ -51,6 +53,7 @@ from tpen.callback.resource_samples import (
 )
 from tpen.checkpoint import TrainResume, save_checkpoint
 from tpen.checkpoint.operational_slots import OPERATIONAL_SLOT_MANIFEST
+from tpen.distributed import ExecutionTopology
 from tpen.inspection import inspect_observability_bundle, inspect_run_observability
 from tpen.process_resources import ProcessResourceBaseline, ResourceUnavailable
 import tpen.run as run_mod
@@ -588,7 +591,7 @@ def test_rusage_periodic_background_thread_captures_multiple_samples(tmp_path: P
     )
     cb = ResourceSamples(
         interval_seconds=0.02,
-        max_pending_envelopes=16,
+        max_pending_envelopes=64,
         rusage=RUsageSource(enabled=True, probe=probe),
     )
     cfg = _base_cfg(
@@ -603,13 +606,18 @@ def test_rusage_periodic_background_thread_captures_multiple_samples(tmp_path: P
     assert exit_code == 0
 
     bundle = inspect_run_observability(tmp_path / "outputs" / "o3-run").invocations[0]
+    status = bundle.statuses["resource-samples"]
     assert bundle.derived_lifecycle_state == "closed"
-    assert bundle.derived_data_completeness == "complete"
+    assert bundle.derived_data_completeness == "complete", (
+        f"expected complete bundle, got {bundle.derived_data_completeness!r} "
+        f"(reason={bundle.derived_reason!r}, counts={status.counts!r}, "
+        f"truncation_reasons={status.truncation_reasons!r}, "
+        f"diagnostics={bundle.diagnostics!r})"
+    )
     samples = bundle.samples["resource-samples"]
     assert len(samples) >= 3
     # At least one sample came from the background RUSAGE thread, not the main thread.
     assert any(tid != main_tid for tid in probe.thread_ids)
-    status = bundle.statuses["resource-samples"]
     assert status.application_outcome == "completed"
     assert status.invocation_outcome == "completed"
     assert status.helper_cleanup["state"] == "confirmed_stopped"
@@ -621,7 +629,7 @@ def test_rusage_periodic_background_thread_captures_multiple_samples(tmp_path: P
 
 
 def test_allocator_current_vs_peak_and_deferred_cooperative_execution(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Allocator probes activate lazily inside run_scope, reset once, and run cooperatively."""
 
@@ -652,10 +660,13 @@ def test_allocator_current_vs_peak_and_deferred_cooperative_execution(
         created_devices.append(f"peak:{dev}")
         return peak_probe
 
-    clock = _SteppingClock(start_ns=1_000_000_000_000, step_ns=200_000_000)
+    # 0.1s per monotonic_ns() call with 0.5s interval exercises cooperative
+    # throttling cleanly (multiple checkpoints skipped between due samples)
+    # while staying well below max_pending_envelopes=32 even on 1-CPU nodes.
+    clock = _SteppingClock(start_ns=1_000_000_000_000, step_ns=100_000_000)
     cb = ResourceSamples(
         interval_seconds=0.5,
-        max_pending_envelopes=16,
+        max_pending_envelopes=32,
         rusage=RUsageSource(enabled=False),
         allocator=AllocatorSource(
             enabled=True,
@@ -670,25 +681,60 @@ def test_allocator_current_vs_peak_and_deferred_cooperative_execution(
     # Construction must NOT invoke probe factories.
     assert created_devices == []
 
+    checkpoint_calls = 0
+    original_run_scope = cb.run_scope
+
+    @contextlib.contextmanager
+    def counting_run_scope(ctx: RunContext) -> Iterator[Any]:
+        with original_run_scope(ctx) as handle:
+            assert handle is not None
+
+            class _CountingHandle:
+                def checkpoint(self) -> None:
+                    nonlocal checkpoint_calls
+                    checkpoint_calls += 1
+                    handle.checkpoint()
+
+                def request_stop(self) -> None:
+                    handle.request_stop()
+
+            yield _CountingHandle()
+
+    monkeypatch.setattr(cb, "run_scope", counting_run_scope)
+
     cfg = _base_cfg(
         tmp_path,
         device="cuda:0",
         runner={"_target_": f"{__name__}._CheckpointRunner", "steps": 6},
     )
-    exit_code = run_from_config(cfg, raise_exceptions=True, runtime_callbacks=[cb])
+    topology = ExecutionTopology.single_process(device="cuda:0", device_identity=identity)
+    exit_code = run_from_config(
+        cfg,
+        raise_exceptions=True,
+        topology=topology,
+        runtime_callbacks=[cb],
+    )
     assert exit_code == 0
 
     assert created_devices == ["current:cuda:0", "peak:cuda:0"]
     assert peak_probe.reset_calls == 1
-    assert current_probe.read_calls >= 3
-    assert peak_probe.read_calls >= 3
+    assert checkpoint_calls >= 10
+    # Cooperative throttling must fire multiple samples while skipping non-due checkpoints.
+    assert 3 <= current_probe.read_calls < checkpoint_calls
+    assert peak_probe.read_calls == current_probe.read_calls
     # Every allocator call happened strictly on the owning main thread.
     assert set(current_probe.thread_ids) == {main_tid}
     assert set(peak_probe.thread_ids) == {main_tid}
 
     bundle = inspect_run_observability(tmp_path / "outputs" / "o3-run").invocations[0]
+    status = bundle.statuses["resource-samples"]
     assert bundle.derived_lifecycle_state == "closed"
-    assert bundle.derived_data_completeness == "complete"
+    assert bundle.derived_data_completeness == "complete", (
+        f"expected complete bundle, got {bundle.derived_data_completeness!r} "
+        f"(reason={bundle.derived_reason!r}, counts={status.counts!r}, "
+        f"truncation_reasons={status.truncation_reasons!r}, "
+        f"diagnostics={bundle.diagnostics!r})"
+    )
 
     descriptors = bundle.descriptors
     assert descriptors is not None
@@ -719,7 +765,6 @@ def test_allocator_current_vs_peak_and_deferred_cooperative_execution(
     assert peak_summary.observed_max == 4 * 1024 * 1024
     assert peak_summary.sampled_max is None
 
-    status = bundle.statuses["resource-samples"]
     assert status.helper_cleanup["state"] == "not_started"
     assert status.counts["attempted"] == status.counts["written"]
 
@@ -780,15 +825,27 @@ def test_allocator_without_reset_coexists_with_resource_usage_and_never_resets(
     legacy = ResourceUsage(
         allocator_probe=_FakePeakAllocatorProbe([AllocatorUsage(identity, 2.0, 4.0, 1)])
     )
+    # Supply explicit topology matching the fake device identity so CPU-only
+    # nodes without CUDA do not mismatch uuid=None against uuid='GPU-RO'.
+    topology = ExecutionTopology.single_process(device="cuda:0", device_identity=identity)
     exit_code = run_from_config(
         _base_cfg(tmp_path, device="cuda:0"),
         raise_exceptions=True,
+        topology=topology,
         runtime_callbacks=[cb, legacy],
     )
     assert exit_code == 0
     assert peak_probe.reset_calls == 0
 
     bundle = inspect_run_observability(tmp_path / "outputs" / "o3-run").invocations[0]
+    status = bundle.statuses["resource-samples"]
+    assert bundle.derived_lifecycle_state == "closed"
+    assert bundle.derived_data_completeness == "complete", (
+        f"expected complete bundle, got {bundle.derived_data_completeness!r} "
+        f"(reason={bundle.derived_reason!r}, counts={status.counts!r}, "
+        f"truncation_reasons={status.truncation_reasons!r}, "
+        f"diagnostics={bundle.diagnostics!r})"
+    )
     assert bundle.descriptors is not None
     peak_desc = bundle.descriptors.quantities["allocator.peak.allocated_bytes"]
     assert peak_desc.window == "unknown"
