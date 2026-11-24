@@ -633,9 +633,9 @@ class _CountingSampler:
         self._inner = _FixedSampler()
         self.collect_calls = 0
 
-    def collect_samples(self, model, *, device=None):
+    def collect_samples(self, model, *, reset=False, device=None, emitter=None):
         self.collect_calls += 1
-        return self._inner.collect_samples(model, device=device)
+        return self._inner.collect_samples(model, reset=reset, device=device, emitter=emitter)
 
     def mcmc_state_dict(self):
         return self._inner.mcmc_state_dict()

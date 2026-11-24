@@ -563,9 +563,9 @@ class _CountingFixedSampler(_FixedSampler):
         super().__init__(n_walkers=n_walkers, seed=seed)
         self.calls = 0
 
-    def collect_samples(self, model, *, device=None):
+    def collect_samples(self, model, *, reset=False, device=None, emitter=None):
         self.calls += 1
-        return super().collect_samples(model, device=device)
+        return super().collect_samples(model, reset=reset, device=device, emitter=emitter)
 
 
 @pytest.mark.parametrize("kind", ["sr", "spring"])

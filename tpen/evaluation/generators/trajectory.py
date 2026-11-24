@@ -70,7 +70,7 @@ class TrajectoryMCMCGenerator:
     Parameters
     ----------
     sampler : object
-        Sampler exposing ``collect_samples(model, *, reset=..., device=...)``.
+        Sampler exposing ``collect_samples(model, *, reset=..., device=..., emitter=...)``.
     hamiltonian_terms : sequence or mapping of HamiltonianTerm
         Terms defining the local energy evaluated once per draw.
     n_draws : int

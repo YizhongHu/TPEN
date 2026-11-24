@@ -401,7 +401,7 @@ def collect_observable_trajectory_with_diagnostics(
     Parameters
     ----------
     sampler : object
-        Sampler exposing ``collect_samples(model, *, reset=..., device=...)``
+        Sampler exposing ``collect_samples(model, *, reset=..., device=..., emitter=...)``
         returning ``(Walkers, SamplerStats)``.
     model : torch.nn.Module
         Wavefunction model, held fixed for the whole collection.

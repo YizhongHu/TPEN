@@ -92,8 +92,8 @@ class _FixedSampler:
         )
         self._batch = ElectronBatch(positions=positions, spins=batch.spins)
 
-    def collect_samples(self, model, *, device=None):
-        del model, device
+    def collect_samples(self, model, *, reset=False, device=None, emitter=None):
+        del model, reset, device, emitter
         return _FixedWalkers(self._batch), None
 
     def mcmc_state_dict(self) -> dict[str, Any]:

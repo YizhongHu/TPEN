@@ -7,7 +7,6 @@ from .evaluation_timing import EvaluationTiming
 from .run_timing import RunTiming
 from .train_phase_timing import TrainPhaseTiming
 from .train_step_timing import TrainStepTiming
-from .sampling_timing import SamplingScopeTiming
 
 
 def __getattr__(name: str) -> object:
@@ -25,6 +24,10 @@ def __getattr__(name: str) -> object:
         from .diagnostic_timing import DiagnosticTiming
 
         return DiagnosticTiming
+    if name == "SamplingScopeTiming":
+        from .sampling_timing import SamplingScopeTiming
+
+        return SamplingScopeTiming
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

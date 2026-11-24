@@ -475,8 +475,8 @@ class _SequenceSampler:
         self._batches = batches
         self.cursor = 0
 
-    def collect_samples(self, model: Any, *, device: Any = None):
-        del model, device
+    def collect_samples(self, model: Any, *, reset: bool = False, device: Any = None, emitter=None):
+        del model, reset, device, emitter
         batch = self._batches[self.cursor % len(self._batches)]
         self.cursor += 1
         return _FixedWalkers(batch), None

@@ -47,12 +47,15 @@ class SamplingScopeTiming(Callback):
             operation = event.operation
             if isinstance(operation, self._training_type):
                 self._step = operation.step if isinstance(event, Started) else None
+                if isinstance(event, Started):
+                    self._task = None
                 if isinstance(event, Ended):
                     self._clear_parent("train", operation.step)
                 return
             if isinstance(operation, self._evaluation_type):
                 if isinstance(event, Started):
                     self._task = operation.name
+                    self._step = None
                 else:
                     self._flush("eval", operation.name, context)
                     self._task = None
