@@ -101,6 +101,7 @@ from tpen.training.linear_method import (
     validate_dense_memory_budget,
 )
 from tpen.training.score_geometry import ScoreConventions
+from tpen.training.statistics import StatisticsReducer
 from tpen.training.step_requests import (
     HamiltonianTangentUpdateInput,
     MaterializedHamiltonianTangentStepRequest,
@@ -2252,3 +2253,812 @@ def test_real_tiny_tpen_smoke_chunk_parity_disconnected_zero_and_train_resume(
         with pytest.raises(ValueError, match=pattern):
             res_method.load_method_state_dict(copy.deepcopy(mutated_state))
         assert res_method.completed_updates == 2
+
+
+# ---------------------------------------------------------------------------
+# 13. Review Round-1 Fix Regressions (F1--F4)
+# ---------------------------------------------------------------------------
+
+
+class _TwoParamOracleAHarmonicWavefunction(torch.nn.Module):
+    """Two-parameter variant of Oracle A for partial-subset SGD carrier probes."""
+
+    def __init__(self, alpha: float = 0.35, beta: float = 0.40) -> None:
+        super().__init__()
+        self.alpha = torch.nn.Parameter(torch.tensor([alpha], dtype=torch.float64))
+        self.beta = torch.nn.Parameter(torch.tensor([beta], dtype=torch.float64))
+        self._binding = ParameterBinding(
+            layout=ParameterLayout(
+                slots=(
+                    ParameterSlot(ordinal=0, shape=(1,), numel=1, dtype=torch.float64),
+                    ParameterSlot(ordinal=1, shape=(1,), numel=1, dtype=torch.float64),
+                )
+            ),
+            parameters=(self.alpha, self.beta),
+        )
+
+    @property
+    def parameter_binding(self) -> ParameterBinding:
+        return self._binding
+
+    def forward(self, batch: ElectronBatch) -> WavefunctionOutput:
+        flat = batch.flatten_samples()
+        r = flat.positions[:, 0, :]
+        r2 = (r * r).sum(dim=-1)
+        x = r[:, 0]
+        logabs = -self.alpha[0] * r2 + self.beta[0] * x
+        return WavefunctionOutput(logabs=logabs, sign=torch.ones_like(logabs))
+
+
+class _FixedCheckpointedSampler(_FixedSampler):
+    """Minimal fixed sampler supporting TrainResume checkpoint save and restore."""
+
+    def mcmc_state_dict(self) -> dict[str, Any]:
+        return {"step": 0}
+
+    def load_mcmc_state_dict(self, state: dict[str, Any], *, device: Any = None) -> None:
+        del state, device
+
+
+def test_f1_plain_sgd_carrier_validation_and_runtime_resume_revalidation(
+    tmp_path: Path,
+) -> None:
+    """Plain-SGD validation enforces exact coverage, non-bool lr, and runtime/resume atomicity."""
+
+    positions, e_loc, o_mat, ge_mat = _oracle_a_arrays()
+    policy = LinearMethodPolicy(derivative_block_shift=0.01, overlap_shift=0.0, step_scale=1.0)
+
+    # 1. Constructor guards: empty param_groups, empty params, bool/None/non-finite lr,
+    #    strict-subset carrier, foreign/extra carrier, duplicate parameter, multi-group OK.
+    p1 = torch.nn.Parameter(torch.tensor([0.35], dtype=torch.float64))
+    p2 = torch.nn.Parameter(torch.tensor([0.40], dtype=torch.float64))
+    p_extra = torch.nn.Parameter(torch.tensor([0.10], dtype=torch.float64))
+    binding_12 = ModelParameterBinding(parameters=(p1, p2))
+
+    opt_empty_groups = torch.optim.SGD([p1, p2], lr=1.0)
+    opt_empty_groups.param_groups.clear()
+    with pytest.raises(ValueError, match="non-empty"):
+        LinearMethodUpdate(opt_empty_groups, model_parameters=binding_12, policy=policy)
+
+    opt_empty_params = torch.optim.SGD([p1, p2], lr=1.0)
+    opt_empty_params.param_groups[0]["params"].clear()
+    with pytest.raises(ValueError, match="empty"):
+        LinearMethodUpdate(opt_empty_params, model_parameters=binding_12, policy=policy)
+
+    for bool_lr in (True, False):
+        with pytest.raises(TypeError, match="real number"):
+            LinearMethodUpdate(
+                torch.optim.SGD([p1, p2], lr=bool_lr),  # type: ignore[arg-type]
+                model_parameters=binding_12,
+                policy=policy,
+            )
+
+    opt_none_lr = torch.optim.SGD([p1, p2], lr=1.0)
+    opt_none_lr.param_groups[0]["lr"] = None
+    with pytest.raises(TypeError, match="real number"):
+        LinearMethodUpdate(opt_none_lr, model_parameters=binding_12, policy=policy)
+
+    for bad_lr in (float("nan"), float("inf")):
+        opt_nonfinite_lr = torch.optim.SGD([p1, p2], lr=1.0)
+        opt_nonfinite_lr.param_groups[0]["lr"] = bad_lr
+        with pytest.raises(ValueError, match="finite"):
+            LinearMethodUpdate(opt_nonfinite_lr, model_parameters=binding_12, policy=policy)
+
+    # Strict-subset SGD (missing p2) refused loudly at construction.
+    with pytest.raises(ValueError, match="partial parameter-subset"):
+        LinearMethodUpdate(
+            torch.optim.SGD([p1], lr=1.0),
+            model_parameters=binding_12,
+            policy=policy,
+        )
+
+    # Extra/foreign parameter SGD refused loudly at construction.
+    with pytest.raises(ValueError, match="foreign"):
+        LinearMethodUpdate(
+            torch.optim.SGD([p1, p2, p_extra], lr=1.0),
+            model_parameters=binding_12,
+            policy=policy,
+        )
+    with pytest.raises(ValueError, match="foreign"):
+        LinearMethodUpdate(
+            torch.optim.SGD([p_extra], lr=1.0),
+            model_parameters=ModelParameterBinding(parameters=(p1,)),
+            policy=policy,
+        )
+
+    # Duplicate parameter across groups or inside a group refused loudly.
+    opt_dup = torch.optim.SGD([p1, p2], lr=1.0)
+    opt_dup.param_groups[0]["params"].append(p1)
+    with pytest.raises(ValueError, match="duplicate"):
+        LinearMethodUpdate(opt_dup, model_parameters=binding_12, policy=policy)
+
+    # Positive control: multi-group plain SGD with exact disjoint coverage succeeds.
+    opt_multi = torch.optim.SGD([{"params": [p1], "lr": 1.0}, {"params": [p2], "lr": 1.0}])
+    method_multi = LinearMethodUpdate(opt_multi, model_parameters=binding_12, policy=policy)
+    assert method_multi.completed_updates == 0
+
+    # 2. Post-init param_groups drift before update(): atomic zero-mutation refusal.
+    drift_mutations: list[tuple[Any, type[Exception], str]] = [
+        (lambda opt, _p: opt.param_groups[0].__setitem__("lr", 0.5), ValueError, "step_scale"),
+        (lambda opt, _p: opt.param_groups[0].__setitem__("lr", True), TypeError, "real number"),
+        (lambda opt, _p: opt.param_groups[0].__setitem__("lr", None), TypeError, "real number"),
+        (
+            lambda opt, _p: opt.param_groups[0].__setitem__("lr", float("nan")),
+            ValueError,
+            "finite",
+        ),
+        (
+            lambda opt, _p: opt.param_groups[0].__setitem__("momentum", 0.9),
+            ValueError,
+            "momentum",
+        ),
+        (
+            lambda opt, _p: opt.param_groups[0].__setitem__("dampening", 0.1),
+            ValueError,
+            "dampening",
+        ),
+        (
+            lambda opt, _p: opt.param_groups[0].__setitem__("weight_decay", 1.0e-4),
+            ValueError,
+            "weight_decay",
+        ),
+        (
+            lambda opt, _p: opt.param_groups[0].__setitem__("nesterov", True),
+            ValueError,
+            "nesterov",
+        ),
+        (
+            lambda opt, _p: opt.param_groups[0].__setitem__("maximize", True),
+            ValueError,
+            "maximize",
+        ),
+        (lambda opt, _p: opt.param_groups.clear(), ValueError, "non-empty"),
+        (
+            lambda opt, _p: opt.param_groups[0].__setitem__("params", [p_extra]),
+            ValueError,
+            "foreign",
+        ),
+        (
+            lambda opt, p: opt.param_groups[0]["params"].append(p),
+            ValueError,
+            "duplicate",
+        ),
+    ]
+    for mutate, expected_exc, pattern in drift_mutations:
+        param = torch.nn.Parameter(torch.tensor([0.35, 0.40], dtype=torch.float64))
+        method = _lm_method(param, policy=policy)
+        # Apply one clean step first so completed_updates and _last_result are non-trivial.
+        first_res = method.update(_tangent_input(param, o_mat, ge_mat, e_loc, positions=positions))
+        assert first_res.applied is True
+        assert method.completed_updates == 1
+        sentinel_grad = torch.tensor([11.0, -13.0], dtype=torch.float64)
+        param.grad = sentinel_grad.clone()
+        before_param = param.detach().clone()
+        before_last_result = method._last_result
+
+        mutate(method.optimizer, param)
+        with pytest.raises(expected_exc, match=pattern):
+            method.update(_tangent_input(param, o_mat, ge_mat, e_loc, positions=positions))
+
+        assert torch.equal(param.detach(), before_param)
+        assert param.grad is not None and torch.equal(param.grad, sentinel_grad)
+        assert method.completed_updates == 1
+        assert method._last_result is before_last_result
+
+    # 3. Post-init strict-subset mutation routed through VMCTrainer.fit() fails closed
+    #    even though VMCTrainer's validate_optimizer_parameter_containment admits subsets.
+    two_param_model = _TwoParamOracleAHarmonicWavefunction(alpha=0.35, beta=0.40)
+    with pytest.raises(ValueError, match="partial parameter-subset"):
+        LinearMethodUpdate(
+            torch.optim.SGD([two_param_model.alpha], lr=1.0),
+            model_parameters=ModelParameterBinding(parameters=tuple(two_param_model.parameters())),
+            policy=policy,
+        )
+
+    subset_method = LinearMethodUpdate(
+        torch.optim.SGD(two_param_model.parameters(), lr=1.0),
+        model_parameters=ModelParameterBinding(parameters=tuple(two_param_model.parameters())),
+        policy=policy,
+    )
+    subset_method.optimizer.param_groups[0]["params"] = [two_param_model.alpha]
+    before_alpha = two_param_model.alpha.detach().clone()
+    before_beta = two_param_model.beta.detach().clone()
+    batch = ElectronBatch(
+        positions=positions,
+        spins=torch.ones((12, 1), dtype=torch.float64),
+    )
+    subset_trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, update_method=subset_method)
+    with pytest.raises(ValueError, match="partial parameter-subset"):
+        subset_trainer.fit(
+            model=two_param_model,
+            sampler=_FixedSampler(batch),
+            hamiltonian_terms=[KineticEnergy(), HarmonicTrap(omega=1.0)],
+            optimizer=subset_method.optimizer,
+            context=_StubContext(),
+            emit=lambda **_: None,
+        )
+    assert torch.equal(two_param_model.alpha.detach(), before_alpha)
+    assert torch.equal(two_param_model.beta.detach(), before_beta)
+    assert two_param_model.alpha.grad is None
+    assert two_param_model.beta.grad is None
+    assert subset_method.completed_updates == 0
+    assert subset_method._last_result is None
+    assert subset_trainer.completed_updates == 0
+
+    # 4. Direct load_method_state_dict() fails closed atomically on drifted optimizer.
+    for mutate, expected_exc, pattern in (
+        (lambda opt, _p: opt.param_groups[0].__setitem__("lr", 0.5), ValueError, "step_scale"),
+        (lambda opt, _p: opt.param_groups[0].__setitem__("lr", True), TypeError, "real number"),
+        (
+            lambda opt, _p: opt.param_groups[0].__setitem__("momentum", 0.9),
+            ValueError,
+            "momentum",
+        ),
+        (
+            lambda opt, _p: opt.param_groups[0].__setitem__("weight_decay", 1.0e-3),
+            ValueError,
+            "weight_decay",
+        ),
+        (
+            lambda opt, _p: opt.param_groups[0].__setitem__("maximize", True),
+            ValueError,
+            "maximize",
+        ),
+        (lambda opt, _p: opt.param_groups.clear(), ValueError, "non-empty"),
+    ):
+        param_load = torch.nn.Parameter(torch.tensor([0.35, 0.40], dtype=torch.float64))
+        method_load = _lm_method(param_load, policy=policy)
+        method_load.update(_tangent_input(param_load, o_mat, ge_mat, e_loc, positions=positions))
+        assert method_load.completed_updates == 1
+        target_state = {**method_load.method_state_dict(), "completed_updates": 7}
+        sentinel_grad = torch.tensor([5.0, -6.0], dtype=torch.float64)
+        param_load.grad = sentinel_grad.clone()
+        before_param = param_load.detach().clone()
+        before_last_result = method_load._last_result
+
+        mutate(method_load.optimizer, param_load)
+        with pytest.raises(expected_exc, match=pattern):
+            method_load.load_method_state_dict(target_state)
+
+        assert method_load.completed_updates == 1
+        assert torch.equal(param_load.detach(), before_param)
+        assert param_load.grad is not None and torch.equal(param_load.grad, sentinel_grad)
+        assert method_load._last_result is before_last_result
+
+    # 5. Real TrainResume checkpoint restore refuses drifted optimizer.pt atomically
+    #    inside load_method_state_dict() before mutating method/trainer counters.
+    ho_cfg = OmegaConf.create(
+        {
+            "model": {"name": "oracle_a_ho"},
+            "sampler": {"name": "fixed"},
+            "hamiltonian_terms": {"kinetic": True, "harmonic_trap": 1.0},
+            "optimizer": {"_target_": "torch.optim.SGD", "lr": 1.0},
+            "trainer": {"max_steps": 2, "log_every_n_steps": 1},
+        }
+    )
+    terms = [KineticEnergy(), HarmonicTrap(omega=1.0)]
+    for label, drift_key, drift_val, pattern in (
+        ("lr_drift", "lr", 0.5, "step_scale"),
+        ("momentum_drift", "momentum", 0.9, "momentum"),
+        ("maximize_drift", "maximize", True, "maximize"),
+    ):
+        src_model = _OracleAHarmonicWavefunction(alpha=0.35, beta=0.40)
+        src_method = LinearMethodUpdate(
+            torch.optim.SGD(src_model.parameters(), lr=1.0),
+            model_parameters=ModelParameterBinding(parameters=tuple(src_model.parameters())),
+            policy=policy,
+        )
+        src_sampler = _FixedCheckpointedSampler(batch)
+        src_ctx = _ResumeContext(ho_cfg, tmp_path / f"{label}_src")
+        src_trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, update_method=src_method)
+        src_trainer.fit(
+            model=src_model,
+            sampler=src_sampler,
+            hamiltonian_terms=terms,
+            optimizer=src_method.optimizer,
+            context=src_ctx,
+            emit=lambda **_: None,
+        )
+        assert src_method.completed_updates == 1
+
+        # Simulate scheduler/carrier mutation persisted into optimizer.pt with valid manifest hashes.
+        src_method.optimizer.param_groups[0][drift_key] = drift_val
+        ckpt_dir = save_checkpoint(
+            output_dir=tmp_path / f"{label}_ckpts",
+            next_iteration=src_trainer.next_iteration,
+            completed_updates=src_trainer.completed_updates,
+            model=src_model,
+            context=src_ctx,
+            optimizer=src_method.optimizer,
+            trainer=src_trainer,
+            sampler=src_sampler,
+        )
+
+        res_model = _OracleAHarmonicWavefunction(alpha=0.35, beta=0.40)
+        res_method = LinearMethodUpdate(
+            torch.optim.SGD(res_model.parameters(), lr=1.0),
+            model_parameters=ModelParameterBinding(parameters=tuple(res_model.parameters())),
+            policy=policy,
+        )
+        res_sampler = _FixedCheckpointedSampler(batch)
+        res_ctx = _ResumeContext(ho_cfg, tmp_path / f"{label}_res")
+        res_trainer = VMCTrainer(max_steps=2, log_every_n_steps=1, update_method=res_method)
+        res_trainer.resolve_update_state(model=res_model, optimizer=res_method.optimizer)
+
+        with pytest.raises(ValueError, match=pattern):
+            restore_checkpoint(
+                load={"mode": "train_resume", "path": str(ckpt_dir)},
+                model=res_model,
+                context=res_ctx,
+                optimizer=res_method.optimizer,
+                trainer=res_trainer,
+                sampler=res_sampler,
+            )
+        assert res_method.completed_updates == 0
+        assert res_method._last_result is None
+        assert res_trainer.completed_updates == 0
+        assert res_trainer.next_iteration == 0
+
+
+class _Pass1Done(Exception):
+    """Sentinel stopping Stage-1 capture immediately after Pass-1 reduction."""
+
+
+class _Pass1CaptureReducer(StatisticsReducer):
+    """Capture one rank's Pass-1 local count and sums emitted by assembly."""
+
+    def __init__(self) -> None:
+        self.count: int | None = None
+        self.sums: list[torch.Tensor] = []
+
+    def reduce_count(self, count: int) -> int:
+        self.count = count
+        return count
+
+    def reduce_sum(self, value: torch.Tensor) -> torch.Tensor:
+        self.sums.append(value.detach().clone())
+        if len(self.sums) == 3:
+            raise _Pass1Done()
+        return value
+
+
+class _Pass2CaptureReducer(StatisticsReducer):
+    """Replay global Pass-1 sums and capture one rank's Pass-2 local sums."""
+
+    def __init__(
+        self,
+        *,
+        global_count: int,
+        global_first: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> None:
+        self._global_count = global_count
+        self._global_first = global_first
+        self._sum_calls = 0
+        self.pass2_sums: list[torch.Tensor] = []
+
+    def reduce_count(self, count: int) -> int:
+        del count
+        return self._global_count
+
+    def reduce_sum(self, value: torch.Tensor) -> torch.Tensor:
+        idx = self._sum_calls
+        self._sum_calls += 1
+        if idx < 3:
+            return self._global_first[idx].clone()
+        self.pass2_sums.append(value.detach().clone())
+        return value
+
+
+class _ReplayAllReduceReducer(StatisticsReducer):
+    """Replay exact all-reduced Pass-1 and Pass-2 sums and assert reducer call protocol."""
+
+    def __init__(
+        self,
+        *,
+        expected_count: int,
+        expected_locals: tuple[torch.Tensor, ...],
+        global_count: int,
+        global_sums: tuple[torch.Tensor, ...],
+    ) -> None:
+        self._expected_count = expected_count
+        self._expected_locals = expected_locals
+        self._global_count = global_count
+        self._global_sums = global_sums
+        self.count_calls = 0
+        self.sum_calls = 0
+
+    def reduce_count(self, count: int) -> int:
+        assert count == self._expected_count
+        self.count_calls += 1
+        return self._global_count
+
+    def reduce_sum(self, value: torch.Tensor) -> torch.Tensor:
+        idx = self.sum_calls
+        assert idx < len(self._global_sums)
+        torch.testing.assert_close(value, self._expected_locals[idx], atol=0.0, rtol=0.0)
+        self.sum_calls += 1
+        return self._global_sums[idx].clone()
+
+
+class _AsymmetricReducer(StatisticsReducer):
+    """Doubles count and triples sums so reduced mean is 1.5x local mean."""
+
+    def reduce_count(self, count: int) -> int:
+        return 2 * count
+
+    def reduce_sum(self, value: torch.Tensor) -> torch.Tensor:
+        return 3.0 * value
+
+
+def _simulate_multirank_assembly(
+    shards: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    *,
+    solve_dtype: torch.dtype = torch.float64,
+) -> tuple[list[DenseLinearMethodMatrices], list[list[torch.Tensor]], list[list[torch.Tensor]]]:
+    """Deterministically execute two-pass multi-rank reduction across rank shards."""
+
+    pass1_counts: list[int] = []
+    pass1_locals: list[list[torch.Tensor]] = []
+    for e_r, o_r, ge_r in shards:
+        cap1 = _Pass1CaptureReducer()
+        try:
+            assemble_dense_linear_method_matrices(
+                e_r, o_r, ge_r, solve_dtype=solve_dtype, reducer=cap1
+            )
+        except _Pass1Done:
+            pass
+        assert cap1.count == int(e_r.shape[0])
+        assert len(cap1.sums) == 3
+        pass1_counts.append(cap1.count)
+        pass1_locals.append(cap1.sums)
+
+    global_count = sum(pass1_counts)
+    global_first = (
+        sum((sums[0] for sums in pass1_locals[1:]), pass1_locals[0][0].clone()),
+        sum((sums[1] for sums in pass1_locals[1:]), pass1_locals[0][1].clone()),
+        sum((sums[2] for sums in pass1_locals[1:]), pass1_locals[0][2].clone()),
+    )
+
+    pass2_locals: list[list[torch.Tensor]] = []
+    for e_r, o_r, ge_r in shards:
+        cap2 = _Pass2CaptureReducer(global_count=global_count, global_first=global_first)
+        assemble_dense_linear_method_matrices(
+            e_r, o_r, ge_r, solve_dtype=solve_dtype, reducer=cap2
+        )
+        assert len(cap2.pass2_sums) == 3
+        pass2_locals.append(cap2.pass2_sums)
+
+    global_second = (
+        sum((sums[0] for sums in pass2_locals[1:]), pass2_locals[0][0].clone()),
+        sum((sums[1] for sums in pass2_locals[1:]), pass2_locals[0][1].clone()),
+        sum((sums[2] for sums in pass2_locals[1:]), pass2_locals[0][2].clone()),
+    )
+    global_all = global_first + global_second
+
+    rank_outputs: list[DenseLinearMethodMatrices] = []
+    for rank_idx, (e_r, o_r, ge_r) in enumerate(shards):
+        replay = _ReplayAllReduceReducer(
+            expected_count=pass1_counts[rank_idx],
+            expected_locals=tuple(pass1_locals[rank_idx]) + tuple(pass2_locals[rank_idx]),
+            global_count=global_count,
+            global_sums=global_all,
+        )
+        mats = assemble_dense_linear_method_matrices(
+            e_r, o_r, ge_r, solve_dtype=solve_dtype, reducer=replay
+        )
+        assert replay.count_calls == 1
+        assert replay.sum_calls == 6
+        rank_outputs.append(mats)
+
+    return rank_outputs, pass1_locals, pass2_locals
+
+
+def test_f2_multirank_statistics_reducer_splits_empty_rank_and_asymmetric_centering() -> None:
+    """Two-pass StatisticsReducer assembly matches single-rank on 5+7, 5+0+7, and skewed means."""
+
+    _, e_loc, o_mat, ge_mat = _oracle_a_arrays()
+    ref_mats = assemble_dense_linear_method_matrices(
+        e_loc, o_mat, ge_mat, solve_dtype=torch.float64
+    )
+    policy = LinearMethodPolicy(derivative_block_shift=0.01, overlap_shift=0.05, rescaling_xi=0.5)
+    ref_out = solve_dense_linear_method(ref_mats, policy=policy)
+    assert ref_out.accepted and ref_out.delta_theta is not None
+
+    def _assert_matches_ref(mats: DenseLinearMethodMatrices) -> None:
+        assert mats.count == ref_mats.count == 12
+        assert mats.dtype == ref_mats.dtype == "torch.float64"
+        assert mats.energy_mean == pytest.approx(ref_mats.energy_mean, abs=1.0e-12, rel=1.0e-12)
+        assert mats.score_mean_norm_sq == pytest.approx(
+            ref_mats.score_mean_norm_sq, abs=1.0e-12, rel=1.0e-12
+        )
+        torch.testing.assert_close(mats.S_param, ref_mats.S_param, atol=1.0e-12, rtol=1.0e-12)
+        torch.testing.assert_close(mats.h_c, ref_mats.h_c, atol=1.0e-12, rtol=1.0e-12)
+        torch.testing.assert_close(mats.h_r, ref_mats.h_r, atol=1.0e-12, rtol=1.0e-12)
+        torch.testing.assert_close(mats.dH11, ref_mats.dH11, atol=1.0e-12, rtol=1.0e-12)
+        out = solve_dense_linear_method(mats, policy=policy)
+        assert out.accepted and out.delta_theta is not None
+        assert out.diagnostics.selected_delta_eigenvalue == pytest.approx(
+            ref_out.diagnostics.selected_delta_eigenvalue, abs=1.0e-11, rel=1.0e-11
+        )
+        assert out.diagnostics.selected_eigenvalue == pytest.approx(
+            ref_out.diagnostics.selected_eigenvalue, abs=1.0e-11, rel=1.0e-11
+        )
+        assert out.diagnostics.selected_c0 == pytest.approx(
+            ref_out.diagnostics.selected_c0, abs=1.0e-11, rel=1.0e-11
+        )
+        assert out.diagnostics.directional_derivative == pytest.approx(
+            ref_out.diagnostics.directional_derivative, abs=1.0e-11, rel=1.0e-11
+        )
+        torch.testing.assert_close(out.delta_theta, ref_out.delta_theta, atol=1.0e-11, rtol=1.0e-11)
+
+    # (a) Uneven 5 + 7 multi-rank split.
+    shards_5_7 = [
+        (e_loc[:5], o_mat[:5], ge_mat[:5]),
+        (e_loc[5:], o_mat[5:], ge_mat[5:]),
+    ]
+    outputs_5_7, _, _ = _simulate_multirank_assembly(shards_5_7)
+    for mats in outputs_5_7:
+        _assert_matches_ref(mats)
+
+    # (b) 5 + 0 + 7 multi-rank split exercising n_local == 0 Pass-1 and Pass-2 zero branches.
+    shards_5_0_7 = [
+        (e_loc[:5], o_mat[:5], ge_mat[:5]),
+        (
+            torch.empty((0,), dtype=torch.float64),
+            torch.empty((0, 2), dtype=torch.float64),
+            torch.empty((0, 2), dtype=torch.float64),
+        ),
+        (e_loc[5:], o_mat[5:], ge_mat[5:]),
+    ]
+    outputs_5_0_7, pass1_5_0_7, pass2_5_0_7 = _simulate_multirank_assembly(shards_5_0_7)
+    # Directly verify empty rank emitted exact zero tensors of exact shapes.
+    assert pass1_5_0_7[1][0].shape == () and torch.equal(
+        pass1_5_0_7[1][0], torch.zeros((), dtype=torch.float64)
+    )
+    assert pass1_5_0_7[1][1].shape == (2,) and torch.equal(
+        pass1_5_0_7[1][1], torch.zeros((2,), dtype=torch.float64)
+    )
+    assert pass1_5_0_7[1][2].shape == (2,) and torch.equal(
+        pass1_5_0_7[1][2], torch.zeros((2,), dtype=torch.float64)
+    )
+    assert pass2_5_0_7[1][0].shape == (2,) and torch.equal(
+        pass2_5_0_7[1][0], torch.zeros((2,), dtype=torch.float64)
+    )
+    assert pass2_5_0_7[1][1].shape == (2, 2) and torch.equal(
+        pass2_5_0_7[1][1], torch.zeros((2, 2), dtype=torch.float64)
+    )
+    assert pass2_5_0_7[1][2].shape == (2, 2) and torch.equal(
+        pass2_5_0_7[1][2], torch.zeros((2, 2), dtype=torch.float64)
+    )
+    for mats in outputs_5_0_7:
+        _assert_matches_ref(mats)
+
+    # (c.1) Strongly skewed rank-0 vs rank-1 means prove centering uses global reduced totals.
+    e_skew0 = e_loc[:5] + 15.0
+    o_skew0 = o_mat[:5] + torch.tensor([8.0, -6.0], dtype=torch.float64)
+    ge_skew0 = ge_mat[:5] + torch.tensor([1.5, -2.0], dtype=torch.float64)
+    e_skew1 = e_loc[5:] - 11.0
+    o_skew1 = o_mat[5:] + torch.tensor([-7.0, 5.0], dtype=torch.float64)
+    ge_skew1 = ge_mat[5:] + torch.tensor([-1.0, 3.0], dtype=torch.float64)
+    assert abs(float((e_skew0.mean() - e_skew1.mean()).item())) > 20.0
+    assert float(torch.linalg.vector_norm(o_skew0.mean(dim=0) - o_skew1.mean(dim=0)).item()) > 15.0
+
+    e_skew_all = torch.cat((e_skew0, e_skew1), dim=0)
+    o_skew_all = torch.cat((o_skew0, o_skew1), dim=0)
+    ge_skew_all = torch.cat((ge_skew0, ge_skew1), dim=0)
+    skew_ref = assemble_dense_linear_method_matrices(
+        e_skew_all, o_skew_all, ge_skew_all, solve_dtype=torch.float64
+    )
+    skew_ranks, _, _ = _simulate_multirank_assembly(
+        [(e_skew0, o_skew0, ge_skew0), (e_skew1, o_skew1, ge_skew1)]
+    )
+    for mats in skew_ranks:
+        assert mats.count == 12
+        assert mats.energy_mean == pytest.approx(skew_ref.energy_mean, abs=1.0e-12, rel=1.0e-12)
+        assert mats.score_mean_norm_sq == pytest.approx(
+            skew_ref.score_mean_norm_sq, abs=1.0e-12, rel=1.0e-12
+        )
+        torch.testing.assert_close(mats.S_param, skew_ref.S_param, atol=1.0e-12, rtol=1.0e-12)
+        torch.testing.assert_close(mats.h_c, skew_ref.h_c, atol=1.0e-12, rtol=1.0e-12)
+        torch.testing.assert_close(mats.h_r, skew_ref.h_r, atol=1.0e-12, rtol=1.0e-12)
+        torch.testing.assert_close(mats.dH11, skew_ref.dH11, atol=1.0e-12, rtol=1.0e-12)
+
+    # Naive rank-local centering disagrees sharply (> 10.0 in Frobenius norm).
+    local_s_wrong = (
+        (o_skew0 - o_skew0.mean(dim=0)).transpose(0, 1) @ (o_skew0 - o_skew0.mean(dim=0))
+        + (o_skew1 - o_skew1.mean(dim=0)).transpose(0, 1) @ (o_skew1 - o_skew1.mean(dim=0))
+    ) / 12.0
+    assert float(torch.linalg.matrix_norm(local_s_wrong - skew_ref.S_param).item()) > 10.0
+
+    # (c.2) Asymmetric reducer probe (count * 2, sum * 3 => reduced mean = 1.5x local mean).
+    asym_mats = assemble_dense_linear_method_matrices(
+        e_loc, o_mat, ge_mat, solve_dtype=torch.float64, reducer=_AsymmetricReducer()
+    )
+    n_reduced = 2 * int(e_loc.shape[0])
+    total_e = 3.0 * e_loc.sum()
+    total_o = 3.0 * o_mat.sum(dim=0)
+    total_ge = 3.0 * ge_mat.sum(dim=0)
+    exp_e_mean = float((total_e / n_reduced).item())
+    exp_o_mean = total_o / n_reduced
+    exp_ge_mean = total_ge / n_reduced
+    exp_score_mean_sq = float((exp_o_mean * exp_o_mean).sum().item())
+    e_bar_asym = e_loc - total_e / n_reduced
+    o_bar_asym = o_mat - total_o / n_reduced
+    h_tan_asym = e_bar_asym.unsqueeze(1) * o_bar_asym + ge_mat
+    exp_hc = (3.0 * (o_bar_asym.transpose(0, 1) @ e_bar_asym)) / n_reduced
+    exp_hr = exp_hc + exp_ge_mean
+    exp_s_raw = (3.0 * (o_bar_asym.transpose(0, 1) @ o_bar_asym)) / n_reduced
+    exp_s = 0.5 * (exp_s_raw + exp_s_raw.transpose(0, 1))
+    exp_dh11 = (3.0 * (o_bar_asym.transpose(0, 1) @ h_tan_asym)) / n_reduced
+
+    assert asym_mats.count == n_reduced
+    assert asym_mats.energy_mean == pytest.approx(exp_e_mean, abs=1.0e-12, rel=1.0e-12)
+    assert asym_mats.score_mean_norm_sq == pytest.approx(
+        exp_score_mean_sq, abs=1.0e-12, rel=1.0e-12
+    )
+    torch.testing.assert_close(asym_mats.S_param, exp_s, atol=1.0e-12, rtol=1.0e-12)
+    torch.testing.assert_close(asym_mats.h_c, exp_hc, atol=1.0e-12, rtol=1.0e-12)
+    torch.testing.assert_close(asym_mats.h_r, exp_hr, atol=1.0e-12, rtol=1.0e-12)
+    torch.testing.assert_close(asym_mats.dH11, exp_dh11, atol=1.0e-12, rtol=1.0e-12)
+    # Must strictly disagree with local-mean centering.
+    local_o_bar = o_mat - o_mat.mean(dim=0)
+    local_s_only = (3.0 * (local_o_bar.transpose(0, 1) @ local_o_bar)) / n_reduced
+    assert float(torch.linalg.matrix_norm(asym_mats.S_param - local_s_only).item()) > 1.0
+
+
+def test_f3_pre_eig_finiteness_guard_float32_overflow_atomic_skip(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Whitened/shifted M overflow in float32 skips atomically before entering torch.linalg.eig."""
+
+    def _forbid_eig(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("torch.linalg.eig must not be entered when M is non-finite")
+
+    # 1. Direct solve_dense_linear_method float32 overflow: 100.0 / 1e-37 -> +inf in M.
+    ovf_matrices = DenseLinearMethodMatrices(
+        count=4,
+        energy_mean=1.5,
+        S_param=torch.tensor([[1.0e-37]], dtype=torch.float32),
+        h_c=torch.tensor([-1.5811388e-19], dtype=torch.float32),
+        h_r=torch.tensor([-1.5811388e-19], dtype=torch.float32),
+        dH11=torch.tensor([[0.0]], dtype=torch.float32),
+        dtype="torch.float32",
+    )
+    ovf_policy = LinearMethodPolicy(
+        derivative_block_shift=100.0,
+        overlap_shift=0.0,
+        rescaling_xi=0.5,
+    )
+    with monkeypatch.context() as mp:
+        mp.setattr(torch.linalg, "eig", _forbid_eig)
+        outcome = solve_dense_linear_method(ovf_matrices, policy=ovf_policy)
+
+    assert outcome.accepted is False
+    assert outcome.reason == "nonfinite_eigensolve"
+    assert outcome.delta_theta is None
+    assert outcome.update_direction_norm is None
+    assert outcome.diagnostics.dtype == "torch.float32"
+    assert outcome.diagnostics.overlap_retained_modes == 1
+    assert outcome.diagnostics.overlap_truncated_modes == 0
+    assert outcome.diagnostics.overlap_min_retained_eigenvalue == pytest.approx(
+        1.0e-37, rel=1.0e-4
+    )
+    for field_name in _SELECTED_12_OPTIONAL_FIELDS:
+        assert getattr(outcome.diagnostics, field_name) is None, f"{field_name} must be None"
+
+    # 2. Full LinearMethodUpdate.update() in float32: zero mutation and JSONL/CSV-safe telemetry.
+    param = torch.nn.Parameter(torch.tensor([0.5], dtype=torch.float32))
+    sentinel_grad = torch.tensor([3.25], dtype=torch.float32)
+    param.grad = sentinel_grad.clone()
+    before_param = param.detach().clone()
+    method = _lm_method(
+        param,
+        policy=ovf_policy,
+        conventions=ScoreConventions(solve_dtype=torch.float32),
+    )
+    o_rows = torch.tensor([[1.0], [-1.0], [1.0], [-1.0]], dtype=torch.float32) * 3.1622777e-19
+    ge_rows = torch.zeros((4, 1), dtype=torch.float32)
+    e_rows = torch.tensor([1.0, 2.0, 1.0, 2.0], dtype=torch.float32)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(torch.linalg, "eig", _forbid_eig)
+        result = method.update(_tangent_input(param, o_rows, ge_rows, e_rows))
+
+    assert result.applied is False
+    assert result.reason == "nonfinite_eigensolve"
+    assert torch.equal(param.detach(), before_param)
+    assert param.grad is not None and torch.equal(param.grad, sentinel_grad)
+    assert method.completed_updates == 0
+    tel = method.last_telemetry
+    assert tel is not None and tel.diagnostics is not None
+    assert tel.diagnostics.dtype == "torch.float32"
+    assert tel.diagnostics.overlap_retained_modes == 1
+    assert tel.diagnostics.overlap_min_retained_eigenvalue == pytest.approx(1.0e-37, rel=1.0e-4)
+    for field_name in _SELECTED_12_OPTIONAL_FIELDS:
+        assert getattr(tel.diagnostics, field_name) is None, f"{field_name} must be None"
+    _assert_csv_and_jsonl_roundtrip(
+        tmp_path, name="f3_float32_m_overflow", namespace="train", metrics=tel.as_metrics()
+    )
+
+
+def test_f4_assembly_releases_promoted_inputs_before_gemm_and_preserves_caller_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """float32 -> float64 assembly frees e_loc/o_loc early and never mutates caller inputs."""
+
+    _, e_f64, o_f64, ge_f64 = _oracle_a_arrays()
+    e_f32 = e_f64.to(dtype=torch.float32)
+    o_f32 = o_f64.to(dtype=torch.float32)
+    ge_f32 = ge_f64.to(dtype=torch.float32)
+
+    e_f32_snap = e_f32.clone()
+    o_f32_snap = o_f32.clone()
+    ge_f32_snap = ge_f32.clone()
+    e_f64_snap = e_f64.clone()
+    o_f64_snap = o_f64.clone()
+    ge_f64_snap = ge_f64.clone()
+
+    refs: dict[str, weakref.ReferenceType[Any]] = {}
+    orig_center = lm_module.center_statistics
+    center_calls = 0
+
+    def spy_center(values: torch.Tensor, *, count: int, total: torch.Tensor) -> torch.Tensor:
+        nonlocal center_calls
+        out = orig_center(values, count=count, total=total)
+        if center_calls == 0:
+            refs["e_loc"] = weakref.ref(values)
+            refs["e_bar"] = weakref.ref(out)
+        elif center_calls == 1:
+            gc.collect()
+            assert refs["e_loc"]() is None, "promoted e_loc must be freed right after e_bar"
+            refs["o_loc"] = weakref.ref(values)
+            refs["o_bar"] = weakref.ref(out)
+        center_calls += 1
+        return out
+
+    class _LivenessCheckReducer(StatisticsReducer):
+        def __init__(self) -> None:
+            self.sum_calls = 0
+
+        def reduce_count(self, count: int) -> int:
+            return count
+
+        def reduce_sum(self, value: torch.Tensor) -> torch.Tensor:
+            if self.sum_calls == 3:
+                # Entering Pass-2 reductions: e_loc, o_loc, e_bar, and o_bar must all be freed.
+                gc.collect()
+                for name in ("e_loc", "o_loc", "e_bar", "o_bar"):
+                    assert refs[name]() is None, f"{name} must be released before Pass-2 reduce"
+            self.sum_calls += 1
+            return value
+
+    liveness_reducer = _LivenessCheckReducer()
+    with monkeypatch.context() as mp:
+        mp.setattr(lm_module, "center_statistics", spy_center)
+        mats_promoted = assemble_dense_linear_method_matrices(
+            e_f32, o_f32, ge_f32, solve_dtype=torch.float64, reducer=liveness_reducer
+        )
+
+    assert center_calls == 2
+    assert liveness_reducer.sum_calls == 6
+    assert torch.equal(e_f32, e_f32_snap)
+    assert torch.equal(o_f32, o_f32_snap)
+    assert torch.equal(ge_f32, ge_f32_snap)
+
+    # Matches explicit pre-cast float64 assembly identically and also preserves float64 inputs.
+    mats_precast = assemble_dense_linear_method_matrices(
+        e_f32.to(torch.float64),
+        o_f32.to(torch.float64),
+        ge_f32.to(torch.float64),
+        solve_dtype=torch.float64,
+    )
+    torch.testing.assert_close(mats_promoted.S_param, mats_precast.S_param, atol=1.0e-12, rtol=1.0e-12)
+    torch.testing.assert_close(mats_promoted.h_c, mats_precast.h_c, atol=1.0e-12, rtol=1.0e-12)
+    torch.testing.assert_close(mats_promoted.h_r, mats_precast.h_r, atol=1.0e-12, rtol=1.0e-12)
+    torch.testing.assert_close(mats_promoted.dH11, mats_precast.dH11, atol=1.0e-12, rtol=1.0e-12)
+
+    assemble_dense_linear_method_matrices(e_f64, o_f64, ge_f64, solve_dtype=torch.float64)
+    assert torch.equal(e_f64, e_f64_snap)
+    assert torch.equal(o_f64, o_f64_snap)
+    assert torch.equal(ge_f64, ge_f64_snap)

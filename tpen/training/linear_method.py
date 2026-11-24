@@ -1475,20 +1475,26 @@ def assemble_dense_linear_method_matrices(
 
         # Pass 2: center locally using reduced first moments and form second-moment sums.
         if n_local == 0:
+            del e_loc, o_loc, ge_loc
             local_hc = torch.zeros((n_parameters,), dtype=target_dtype, device=device)
             local_s = torch.zeros((n_parameters, n_parameters), dtype=target_dtype, device=device)
             local_dh11 = torch.zeros((n_parameters, n_parameters), dtype=target_dtype, device=device)
         else:
             e_bar = center_statistics(e_loc, count=global_count, total=total_e)
+            del e_loc
             o_bar = center_statistics(o_loc, count=global_count, total=total_o)
+            del o_loc
             # Centered Hamiltonian-applied tangent H_tan = E_bar[:, None] * O_bar + g^E.
             # Using raw g^E is algebraically exact because <O_bar_i> == 0 identically.
-            h_tan = e_bar.unsqueeze(1) * o_bar + ge_loc
+            # Form in-place and release ge_loc immediately to stay within 3 N P b + 2 P^2 b.
+            h_tan = e_bar.unsqueeze(1) * o_bar
+            h_tan.add_(ge_loc)
+            del ge_loc
             local_hc = o_bar.transpose(0, 1) @ e_bar
+            del e_bar
             local_s = o_bar.transpose(0, 1) @ o_bar
             local_dh11 = o_bar.transpose(0, 1) @ h_tan
-            del e_bar, o_bar, h_tan
-        del e_loc, o_loc, ge_loc
+            del o_bar, h_tan
 
         reduced_hc = resolved_reducer.reduce_sum(local_hc)
         del local_hc
@@ -1801,6 +1807,34 @@ def _solve_dense_linear_method_core(
         del hw, h_c_tilde, h_r_tilde
 
         # Step 4: Dense non-symmetric eigensolve M y = dlam y.
+        # Guard finiteness before LAPACK eig so whitened/shifted overflow
+        # skips atomically with reason="nonfinite_eigensolve" rather than
+        # entering eig() and raising RuntimeError or misclassifying as LinAlgError.
+        if not bool(torch.isfinite(m_mat).all()):
+            del m_mat, w_map, w_r, w_reg_r
+            diagnostics = LinearMethodSolveDiagnostics(
+                dtype=dtype_str,
+                derivative_block_shift=policy.derivative_block_shift,
+                overlap_shift=policy.overlap_shift,
+                overlap_modes=n_parameters,
+                overlap_retained_modes=r,
+                overlap_truncated_modes=n_parameters - r,
+                overlap_max_eigenvalue=w_max,
+                overlap_min_retained_eigenvalue=overlap_min_retained,
+                energy_mean=energy_mean,
+                n_admissible_real_eigenpairs=0,
+                n_complex_eigenpairs=0,
+                rescaling_xi=policy.rescaling_xi,
+                estimated_dense_bytes=estimated_dense_bytes,
+            )
+            return LinearMethodSolveOutcome(
+                accepted=False,
+                reason="nonfinite_eigensolve",
+                delta_theta=None,
+                diagnostics=diagnostics,
+                update_direction_norm=None,
+            )
+
         try:
             evals, evecs = torch.linalg.eig(m_mat)
         except torch.linalg.LinAlgError:
@@ -2316,7 +2350,6 @@ class LinearMethodUpdate(VMCUpdateMethod[HamiltonianTangentUpdateInput]):
                 f"got {type(resolved_policy).__name__}"
             )
         resolved_policy.validate()
-        _validate_plain_sgd(optimizer, step_scale=resolved_policy.step_scale)
 
         if not isinstance(model_parameters, ModelParameterBinding):
             raise TypeError(
@@ -2324,6 +2357,11 @@ class LinearMethodUpdate(VMCUpdateMethod[HamiltonianTangentUpdateInput]):
                 f"got {type(model_parameters).__name__}"
             )
         effective_input_dtype = _validate_model_parameters(model_parameters)
+        _validate_plain_sgd(
+            optimizer,
+            step_scale=resolved_policy.step_scale,
+            model_parameters=model_parameters,
+        )
 
         resolved_conventions = (
             ScoreConventions(energy_gradient_scale=2.0, solve_dtype=torch.float64)
@@ -2498,6 +2536,11 @@ class LinearMethodUpdate(VMCUpdateMethod[HamiltonianTangentUpdateInput]):
             raise ValueError(
                 "Linear Method state completed_updates must be a non-negative integer"
             )
+        _validate_plain_sgd(
+            self.optimizer,
+            step_scale=self.policy.step_scale,
+            model_parameters=self.model_parameters,
+        )
         self.completed_updates = completed
 
     def update(self, update_input: HamiltonianTangentUpdateInput) -> VMCUpdateResult:
@@ -2505,6 +2548,11 @@ class LinearMethodUpdate(VMCUpdateMethod[HamiltonianTangentUpdateInput]):
 
         if not isinstance(update_input, HamiltonianTangentUpdateInput):
             raise TypeError("LinearMethodUpdate requires HamiltonianTangentUpdateInput")
+        _validate_plain_sgd(
+            self.optimizer,
+            step_scale=self.policy.step_scale,
+            model_parameters=self.model_parameters,
+        )
         update_input.validate()
         self._validate_real_and_detached(update_input)
         self._validate_binding(update_input)
@@ -2864,8 +2912,13 @@ def _validate_model_parameters(model_parameters: ModelParameterBinding) -> torch
     return _resolve_layout_input_dtype(model_parameters.layout)
 
 
-def _validate_plain_sgd(optimizer: Any, *, step_scale: float) -> None:
-    """Require a plain momentum-free, decay-free SGD whose ``lr`` matches ``step_scale``."""
+def _validate_plain_sgd(
+    optimizer: Any,
+    *,
+    step_scale: float,
+    model_parameters: ModelParameterBinding | None = None,
+) -> None:
+    """Require a plain momentum-free, decay-free SGD matching ``step_scale`` and binding."""
 
     if not isinstance(optimizer, torch.optim.SGD):
         raise TypeError(
@@ -2874,25 +2927,85 @@ def _validate_plain_sgd(optimizer: Any, *, step_scale: float) -> None:
             f"{type(optimizer).__name__}. An adaptive optimizer such as Adam is never "
             "an acceptable substitute here."
         )
+    if not optimizer.param_groups:
+        raise ValueError(
+            "LinearMethodUpdate requires a non-empty torch.optim.SGD param_groups list"
+        )
+
+    seen_ids: set[int] = set()
     for index, group in enumerate(optimizer.param_groups):
+        if not isinstance(group, Mapping):
+            raise TypeError(
+                f"LinearMethodUpdate SGD param group {index} must be a mapping, "
+                f"got {type(group).__name__}"
+            )
+        if "params" not in group or not isinstance(group["params"], (list, tuple)):
+            raise ValueError(
+                f"LinearMethodUpdate SGD param group {index} must define a 'params' sequence"
+            )
+        for parameter in group["params"]:
+            param_id = id(parameter)
+            if param_id in seen_ids:
+                raise ValueError(
+                    f"LinearMethodUpdate SGD param group {index} contains a duplicate "
+                    "parameter reference"
+                )
+            seen_ids.add(param_id)
+
         for key in ("momentum", "dampening", "weight_decay"):
             value = group.get(key, 0.0)
-            if float(value) != 0.0:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(
                     f"LinearMethodUpdate requires SGD param group {index} to have "
-                    f"{key}=0, got {value}"
+                    f"{key}=0, got {value!r}"
                 )
-        for key in ("nesterov", "maximize"):
-            if bool(group.get(key, False)):
+            numeric_val = float(value)
+            if not _is_finite(numeric_val) or numeric_val != 0.0:
+                raise ValueError(
+                    f"LinearMethodUpdate requires SGD param group {index} to have "
+                    f"{key}=0, got {value!r}"
+                )
+        for key in ("nesterov", "maximize", "differentiable"):
+            flag = group.get(key, False)
+            if not isinstance(flag, bool):
+                raise ValueError(
+                    f"LinearMethodUpdate requires SGD param group {index} to have "
+                    f"{key}=False, got {flag!r}"
+                )
+            if flag:
                 raise ValueError(
                     f"LinearMethodUpdate requires SGD param group {index} to have "
                     f"{key} disabled"
                 )
-        group_lr = float(group.get("lr"))
+        group_lr = _validate_real_float(
+            group.get("lr"),
+            field_name=f"LinearMethodUpdate SGD param group {index} lr",
+            min_value=0.0,
+            min_inclusive=False,
+        )
         if group_lr != float(step_scale):
             raise ValueError(
                 f"LinearMethodUpdate SGD param group {index} has lr={group_lr}, "
                 f"which disagrees with LinearMethodPolicy.step_scale={step_scale}"
+            )
+
+    if not seen_ids:
+        raise ValueError("LinearMethodUpdate SGD optimizer parameter carrier is empty")
+
+    if model_parameters is not None:
+        bound_ids = {id(parameter) for parameter in model_parameters.parameters}
+        extra_ids = seen_ids - bound_ids
+        if extra_ids:
+            raise ValueError(
+                f"LinearMethodUpdate SGD optimizer contains {len(extra_ids)} foreign "
+                "parameter(s) outside the bound model_parameters"
+            )
+        missing_ids = bound_ids - seen_ids
+        if missing_ids:
+            raise ValueError(
+                f"LinearMethodUpdate SGD optimizer is missing {len(missing_ids)} bound "
+                "model parameter(s); partial parameter-subset Linear Method updates are "
+                "forbidden"
             )
 
 
