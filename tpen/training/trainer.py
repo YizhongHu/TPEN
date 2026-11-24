@@ -854,6 +854,15 @@ class VMCTrainer:
         # Validate the method's typed step request before inspecting state or
         # sampling, including for stateless methods (`update_state() is None`).
         resolve_step_request(update_method)
+        method_policy = update_method.declared_nonfinite_local_energy_policy()
+        if method_policy is not None and method_policy != self.nonfinite_local_energy_policy:
+            raise ValueError(
+                "update method nonfinite_local_energy_policy disagrees with VMCTrainer: "
+                f"{type(update_method).__name__} declared {method_policy!r}, "
+                f"trainer is configured for {self.nonfinite_local_energy_policy!r}. "
+                "Match both policies so the objective and update method run under one estimator"
+            )
+
         owned_state = update_method.update_state()
         if owned_state is None:
             resolved_state = VMCUpdateState(
