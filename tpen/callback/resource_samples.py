@@ -2021,11 +2021,51 @@ class _ResourceSamplesSession:
                             reason_code="cgroup_resolve_failed",
                             status="error",
                         )
+                        self._linux_cgroup_init_error = lc_cgroup_issue
+                        self._linux_cgroup_probe = None
+                        self._diagnostics.append(
+                            f"{lc_cfg.source_id} resolve_cgroup_identity failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
                     else:
                         if isinstance(resolved, LinuxCgroupV2Identity):
                             lc_identity = resolved
                         elif isinstance(resolved, LinuxMemoryUnavailable):
                             lc_cgroup_issue = resolved
+                        else:
+                            raw_cg_err = getattr(
+                                self._linux_cgroup_probe, "cgroup_error", None
+                            )
+                            if isinstance(raw_cg_err, LinuxMemoryUnavailable):
+                                lc_cgroup_issue = raw_cg_err
+                            elif isinstance(resolved, ResourceUnavailable):
+                                lc_cgroup_issue = LinuxMemoryUnavailable(
+                                    reason=(
+                                        resolved.reason
+                                        or f"{lc_cfg.source_id} resolve_cgroup_identity unavailable"
+                                    ),
+                                    reason_code="cgroup_resolve_failed",
+                                    status="unavailable",
+                                )
+                            elif isinstance(raw_cg_err, ResourceUnavailable):
+                                lc_cgroup_issue = LinuxMemoryUnavailable(
+                                    reason=(
+                                        raw_cg_err.reason
+                                        or f"{lc_cfg.source_id} resolve_cgroup_identity failed"
+                                    ),
+                                    reason_code="cgroup_resolve_failed",
+                                    status="unavailable",
+                                )
+                            else:
+                                lc_cgroup_issue = LinuxMemoryUnavailable(
+                                    reason=(
+                                        f"{lc_cfg.source_id} resolve_cgroup_identity returned None"
+                                        if resolved is None
+                                        else f"{lc_cfg.source_id} resolve_cgroup_identity returned {type(resolved).__name__}"
+                                    ),
+                                    reason_code="cgroup_resolve_failed",
+                                    status="unavailable",
+                                )
 
             if lc_identity is not None:
                 self._linux_cgroup_subject = lc_identity.to_subject_dict(
@@ -2788,11 +2828,7 @@ class _ResourceSamplesSession:
             return
 
         if isinstance(reading, LinuxProcessTreeReading):
-            if (
-                reading.status == "partial"
-                or not reading.membership_complete
-                or bool(reading.partial_reasons)
-            ):
+            if not reading.membership_complete or bool(reading.partial_reasons):
                 with self._lock:
                     self._source_partial_flags.add(source_id)
             target_gen = reading.target_generation

@@ -145,8 +145,10 @@ def _generation_exact_mismatch(
 ) -> str | None:
     """Return a concise mismatch diagnostic enforcing exact optional matching.
 
-    Enforces exact equality across ``pid``, ``start_ticks``, ``boot_id``,
-    ``pid_ns_inode``, and ``host_id`` (``exact_optional=True``).
+    Enforces exact equality across ``pid``, ``start_ticks``, ``boot_id``, and
+    ``pid_ns_inode`` (``exact_optional=True``), and compares ``host_id`` when
+    ``expected.host_id`` is explicitly specified (matching O4
+    ``LinuxProcessMemoryProbe`` parity).
     """
 
     if expected.pid != observed.pid:
@@ -166,7 +168,7 @@ def _generation_exact_mismatch(
             f"pid_ns_inode changed (expected {expected.pid_ns_inode!r}, "
             f"observed {observed.pid_ns_inode!r})"
         )
-    if expected.host_id != observed.host_id:
+    if expected.host_id is not None and expected.host_id != observed.host_id:
         return (
             f"host_id changed (expected {expected.host_id!r}, "
             f"observed {observed.host_id!r})"
@@ -1824,17 +1826,17 @@ class LinuxProcessTreeProbe:
                 )
             )
 
-        # Commit baselines only after post-scan root verification succeeded.
-        self._member_baselines = new_baselines
-        self._has_baseline_scan = True
-
         observed_count = len(members_out)
         reasons_tuple = tuple(partial_reasons)
 
         # If zero members were observed AND membership is incomplete (e.g.
         # permission_denied or scan timeout before finding any member), do NOT
-        # report 0 members or 0 RSS as verified zero.
+        # report 0 members or 0 RSS as verified zero, and reset baselines so a
+        # subsequent healthy scan cannot fabricate a 0.0 CPU delta or stitch
+        # across an unavailable gap.
         if observed_count == 0 and not membership_complete:
+            self._member_baselines = {}
+            self._has_baseline_scan = False
             primary_code = reasons_tuple[0] if reasons_tuple else "partial_scan"
             issue = LinuxMemoryUnavailable(
                 reason=(
@@ -1857,6 +1859,11 @@ class LinuxProcessTreeProbe:
                 permission_denied_count=permission_denied_count,
                 excluded_count=excluded_count,
             )
+
+        # Commit baselines only after post-scan root verification succeeded and
+        # the scan produced a usable (non-unavailable) observation.
+        self._member_baselines = new_baselines
+        self._has_baseline_scan = True
 
         live_member_val: Any = observed_count
         if rss_issues:
@@ -3493,21 +3500,120 @@ class LinuxCgroupV2Probe:
             else (self._pid if self._pid is not None else os.getpid())
         )
         deadline_ns = int(self._monotonic_ns()) + self._max_read_ns
+
+        # 1. Pre-read target generation verification.
+        gen_before = self._read_generation(target_pid, deadline_ns=deadline_ns)
+        if isinstance(gen_before, LinuxMemoryUnavailable):
+            self._last_cgroup_error = gen_before
+            return gen_before
+        if int(self._monotonic_ns()) > deadline_ns:
+            timeout_issue = LinuxMemoryUnavailable(
+                reason=(
+                    f"resolving cgroup v2 identity for pid {target_pid} exceeded "
+                    f"max_read_seconds ({self._max_read_seconds}s)"
+                ),
+                reason_code="read_timeout",
+                status="error",
+            )
+            self._last_cgroup_error = timeout_issue
+            return timeout_issue
+        if expected is not None:
+            pre_mismatch = _generation_exact_mismatch(expected, gen_before)
+            if pre_mismatch is not None:
+                changed = LinuxMemoryUnavailable(
+                    reason=(
+                        f"target process generation changed before cgroup identity "
+                        f"resolution: {pre_mismatch}"
+                    ),
+                    reason_code="generation_changed",
+                    status="unavailable",
+                )
+                self._last_cgroup_error = changed
+                return changed
+
+        # 2. Resolve unified cgroup v2 membership, mount root, and contained chain.
         rel_path = self._read_cgroup_rel_path(target_pid, deadline_ns=deadline_ns)
         if isinstance(rel_path, LinuxMemoryUnavailable):
             self._last_cgroup_error = rel_path
             return rel_path
-        mount_root = self._read_mountinfo_cgroup2_root(target_pid, deadline_ns=deadline_ns)
+        mount_root = self._read_mountinfo_cgroup2_root(
+            target_pid, deadline_ns=deadline_ns
+        )
         if isinstance(mount_root, LinuxMemoryUnavailable):
             self._last_cgroup_error = mount_root
             return mount_root
+        if int(self._monotonic_ns()) > deadline_ns:
+            timeout_issue = LinuxMemoryUnavailable(
+                reason=(
+                    f"resolving cgroup v2 identity for pid {target_pid} exceeded "
+                    f"max_read_seconds ({self._max_read_seconds}s)"
+                ),
+                reason_code="read_timeout",
+                status="error",
+            )
+            self._last_cgroup_error = timeout_issue
+            return timeout_issue
         chain = self._resolve_contained_cgroup_chain(mount_root, rel_path)
         if isinstance(chain, LinuxMemoryUnavailable):
             self._last_cgroup_error = chain
             return chain
+        cg_rel_path = chain[0][0]
+
+        # 3. Post-read cgroup-path stability, target generation, and deadline check.
+        rel_path_after = self._read_cgroup_rel_path(
+            target_pid, deadline_ns=deadline_ns
+        )
+        gen_after = self._read_generation(target_pid, deadline_ns=deadline_ns)
+        if isinstance(gen_after, LinuxMemoryUnavailable):
+            self._last_cgroup_error = gen_after
+            return gen_after
+        if int(self._monotonic_ns()) > deadline_ns:
+            timeout_issue = LinuxMemoryUnavailable(
+                reason=(
+                    f"resolving cgroup v2 identity for pid {target_pid} exceeded "
+                    f"max_read_seconds ({self._max_read_seconds}s)"
+                ),
+                reason_code="read_timeout",
+                status="error",
+            )
+            self._last_cgroup_error = timeout_issue
+            return timeout_issue
+
+        post_mismatch = (
+            _generation_exact_mismatch(expected, gen_after)
+            if expected is not None
+            else None
+        ) or _generation_exact_mismatch(gen_before, gen_after)
+        if post_mismatch is not None:
+            changed = LinuxMemoryUnavailable(
+                reason=(
+                    f"target process generation changed during cgroup identity "
+                    f"resolution: {post_mismatch}"
+                ),
+                reason_code="generation_changed",
+                status="unavailable",
+            )
+            self._last_cgroup_error = changed
+            return changed
+
+        if isinstance(rel_path_after, LinuxMemoryUnavailable):
+            self._last_cgroup_error = rel_path_after
+            return rel_path_after
+        if rel_path_after != cg_rel_path:
+            moved = LinuxMemoryUnavailable(
+                reason=(
+                    f"target cgroup path changed during identity resolution "
+                    f"({cg_rel_path!r} -> {rel_path_after!r})"
+                ),
+                reason_code="cgroup_changed",
+                status="unavailable",
+            )
+            self._last_cgroup_error = moved
+            return moved
+
         ident = LinuxCgroupV2Identity(
             mount_root=str(mount_root),
-            cgroup_path=chain[0][0],
+            cgroup_path=cg_rel_path,
             shared_scope_not_exclusive=True,
         )
         self._last_cgroup_identity = ident
