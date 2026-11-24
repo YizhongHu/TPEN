@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -305,6 +307,19 @@ def _real_restart_child() -> None:
             command="stage1 real restart resumed",
         )
         result = {"outcome": resumed.outcome, "exit_code": resumed.exit_code}
+        Path(str(payload["diagnostics_path"])).write_text(
+            json.dumps(
+                {
+                    "result": result,
+                    "run_dir": str(resumed.selection.run_dir),
+                    "checkpoint_dir": str(resumed.selection.checkpoint_dir),
+                    "runner_load": dict(resumed.runner_load),
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     elif phase == "reference":
         code = run_from_config(
             cfg,
@@ -326,7 +341,9 @@ def _run_real_restart_child(payload: dict[str, object]) -> dict[str, object]:
     argument_path = row_path.with_name(f"{row_path.stem}.{phase}.args.json")
     stdout_path = row_path.with_name(f"{row_path.stem}.{phase}.stdout")
     stderr_path = row_path.with_name(f"{row_path.stem}.{phase}.stderr")
-    argument_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    diagnostics_path = row_path.with_name(f"{row_path.stem}.{phase}.diagnostics.json")
+    child_payload = {**payload, "diagnostics_path": str(diagnostics_path)}
+    argument_path.write_text(json.dumps(child_payload, sort_keys=True) + "\n", encoding="utf-8")
     completed = subprocess.run(
         [
             sys.executable,
@@ -344,6 +361,22 @@ def _run_real_restart_child(payload: dict[str, object]) -> dict[str, object]:
     )
     stdout_path.write_text(completed.stdout, encoding="utf-8")
     stderr_path.write_text(completed.stderr, encoding="utf-8")
+    if phase == "resumed" and diagnostics_path.is_file():
+        diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+        run_dir = Path(str(diagnostics["run_dir"]))
+        evidence_root = os.environ.get("VERIFY_EVIDENCE_DIR")
+        if evidence_root is None and os.environ.get("RUN_ROOT"):
+            evidence_root = str(Path(os.environ["RUN_ROOT"]) / "evidence")
+        if evidence_root:
+            preserved = Path(evidence_root) / "stage1-restart" / phase
+            preserved.mkdir(parents=True, exist_ok=True)
+            for name in ("run-outcome.json", "status.json", "resolved_config.yaml", "error.json"):
+                source = run_dir / name
+                if source.is_file():
+                    shutil.copyfile(source, preserved / name)
+            shutil.copyfile(diagnostics_path, preserved / "diagnostics.json")
+            shutil.copyfile(stdout_path, preserved / "child.stdout")
+            shutil.copyfile(stderr_path, preserved / "child.stderr")
     assert completed.returncode == 0, (
         f"{phase} child exited {completed.returncode}; "
         f"stdout={stdout_path}\n{completed.stdout}\n"
@@ -378,11 +411,23 @@ def test_real_fresh_process_restore_parity_with_checkpoint_zero_and_overlay(
     if resumed_result != {"outcome": "completed", "exit_code": 0}:
         resumed_stderr = resumed_row_path.with_name("resumed-row.resumed.stderr")
         resumed_stdout = resumed_row_path.with_name("resumed-row.resumed.stdout")
+        resumed_diagnostics = resumed_row_path.with_name("resumed-row.resumed.diagnostics.json")
+        diagnostics = json.loads(resumed_diagnostics.read_text(encoding="utf-8"))
+        run_dir = Path(str(diagnostics["run_dir"]))
+        def read_artifact(name: str) -> str:
+            path = run_dir / name
+            return path.read_text(encoding="utf-8") if path.is_file() else "<missing>"
+
         pytest.fail(
             "resumed child did not complete:\n"
             f"result={resumed_result!r}\n"
+            f"runner_load={diagnostics['runner_load']!r}\n"
+            f"checkpoint_dir={diagnostics['checkpoint_dir']}\n"
+            f"run-outcome.json={read_artifact('run-outcome.json')}\n"
+            f"status.json={read_artifact('status.json')}\n"
             f"stdout_path={resumed_stdout}\n{resumed_stdout.read_text(encoding='utf-8')}\n"
-            f"stderr_path={resumed_stderr}\n{resumed_stderr.read_text(encoding='utf-8')}"
+            f"stderr_path={resumed_stderr}\n"
+            f"{chr(10).join(resumed_stderr.read_text(encoding='utf-8').splitlines()[-80:])}"
         )
 
     reference_row = _real_restart_row(tmp_path / "reference", run_id="train-lineage-reference")
