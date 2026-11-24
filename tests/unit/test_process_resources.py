@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
+import time
 from typing import Any
 
 import pytest
@@ -682,3 +684,220 @@ def test_probe_reads_live_linux_self_process_from_real_procfs() -> None:
     assert reading.observed_generation_before == gen
     assert reading.observed_generation_after == gen
     assert reading.read_end_ns >= reading.read_start_ns
+
+
+# ---------------------------------------------------------------------------
+# O4 T2 review tests
+# ---------------------------------------------------------------------------
+
+
+def test_probe_rejects_boot_id_and_pid_ns_appearance_or_drift_after_none_optional_bind(
+    tmp_path: Path,
+) -> None:
+    """T1 (F1): Optional boot_id/pid_ns_inode appearance or drift after None bind must fail closed."""
+
+    failures: list[str] = []
+
+    # Sub-case A: Bind when boot_id and pid_ns_inode are absent (None), then both appear.
+    proc_root_a = _populate_proc_fixture(
+        tmp_path / "proc_a",
+        pid=5101,
+        start_ticks=1000,
+        boot_id=None,
+        pid_ns_target=None,
+    )
+    probe_a = LinuxProcessMemoryProbe(pid=5101, proc_root=proc_root_a, host_id="h1")
+    bound_a = probe_a.bind_target()
+    assert bound_a is not None
+    assert bound_a.boot_id is None
+    assert bound_a.pid_ns_inode is None
+
+    boot_file_a = proc_root_a / "sys" / "kernel" / "random" / "boot_id"
+    boot_file_a.parent.mkdir(parents=True, exist_ok=True)
+    boot_file_a.write_text("boot-A\n", encoding="utf-8")
+    ns_dir_a = proc_root_a / "5101" / "ns"
+    ns_dir_a.mkdir(parents=True, exist_ok=True)
+    os.symlink("pid:[100]", ns_dir_a / "pid")
+
+    r1 = probe_a.read()
+    if (
+        r1.status != "unavailable"
+        or r1.reason_code != "generation_changed"
+        or not isinstance(r1.rss_bytes, LinuxMemoryUnavailable)
+    ):
+        failures.append(
+            "sub-case A accepted boot_id/pid_ns appearance after None bind: "
+            f"status={r1.status!r}, reason_code={r1.reason_code!r}, rss_bytes={r1.rss_bytes!r}"
+        )
+
+    # Sub-case B: Pre-bound expected_generation with None optional fields must not pass across drift.
+    proc_root_b = _populate_proc_fixture(
+        tmp_path / "proc_b",
+        pid=5102,
+        start_ticks=1000,
+        boot_id="boot-A",
+        pid_ns_target="pid:[100]",
+    )
+    probe_b = LinuxProcessMemoryProbe(
+        pid=5102,
+        expected_generation=LinuxProcessGeneration(
+            pid=5102, start_ticks=1000, host_id="h1"
+        ),
+        proc_root=proc_root_b,
+        host_id="h1",
+    )
+    r_a = probe_b.read()
+
+    (proc_root_b / "sys" / "kernel" / "random" / "boot_id").write_text(
+        "boot-B\n", encoding="utf-8"
+    )
+    ns_link_b = proc_root_b / "5102" / "ns" / "pid"
+    ns_link_b.unlink()
+    os.symlink("pid:[200]", ns_link_b)
+
+    r_b = probe_b.read()
+    if (
+        r_b.status != "unavailable"
+        or r_b.reason_code != "generation_changed"
+        or not isinstance(r_b.rss_bytes, LinuxMemoryUnavailable)
+        or (r_a.status == "ok" and r_b.status == "ok")
+    ):
+        failures.append(
+            "sub-case B failed to reject boot_id/pid_ns drift with None optional expected_generation: "
+            f"r_a=({r_a.status!r}, {r_a.reason_code!r}), "
+            f"r_b=({r_b.status!r}, {r_b.reason_code!r}, rss_bytes={r_b.rss_bytes!r})"
+        )
+
+    assert failures == [], "; ".join(failures)
+
+
+def test_probe_refuses_symlinked_procfs_files_and_does_not_block_on_fifo(
+    tmp_path: Path,
+) -> None:
+    """T2 (F2): Procfs reader must refuse symlinked stat/status files and never block on FIFOs."""
+
+    failures: list[str] = []
+
+    # Sub-case A1: symlinked /proc/<pid>/status
+    outside_status = tmp_path / "outside_status.txt"
+    outside_status.write_text(
+        _make_status_text(pid=6101, vm_rss_kib=999999, vm_size_kib=999999, threads=99),
+        encoding="utf-8",
+    )
+    proc_root_a = _populate_proc_fixture(
+        tmp_path / "proc_sym_status", pid=6101, write_status=False
+    )
+    os.symlink(outside_status, proc_root_a / "6101" / "status")
+    r_sym_status = LinuxProcessMemoryProbe(pid=6101, proc_root=proc_root_a).read()
+    if r_sym_status.status not in ("error", "unavailable") or not isinstance(
+        r_sym_status.rss_bytes, LinuxMemoryUnavailable
+    ):
+        failures.append(
+            "sub-case A1 followed symlinked status: "
+            f"status={r_sym_status.status!r}, rss_bytes={r_sym_status.rss_bytes!r}"
+        )
+
+    # Sub-case A2: symlinked /proc/<pid>/stat
+    outside_stat = tmp_path / "outside_stat.txt"
+    outside_stat.write_text(_make_stat_line(6101, start_ticks=9000), encoding="utf-8")
+    proc_root_stat = _populate_proc_fixture(
+        tmp_path / "proc_sym_stat", pid=6101, write_stat=False
+    )
+    os.symlink(outside_stat, proc_root_stat / "6101" / "stat")
+    r_sym_stat = LinuxProcessMemoryProbe(pid=6101, proc_root=proc_root_stat).read()
+    if r_sym_stat.status not in ("error", "unavailable") or not isinstance(
+        r_sym_stat.rss_bytes, LinuxMemoryUnavailable
+    ):
+        failures.append(
+            "sub-case A2 followed symlinked stat: "
+            f"status={r_sym_stat.status!r}, rss_bytes={r_sym_stat.rss_bytes!r}"
+        )
+
+    # Sub-case B: FIFO at /proc/<pid>/status must not block open(2)
+    proc_root_b = _populate_proc_fixture(
+        tmp_path / "proc_fifo", pid=6102, write_status=False
+    )
+    fifo = proc_root_b / "6102" / "status"
+    os.mkfifo(fifo)
+    probe_fifo = LinuxProcessMemoryProbe(
+        pid=6102, proc_root=proc_root_b, max_read_seconds=0.05
+    )
+
+    result_box: list[LinuxProcessMemoryReading] = []
+    exc_box: list[BaseException] = []
+
+    def _run_read() -> None:
+        try:
+            result_box.append(probe_fifo.read())
+        except BaseException as exc:  # pragma: no cover - captured for assertion
+            exc_box.append(exc)
+
+    thread = threading.Thread(target=_run_read, daemon=True)
+    thread.start()
+    try:
+        thread.join(timeout=0.35)
+        blocked = thread.is_alive()
+    finally:
+        if thread.is_alive():
+            for _ in range(5):
+                try:
+                    fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+                except OSError:
+                    time.sleep(0.02)
+                else:
+                    os.close(fd)
+                    break
+            thread.join(timeout=2.0)
+
+    if blocked:
+        failures.append(
+            "sub-case B blocked in open(2) on FIFO /proc/<pid>/status beyond 0.35s"
+        )
+    elif exc_box:
+        failures.append(f"sub-case B raised unexpected exception: {exc_box[0]!r}")
+    elif not result_box:
+        failures.append("sub-case B produced no reading")
+    else:
+        r_fifo = result_box[0]
+        if r_fifo.status not in ("error", "unavailable") or not isinstance(
+            r_fifo.rss_bytes, LinuxMemoryUnavailable
+        ):
+            failures.append(
+                "sub-case B accepted FIFO status read: "
+                f"status={r_fifo.status!r}, rss_bytes={r_fifo.rss_bytes!r}"
+            )
+
+    assert failures == [], "; ".join(failures)
+
+
+def test_failed_bind_target_with_explicit_pid_does_not_retarget_read_to_self(
+    tmp_path: Path,
+) -> None:
+    """T4 (F4): Failed bind_target(pid=missing) must not cause read() to silently retarget to self."""
+
+    self_pid = os.getpid()
+    missing_pid = self_pid + 100000
+    proc_root = _populate_proc_fixture(
+        tmp_path / "proc_retarget",
+        pid=self_pid,
+        status_text=_make_status_text(
+            pid=self_pid, vm_rss_kib=2048, vm_size_kib=8192, threads=4
+        ),
+    )
+    probe = LinuxProcessMemoryProbe(proc_root=proc_root)
+
+    assert probe.bind_target(pid=missing_pid) is None
+    assert probe.bind_error is not None
+    assert probe.bind_error.reason_code == "process_exited"
+
+    reading = probe.read()
+    assert (
+        reading.status == "unavailable"
+        and reading.reason_code == "process_exited"
+        and probe.target_generation is None
+        and isinstance(reading.rss_bytes, LinuxMemoryUnavailable)
+    ), (
+        "probe.read() retargeted to self after failed bind_target(pid=missing_pid): "
+        f"status={reading.status!r}, reason_code={reading.reason_code!r}, "
+        f"target_generation={probe.target_generation!r}, rss_bytes={reading.rss_bytes!r}"
+    )
