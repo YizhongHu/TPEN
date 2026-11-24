@@ -40,6 +40,10 @@ class _RecordingEmitter:
         self.events: list[tuple[type[object], int, bool | None]] = []
         self._counts: dict[type[object], int] = {}
 
+    def emit(self, event, *, state=None):
+        del event, state
+        return None
+
     @contextmanager
     def scope(self, operation, *, state=None):
         del state
@@ -159,7 +163,9 @@ class _MetricContext:
 
 
 def _deliver(callback, event, count: int, context: _MetricContext) -> None:
-    callback.handle_occurrence_impl(Occurrence(event, count, monotonic_time=float(count)), context)
+    callback.handle_occurrence_impl.__wrapped__(  # type: ignore[attr-defined]
+        callback, Occurrence(event, count, monotonic_time=float(count)), context
+    )
 
 
 def test_sampling_scope_timing_correlates_training_and_evaluation_and_cleans_up() -> None:
