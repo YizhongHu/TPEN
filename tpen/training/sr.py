@@ -825,6 +825,13 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
     def load_method_state_dict(self, state: Mapping[str, Any]) -> None:
         """Restore the envelope, rejecting layout, convention, or policy drift."""
 
+        self.validate_method_state_dict(state)
+        completed = state.get("completed_updates", 0)
+        self.completed_updates = completed
+
+    def validate_method_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Validate the envelope without mutating the live update method."""
+
         if not isinstance(state, Mapping):
             raise TypeError("StochasticReconfigurationUpdate state must be a mapping")
         version = state.get("version")
@@ -855,7 +862,6 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         completed = state.get("completed_updates", 0)
         if type(completed) is not int or completed < 0:
             raise ValueError("SR state completed_updates must be a non-negative integer")
-        self.completed_updates = completed
 
     def update(self, update_input: ScoreUpdateInput) -> VMCUpdateResult:
         """Apply one SR/minSR step and report the outcome.
