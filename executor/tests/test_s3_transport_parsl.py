@@ -1355,7 +1355,7 @@ def test_configured_parsl_public_run_refuses_before_dfk_or_submission(
 
     group = _group("s3b-configured-refuse", "member")
     lifecycle = _lifecycle(tmp_path)
-    dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path))
+    dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path), binding=BINDING)
     with pytest.raises(ConfiguredProgramRouteRefused, match="until C2.2"):
         dispatcher.run(group, {"member": _configured_run(tmp_path)}, lifecycle, timeout=60)
     assert fake_parsl.dfks == []
