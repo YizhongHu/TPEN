@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 import torch
+import typeguard
 from typeguard import TypeCheckError
 
 import tpen.training as training_pkg
@@ -26,6 +27,7 @@ from tpen.data.batch import (
     WavefunctionOutput,
 )
 from tpen.data.permutation import Permutation
+from tpen.events import Ended, Started
 from tpen.nn.activation import SoftplusBeta
 from tpen.nn.forward import (
     CoordinateGradientRequest,
@@ -60,6 +62,16 @@ from tpen.training.update import (
     VMCUpdateResult,
 )
 from tpen.training.vmc import VMCObjectiveResult
+
+
+def _scoped_operation_types(context: _StubContext) -> set[type[object]]:
+    """Return concrete operation types observed across Started/Ended boundaries."""
+
+    return {
+        type(occ.event.operation)
+        for occ in context.occurrences
+        if isinstance(occ.event, (Started, Ended))
+    }
 
 
 def _build_parameter_binding(parameters: tuple[torch.nn.Parameter, ...]) -> ParameterBinding:
@@ -172,8 +184,11 @@ class _SoftplusWavefunction(torch.nn.Module):
         if self.constant_logabs:
             logabs = torch.zeros((flat.batch_size,), dtype=flat.dtype, device=flat.device)
         elif flat.n_electrons == 0:
-            # Depend on parameters even in the vacuum sector so logabs is differentiable.
-            logabs = (self.envelope_scale + self.linear_bias.sum()).expand(flat.batch_size)
+            # Depend on parameters and zero-electron positions so KineticEnergy
+            # autograd differentiation sees a connected graph in the vacuum sector.
+            logabs = (self.envelope_scale + self.linear_bias.sum()).expand(
+                flat.batch_size
+            ) + 0.0 * flat.positions.sum(dim=(1, 2))
         else:
             # Shape: [B, N_e, 2]
             projected = torch.matmul(flat.positions, self.linear_weight.transpose(0, 1)) + self.linear_bias
@@ -406,8 +421,8 @@ def test_autograd_step_request_liveness_identity_and_bitwise_parity() -> None:
     assert state.local_energy.requires_grad is False
     train_metrics = [m for ns, m in context.records if ns == "train"][-1]
     assert train_metrics["loss_has_grad"] is True
-    event_types = {type(occ.event) for occ in context.occurrences}
-    assert {LocalEnergy, Forward, Objective}.issubset(event_types)
+    phase_types = _scoped_operation_types(context)
+    assert {LocalEnergy, Forward, Objective}.issubset(phase_types)
 
     # Bitwise parity against manual LegacyAutogradUpdate step.
     model_a = _SoftplusWavefunction()
@@ -532,7 +547,7 @@ def test_tangent_flattened_1d_shapes_chunking_return_terms_and_edge_batches() ->
     )
     assert chunk_sizes_seen == [2, 2, 2]
     assert multi_terms is not None
-    assert set(multi_terms) == {"kinetic", "harmonic_trap"}
+    assert set(multi_terms) == {"kinetic_energy", "harmonic_trap"}
     for tensor in multi_terms.values():
         assert tensor.shape == (6,)
         assert not tensor.requires_grad
@@ -694,12 +709,12 @@ def test_softplus_beta_triple_backward_central_finite_difference_oracle() -> Non
         emit=lambda **_: None,
     )
     assert recorder.received is not None
-    event_types = {type(occ.event) for occ in context.occurrences}
-    assert LocalEnergy in event_types
-    assert Objective in event_types
-    assert Forward not in event_types
+    phase_types = _scoped_operation_types(context)
+    assert LocalEnergy in phase_types
+    assert Objective in phase_types
+    assert Forward not in phase_types
     train_metrics = [m for ns, m in context.records if ns == "train"][-1]
-    assert "energy_term_kinetic" in train_metrics
+    assert "energy_term_kinetic_energy" in train_metrics
     assert "energy_term_harmonic_trap" in train_metrics
     assert train_metrics["loss_has_grad"] is False
 
@@ -857,14 +872,25 @@ def test_loud_refusals_inference_binding_requests_stateless_and_runtime_guards()
         )
     assert empty_binding_model.forward_calls == 0
 
-    # 3. Invalid request constructors.
-    for bad_chunk in (0, -1, True, False, 1.5, "2"):
+    # 3. Invalid request constructors (active Typeguard + suppressed runtime guards).
+    for bad_chunk in (0, -1, True, False):
         with pytest.raises(ValueError, match="positive integer or None"):
             MaterializedHamiltonianTangentStepRequest(chunk_size=bad_chunk)  # type: ignore[arg-type]
+    for bad_chunk_type in (1.5, "2"):
+        with pytest.raises((ValueError, TypeCheckError)):
+            MaterializedHamiltonianTangentStepRequest(chunk_size=bad_chunk_type)  # type: ignore[arg-type]
+    with typeguard.suppress_type_checks():
+        for bad_chunk in (0, -1, True, False, 1.5, "2"):
+            with pytest.raises(ValueError, match="positive integer or None"):
+                MaterializedHamiltonianTangentStepRequest(chunk_size=bad_chunk)  # type: ignore[arg-type]
 
     for bad_fwd in (CoordinateGradientRequest(), "value", None):
-        with pytest.raises(TypeError, match="ParameterScoreRequest"):
+        with pytest.raises((TypeError, TypeCheckError)):
             ParameterScoreStepRequest(forward_request=bad_fwd)  # type: ignore[arg-type]
+    with typeguard.suppress_type_checks():
+        for bad_fwd in (CoordinateGradientRequest(), "value", None):
+            with pytest.raises(TypeError, match="ParameterScoreRequest"):
+                ParameterScoreStepRequest(forward_request=bad_fwd)  # type: ignore[arg-type]
 
     # 4. Conflicting / invalid step_request() vs forward_request() and stateless bypass guard.
     class _NonRequestMethod(VMCUpdateMethod[Any]):
@@ -933,9 +959,15 @@ def test_loud_refusals_inference_binding_requests_stateless_and_runtime_guards()
         forward_request=MaterializedParameterScoreRequest(chunk_size=2)
     )
 
-    # Stateless method (update_state() is None) must fail BEFORE sampler.collect_samples.
+    # Stateless method (update_state() is None) must fail at resolve_update_state
+    # and in fit() BEFORE sampler.collect_samples.
     stateless_bad = _ConflictScoreMismatchMethod()
     assert stateless_bad.update_state() is None
+    with pytest.raises(ValueError, match="conflicting"):
+        VMCTrainer(max_steps=1, update_method=stateless_bad).resolve_update_state(
+            model=model,
+            optimizer=torch.optim.SGD(model.parameters(), lr=0.01),
+        )
     sampler = _FixedSampler(batch)
     with pytest.raises(ValueError, match="conflicting"):
         VMCTrainer(max_steps=1, update_method=stateless_bad).fit(
@@ -1149,3 +1181,6 @@ def test_disconnected_parameter_zero_blocks_and_derivatives_operations() -> None
     # Also verify non-VMCUpdateMethod passed to resolve_step_request fails loudly.
     with pytest.raises((TypeError, TypeCheckError)):
         resolve_step_request(object())  # type: ignore[arg-type]
+    with typeguard.suppress_type_checks():
+        with pytest.raises(TypeError, match="VMCUpdateMethod"):
+            resolve_step_request(object())  # type: ignore[arg-type]
