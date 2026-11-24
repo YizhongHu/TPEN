@@ -191,7 +191,12 @@ def __getattr__(name: str) -> object:
         from .resource_usage import ResourceUsage
 
         return ResourceUsage
-    if name in {"AllocatorSource", "RUsageSource", "ResourceSamples"}:
+    if name in {
+        "AllocatorSource",
+        "LinuxMemorySource",
+        "RUsageSource",
+        "ResourceSamples",
+    }:
         from . import resource_samples
 
         return getattr(resource_samples, name)
@@ -233,6 +238,7 @@ __all__ = [
     "FactorScalars",
     "GradientStats",
     "InitialCheckpoint",
+    "LinuxMemorySource",
     "ManagedCallback",
     "ManagedLifecycleError",
     "Metadata",
