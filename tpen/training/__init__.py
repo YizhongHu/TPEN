@@ -1,6 +1,7 @@
 """Training-loop namespace."""
 
 from tpen.training.optim import make_optimizer
+from tpen.training.soap import SOAP
 from tpen.training.qgt import (
     DampingPolicy,
     QGTOperator,
@@ -73,6 +74,7 @@ __all__ = [
     "deserialize_parameter_layout",
     "serialize_parameter_layout",
     "SCORE_CONVENTION_VERSION",
+    "SOAP",
     "SR_STATE_VERSION",
     "DampingPolicy",
     "QGTOperator",
