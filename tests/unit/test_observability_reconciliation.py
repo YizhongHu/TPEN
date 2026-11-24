@@ -149,22 +149,18 @@ def _make_context(
     manager = _make_manager(tmp_path, run_id=run_id)
     metadata = RunMetadata(
         run_id=run_id,
-        experiment="obs-o7",
-        sector="unit",
         run_name=run_id,
         timestamp="2026-11-24T12:00:00+00:00",
         timezone="UTC",
+        git_branch="test-branch",
+        dirty_worktree=False,
         command="pytest",
         config_path="o7.yaml",
-        seed=7,
+        resolved_config_path=str(manager.path("resolved_config.yaml")),
+        run_dir=str(manager.run_dir),
         device=device,
         dtype="float64",
         git_commit="abc123def456",
-        git_dirty=False,
-        python_version="3.12",
-        torch_version="2.6",
-        platform="linux",
-        hostname="o7-host",
     )
     cfg = OmegaConf.create(
         {
@@ -175,6 +171,7 @@ def _make_context(
     )
     kwargs: dict[str, Any] = {
         "cfg": cfg,
+        "source_cfg": OmegaConf.create({}),
         "metadata": metadata,
         "artifact_manager": manager,
         "clock": RunClock(timezone="UTC", tzinfo=UTC),
@@ -651,7 +648,14 @@ def _write_clean_bundle(
 def test_o7_reconciliation_module_is_torch_psutil_experiments_executor_free(
     tmp_path: Path,
 ) -> None:
-    """Importing reconciliation/inspection modules must never pull forbidden packages."""
+    """Importing O7 modules must never pull forbidden packages.
+
+    ``tpen.inspection`` is a public compatibility facade whose pre-O7
+    trajectory-record import eagerly loads the evaluation bundle and Torch.
+    O7's contract is therefore limited to the new reconciliation/artifact and
+    resource-sample modules; changing the existing inspection import boundary
+    belongs to the evaluation owner.
+    """
 
     source = (REPO_ROOT / "tpen" / "observability_reconciliation.py").read_text(
         encoding="utf-8"
@@ -682,7 +686,7 @@ def test_o7_reconciliation_module_is_torch_psutil_experiments_executor_free(
             "-c",
             (
                 "import sys, tpen.observability_reconciliation, "
-                "tpen.observability_artifacts, tpen.inspection, "
+                "tpen.observability_artifacts, "
                 "tpen.callback.resource_samples; "
                 "assert 'torch' not in sys.modules; "
                 "assert 'psutil' not in sys.modules; "

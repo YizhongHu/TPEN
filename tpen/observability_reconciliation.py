@@ -882,6 +882,36 @@ def _verify_lifecycle_marker(
         )
     if identity_mismatches:
         detail = "; ".join(identity_mismatches)
+        # Finalization adds the closed manifest's artifact references.  If the
+        # manifest replace won but the marker replace did not, the old open
+        # marker necessarily has the pre-finalization artifact count.  Preserve
+        # that protocol evidence for reconciliation instead of collapsing it
+        # into an unsafe/tampered marker.
+        if (
+            marker.state == "open"
+            and manifest.lifecycle_state == "closed"
+            and identity_mismatches == [
+                f"artifact_count {marker.artifact_count} != {len(manifest.artifacts)}"
+            ]
+        ):
+            diagnostics.append(
+                ObservabilityDiagnostic(
+                    code="lifecycle_marker_state_mismatch",
+                    message=(
+                        f"{LIFECYCLE_MARKER_FILENAME} is the prior open marker "
+                        f"while manifest.json is closed ({detail})"
+                    ),
+                    path=LIFECYCLE_MARKER_FILENAME,
+                )
+            )
+            return LifecycleMarkerVerification(
+                present=True,
+                state="open",
+                matches_manifest=False,
+                manifest_sha256_verified=False,
+                diagnostic_code="lifecycle_marker_state_mismatch",
+                detail=detail,
+            )
         diagnostics.append(
             ObservabilityDiagnostic(
                 code="lifecycle_marker_identity_mismatch",
@@ -1538,10 +1568,16 @@ def _classify_bundle_reconciliation(
     has_torn_tails = bool(inspection.torn_tails)
     has_interior_errors = bool(inspection.interior_errors)
 
+    # Finalization is a two-file protocol: the manifest is replaced first and
+    # the marker is replaced second.  A process death after the first replace
+    # leaves a valid closed manifest beside the previous valid open marker.
+    # The state-mismatch diagnostic is the evidence that this is that protocol
+    # boundary, rather than an arbitrary marker/hash tamper.
     marker_open_while_manifest_closed = (
         marker.present
         and marker.state == "open"
         and manifest.lifecycle_state == "closed"
+        and marker.diagnostic_code == "lifecycle_marker_state_mismatch"
     )
     marker_tampered_or_invalid = marker.present and (
         not marker.matches_manifest or marker.manifest_sha256_verified is False
