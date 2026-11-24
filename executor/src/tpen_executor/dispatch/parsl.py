@@ -858,6 +858,18 @@ class ParslDispatcher(DispatcherContract):
             object.__setattr__(self, "_local_provider_type", LocalProvider)
             object.__setattr__(self, "_mpiexec_launcher_type", MpiExecLauncher)
 
+    def validate(
+        self,
+        group: ReadyGroup,
+        runs: Mapping[str, ConfiguredRun],
+        lifecycle: AttachedAllocation,
+        env: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        """Run shared admission before creating a Parsl DFK or app."""
+
+        super().validate(group, runs, lifecycle, env, timeout)
+
     def run(
         self,
         group: ReadyGroup,

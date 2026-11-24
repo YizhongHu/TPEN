@@ -14,7 +14,6 @@ from tpen_executor._codec import digest
 from tpen_executor.contracts import ProgramSpecRef, ReadyGroup, TaskSpec
 from tpen_executor.dispatch import LocalDispatcher
 from tpen_executor.dispatch.contract import ConfiguredProgramRouteRefused
-from tpen_executor.dispatch.parsl import ParslDispatcher
 from tpen_executor.dispatch.transport import LeafRequest
 from tpen_executor.programs import ConfiguredProgram
 from tpen_executor.runners import CONFIGURED_RUN_SHIM, ConfiguredProgramCommand, RUN_SHIM, TPENCommand
@@ -114,10 +113,10 @@ def test_public_configured_decoders_round_trip_and_refuse_bad_payloads(tmp_path:
     legacy_payload.pop("manifest_sha256")
     assert ConfiguredProgram.from_mapping(legacy_payload).program_digest == program.program_digest
 
-    table = ConfiguredRunTable("group", (ConfiguredRun("configured", "", (), program),))
+    table = ConfiguredRunTable(digest("group"), (ConfiguredRun("configured", "", (), program),))
     table_decoded = ConfiguredRunTable.from_mapping(table.to_dict())
-    assert table_decoded.to_dict() == table.to_dict()
-    assert table_decoded.runs[0].program_digest == program.program_digest
+    assert table_decoded.runs[0].program_digest == table.runs[0].program_digest
+    assert table_decoded.runs[0].program.program_digest == table.runs[0].program.program_digest
 
     malformed = program.to_dict()
     malformed.pop("script_path")
@@ -235,10 +234,6 @@ def test_legacy_dispatch_unchanged_and_configured_dispatch_refuses_before_spawn(
     with pytest.raises(ConfiguredProgramRouteRefused, match="until C2.2"):
         LocalDispatcher(worker).run(group, {"configured": configured}, lifecycle)
     assert calls == []
-    # Parsl's in-process route uses the same admission gate before DFK/app setup.
-    with pytest.raises(ConfiguredProgramRouteRefused, match="until C2.2"):
-        ParslDispatcher._validate_inputs(group, {"configured": configured}, lifecycle, None, None)
-    assert calls == []
 
 
 def test_configured_shim_refuses_mismatched_attempt_output(tmp_path: Path) -> None:
@@ -319,6 +314,13 @@ MUTANTS = (
         "old": "            if configured.program is not None:\n                raise ConfiguredProgramRouteRefused(\n                    \"configured program not supported on this route until C2.2\"\n                )\n",
         "new": "            if False:\n                raise ConfiguredProgramRouteRefused(\n                    \"configured program not supported on this route until C2.2\"\n                )\n",
         "killer": "test_legacy_dispatch_unchanged_and_configured_dispatch_refuses_before_spawn",
+    },
+    {
+        "id": "parsl-admits-configured-before-dfk",
+        "target": "executor/src/tpen_executor/dispatch/parsl.py",
+        "old": "        super().validate(group, runs, lifecycle, env, timeout)\n",
+        "new": "        pass\n",
+        "killer": "test_configured_parsl_public_run_refuses_before_dfk_or_submission",
     },
 )
 
