@@ -2706,3 +2706,454 @@ def test_linux_memory_live_procfs_roundtrip_with_rusage_on_linux(tmp_path: Path)
     assert lm_summary.sampled_max is not None and lm_summary.sampled_max >= lm_summary.sampled_min
     assert lm_summary.sampled_max_is_lower_bound is True
 
+
+# ---------------------------------------------------------------------------
+# O4 T2 review tests
+# ---------------------------------------------------------------------------
+
+
+def test_linux_memory_non_linux_platform_refused_with_expected_generation_and_explicit_proc_root(
+    tmp_path: Path,
+) -> None:
+    """T3 (F3): Non-Linux platform must be refused even with expected_generation or explicit proc_root."""
+
+    failures: list[str] = []
+
+    # Sub-case A: expected_generation supplied with platform_name="darwin"
+    gen = LinuxProcessGeneration(pid=os.getpid(), start_ticks=1234, host_id="h1")
+    probe_a = LinuxProcessMemoryProbe(expected_generation=gen, platform_name="darwin")
+    bound_a = probe_a.bind_target()
+    if (
+        bound_a is not None
+        or probe_a.bind_error is None
+        or probe_a.bind_error.reason_code != "unsupported_platform"
+    ):
+        failures.append(
+            "sub-case A1 bind_target accepted non-Linux probe with expected_generation: "
+            f"bound={bound_a!r}, bind_error={probe_a.bind_error!r}"
+        )
+
+    probe_a2 = LinuxProcessMemoryProbe(expected_generation=gen, platform_name="darwin")
+    cb_a2 = ResourceSamples(
+        interval_seconds=60.0,
+        linux_memory=LinuxMemorySource(enabled=True, probe=probe_a2),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "darwin_expected_gen"), runtime_callbacks=[cb_a2]
+    ) as ctx_a2:
+        run_dir_a2 = ctx_a2.run_dir
+    bundle_a2 = inspect_run_observability(run_dir_a2).invocations[0]
+    assert bundle_a2.inventory is not None
+    src_inv_a2 = bundle_a2.inventory.sources[LINUX_MEMORY_SOURCE_ID]
+    if (
+        src_inv_a2.get("capability") != "unavailable"
+        or src_inv_a2.get("unavailable_reason_code") != "unsupported_platform"
+    ):
+        failures.append(
+            "sub-case A2 inventory failed to report unsupported_platform on darwin with expected_generation: "
+            f"capability={src_inv_a2.get('capability')!r}, "
+            f"unavailable_reason_code={src_inv_a2.get('unavailable_reason_code')!r}"
+        )
+
+    # Sub-case B: explicit proc_root="/proc" with platform_name="darwin"
+    probe_b = LinuxProcessMemoryProbe(proc_root="/proc", platform_name="darwin")
+    bound_b = probe_b.bind_target()
+    read_b = probe_b.read()
+    if (
+        bound_b is not None
+        or probe_b.bind_error is None
+        or probe_b.bind_error.reason_code != "unsupported_platform"
+        or read_b.status != "unavailable"
+        or read_b.reason_code != "unsupported_platform"
+    ):
+        failures.append(
+            "sub-case B accepted proc_root='/proc' on platform_name='darwin': "
+            f"bound={bound_b!r}, bind_error={probe_b.bind_error!r}, "
+            f"read=({read_b.status!r}, {read_b.reason_code!r})"
+        )
+
+    # Sub-case C: custom fake proc_root with platform_name="darwin"
+    proc_root_c = _write_fake_proc_tree(tmp_path / "proc_darwin", pid=os.getpid())
+    probe_c = LinuxProcessMemoryProbe(
+        pid=os.getpid(), proc_root=proc_root_c, platform_name="darwin"
+    )
+    read_c = probe_c.read()
+    if read_c.status != "unavailable" or read_c.reason_code != "unsupported_platform":
+        failures.append(
+            "sub-case C accepted custom proc_root on platform_name='darwin': "
+            f"status={read_c.status!r}, reason_code={read_c.reason_code!r}"
+        )
+
+    assert failures == [], "; ".join(failures)
+
+
+def test_linux_memory_bind_target_failure_does_not_poll_or_report_available_complete(
+    tmp_path: Path,
+) -> None:
+    """T5 (F5): Failed bind_target must not poll probe.read() or report available/complete."""
+
+    failures: list[str] = []
+    gen = LinuxProcessGeneration(pid=os.getpid(), start_ticks=4321, host_id="h-bind")
+
+    # Sub-case A: bind_target() raises RuntimeError("bind exploded") while read() returns ok
+    class _ExplodingBindProbe:
+        def __init__(self) -> None:
+            self.read_calls = 0
+
+        def bind_target(self) -> LinuxProcessGeneration | None:
+            raise RuntimeError("bind exploded")
+
+        def read(self) -> LinuxProcessMemoryReading:
+            self.read_calls += 1
+            return LinuxProcessMemoryReading(
+                status="ok",
+                rss_bytes=1024 * 1024,
+                virtual_bytes=4 * 1024 * 1024,
+                thread_count=2,
+                read_start_ns=10,
+                read_end_ns=20,
+                target_generation=gen,
+                observed_generation_before=gen,
+                observed_generation_after=gen,
+            )
+
+    probe_a = _ExplodingBindProbe()
+    cb_a = ResourceSamples(
+        interval_seconds=60.0,
+        linux_memory=LinuxMemorySource(enabled=True, probe=probe_a),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "bind_exploded"), runtime_callbacks=[cb_a]
+    ) as ctx_a:
+        run_dir_a = ctx_a.run_dir
+
+    bundle_a = inspect_run_observability(run_dir_a).invocations[0]
+    assert bundle_a.inventory is not None
+    inv_a = bundle_a.inventory.sources[LINUX_MEMORY_SOURCE_ID]
+    status_a = bundle_a.statuses["resource-samples"]
+    samples_a = bundle_a.samples["resource-samples"]
+
+    if probe_a.read_calls != 0:
+        failures.append(f"sub-case A polled read() {probe_a.read_calls} time(s) after bind_target raised")
+    if inv_a.get("capability") != "unavailable":
+        failures.append(f"sub-case A inventory capability={inv_a.get('capability')!r} (expected 'unavailable')")
+    if inv_a.get("unavailable_reason_code") != "probe_init_failed":
+        failures.append(
+            f"sub-case A inventory unavailable_reason_code={inv_a.get('unavailable_reason_code')!r} "
+            "(expected 'probe_init_failed')"
+        )
+    if status_a.source_status.get(LINUX_MEMORY_SOURCE_ID) != "unavailable":
+        failures.append(
+            f"sub-case A status.source_status={status_a.source_status.get(LINUX_MEMORY_SOURCE_ID)!r} "
+            "(expected 'unavailable')"
+        )
+    if bundle_a.derived_data_completeness == "complete":
+        failures.append("sub-case A reported derived_data_completeness='complete' after bind_target raised")
+    if not samples_a:
+        failures.append("sub-case A emitted zero samples instead of probe_init_failed records")
+    else:
+        bad_reasons = [
+            (s.sequence, qty, r.status, r.reason_code)
+            for s in samples_a
+            for qty, r in s.readings.items()
+            if r.reason_code != "probe_init_failed" or r.value is not None
+        ]
+        if bad_reasons:
+            failures.append(
+                f"sub-case A samples did not carry probe_init_failed with value=None: {bad_reasons[:3]!r}"
+            )
+    if status_a.counts["failed"] != 0 or status_a.counts["attempted"] != (
+        status_a.counts["written"] + status_a.counts["dropped"] + status_a.counts["failed"]
+    ):
+        failures.append(f"sub-case A unreconciled counts: {status_a.counts!r}")
+
+    # Sub-case B: bind_target() returns None with bind_error=None
+    class _SilentNoneBindProbe:
+        @property
+        def bind_error(self) -> LinuxMemoryUnavailable | None:
+            return None
+
+        def bind_target(self) -> LinuxProcessGeneration | None:
+            return None
+
+        def read(self) -> LinuxProcessMemoryReading:
+            issue = LinuxMemoryUnavailable(
+                reason="procfs missing", reason_code="procfs_missing", status="unavailable"
+            )
+            return LinuxProcessMemoryReading(
+                status="unavailable",
+                rss_bytes=issue,
+                virtual_bytes=issue,
+                thread_count=issue,
+                read_start_ns=10,
+                read_end_ns=20,
+                reason_code="procfs_missing",
+                detail="procfs missing",
+            )
+
+    probe_b = _SilentNoneBindProbe()
+    cb_b = ResourceSamples(
+        interval_seconds=60.0,
+        linux_memory=LinuxMemorySource(enabled=True, probe=probe_b),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "bind_none"), runtime_callbacks=[cb_b]
+    ) as ctx_b:
+        run_dir_b = ctx_b.run_dir
+
+    bundle_b = inspect_run_observability(run_dir_b).invocations[0]
+    assert bundle_b.inventory is not None
+    cap_b = bundle_b.inventory.sources[LINUX_MEMORY_SOURCE_ID].get("capability")
+    if cap_b != "unavailable":
+        failures.append(
+            f"sub-case B inventory capability={cap_b!r} when bind_target() returned None with bind_error=None"
+        )
+
+    assert failures == [], "; ".join(failures)
+
+
+def test_linux_memory_yaml_nested_target_routed_destination_config_identity_and_profile_refusal(
+    tmp_path: Path,
+) -> None:
+    """T6: LinuxMemorySource YAML targets, plain mappings, routed destination, identity, and profile refusal."""
+
+    proc_root = _write_fake_proc_tree(
+        tmp_path / "proc_yaml",
+        pid=os.getpid(),
+        start_ticks=54321,
+        vm_rss_kib=3072,
+        vm_size_kib=9216,
+        threads=5,
+    )
+    physical_root = tmp_path / "physical_routed_lm"
+    logical_outputs_a = tmp_path / "logical_yaml_a" / "outputs"
+
+    yaml_a = f"""
+experiment:
+  name: o4_yaml_test
+  sector: unit
+run:
+  root: {json.dumps(str(logical_outputs_a))}
+  layout: flat
+  run_id: o4-yaml-run
+  timezone: UTC
+runtime:
+  device: cpu
+  dtype: float64
+callbacks:
+  - _target_: tpen.callback.ResourceSamples
+    interval_seconds: 60.0
+    linux_memory:
+      _target_: tpen.callback.LinuxMemorySource
+      enabled: true
+      proc_root: {json.dumps(str(proc_root))}
+      max_read_bytes: 65536
+      quantities:
+        - process.memory.rss_bytes
+        - process.memory.thread_count
+    sink:
+      _target_: tpen.artifacts.RunArtifactSink
+      relative_dir: observability
+loggers: []
+runner:
+  _target_: {__name__}._NoopRunner
+"""
+    cfg_a = OmegaConf.create(yaml_a)
+    exit_code_a = run_from_config(
+        cfg_a,
+        raise_exceptions=True,
+        artifact_destination=ArtifactDestination(physical_root),
+    )
+    assert exit_code_a == 0
+    assert not logical_outputs_a.exists()
+
+    obs_a = inspect_run_observability(physical_root)
+    assert obs_a.status == "present"
+    assert len(obs_a.invocations) == 1
+    bundle_a = obs_a.invocations[0]
+    assert bundle_a.derived_lifecycle_state == "closed"
+    assert bundle_a.derived_data_completeness == "complete"
+    assert bundle_a.descriptors is not None
+    expected_qtys = {"process.memory.rss_bytes", "process.memory.thread_count"}
+    assert set(bundle_a.descriptors.quantities.keys()) == expected_qtys
+    assert "process.memory.virtual_bytes" not in bundle_a.descriptors.quantities
+    assert bundle_a.inventory is not None
+    assert bundle_a.inventory.process["start_ticks"] == 54321
+    samples_a = bundle_a.samples["resource-samples"]
+    assert len(samples_a) >= 1
+    assert set(samples_a[0].readings.keys()) == expected_qtys
+    assert samples_a[0].readings["process.memory.rss_bytes"].value == 3072 * 1024
+    assert samples_a[0].readings["process.memory.thread_count"].value == 5
+    assert bundle_a.statuses["resource-samples"].application_outcome == "completed"
+
+    # YAML B: plain mapping without nested _target_
+    yaml_b = f"""
+experiment:
+  name: o4_yaml_plain
+  sector: unit
+run:
+  root: {json.dumps(str(tmp_path / "yaml_plain_lm" / "outputs"))}
+  layout: flat
+  run_id: o4-plain-run
+  timezone: UTC
+runtime:
+  device: cpu
+  dtype: float64
+callbacks:
+  - _target_: tpen.callback.ResourceSamples
+    interval_seconds: 60.0
+    linux_memory:
+      enabled: true
+      proc_root: {json.dumps(str(proc_root))}
+loggers: []
+runner:
+  _target_: {__name__}._NoopRunner
+"""
+    cfg_b = OmegaConf.create(yaml_b)
+    assert run_from_config(cfg_b, raise_exceptions=True) == 0
+    bundle_b = inspect_run_observability(
+        tmp_path / "yaml_plain_lm" / "outputs" / "o4-plain-run"
+    ).invocations[0]
+    assert bundle_b.derived_lifecycle_state == "closed"
+    assert bundle_b.derived_data_completeness == "complete"
+
+    # Config identity sensitivity to linux_memory.max_read_bytes
+    cfg_a_alt = OmegaConf.create(
+        yaml_a.replace("max_read_bytes: 65536", "max_read_bytes: 32768")
+    )
+    assert resolved_config_identity(cfg_a) != resolved_config_identity(cfg_a_alt)
+
+    # Profile refusal on NATIVE_RECOVERY_PROFILE
+    profile_check = check_profile(cfg_a, NATIVE_RECOVERY_PROFILE)
+    assert profile_check.verdict == "refused"
+    assert profile_check.refusal is not None
+    assert profile_check.refusal["code"] == "unsupported-callback"
+
+
+def test_real_linux_memory_probe_in_resource_samples_mid_run_generation_change_roundtrip(
+    tmp_path: Path,
+) -> None:
+    """T7: Real LinuxProcessMemoryProbe in ResourceSamples catches mid-run start_ticks drift cleanly."""
+
+    pid = os.getpid()
+    proc_root = _write_fake_proc_tree(
+        tmp_path / "proc_mid_drift",
+        pid=pid,
+        start_ticks=1000,
+        vm_rss_kib=2048,
+        vm_size_kib=8192,
+        threads=3,
+    )
+    cb = ResourceSamples(
+        interval_seconds=60.0,
+        linux_memory=LinuxMemorySource(enabled=True, proc_root=proc_root),
+    )
+    with open_run_context(_base_cfg(tmp_path / "mid_drift"), runtime_callbacks=[cb]) as ctx:
+        run_dir = ctx.run_dir
+        stat_fields = "S 1 1 1 0 -1 4194304 10 0 0 0 1 1 0 0 20 0 3 0"
+        (proc_root / str(pid) / "stat").write_text(
+            f"{pid} (python3) {stat_fields} 9999 1000 50\n",
+            encoding="utf-8",
+        )
+        (proc_root / str(pid) / "status").write_text(
+            f"Name:\tpython3\nPid:\t{pid}\nVmSize:\t8192 kB\n"
+            "VmRSS:\t999999 kB\nThreads:\t3\n",
+            encoding="utf-8",
+        )
+
+    bundle_dir = next((run_dir / "observability").iterdir())
+    bundle = inspect_observability_bundle(bundle_dir)
+    assert bundle.derived_lifecycle_state == "closed"
+    assert bundle.derived_data_completeness == "partial"
+
+    samples = bundle.samples["resource-samples"]
+    assert len(samples) == 2
+    assert samples[0].readings["process.memory.rss_bytes"].status == "ok"
+    assert samples[0].readings["process.memory.rss_bytes"].value == 2048 * 1024
+
+    for qty_id in LINUX_MEMORY_QUANTITY_IDS:
+        reading = samples[1].readings[qty_id]
+        assert reading.status == "unavailable"
+        assert reading.reason_code == "generation_changed"
+        assert reading.value is None
+
+    rss_summary = bundle.summary.quantity(
+        LINUX_MEMORY_SOURCE_ID, "process.memory.rss_bytes"
+    )
+    assert rss_summary is not None
+    assert rss_summary.ok_count == 1
+    assert rss_summary.unavailable_count == 1
+    assert rss_summary.sampled_max == 2048 * 1024
+    assert rss_summary.reason_codes == ("generation_changed",)
+
+    status = bundle.statuses["resource-samples"]
+    assert status.counts == {"attempted": 2, "written": 2, "dropped": 0, "failed": 0}
+
+
+def test_dual_blocking_rusage_and_linux_memory_share_single_close_deadline_and_start_rollback(
+    tmp_path: Path,
+) -> None:
+    """T8: Dual blocking threads share one close deadline; symlinked manifest rolls back start cleanly."""
+
+    # Sub-case A: dual blocking RUSAGE + linux-memory share a single close deadline
+    gen = LinuxProcessGeneration(pid=os.getpid(), start_ticks=12345)
+    rusage_probe = _BlockingRUsageProbe()
+    lm_probe = _BlockingLinuxMemoryProbe(gen)
+    cb = ResourceSamples(
+        interval_seconds=0.01,
+        close_timeout_seconds=0.12,
+        rusage=RUsageSource(enabled=True, probe=rusage_probe),
+        linux_memory=LinuxMemorySource(enabled=True, probe=lm_probe),
+    )
+
+    dual_dir: Path | None = None
+    close_start = 0.0
+    try:
+        with pytest.raises(ManagedLifecycleError, match="quiescence"):
+            with open_run_context(
+                _base_cfg(tmp_path / "dual_hung"), runtime_callbacks=[cb]
+            ) as ctx:
+                assert rusage_probe.blocked_in_second.wait(timeout=2.0)
+                assert lm_probe.blocked_in_second.wait(timeout=2.0)
+                dual_dir = ctx.run_dir
+                close_start = time.monotonic()
+        close_elapsed = time.monotonic() - close_start
+        assert close_elapsed < 0.6
+
+        assert dual_dir is not None
+        bundle = inspect_run_observability(dual_dir).invocations[0]
+        assert bundle.derived_lifecycle_state == "unsafe"
+        status = bundle.statuses["resource-samples"]
+        assert status.helper_cleanup["state"] == "unconfirmed_timeout"
+        diag_text = " ".join(status.diagnostics or ())
+        assert "rusage" in diag_text
+        assert "linux-memory" in diag_text
+        assert cb.is_managed_scope_active() is True
+
+        with pytest.raises(ManagedLifecycleError):
+            with open_run_context(
+                _base_cfg(tmp_path / "dual_reuse"), runtime_callbacks=[cb]
+            ):
+                pass
+    finally:
+        rusage_probe.release.set()
+        lm_probe.release.set()
+
+    # Sub-case B: symlinked manifest.json during start() with linux_memory rolls back cleanly
+    proc_root = _write_fake_proc_tree(tmp_path / "proc_rollback", pid=os.getpid())
+    ctx_b = make_run_context(tmp_path / "lm_rollback", run_id="o4-rollback")
+    ctx_b.invocation_id = "inv-lm-symlink"
+    bundle_b = ctx_b.run_dir / "observability" / "inv-lm-symlink"
+    bundle_b.mkdir(parents=True, exist_ok=True)
+    (bundle_b / "manifest.json").symlink_to(tmp_path / "outside_lm_manifest.json")
+
+    cb_b = ResourceSamples(
+        interval_seconds=60.0,
+        linux_memory=LinuxMemorySource(enabled=True, proc_root=proc_root),
+    )
+    with pytest.raises(ObservabilityPathError):
+        with cb_b.run_scope(ctx_b):
+            pass
+    assert not (bundle_b / "status" / "resource-samples.json").exists()
+    assert cb_b.is_managed_scope_active() is False
+
