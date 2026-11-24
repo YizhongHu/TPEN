@@ -20,6 +20,81 @@ from .metadata import Metadata
 from .snapshot import ConfigSnapshot, ResolvedConfigSnapshot
 from .terminal_logging import configure_terminal_logging
 
+#: Closed torch-free set of shipped non-managed callback dotted targets
+#: (package exports, subpackage re-exports, and defining-module paths).
+#: Preflight classification uses this table to skip eager ``get_class`` imports
+#: of ordinary shipped callbacks (whose modules pull in ``torch``) until inside
+#: the managed ``PREPARING`` scope.
+_KNOWN_NON_MANAGED_CALLBACK_TARGETS: frozenset[str] = frozenset(
+    {
+        "tpen.callback.AmplitudeRiskFraction",
+        "tpen.callback.amplitude_risk.AmplitudeRiskFraction",
+        "tpen.callback.ArtifactIndex",
+        "tpen.callback.evaluation.ArtifactIndex",
+        "tpen.callback.Checkpoint",
+        "tpen.callback.checkpoint.Checkpoint",
+        "tpen.callback.ConfigSnapshot",
+        "tpen.callback.snapshot.ConfigSnapshot",
+        "tpen.callback.DataIntegrity",
+        "tpen.callback.health.DataIntegrity",
+        "tpen.callback.health.data_integrity.DataIntegrity",
+        "tpen.callback.DiagnosticTiming",
+        "tpen.callback.timing.DiagnosticTiming",
+        "tpen.callback.timing.diagnostic_timing.DiagnosticTiming",
+        "tpen.callback.ElectronNucleusDistanceQuantiles",
+        "tpen.callback.electron_nucleus_distance.ElectronNucleusDistanceQuantiles",
+        "tpen.callback.EvaluationComponentTiming",
+        "tpen.callback.timing.EvaluationComponentTiming",
+        "tpen.callback.timing.evaluation_component_timing.EvaluationComponentTiming",
+        "tpen.callback.EvaluationTiming",
+        "tpen.callback.timing.EvaluationTiming",
+        "tpen.callback.timing.evaluation_timing.EvaluationTiming",
+        "tpen.callback.FactorScalars",
+        "tpen.callback.factor_scalars.FactorScalars",
+        "tpen.callback.FailureLog",
+        "tpen.callback.evaluation.FailureLog",
+        "tpen.callback.GradientStats",
+        "tpen.callback.health.GradientStats",
+        "tpen.callback.health.gradient_stats.GradientStats",
+        "tpen.callback.InitialCheckpoint",
+        "tpen.callback.initial_checkpoint.InitialCheckpoint",
+        "tpen.callback.Metadata",
+        "tpen.callback.metadata.Metadata",
+        "tpen.callback.ModuleNorms",
+        "tpen.callback.module_norms.ModuleNorms",
+        "tpen.callback.OptimizerState",
+        "tpen.callback.optimizer_state.OptimizerState",
+        "tpen.callback.ParameterActivity",
+        "tpen.callback.parameter_activity.ParameterActivity",
+        "tpen.callback.PlannedYield",
+        "tpen.callback.planned_yield.PlannedYield",
+        "tpen.callback.RawTrainingBatchRecorder",
+        "tpen.callback.raw_training_batch_recorder.RawTrainingBatchRecorder",
+        "tpen.callback.ResolvedConfigSnapshot",
+        "tpen.callback.snapshot.ResolvedConfigSnapshot",
+        "tpen.callback.ResourceUsage",
+        "tpen.callback.resource_usage.ResourceUsage",
+        "tpen.callback.RunTiming",
+        "tpen.callback.timing.RunTiming",
+        "tpen.callback.timing.run_timing.RunTiming",
+        "tpen.callback.RuntimeEquivariance",
+        "tpen.callback.equivariance.RuntimeEquivariance",
+        "tpen.callback.SamplerHealth",
+        "tpen.callback.health.SamplerHealth",
+        "tpen.callback.health.sampler_health.SamplerHealth",
+        "tpen.callback.Status",
+        "tpen.callback.status.Status",
+        "tpen.callback.TrainPhaseTiming",
+        "tpen.callback.timing.TrainPhaseTiming",
+        "tpen.callback.timing.train_phase_timing.TrainPhaseTiming",
+        "tpen.callback.TrainStepTiming",
+        "tpen.callback.timing.TrainStepTiming",
+        "tpen.callback.timing.train_step_timing.TrainStepTiming",
+        "tpen.callback.TrainingBatchRecorder",
+        "tpen.callback.raw_training_batch_recorder.TrainingBatchRecorder",
+    }
+)
+
 
 def __getattr__(name: str) -> object:
     """Load torch-dependent callback classes only when they are requested.

@@ -44,7 +44,10 @@ from tpen.distributed import (
     RankLocalJSONLWriter,
     execution_topology_from_facts,
 )
-from tpen.callback import configure_terminal_logging
+from tpen.callback import (
+    _KNOWN_NON_MANAGED_CALLBACK_TARGETS,
+    configure_terminal_logging,
+)
 from tpen.callback.base import (
     ManagedLifecycleError,
     ResourceOwnershipClaim,
@@ -186,6 +189,8 @@ _FORBIDDEN_CALLBACK_SELECTOR_KEYS: frozenset[str] = frozenset(
 _FORBIDDEN_CALLBACK_SELECTOR_TARGETS: frozenset[str] = frozenset(
     {
         "tpen.events.Subscription",
+        "tpen.events.started",
+        "tpen.events.ended",
         "tpen.callback.cadence.SubscriptionGroup",
         "tpen.callback.SubscriptionGroup",
     }
@@ -197,6 +202,16 @@ _RESOURCE_USAGE_TARGETS: frozenset[str] = frozenset(
         _RESOURCE_USAGE_QUALIFIED_NAME,
     }
 )
+
+
+def _is_forbidden_callback_selector_target(target: str) -> bool:
+    """Return whether ``target`` names or accesses a forbidden selector callable."""
+
+    normalized = target.strip()
+    return any(
+        normalized == forbidden or normalized.startswith(f"{forbidden}.")
+        for forbidden in _FORBIDDEN_CALLBACK_SELECTOR_TARGETS
+    )
 
 
 def _extract_callbacks_view(cfg: DictConfig, *, resolved: bool) -> Any:
@@ -222,8 +237,31 @@ def _extract_callbacks_view(cfg: DictConfig, *, resolved: bool) -> Any:
         except Exception:
             return None
         if OmegaConf.is_config(selected):
-            return OmegaConf.to_container(selected, resolve=False, throw_on_missing=False)
-        return selected
+            callbacks = OmegaConf.to_container(selected, resolve=False, throw_on_missing=False)
+        else:
+            callbacks = selected
+    # Resolve interpolated callback list elements (e.g. ``callbacks: ["${obs_cb}"]``)
+    # without resolving unrelated placeholders such as ``${run.dir}`` inside them.
+    if isinstance(callbacks, (list, tuple)) and isinstance(cfg, DictConfig):
+        resolved_entries: list[Any] = []
+        for index, entry in enumerate(callbacks):
+            if isinstance(entry, str) and "${" in entry:
+                try:
+                    selected = OmegaConf.select(cfg, f"callbacks[{index}]", default=None)
+                except Exception:
+                    resolved_entries.append(entry)
+                    continue
+                if OmegaConf.is_config(selected):
+                    resolved_entries.append(
+                        OmegaConf.to_container(
+                            selected, resolve=False, throw_on_missing=False
+                        )
+                    )
+                else:
+                    resolved_entries.append(selected)
+            else:
+                resolved_entries.append(entry)
+        return resolved_entries
     return callbacks
 
 
@@ -232,7 +270,7 @@ def _walk_callback_spec(node: object, *, path: str) -> None:
 
     if isinstance(node, Mapping):
         target = node.get("_target_")
-        if isinstance(target, str) and target.strip() in _FORBIDDEN_CALLBACK_SELECTOR_TARGETS:
+        if isinstance(target, str) and _is_forbidden_callback_selector_target(target):
             raise ValueError(
                 f"{path}._target_={target!r} is forbidden: configured callbacks "
                 "must not supply free-form event or subscription selectors"
@@ -298,7 +336,10 @@ def _has_managed_callbacks(
                 except Exception:
                     target = None
             if isinstance(target, str) and target.strip() and "${" not in target:
-                klass = _try_resolve_target_class(target.strip())
+                normalized_target = target.strip()
+                if normalized_target in _KNOWN_NON_MANAGED_CALLBACK_TARGETS:
+                    continue
+                klass = _try_resolve_target_class(normalized_target)
                 if klass is not None and _is_managed_callback_class(klass):
                     return True
         elif is_managed_callback(entry):
@@ -316,6 +357,17 @@ class _ManagedLifecycleRegistry:
         self._active_claims: dict[str, list[ResourceOwnershipClaim]] = {}
         self._unsafe_claims: list[ResourceOwnershipClaim] = []
 
+    def _prune_dead_unsafe_callbacks_locked(self) -> None:
+        """Remove collected weak references while ``self._lock`` is already held."""
+
+        dead_ids = [
+            cb_id
+            for cb_id, ref in self._unsafe_callbacks.items()
+            if ref is not None and ref() is None
+        ]
+        for cb_id in dead_ids:
+            self._unsafe_callbacks.pop(cb_id, None)
+
     def _is_unsafe_callback(self, callback: object) -> bool:
         cb_id = id(callback)
         if cb_id not in self._unsafe_callbacks:
@@ -330,15 +382,13 @@ class _ManagedLifecycleRegistry:
         return alive is callback
 
     def _mark_unsafe_callback(self, callback: object) -> None:
+        self._prune_dead_unsafe_callbacks_locked()
         cb_id = id(callback)
-
-        def _cleanup(_ref: weakref.ref[object]) -> None:
-            with self._lock:
-                if self._unsafe_callbacks.get(cb_id) is _ref:
-                    self._unsafe_callbacks.pop(cb_id, None)
-
         try:
-            self._unsafe_callbacks[cb_id] = weakref.ref(callback, _cleanup)
+            # Bare weakref without a finalizer callback: cyclic GC may collect
+            # a callback while ``self._lock`` is held, so a finalizer acquiring
+            # this non-reentrant lock would self-deadlock.
+            self._unsafe_callbacks[cb_id] = weakref.ref(callback)
         except TypeError:
             self._unsafe_callbacks[cb_id] = None
 
@@ -347,6 +397,7 @@ class _ManagedLifecycleRegistry:
         callbacks: Sequence[object],
         claims: Sequence[ResourceOwnershipClaim],
     ) -> None:
+        self._prune_dead_unsafe_callbacks_locked()
         seen_ids: set[int] = set()
         for callback in callbacks:
             cb_id = id(callback)
@@ -526,9 +577,12 @@ def _callback_ownership_claims(
 def _is_resource_usage_target(target: str) -> bool:
     """Return whether a configured ``_target_`` names ``ResourceUsage``."""
 
-    if target in _RESOURCE_USAGE_TARGETS:
+    normalized = target.strip()
+    if normalized in _RESOURCE_USAGE_TARGETS:
         return True
-    klass = _try_resolve_target_class(target)
+    if normalized in _KNOWN_NON_MANAGED_CALLBACK_TARGETS:
+        return False
+    klass = _try_resolve_target_class(normalized)
     if klass is None:
         return False
     return any(
@@ -629,6 +683,7 @@ class _ManagedRunSession:
         self._managed_callbacks: list[Any] = []
         self._claims_by_callback: dict[int, list[ResourceOwnershipClaim]] = {}
         self._entered_scopes: list[_EnteredScope] = []
+        self._enter_attempted_callbacks: list[Any] = []
         self._registry_acquired = False
         self._closed = False
 
@@ -744,7 +799,11 @@ class _ManagedRunSession:
         configured_ordinary_specs: list[tuple[int, Any]] = []
         for index, item in enumerate(callback_specs):
             if isinstance(item, DictConfig) and "_target_" in item:
-                klass = _try_resolve_target_class(str(item["_target_"]))
+                target = str(item["_target_"]).strip()
+                if target in _KNOWN_NON_MANAGED_CALLBACK_TARGETS:
+                    configured_ordinary_specs.append((index, item))
+                    continue
+                klass = _try_resolve_target_class(target)
                 if klass is not None and _is_managed_callback_class(klass):
                     instance = instantiate(item)
                     if not is_managed_callback(instance):
@@ -762,9 +821,13 @@ class _ManagedRunSession:
 
         _validate_callbacks([callback for _, callback in configured_managed])
         managed_callbacks = [callback for _, callback in configured_managed] + runtime_managed
-        managed_routed_sinks: dict[str, str] = {}
+        # Refuse active, unsafe, duplicate, or arrive-active callbacks BEFORE
+        # routing checks so live callbacks are never mutated or misdiagnosed.
+        _MANAGED_LIFECYCLE_REGISTRY.preflight_check(managed_callbacks, ())
+        planned_managed_routes: list[tuple[object, str, str, Path]] = []
         if routed:
-            managed_routed_sinks = _route_artifact_sinks(
+            assert self._artifact_destination is not None
+            planned_managed_routes = _plan_artifact_sink_routes(
                 managed_callbacks,
                 logical_run_dir=logical_run_dir,
                 destination=self._artifact_destination,
@@ -804,8 +867,8 @@ class _ManagedRunSession:
             if ru_claim is not None:
                 all_claims.append(ru_claim)
 
-        # Acquire leases atomically BEFORE make_dirs() so even a concurrent
-        # conflict leaves zero directories or artifacts on disk.
+        # Acquire leases atomically BEFORE mutating sinks or calling make_dirs()
+        # so even a concurrent conflict leaves zero directories or mutated sinks.
         invocation_id = str(uuid4())
         _MANAGED_LIFECYCLE_REGISTRY.acquire(invocation_id, managed_callbacks, all_claims)
         self._invocation_id = invocation_id
@@ -814,6 +877,9 @@ class _ManagedRunSession:
         self._registry_acquired = True
 
         try:
+            managed_routed_sinks = (
+                _apply_artifact_sink_routes(planned_managed_routes) if routed else {}
+            )
             # 2. Create run directories and the PREPARING RunContext.
             artifact_manager.make_dirs()
             if self._bootstrap is not None:
@@ -838,6 +904,7 @@ class _ManagedRunSession:
             # 3. Bind typed context once and enter managed callback scopes.
             for callback in managed_callbacks:
                 callback.bind_typed_context(context)
+                self._enter_attempted_callbacks.append(callback)
                 cm = callback.run_scope(context)
                 if not (
                     callable(getattr(cm, "__enter__", None))
@@ -955,12 +1022,10 @@ class _ManagedRunSession:
             return context
         except BaseException as exc:
             cleanup_errors = self.close(exc)
-            for cleanup_exc in cleanup_errors:
-                logging.getLogger(_BOOTSTRAP_LOGGER_NAME).error(
-                    "FATAL: secondary cleanup error during preparation rollback: %s: %s",
-                    type(cleanup_exc).__name__,
-                    cleanup_exc,
-                )
+            _log_cleanup_errors(
+                cleanup_errors,
+                context_label="secondary cleanup error during preparation rollback",
+            )
             raise
 
     def close(self, primary_exc: BaseException | None = None) -> list[Exception]:
@@ -1033,8 +1098,34 @@ class _ManagedRunSession:
                                 )
                             )
 
+        entered_ids = {id(entry.callback) for entry in self._entered_scopes}
+        unsafe_ids = {id(entry.callback) for entry in self._entered_scopes if entry.unsafe}
+
+        # Check callbacks whose run_scope() / __enter__() was attempted without
+        # completing entry: if a failed entry left an exclusive resource active
+        # (or failed to confirm quiescence), retain it and its claims as unsafe.
+        for callback in self._enter_attempted_callbacks:
+            cb_id = id(callback)
+            if cb_id in entered_ids:
+                continue
+            is_active_fn = getattr(callback, "is_managed_scope_active", None)
+            if callable(is_active_fn):
+                try:
+                    still_active = bool(is_active_fn())
+                except Exception as exc:
+                    unsafe_ids.add(cb_id)
+                    cleanup_errors.append(exc)
+                else:
+                    if still_active:
+                        unsafe_ids.add(cb_id)
+                        cleanup_errors.append(
+                            ManagedLifecycleError(
+                                f"managed callback {type(callback).__name__} "
+                                "remained active after failed scope entry"
+                            )
+                        )
+
         if self._registry_acquired and self._invocation_id is not None:
-            unsafe_ids = {id(entry.callback) for entry in self._entered_scopes if entry.unsafe}
             clean_callbacks = [
                 cb for cb in self._managed_callbacks if id(cb) not in unsafe_ids
             ]
@@ -1055,6 +1146,21 @@ class _ManagedRunSession:
         if context is not None and context.readiness is RunContextReadiness.FINALIZING:
             context._transition_readiness(RunContextReadiness.CLOSED)
         return cleanup_errors
+
+
+def _log_cleanup_errors(
+    cleanup_errors: Sequence[BaseException], *, context_label: str
+) -> None:
+    """Emit every secondary cleanup failure on the bootstrap logger."""
+
+    bootstrap_logger = logging.getLogger(_BOOTSTRAP_LOGGER_NAME)
+    for cleanup_exc in cleanup_errors:
+        bootstrap_logger.error(
+            "FATAL: %s: %s: %s",
+            context_label,
+            type(cleanup_exc).__name__,
+            cleanup_exc,
+        )
 
 
 def _close_unmanaged_context(context: RunContext) -> list[Exception]:
@@ -1096,6 +1202,8 @@ def open_run_context(
 
     validate_hi_train_config(cfg)
     _validate_configured_callback_specs(cfg, resolved=False)
+    if artifact_destination is not None:
+        artifact_destination.require_fresh()
     normalized_topology = (
         None if topology is None else execution_topology_from_facts(topology)
     )
@@ -1117,7 +1225,16 @@ def open_run_context(
             raise
         finally:
             cleanup_errors = session.close(primary_exc)
-            if primary_exc is None and cleanup_errors:
+            if primary_exc is not None:
+                _log_cleanup_errors(
+                    cleanup_errors,
+                    context_label="secondary cleanup error during open_run_context exit",
+                )
+            elif cleanup_errors:
+                _log_cleanup_errors(
+                    cleanup_errors[1:],
+                    context_label="additional cleanup error during open_run_context exit",
+                )
                 raise cleanup_errors[0]
         return
 
@@ -1134,7 +1251,10 @@ def open_run_context(
         try:
             _validate_callbacks(runtime_list)
         except BaseException:
-            _close_unmanaged_context(context)
+            _log_cleanup_errors(
+                _close_unmanaged_context(context),
+                context_label="secondary cleanup error during open_run_context validation rollback",
+            )
             raise
         context.callbacks.extend(runtime_list)
     primary_exc = None
@@ -1145,7 +1265,16 @@ def open_run_context(
         raise
     finally:
         cleanup_errors = _close_unmanaged_context(context)
-        if primary_exc is None and cleanup_errors:
+        if primary_exc is not None:
+            _log_cleanup_errors(
+                cleanup_errors,
+                context_label="secondary cleanup error during open_run_context exit",
+            )
+        elif cleanup_errors:
+            _log_cleanup_errors(
+                cleanup_errors[1:],
+                context_label="additional cleanup error during open_run_context exit",
+            )
             raise cleanup_errors[0]
 
 
@@ -1323,6 +1452,13 @@ def prepare_run_context(
     callbacks = _instantiate_sequence(
         OmegaConf.select(resolved_cfg, "callbacks", default=[]), routed=routed
     )
+    for index, callback in enumerate(callbacks):
+        if is_managed_callback(callback):
+            raise ManagedLifecycleError(
+                f"callbacks[{index}]={type(callback).__name__} declares run_scope(); "
+                "prepare_run_context() cannot manage it — use open_run_context() or "
+                "run_from_config() instead"
+            )
     # CONFIGURED validation is unconditional and happens here, before this
     # context (or anything else below) is constructed (review-r3 R3.4,
     # restoring the original pre-S3 legacy ordering): fail-loud interface
@@ -1495,6 +1631,8 @@ def run_from_config(
             validate_native_recovery_profile(cfg)
         validate_hi_train_config(cfg)
         _validate_configured_callback_specs(cfg, resolved=False)
+        if artifact_destination is not None:
+            artifact_destination.require_fresh()
         if topology is not None:
             topology = execution_topology_from_facts(topology)
         managed = _has_managed_callbacks(cfg, runtime_callbacks, resolved=False)
@@ -1788,36 +1926,31 @@ def _run_managed_from_config(
         raise
     finally:
         cleanup_errors = session.close(primary_exc)
+        if primary_exc is not None:
+            _log_cleanup_errors(
+                cleanup_errors,
+                context_label="secondary cleanup error after primary failure",
+            )
 
     if primary_exc is not None:
-        for cleanup_exc in cleanup_errors:
-            logging.getLogger(_BOOTSTRAP_LOGGER_NAME).error(
-                "FATAL: secondary cleanup error after primary failure: %s: %s",
-                type(cleanup_exc).__name__,
-                cleanup_exc,
-            )
         if raise_exceptions:
             raise primary_exc
         return 1 if exit_code is None else exit_code
 
     if cleanup_errors:
         if app_failed:
-            for cleanup_exc in cleanup_errors:
-                logging.getLogger(_BOOTSTRAP_LOGGER_NAME).error(
-                    "FATAL: secondary cleanup error after failed run outcome: %s: %s",
-                    type(cleanup_exc).__name__,
-                    cleanup_exc,
-                )
+            _log_cleanup_errors(
+                cleanup_errors,
+                context_label="secondary cleanup error after failed run outcome",
+            )
             return 1
         # Application succeeded or yielded, but mandatory cleanup failed:
         # keep run-outcome.json untouched and report fatal cleanup failure.
         first_cleanup_exc = cleanup_errors[0]
-        for extra_exc in cleanup_errors[1:]:
-            logging.getLogger(_BOOTSTRAP_LOGGER_NAME).error(
-                "FATAL: additional cleanup error: %s: %s",
-                type(extra_exc).__name__,
-                extra_exc,
-            )
+        _log_cleanup_errors(
+            cleanup_errors[1:],
+            context_label="additional cleanup error",
+        )
         _print_fatal(
             first_cleanup_exc,
             phase="cleanup",
@@ -2040,8 +2173,93 @@ def _admit_runtime_sink(sink: object) -> None:
     )
 
 
+def _plan_artifact_sink_routes(
+    sinks: Sequence[object],
+    *,
+    logical_run_dir: Path,
+    destination: ArtifactDestination,
+) -> list[tuple[object, str, str, Path]]:
+    """Validate and plan physical sink bindings without mutating any sink.
+
+    Checks exact-type closed admission for every sink and computes each
+    non-``None`` registered output field's bound physical path via
+    ``destination.bind`` without invoking ``rebind_<field>()`` or
+    ``setattr()``.
+
+    Parameters
+    ----------
+    sinks : sequence of object
+        Callbacks or loggers to admit and plan routes for.
+    logical_run_dir : pathlib.Path
+        Admitted logical run directory baked into sink fields.
+    destination : tpen.artifacts.ArtifactDestination
+        Claimed physical destination root.
+
+    Returns
+    -------
+    list of tuple of (object, str, str, pathlib.Path)
+        Planned ``(sink, qualified_type_name, field_name, physical_path)``
+        entries ready for :func:`_apply_artifact_sink_routes`.
+
+    Raises
+    ------
+    tpen.artifacts.ArtifactRoutingError
+        When a sink's exact type is not a registered routed writer and is not
+        a known sink-free type, or when a field cannot be bound beneath
+        ``destination``.
+    """
+
+    planned: list[tuple[object, str, str, Path]] = []
+    for sink in sinks:
+        qualified = f"{type(sink).__module__}.{type(sink).__qualname__}"
+        fields = _registered_sink_fields(sink)
+        if fields is None:
+            if qualified not in _SINK_FREE_TYPES:
+                raise ArtifactRoutingError(
+                    f"{qualified} is not a registered routed writer or a known "
+                    "sink-free type; refusing to admit it to a routed run before "
+                    "it can write outside the claimed physical destination"
+                )
+            continue
+        for field in fields:
+            current = getattr(sink, field, None)
+            if current is None:
+                continue
+            physical = destination.bind(logical_run_dir, Path(current))
+            planned.append((sink, qualified, field, physical))
+    return planned
+
+
+def _apply_artifact_sink_routes(
+    planned: Sequence[tuple[object, str, str, Path]],
+) -> dict[str, str]:
+    """Apply planned physical sink bindings via ``rebind_<field>`` or ``setattr``.
+
+    Parameters
+    ----------
+    planned : sequence of tuple of (object, str, str, pathlib.Path)
+        Planned bindings produced by :func:`_plan_artifact_sink_routes`.
+
+    Returns
+    -------
+    dict of str to str
+        ``"<qualified type name>.<field>"`` to the physical path it was
+        rebound to.
+    """
+
+    routed: dict[str, str] = {}
+    for sink, qualified, field, physical in planned:
+        rebind = getattr(sink, f"rebind_{field}", None)
+        if callable(rebind):
+            rebind(physical)
+        else:
+            setattr(sink, field, physical)
+        routed[f"{qualified}.{field}"] = str(physical)
+    return routed
+
+
 def _route_artifact_sinks(
-    sinks: list[object],
+    sinks: Sequence[object],
     *,
     logical_run_dir: Path,
     destination: ArtifactDestination,
@@ -2085,30 +2303,12 @@ def _route_artifact_sinks(
         not a known sink-free type.
     """
 
-    routed: dict[str, str] = {}
-    for sink in sinks:
-        qualified = f"{type(sink).__module__}.{type(sink).__qualname__}"
-        fields = _registered_sink_fields(sink)
-        if fields is None:
-            if qualified not in _SINK_FREE_TYPES:
-                raise ArtifactRoutingError(
-                    f"{qualified} is not a registered routed writer or a known "
-                    "sink-free type; refusing to admit it to a routed run before "
-                    "it can write outside the claimed physical destination"
-                )
-            continue
-        for field in fields:
-            current = getattr(sink, field, None)
-            if current is None:
-                continue
-            physical = destination.bind(logical_run_dir, Path(current))
-            rebind = getattr(sink, f"rebind_{field}", None)
-            if callable(rebind):
-                rebind(physical)
-            else:
-                setattr(sink, field, physical)
-            routed[f"{qualified}.{field}"] = str(physical)
-    return routed
+    planned = _plan_artifact_sink_routes(
+        sinks,
+        logical_run_dir=logical_run_dir,
+        destination=destination,
+    )
+    return _apply_artifact_sink_routes(planned)
 
 
 def _instantiate_sequence(items: ListConfig | list | tuple | None, *, routed: bool = False) -> list:
