@@ -13,6 +13,7 @@ import time
 from typing import Any
 
 import pytest
+from typeguard import TypeCheckError, suppress_type_checks
 
 from tpen.accelerator import (
     AcceleratorIdentity,
@@ -84,12 +85,22 @@ def test_constructor_is_pure_and_enforces_hard_ten_second_timeout_cap() -> None:
     for bad_exe in ("", "   ", "nvidia-smi\n--help", "nvidia\x00smi"):
         with pytest.raises(ValueError, match="executable"):
             NvidiaSmiDeviceProbe(identity=identity, executable=bad_exe)
-    with pytest.raises(TypeError, match="executable"):
+    # Under Typeguard instrumentation (--typecheck on), function-entry checks
+    # raise TypeCheckError before entering __init__; suppress_type_checks()
+    # below verifies __init__'s own runtime TypeError guards as well.
+    with pytest.raises((TypeError, TypeCheckError), match="executable"):
         NvidiaSmiDeviceProbe(identity=identity, executable=123)  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="identity"):
+    with pytest.raises((TypeError, TypeCheckError), match="identity"):
         NvidiaSmiDeviceProbe(identity="cuda:0")  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="env"):
+    with pytest.raises((TypeError, TypeCheckError), match="env"):
         NvidiaSmiDeviceProbe(identity=identity, env={"KEY": 1})  # type: ignore[dict-item]
+    with suppress_type_checks():
+        with pytest.raises(TypeError, match="executable"):
+            NvidiaSmiDeviceProbe(identity=identity, executable=123)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="identity"):
+            NvidiaSmiDeviceProbe(identity="cuda:0")  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="env"):
+            NvidiaSmiDeviceProbe(identity=identity, env={"KEY": 1})  # type: ignore[dict-item]
 
 
 def test_canonicalize_nvidia_device_uuid_normalizes_and_blocks_mig_or_injection() -> None:
