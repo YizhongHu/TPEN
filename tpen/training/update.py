@@ -1549,6 +1549,23 @@ class VMCUpdateMethod(Generic[InputT], ABC):
         if state:
             raise ValueError("stateless VMCUpdateMethod cannot load non-empty method state")
 
+    def method_tensor_state_dict(self) -> Mapping[str, Any] | None:
+        """Return optional binary tensor state persisted to ``method_state.pt``.
+
+        Returns ``None`` by default so methods without large curvature tensors
+        omit ``method_state.pt`` and keep existing checkpoints unchanged.
+        """
+
+        return None
+
+    def load_method_tensor_state_dict(self, state: Mapping[str, Any] | None) -> None:
+        """Restore optional binary tensor state from ``method_state.pt``."""
+
+        if state is not None:
+            raise ValueError(
+                f"{type(self).__name__} does not accept binary method tensor state"
+            )
+
     def forward_request(self) -> Any | None:
         """Return the typed forward request this method's input requires.
 

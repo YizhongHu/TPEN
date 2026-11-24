@@ -1,5 +1,18 @@
 """Training-loop namespace."""
 
+from tpen.training.kfac import (
+    KFAC_CONVENTION_VERSION,
+    KFAC_DAMPING_TRACE_FLOOR,
+    KFAC_GRID_FACTOR_KEYS,
+    KFAC_KL_DENOM_FLOOR,
+    KFAC_STATE_VERSION,
+    KFACGridHyperparameters,
+    KFACPolicy,
+    KFACTelemetry,
+    NativeKFACUpdate,
+    build_kfac_update_from_factors,
+    kfac_policy_from_factors,
+)
 from tpen.training.optim import make_optimizer
 from tpen.training.soap import SOAP
 from tpen.training.qgt import (
@@ -44,6 +57,9 @@ from tpen.training.step_requests import (
     ParameterScoreStepProducer,
     ParameterScoreStepRequest,
     ProducedVMCStep,
+    StructuredCurvatureStepProducer,
+    StructuredCurvatureStepRequest,
+    StructuredCurvatureUpdateInput,
     VMCStepProducer,
     VMCStepRequest,
     evaluate_hamiltonian_tangent_step,
@@ -92,6 +108,17 @@ __all__ = [
     "SCORE_CONVENTION_VERSION",
     "SOAP",
     "SR_STATE_VERSION",
+    "KFAC_CONVENTION_VERSION",
+    "KFAC_DAMPING_TRACE_FLOOR",
+    "KFAC_GRID_FACTOR_KEYS",
+    "KFAC_KL_DENOM_FLOOR",
+    "KFAC_STATE_VERSION",
+    "KFACGridHyperparameters",
+    "KFACPolicy",
+    "KFACTelemetry",
+    "NativeKFACUpdate",
+    "build_kfac_update_from_factors",
+    "kfac_policy_from_factors",
     "DampingPolicy",
     "QGTOperator",
     "SRPolicy",
@@ -122,6 +149,9 @@ __all__ = [
     "ParameterScoreStepProducer",
     "ParameterScoreStepRequest",
     "ProducedVMCStep",
+    "StructuredCurvatureStepProducer",
+    "StructuredCurvatureStepRequest",
+    "StructuredCurvatureUpdateInput",
     "VMCStepProducer",
     "VMCStepRequest",
     "evaluate_hamiltonian_tangent_step",

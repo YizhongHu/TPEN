@@ -17,6 +17,14 @@ from tpen.data.batch import (
     ParameterScoreForwardPacket,
     WavefunctionPacket,
 )
+from tpen.dependencies import require_torch
+from tpen.nn.structured_curvature import (
+    DenseFactorBlock,
+    KroneckerFactorBlock,
+    StructuredCurvatureForwardPacket,
+)
+
+torch = require_torch(feature="wavefunction forward requests")
 
 
 PacketT = TypeVar("PacketT", bound=WavefunctionPacket)
@@ -85,6 +93,88 @@ class MaterializedParameterScoreRequest(ParameterScoreRequest):
         return provider.evaluate_materialized_parameter_score_request(request=self, batch=batch)
 
 
+@dataclass(frozen=True, kw_only=True)
+class StructuredCurvatureForwardRequest(
+    WavefunctionForwardRequest[StructuredCurvatureForwardPacket]
+):
+    """Request physics-free structured KFAC curvature factors and half-gradient.
+
+    Parameters
+    ----------
+    sample_weights : torch.Tensor
+        Detached 1D per-sample weights of shape ``(batch.batch_size,)`` used to
+        compute the exact weighted energy half-gradient in one retained-graph
+        backward pass.
+    solve_dtype : torch.dtype, optional
+        Real floating dtype (``torch.float32`` or ``torch.float64``) for
+        captured curvature factors and energy half-gradient blocks.
+    max_dense_block_numel : int, optional
+        Maximum allowed scalar element count for any :class:`DenseFactorBlock`.
+    """
+
+    sample_weights: torch.Tensor
+    solve_dtype: torch.dtype = torch.float64
+    max_dense_block_numel: int = 2048
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sample_weights, torch.Tensor):
+            raise TypeError(
+                "StructuredCurvatureForwardRequest.sample_weights must be a torch.Tensor"
+            )
+        if self.sample_weights.requires_grad:
+            raise ValueError(
+                "StructuredCurvatureForwardRequest.sample_weights must be detached"
+            )
+        if not self.sample_weights.is_floating_point() or self.sample_weights.is_complex():
+            raise TypeError(
+                "StructuredCurvatureForwardRequest.sample_weights must have a real floating dtype"
+            )
+        if self.sample_weights.ndim != 1:
+            raise ValueError(
+                "StructuredCurvatureForwardRequest.sample_weights must be 1D, "
+                f"got shape {tuple(self.sample_weights.shape)}"
+            )
+        if not isinstance(self.solve_dtype, torch.dtype) or self.solve_dtype not in (
+            torch.float32,
+            torch.float64,
+        ):
+            raise ValueError(
+                "StructuredCurvatureForwardRequest.solve_dtype must be torch.float32 or torch.float64"
+            )
+        if (
+            isinstance(self.max_dense_block_numel, bool)
+            or not isinstance(self.max_dense_block_numel, int)
+            or self.max_dense_block_numel < 1
+        ):
+            raise ValueError(
+                "StructuredCurvatureForwardRequest.max_dense_block_numel must be a positive integer"
+            )
+
+    def evaluate(
+        self,
+        provider: "StructuredCurvatureProvider",
+        batch: ElectronBatch,
+    ) -> StructuredCurvatureForwardPacket:
+        """Delegate to the provider's structured-curvature implementation."""
+
+        return provider.evaluate_structured_curvature_request(request=self, batch=batch)
+
+
+@runtime_checkable
+class StructuredCurvatureProvider(Protocol):
+    """Typed provider targeted by :class:`StructuredCurvatureForwardRequest`."""
+
+    def evaluate_structured_curvature_request(
+        self,
+        *,
+        request: StructuredCurvatureForwardRequest,
+        batch: ElectronBatch,
+    ) -> StructuredCurvatureForwardPacket:
+        """Evaluate a structured-curvature forward request."""
+
+        ...
+
+
 @runtime_checkable
 class CoordinateGradientProvider(Protocol):
     """Typed provider targeted by :class:`CoordinateGradientRequest`."""
@@ -123,9 +213,14 @@ class WavefunctionRequestProvider(CoordinateGradientProvider, ParameterScoreProv
 __all__ = [
     "CoordinateGradientRequest",
     "CoordinateGradientProvider",
+    "DenseFactorBlock",
+    "KroneckerFactorBlock",
     "MaterializedParameterScoreRequest",
     "ParameterScoreRequest",
     "ParameterScoreProvider",
+    "StructuredCurvatureForwardPacket",
+    "StructuredCurvatureForwardRequest",
+    "StructuredCurvatureProvider",
     "WavefunctionForwardRequest",
     "WavefunctionRequestProvider",
 ]

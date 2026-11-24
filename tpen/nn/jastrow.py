@@ -20,6 +20,7 @@ from tpen.data.batch import ElectronBatch
 from tpen.dependencies import require_torch, require_torch_nn
 from tpen.nn.basis import bounded_distance
 from tpen.nn.factor import LogAmplitudeFactor
+from tpen.nn.structured_curvature import active_structured_curvature_session
 
 torch = require_torch(feature="TPEN Jastrow modules")
 nn = require_torch_nn(feature="TPEN Jastrow modules")
@@ -207,6 +208,24 @@ class BoundedTwoCoefficientJastrow(LogAmplitudeFactor):
         # rather than failing.
         upper = torch.triu(torch.ones_like(contribution, dtype=torch.bool), diagonal=1)
         output = contribution.masked_fill(~upper, 0.0).sum(dim=(-2, -1))
+        session = active_structured_curvature_session()
+        if session is not None and self.trainable:
+            params: list[nn.Parameter] = []
+            cols: list[torch.Tensor] = []
+            if self.theta_s.requires_grad:
+                params.append(self.theta_s)
+                term_s = (q_pair * 0.5 * (q_i + q_j)).masked_fill(~upper, 0.0).sum(dim=(-2, -1))
+                cols.append(term_s.detach().to(dtype=session.solve_dtype))
+            if self.theta_t.requires_grad:
+                params.append(self.theta_t)
+                term_t = (q_pair * (q_i - q_j).square()).masked_fill(~upper, 0.0).sum(dim=(-2, -1))
+                cols.append(term_t.detach().to(dtype=session.solve_dtype))
+            if params:
+                session.record_local_dense_scores(
+                    parameters=params,
+                    scores=torch.stack(cols, dim=1),
+                    label="BoundedTwoCoefficientJastrow",
+                )
         assert output.shape == (batch.batch_size,)
         return output
 
