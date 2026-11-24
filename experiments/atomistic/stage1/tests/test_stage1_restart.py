@@ -302,6 +302,7 @@ def _real_restart_row(tmp_path: Path, *, run_id: str) -> dict[str, object]:
 def _assert_checkpoint_payload_equal(left: Path, right: Path) -> None:
     """Compare serialized tensor/state payloads, not archive container bytes."""
 
+    import numpy as np
     import torch
 
     left_payload = torch.load(left, map_location="cpu", weights_only=False)
@@ -311,6 +312,9 @@ def _assert_checkpoint_payload_equal(left: Path, right: Path) -> None:
         if torch.is_tensor(actual) or torch.is_tensor(expected):
             assert torch.is_tensor(actual) and torch.is_tensor(expected), path
             assert torch.equal(actual, expected), path
+        elif isinstance(actual, np.ndarray) or isinstance(expected, np.ndarray):
+            assert isinstance(actual, np.ndarray) and isinstance(expected, np.ndarray), path
+            assert np.array_equal(actual, expected), path
         elif dataclasses.is_dataclass(actual) or dataclasses.is_dataclass(expected):
             assert dataclasses.is_dataclass(actual) and dataclasses.is_dataclass(expected), path
             assert type(actual) is type(expected), path
