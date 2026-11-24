@@ -351,15 +351,21 @@ def _real_hooke_restart_row(tmp_path: Path, *, run_id: str) -> dict[str, object]
 
 
 @pytest.mark.parametrize(
-    ("label", "system", "config_name", "overlay"),
+    ("label", "system", "config_name", "overlay", "expected_overlay_fragment"),
     (
-        ("protocol-default", "he", "he", overlay_path_for_system("he")),
-        ("diagnostics-v1", "he", "he", str(OVERLAY)),
-        ("hooke-diagnostics-v1", "hooke1", "hooke1", str(HOOKE_OVERLAY)),
+        ("protocol-default", "he", "he", overlay_path_for_system("he"), "diagnostics-v1"),
+        ("diagnostics-v1", "he", "he", str(OVERLAY), "diagnostics-v1"),
+        ("hooke-diagnostics-v1", "hooke1", "hooke1", str(HOOKE_OVERLAY), "hooke-diagnostics-v1"),
     ),
 )
 def test_real_recorder_compositions_refuse_before_runner_call(
-    tmp_path: Path, monkeypatch, label: str, system: str, config_name: str, overlay: str,
+    tmp_path: Path,
+    monkeypatch,
+    label: str,
+    system: str,
+    config_name: str,
+    overlay: str,
+    expected_overlay_fragment: str,
 ) -> None:
     """Every committed recorder-enabled train composition is refused loudly."""
 
@@ -384,7 +390,7 @@ def test_real_recorder_compositions_refuse_before_runner_call(
 
     with pytest.raises(
         restart.RestartRefusal,
-        match=rf"7eaf9e0c.*{label.split('-', 1)[-1]}",
+        match=rf"7eaf9e0c.*{expected_overlay_fragment}",
     ):
         restart.execute_restart(
             cfg=cfg,

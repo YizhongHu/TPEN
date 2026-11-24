@@ -4,7 +4,7 @@
       "id": "parity-helper-drops-checkpoint-payload-r4",
       "target": "experiments/atomistic/stage1/tests/test_stage1_restart.py",
       "old": "        name: _assert_checkpoint_payload_equal(resumed_checkpoint / name, reference_checkpoint / name)",
-      "new": "        name: frozenset(),  # mutant: drop checkpoint payload comparison",
+      "new": "        name: frozenset()  # mutant: drop checkpoint payload comparison",
       "killer": "experiments/atomistic/stage1/tests/test_stage1_restart.py::test_real_fresh_process_restore_parity_with_checkpoint_zero_and_overlay"
     },
     {
