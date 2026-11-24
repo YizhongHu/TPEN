@@ -72,7 +72,7 @@ from tpen.data.batch import (
     WavefunctionOutput,
 )
 from tpen.logging import CSV, JSONL, LogRecord
-from tpen.physics.hamiltonian import LocalEnergyResult
+from tpen.physics.hamiltonian import LocalEnergyResult, local_energy
 from tpen.physics.kinetic import KineticEnergy
 from tpen.physics.potential import HarmonicTrap
 from tpen.training.linear_method import (
@@ -1876,9 +1876,127 @@ def test_hi_authority_grid_all_16_cells_and_invalid_mappings() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 12. Real tiny TPENWaveFunction smoke (PR #854 NB2) + TrainResume parity
-#     + lm-state-1 strict drift refusals
+# 12. Real tiny TPENWaveFunction central finite-difference tangent parity,
+#     smoke (PR #854 NB2) + TrainResume parity + lm-state-1 drift refusals
 # ---------------------------------------------------------------------------
+
+
+def test_real_tiny_tpen_hamiltonian_tangent_central_finite_difference_parity() -> None:
+    """Real TPEN second-order autograd (O, g^E) matches central FD across all parameter groups."""
+
+    cfg = _tiny_tpen_config()
+    cfg.sampler.n_walkers = 4
+    cfg.model.readout.trainable = True
+    cfg.model.envelope.envelopes[0].trainable = True
+
+    model, sampler, terms = _instantiate_tiny_tpen(cfg, seed=19)
+    pair_parameters_by_name(model)
+    walkers, _ = sampler.collect_samples(model)
+    batch = walkers.make_batch()
+
+    update_input, term_map = evaluate_hamiltonian_tangent_step(
+        model=model,
+        hamiltonian_terms=terms,
+        batch=batch,
+        chunk_size=2,
+        return_terms=True,
+    )
+    assert term_map is not None
+    assert "kinetic" in term_map
+
+    named_slots = {
+        name: (slot_idx, parameter)
+        for slot_idx, (name, parameter) in enumerate(model.named_parameters())
+    }
+    # Deterministic subset covering all five live parameter groups plus one
+    # structurally disconnected order-1 parameter.
+    live_targets: tuple[tuple[str, str, int], ...] = (
+        ("embedding", "embedding.order_mlps.1.layers.0.weight", 0),
+        ("embedding", "embedding.order_mlps.2.layers.2.weight", 0),
+        ("mixing", "stack.layers.0.mixing.weights.g15", 0),
+        ("mixing", "stack.layers.0.mixing.weights.g20", 3),
+        ("path_aggregation", "stack.layers.0.path_aggregation.weights.o2", 0),
+        ("readout", "readout.channel_weights", 0),
+        ("envelope", "envelope.envelopes.0.raw_coefficient", 0),
+    )
+    inactive_target = ("stack.layers.0.mixing.weights.g0", 0)
+    assert inactive_target[0] in INACTIVE_PAIR_PARAMETERS
+
+    eps = 1.0e-6
+
+    checked_groups: set[str] = set()
+    for group_name, param_name, flat_idx in live_targets:
+        assert param_name in named_slots, f"missing expected live parameter {param_name!r}"
+        assert param_name not in INACTIVE_PAIR_PARAMETERS
+        slot_idx, parameter = named_slots[param_name]
+        ag_o = update_input.parameter_scores.blocks[slot_idx].reshape(batch.batch_size, -1)[
+            :, flat_idx
+        ]
+        ag_ge = update_input.local_energy_derivatives.blocks[slot_idx].reshape(
+            batch.batch_size, -1
+        )[:, flat_idx]
+        assert torch.isfinite(ag_o).all()
+        assert torch.isfinite(ag_ge).all()
+
+        flat_view = parameter.data.reshape(-1)
+        orig = float(flat_view[flat_idx].item())
+        try:
+            flat_view[flat_idx] = orig + eps
+            res_plus = local_energy(terms, model, batch, return_terms=True)
+            assert res_plus.wavefunction_output is not None
+            logabs_plus = res_plus.wavefunction_output.logabs.detach()
+            eloc_plus = res_plus.total.detach()
+
+            flat_view[flat_idx] = orig - eps
+            res_minus = local_energy(terms, model, batch, return_terms=True)
+            assert res_minus.wavefunction_output is not None
+            logabs_minus = res_minus.wavefunction_output.logabs.detach()
+            eloc_minus = res_minus.total.detach()
+        finally:
+            flat_view[flat_idx] = orig
+
+        fd_o = (logabs_plus - logabs_minus) / (2.0 * eps)
+        fd_ge = (eloc_plus - eloc_minus) / (2.0 * eps)
+
+        assert float(fd_o.abs().max().item()) > 1.0e-6, f"vacuous score FD for {param_name}"
+        assert float(fd_ge.abs().max().item()) > 1.0e-6, f"vacuous E_L FD for {param_name}"
+        torch.testing.assert_close(ag_o, fd_o, atol=1.0e-6, rtol=1.0e-5)
+        torch.testing.assert_close(ag_ge, fd_ge, atol=1.0e-6, rtol=1.0e-5)
+        checked_groups.add(group_name)
+
+    assert checked_groups == {"embedding", "mixing", "path_aggregation", "readout", "envelope"}
+
+    # Disconnected order-1 parameter must have exact zero autograd and FD tangents.
+    inactive_name, inactive_idx = inactive_target
+    slot_idx, inactive_param = named_slots[inactive_name]
+    ag_o_zero = update_input.parameter_scores.blocks[slot_idx].reshape(batch.batch_size, -1)[
+        :, inactive_idx
+    ]
+    ag_ge_zero = update_input.local_energy_derivatives.blocks[slot_idx].reshape(
+        batch.batch_size, -1
+    )[:, inactive_idx]
+    assert torch.equal(ag_o_zero, torch.zeros_like(ag_o_zero))
+    assert torch.equal(ag_ge_zero, torch.zeros_like(ag_ge_zero))
+
+    flat_view = inactive_param.data.reshape(-1)
+    orig = float(flat_view[inactive_idx].item())
+    try:
+        flat_view[inactive_idx] = orig + eps
+        res_plus = local_energy(terms, model, batch, return_terms=True)
+        assert res_plus.wavefunction_output is not None
+        logabs_plus = res_plus.wavefunction_output.logabs.detach()
+        eloc_plus = res_plus.total.detach()
+
+        flat_view[inactive_idx] = orig - eps
+        res_minus = local_energy(terms, model, batch, return_terms=True)
+        assert res_minus.wavefunction_output is not None
+        logabs_minus = res_minus.wavefunction_output.logabs.detach()
+        eloc_minus = res_minus.total.detach()
+    finally:
+        flat_view[inactive_idx] = orig
+
+    assert torch.equal(logabs_plus, logabs_minus)
+    assert torch.equal(eloc_plus, eloc_minus)
 
 
 def test_real_tiny_tpen_smoke_chunk_parity_disconnected_zero_and_train_resume(
@@ -1887,14 +2005,19 @@ def test_real_tiny_tpen_smoke_chunk_parity_disconnected_zero_and_train_resume(
     """Tiny 2e TPEN (C=2, H=4, P=366) runs end-to-end with chunk parity and TrainResume parity."""
 
     cfg = _tiny_tpen_config()
+    # At random tiny-TPEN initialization with N=12 walkers << P=366 parameters,
+    # ||dH11||_F ~ 60 and w_max ~ 139, so c_diag=100.0 stabilizes
+    # Sym(dH11) + c_diag * I > 0 into the guaranteed-descent regime while still
+    # exercising the N < P (r <= 11) nullspace projection and staying distinct
+    # from the lm-state-1 policy-drift probe (0.1) below.
     policy_chunked = LinearMethodPolicy(
-        derivative_block_shift=1.0,
+        derivative_block_shift=100.0,
         overlap_shift=0.0,
         overlap_metric_trust_radius=0.1,
         tangent_chunk_size=4,
     )
     policy_full = LinearMethodPolicy(
-        derivative_block_shift=1.0,
+        derivative_block_shift=100.0,
         overlap_shift=0.0,
         overlap_metric_trust_radius=0.1,
         tangent_chunk_size=None,
