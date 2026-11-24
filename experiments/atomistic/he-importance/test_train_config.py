@@ -215,17 +215,17 @@ def _load_prechange_resolver() -> types.ModuleType:
 
 
 def _canonical_resolved_config(
-    config: object, *, path_replacement: tuple[str, str] | None = None
+    config: object, *, replacements: tuple[tuple[str, str], ...] = ()
 ) -> str:
-    """Serialize one resolved config with stable keys and optional path normalization."""
+    """Serialize one resolved config with stable keys and optional value normalization."""
 
     serialized = json.dumps(
         OmegaConf.to_container(config, resolve=True),
         sort_keys=True,
         separators=(",", ":"),
     )
-    if path_replacement is not None:
-        serialized = serialized.replace(*path_replacement)
+    for old, new in replacements:
+        serialized = serialized.replace(old, new)
     return serialized
 
 
@@ -274,7 +274,10 @@ def _assert_matches_prechange(
             observed = resolver(cell)
             assert _canonical_resolved_config(observed) == _canonical_resolved_config(
                 expected,
-                path_replacement=(str(legacy_cell.output_path), str(cell.output_path)),
+                replacements=(
+                    (str(legacy_cell.content_hash), str(cell.content_hash)),
+                    (str(legacy_cell.output_path), str(cell.output_path)),
+                ),
             )
 
 
