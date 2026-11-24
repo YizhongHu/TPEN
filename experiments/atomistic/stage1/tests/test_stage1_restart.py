@@ -174,6 +174,33 @@ def test_fresh_train_stop_uses_runtime_planned_yield_without_changing_cfg(
     assert resolved["trainer"]["max_steps"] == 100_000
 
 
+def test_fresh_recorder_overlay_reaches_runner_before_continuation_guard(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A fresh recorder-enabled row is not mistaken for a continuation."""
+
+    row = _real_restart_row(tmp_path / "fresh", run_id="fresh-recorder")
+    config_path = CONFIG_ROOT / "he" / "train.yaml"
+    cfg = build_train_config(
+        row,
+        config_path=config_path,
+        overrides=row_overrides(row),
+        overlay=str(OVERLAY),
+        overlay_sha256=overlay_sha256(OVERLAY),
+    )
+    calls: list[object] = []
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+
+    def fake_run(*_args: object, **_kwargs: object) -> int:
+        calls.append(True)
+        return 0
+
+    assert restart.execute_train(
+        cfg=cfg, row=row, config_path=config_path, run=fake_run,
+    ) == 0
+    assert calls == [True]
+
+
 def test_reached_prefix_stop_refuses_before_runner_call(tmp_path: Path) -> None:
     """A published prefix cannot be asked to stop at its already-reached boundary."""
 
@@ -194,6 +221,35 @@ def test_reached_prefix_stop_refuses_before_runner_call(tmp_path: Path) -> None:
             inspector=lambda _path: evidence,
             run=lambda *_a, **_k: pytest.fail("stale prefix launched"),
         )
+
+
+def test_existing_recorder_overlay_refuses_before_inspection_or_runner(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A recorder-enabled continuation remains blocked at the Stage-1 boundary."""
+
+    row = _real_restart_row(tmp_path / "continuation", run_id="recorder-continuation")
+    config_path = CONFIG_ROOT / "he" / "train.yaml"
+    cfg = build_train_config(
+        row,
+        config_path=config_path,
+        overrides=row_overrides(row),
+        overlay=str(OVERLAY),
+        overlay_sha256=overlay_sha256(OVERLAY),
+    )
+    resolve_run_dir(row).mkdir(parents=True)
+    calls: list[object] = []
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+
+    with pytest.raises(restart.RestartRefusal, match="7eaf9e0c.*diagnostics-v1"):
+        restart.execute_train(
+            cfg=cfg,
+            row=row,
+            config_path=config_path,
+            inspector=lambda _path: pytest.fail("recorder refusal must precede inspection"),
+            run=lambda *_a, **_k: calls.append(True) or 0,
+        )
+    assert calls == []
 
 
 def test_recorder_configured_refuses_before_runner_call(tmp_path: Path, monkeypatch) -> None:

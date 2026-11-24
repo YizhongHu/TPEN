@@ -407,9 +407,9 @@ def execute_train(
 
     validate_resolved_train_config(cfg, row)
     target = _target_iterations(cfg, row)
-    _refuse_unsupported_resume_callbacks(cfg, row.get("overlay"))
     admitted = _admitted_run_dir(cfg, row, None)
     if admitted.exists():
+        _refuse_unsupported_resume_callbacks(cfg, row.get("overlay"))
         return execute_restart(
             cfg=cfg, row=row, config_path=config_path, command=command,
             run=run, inspector=inspector,

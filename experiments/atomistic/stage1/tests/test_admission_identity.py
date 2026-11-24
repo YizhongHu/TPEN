@@ -275,6 +275,7 @@ def test_v3_rows_keep_identity_and_compose_after_v4_planner_addition() -> None:
         systems=("he",),
         phase=1,
         include_smoke=False,
+        auto_overlay=True,
     )
     assert v4_train == legacy_train
 
