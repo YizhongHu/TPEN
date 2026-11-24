@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shlex
+import signal
 import stat
 import subprocess
 import sys
@@ -597,3 +598,179 @@ def test_nvidia_smi_and_accelerator_imports_are_torch_and_psutil_free() -> None:
         check=False,
     )
     assert proc.returncode == 0, proc.stderr or proc.stdout
+
+
+@pytest.mark.parametrize("mode", ["sigterm_ignoring_child", "early_exit_background_child"])
+def test_o6_review_t1_terminate_process_group_kills_descendants(
+    tmp_path: Path, mode: str
+) -> None:
+    """T1 (F1): timeout cleanup must kill process-group descendants even if parent exits or child ignores SIGTERM."""
+
+    pid_file = tmp_path / f"descendant_{mode}.pid"
+    tmp_pid_file = tmp_path / f"descendant_{mode}.pid.tmp"
+    impl = tmp_path / f"descendant_{mode}.impl.py"
+    wrapper = tmp_path / f"wrapper_{mode}.sh"
+
+    if mode == "sigterm_ignoring_child":
+        impl.write_text(
+            (
+                "import os, signal, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                f"with open({str(tmp_pid_file)!r}, 'w', encoding='utf-8') as f:\n"
+                "    f.write(str(os.getpid()))\n"
+                "    f.flush()\n"
+                "    os.fsync(f.fileno())\n"
+                f"os.replace({str(tmp_pid_file)!r}, {str(pid_file)!r})\n"
+                "time.sleep(30.0)\n"
+            ),
+            encoding="utf-8",
+        )
+        # Do NOT use exec; keep a trailing command so /bin/sh cannot optimize
+        # the child invocation into an implicit exec.
+        wrapper.write_text(
+            (
+                "#!/bin/sh\n"
+                f"{shlex.quote(sys.executable)} -S {shlex.quote(str(impl))} \"$@\"\n"
+                "status=$?\n"
+                "exit $status\n"
+            ),
+            encoding="utf-8",
+        )
+    else:
+        impl.write_text(
+            (
+                "import os, time\n"
+                f"with open({str(tmp_pid_file)!r}, 'w', encoding='utf-8') as f:\n"
+                "    f.write(str(os.getpid()))\n"
+                "    f.flush()\n"
+                "    os.fsync(f.fileno())\n"
+                f"os.replace({str(tmp_pid_file)!r}, {str(pid_file)!r})\n"
+                "time.sleep(30.0)\n"
+            ),
+            encoding="utf-8",
+        )
+        # Background child inherits stdout pipe while shell leader exits 0 immediately.
+        wrapper.write_text(
+            (
+                "#!/bin/sh\n"
+                f"{shlex.quote(sys.executable)} -S {shlex.quote(str(impl))} \"$@\" &\n"
+                "exit 0\n"
+            ),
+            encoding="utf-8",
+        )
+    wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR)
+
+    descendant_pid: int | None = None
+    try:
+        reading = NvidiaSmiDeviceProbe(
+            identity=AcceleratorIdentity(AcceleratorKind.CUDA, 0, _RAW_UUID),
+            executable=wrapper,
+            timeout_seconds=0.45,
+        ).read()
+        assert reading.status == "error"
+        assert reading.reason_code == "read_timeout"
+        assert pid_file.exists(), f"descendant did not write {pid_file} before timeout"
+        descendant_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        with pytest.raises(ProcessLookupError):
+            os.kill(descendant_pid, 0)
+    finally:
+        if descendant_pid is None and pid_file.exists():
+            raw = pid_file.read_text(encoding="utf-8").strip()
+            if raw.isdigit():
+                descendant_pid = int(raw)
+        if descendant_pid is not None:
+            try:
+                os.kill(descendant_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_o6_review_t3_parse_mib_overflow_fails_closed_without_crashing() -> None:
+    """T3 (F3): MiB values that overflow to inf on byte scaling must fail closed without OverflowError."""
+
+    used_overflow_csv = f"{_CANONICAL_UUID}, 2026/11/24 12:45:00.000, 1e308, 40960, 25, Disabled\n"
+    reading = parse_nvidia_smi_query_output(
+        used_overflow_csv,
+        expected_uuid=_CANONICAL_UUID,
+    )
+    assert reading.status == "partial"
+    assert reading.reason_code == "malformed_output"
+    assert isinstance(reading.framebuffer_used_bytes, NvidiaDeviceUnavailable)
+    assert reading.framebuffer_used_bytes.status == "error"
+    assert reading.framebuffer_used_bytes.reason_code == "malformed_output"
+    assert reading.framebuffer_total_bytes == 40960 * 1024 * 1024
+    assert reading.busy_fraction == pytest.approx(0.25)
+
+    probe = NvidiaSmiDeviceProbe(
+        identity=AcceleratorIdentity(AcceleratorKind.CUDA, 0, _RAW_UUID),
+        command_runner=lambda argv, **kwargs: NvidiaDeviceCommandResult(
+            returncode=0,
+            stdout=used_overflow_csv,
+        ),
+    )
+    probe_reading = probe.read()
+    assert probe_reading.status == "partial"
+    assert probe_reading.reason_code == "malformed_output"
+    assert isinstance(probe_reading.framebuffer_used_bytes, NvidiaDeviceUnavailable)
+    assert probe_reading.framebuffer_used_bytes.status == "error"
+    assert probe_reading.framebuffer_used_bytes.reason_code == "malformed_output"
+    assert probe_reading.framebuffer_total_bytes == 40960 * 1024 * 1024
+    assert probe_reading.busy_fraction == pytest.approx(0.25)
+
+    total_overflow_csv = f"{_CANONICAL_UUID}, 2026/11/24 12:45:01.000, 1024, 1e308, 25, Disabled\n"
+    total_reading = parse_nvidia_smi_query_output(
+        total_overflow_csv,
+        expected_uuid=_CANONICAL_UUID,
+    )
+    assert total_reading.status == "partial"
+    assert total_reading.reason_code == "malformed_output"
+    assert total_reading.framebuffer_used_bytes == 1024 * 1024 * 1024
+    assert isinstance(total_reading.framebuffer_total_bytes, NvidiaDeviceUnavailable)
+    assert total_reading.framebuffer_total_bytes.status == "error"
+    assert total_reading.framebuffer_total_bytes.reason_code == "malformed_output"
+    assert total_reading.busy_fraction == pytest.approx(0.25)
+
+
+def test_o6_review_t4_parse_rejects_used_exceeding_total_memory() -> None:
+    """T4 (F4): memory.used > memory.total must fail closed as malformed_output; equality remains ok."""
+
+    impossible = parse_nvidia_smi_query_output(
+        f"{_CANONICAL_UUID}, 2026/11/24 12:46:00.000, 81920, 40960, 25, Disabled\n",
+        expected_uuid=_CANONICAL_UUID,
+    )
+    assert impossible.status == "partial"
+    assert impossible.reason_code == "malformed_output"
+    assert isinstance(impossible.framebuffer_used_bytes, NvidiaDeviceUnavailable)
+    assert impossible.framebuffer_used_bytes.status == "error"
+    assert impossible.framebuffer_used_bytes.reason_code == "malformed_output"
+    assert isinstance(impossible.framebuffer_total_bytes, NvidiaDeviceUnavailable)
+    assert impossible.framebuffer_total_bytes.status == "error"
+    assert impossible.framebuffer_total_bytes.reason_code == "malformed_output"
+    assert impossible.busy_fraction == pytest.approx(0.25)
+
+    boundary = parse_nvidia_smi_query_output(
+        f"{_CANONICAL_UUID}, 2026/11/24 12:46:01.000, 40960, 40960, 25, Disabled\n",
+        expected_uuid=_CANONICAL_UUID,
+    )
+    assert boundary.status == "ok"
+    assert boundary.framebuffer_used_bytes == 40960 * 1024 * 1024
+    assert boundary.framebuffer_total_bytes == 40960 * 1024 * 1024
+    assert boundary.busy_fraction == pytest.approx(0.25)
+
+
+def test_o6_review_t6_explicit_env_without_path_does_not_leak_host_path() -> None:
+    """T6 (F6): explicit env={} omitting PATH must not fall back to host os.environ['PATH']."""
+
+    probe = NvidiaSmiDeviceProbe(
+        identity=AcceleratorIdentity(AcceleratorKind.CUDA, 0, _RAW_UUID),
+        executable="sh",
+        env={},
+    )
+    issue = probe.preflight_issue()
+    assert isinstance(issue, NvidiaDeviceUnavailable)
+    assert issue.status == "unavailable"
+    assert issue.reason_code == "executable_unavailable"
+
+    reading = probe.read()
+    assert reading.status == "unavailable"
+    assert reading.reason_code == "executable_unavailable"
