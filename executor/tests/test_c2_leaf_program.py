@@ -277,7 +277,7 @@ def test_configured_command_for_attempt_carries_only_the_typed_delta(tmp_path: P
     )
     assert command.args[-2] == "--attempt-delta"
     assert "run.root=" not in " ".join(command.args)
-    assert '"attempt_core_dir":"' + str(tmp_path / "attempt" / "core") + '"' in command.args[-1]
+    assert '"attempt_core_dir":"' + str(tmp_path / "groups" / ("g" * 64) / "configured" / "a1" / "core") + '"' in command.args[-1]
 
 
 def test_legacy_and_configured_attempt_bindings_are_separate(tmp_path: Path) -> None:

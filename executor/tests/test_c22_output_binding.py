@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -11,10 +12,16 @@ import sys
 import pytest
 
 from tpen_executor._codec import digest
-from tpen_executor.configured_program import AttemptDelta, ConfiguredLoad, ConfiguredProgram
-from tpen_executor.dispatch.transport import LeafRequest
+from tpen_executor.configured_program import CONFIGURED_PROGRAM_ALLOWLIST, AttemptDelta, ConfiguredLoad, ConfiguredProgram
+from tpen_executor.dispatch import LocalDispatcher
+from tpen_executor.dispatch import parsl as parsl_dispatch
+from tpen_executor.dispatch.transport import LeafRequest, run_leaf
 from tpen_executor.environments import PreparedPythonEnvironment
+from tpen_executor.placement import PLACEMENT_OUTPUT_ENV
 from tpen_executor.tasks import ConfiguredRun
+from tpen_executor.workers import ProcessOutcome, SubprocessWorker
+
+from test_s3_transport_parsl import BINDING, _Parsl, _group, _lifecycle, _worker
 
 
 ROOT = Path(__file__).parents[2]
@@ -37,8 +44,8 @@ def _program(tmp_path: Path, *, load: dict[str, object] | None = None) -> Config
     )
 
 
-def _configured(tmp_path: Path, *, load: dict[str, object] | None = None) -> ConfiguredRun:
-    return ConfiguredRun("task", "", (), _program(tmp_path, load=load))
+def _configured(tmp_path: Path, *, load: dict[str, object] | None = None, task_id: str = "task") -> ConfiguredRun:
+    return ConfiguredRun(task_id, "", (), _program(tmp_path, load=load))
 
 
 def _request(tmp_path: Path, *, load: dict[str, object] | None = None) -> LeafRequest:
@@ -55,6 +62,37 @@ def _request(tmp_path: Path, *, load: dict[str, object] | None = None) -> LeafRe
         fence, allocation, _configured(tmp_path, load=load),
         PreparedPythonEnvironment(sys.executable, env={}), 60,
     )
+
+
+def _marker_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ConfiguredRun, Path]:
+    """Build an allowlisted marker that records the delivered shim environment."""
+
+    marker = tmp_path / "marker.json"
+    script = tmp_path / "marker.py"
+    script.write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "core = Path(os.environ['TPEN_PLACEMENT_OUTPUT_DIR']) / 'core'\n"
+        "core.mkdir(parents=True, exist_ok=True)\n"
+        f"Path({str(marker)!r}).write_text(json.dumps({{'argv': sys.argv, 'env': {{key: os.environ.get(key) for key in ('TPEN_PLACEMENT_OUTPUT', 'TPEN_PLACEMENT_OUTPUT_DIR', 'TPEN_PLACEMENT_TASK_ID', 'TPEN_PLACEMENT_ATTEMPT_ID', 'TPEN_PLACEMENT_GROUP_DIGEST', 'TPEN_PLACEMENT_SLOT_ID')}}}}))\n"
+        "(core / 'evidence.json').write_text(json.dumps({"
+        "'schema': 'tpen.run-evidence/v2', 'run_dir': str(core), 'verdict': 'completed', "
+        "'run_status': 'completed', 'checkpoint': {'checkpoint_dir': str(core / 'checkpoint'), "
+        "'schema_version': 1, 'next_iteration': 1, 'completed_updates': 1}, 'refusal': None, "
+        "'resolved_config_identity': {'schema': 'tpen-config-identity-v1', 'sha256': 'a' * 64}}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(CONFIGURED_PROGRAM_ALLOWLIST, "marker", {
+        "trusted_root": str(tmp_path),
+        "relative_path": "marker.py",
+        "arguments": ("manifest", "row", "output_root"),
+        "output_contract": "attempt-core",
+    })
+    program = ConfiguredProgram(
+        "marker", str(script), str(MANIFEST), ROW, str(tmp_path / "campaign"),
+        load={"mode": "fresh", "path": None},
+    )
+    return ConfiguredRun("member", "", (), program), marker
 
 
 def test_attempt_delta_encoder_matches_normative_doc_example() -> None:
@@ -77,15 +115,6 @@ def test_load_mode_is_explicit_and_train_resume_is_not_own_leaf(tmp_path: Path) 
             str(own_leaf.parent / "core"), ConfiguredLoad("train_resume", str(own_leaf)),
             GROUP, "task", "attempt",
         )
-
-
-def test_local_and_parsl_sources_use_one_typed_binding_without_duplicate_run_overrides() -> None:
-    contract = (ROOT / "executor/src/tpen_executor/dispatch/contract.py").read_text(encoding="utf-8")
-    parsl = (ROOT / "executor/src/tpen_executor/dispatch/parsl.py").read_text(encoding="utf-8")
-    assert contract.count("configured.command_for_attempt(") == 1
-    assert parsl.count("configured.command_for_attempt(") == 1
-    assert "f\"run.root={output_dir}\"" not in contract
-    assert "f\"run.root={output_dir}\"" not in parsl
 
 
 def test_serialized_leaf_carries_delta_and_rejects_crossed_output(tmp_path: Path) -> None:
@@ -118,51 +147,151 @@ def test_common_configured_binding_has_no_legacy_run_overrides(tmp_path: Path) -
     assert not any(argument.startswith("run.") for argument in args)
 
 
+def test_no_slot_configured_local_delivers_placement_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Actual LocalDispatcher no-slot launch receives and uses the fence sidecar path."""
+
+    configured, marker = _marker_run(tmp_path, monkeypatch)
+    group = _group("c22-no-slot-local", "member")
+    lifecycle = _lifecycle(tmp_path)
+    manifest = LocalDispatcher(_worker(tmp_path)).run(group, {"member": configured}, lifecycle, timeout=60)
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    attempt = manifest.attempts[0]
+    output_dir = Path(lifecycle.store.root) / "groups" / group.identity / "member" / attempt.attempt_id.value
+    assert payload["env"]["TPEN_PLACEMENT_OUTPUT"] == str(output_dir / "child-placement.json")
+    assert payload["env"]["TPEN_PLACEMENT_SLOT_ID"] == ""
+    assert (output_dir / "child-placement.json").is_file()
+
+
+def test_no_slot_configured_parsl_delivers_placement_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Actual in-process Parsl launch receives the controller fence sidecar path."""
+
+    fake_parsl = _Parsl().install(monkeypatch)
+    configured, marker = _marker_run(tmp_path, monkeypatch)
+    group = _group("c22-no-slot-parsl", "member")
+    lifecycle = _lifecycle(tmp_path)
+    dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path), binding=BINDING)
+    manifest = dispatcher.run(group, {"member": configured}, lifecycle, timeout=60)
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    attempt = manifest.attempts[0]
+    output_dir = Path(lifecycle.store.root) / "groups" / group.identity / "member" / attempt.attempt_id.value
+    assert payload["env"]["TPEN_PLACEMENT_OUTPUT"] == str(output_dir / "child-placement.json")
+    records = [record for record in fake_parsl.submissions if record["function"] == "_run_parsl_child_captured"]
+    assert records and records[0]["args"][2]["TPEN_PLACEMENT_OUTPUT"] == str(output_dir / "child-placement.json")
+
+
+def test_no_slot_configured_leaf_delivers_placement_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Actual run_leaf receives the controller overlay even when its input env is empty."""
+
+    configured, marker = _marker_run(tmp_path, monkeypatch)
+    root = tmp_path / "store"
+    output = root / "groups" / GROUP / "member" / "attempt"
+    output.mkdir(parents=True)
+    fence = SimpleNamespace(
+        allocation_id="allocation", group_digest=GROUP, task_id="member",
+        attempt_id=SimpleNamespace(value="attempt"), root=str(root), output_dir=str(output),
+    )
+    allocation = SimpleNamespace(
+        allocation_id=SimpleNamespace(value="allocation"), backend_job_id=SimpleNamespace(value="job"),
+    )
+    environment = _worker(tmp_path).materialize(None)["environment"]
+    request = LeafRequest.for_attempt(fence, allocation, configured, environment, 60)
+    assert request.environment.env[PLACEMENT_OUTPUT_ENV] == str(output / "child-placement.json")
+    run_leaf(request.encode())
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["env"]["TPEN_PLACEMENT_OUTPUT"] == str(output / "child-placement.json")
+    assert (output / "child-placement.json").is_file()
+
+
+@pytest.mark.parametrize("carrier", ["local", "parsl"])
 @pytest.mark.parametrize("crossed", ["group", "task", "attempt"])
-def test_crossed_identity_is_refused_before_child_on_all_carriers(tmp_path: Path, crossed: str) -> None:
-    """The shared equation rejects crossed local/Parsl bindings and wire requests."""
+def test_actual_dispatchers_refuse_crossed_identity_before_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, carrier: str, crossed: str,
+) -> None:
+    """Actual dispatchers reject each crossed identity before process/submission."""
 
     root = tmp_path / "store"
-    valid_output = root / "groups" / GROUP / "task" / "attempt"
-    values = {"group": GROUP, "task": "task", "attempt": "attempt"}
+    values = {"group": GROUP, "task": "member", "attempt": "attempt"}
     values[crossed] = {"group": "foreign-group", "task": "foreign-task", "attempt": "foreign-attempt"}[crossed]
     crossed_output = root / "groups" / values["group"] / values["task"] / values["attempt"]
-    configured = _configured(tmp_path)
-    child_calls: list[str] = []
-    for carrier in ("local", "parsl"):
-        try:
-            configured.command_for_attempt(
-                str(crossed_output), root=str(root), group_digest=GROUP, task_id="task", attempt_id="attempt",
-            )
-        except ValueError as error:
-            assert "placement fence" in str(error)
-        else:
-            child_calls.append(carrier)
-    assert child_calls == []
-    positive = configured.command_for_attempt(
-        str(valid_output), root=str(root), group_digest=GROUP, task_id="task", attempt_id="attempt",
-    )
-    assert "--attempt-delta" in positive.args
+    configured = _configured(tmp_path, task_id="member")
+    original = ConfiguredRun.command_for_attempt
+
+    def crossed_command(self, output_dir, **kwargs):
+        if self.program is not None and self.id == "member":
+            output_dir = str(crossed_output)
+        return original(self, output_dir, **kwargs)
+
+    monkeypatch.setattr(ConfiguredRun, "command_for_attempt", crossed_command)
+    group = _group(f"c22-crossed-{carrier}-{crossed}", "member")
+    lifecycle = _lifecycle(tmp_path)
+    if carrier == "local":
+        calls: list[tuple[object, tuple[str, ...]]] = []
+
+        def spy(self, environment, args, **kwargs):
+            calls.append((environment, tuple(args)))
+            return ProcessOutcome(tuple(args), 0, kwargs["stdout_path"], kwargs["stderr_path"], False)
+
+        monkeypatch.setattr(SubprocessWorker, "run", spy)
+        LocalDispatcher(_worker(tmp_path)).run(group, {"member": configured}, lifecycle, timeout=60)
+        assert calls == []
+    else:
+        fake_parsl = _Parsl().install(monkeypatch)
+        parsl_dispatch.ParslDispatcher(_worker(tmp_path), binding=BINDING).run(
+            group, {"member": configured}, lifecycle, timeout=60,
+        )
+        assert not [record for record in fake_parsl.submissions if record["function"] == "_run_parsl_child_captured"]
+
+
+@pytest.mark.parametrize("carrier", ["local", "parsl"])
+def test_actual_carriers_capture_matching_full_argv_and_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, carrier: str,
+) -> None:
+    """Matching actual carriers deliver the common configured argv and fence env."""
+
+    configured, _marker = _marker_run(tmp_path, monkeypatch)
+    configured = dataclasses.replace(configured, id="member")
+    group = _group(f"c22-matching-{carrier}", "member")
+    lifecycle = _lifecycle(tmp_path)
+    if carrier == "local":
+        calls: list[tuple[PreparedPythonEnvironment, tuple[str, ...]]] = []
+
+        def spy(self, environment, args, **kwargs):
+            calls.append((environment, tuple(args)))
+            return ProcessOutcome(tuple(args), 0, kwargs["stdout_path"], kwargs["stderr_path"], False)
+
+        monkeypatch.setattr(SubprocessWorker, "run", spy)
+        manifest = LocalDispatcher(_worker(tmp_path)).run(group, {"member": configured}, lifecycle, timeout=60)
+        _environment, args = calls[0]
+        attempt = manifest.attempts[0]
+        output = Path(lifecycle.store.root) / "groups" / group.identity / "member" / attempt.attempt_id.value
+        assert args == configured.command_for_attempt(
+            str(output), root=str(lifecycle.store.root), group_digest=group.identity,
+            task_id="member", attempt_id=attempt.attempt_id.value,
+        ).args
+        assert _environment.env[PLACEMENT_OUTPUT_ENV] == str(output / "child-placement.json")
+    else:
+        fake_parsl = _Parsl().install(monkeypatch)
+        manifest = parsl_dispatch.ParslDispatcher(_worker(tmp_path), binding=BINDING).run(
+            group, {"member": configured}, lifecycle, timeout=60,
+        )
+        [record] = [record for record in fake_parsl.submissions if record["function"] == "_run_parsl_child_captured"]
+        _python, _setup, environment, args = record["args"]
+        attempt = manifest.attempts[0]
+        output = Path(lifecycle.store.root) / "groups" / group.identity / "member" / attempt.attempt_id.value
+        expected = configured.command_for_attempt(
+            str(output), root=str(lifecycle.store.root), group_digest=group.identity,
+            task_id="member", attempt_id=attempt.attempt_id.value,
+        ).args
+        assert tuple(args) == expected
+        assert environment[PLACEMENT_OUTPUT_ENV] == str(output / "child-placement.json")
+
+
+def test_serialized_variants_call_shared_command_method(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both serialized configured and legacy argv construction call the shared seam."""
 
     request = _request(tmp_path)
-    payload = request.to_dict()
-    payload["output_dir"] = str(crossed_output)
-    with pytest.raises(ValueError):
-        LeafRequest.from_mapping(payload)
-    assert request == LeafRequest.decode(request.encode())
-
-
-def test_all_carriers_use_the_shared_full_argv_binding(tmp_path: Path) -> None:
-    """Legacy and configured argv stay identical for local, Parsl, and wire seams."""
-
-    configured = _configured(tmp_path)
-    request = _request(tmp_path)
-    output = request.output_dir
-    expected_configured = configured.command_for_attempt(
-        output, root=request.root, group_digest=GROUP, task_id="task", attempt_id="attempt",
-    ).args
-    assert request.science_args() == expected_configured
-
     legacy_config = "/prepared/config.yaml"
     legacy_overrides = ("payload.mode=attached",)
     legacy = dataclasses.replace(
@@ -171,18 +300,24 @@ def test_all_carriers_use_the_shared_full_argv_binding(tmp_path: Path) -> None:
         attempt_delta=None,
         config=legacy_config,
         overrides=legacy_overrides,
+        environment=PreparedPythonEnvironment(sys.executable, env={}),
         payload_digest=digest({"config": legacy_config, "overrides": list(legacy_overrides)}),
     )
-    expected_legacy = ConfiguredRun("task", legacy_config, legacy_overrides).command_for_attempt(output).args
-    assert legacy.science_args() == expected_legacy
+    calls: list[bool] = []
+    original = ConfiguredRun.command_for_attempt
 
-    contract = (ROOT / "executor/src/tpen_executor/dispatch/contract.py").read_text(encoding="utf-8")
-    parsl = (ROOT / "executor/src/tpen_executor/dispatch/parsl.py").read_text(encoding="utf-8")
-    transport = (ROOT / "executor/src/tpen_executor/dispatch/transport.py").read_text(encoding="utf-8")
-    assert contract.count("configured.command_for_attempt(") == 1
-    assert parsl.count("configured.command_for_attempt(") == 1
-    assert transport.count("command_for_attempt(") == 1
-    assert "ConfiguredProgramCommand" not in transport
+    def spy(self, *args, **kwargs):
+        calls.append(self.program is not None)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ConfiguredRun, "command_for_attempt", spy)
+    configured_args = request.science_args()
+    legacy_args = legacy.science_args()
+    assert configured_args == _configured(tmp_path).command_for_attempt(
+        request.output_dir, root=request.root, group_digest=GROUP, task_id="task", attempt_id="attempt",
+    ).args
+    assert legacy_args == ConfiguredRun("task", legacy_config, legacy_overrides).command_for_attempt(request.output_dir).args
+    assert calls == [True, False, True, False]
 
 
 def test_attempt_binding_digest_changes_with_placement_delta(tmp_path: Path) -> None:
@@ -197,6 +332,13 @@ def test_attempt_binding_digest_changes_with_placement_delta(tmp_path: Path) -> 
 
 MUTANTS = (
     {
+        "id": "no-slot-placement-output",
+        "target": "executor/src/tpen_executor/dispatch/contract.py",
+        "old": "                        PLACEMENT_OUTPUT_ENV: os.path.join(fence.output_dir, \"child-placement.json\"),\n                        \"TPEN_PLACEMENT_OUTPUT_DIR\": fence.output_dir,\n                        \"TPEN_PLACEMENT_TASK_ID\": member.task_id,\n",
+        "new": "                        PLACEMENT_OUTPUT_ENV: \"\",\n                        \"TPEN_PLACEMENT_OUTPUT_DIR\": fence.output_dir,\n                        \"TPEN_PLACEMENT_TASK_ID\": member.task_id,\n",
+        "killer": "test_no_slot_configured_local_delivers_placement_output",
+    },
+    {
         "id": "configured-local-duplicate-run-injection",
         "target": "executor/src/tpen_executor/tasks.py",
         "old": "        return ConfiguredProgramCommand(self.program, delta)\n",
@@ -208,13 +350,13 @@ MUTANTS = (
         "target": "executor/src/tpen_executor/dispatch/parsl.py",
         "old": "                args = configured.command_for_attempt(\n                    output_dir,\n                    root=fence.root,\n                    group_digest=group.identity,\n                    task_id=member.task_id,\n                    attempt_id=fence.attempt_id.value,\n                ).args\n",
         "new": "                args = configured.command_for_attempt(\n                    output_dir,\n                    root=fence.root,\n                    group_digest=group.identity,\n                    task_id=member.task_id,\n                    attempt_id=fence.attempt_id.value,\n                ).args + (f\"run.root={output_dir}\", \"run.layout=flat\", \"run.run_id=core\")\n",
-        "killer": "test_local_and_parsl_sources_use_one_typed_binding_without_duplicate_run_overrides",
+        "killer": "test_actual_carriers_capture_matching_full_argv_and_environment",
     },
     {
         "id": "transport-duplicate-run-injection",
         "target": "executor/src/tpen_executor/dispatch/transport.py",
-        "old": "            return ConfiguredRun(self.task_id, \"\", (), self.program).command_for_attempt(\n                output_dir,\n                root=self.root,\n                group_digest=self.group_digest,\n                task_id=self.task_id,\n                attempt_id=self.attempt_id,\n            ).args\n",
-        "new": "            return ConfiguredRun(self.task_id, \"\", (), self.program).command_for_attempt(\n                output_dir,\n                root=self.root,\n                group_digest=self.group_digest,\n                task_id=self.task_id,\n                attempt_id=self.attempt_id,\n            ).args + (f\"run.root={output_dir}\", \"run.layout=flat\", \"run.run_id=core\")\n",
+        "old": "        return configured.command_for_attempt(\n            output_dir,\n            root=self.root if self.program is not None else None,\n            group_digest=self.group_digest if self.program is not None else None,\n            task_id=self.task_id if self.program is not None else None,\n            attempt_id=self.attempt_id if self.program is not None else None,\n        ).args\n",
+        "new": "        return configured.command_for_attempt(\n            output_dir,\n            root=self.root if self.program is not None else None,\n            group_digest=self.group_digest if self.program is not None else None,\n            task_id=self.task_id if self.program is not None else None,\n            attempt_id=self.attempt_id if self.program is not None else None,\n        ).args + (f\"run.root={output_dir}\", \"run.layout=flat\", \"run.run_id=core\")\n",
         "killer": "test_serialized_leaf_carries_delta_and_rejects_crossed_output",
     },
     {
