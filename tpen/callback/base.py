@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Generic, Protocol, final, runtime_checkable
+from pathlib import Path
+from typing import Any, ClassVar, ContextManager, Generic, Protocol, final, runtime_checkable
 
 from tpen.artifacts import RunContext
 from tpen.events import DomainState, Ended, Started, StateT
@@ -34,6 +36,196 @@ class CallbackContext(Protocol):
 
     def now_iso(self) -> str:
         """Return the current run timestamp in the configured timezone."""
+
+
+class ManagedLifecycleError(RuntimeError):
+    """Raised when a managed callback violates its core lifecycle contract."""
+
+
+class ResourceOwnershipConflictError(ManagedLifecycleError):
+    """Raised when two resource ownership claims cannot safely coexist."""
+
+
+@runtime_checkable
+class RunResource(Protocol):
+    """Cooperative control handle returned by a managed callback scope.
+
+    ``checkpoint`` advances due cooperative work at a safe core boundary;
+    ``request_stop`` signals a nonblocking stop request so helpers can begin
+    stopping before potentially blocking scope exits run.
+    """
+
+    def checkpoint(self) -> None:
+        """Advance due cooperative work at a safe core boundary."""
+
+    def request_stop(self) -> None:
+        """Signal a nonblocking stop request before scope exit."""
+
+
+class ManagedCallback(Protocol):
+    """Optional lifecycle protocol implemented by resource-owning callbacks."""
+
+    def run_scope(self, context: RunContext) -> ContextManager[RunResource | None]:
+        """Return a context manager acquiring and releasing callback resources."""
+
+
+_RESOURCE_OWNERSHIP_KINDS: frozenset[str] = frozenset(
+    {"torch_profiler", "allocator_reset", "artifact_writer"}
+)
+_KNOWN_ACCELERATOR_BACKENDS: dict[str, str] = {
+    "cuda": "cuda",
+    "rocm": "rocm",
+    "hip": "rocm",
+    "xpu": "xpu",
+    "mps": "mps",
+}
+
+
+@dataclass(frozen=True)
+class ResourceOwnershipClaim:
+    """Exclusive ownership claim declared for preflight conflict detection.
+
+    Parameters
+    ----------
+    kind : {"torch_profiler", "allocator_reset", "artifact_writer"}
+        Closed resource ownership category.
+    scope : str
+        Resource scope identifier. ``"torch_profiler"`` requires ``"process"``;
+        ``"allocator_reset"`` carries a canonical device scope or ``"unknown"``;
+        ``"artifact_writer"`` carries a destination path.
+    """
+
+    kind: str
+    scope: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, str) or self.kind not in _RESOURCE_OWNERSHIP_KINDS:
+            raise ValueError(
+                f"unsupported ResourceOwnershipClaim kind {self.kind!r}; "
+                f"expected one of {sorted(_RESOURCE_OWNERSHIP_KINDS)}"
+            )
+        if not isinstance(self.scope, str) or not self.scope.strip():
+            raise ValueError("ResourceOwnershipClaim scope must be a nonempty string")
+        if self.kind == "torch_profiler" and self.scope != "process":
+            raise ValueError(
+                "torch_profiler ownership claim requires scope == 'process', "
+                f"got {self.scope!r}"
+            )
+
+
+def canonicalize_allocator_reset_scope(device: str) -> str | None:
+    """Canonicalize a configured device string for allocator-reset conflict checks.
+
+    Returns ``None`` for CPU targets (which have no accelerator allocator reset
+    claim), ``"<backend>"`` for indexless accelerators, ``"<backend>:<index>"``
+    for indexed accelerators, and ``"unknown"`` conservatively for any
+    unrecognized, empty, or ambiguous device string.
+    """
+
+    if not isinstance(device, str):
+        return "unknown"
+    raw = device.strip().lower()
+    if not raw:
+        return "unknown"
+    if raw == "cpu" or raw.startswith("cpu:"):
+        return None
+    parts = raw.split(":")
+    if len(parts) == 1:
+        backend = _KNOWN_ACCELERATOR_BACKENDS.get(parts[0])
+        return "unknown" if backend is None else backend
+    if len(parts) == 2:
+        backend = _KNOWN_ACCELERATOR_BACKENDS.get(parts[0])
+        index_text = parts[1]
+        if backend is None or not index_text.isdigit():
+            return "unknown"
+        return f"{backend}:{int(index_text)}"
+    return "unknown"
+
+
+def claims_conflict(
+    first: ResourceOwnershipClaim, second: ResourceOwnershipClaim
+) -> bool:
+    """Return whether two ownership claims cannot safely coexist.
+
+    Conservative per the observability ownership contract: any two
+    ``torch_profiler`` claims conflict process-wide; ``artifact_writer`` claims
+    conflict when their canonicalized paths match; ``allocator_reset`` claims
+    conflict whenever either scope is ``"unknown"`` or both name the same
+    backend with at least one indexless scope or identical indices.
+    """
+
+    if not isinstance(first, ResourceOwnershipClaim) or not isinstance(
+        second, ResourceOwnershipClaim
+    ):
+        raise TypeError("claims_conflict requires ResourceOwnershipClaim arguments")
+    if first.kind != second.kind:
+        return False
+    if first.kind == "torch_profiler":
+        return True
+    if first.kind == "artifact_writer":
+        first_path = os.path.normpath(str(Path(first.scope).resolve(strict=False)))
+        second_path = os.path.normpath(str(Path(second.scope).resolve(strict=False)))
+        return first_path == second_path
+    # allocator_reset
+    first_scope = canonicalize_allocator_reset_scope(first.scope)
+    second_scope = canonicalize_allocator_reset_scope(second.scope)
+    if first_scope is None or second_scope is None:
+        return False
+    if first_scope == "unknown" or second_scope == "unknown":
+        return True
+    first_parts = first_scope.split(":", 1)
+    second_parts = second_scope.split(":", 1)
+    if first_parts[0] != second_parts[0]:
+        return False
+    # Same backend: indexless overlaps every concrete index on that backend.
+    if len(first_parts) == 1 or len(second_parts) == 1:
+        return True
+    return first_parts[1] == second_parts[1]
+
+
+def _is_managed_callback_class(klass: object) -> bool:
+    """Return whether ``klass`` is a ``_CallbackCore`` subclass declaring ``run_scope``."""
+
+    if not isinstance(klass, type) or not issubclass(klass, _CallbackCore):
+        return False
+    scope_attr = getattr(klass, "run_scope", None)
+    if scope_attr is None:
+        return False
+    if not callable(scope_attr) and not isinstance(scope_attr, property):
+        raise TypeError(f"{klass.__name__}.run_scope must be callable")
+    return True
+
+
+def is_managed_callback(callback: object) -> bool:
+    """Return whether ``callback`` implements the core-owned managed scope protocol.
+
+    Recognizes ``run_scope`` only on ``_CallbackCore`` subclasses that declare
+    ``run_scope`` on the class itself, never on unrelated objects or ad-hoc
+    instance attributes.
+    """
+
+    if not isinstance(callback, _CallbackCore):
+        return False
+    if getattr(type(callback), "run_scope", None) is None:
+        return False
+    if not callable(getattr(callback, "run_scope", None)):
+        raise TypeError(f"{type(callback).__name__}.run_scope must be callable")
+    return True
+
+
+def validate_run_resource(resource: object) -> None:
+    """Validate the optional handle returned by ``ManagedCallback.run_scope``."""
+
+    if resource is None:
+        return
+    if not callable(getattr(resource, "checkpoint", None)):
+        raise TypeError(
+            f"RunResource {type(resource).__name__} must expose callable checkpoint()"
+        )
+    if not callable(getattr(resource, "request_stop", None)):
+        raise TypeError(
+            f"RunResource {type(resource).__name__} must expose callable request_stop()"
+        )
 
 
 @dataclass
@@ -135,13 +327,26 @@ class _CallbackCore:
             return False
         return self._rng.random() < self.probability
 
-    def _ensure_typed_context(self, context: object) -> None:
-        if not self._typed_group_states or self._typed_context is context:
+    def bind_typed_context(self, context: object) -> None:
+        """Bind typed state to ``context`` once, resetting caches on change.
+
+        Core invokes this before entering ``run_scope(context)`` so the first
+        event delivered after readiness sees ``self._typed_context is context``
+        and does not re-reset live activated resources, while reusing a cleanly
+        closed callback with a fresh context resets before re-activation.
+        """
+
+        if self._typed_context is context:
             return
         self._typed_context = context
         for group_state in self._typed_group_states:
             group_state.reset()
         self._reset_typed_state()
+
+    def _ensure_typed_context(self, context: object) -> None:
+        if not self._typed_group_states or self._typed_context is context:
+            return
+        self.bind_typed_context(context)
 
     def _reset_typed_state(self) -> None:
         """Reset subclass caches when typed state moves to a new context."""
@@ -504,3 +709,19 @@ class StatefulCallback(_CallbackCore, Generic[StateT]):
         """
 
         del occurrence, context
+
+
+__all__ = [
+    "Callback",
+    "CallbackContext",
+    "ManagedCallback",
+    "ManagedLifecycleError",
+    "ResourceOwnershipClaim",
+    "ResourceOwnershipConflictError",
+    "RunResource",
+    "StatefulCallback",
+    "canonicalize_allocator_reset_scope",
+    "claims_conflict",
+    "is_managed_callback",
+    "validate_run_resource",
+]
