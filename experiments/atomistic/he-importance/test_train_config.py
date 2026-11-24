@@ -1050,8 +1050,7 @@ def test_resolve_refuses_available_optimizer_when_roster_entry_is_not_admitted(
         ),
     )
 
-    optimizer_cell = cell.manifest["scientific_identity"]["optimizer_cell"]
-    assert optimizer_cell["status"] == "available"
+    assert cell.availability["status"] == "available"
     patched_entry = next(entry for entry in schema.HI_METHOD_ROSTER if entry.method == "adam")
     assert not patched_entry.admitted
     assert patched_entry.target == original_entry.target
@@ -1066,7 +1065,7 @@ def test_resolve_refuses_unavailable_optimizer_cell_without_adam_substitution(tm
     with pytest.raises(train_config.UnavailableOptimizerError, match="unavailable"):
         train_config.resolve_train_config(cell)
 
-    assert cell.manifest["scientific_identity"]["optimizer_cell"]["status"] == "unavailable"
+    assert cell.availability["status"] == "unavailable"
 
 
 def test_resolve_refuses_stage_without_fixed_training_horizon(tmp_path: Path) -> None:
@@ -1277,8 +1276,7 @@ def _assert_prechange_error_matches(
         assert str(observed_error) == str(expected_error)
         return
 
-    optimizer_cell = cell.manifest["scientific_identity"]["optimizer_cell"]
-    reason = optimizer_cell.get("unavailable_reason")
+    reason = cell.availability.get("unavailable_reason")
     if reason:
         method = cell.manifest["scientific_identity"]["optimizer"]["method"]
         assert str(observed_error) == f"optimizer method {method!r} is unavailable: {reason}"

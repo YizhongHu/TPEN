@@ -290,9 +290,9 @@ def test_contract_clause_4_roster_change_leaves_declared_universe_fixed(tmp_path
 
     def _sr_statuses(cells: tuple) -> set[str]:
         return {
-            cell.manifest["scientific_identity"]["optimizer_cell"]["status"]
+            cell.availability["status"]
             for cell in cells
-            if cell.manifest["scientific_identity"]["optimizer_cell"]["method"] == "sr"
+            if cell.availability["method"] == "sr"
         }
 
     assert _sr_statuses(cells_a) == {"unavailable"}
@@ -360,9 +360,9 @@ def test_unavailable_arms_are_present_and_carry_the_roster_reason_verbatim(tmp_p
     ]
     # 32 declared kfac cells x 2 contexts x 2 seeds.
     assert len(kfac_cells) == 32 * 2 * 2
+    assert all(cell.manifest["scientific_identity"]["optimizer_cell"] == {"method": "kfac"} for cell in kfac_cells)
     assert all(
-        cell.manifest["scientific_identity"]["optimizer_cell"]
-        == {"method": "kfac", "status": "unavailable", "unavailable_reason": reason}
+        cell.availability == {"method": "kfac", "status": "unavailable", "unavailable_reason": reason}
         for cell in kfac_cells
     )
 

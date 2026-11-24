@@ -67,12 +67,6 @@ def content_hash(value: Any) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
-def _legacy_content_hash(value: Any) -> str:
-    """Authenticate the preserved v1 bytes with their historical projection."""
-
-    return hashlib.sha256(_canonical(value)).hexdigest()
-
-
 def _validate_design_document() -> None:
     """Require the tracked design-document copy to match its frozen citation."""
 
@@ -243,8 +237,7 @@ def load_manifest(path: Path = MANIFEST_PATH) -> dict[str, Any]:
     if not isinstance(manifest, Mapping) or manifest.get("schema") not in {MANIFEST_SCHEMA, MANIFEST_V1_SCHEMA}:
         raise ScanManifestError(f"manifest schema is not {MANIFEST_SCHEMA!r} or {MANIFEST_V1_SCHEMA!r}")
     declared = manifest.get("content_hash")
-    hash_fn = _legacy_content_hash if manifest.get("schema") == MANIFEST_V1_SCHEMA else content_hash
-    if not isinstance(declared, str) or hash_fn(_body_without_hash(manifest)) != declared:
+    if not isinstance(declared, str) or content_hash(_body_without_hash(manifest)) != declared:
         raise ScanManifestError("manifest content hash mismatch")
     if manifest.get("counts") != {"rows": 1920, "admitted": 128, "unavailable": 1792}:
         raise ScanManifestError("manifest counts do not match the frozen O1 design")

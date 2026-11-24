@@ -514,16 +514,6 @@ def _project_identity(value: Any, *, exclude_root_topology: bool, is_root: bool 
                 raise MaterializationError("identity mapping keys must be strings")
             if is_root and exclude_root_topology and key == TOPOLOGY_KEY:
                 continue
-            # Runnability is a live roster judgement.  Keep the declared
-            # method in scientific identity, but never hash its mutable
-            # status or reason into a content-addressed row.
-            if is_root and key == "scientific_identity" and isinstance(nested, Mapping):
-                nested = dict(nested)
-                optimizer_cell = nested.get("optimizer_cell")
-                if isinstance(optimizer_cell, Mapping):
-                    nested["optimizer_cell"] = {
-                        "method": optimizer_cell.get("method")
-                    }
             projected[key] = _project_identity(nested, exclude_root_topology=False, is_root=False)
         return projected
     if isinstance(value, (list, tuple)):
@@ -632,9 +622,10 @@ def materialize_stage(
                 )
             continue
         identities[identity_hash] = configuration
-        optimizer_identity = {"method": optimizer.method, "status": optimizer.status}
+        optimizer_identity = {"method": optimizer.method}
+        availability = {"method": optimizer.method, "status": optimizer.status}
         if optimizer.reason is not None:
-            optimizer_identity["unavailable_reason"] = optimizer.reason
+            availability["unavailable_reason"] = optimizer.reason
         if not isinstance(payload.get("updates"), int):
             raise MaterializationError("payload updates must be an integer")
         # The identity-bearing horizon must be the horizon that trains: the
@@ -662,7 +653,7 @@ def materialize_stage(
                     content_hash=digest,
                     output_path=_absolute_unique_path(output_root, stage, digest, seen_paths),
                     seed_streams=_freeze(namespaces[label]),
-                    availability=_freeze(optimizer_identity),
+                    availability=_freeze(availability),
                 )
             )
     return tuple(cells)

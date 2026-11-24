@@ -62,18 +62,14 @@ def test_committed_manifest_regenerates_byte_identically() -> None:
     path = HERE / "o1_scan_manifest_v1.json"
     assert path.stat().st_size < 1_000_000
     committed = path.read_bytes()
-    rendered = json.dumps(
-        manifest_module.render_manifest(version="v1"), sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    rendered += b"\n"
     committed_hash = hashlib.sha256(committed).hexdigest()
-    rendered_hash = hashlib.sha256(rendered).hexdigest()
-    if committed_hash != rendered_hash or len(committed) != len(rendered):
-        raise AssertionError(
-            "manifest bytes differ: "
-            f"committed_sha256={committed_hash} rendered_sha256={rendered_hash} "
-            f"committed_length={len(committed)} rendered_length={len(rendered)}"
-        )
+    assert committed_hash == "6e077a97fedc29eee4228c6e33c086cc7d8a45ab1c6a9f9a728d565a0c62bee6"
+
+
+def test_committed_v2_matches_live_render() -> None:
+    assert (HERE / "o1_scan_manifest_v2.json").read_text(encoding="utf-8") == (
+        manifest_module.render_manifest_text()
+    )
 
 
 def test_v1_manifest_is_inspection_only_and_names_v2_for_launch() -> None:

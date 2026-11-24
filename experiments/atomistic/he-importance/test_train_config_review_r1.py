@@ -313,8 +313,7 @@ def _assert_matches_prechange(cells: Any, resolver: Any, prechange: types.Module
             except Exception as observed_error:  # noqa: BLE001
                 assert type(observed_error).__name__ == type(expected_error).__name__
                 if type(expected_error).__name__ == "UnavailableOptimizerError":
-                    optimizer_cell = cell.manifest["scientific_identity"]["optimizer_cell"]
-                    reason = optimizer_cell.get("unavailable_reason")
+                    reason = cell.availability.get("unavailable_reason")
                     if reason:
                         method = cell.manifest["scientific_identity"]["optimizer"]["method"]
                         assert str(observed_error) == (
@@ -339,8 +338,8 @@ def test_prechange_oracle_refusal_arm_is_a_live_control(tmp_path: Path) -> None:
     cells = stage_coordinate.materialize_intended_configurations(
         tmp_path / "materialized", availability=optimizer_grid.roster_availability(), stages=("Q",)
     )
-    refused = [c for c in cells if c.manifest["scientific_identity"]["optimizer_cell"]["status"] != "available"]
-    accepted = [c for c in cells if c.manifest["scientific_identity"]["optimizer_cell"]["status"] == "available"]
+    refused = [c for c in cells if c.availability["status"] != "available"]
+    accepted = [c for c in cells if c.availability["status"] == "available"]
     assert refused and accepted
     _assert_matches_prechange(refused[:1], train_config.resolve_train_config, prechange)  # sanity: green
 

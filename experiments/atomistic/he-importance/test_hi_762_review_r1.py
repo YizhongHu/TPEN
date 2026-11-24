@@ -45,8 +45,7 @@ def real_o1_cell(tmp_path_factory: pytest.TempPathFactory) -> Any:
         cell
         for cell in cells
         if cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
-        and cell.manifest["scientific_identity"]["optimizer_cell"]["status"]
-        == "available"
+        and cell.availability["status"] == "available"
     )
 
 

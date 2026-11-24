@@ -105,7 +105,7 @@ def _descriptor(cell: Any) -> CellDescriptor:
     identity = manifest["scientific_identity"]
     context = identity["context"]
     optimizer = identity["optimizer"]
-    optimizer_cell = identity["optimizer_cell"]
+    optimizer_cell = cell.availability
     context_name = context.get("name", context.get("axis"))
     levels = optimizer.get("levels")
     return CellDescriptor(
@@ -337,7 +337,7 @@ def select_cell(
             reasons = sorted(
                 {
                     str(
-                        cell.manifest["scientific_identity"]["optimizer_cell"].get(
+                        cell.availability.get(
                             "unavailable_reason", "method not admitted by HI_METHOD_ROSTER"
                         )
                     )

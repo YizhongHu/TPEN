@@ -3266,7 +3266,7 @@ def test_o1_unavailable_rows_are_materialized_and_observable(tmp_path: Path) -> 
         assert len(present) == {"sr": 32, "kfac": 32, "spring": 32, "linear_method": 16}[method] * 2 * 8
         expected = {"available"} if method in admitted else {"unavailable"}
         assert {
-            cell.manifest["scientific_identity"]["optimizer_cell"]["status"] for cell in present
+            cell.availability["status"] for cell in present
         } == expected
 
 
