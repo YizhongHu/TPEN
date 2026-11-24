@@ -69,6 +69,7 @@ from .contract import (
     _inside,
     _member_paths,
     _require_configured_physical_slot,
+    _physical_slot_overlay,
     _without_gpu_sampler,
 )
 
@@ -554,6 +555,7 @@ class LeafRequest:
             overrides = ()
             values = dict(environment.env)
             values.update(slot.env)
+            values.update(_physical_slot_overlay(slot))
             values.pop("TPEN_SLOT_ID", None)
             values.pop("TPEN_PLACEMENT_SLOT_ID", None)
             values.update(_fence_placement_overlay(
@@ -565,13 +567,6 @@ class LeafRequest:
                 attempt_id=fence.attempt_id.value,
                 slot_id=slot.slot_id,
             ))
-            values["TPEN_PLACEMENT_PAYLOAD_DIGEST"] = configured.attempt_binding_digest(
-                fence.output_dir,
-                root=fence.root,
-                group_digest=fence.group_digest,
-                task_id=fence.task_id,
-                attempt_id=fence.attempt_id.value,
-            )
             environment = PreparedPythonEnvironment(environment.python, environment.setup, values)
         return cls(
             fence.group_digest,

@@ -142,6 +142,17 @@ def _fence_placement_overlay(
 ) -> dict[str, str]:
     """Build the controller-owned placement identities for one fenced attempt."""
 
+    payload_digest = (
+        configured.attempt_binding_digest(
+            fence.output_dir,
+            root=fence.root,
+            group_digest=group_digest,
+            task_id=task_id,
+            attempt_id=attempt_id,
+        )
+        if configured.program is not None
+        else digest({"config": configured.config, "overrides": list(configured.overrides)})
+    )
     values = {
         PLACEMENT_OUTPUT_ENV: os.path.join(fence.output_dir, "child-placement.json"),
         "TPEN_PLACEMENT_OUTPUT_DIR": fence.output_dir,
@@ -150,9 +161,7 @@ def _fence_placement_overlay(
         "TPEN_PLACEMENT_GROUP_DIGEST": group_digest,
         "TPEN_PLACEMENT_ALLOCATION_ID": allocation.allocation_id.value,
         "TPEN_PLACEMENT_BACKEND_JOB_ID": allocation.backend_job_id.value,
-        "TPEN_PLACEMENT_PAYLOAD_DIGEST": digest(
-            {"config": configured.config, "overrides": list(configured.overrides)}
-        ),
+        "TPEN_PLACEMENT_PAYLOAD_DIGEST": payload_digest,
     }
     if slot_id:
         values["TPEN_SLOT_ID"] = slot_id
@@ -181,6 +190,16 @@ def _require_configured_physical_slot(allocation: Any) -> Any:
             "configured programs require a physical slot ID, host, and CPUs",
         )
     return slot
+
+
+def _physical_slot_overlay(slot: Any) -> dict[str, str]:
+    """Return declared physical placement facts for one resolved slot."""
+
+    return {
+        "TPEN_PLACEMENT_DECLARED_HOST": slot.node,
+        "TPEN_PLACEMENT_DECLARED_CPUS": ",".join(str(cpu) for cpu in slot.cpus),
+        "TPEN_PLACEMENT_DECLARED_DEVICES": ",".join(slot.devices),
+    }
 
 
 def _status(process_outcome: Any) -> str:
@@ -318,8 +337,11 @@ def _with_child_placement(
     resolve_slots = slot_resolver or physical_slots_from_allocation
     if configured.program is not None:
         slot = _require_configured_physical_slot(allocation)
-        slot_id, host, cpus = slot.slot_id, slot.node, ",".join(str(cpu) for cpu in slot.cpus)
-        devices = ",".join(slot.devices)
+        slot_facts = _physical_slot_overlay(slot)
+        slot_id = slot.slot_id
+        host = slot_facts["TPEN_PLACEMENT_DECLARED_HOST"]
+        cpus = slot_facts["TPEN_PLACEMENT_DECLARED_CPUS"]
+        devices = slot_facts["TPEN_PLACEMENT_DECLARED_DEVICES"]
         values.update(slot.env)
     elif not (slot_id and host and cpus):
         try:
@@ -567,7 +589,17 @@ def _placement_receipt(
     if not isinstance(environment, PreparedPythonEnvironment):
         raise PlacementRefusal("placement-environment", "child environment is not a prepared Python environment")
     values = environment.env
-    expected_payload = digest({"config": configured.config, "overrides": list(configured.overrides)})
+    expected_payload = (
+        configured.attempt_binding_digest(
+            fence.output_dir,
+            root=fence.root,
+            group_digest=group.identity,
+            task_id=member.task_id,
+            attempt_id=fence.attempt_id.value,
+        )
+        if configured.program is not None
+        else digest({"config": configured.config, "overrides": list(configured.overrides)})
+    )
     checks = {
         "task": observation.task_id == member.task_id,
         "attempt": observation.attempt_id == fence.attempt_id.value,
