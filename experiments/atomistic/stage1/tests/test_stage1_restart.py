@@ -303,11 +303,12 @@ def _real_restart_child() -> None:
 
     payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     row = json.loads(Path(payload["row_path"]).read_text(encoding="utf-8"))
+    recorder_free_row = {**row, "overlay": None, "overlay_sha256": None}
     config_path = Path(str(payload["config_path"]))
     cfg = build_train_config(
-        row,
+        recorder_free_row,
         config_path=config_path,
-        overrides=row_overrides(row),
+        overrides=row_overrides(recorder_free_row),
         overlay=str(OVERLAY),
         overlay_sha256=overlay_sha256(OVERLAY),
     )
@@ -333,7 +334,7 @@ def _real_restart_child() -> None:
     elif phase == "resumed":
         resumed = restart.execute_restart(
             cfg=cfg,
-            row=row,
+            row=recorder_free_row,
             config_path=config_path,
             command="stage1 real restart resumed",
         )
