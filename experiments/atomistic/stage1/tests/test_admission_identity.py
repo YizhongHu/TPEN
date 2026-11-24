@@ -274,6 +274,7 @@ def test_v3_rows_keep_identity_and_compose_after_v4_planner_addition() -> None:
         results_root="/external/stage1-review-r1",
         systems=("he",),
         phase=1,
+        device="cpu",
         include_smoke=False,
         auto_overlay=True,
     )
