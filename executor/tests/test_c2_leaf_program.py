@@ -120,17 +120,23 @@ def test_foreign_same_suffix_and_symlink_are_rejected_on_construction_and_decode
     foreign = tmp_path / "foreign" / "experiments" / "atomistic" / "he-importance" / "run_stage_q.py"
     foreign.parent.mkdir(parents=True)
     foreign.write_text("raise SystemExit(0)\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="trusted"):
-        _program(script_path=str(foreign))
     link = tmp_path / "link" / "experiments" / "atomistic" / "he-importance" / "run_stage_q.py"
     link.parent.mkdir(parents=True)
     link.symlink_to(foreign)
-    with pytest.raises(ValueError, match="trusted"):
-        _program(script_path=str(link))
-    payload = _program().to_dict()
-    payload["script_path"] = str(foreign)
-    with pytest.raises(ValueError, match="trusted"):
-        ConfiguredProgram.from_mapping(payload)
+    for candidate in (foreign, link):
+        with pytest.raises(ValueError, match="trusted"):
+            _program(script_path=str(candidate))
+        payload = _program().to_dict()
+        payload["script_path"] = str(candidate)
+        decoded_fields = {
+            field: payload[field]
+            for field in (
+                "entrypoint", "script_path", "manifest", "row", "output_root",
+                "output_contract", "manifest_sha256",
+            )
+        }
+        with pytest.raises(ValueError, match="trusted"):
+            ConfiguredProgram(**decoded_fields)
 
 
 def test_manifest_must_exist_be_regular_and_match_bound_sha256(tmp_path: Path) -> None:
