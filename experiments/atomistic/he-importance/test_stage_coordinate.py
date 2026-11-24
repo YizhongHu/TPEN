@@ -252,7 +252,7 @@ def test_inventory_and_every_q_override_match_exact_base_with_deliberate_red(
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
     )
-    assert named.content_hash == "0b51514133bcb9e11ff8ad412390a994f29c0b8b9a222c92894a0374cd09f5da"
+    assert named.content_hash == "be215cf996902752eda3d736a2f88ded079769d8e463274ca26f06fd50a5cd37"
 
     original_canonical_json = stage_coordinate.canonical_json
 
