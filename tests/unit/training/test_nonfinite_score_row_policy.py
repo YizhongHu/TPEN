@@ -90,8 +90,14 @@ def _step_input(
     positions = torch.zeros((n_samples, n_electrons, 1), dtype=torch.float64)
     spins = torch.ones((n_samples, n_electrons), dtype=torch.float64)
     batch = ElectronBatch(positions=positions, spins=spins)
+    # Keep WavefunctionOutput.logabs finite when tests inject non-finite score entries
+    # into `features`, so WavefunctionOutput.__post_init__ does not reject `-inf`
+    # logabs with `sign == 1` before `method.update(...)` sees the poisoned scores.
+    clean_features = torch.where(
+        torch.isfinite(features), features, torch.zeros_like(features)
+    )
     output = WavefunctionOutput(
-        logabs=(features @ parameter).detach(),
+        logabs=(clean_features @ parameter).detach(),
         sign=torch.ones(n_samples, dtype=torch.float64),
     )
     layout = _layout(int(features.shape[1]))
