@@ -128,6 +128,30 @@ def test_row_update_horizon_mismatch_refuses_before_runner_call(
     assert calls == []
 
 
+def test_recorder_configured_refuses_before_runner_call(tmp_path: Path, monkeypatch) -> None:
+    """Deferred recorder resume is loud and never reaches inspection or launch."""
+
+    cfg = _cfg(tmp_path)
+    cfg.stage1_overlay = {"path": "configs/overlays/diagnostics-v1.yaml"}
+    cfg.callbacks.append({
+        "_target_": "tpen.callback.RawTrainingBatchRecorder",
+        "path": "old-training-history",
+    })
+    row = _row(tmp_path)
+    calls: list[object] = []
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+    monkeypatch.setattr(restart, "run_from_config", lambda *_a, **_k: calls.append(True) or 0)
+
+    with pytest.raises(restart.RestartRefusal, match="7eaf9e0c.*diagnostics-v1"):
+        restart.execute_restart(
+            cfg=cfg,
+            row=row,
+            config_path="train.yaml",
+            inspector=lambda _path: pytest.fail("recorder refusal must precede inspection"),
+        )
+    assert calls == []
+
+
 def test_exact_runner_load_and_overlay_survive_configured_restore(tmp_path: Path, monkeypatch) -> None:
     cfg = _cfg(tmp_path)
     row = _row(tmp_path)
@@ -287,6 +311,13 @@ def _real_restart_child() -> None:
         overlay=str(OVERLAY),
         overlay_sha256=overlay_sha256(OVERLAY),
     )
+    # The diagnostics overlay remains bound and visible, but this parity arm
+    # deliberately exercises the recorder-free Stage-1 configuration while
+    # core item 7eaf9e0c owns recorder resume semantics.
+    cfg.callbacks = [
+        callback for callback in cfg.callbacks
+        if callback.get("_target_") != "tpen.callback.RawTrainingBatchRecorder"
+    ]
     phase = str(payload["phase"])
     if phase == "fresh":
         from tpen.callback.planned_yield import PlannedYield
@@ -445,6 +476,10 @@ def test_real_fresh_process_restore_parity_with_checkpoint_zero_and_overlay(
         resolved = OmegaConf.load(run_dir / "resolved_config.yaml")
         assert resolved.stage1_overlay.path == "configs/overlays/diagnostics-v1.yaml"
         assert resolved.stage1_overlay.sha256 == overlay_sha256(OVERLAY)
+        assert not any(
+            callback.get("_target_") == "tpen.callback.RawTrainingBatchRecorder"
+            for callback in resolved.callbacks
+        )
         assert any(
             callback.get("_target_") == "tpen.callback.DataIntegrity"
             for callback in resolved.callbacks

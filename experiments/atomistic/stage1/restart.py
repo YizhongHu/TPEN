@@ -79,6 +79,31 @@ class RestartResult:
     runner_load: Mapping[str, str]
 
 
+def _configured_recorder_overlay(cfg: Any, overlay: str | None) -> str | None:
+    """Return the configured diagnostics overlay when recorder resume is present."""
+
+    callbacks = OmegaConf.select(cfg, "callbacks", default=())
+    for callback in callbacks or ():
+        target = callback.get("_target_") if isinstance(callback, Mapping) else None
+        if target == "tpen.callback.RawTrainingBatchRecorder":
+            configured_overlay = OmegaConf.select(cfg, "stage1_overlay.path", default=None)
+            return str(configured_overlay or overlay or "<unspecified overlay>")
+    return None
+
+
+def _refuse_unsupported_resume_callbacks(cfg: Any, overlay: str | None) -> None:
+    """Refuse the deferred recorder contract before checkpoint inspection or launch."""
+
+    configured_overlay = _configured_recorder_overlay(cfg, overlay)
+    if configured_overlay is not None:
+        raise RestartRefusal(
+            "RawTrainingBatchRecorder cannot be resumed by Stage-1; "
+            "core item 7eaf9e0c (Executor lane ea7125c1) owns deferred recorder "
+            f"resume semantics; refusing overlay {configured_overlay}",
+            cause=RestartCause.INVALID_RESUME,
+        )
+
+
 def _target_iterations(cfg: Any, row: Mapping[str, Any]) -> int:
     """Require the resolved trainer horizon and manifest horizon to agree."""
 
@@ -274,6 +299,7 @@ def execute_restart(
             overlay=overlay, overlay_sha256=overlay_sha256,
         )
     validate_resolved_train_config(cfg, row)
+    _refuse_unsupported_resume_callbacks(cfg, overlay)
     selection = select_restart(cfg=cfg, row=row, run_dir=run_dir, inspector=inspector)
     _remove_initial_checkpoint(cfg)
     runner_load = _set_resume_load(cfg, selection.checkpoint_dir)
