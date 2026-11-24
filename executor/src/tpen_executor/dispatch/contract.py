@@ -150,18 +150,37 @@ def _fence_placement_overlay(
         "TPEN_PLACEMENT_GROUP_DIGEST": group_digest,
         "TPEN_PLACEMENT_ALLOCATION_ID": allocation.allocation_id.value,
         "TPEN_PLACEMENT_BACKEND_JOB_ID": allocation.backend_job_id.value,
-        "TPEN_PLACEMENT_PAYLOAD_DIGEST": configured.attempt_binding_digest(
-            fence.output_dir,
-            root=fence.root,
-            group_digest=group_digest,
-            task_id=task_id,
-            attempt_id=attempt_id,
+        "TPEN_PLACEMENT_PAYLOAD_DIGEST": digest(
+            {"config": configured.config, "overrides": list(configured.overrides)}
         ),
     }
     if slot_id:
         values["TPEN_SLOT_ID"] = slot_id
         values["TPEN_PLACEMENT_SLOT_ID"] = slot_id
     return values
+
+
+def _require_configured_physical_slot(allocation: Any) -> Any:
+    """Return the sole resolved physical slot required by configured runs."""
+
+    try:
+        slots = physical_slots_from_allocation(allocation)
+    except PlacementRefusal:
+        raise
+    except (BindingError, TypeError, ValueError) as error:
+        raise PlacementRefusal("configured-physical-slot-required", str(error)) from error
+    if len(slots) != 1:
+        raise PlacementRefusal(
+            "configured-physical-slot-required",
+            "configured programs require exactly one resolved physical slot (slot ID, host, and CPUs)",
+        )
+    slot = slots[0]
+    if not slot.slot_id or not slot.node or not slot.cpus:
+        raise PlacementRefusal(
+            "configured-physical-slot-required",
+            "configured programs require a physical slot ID, host, and CPUs",
+        )
+    return slot
 
 
 def _status(process_outcome: Any) -> str:
@@ -297,7 +316,12 @@ def _with_child_placement(
         )
     devices = values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "")
     resolve_slots = slot_resolver or physical_slots_from_allocation
-    if not (slot_id and host and cpus):
+    if configured.program is not None:
+        slot = _require_configured_physical_slot(allocation)
+        slot_id, host, cpus = slot.slot_id, slot.node, ",".join(str(cpu) for cpu in slot.cpus)
+        devices = ",".join(slot.devices)
+        values.update(slot.env)
+    elif not (slot_id and host and cpus):
         try:
             slots = resolve_slots(allocation)
         except PlacementRefusal:
@@ -314,23 +338,6 @@ def _with_child_placement(
             if not strict_host:
                 # Legacy/no-slot requests also carry only controller policy.
                 values.pop(ROUTED_STRICT_HOST_ENV, None)
-                if not slot_id:
-                    values.pop("TPEN_SLOT_ID", None)
-                    values.pop("TPEN_PLACEMENT_SLOT_ID", None)
-                if configured.program is not None:
-                    # Configured children still need the fence-derived leaf
-                    # for the placement prelude, even without declared CPUs.
-                    values.pop("TPEN_SLOT_ID", None)
-                    values.pop("TPEN_PLACEMENT_SLOT_ID", None)
-                    values.update(_fence_placement_overlay(
-                        fence,
-                        allocation,
-                        configured,
-                        group_digest=group.identity,
-                        task_id=member.task_id,
-                        attempt_id=fence.attempt_id.value,
-                        slot_id=slot_id or None,
-                    ))
                 environment = PreparedPythonEnvironment(environment.python, environment.setup, values)
             return _without_gpu_sampler(environment)
         slot = slots[0]
@@ -560,21 +567,14 @@ def _placement_receipt(
     if not isinstance(environment, PreparedPythonEnvironment):
         raise PlacementRefusal("placement-environment", "child environment is not a prepared Python environment")
     values = environment.env
-    expected_payload = configured.attempt_binding_digest(
-        fence.output_dir,
-        root=fence.root,
-        group_digest=group.identity,
-        task_id=member.task_id,
-        attempt_id=fence.attempt_id.value,
-    )
-    slot_id = values.get("TPEN_SLOT_ID") or None
+    expected_payload = digest({"config": configured.config, "overrides": list(configured.overrides)})
     checks = {
         "task": observation.task_id == member.task_id,
         "attempt": observation.attempt_id == fence.attempt_id.value,
         "group": observation.group_digest == group.identity,
         "allocation": observation.allocation_id == allocation.allocation_id.value,
         "backend": observation.backend_job_id == allocation.backend_job_id.value,
-        "slot": observation.slot_id == slot_id,
+        "slot": observation.slot_id == values.get("TPEN_SLOT_ID"),
         "payload": observation.payload_digest == expected_payload,
         "output": observation.output_dir == fence.output_dir,
     }
@@ -591,22 +591,18 @@ def _placement_receipt(
             "code": "placement-generation-mismatch",
             "reason": "child sidecar PID/start token does not match the spawned live process",
         }
-    physical_slot = slot_id is not None and bool(values.get("TPEN_SLOT_CPUS"))
-    expected_host = values.get("TPEN_SLOT_NODE") if physical_slot else None
-    expected_cpus = parse_cpu_set(values["TPEN_SLOT_CPUS"]) if physical_slot else ()
+    expected_host = values.get("TPEN_SLOT_NODE")
+    expected_cpus = parse_cpu_set(values.get("TPEN_SLOT_CPUS", ""))
     child_precore_refusal = observation.refusal is not None and observation.refusal.get("code") == "child-placement-refused"
     host_match = expected_host is not None and canonical_host(observation.host) == canonical_host(expected_host)
     affinity_match = expected_cpus == observation.affinity
-    if not physical_slot:
-        comparison_host = "unavailable"
-        comparison_affinity = "unavailable"
-    elif child_precore_refusal:
+    if child_precore_refusal:
         comparison_host = "unavailable"
         comparison_affinity = "matched" if affinity_match else ("unavailable" if not observation.affinity else "mismatch")
     else:
         comparison_host = "matched" if host_match else "mismatch"
         comparison_affinity = "matched" if affinity_match else "mismatch"
-    if physical_slot and (not host_match or not affinity_match):
+    if not host_match or not affinity_match:
         refusal = refusal or {
             "code": "placement-affinity-mismatch",
             "reason": f"child host/affinity differs from declared slot ({observation.host!r}, {observation.affinity!r})",
@@ -617,7 +613,7 @@ def _placement_receipt(
         group.identity,
         allocation.allocation_id.value,
         allocation.backend_job_id.value,
-        slot_id,
+        values.get("TPEN_SLOT_ID", observation.slot_id),
         expected_payload,
         fence.output_dir,
         {
@@ -630,7 +626,7 @@ def _placement_receipt(
             "observed_at_utc": observation.observed_at_utc,
         },
         {
-            "host": expected_host or "unavailable",
+            "host": expected_host,
             "cpus": list(expected_cpus),
             "devices": [item for item in values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "").split(",") if item],
         },
@@ -829,13 +825,11 @@ def _placement_refusal_receipt(
     if not isinstance(environment, PreparedPythonEnvironment):
         raise PlacementRefusal("placement-environment", "child environment is not a prepared Python environment")
     values = environment.env
-    slot_id = values.get("TPEN_SLOT_ID") or None
     try:
         declared_cpus = [int(item) for item in values.get("TPEN_SLOT_CPUS", "").split(",") if item]
     except ValueError:
         declared_cpus = []
-    physical_slot = slot_id is not None and bool(values.get("TPEN_SLOT_CPUS"))
-    if physical_slot and not declared_cpus:
+    if not declared_cpus:
         declared_cpus = [0]
     declared_devices = [item for item in values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "").split(",") if item]
     pid = getattr(process_outcome, "pid", None)
@@ -846,17 +840,11 @@ def _placement_refusal_receipt(
         group.identity,
         allocation.allocation_id.value,
         allocation.backend_job_id.value,
-        slot_id,
-        configured.attempt_binding_digest(
-            fence.output_dir,
-            root=fence.root,
-            group_digest=group.identity,
-            task_id=member.task_id,
-            attempt_id=fence.attempt_id.value,
-        ),
+        values.get("TPEN_SLOT_ID", "unavailable"),
+        digest({"config": configured.config, "overrides": list(configured.overrides)}),
         fence.output_dir,
         {
-            "host": values.get("TPEN_SLOT_NODE", "unavailable") if physical_slot and not _placement_v2_requested(allocation, values) else "unavailable",
+            "host": values.get("TPEN_SLOT_NODE", "unknown") if not _placement_v2_requested(allocation, values) else "unavailable",
             "pid": pid if type(pid) is int and pid > 0 else 1,
             "proc_start_ticks": ticks if type(ticks) is int and ticks >= 0 else 0,
             "affinity": [],
@@ -865,7 +853,7 @@ def _placement_refusal_receipt(
             "observed_at_utc": _utc_now(),
         },
         {
-            "host": values.get("TPEN_SLOT_NODE", "unavailable") if physical_slot and not _placement_v2_requested(allocation, values) else "unavailable",
+            "host": values.get("TPEN_SLOT_NODE", "unknown") if not _placement_v2_requested(allocation, values) else "unavailable",
             "cpus": declared_cpus,
             "devices": declared_devices,
         },
@@ -882,7 +870,7 @@ def _placement_refusal_receipt(
         {"host": "refused", "affinity": "refused", "device": "unavailable"},
         observation_error.to_dict(),
     )
-    if not physical_slot or not _placement_v2_requested(allocation, values):
+    if not _placement_v2_requested(allocation, values):
         return base
     reason = observation_error.reason
     return SciencePlacementReceiptV2(
@@ -946,9 +934,9 @@ def _ensure_placement_refusal_environment(
     if PLACEMENT_OUTPUT_ENV in environment.env:
         return environment
     values = dict(environment.env)
-    slot_id = values.get("TPEN_SLOT_ID") or None
-    host = values.get("TPEN_SLOT_NODE", "unavailable") if slot_id is not None else "unavailable"
-    cpus = values.get("TPEN_SLOT_CPUS", "") if slot_id is not None else ""
+    slot_id = values.get("TPEN_SLOT_ID", "unavailable")
+    host = values.get("TPEN_SLOT_NODE", "unknown")
+    cpus = values.get("TPEN_SLOT_CPUS", "0")
     facts = getattr(allocation, "facts", {})
     v2_requested = _placement_v2_requested(allocation, values)
     scheduler_metadata = facts.get("scheduler", facts.get("scheduler_host_map")) if isinstance(facts, Mapping) else None
@@ -976,31 +964,25 @@ def _ensure_placement_refusal_environment(
         host = "unavailable" if v2_requested else slot.node
     if v2_requested and not slots:
         host = "unavailable"
-    if slot_id is None:
-        declared_cpus = ()
-    else:
-        try:
-            declared_cpus = parse_cpu_set(cpus)
-        except PlacementRefusal:
-            declared_cpus = (0,)
-    if slot_id is None:
-        values.pop("TPEN_SLOT_ID", None)
-        values.pop("TPEN_PLACEMENT_SLOT_ID", None)
-    placement_values = _fence_placement_overlay(
-        fence,
-        allocation,
-        configured,
-        group_digest=group.identity,
-        task_id=member.task_id,
-        attempt_id=fence.attempt_id.value,
-        slot_id=slot_id,
-    )
-    placement_values.update({
+    try:
+        declared_cpus = parse_cpu_set(cpus)
+    except PlacementRefusal:
+        declared_cpus = (0,)
+    placement_values = {
+        PLACEMENT_OUTPUT_ENV: os.path.join(fence.output_dir, "child-placement.json"),
+        "TPEN_PLACEMENT_OUTPUT_DIR": fence.output_dir,
+        "TPEN_PLACEMENT_TASK_ID": member.task_id,
+        "TPEN_PLACEMENT_ATTEMPT_ID": fence.attempt_id.value,
+        "TPEN_PLACEMENT_GROUP_DIGEST": group.identity,
+        "TPEN_PLACEMENT_ALLOCATION_ID": allocation.allocation_id.value,
+        "TPEN_PLACEMENT_BACKEND_JOB_ID": allocation.backend_job_id.value,
+        "TPEN_PLACEMENT_SLOT_ID": slot_id,
         "TPEN_PLACEMENT_DECLARED_HOST": host,
         "TPEN_PLACEMENT_DECLARED_CPUS": ",".join(str(cpu) for cpu in declared_cpus),
         "TPEN_PLACEMENT_DECLARED_DEVICES": values.get("TPEN_PLACEMENT_DECLARED_DEVICES", ""),
+        "TPEN_PLACEMENT_PAYLOAD_DIGEST": digest({"config": configured.config, "overrides": list(configured.overrides)}),
         PLACEMENT_REFUSAL_ENV: json.dumps(refusal.to_dict(), sort_keys=True),
-    })
+    }
     if v2_requested:
         placement_values[PLACEMENT_RECEIPT_VERSION_ENV] = "2"
         placement_values["TPEN_PLACEMENT_HOST_STATUS"] = (
