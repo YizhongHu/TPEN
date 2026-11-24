@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import shlex
@@ -59,7 +60,7 @@ def test_stage1_planning_scripts_import_by_path_outside_checkout(
     assert "usage:" in result.stdout
 
 
-def _row(kind: str) -> dict[str, object]:
+def _row(kind: str, checkpoint_root: Path | None = None) -> dict[str, object]:
     """Return one small manifest row for a real rendered driver command."""
 
     row = {
@@ -71,12 +72,22 @@ def _row(kind: str) -> dict[str, object]:
     if kind == "smoke":
         row.update(updates=3, walkers=2, checkpoint_steps=[3])
     elif kind == "eval":
+        checkpoint_dir = (
+            checkpoint_root / "checkpoint" if checkpoint_root is not None
+            else Path(f"{RESULTS_ROOT}/stage1/he/train-lineage-0/checkpoints/step_000005")
+        )
+        checkpoint_file = checkpoint_dir / "model.pt"
+        if checkpoint_root is not None:
+            checkpoint_dir.mkdir(parents=True)
+            payload = b"matching checkpoint bytes"
+            checkpoint_file.write_bytes(payload)
+            checkpoint_digest = hashlib.sha256(payload).hexdigest()
+        else:
+            checkpoint_digest = "d" * 64
         row.update(
             config="configs/he/eval.yaml",
-            draws=2,
-            checkpoint_dir=f"{RESULTS_ROOT}/stage1/he/train-lineage-0/checkpoints/step_000005",
-            checkpoint_file=f"{RESULTS_ROOT}/stage1/he/train-lineage-0/checkpoints/step_000005/model.pt",
-            checkpoint_sha256="d" * 64,
+            draws=2, checkpoint_dir=str(checkpoint_dir),
+            checkpoint_file=str(checkpoint_file), checkpoint_sha256=checkpoint_digest,
         )
     else:
         row["checkpoint_steps"] = [5]
@@ -119,6 +130,10 @@ def _production_eval_row(system: str, root: Path) -> dict[str, object]:
 
     row = dict(_production_train_row(system, root))
     checkpoint_dir = (root / "checkpoint").resolve()
+    checkpoint_dir.mkdir(parents=True)
+    payload = b"matching checkpoint bytes"
+    checkpoint_file = checkpoint_dir / "model.pt"
+    checkpoint_file.write_bytes(payload)
     row.update(
         kind="eval",
         config=f"configs/{system}/eval.yaml",
@@ -127,8 +142,8 @@ def _production_eval_row(system: str, root: Path) -> dict[str, object]:
         draws=STAGE1_PROTOCOL.eval_draws,
         walkers=STAGE1_PROTOCOL.eval_walkers,
         checkpoint_dir=str(checkpoint_dir),
-        checkpoint_file=str(checkpoint_dir / "model.pt"),
-        checkpoint_sha256="d" * 64,
+        checkpoint_file=str(checkpoint_file),
+        checkpoint_sha256=hashlib.sha256(payload).hexdigest(),
     )
     for key in ("checkpoint_steps", "overlay", "overlay_sha256"):
         row.pop(key, None)
@@ -298,7 +313,7 @@ def test_rendered_driver_resolves_config_from_any_submission_cwd(
 ) -> None:
     """The rendered command reaches load_config with its bounded row budget."""
 
-    row = _row(kind)
+    row = _row(kind, checkpoint_root=tmp_path)
     argv = _rendered_argv(row, driver, tmp_path, REPO_ROOT)
     assert "--binding" in argv
     assert "--config" not in argv
