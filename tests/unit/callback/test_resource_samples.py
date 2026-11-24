@@ -73,6 +73,7 @@ from tpen.distributed import ExecutionTopology
 from tpen.inspection import inspect_observability_bundle, inspect_run_observability
 from tpen.observability_artifacts import ObservabilityPathError
 from tpen.process_resources import (
+    DEFAULT_LINUX_CGROUP_MAX_MOUNTINFO_BYTES,
     LinuxCgroupV2Identity,
     LinuxCgroupV2Probe,
     LinuxCgroupV2Reading,
@@ -3792,6 +3793,122 @@ runner:
     assert resolved_config_identity(cfg) != resolved_config_identity(cfg_alt)
 
 
+def test_o5_linux_cgroup_source_max_mountinfo_bytes_validation_inventory_wiring_and_identity(
+    tmp_path: Path,
+) -> None:
+    """LinuxCgroupV2Source validates, exposes, wires, and hashes max_mountinfo_bytes."""
+
+    default_src = LinuxCgroupV2Source(enabled=True)
+    assert default_src.max_mountinfo_bytes == DEFAULT_LINUX_CGROUP_MAX_MOUNTINFO_BYTES
+
+    for bad_type in (True, False, "1024", 1.5, None):
+        with pytest.raises(TypeError, match="max_mountinfo_bytes"):
+            LinuxCgroupV2Source(enabled=True, max_mountinfo_bytes=bad_type)  # type: ignore[arg-type]
+    for bad_val in (0, -1, -65536):
+        with pytest.raises(ValueError, match="max_mountinfo_bytes"):
+            LinuxCgroupV2Source(enabled=True, max_mountinfo_bytes=bad_val)
+
+    # Synthetic >64 KiB mountinfo succeeds under default max_mountinfo_bytes (2 MiB)
+    # even though max_read_bytes stays 65536, and fails cleanly when max_mountinfo_bytes is small.
+    root_pid = os.getpid()
+    proc_root, cg_mount = _write_o5_proc_and_cgroup_fixture(
+        tmp_path / "large_mi",
+        root_pid=root_pid,
+    )
+    large_lines = [
+        f"{100 + i} 28 0:{100 + i} / /mnt/nfs/export_{i:04d}/"
+        + ("a" * 160)
+        + " rw,relatime shared:1 - nfs4 server.example:/export rw\n"
+        for i in range(900)
+    ]
+    large_lines.append(f"36 28 0:30 / {cg_mount} rw,nosuid - cgroup2 cgroup2 rw\n")
+    large_bytes = "".join(large_lines).encode("utf-8")
+    assert len(large_bytes) > 65536
+    (proc_root / str(root_pid) / "mountinfo").write_bytes(large_bytes)
+
+    cb_ok = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        linux_cgroup=LinuxCgroupV2Source(enabled=True, proc_root=proc_root),
+    )
+    with open_run_context(_base_cfg(tmp_path / "run_mi_ok"), runtime_callbacks=[cb_ok]) as ctx:
+        ok_dir = ctx.run_dir
+
+    ok_bundle = inspect_run_observability(ok_dir).invocations[0]
+    assert ok_bundle.inventory is not None
+    ok_inv = ok_bundle.inventory.sources[LINUX_CGROUP_V2_SOURCE_ID]
+    assert ok_inv["max_mountinfo_bytes"] == DEFAULT_LINUX_CGROUP_MAX_MOUNTINFO_BYTES
+    assert ok_inv["capability"] == "available"
+    ok_samples = [
+        s for s in ok_bundle.samples["resource-samples"] if s.source_id == LINUX_CGROUP_V2_SOURCE_ID
+    ]
+    assert len(ok_samples) >= 2
+    assert ok_samples[0].readings["cgroup.memory.current_bytes"].status == "ok"
+    assert ok_samples[0].readings["cgroup.memory.current_bytes"].value == 67108864
+
+    small_limit = 32768
+    cb_small = ResourceSamples(
+        interval_seconds=60.0,
+        max_pending_envelopes=16,
+        linux_cgroup=LinuxCgroupV2Source(
+            enabled=True,
+            proc_root=proc_root,
+            max_mountinfo_bytes=small_limit,
+        ),
+    )
+    with open_run_context(
+        _base_cfg(tmp_path / "run_mi_small"), runtime_callbacks=[cb_small]
+    ) as ctx:
+        small_dir = ctx.run_dir
+
+    small_bundle = inspect_run_observability(small_dir).invocations[0]
+    assert small_bundle.inventory is not None
+    small_inv = small_bundle.inventory.sources[LINUX_CGROUP_V2_SOURCE_ID]
+    assert small_inv["max_mountinfo_bytes"] == small_limit
+    assert small_inv["capability"] == "unavailable"
+    assert small_inv["unavailable_reason_code"] == "input_limit_exceeded"
+    small_samples = [
+        s
+        for s in small_bundle.samples["resource-samples"]
+        if s.source_id == LINUX_CGROUP_V2_SOURCE_ID
+    ]
+    assert small_samples[0].readings["cgroup.memory.current_bytes"].status == "error"
+    assert (
+        small_samples[0].readings["cgroup.memory.current_bytes"].reason_code
+        == "input_limit_exceeded"
+    )
+
+    # resolved_config_identity sensitivity to max_mountinfo_bytes in YAML config.
+    yaml_base = f"""
+experiment:
+  name: o5_mi_identity
+  sector: unit
+run:
+  root: {json.dumps(str(tmp_path / "mi_id_out"))}
+  layout: flat
+  run_id: o5-mi-id
+  timezone: UTC
+runtime:
+  device: cpu
+  dtype: float64
+callbacks:
+  - _target_: tpen.callback.ResourceSamples
+    interval_seconds: 60.0
+    linux_cgroup:
+      _target_: tpen.callback.LinuxCgroupV2Source
+      enabled: true
+      max_mountinfo_bytes: 2097152
+loggers: []
+runner:
+  _target_: {__name__}._NoopRunner
+"""
+    cfg_a = OmegaConf.create(yaml_base)
+    cfg_b = OmegaConf.create(
+        yaml_base.replace("max_mountinfo_bytes: 2097152", "max_mountinfo_bytes: 524288")
+    )
+    assert resolved_config_identity(cfg_a) != resolved_config_identity(cfg_b)
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="requires real Linux /proc filesystem")
 def test_o5_live_linux_tree_and_cgroup_roundtrip_in_resource_samples(tmp_path: Path) -> None:
     """On Linux (Cannon), LinuxProcessTreeSource + LinuxCgroupV2Source round-trip honestly."""
@@ -3823,10 +3940,19 @@ def test_o5_live_linux_tree_and_cgroup_roundtrip_in_resource_samples(tmp_path: P
             tree_samples[0].readings["descendants.matched_cpu_user_delta_seconds"].reason_code
             == "baseline_pending"
         )
-    # On Cannon (Linux 4.18 cgroup v1), cgroup v2 is honestly unavailable; on cgroup v2 hosts it is ok/partial.
+    # Cannon compute nodes run Linux 4.18 with unified cgroup v2 mounted at /sys/fs/cgroup
+    # (not cgroup v1); non-v2 Linux hosts still return honest unavailability.
     cg_cap = bundle.inventory.sources[LINUX_CGROUP_V2_SOURCE_ID]["capability"]
     assert cg_cap in ("available", "unavailable")
-    if cg_cap == "unavailable":
+    if cg_cap == "available":
+        assert cg_samples[0].subject["kind"] == "cgroup"
+        assert cg_samples[0].subject["cgroup_version"] == 2
+        assert cg_samples[0].subject["shared_scope_not_exclusive"] is True
+        assert isinstance(cg_samples[0].subject["cgroup_path"], str)
+        assert cg_samples[0].subject["cgroup_path"].startswith("/")
+        assert all(r.status != "error" for r in cg_samples[0].readings.values())
+        assert any(r.status == "ok" for r in cg_samples[0].readings.values())
+    else:
         assert cg_samples[0].readings["cgroup.memory.current_bytes"].status == "unavailable"
         assert cg_samples[0].readings["cgroup.memory.current_bytes"].value is None
 

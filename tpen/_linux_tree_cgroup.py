@@ -52,6 +52,7 @@ DEFAULT_LINUX_TREE_MAX_ENUMERATED_CANDIDATES = 16384
 DEFAULT_LINUX_TREE_MAX_READ_BYTES = 65536
 
 DEFAULT_LINUX_CGROUP_MAX_READ_BYTES = 65536
+DEFAULT_LINUX_CGROUP_MAX_MOUNTINFO_BYTES = 2 * 1024 * 1024
 DEFAULT_LINUX_CGROUP_MAX_READ_SECONDS = 1.0
 DEFAULT_LINUX_CGROUP_MAX_ANCESTOR_DEPTH = 64
 DEFAULT_LINUX_CGROUP_MAX_PROCS = 4096
@@ -1942,7 +1943,7 @@ class LinuxProcessTreeProbe:
             detail_parts.append(f"partial_reasons={', '.join(reasons_tuple)}")
         for issue in field_issues:
             _append_unique(issue_codes, issue.reason_code)
-            detail_parts.append(issue.reason)
+            _append_unique(detail_parts, issue.reason)
         summary_code = issue_codes[0] if len(issue_codes) == 1 else "partial_scan"
         return LinuxProcessTreeReading(
             status="partial",
@@ -2109,72 +2110,272 @@ def parse_proc_cgroup_v2_path(raw: str | bytes) -> str | Any:
     return validated[0]
 
 
-def parse_proc_mountinfo_cgroup2(raw: str | bytes) -> tuple[str, ...] | Any:
-    """Parse ``cgroup2`` mount points from ``/proc/<pid>/mountinfo``.
+def _consume_mountinfo_line_bytes(
+    line_bytes: bytes,
+    root_mounts: list[str],
+    other_mounts: list[str],
+) -> Any:
+    """Parse one raw ``/proc/<pid>/mountinfo`` line at byte level.
 
-    Inspects entries strictly past the ``' - '`` separator for
-    ``fs_type == "cgroup2"`` (never accepting cgroup v1 ``fs_type == "cgroup"``).
-    Entries rooted at ``'/'`` inside the cgroup2 filesystem are ordered first.
+    Skips blank lines and non-``cgroup2`` mounts immediately without UTF-8
+    decoding unrelated mount paths so raw non-UTF-8 bytes in unrelated
+    NFS/autofs mounts never break ``cgroup2`` discovery. Validates ``cgroup2``
+    mount points strictly and appends ``mount_fs_root == "/"`` entries to
+    ``root_mounts`` and other entries to ``other_mounts``.
     """
 
     pr = _pr()
     LinuxMemoryUnavailable = pr.LinuxMemoryUnavailable
 
-    text = _decode_utf8_or_error(
-        raw, context="/proc/<pid>/mountinfo", reason_code="malformed_procfs"
-    )
-    if isinstance(text, LinuxMemoryUnavailable):
-        return text
+    stripped = line_bytes.strip()
+    if not stripped:
+        return None
 
-    nonempty_lines = [line for line in text.splitlines() if line.strip()]
-    if not nonempty_lines:
+    left, sep, right = stripped.partition(b" - ")
+    if not sep:
+        return LinuxMemoryUnavailable(
+            reason="malformed /proc/<pid>/mountinfo: missing ' - ' separator",
+            reason_code="malformed_procfs",
+            status="error",
+        )
+    left_fields = left.split()
+    right_fields = right.split()
+    if len(left_fields) < 5 or len(right_fields) < 2:
+        return LinuxMemoryUnavailable(
+            reason="malformed /proc/<pid>/mountinfo: insufficient fields",
+            reason_code="malformed_procfs",
+            status="error",
+        )
+    if right_fields[0] != b"cgroup2":
+        return None
+
+    try:
+        raw_fs_root = left_fields[3].decode("utf-8")
+        raw_mount_point = left_fields[4].decode("utf-8")
+    except UnicodeDecodeError:
+        return LinuxMemoryUnavailable(
+            reason="malformed /proc/<pid>/mountinfo: invalid UTF-8 bytes in cgroup2 entry",
+            reason_code="malformed_procfs",
+            status="error",
+        )
+
+    mount_fs_root = _unescape_mountinfo_field(raw_fs_root)
+    mount_point = _unescape_mountinfo_field(raw_mount_point)
+    if "\x00" in mount_point or not mount_point.startswith("/"):
+        return LinuxMemoryUnavailable(
+            reason=f"unsafe cgroup2 mount point {mount_point!r} in mountinfo",
+            reason_code="unsafe_cgroup_path",
+            status="error",
+        )
+    mp_parts = [seg for seg in mount_point.split("/") if seg]
+    if any(seg in (".", "..") for seg in mp_parts):
+        return LinuxMemoryUnavailable(
+            reason=f"unsafe cgroup2 mount point traversal {mount_point!r} in mountinfo",
+            reason_code="unsafe_cgroup_path",
+            status="error",
+        )
+    if mount_fs_root == "/":
+        _append_unique(root_mounts, mount_point)
+    else:
+        _append_unique(other_mounts, mount_point)
+    return None
+
+
+def parse_proc_mountinfo_cgroup2(raw: str | bytes) -> tuple[str, ...] | Any:
+    """Parse ``cgroup2`` mount points from ``/proc/<pid>/mountinfo``.
+
+    Inspects entries strictly past the ``' - '`` separator for
+    ``fs_type == "cgroup2"`` (never accepting cgroup v1 ``fs_type == "cgroup"``).
+    Unrelated mount entries are skipped at the byte level without UTF-8
+    decoding so raw non-UTF-8 bytes in unrelated NFS/autofs mounts never break
+    ``cgroup2`` discovery. Entries rooted at ``'/'`` inside the cgroup2
+    filesystem are ordered first.
+    """
+
+    pr = _pr()
+    LinuxMemoryUnavailable = pr.LinuxMemoryUnavailable
+
+    if isinstance(raw, bytes):
+        raw_bytes = raw
+    elif isinstance(raw, str):
+        try:
+            raw_bytes = raw.encode("utf-8")
+        except UnicodeEncodeError:
+            return LinuxMemoryUnavailable(
+                reason="malformed /proc/<pid>/mountinfo: invalid UTF-8 characters",
+                reason_code="malformed_procfs",
+                status="error",
+            )
+    else:
+        return LinuxMemoryUnavailable(
+            reason=(
+                f"malformed /proc/<pid>/mountinfo: unexpected type "
+                f"{type(raw).__name__}"
+            ),
+            reason_code="malformed_procfs",
+            status="error",
+        )
+
+    root_mounts: list[str] = []
+    other_mounts: list[str] = []
+    saw_nonempty = False
+    for line_bytes in raw_bytes.split(b"\n"):
+        if line_bytes.strip():
+            saw_nonempty = True
+        err = _consume_mountinfo_line_bytes(line_bytes, root_mounts, other_mounts)
+        if err is not None:
+            return err
+
+    if not saw_nonempty:
         return LinuxMemoryUnavailable(
             reason="/proc/<pid>/mountinfo is empty; no cgroup2 mount found",
             reason_code="cgroup_v2_not_mounted_or_v1_only",
             status="unavailable",
         )
+    ordered = tuple(root_mounts + [m for m in other_mounts if m not in root_mounts])
+    if not ordered:
+        return LinuxMemoryUnavailable(
+            reason="no cgroup2 filesystem mount found in mountinfo",
+            reason_code="cgroup_v2_not_mounted_or_v1_only",
+            status="unavailable",
+        )
+    return ordered
+
+
+def _read_bounded_mountinfo_cgroup2(
+    path: Path,
+    *,
+    root_path: Path,
+    max_mountinfo_bytes: int,
+    max_read_seconds: float,
+    deadline_ns: int,
+    monotonic_ns: Callable[[], int],
+    missing_reason_code: str,
+    root_missing_reason_code: str,
+    unsafe_reason_code: str = "unsafe_procfs_file",
+    read_error_reason_code: str = "procfs_read_error",
+) -> tuple[str, ...] | Any:
+    """Stream ``/proc/<pid>/mountinfo`` in bounded chunks to extract ``cgroup2`` mounts.
+
+    Refuses symlinks (``S_ISLNK``) and non-regular files (FIFOs, sockets,
+    devices) via ``os.lstat`` before ``open`` and ``os.fstat`` after ``open``.
+    Streams in :data:`_READ_CHUNK_BYTES` (16 KiB) chunks up to
+    ``max_mountinfo_bytes + 1``, keeping peak memory ``O(one line + matched
+    cgroup2 mounts)`` rather than buffering large NFS/autofs mount tables.
+    """
+
+    pr = _pr()
+    LinuxMemoryUnavailable = pr.LinuxMemoryUnavailable
 
     root_mounts: list[str] = []
     other_mounts: list[str] = []
-    for line in nonempty_lines:
-        left, sep, right = line.partition(" - ")
-        if not sep:
-            return LinuxMemoryUnavailable(
-                reason="malformed /proc/<pid>/mountinfo: missing ' - ' separator",
-                reason_code="malformed_procfs",
-                status="error",
-            )
-        left_fields = left.split()
-        right_fields = right.split()
-        if len(left_fields) < 5 or len(right_fields) < 2:
-            return LinuxMemoryUnavailable(
-                reason="malformed /proc/<pid>/mountinfo: insufficient fields",
-                reason_code="malformed_procfs",
-                status="error",
-            )
-        fs_type = right_fields[0]
-        if fs_type != "cgroup2":
-            continue
-        mount_fs_root = _unescape_mountinfo_field(left_fields[3])
-        mount_point = _unescape_mountinfo_field(left_fields[4])
-        if "\x00" in mount_point or not mount_point.startswith("/"):
-            return LinuxMemoryUnavailable(
-                reason=f"unsafe cgroup2 mount point {mount_point!r} in mountinfo",
-                reason_code="unsafe_cgroup_path",
-                status="error",
-            )
-        mp_parts = [seg for seg in mount_point.split("/") if seg]
-        if any(seg in (".", "..") for seg in mp_parts):
-            return LinuxMemoryUnavailable(
-                reason=f"unsafe cgroup2 mount point traversal {mount_point!r} in mountinfo",
-                reason_code="unsafe_cgroup_path",
-                status="error",
-            )
-        if mount_fs_root == "/":
-            _append_unique(root_mounts, mount_point)
-        else:
-            _append_unique(other_mounts, mount_point)
+    saw_nonempty = False
 
+    try:
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode):
+            return LinuxMemoryUnavailable(
+                reason=f"refusing symlinked file {path}",
+                reason_code=unsafe_reason_code,
+                status="error",
+            )
+        if not stat.S_ISREG(st.st_mode):
+            return LinuxMemoryUnavailable(
+                reason=f"refusing non-regular file {path}",
+                reason_code=unsafe_reason_code,
+                status="error",
+            )
+        with path.open("rb") as handle:
+            fileno_fn = getattr(handle, "fileno", None)
+            if callable(fileno_fn):
+                try:
+                    fd = fileno_fn()
+                except (OSError, ValueError):
+                    fd = None
+                if isinstance(fd, int):
+                    fst = os.fstat(fd)
+                    if not stat.S_ISREG(fst.st_mode):
+                        return LinuxMemoryUnavailable(
+                            reason=f"refusing non-regular opened file {path}",
+                            reason_code=unsafe_reason_code,
+                            status="error",
+                        )
+            pending = b""
+            total = 0
+            limit = max_mountinfo_bytes + 1
+            while total < limit:
+                if int(monotonic_ns()) > deadline_ns:
+                    return LinuxMemoryUnavailable(
+                        reason=(
+                            f"reading {path} exceeded time bound "
+                            f"({max_read_seconds}s)"
+                        ),
+                        reason_code="read_timeout",
+                        status="error",
+                    )
+                chunk = handle.read(min(limit - total, _READ_CHUNK_BYTES))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_mountinfo_bytes:
+                    return LinuxMemoryUnavailable(
+                        reason=(
+                            f"file {path} exceeded max_mountinfo_bytes "
+                            f"({max_mountinfo_bytes})"
+                        ),
+                        reason_code="input_limit_exceeded",
+                        status="error",
+                    )
+                data = pending + chunk
+                lines = data.split(b"\n")
+                pending = lines.pop()
+                for line_bytes in lines:
+                    if line_bytes.strip():
+                        saw_nonempty = True
+                    err = _consume_mountinfo_line_bytes(
+                        line_bytes, root_mounts, other_mounts
+                    )
+                    if err is not None:
+                        return err
+            if pending:
+                if pending.strip():
+                    saw_nonempty = True
+                err = _consume_mountinfo_line_bytes(
+                    pending, root_mounts, other_mounts
+                )
+                if err is not None:
+                    return err
+    except PermissionError as exc:
+        return LinuxMemoryUnavailable(
+            reason=f"permission denied reading {path}: {exc}",
+            reason_code="permission_denied",
+            status="unavailable",
+        )
+    except (FileNotFoundError, ProcessLookupError) as exc:
+        if not root_path.exists():
+            return LinuxMemoryUnavailable(
+                reason=f"root directory {root_path} is missing: {exc}",
+                reason_code=root_missing_reason_code,
+                status="unavailable",
+            )
+        return LinuxMemoryUnavailable(
+            reason=f"path {path} not found: {exc}",
+            reason_code=missing_reason_code,
+            status="unavailable",
+        )
+    except OSError as exc:
+        return LinuxMemoryUnavailable(
+            reason=f"OS error reading {path}: {type(exc).__name__}: {exc}",
+            reason_code=read_error_reason_code,
+            status="error",
+        )
+
+    if not saw_nonempty:
+        return LinuxMemoryUnavailable(
+            reason="/proc/<pid>/mountinfo is empty; no cgroup2 mount found",
+            reason_code="cgroup_v2_not_mounted_or_v1_only",
+            status="unavailable",
+        )
     ordered = tuple(root_mounts + [m for m in other_mounts if m not in root_mounts])
     if not ordered:
         return LinuxMemoryUnavailable(
@@ -2697,6 +2898,7 @@ class LinuxCgroupV2Probe:
         proc_root: str | Path | None = None,
         cgroup_root: str | Path | None = None,
         max_read_bytes: int = DEFAULT_LINUX_CGROUP_MAX_READ_BYTES,
+        max_mountinfo_bytes: int = DEFAULT_LINUX_CGROUP_MAX_MOUNTINFO_BYTES,
         max_read_seconds: float = DEFAULT_LINUX_CGROUP_MAX_READ_SECONDS,
         max_ancestor_depth: int = DEFAULT_LINUX_CGROUP_MAX_ANCESTOR_DEPTH,
         max_procs: int = DEFAULT_LINUX_CGROUP_MAX_PROCS,
@@ -2763,6 +2965,9 @@ class LinuxCgroupV2Probe:
         self._max_read_bytes = _require_positive_int(
             max_read_bytes, "LinuxCgroupV2Probe.max_read_bytes"
         )
+        self._max_mountinfo_bytes = _require_positive_int(
+            max_mountinfo_bytes, "LinuxCgroupV2Probe.max_mountinfo_bytes"
+        )
         self._max_read_seconds = _require_positive_finite_float(
             max_read_seconds, "LinuxCgroupV2Probe.max_read_seconds"
         )
@@ -2804,6 +3009,10 @@ class LinuxCgroupV2Probe:
     @property
     def max_read_bytes(self) -> int:
         return self._max_read_bytes
+
+    @property
+    def max_mountinfo_bytes(self) -> int:
+        return self._max_mountinfo_bytes
 
     @property
     def max_read_seconds(self) -> float:
@@ -2936,10 +3145,10 @@ class LinuxCgroupV2Probe:
         if isinstance(pid_dir, LinuxMemoryUnavailable):
             return pid_dir
 
-        mi_bytes = _read_bounded_regular_bytes(
+        mount_points = _read_bounded_mountinfo_cgroup2(
             pid_dir / "mountinfo",
             root_path=self._proc_root,
-            max_read_bytes=self._max_read_bytes,
+            max_mountinfo_bytes=self._max_mountinfo_bytes,
             max_read_seconds=self._max_read_seconds,
             deadline_ns=deadline_ns,
             monotonic_ns=self._monotonic_ns,
@@ -2947,26 +3156,22 @@ class LinuxCgroupV2Probe:
             root_missing_reason_code="procfs_missing",
         )
         if (
-            isinstance(mi_bytes, LinuxMemoryUnavailable)
-            and mi_bytes.reason_code == "mountinfo_missing"
+            isinstance(mount_points, LinuxMemoryUnavailable)
+            and mount_points.reason_code == "mountinfo_missing"
             and (pid == os.getpid() or self._uses_custom_proc_root)
         ):
             # Safe fallback to /proc/self/mountinfo when appropriate.
             self_mi = self._proc_root / "self" / "mountinfo"
-            mi_bytes = _read_bounded_regular_bytes(
+            mount_points = _read_bounded_mountinfo_cgroup2(
                 self_mi,
                 root_path=self._proc_root,
-                max_read_bytes=self._max_read_bytes,
+                max_mountinfo_bytes=self._max_mountinfo_bytes,
                 max_read_seconds=self._max_read_seconds,
                 deadline_ns=deadline_ns,
                 monotonic_ns=self._monotonic_ns,
                 missing_reason_code="cgroup_v2_not_mounted_or_v1_only",
                 root_missing_reason_code="procfs_missing",
             )
-        if isinstance(mi_bytes, LinuxMemoryUnavailable):
-            return mi_bytes
-
-        mount_points = parse_proc_mountinfo_cgroup2(mi_bytes)
         if isinstance(mount_points, LinuxMemoryUnavailable):
             return mount_points
 
@@ -3519,7 +3724,6 @@ class LinuxCgroupV2Probe:
             if procs_raw.reason_code in (
                 "unsafe_cgroup_path",
                 "read_timeout",
-                "input_limit_exceeded",
             ):
                 return self._unavailable_reading(
                     procs_raw,
@@ -3529,6 +3733,12 @@ class LinuxCgroupV2Probe:
                     observed_before=gen_before,
                     observed_after=None,
                 )
+            if procs_raw.reason_code == "input_limit_exceeded":
+                # On a large shared cgroup, cgroup.procs may exceed max_read_bytes;
+                # record bounded truncation rather than discarding valid metrics.
+                procs_truncated = True
+                includes_other_tasks = True
+                observed_member_count = None
         else:
             parsed_procs = parse_cgroup_procs(procs_raw, max_procs=self._max_procs)
             if not isinstance(parsed_procs, LinuxMemoryUnavailable):
@@ -3723,6 +3933,7 @@ class LinuxCgroupV2Probe:
 
 __all__ = [
     "DEFAULT_LINUX_CGROUP_MAX_ANCESTOR_DEPTH",
+    "DEFAULT_LINUX_CGROUP_MAX_MOUNTINFO_BYTES",
     "DEFAULT_LINUX_CGROUP_MAX_PROCS",
     "DEFAULT_LINUX_CGROUP_MAX_READ_BYTES",
     "DEFAULT_LINUX_CGROUP_MAX_READ_SECONDS",

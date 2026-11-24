@@ -15,6 +15,7 @@ import pytest
 
 from tpen.process_resources import (
     DEFAULT_LINUX_CGROUP_MAX_ANCESTOR_DEPTH,
+    DEFAULT_LINUX_CGROUP_MAX_MOUNTINFO_BYTES,
     DEFAULT_LINUX_CGROUP_MAX_READ_BYTES,
     DEFAULT_LINUX_CGROUP_MAX_READ_SECONDS,
     DEFAULT_LINUX_TREE_MAX_ENUMERATED_CANDIDATES,
@@ -305,6 +306,7 @@ def test_probe_constructors_are_pure_and_do_not_freeze_pid(
     assert tree_probe.max_read_bytes == DEFAULT_LINUX_TREE_MAX_READ_BYTES
     assert cg_probe.target_generation is None
     assert cg_probe.max_read_bytes == DEFAULT_LINUX_CGROUP_MAX_READ_BYTES
+    assert cg_probe.max_mountinfo_bytes == DEFAULT_LINUX_CGROUP_MAX_MOUNTINFO_BYTES
     assert cg_probe.max_read_seconds == DEFAULT_LINUX_CGROUP_MAX_READ_SECONDS
     assert cg_probe.max_ancestor_depth == DEFAULT_LINUX_CGROUP_MAX_ANCESTOR_DEPTH
 
@@ -895,6 +897,166 @@ def test_cgroup_v2_probe_refuses_traversal_symlink_escape_fifo_and_non_linux(
     assert darwin_probe.read().reason_code == "unsupported_platform"
 
 
+def test_cgroup_v2_streaming_mountinfo_large_non_utf8_limit_and_unsafe_files(
+    tmp_path: Path,
+) -> None:
+    """Streaming mountinfo handles >64 KiB + non-UTF-8 unrelated mounts, limits, symlinks, FIFOs."""
+
+    # 1. Synthetic ~200 KiB /proc/<pid>/mountinfo (~900 unrelated NFS/autofs mounts,
+    # including raw non-UTF-8 bytes in an unrelated NFS mount path + cgroup2 at the end
+    # without a trailing newline) succeeds under default LinuxCgroupV2Probe() (max_read_bytes=65536).
+    proc_big, cg_big = _setup_cgroup_v2_fixture(
+        tmp_path / "cg_big_mi",
+        pid=2300,
+        cgroup_rel_path="/system.slice/slurmstepd.scope/job_42",
+    )
+    mount_lines: list[bytes] = []
+    for idx in range(900):
+        if idx == 450:
+            mount_lines.append(
+                b"550 28 0:99 / /mnt/nfs/raw_\xff\xfe_export/"
+                + (b"x" * 160)
+                + b" rw,relatime shared:4 - nfs4 server:/raw_export rw\n"
+            )
+        else:
+            mount_lines.append(
+                (
+                    f"{100 + idx} 28 0:{100 + idx} / /mnt/autofs/export_{idx:04d}/"
+                    + ("p" * 160)
+                    + " rw,relatime shared:4 - nfs4 nfs.rc.example:/export rw\n"
+                ).encode("ascii")
+            )
+    # Append cgroup2 mount at the very end WITHOUT a trailing newline to exercise EOF flush.
+    mount_lines.append(
+        f"29 22 0:25 / {cg_big} rw,nosuid,nodev,noexec,relatime shared:4 - cgroup2 cgroup2 rw".encode(
+            "utf-8"
+        )
+    )
+    big_mi_bytes = b"".join(mount_lines)
+    assert len(big_mi_bytes) > 180_000
+    (proc_big / "2300" / "mountinfo").write_bytes(big_mi_bytes)
+
+    # Also prove parse_proc_mountinfo_cgroup2 directly skips raw non-UTF-8 unrelated mounts.
+    assert parse_proc_mountinfo_cgroup2(big_mi_bytes) == (str(cg_big),)
+
+    default_probe = LinuxCgroupV2Probe(pid=2300, proc_root=proc_big)
+    assert default_probe.max_read_bytes == DEFAULT_LINUX_CGROUP_MAX_READ_BYTES
+    assert default_probe.max_mountinfo_bytes == DEFAULT_LINUX_CGROUP_MAX_MOUNTINFO_BYTES
+    r_big = default_probe.read()
+    assert r_big.status == "ok"
+    assert r_big.memory_current_bytes == 104_857_600
+    assert r_big.cgroup_identity is not None
+    assert r_big.cgroup_identity.mount_root == str(cg_big)
+    assert r_big.cgroup_identity.cgroup_path == "/system.slice/slurmstepd.scope/job_42"
+
+    # Also verify /proc/self/mountinfo fallback routes through streaming bounded reader.
+    (proc_big / "2300" / "mountinfo").unlink()
+    self_dir = proc_big / "self"
+    self_dir.mkdir(exist_ok=True)
+    (self_dir / "mountinfo").write_bytes(big_mi_bytes)
+    r_self_fallback = LinuxCgroupV2Probe(pid=2300, proc_root=proc_big).read()
+    assert r_self_fallback.status == "ok"
+    assert r_self_fallback.cgroup_identity is not None
+    assert r_self_fallback.cgroup_identity.mount_root == str(cg_big)
+    # Restore /proc/2300/mountinfo for the limit test below.
+    (proc_big / "2300" / "mountinfo").write_bytes(big_mi_bytes)
+
+    # 2. Synthetic mountinfo exceeding max_mountinfo_bytes returns input_limit_exceeded error.
+    capped_probe = LinuxCgroupV2Probe(
+        pid=2300, proc_root=proc_big, max_mountinfo_bytes=65536
+    )
+    r_cap = capped_probe.read()
+    assert r_cap.status == "error"
+    assert r_cap.reason_code == "input_limit_exceeded"
+    assert isinstance(r_cap.memory_current_bytes, LinuxMemoryUnavailable)
+    assert r_cap.memory_current_bytes.status == "error"
+    assert r_cap.memory_current_bytes.reason_code == "input_limit_exceeded"
+
+    # 3. Symlinked /proc/<pid>/mountinfo refused with unsafe_procfs_file.
+    proc_sym, _ = _setup_cgroup_v2_fixture(tmp_path / "cg_mi_sym", pid=2301)
+    real_mi = proc_sym / "2301" / "mountinfo"
+    outside_mi = tmp_path / "outside_mountinfo"
+    outside_mi.write_bytes(real_mi.read_bytes())
+    real_mi.unlink()
+    os.symlink(outside_mi, real_mi)
+    r_sym = LinuxCgroupV2Probe(pid=2301, proc_root=proc_sym).read()
+    assert r_sym.status == "error"
+    assert r_sym.reason_code == "unsafe_procfs_file"
+
+    # 4. FIFO /proc/<pid>/mountinfo refused non-blockingly with unsafe_procfs_file.
+    proc_fifo, _ = _setup_cgroup_v2_fixture(tmp_path / "cg_mi_fifo", pid=2302)
+    fifo_mi = proc_fifo / "2302" / "mountinfo"
+    fifo_mi.unlink()
+    os.mkfifo(fifo_mi)
+    fifo_out: list[LinuxCgroupV2Reading] = []
+    t = threading.Thread(
+        target=lambda: fifo_out.append(
+            LinuxCgroupV2Probe(pid=2302, proc_root=proc_fifo).read()
+        )
+    )
+    t.start()
+    t.join(timeout=2.0)
+    assert not t.is_alive(), "FIFO /proc/<pid>/mountinfo blocked cgroup probe!"
+    assert fifo_out[0].status == "error"
+    assert fifo_out[0].reason_code == "unsafe_procfs_file"
+
+
+def test_tree_probe_scan1_detail_deduplicates_baseline_pending(tmp_path: Path) -> None:
+    """Scan-1 partial detail records the baseline_pending clause once, not duplicated."""
+
+    proc_root = _init_proc_root(tmp_path / "proc_dedup")
+    _write_proc_entry(proc_root, pid=300, ppid=1, start_ticks=1000)
+    _write_proc_entry(proc_root, pid=301, ppid=300, start_ticks=1100)
+
+    r1 = LinuxProcessTreeProbe(pid=300, proc_root=proc_root).read()
+    assert r1.status == "partial"
+    assert r1.reason_code == "baseline_pending"
+    assert r1.detail is not None
+    clause = "initial scan establishes per-member descendant CPU baseline"
+    assert r1.detail.count(clause) == 1
+    parts = [p.strip() for p in r1.detail.split(";")]
+    assert len(parts) == len(set(parts))
+
+
+def test_cgroup_v2_large_cgroup_procs_truncates_without_failing_metrics(
+    tmp_path: Path,
+) -> None:
+    """Oversized cgroup.procs records bounded truncation without failing valid metrics."""
+
+    large_procs = "".join(f"{10000 + i}\n" for i in range(15000))
+    assert len(large_procs.encode("ascii")) > DEFAULT_LINUX_CGROUP_MAX_READ_BYTES
+    proc_root, _ = _setup_cgroup_v2_fixture(
+        tmp_path / "cg_big_procs",
+        pid=2400,
+        cgroup_rel_path="/shared_slice/job_large",
+        cgroup_procs=large_procs,
+    )
+    reading = LinuxCgroupV2Probe(pid=2400, proc_root=proc_root).read()
+    assert reading.status == "ok"
+    assert reading.memory_current_bytes == 104_857_600
+    assert reading.cpu_usage_seconds == pytest.approx(2.5)
+    assert reading.cgroup_identity is not None
+    assert reading.cgroup_identity.procs_truncated is True
+    assert reading.cgroup_identity.includes_other_tasks is True
+    assert reading.cgroup_identity.observed_member_count is None
+    assert reading.cgroup_identity.shared_scope_not_exclusive is True
+
+    # Symlinked cgroup.procs still fails closed with unsafe_cgroup_path.
+    proc_sym, cg_sym = _setup_cgroup_v2_fixture(
+        tmp_path / "cg_procs_sym",
+        pid=2401,
+        cgroup_rel_path="/shared_slice/job_sym",
+    )
+    procs_file = cg_sym / "shared_slice" / "job_sym" / "cgroup.procs"
+    outside_procs = tmp_path / "outside_procs"
+    outside_procs.write_text("2401\n", encoding="utf-8")
+    procs_file.unlink()
+    os.symlink(outside_procs, procs_file)
+    r_sym = LinuxCgroupV2Probe(pid=2401, proc_root=proc_sym).read()
+    assert r_sym.status == "error"
+    assert r_sym.reason_code == "unsafe_cgroup_path"
+
+
 # ---------------------------------------------------------------------------
 # Live Linux /proc smoke tests (Cannon / Linux only)
 # ---------------------------------------------------------------------------
@@ -917,6 +1079,13 @@ def test_live_linux_tree_and_cgroup_v2_probes_on_real_procfs() -> None:
         r1 = tree_probe.read()
         assert r1.target_generation == bound
         assert r1.status in ("partial", "ok")
+        if r1.detail is not None:
+            assert (
+                r1.detail.count(
+                    "initial scan establishes per-member descendant CPU baseline"
+                )
+                <= 1
+            )
         assert isinstance(r1.live_member_count, int) and r1.live_member_count >= 1
         assert any(m.generation.pid == child.pid for m in r1.members)
         assert isinstance(r1.matched_cpu_user_delta_seconds, LinuxMemoryUnavailable)
@@ -935,8 +1104,10 @@ def test_live_linux_tree_and_cgroup_v2_probes_on_real_procfs() -> None:
     assert cg_bound is not None and cg_bound.pid == os.getpid()
     cg_reading = cg_probe.read()
     assert cg_reading.target_generation == cg_bound
+    assert cg_reading.status != "error"
     if cg_reading.status == "unavailable":
-        # Linux 4.18 / RHEL 8 (Cannon) uses cgroup v1 -> honest unavailability, never guessed 0.
+        # Cannon compute nodes run Linux 4.18 with unified cgroup v2 mounted at /sys/fs/cgroup
+        # (not cgroup v1); non-v2 Linux hosts still return honest unavailability, never guessed 0.
         assert cg_reading.reason_code in (
             "cgroup_v2_not_mounted_or_v1_only",
             "permission_denied",
@@ -948,3 +1119,20 @@ def test_live_linux_tree_and_cgroup_v2_probes_on_real_procfs() -> None:
         assert cg_reading.cgroup_identity is not None
         assert cg_reading.cgroup_identity.cgroup_version == 2
         assert cg_reading.cgroup_identity.shared_scope_not_exclusive is True
+        assert cg_reading.cgroup_identity.cgroup_path.startswith("/")
+        for field_val in (
+            cg_reading.memory_current_bytes,
+            cg_reading.memory_peak_bytes,
+            cg_reading.memory_max_bytes,
+            cg_reading.cpu_usage_seconds,
+            cg_reading.cpu_user_seconds,
+            cg_reading.cpu_system_seconds,
+            cg_reading.cpu_throttled_seconds,
+            cg_reading.cpu_nr_throttled,
+            cg_reading.cpu_max_cores,
+            cg_reading.cpuset_effective_cpus,
+        ):
+            assert not (
+                isinstance(field_val, LinuxMemoryUnavailable)
+                and field_val.status == "error"
+            )

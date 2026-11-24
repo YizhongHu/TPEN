@@ -78,6 +78,7 @@ from tpen.observability_artifacts import (
 )
 from tpen.process_resources import (
     DEFAULT_LINUX_CGROUP_MAX_ANCESTOR_DEPTH,
+    DEFAULT_LINUX_CGROUP_MAX_MOUNTINFO_BYTES,
     DEFAULT_LINUX_CGROUP_MAX_READ_BYTES,
     DEFAULT_LINUX_CGROUP_MAX_READ_SECONDS,
     DEFAULT_LINUX_MEMORY_MAX_READ_BYTES,
@@ -820,6 +821,7 @@ class LinuxCgroupV2Source:
     interval_seconds: float | None = None
     quantities: tuple[str, ...] = DEFAULT_LINUX_CGROUP_V2_QUANTITIES
     max_read_bytes: int = DEFAULT_LINUX_CGROUP_MAX_READ_BYTES
+    max_mountinfo_bytes: int = DEFAULT_LINUX_CGROUP_MAX_MOUNTINFO_BYTES
     max_read_seconds: float = DEFAULT_LINUX_CGROUP_MAX_READ_SECONDS
     max_ancestor_depth: int = DEFAULT_LINUX_CGROUP_MAX_ANCESTOR_DEPTH
     pid: int | None = None
@@ -869,6 +871,9 @@ class LinuxCgroupV2Source:
         object.__setattr__(self, "quantities", selected)
 
         _require_positive_int(self.max_read_bytes, "LinuxCgroupV2Source.max_read_bytes")
+        _require_positive_int(
+            self.max_mountinfo_bytes, "LinuxCgroupV2Source.max_mountinfo_bytes"
+        )
         object.__setattr__(
             self,
             "max_read_seconds",
@@ -1940,6 +1945,7 @@ class _ResourceSamplesSession:
                     proc_root=lc_cfg.proc_root,
                     cgroup_root=lc_cfg.cgroup_root,
                     max_read_bytes=lc_cfg.max_read_bytes,
+                    max_mountinfo_bytes=lc_cfg.max_mountinfo_bytes,
                     max_read_seconds=lc_cfg.max_read_seconds,
                     max_ancestor_depth=lc_cfg.max_ancestor_depth,
                     host_id=self._host_id,
@@ -2050,6 +2056,7 @@ class _ResourceSamplesSession:
                 "selected_quantities": list(lc_cfg.quantities),
                 "interval_seconds": lc_interval,
                 "max_read_bytes": lc_cfg.max_read_bytes,
+                "max_mountinfo_bytes": lc_cfg.max_mountinfo_bytes,
                 "max_read_seconds": lc_cfg.max_read_seconds,
                 "max_ancestor_depth": lc_cfg.max_ancestor_depth,
                 "cgroup_version": 2,
