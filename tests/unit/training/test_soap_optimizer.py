@@ -27,6 +27,7 @@ from __future__ import annotations
 import copy
 import csv
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -43,7 +44,7 @@ from tpen.logging import CSV, JSONL, LogRecord
 from tpen.physics.kinetic import KineticEnergy
 from tpen.physics.potential import ElectronElectronInteraction, HarmonicTrap
 from tpen.training import SOAP, VMCTrainer, make_optimizer
-from tpen.training.soap import _project, _project_back
+from tpen.training.soap import _project, _project_back, _qr_refresh_basis
 from tpen.training.state import TrainerState
 from tpen.training.update import (
     AutogradUpdateInput,
@@ -171,9 +172,20 @@ def _oracle_soap_trajectory(
                     sort_idx = torch.argsort(est_eig, descending=True, stable=True)
                     q_sorted = q_old[:, sort_idx]
                     exp_avg_sq = exp_avg_sq.index_select(axis, sort_idx)
-                    q_new, r_mat = torch.linalg.qr(sym @ q_sorted)
-                    signs = torch.where(torch.diagonal(r_mat) < 0, -1.0, 1.0).to(dtype=q_new.dtype)
-                    q_mats[axis] = q_new * signs.unsqueeze(0)
+                    max_eig = torch.clamp(est_eig.max(), min=0.0)
+                    if float(max_eig.item()) == 0.0:
+                        q_mats[axis] = q_sorted
+                    else:
+                        finfo = torch.finfo(sym.dtype)
+                        shift = torch.clamp(
+                            max_eig * math.sqrt(finfo.eps), min=math.sqrt(finfo.tiny)
+                        )
+                        eye = torch.eye(sym.shape[0], device=sym.device, dtype=sym.dtype)
+                        q_new, r_mat = torch.linalg.qr((sym + shift * eye) @ q_sorted)
+                        signs = torch.where(torch.diagonal(r_mat) < 0, -1.0, 1.0).to(
+                            dtype=q_new.dtype
+                        )
+                        q_mats[axis] = q_new * signs.unsqueeze(0)
 
         # Explicit mode-by-mode forward projection: apply Q_k^T along each axis k
         grad_proj = grad.clone()
@@ -394,7 +406,14 @@ def test_2d_matrix_matches_independent_oracle_and_differs_from_adamw() -> None:
     ref_param, ref_state = _oracle_soap_trajectory(init, grads, **kwargs)
     st = opt_soap.state[p_soap]
     assert int(st["step"].item()) == 6
-    assert torch.allclose(p_soap.detach(), ref_param, atol=1e-12, rtol=1e-12)
+    # On step 1 of a 2D matrix G_1, Q_0 and Q_1 are exact left/right singular
+    # vectors of G_1, so Q_0^T G_1 Q_1 = Sigma has mathematically zero
+    # off-diagonal entries (residual O(eps_mach * ||G_1||) ~ 1e-15 in float64).
+    # Dividing those O(1e-15) residuals by denom ~= eps = 1e-8 amplifies
+    # contraction-order differences (tensordot vs explicit unfold/matmul) by
+    # 1 / eps = 1e8 into O(lr * eps_mach * ||G_1|| / eps) ~ 1e-9 parameter
+    # differences, whereas state tensors never divide by eps and match at 1e-12.
+    assert torch.allclose(p_soap.detach(), ref_param, atol=1e-7, rtol=1e-7)
     assert torch.allclose(st["exp_avg"], ref_state["exp_avg"], atol=1e-12, rtol=1e-12)
     assert torch.allclose(st["exp_avg_sq"], ref_state["exp_avg_sq"], atol=1e-12, rtol=1e-12)
     for axis in range(2):
@@ -403,6 +422,18 @@ def test_2d_matrix_matches_independent_oracle_and_differs_from_adamw() -> None:
 
     # Discriminating control: rotated SOAP update materially differs from coordinatewise AdamW.
     assert float((p_soap.detach() - p_adamw.detach()).abs().max().item()) > 1e-3
+
+    # Well-conditioned eps=1e-2 on the exact same 2D trajectory reduces step-1
+    # off-diagonal 0 / eps amplification to O(lr * eps_mach * ||G_1|| / 1e-2) ~ 1e-14,
+    # verifying full float64 machine-precision parity in the update formula itself.
+    kwargs_wc = {**kwargs, "eps": 1e-2}
+    p_wc = nn.Parameter(init.clone())
+    opt_wc = SOAP([p_wc], **kwargs_wc)
+    for g in grads:
+        p_wc.grad = g.clone()
+        opt_wc.step()
+    ref_wc, _ = _oracle_soap_trajectory(init, grads, **kwargs_wc)
+    assert torch.allclose(p_wc.detach(), ref_wc, atol=1e-12, rtol=1e-12)
 
 
 def test_rank3_tensor_unmerged_modes_and_mixed_precond_dim_match_oracle() -> None:
@@ -519,7 +550,7 @@ def test_precondition_1d_true_preconditions_vector() -> None:
     for g in grads:
         p.grad = g.clone()
         opt.step()
-    ref, _ = _oracle_soap_trajectory(
+    ref, ref_state = _oracle_soap_trajectory(
         init,
         grads,
         lr=1e-2,
@@ -534,7 +565,83 @@ def test_precondition_1d_true_preconditions_vector() -> None:
     st = opt.state[p]
     assert st["GG"][0] is not None and tuple(st["GG"][0].shape) == (5, 5)
     assert st["Q"][0].dtype == torch.float64
-    assert torch.allclose(p.detach(), ref, atol=1e-12, rtol=1e-12)
+    assert torch.allclose(st["Q"][0].T @ st["Q"][0], torch.eye(5, dtype=torch.float64), atol=1e-12)
+    assert torch.allclose(st["exp_avg"], ref_state["exp_avg"], atol=1e-12, rtol=1e-12)
+    assert torch.allclose(st["GG"][0], ref_state["GG"][0], atol=1e-12, rtol=1e-12)
+    # A 1D length-5 vector has rank-1 GG on step 1 (exact zero nullspace entries
+    # in grad_proj divided by eps=1e-8) and rank-2/rank-4 GG on refresh steps 2/4
+    # (shift-stabilized QR condition number 1 / sqrt(eps_mach) ~= 6.7e7 in float64).
+    # Together these give O(lr * sqrt(eps_mach)) + O(lr * eps_mach / eps) ~ 1e-10
+    # trajectory sensitivity between independent contraction paths, vs O(lr) ~ 6.5e-3
+    # drift without shift stabilization.
+    assert torch.allclose(st["Q"][0], ref_state["Q"][0], atol=1e-5, rtol=1e-5)
+    assert torch.allclose(p.detach(), ref, atol=1e-7, rtol=1e-7)
+
+
+def test_qr_refresh_rank_deficient_stability_and_nullspace_preservation() -> None:
+    """Shift-stabilized QR refresh preserves nullspace vectors and resists ULP noise."""
+
+    gen = torch.Generator().manual_seed(61)
+    q_old, r0 = torch.linalg.qr(torch.randn(5, 5, generator=gen, dtype=torch.float64))
+    q_old = q_old * torch.where(torch.diagonal(r0) < 0, -1.0, 1.0).unsqueeze(0)
+    eye5 = torch.eye(5, dtype=torch.float64)
+
+    # 1. Rank-1 matrix aligned with q_old[:, 0]: exact nullspace preservation
+    #    (modulo permutation of tied zero-eigenvalue columns via sort_idx) and
+    #    stability under 1e-15 symmetric perturbation (simulating ULP noise).
+    sym_rank1 = 3.5 * torch.outer(q_old[:, 0], q_old[:, 0])
+    sym_rank1 = 0.5 * (sym_rank1 + sym_rank1.T)
+    q_new1, sort_idx1 = _qr_refresh_basis(sym_rank1, q_old)
+    assert int(sort_idx1[0].item()) == 0
+    assert torch.allclose(q_new1.T @ q_new1, eye5, atol=1e-13, rtol=1e-13)
+    assert torch.allclose(q_new1, q_old.index_select(1, sort_idx1), atol=1e-12, rtol=1e-12)
+
+    noise = torch.randn(5, 5, generator=gen, dtype=torch.float64)
+    sym_noise = 0.5 * (noise + noise.T)
+    sym_rank1_pert = sym_rank1 + 1e-15 * sym_noise
+    q_pert1, sort_idx_pert1 = _qr_refresh_basis(sym_rank1_pert, q_old)
+    assert int(sort_idx_pert1[0].item()) == 0
+    assert torch.allclose(q_pert1.T @ q_pert1, eye5, atol=1e-13, rtol=1e-13)
+    assert torch.allclose(
+        q_pert1, q_old.index_select(1, sort_idx_pert1), atol=1e-6, rtol=1e-6
+    )
+
+    # 2. Rank-2 matrix in 5D (3D nullspace) with distinct Rayleigh quotients:
+    #    1e-15 symmetric noise produces O(1e-15 / shift) ~ 1e-8 drift instead
+    #    of O(1) arbitrary nullspace rotation.
+    coeffs = torch.tensor([0.2, 0.7, 0.5, 0.4, 0.3], dtype=torch.float64)
+    u2 = q_old @ (coeffs / coeffs.norm())
+    sym_rank2 = 2.0 * torch.outer(q_old[:, 0], q_old[:, 0]) + 0.5 * torch.outer(u2, u2)
+    sym_rank2 = 0.5 * (sym_rank2 + sym_rank2.T)
+    q_r2, sort_r2 = _qr_refresh_basis(sym_rank2, q_old)
+    q_r2_pert, sort_r2_pert = _qr_refresh_basis(sym_rank2 + 1e-15 * sym_noise, q_old)
+    assert torch.equal(sort_r2, sort_r2_pert)
+    assert torch.allclose(q_r2.T @ q_r2, eye5, atol=1e-13, rtol=1e-13)
+    assert torch.allclose(q_r2_pert.T @ q_r2_pert, eye5, atol=1e-13, rtol=1e-13)
+    assert torch.allclose(q_r2, q_r2_pert, atol=1e-6, rtol=1e-6)
+
+    # 3. Float32 small-gradient scale invariance: max_eig=1e-8 must NOT be swamped
+    #    by float32 eps (~1.19e-7), so active subspace tracking and scale invariance
+    #    both hold across 4+ orders of magnitude (condition number ~ 1/sqrt(eps_f32)
+    #    gives O(sqrt(eps_f32)) ~ 3.5e-4 nullspace sensitivity vs ~0.56 if swamped).
+    q_old_f32 = torch.eye(4, dtype=torch.float32)
+    v_f32 = torch.tensor([0.6, 0.8, 0.0, 0.0], dtype=torch.float32)
+    sym_small = 1e-8 * torch.outer(v_f32, v_f32)
+    sym_small = 0.5 * (sym_small + sym_small.T)
+    sym_scaled = (2.0**14) * sym_small
+    q_small, sort_small = _qr_refresh_basis(sym_small, q_old_f32)
+    q_scaled, sort_scaled = _qr_refresh_basis(sym_scaled, q_old_f32)
+    assert torch.equal(sort_small, sort_scaled)
+    assert abs(float((q_small[:, 0] @ v_f32).item())) > 0.999
+    assert torch.allclose(q_small.T @ q_small, torch.eye(4, dtype=torch.float32), atol=1e-5)
+    assert torch.allclose(q_small, q_scaled, atol=1e-3, rtol=1e-3)
+
+    # 4. Exact-zero matrix preserves q_old and identity ordering cleanly.
+    q_old_4 = q_old[:4, :4].clone()
+    q_old_4, _ = torch.linalg.qr(q_old_4)
+    q_zero, sort_zero = _qr_refresh_basis(torch.zeros(4, 4, dtype=torch.float64), q_old_4)
+    assert torch.equal(sort_zero, torch.arange(4))
+    assert torch.equal(q_zero, q_old_4)
 
 
 # ---------------------------------------------------------------------------
@@ -729,7 +836,7 @@ def test_zero_transitions_and_degenerate_factors() -> None:
     for g in grads_nb:
         p_nb.grad = g.clone()
         opt_nb.step()
-    ref_nb, _ = _oracle_soap_trajectory(
+    ref_nb, ref_nb_state = _oracle_soap_trajectory(
         init_nb,
         grads_nb,
         lr=1e-2,
@@ -741,7 +848,42 @@ def test_zero_transitions_and_degenerate_factors() -> None:
         max_precond_dim=128,
         correct_bias=False,
     )
-    assert torch.allclose(p_nb.detach(), ref_nb, atol=1e-12, rtol=1e-12)
+    st_nb = opt_nb.state[p_nb]
+    # Same step-1 exact-SVD off-diagonal 0 / eps amplification on 2D matrices:
+    # O(lr * (1 - beta1) * eps_mach * ||G_1|| / eps) ~ 1e-10 at eps=1e-8,
+    # while state tensors match at 1e-12 and well-conditioned eps=1e-2 matches at 1e-12.
+    assert torch.allclose(p_nb.detach(), ref_nb, atol=1e-7, rtol=1e-7)
+    assert torch.allclose(st_nb["exp_avg"], ref_nb_state["exp_avg"], atol=1e-12, rtol=1e-12)
+    assert torch.allclose(st_nb["exp_avg_sq"], ref_nb_state["exp_avg_sq"], atol=1e-12, rtol=1e-12)
+    for axis in range(2):
+        assert torch.allclose(st_nb["GG"][axis], ref_nb_state["GG"][axis], atol=1e-12, rtol=1e-12)
+        assert torch.allclose(st_nb["Q"][axis], ref_nb_state["Q"][axis], atol=1e-12, rtol=1e-12)
+
+    p_nb_wc = nn.Parameter(init_nb.clone())
+    opt_nb_wc = SOAP(
+        [p_nb_wc],
+        lr=1e-2,
+        betas=(0.9, 0.95),
+        eps=1e-2,
+        precondition_frequency=2,
+        correct_bias=False,
+    )
+    for g in grads_nb:
+        p_nb_wc.grad = g.clone()
+        opt_nb_wc.step()
+    ref_nb_wc, _ = _oracle_soap_trajectory(
+        init_nb,
+        grads_nb,
+        lr=1e-2,
+        betas=(0.9, 0.95),
+        shampoo_beta=-1.0,
+        eps=1e-2,
+        weight_decay=0.0,
+        precondition_frequency=2,
+        max_precond_dim=128,
+        correct_bias=False,
+    )
+    assert torch.allclose(p_nb_wc.detach(), ref_nb_wc, atol=1e-12, rtol=1e-12)
 
 
 @pytest.mark.parametrize("bad_kind", ["nan", "pos_inf", "neg_inf", "sparse"])
@@ -768,7 +910,10 @@ def test_atomic_refusal_on_nonfinite_or_sparse_gradient(bad_kind: str) -> None:
         p2.grad = torch.tensor([[1.0, float("-inf")], [0.0, 0.0]], dtype=torch.float64)
     else:
         p2.grad = torch.sparse_coo_tensor(
-            torch.tensor([[0], [1]]), torch.tensor([1.0], dtype=torch.float64), size=(2, 2)
+            torch.tensor([[0], [1]]),
+            torch.tensor([1.0], dtype=torch.float64),
+            size=(2, 2),
+            check_invariants=True,
         )
 
     with pytest.raises(RuntimeError):

@@ -221,6 +221,14 @@ def _eigh_basis(sym: torch.Tensor) -> torch.Tensor:
 def _qr_refresh_basis(sym: torch.Tensor, q_old: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Perform one subspace-iteration QR refresh on ``q_old`` against ``sym``.
 
+    Uses a shift-invariant diagonal regularization ``S_shifted = sym + c * I``
+    with ``c = max(max_eig * sqrt(eps_mach), sqrt(tiny))`` when ``max_eig > 0``.
+    Because ``sym`` and ``sym + c * I`` share identical eigenvectors and
+    eigenvalue ordering for every ``c > 0``, active subspace iteration is
+    preserved to ``O(sqrt(eps_mach))`` while nullspace columns of rank-deficient
+    Gram factors keep well-conditioned norm ``c >> eps_mach * max_eig`` instead
+    of orthonormalizing floating-point roundoff noise into arbitrary directions.
+
     Parameters
     ----------
     sym : torch.Tensor
@@ -242,7 +250,15 @@ def _qr_refresh_basis(sym: torch.Tensor, q_old: torch.Tensor) -> tuple[torch.Ten
     est_eig = (q_old * (sym @ q_old)).sum(dim=0)
     sort_idx = torch.argsort(est_eig, descending=True, stable=True)
     q_sorted = q_old.index_select(1, sort_idx)
-    q_new, r_mat = torch.linalg.qr(sym @ q_sorted)
+    max_eig = torch.clamp(est_eig.max(), min=0.0)
+    if float(max_eig.item()) == 0.0:
+        return q_sorted, sort_idx
+    finfo = torch.finfo(sym.dtype)
+    # Shift by c = max(max_eig * sqrt(eps), sqrt(tiny)) so S + c*I stays
+    # scale-invariant across small float32/float64 gradients while keeping
+    # nullspace columns well above ULP noise (and avoiding subnormal squaring).
+    shift = torch.clamp(max_eig * math.sqrt(finfo.eps), min=math.sqrt(finfo.tiny))
+    q_new, r_mat = torch.linalg.qr(sym @ q_sorted + shift * q_sorted)
     signs = torch.where(torch.diagonal(r_mat) < 0, -1.0, 1.0).to(dtype=q_new.dtype)
     q_new = q_new * signs.unsqueeze(0)
     if not bool(torch.isfinite(q_new).all()):
