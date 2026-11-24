@@ -2867,16 +2867,16 @@ class _ResourceSamplesSession:
                     reason_code="identity_resolution_failed",
                     status="error",
                 )
+        elif nd_cfg.probe is not None:
+            candidate_identity = getattr(nd_cfg.probe, "identity", None)
+            if isinstance(candidate_identity, AcceleratorIdentity):
+                selected_identity = candidate_identity
         elif (
             self._callback.allocator.enabled
             and self._allocator_resolved_identity is not None
             and self._allocator_configured_device == configured_device
         ):
             selected_identity = self._allocator_resolved_identity
-        elif nd_cfg.probe is not None:
-            candidate_identity = getattr(nd_cfg.probe, "identity", None)
-            if isinstance(candidate_identity, AcceleratorIdentity):
-                selected_identity = candidate_identity
         else:
             try:
                 from tpen.accelerator import resolve_selected_accelerator_identity
@@ -3714,6 +3714,20 @@ class _ResourceSamplesSession:
                 )
             return
         read_end_ns = max(int(self._monotonic_ns()), read_start_ns)
+
+        # Normal scope teardown cancels any in-flight periodic poll via
+        # ``self._stop_event`` and immediately follows with a bounded final
+        # capture (``cancel_event=None, deadline_ns=deadline_ns``). Discard a
+        # teardown-cancelled periodic poll cleanly so healthy runs stay
+        # available/complete without spurious unavailable packets.
+        if (
+            cancel_event is self._stop_event
+            and cancel_event.is_set()
+            and isinstance(reading, NvidiaDeviceReading)
+            and reading.status == "unavailable"
+            and reading.reason_code == "read_cancelled"
+        ):
+            return
 
         try:
             readings = _nvidia_device_reading_to_readings(reading, nd_cfg.quantities)

@@ -524,7 +524,14 @@ def _parse_mib_field(raw: str, field_name: str) -> int | NvidiaDeviceUnavailable
             reason_code="malformed_output",
             status="error",
         )
-    return int(round(value * _BYTES_PER_MIB))
+    scaled = value * _BYTES_PER_MIB
+    if not math.isfinite(scaled):
+        return NvidiaDeviceUnavailable(
+            reason=f"overflowing {field_name} value {raw!r}",
+            reason_code="malformed_output",
+            status="error",
+        )
+    return int(round(scaled))
 
 
 def _parse_busy_percent_field(raw: str, field_name: str) -> float | NvidiaDeviceUnavailable:
@@ -747,6 +754,22 @@ def parse_nvidia_smi_query_output(
     total_bytes = _parse_mib_field(raw_total, "memory.total")
     busy_fraction = _parse_busy_percent_field(raw_busy, "utilization.gpu")
 
+    if (
+        type(used_bytes) is int
+        and type(total_bytes) is int
+        and used_bytes > total_bytes
+    ):
+        inconsistent = NvidiaDeviceUnavailable(
+            reason=(
+                f"inconsistent framebuffer memory: used ({used_bytes} B) "
+                f"exceeds total ({total_bytes} B)"
+            ),
+            reason_code="malformed_output",
+            status="error",
+        )
+        used_bytes = inconsistent
+        total_bytes = inconsistent
+
     failures = [
         item
         for item in (used_bytes, total_bytes, busy_fraction)
@@ -791,24 +814,97 @@ def parse_nvidia_smi_query_output(
     )
 
 
+def _posix_process_group_alive(pgid: int) -> bool:
+    """Return True if any member of POSIX process group ``pgid`` still exists."""
+
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def _terminate_process_group(proc: subprocess.Popen[bytes]) -> None:
     """Terminate a child process (and its POSIX process group) without zombies."""
 
-    if proc.poll() is not None:
-        return
     if os.name == "posix":
+        pgid = proc.pid
+        # Always signal the POSIX process group before reaping ``proc``:
+        # an unreaped zombie ``proc`` pins ``pgid == proc.pid``, and surviving
+        # descendants (e.g. non-exec shell children holding pipes) remain in
+        # that group even if the leader has already exited.
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+        except (PermissionError, OSError):
             try:
                 proc.terminate()
             except OSError:
                 pass
-    else:
-        try:
-            proc.terminate()
-        except OSError:
-            pass
+
+        grace_deadline = time.monotonic() + _TERMINATE_GRACE_SECONDS
+        if proc.poll() is None:
+            remaining = max(0.0, grace_deadline - time.monotonic())
+            try:
+                proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                pass
+
+        # Once ``proc`` is reaped, poll the process group up to the remaining
+        # grace window so surviving descendants are detected without zombie
+        # false positives on ``proc`` itself.
+        if proc.poll() is not None:
+            while _posix_process_group_alive(pgid):
+                remaining = grace_deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                time.sleep(min(0.01, remaining))
+
+        if proc.poll() is None or _posix_process_group_alive(pgid):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+            except (PermissionError, OSError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
+            kill_deadline = time.monotonic() + _KILL_WAIT_SECONDS
+            if proc.poll() is None:
+                remaining = max(0.0, kill_deadline - time.monotonic())
+                try:
+                    proc.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    pass
+
+            while _posix_process_group_alive(pgid):
+                remaining = kill_deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                time.sleep(min(0.01, remaining))
+        return
+
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except OSError:
+        pass
 
     try:
         proc.wait(timeout=_TERMINATE_GRACE_SECONDS)
@@ -816,19 +912,10 @@ def _terminate_process_group(proc: subprocess.Popen[bytes]) -> None:
     except subprocess.TimeoutExpired:
         pass
 
-    if os.name == "posix":
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                proc.kill()
-            except OSError:
-                pass
-    else:
-        try:
-            proc.kill()
-        except OSError:
-            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
 
     try:
         proc.wait(timeout=_KILL_WAIT_SECONDS)
@@ -921,6 +1008,8 @@ def _run_bounded_command(
     timed_out = False
     cancelled = False
     output_limit_exceeded = False
+    terminated = False
+    completed_normally = False
 
     selector = selectors.DefaultSelector()
     try:
@@ -936,11 +1025,13 @@ def _run_bounded_command(
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True
                 _terminate_process_group(proc)
+                terminated = True
                 break
             remaining_ns = effective_deadline_ns - int(monotonic_ns())
             if remaining_ns <= 0:
                 timed_out = True
                 _terminate_process_group(proc)
+                terminated = True
                 break
 
             wait_s = min(_POLL_SLICE_SECONDS, remaining_ns / _NS_PER_SECOND)
@@ -968,6 +1059,7 @@ def _run_bounded_command(
                     if stdout_len > max_output_bytes:
                         output_limit_exceeded = True
                         _terminate_process_group(proc)
+                        terminated = True
                         break
                     stdout_chunks.append(chunk)
                 else:
@@ -975,6 +1067,7 @@ def _run_bounded_command(
                     if stderr_len > max_output_bytes:
                         output_limit_exceeded = True
                         _terminate_process_group(proc)
+                        terminated = True
                         break
                     stderr_chunks.append(chunk)
 
@@ -986,11 +1079,13 @@ def _run_bounded_command(
                 if cancel_event is not None and cancel_event.is_set():
                     cancelled = True
                     _terminate_process_group(proc)
+                    terminated = True
                     break
                 remaining_ns = effective_deadline_ns - int(monotonic_ns())
                 if remaining_ns <= 0:
                     timed_out = True
                     _terminate_process_group(proc)
+                    terminated = True
                     break
                 try:
                     proc.wait(
@@ -998,6 +1093,8 @@ def _run_bounded_command(
                     )
                 except subprocess.TimeoutExpired:
                     continue
+            else:
+                completed_normally = True
     finally:
         try:
             selector.close()
@@ -1009,7 +1106,7 @@ def _run_bounded_command(
                     stream.close()
                 except OSError:
                     pass
-        if proc.poll() is None:
+        if not completed_normally and not terminated:
             _terminate_process_group(proc)
 
     stdout_text = b"".join(stdout_chunks).decode("utf-8", errors="replace")
@@ -1248,7 +1345,7 @@ class NvidiaSmiDeviceProbe:
                 reason_code="executable_unavailable",
                 status="unavailable",
             )
-        search_path = self._env.get("PATH") if self._env is not None else None
+        search_path = self._env.get("PATH", "") if self._env is not None else None
         resolved = shutil.which(exe, path=search_path)
         if resolved is not None and os.path.isfile(resolved) and os.access(resolved, os.X_OK):
             return resolved
