@@ -2,25 +2,6 @@ project:
   rootId: 58348558-a4c8-4ed7-8f7b-829ef8163145
   name: TPEN
 
-# traits:
-#   artifact-lifecycle:
-#     notes:
-#       - key: artifact-policy
-#         role: queue
-#         required: true
-#         description: "Artifact retention, recovery, and disposition policy."
-#         guidance: "Define the artifact lifecycle policy, including retention, recovery expectations, and disposition boundaries."
-#       - key: artifact-inventory
-#         role: work
-#         required: true
-#         description: "Inventory of artifacts covered by the lifecycle decision."
-#         guidance: "Inventory the artifacts and identify what is retained, backed up to Holystore, archived to HPSS, or eligible for lifecycle-gated cleanup."
-#       - key: artifact-disposition-summary
-#         role: review
-#         required: true
-#         description: "Summary of the final artifact disposition."
-#         guidance: "Summarize exact output paths, disposition child IDs, and any directly retained paths."
-
 work_item_schemas:
   implementation-slice:
     lifecycle: auto
@@ -44,6 +25,7 @@ work_item_schemas:
         required: true
         description: "Orchestrator: spawn an isolated implementation worker."
         guidance: "Use the `paseo` skill. Before dispatch, the orchestrator claims and advances the item, creates the isolated worktree, spawns the worker, then releases its claim. The worker claims before any edit with a short renewable TTL; record worker, claimRef, TTL, workspace and branch."
+        skill: paseo
         maxLength: 1000
 
       - key: implementation-receipt
@@ -58,6 +40,7 @@ work_item_schemas:
         required: true
         description: "Orchestrator: dispose of the implementation worker and workspace."
         guidance: "Use the `paseo` skill. Confirm the worker finished, its changes are pushed, no unpreserved work remains, and its claim is released before archiving the workspace."
+        skill: paseo
         maxLength: 1000
 
       - key: tip-verification
@@ -68,24 +51,27 @@ work_item_schemas:
         maxLength: 4000
 
       - key: reviewer-initialization
-        role: review
+        role: work
         required: true
         description: "Orchestrator: initiate independent PR review."
         guidance: "Use the `pr-review-loop` and `paseo` skills. Read `review-tier`: T0 records no agent review; T1 uses one round; T2 uses one full round and at most one delta round. Record tier, reviewer/workspace IDs when used, and PR link."
+        skill:
+          - pr-review-loop
+          - paseo
         maxLength: 1000
 
       - key: reviewer-archival
-        role: review
+        role: work
         required: true
         description: "Orchestrator: archive reviewer and review-owned workspaces."
         guidance: "Use the `paseo` skill. Confirm review handoff and safe cleanup of test branches/workspaces. Archive the reviewer with Paseo; record outcome or recovery blocker."
         maxLength: 1000
 
       - key: review-summary
-        role: review
+        role: work
         required: true
         description: "Orchestrator: summarize automated PR review."
-        guidance: "Link review rounds and explicit dispositions of findings and tests, including green tests. Confirm accepted fixes/tests are integrated and verification passes before marking ready for human review."
+        guidance: "Link review rounds and explicit dispositions of findings and tests, including green tests. Confirm accepted fixes/tests are integrated and verification passes before marking ready for human review. Move to review."
         maxLength: 2000
 
       - key: pr-disposition
@@ -95,10 +81,230 @@ work_item_schemas:
         guidance: "Record human outcome and PR link. After confirmed merge, delete this PR's merged branch and its worktree, record both results, and only then complete. Record cancellation for an abandoned PR."
         maxLength: 1000
 
-  # review-slice:
-  #   lifecycle: auto
-  #   notes:
-  #     - key: review-scope
-  #       role: queue
-  #       required: True
-  #     - key: re
+  # DRAFT ONLY. From experiment-slice-design-r10.md; not applied.
+  run-slice:
+    lifecycle: manual
+    notes:
+      - key: experiment-contract
+        role: queue
+        required: true
+        description: "Planner: question, admission, roles and permission boundaries."
+        skill: cluster-access
+        guidance: >-
+          Give the runner and terminal owner the question, scope, roles, inputs,
+          dependency edges and named re-planning checkpoint/owner. Explain the
+          science-trait decision and source admission: non-science uses a frozen
+          dev candidate, never main; science uses main. Identify facility,
+          resource/budget bounds, retention intentions and approval references or
+          pending decisions. Consult current cluster-access and Clusters
+          free-submit-queues at action time; this plan is not submission approval.
+          Science needs human submission approval; other non-free queues need
+          per-run operator approval relayed by the manager for run geometry
+          and budget. The runner follows
+          the runbook; analysts interpret. Later evidence may justify planning
+          again, rather than extending this scope silently.
+        maxLength: 4000
+
+      - key: runbook-index
+        role: queue
+        required: true
+        description: "Planner/runner: Git runbook path, source commit and revision history."
+        guidance: >-
+          Point the runner to a Markdown runbook file in the run's source
+          repository. Identify its repo-relative path and full pinned source
+          commit SHA, with the blob SHA if recorded. Read the file from that
+          exact commit: the runbook and executable source share the commit the
+          run uses. Planners explain changes, allowed edits, their bounds and
+          owners; commit edits on a branch and review them through a PR to dev.
+          A draft can enter work; before submission settle its choices and pin
+          the reviewed file with the run's source. Non-science uses a frozen dev
+          commit, never main; science uses a main commit containing its runbook.
+          Record path, source commit SHA and any blob SHA in the submission
+          record. Changing an approved snapshot requires a new pinned source
+          commit and renewed relevant approvals. Keep earlier run identities and
+          revision references in this index; the runbook itself is versioned in
+          Git rather than copied into TO notes. An index update is not approval.
+        maxLength: 2000
+
+      - key: execution-index
+        role: work
+        required: true
+        description: "Runner: submission, execution and collection evidence."
+        guidance: >-
+          Give the analyst and reviewer the mechanical record, linking preserved
+          attempt receipts, the repo runbook path, full pinned source commit SHA
+          (and blob SHA if recorded), and permission basis. Record
+          actual source/configuration/runtime, submission response, job and node
+          IDs and delivered resources. Link the artifact inventory with exact
+          paths/hashes and the collection account, including missing or lost
+          evidence. Say when no job ran. Preserve earlier attempts when updating
+          this index. A denied session stops and hands off; uncertain submission
+          is reconciled read-only. Runner observations are not interpretation or
+          permission to repair, retry, cancel, archive or delete.
+        maxLength: 6000
+
+      - key: run-conclusions
+        role: work
+        required: true
+        description: "Analyst: this slice's own answers and their reasoning."
+        guidance: >-
+          Leave this slice's own answers, relating records to the question,
+          assumptions, reasoning and limits. Failure is data; use descriptive
+          outcomes without grades. Tell later readers who checked what, how and
+          under which assumptions. Examine job identity, actual delivered
+          resources, pinned source, inventory/hashes and missing evidence.
+          Record discrepancies, unresolved objections and what was not checked,
+          without a verdict label. Distinguish records from interpretation and
+          explain how the evidence supports or challenges the answers. For
+          science, examine this item's science-analysis-conclusions against its
+          data and methods and its preservation account; link that report here,
+          rather than promising a future analysis item's report. Expanded
+          arguments may occupy versioned TO notes on this same item. The
+          terminal owner reads these checks and conclusions before acting;
+          no separate verification note, extra reviewer layer or PR review is
+          required.
+        maxLength: 12000
+
+      - key: terminal-record
+        role: review
+        required: true
+        description: "Authorized owner: terminal decision and outstanding ownership."
+        guidance: >-
+          Identify the actor, cited approval and what work ended, including
+          cancellation or missing evidence. Non-science runs need manager
+          authority and human approval during the trial; science needs human
+          approval. Record data disposition and any later action's owner and
+          trigger; terminal never authorizes deletion. Science stays open while
+          required preservation remains. Each science slice keeps its own
+          account even when nothing ran. Dependents use terminal, not review.
+          Suspicious evidence follows the linked spike, possible implementation
+          and rerun path; creating those items grants no execution approval.
+          Archive analyst and runner.
+        maxLength: 3000
+
+#   spike-slice:
+#     lifecycle: manual
+#     notes:
+#       - key: experiment-contract
+#         role: queue
+#         required: true
+#         description: "Planner: exploratory question, budget and disposal ownership.No lasting code change"
+#         skill: "cluster-access"
+#         guidance: >-
+#           Give the explorer a question, time/compute budget, permission bounds,
+#           roles and any re-planning checkpoint; do not prescribe steps or a
+#           runbook. Science is not permitted on this type. Name the exact
+#           `agent/spike/**` staging branch, when it will be scrapped
+#           (does not have to be this slice), its owner,
+#           who may delete it and what is preserved first. Run data stays on
+#           allocated-node local memory such as `/scratch`;
+#           only bounded TO receipts/conclusions and
+#           prototype preservation leave the slice. Read current cluster-access
+#           and Clusters free-submit-queues at action time; other queues need
+#           per-run operator approval relayed by the manager. Exploration does not
+#           expand submission authority; denied sessions stop and hand off.
+#           But the plan may include another slice that cherry-picks from this slice,
+#           thus the need to keep the branch around temporarily for later work.
+#         maxLength: 4000
+# 
+#       - key: execution-index
+#         role: work
+#         required: true
+#         description: "Explorer: retrospective attempts, identities and bounded receipts."
+#         guidance: >-
+#           Give later readers the actual attempts, decisions and budget use,
+#           preserving links as this account grows. Record baselines, selected
+#           pushed SHA/tree and configuration, job/node IDs, delivered resources
+#           and permission basis; fetch the pinned `agent/spike/**` SHA into
+#           allocated-node /scratch. Code may change between attempts. Link the
+#           bounded receipts/inventory, collection observations and missing or
+#           lost evidence; say when no job ran. No durable run-data exception or
+#           runbook-like submission packet. Uncertain submission is reconciled
+#           read-only, without inventing permission to retry or cancel.
+#         maxLength: 6000
+# 
+#       - key: run-conclusions
+#         role: work
+#         required: true
+#         description: "Explorer/analyst: own answers and prototype reconstruction."
+#         guidance: >-
+#           Explain what the exploration found and what the question still leaves
+#           open, with evidence, assumptions and reasoning, without grades. Identify
+#           the prototype branch/tip and its reconstruction route. Before deletion,
+#           preserve a TO recipe with baseline, changes, commands, observations,
+#           omissions and useful small diffs, or the exact tip in local
+#           refs/preserved/ in a named retained repository. Explain what is actually
+#           recoverable and what remains to do; a hash without objects is not
+#           preservation. The proposed recipe budget is 64 KiB total and 16 KiB
+#           per note, checked by the owner rather than enforced by the server.
+#           The spike itself never opens a PR. A later implementation slice may
+#           cherry-pick spike commits under its own normal review and verification.
+#           Scientifically interesting
+#           observations or interest in archiving are signals for admission and
+#           re-planning; the science threshold remains open. Lost scratch data
+#           needs fresh collection in a later preserved run.
+#           Tell readers who checked the recorded attempts, source/job identities,
+#           bounded evidence and preservation route, how, under which assumptions,
+#           and with which discrepancies or unexamined matters. Scale this account
+#           to what happened; do not invent a fixed runbook or a verdict label.
+#           Anyone acting within ownership/claim discipline may perform this
+#           terminal review; no independent-reviewer layer is required.
+#           No lasting code changes and PRs.
+#         maxLength: 6000
+# 
+#       - key: terminal-record
+#         role: review
+#         required: true
+#         description: "Owner: terminal action, preservation and branch-disposal status."
+#         guidance: >-
+#           Identify the actor and what work ended, including cancellation or
+#           missing evidence. Anyone under ownership/claim discipline may
+#           terminalize. Record scratch-data disposition and the exact branch's
+#           preservation/disposal receipt, or its future trigger, deadline and
+#           owner. Deletion requires exact-ref authority, preservation, quiescence
+#           including queued fetches, tip reconciliation and an observed result;
+#           otherwise the operator deletes. No force-push or terminal-triggered
+#           deletion. Link any repair successors; their creation is not approval
+#           to execute them.
+#         maxLength: 3000
+# 
+traits:
+  # Planner-selected on run-slice only; the schema cannot enforce that restriction.
+  # This item keeps its own science report in science-analysis-conclusions.
+  science:
+    notes:
+      - key: scientific-analysis-plan
+        role: queue
+        required: true
+        description: "Planner: background, open question and evidence design."
+        skill: scientific-analysis-plan
+        guidance: "Use the `scientific-analysis-plan` skill."
+        maxLength: 6000
+
+      - key: science-analysis-conclusions
+        role: work
+        required: true
+        description: "Analyst: this slice's own science answers, evidence and reasoning."
+        skill: science-analysis-conclusions
+        guidance: >-
+          Use the `science-analysis-conclusions` skill. Write this slice's own
+          science report; extra analysis items add their own reports rather than
+          replacing this one.
+        maxLength: 12000
+
+      - key: backup-index
+        role: work
+        required: true
+        description: "Analyst: preservation decisions, execution and coverage."
+        guidance: >-
+          Give the analyst and human terminal reviewer this science slice's own
+          preservation decision and actual execution, including evidence that
+          could disprove its answers. Link records of at least one Holystore
+          backup, exact sources/destinations, copy/hash/inspection observations,
+          omissions, recovery attempted or absent, and path/environment caveats.
+          Requests are not storage authorization. Keep this same item open while
+          required preservation remains, recording outstanding actions and owners;
+          a promise is not a backup. If cancelled, describe what was and was not
+          retained. No separate archive trait/item, universal full-restore
+          mandate or preservation score. Cleanup still needs separate authority.
+        maxLength: 4000
