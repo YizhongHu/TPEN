@@ -13,10 +13,11 @@ import time
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import InitVar, asdict, dataclass, field
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
 from datetime import UTC, datetime, tzinfo
+from enum import Enum
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Callable, Mapping, TypeVar
@@ -380,6 +381,36 @@ class RunClock:
         return self.now().isoformat()
 
 
+class RunContextReadiness(str, Enum):
+    """Core-owned lifecycle readiness state for a ``RunContext``.
+
+    Kept separate from ``RunMetadata.status`` and ``RunResult.status``, which
+    remain application-level facts. Central context operations check this state
+    so ordinary callbacks never observe an initializing or finalizing context.
+    """
+
+    PREPARING = "preparing"
+    READY = "ready"
+    FINALIZING = "finalizing"
+    CLOSED = "closed"
+
+
+class RunContextReadinessError(RuntimeError):
+    """Raised when a ``RunContext`` operation or transition violates readiness."""
+
+
+_ALLOWED_READINESS_TRANSITIONS: dict[
+    RunContextReadiness, frozenset[RunContextReadiness]
+] = {
+    RunContextReadiness.PREPARING: frozenset(
+        {RunContextReadiness.READY, RunContextReadiness.FINALIZING}
+    ),
+    RunContextReadiness.READY: frozenset({RunContextReadiness.FINALIZING}),
+    RunContextReadiness.FINALIZING: frozenset({RunContextReadiness.CLOSED}),
+    RunContextReadiness.CLOSED: frozenset(),
+}
+
+
 @dataclass
 class RunContext:
     """Runtime context shared by runners, callbacks, and loggers."""
@@ -399,6 +430,51 @@ class RunContext:
     monotonic_clock: Callable[[], float] = field(
         default=time.perf_counter, repr=False
     )
+    invocation_id: str = field(default_factory=lambda: str(uuid4()))
+    initial_readiness: InitVar[RunContextReadiness] = RunContextReadiness.READY
+    _readiness: RunContextReadiness = field(init=False, repr=False)
+    _checkpoint_hook: Callable[[], None] | None = field(
+        default=None, init=False, repr=False
+    )
+
+    def __post_init__(self, initial_readiness: RunContextReadiness) -> None:
+        if not isinstance(initial_readiness, RunContextReadiness):
+            raise TypeError(
+                "initial_readiness must be a RunContextReadiness, got "
+                f"{type(initial_readiness).__name__}"
+            )
+        if not isinstance(self.invocation_id, str) or not self.invocation_id.strip():
+            raise ValueError("invocation_id must be a nonempty string")
+        self._readiness = initial_readiness
+
+    @property
+    def readiness(self) -> RunContextReadiness:
+        """Return the core-owned lifecycle readiness state."""
+
+        return self._readiness
+
+    def _transition_readiness(self, target: RunContextReadiness) -> None:
+        """Advance readiness along the closed core-owned state machine."""
+
+        if not isinstance(target, RunContextReadiness):
+            raise TypeError(
+                f"target readiness must be a RunContextReadiness, got {type(target).__name__}"
+            )
+        if target not in _ALLOWED_READINESS_TRANSITIONS[self._readiness]:
+            raise RunContextReadinessError(
+                f"cannot transition RunContext readiness from {self._readiness.value!r} "
+                f"to {target.value!r}"
+            )
+        self._readiness = target
+
+    def _require_ready(self, operation: str) -> None:
+        """Refuse ready-only operations outside the ``READY`` state."""
+
+        if self._readiness is not RunContextReadiness.READY:
+            raise RunContextReadinessError(
+                f"RunContext.{operation}() requires readiness 'ready', "
+                f"got {self._readiness.value!r}"
+            )
 
     @property
     def run_dir(self) -> Path:
@@ -409,6 +485,7 @@ class RunContext:
     def write_profile(self, record: ProfileRecord) -> None:
         """Write a typed rank-local resource profile when configured."""
 
+        self._require_ready("write_profile")
         if self.profile_writer is None:
             raise RuntimeError("rank-local profile writer is not configured")
         self.profile_writer.write(record)
@@ -437,6 +514,7 @@ class RunContext:
     ) -> None:
         """Emit one metric record to every configured logger."""
 
+        self._require_ready("log")
         from tpen.logging import LogRecord
 
         record = LogRecord(step=step, namespace=namespace, metrics=dict(metrics))
@@ -461,6 +539,9 @@ class RunContext:
             domain state, which is how every state-free emitter behaves.
         """
 
+        # Refuse before validating or advancing occurrence counts so a
+        # non-ready emit leaves no side effects behind.
+        self._require_ready("emit")
         if not isinstance(event, TypedEvent):
             raise TypeError(f"event must be an Event, got {type(event).__name__}")
         if isinstance(event, (Started, Ended)):
@@ -495,6 +576,7 @@ class RunContext:
             when the boundary happened, and the state is read at read time.
         """
 
+        self._require_ready("scope")
         if not isinstance(operation, Operation):
             raise TypeError(f"operation must be an Operation, got {type(operation).__name__}")
         if state is not None and not isinstance(state, DomainState):
@@ -534,33 +616,37 @@ class RunContext:
         handlers that declared the domain.
         """
 
+        self._require_ready("_dispatch_occurrence")
+        if self._checkpoint_hook is not None:
+            self._checkpoint_hook()
         write_occurrence_artifact(self, occurrence)
         write_typed_event_artifact(self, occurrence)
-        if not self.callbacks:
-            return
-        # Deferred because callback base imports RunContext from this module:
-        # `tpen.callback.base` imports `RunContext` from this module, so a
-        # module-level import here would be circular.
-        from tpen.callback.base import StatefulCallback
+        if self.callbacks:
+            # Deferred because callback base imports RunContext from this module:
+            # `tpen.callback.base` imports `RunContext` from this module, so a
+            # module-level import here would be circular.
+            from tpen.callback.base import StatefulCallback
 
-        for callback in self.callbacks:
-            if isinstance(callback, StatefulCallback):
-                # The ``isinstance(state, callback.state_type)`` filter used to
-                # live here, and moving it inside is the whole point of the
-                # ADR-E008 amendment. A callback may now declare one subscription
-                # group that wants its domain's state and another that wants a
-                # state-free boundary such as the run lifecycle, and the
-                # dispatcher cannot tell which of them an occurrence will match.
-                # Only the callback can, because only it holds the groups.
-                #
-                # A callback observing a different domain is still skipped rather
-                # than failed -- one run emits several domains' occurrences, and
-                # only some carry state -- and because both boundaries of a scope
-                # share one state, a skipped `Started` is still always matched by
-                # a skipped `Ended`, so no lifecycle pair is left half-open.
-                callback.handle_occurrence(occurrence, self, state)
-            else:
-                callback.handle_occurrence(occurrence, self)
+            for callback in self.callbacks:
+                if isinstance(callback, StatefulCallback):
+                    # The ``isinstance(state, callback.state_type)`` filter used to
+                    # live here, and moving it inside is the whole point of the
+                    # ADR-E008 amendment. A callback may now declare one subscription
+                    # group that wants its domain's state and another that wants a
+                    # state-free boundary such as the run lifecycle, and the
+                    # dispatcher cannot tell which of them an occurrence will match.
+                    # Only the callback can, because only it holds the groups.
+                    #
+                    # A callback observing a different domain is still skipped rather
+                    # than failed -- one run emits several domains' occurrences, and
+                    # only some carry state -- and because both boundaries of a scope
+                    # share one state, a skipped `Started` is still always matched by
+                    # a skipped `Ended`, so no lifecycle pair is left half-open.
+                    callback.handle_occurrence(occurrence, self, state)
+                else:
+                    callback.handle_occurrence(occurrence, self)
+        if self._checkpoint_hook is not None:
+            self._checkpoint_hook()
 
 
 class RunIdentityError(RuntimeError):
@@ -811,11 +897,37 @@ def build_run_metadata(
     command: str | None,
     config_path: str | None,
     clock: RunClock | None = None,
+    include_hardware: bool = True,
 ) -> RunMetadata:
-    """Build metadata for a resolved run config."""
+    """Build metadata for a resolved run config.
+
+    Parameters
+    ----------
+    cfg : DictConfig
+        Resolved run configuration.
+    command : str or None
+        Command provenance string, when invoked from the CLI.
+    config_path : str or None
+        Source configuration path, when supplied.
+    clock : RunClock or None, optional
+        Pre-resolved run clock. Resolved from ``cfg`` when omitted.
+    include_hardware : bool, optional
+        When ``True`` (the default), populate ``extra`` via
+        :func:`collect_hardware_metadata`. When ``False``, leave ``extra`` as
+        an empty dict so managed early-context preparation can defer hardware
+        and Torch probing until after observation scopes activate, without
+        faking git or identity fields.
+    """
 
     run_clock = resolve_run_clock(cfg) if clock is None else clock
     git = collect_git_metadata()
+    device = str(OmegaConf.select(cfg, "runtime.device", default="cpu"))
+    dtype = str(OmegaConf.select(cfg, "runtime.dtype", default="float64"))
+    extra = (
+        collect_hardware_metadata(device=device, dtype=dtype)
+        if include_hardware
+        else {}
+    )
     return RunMetadata(
         run_id=str(OmegaConf.select(cfg, "run.run_id")),
         run_name=str(OmegaConf.select(cfg, "experiment.run_name", default=OmegaConf.select(cfg, "experiment.name"))),
@@ -828,12 +940,9 @@ def build_run_metadata(
         config_path=config_path,
         resolved_config_path=str(Path(str(OmegaConf.select(cfg, "run.dir"))) / "resolved_config.yaml"),
         run_dir=str(OmegaConf.select(cfg, "run.dir")),
-        device=str(OmegaConf.select(cfg, "runtime.device", default="cpu")),
-        dtype=str(OmegaConf.select(cfg, "runtime.dtype", default="float64")),
-        extra=collect_hardware_metadata(
-            device=str(OmegaConf.select(cfg, "runtime.device", default="cpu")),
-            dtype=str(OmegaConf.select(cfg, "runtime.dtype", default="float64")),
-        ),
+        device=device,
+        dtype=dtype,
+        extra=extra,
     )
 
 
@@ -1444,6 +1553,8 @@ __all__ = [
     "REQUIRED_RUN_DIRS",
     "RunClock",
     "RunContext",
+    "RunContextReadiness",
+    "RunContextReadinessError",
     "RunIdentityError",
     "RunMetadata",
     "RunResult",

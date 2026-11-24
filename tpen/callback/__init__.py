@@ -2,7 +2,19 @@
 
 from __future__ import annotations
 
-from .base import Callback, StatefulCallback
+from .base import (
+    Callback,
+    ManagedCallback,
+    ManagedLifecycleError,
+    ResourceOwnershipClaim,
+    ResourceOwnershipConflictError,
+    RunResource,
+    StatefulCallback,
+    canonicalize_allocator_reset_scope,
+    claims_conflict,
+    is_managed_callback,
+    validate_run_resource,
+)
 from .cadence import Cadence, CadenceGate, StepCadence, StepCadenceGate, SubscriptionGroup
 from .metadata import Metadata
 from .snapshot import ConfigSnapshot, ResolvedConfigSnapshot
@@ -141,13 +153,18 @@ __all__ = [
     "FactorScalars",
     "GradientStats",
     "InitialCheckpoint",
+    "ManagedCallback",
+    "ManagedLifecycleError",
     "Metadata",
     "ModuleNorms",
     "OptimizerState",
     "ParameterActivity",
     "RawTrainingBatchRecorder",
     "ResolvedConfigSnapshot",
+    "ResourceOwnershipClaim",
+    "ResourceOwnershipConflictError",
     "ResourceUsage",
+    "RunResource",
     "RunTiming",
     "RuntimeEquivariance",
     "SamplerHealth",
@@ -159,5 +176,9 @@ __all__ = [
     "TrainPhaseTiming",
     "TrainStepTiming",
     "TrainingBatchRecorder",
+    "canonicalize_allocator_reset_scope",
+    "claims_conflict",
     "configure_terminal_logging",
+    "is_managed_callback",
+    "validate_run_resource",
 ]
