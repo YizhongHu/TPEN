@@ -24,6 +24,7 @@ import math
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 
@@ -343,7 +344,7 @@ def _frozen_eval(model: torch.nn.Module) -> Iterator[None]:
 
 
 def collect_observable_trajectory(
-    sampler: SamplingCollector,
+    sampler: object,
     model: torch.nn.Module,
     observable: Callable[[Walkers], torch.Tensor],
     *,
@@ -378,7 +379,7 @@ def collect_observable_trajectory(
 
 
 def collect_observable_trajectory_with_diagnostics(
-    sampler: SamplingCollector,
+    sampler: object,
     model: torch.nn.Module,
     observable: Callable[[Walkers], torch.Tensor],
     *,
@@ -449,6 +450,7 @@ def collect_observable_trajectory_with_diagnostics(
 
     if not isinstance(sampler, SamplingCollector):
         raise TypeError("sampler must implement SamplingCollector.collect_samples")
+    collector = cast(SamplingCollector, sampler)
     if n_draws < 1:
         raise ValueError(f"n_draws must be at least 1, got {n_draws}")
     if discard_draws < 0:
@@ -464,7 +466,7 @@ def collect_observable_trajectory_with_diagnostics(
         for draw_index in range(discard_draws + n_draws):
             # `reset` applies to the first call only: re-seeding mid-collection
             # would restart the chain and destroy the draw axis being built.
-            walkers, stats = sampler.collect_samples(
+            walkers, stats = collector.collect_samples(
                 model,
                 reset=reset and draw_index == 0,
                 device=device,
