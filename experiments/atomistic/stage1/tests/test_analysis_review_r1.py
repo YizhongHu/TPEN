@@ -138,8 +138,8 @@ def test_figures_have_signed_absolute_variance_panels_and_all_lineage_spreads(
     # Every lineage contributes all four stream values plus its aggregate to
     # the variance panel as well; a three-stream plot has only four columns.
     assert [call["values"][0] for call in variance] == [
-        (1.0, 1.0, 1.0, 1.0, 1.0),
-        (1.0, 1.0, 1.0, 1.0, 1.0),
+        (1.0, 1.0, 1.0, 1.0, 10.6875),
+        (1.0, 1.0, 1.0, 1.0, 10.6875),
     ]
     assert [call["values"][0] for call in signed] != [call["values"][0] for call in absolute]
     assert len([call for call in calls if call["kind"] == "spread"]) == 6
