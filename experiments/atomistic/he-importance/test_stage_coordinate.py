@@ -170,7 +170,7 @@ def _available_roster_for(module: object) -> dict[str, object]:
 def _identity_pairs(cells: tuple[object, ...], output_root: Path) -> list[tuple[str, str, str]]:
     pairs = []
     for cell in cells:
-        manifest = json.loads(json.dumps(cell.manifest))
+        manifest = json.loads(json.dumps(stage_coordinate._thaw(cell.manifest)))
         optimizer_cell = manifest["scientific_identity"].get("optimizer_cell")
         if isinstance(optimizer_cell, dict):
             manifest["scientific_identity"]["optimizer_cell"] = {
