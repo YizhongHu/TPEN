@@ -222,12 +222,13 @@ def _is_optimizer_cell(value: Any) -> bool:
 
 @dataclass(frozen=True)
 class MaterializedCell:
-    """One content-addressed train row without an attempt identity."""
+    """One content-addressed train row with runnability beside its identity."""
 
     manifest: Mapping[str, Any]
     content_hash: str
     output_path: Path
     seed_streams: Mapping[str, int]
+    availability: Mapping[str, Any] = MappingProxyType({})
 
 
 @dataclass(frozen=True)
@@ -513,6 +514,16 @@ def _project_identity(value: Any, *, exclude_root_topology: bool, is_root: bool 
                 raise MaterializationError("identity mapping keys must be strings")
             if is_root and exclude_root_topology and key == TOPOLOGY_KEY:
                 continue
+            # Runnability is a live roster judgement.  Keep the declared
+            # method in scientific identity, but never hash its mutable
+            # status or reason into a content-addressed row.
+            if is_root and key == "scientific_identity" and isinstance(nested, Mapping):
+                nested = dict(nested)
+                optimizer_cell = nested.get("optimizer_cell")
+                if isinstance(optimizer_cell, Mapping):
+                    nested["optimizer_cell"] = {
+                        "method": optimizer_cell.get("method")
+                    }
             projected[key] = _project_identity(nested, exclude_root_topology=False, is_root=False)
         return projected
     if isinstance(value, (list, tuple)):
@@ -651,6 +662,7 @@ def materialize_stage(
                     content_hash=digest,
                     output_path=_absolute_unique_path(output_root, stage, digest, seen_paths),
                     seed_streams=_freeze(namespaces[label]),
+                    availability=_freeze(optimizer_identity),
                 )
             )
     return tuple(cells)

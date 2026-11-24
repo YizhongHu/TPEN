@@ -299,6 +299,26 @@ def test_contract_clause_4_roster_change_leaves_declared_universe_fixed(tmp_path
     assert _sr_statuses(cells_b) == {"available"}
 
 
+def test_contract_clause_4_roster_flip_preserves_content_addresses(tmp_path: Path) -> None:
+    """Availability changes beside a row, never inside its content address."""
+
+    roster_a = _fake_roster(admitted={"adam": True, "sr": False, "kfac": False, "spring": False, "linear_method": False})
+    roster_b = _fake_roster(admitted={"adam": True, "sr": True, "kfac": False, "spring": False, "linear_method": False})
+    cells_a = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "a", availability=optimizer_grid.roster_availability(roster_a), stages=("O1",)
+    )
+    cells_b = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "b", availability=optimizer_grid.roster_availability(roster_b), stages=("O1",)
+    )
+    assert [(cell.content_hash, cell.output_path.name) for cell in cells_a] == [
+        (cell.content_hash, cell.output_path.name) for cell in cells_b
+    ]
+    sr_a = [cell for cell in cells_a if cell.availability["method"] == "sr"]
+    sr_b = [cell for cell in cells_b if cell.availability["method"] == "sr"]
+    assert {cell.availability["status"] for cell in sr_a} == {"unavailable"}
+    assert {cell.availability["status"] for cell in sr_b} == {"available"}
+
+
 # ---------------------------------------------------------------------------
 # Fail-closed roster handling
 # ---------------------------------------------------------------------------
