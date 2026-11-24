@@ -60,22 +60,17 @@ class VMCObjectiveResult:
 #: why the helium-importance closed schema requires the declaration to be
 #: present rather than inherited.
 #:
-#: THIS POLICY DOES NOT COVER EVERY ROW-DROPPING PATH. It governs rows whose
-#: LOCAL ENERGY is non-finite. `tpen.training.sr.StochasticReconfigurationUpdate`
-#: has a SECOND, unconditional drop -- rows whose parameter SCORES are
-#: non-finite -- in the same expression that consults this policy. That drop
-#: carries the same selection-bias character and is NOT governed here.
-#:
-#: It is not simply an oversight, which is why it is an open decision rather
-#: than a gap: a non-finite score row would poison the ENTIRE QGT through the
-#: outer product, so the cost of NOT dropping it is categorically different
-#: from the local-energy case -- one bad local energy biases a mean, one bad
-#: score can destroy the solve. "Refuse the step" versus "protect the solve" is
-#: therefore a real question with a different answer available.
-#:
-#: Tracked as item ``02859027-7dbf-492d-8538-2ef7e28d1cee``. Named here because
-#: a reader of this policy would otherwise reasonably conclude it covers
-#: "non-finite rows" in general, and it does not.
+#: SCORE-ROW POLICY (RESOLVED). This policy governs rows whose LOCAL ENERGY
+#: is non-finite. The sibling score-row question for
+#: :class:`~tpen.training.sr.StochasticReconfigurationUpdate` and
+#: :class:`~tpen.training.spring.SPRINGUpdate` (item
+#: ``02859027-7dbf-492d-8538-2ef7e28d1cee``) is resolved under the consolidated
+#: ``377f6b0f`` / ``02859027`` operator ruling in
+#: :func:`tpen.training.score_geometry.select_score_update_rows` with
+#: :data:`~tpen.training.score_geometry.NONFINITE_SCORE_ROW_POLICY`
+#: (``"fail_on_pinned"``): each step pins its finite row mask at the first
+#: (local-energy) evaluation, and any pinned row carrying a non-finite
+#: parameter score raises rather than silently re-masking.
 NONFINITE_LOCAL_ENERGY_POLICIES = ("fail", "mask")
 
 #: Historical default, kept so existing non-HI callers are unchanged by the

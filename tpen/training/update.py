@@ -1717,6 +1717,20 @@ class VMCUpdateMethod(Generic[InputT], ABC):
 
         return "method_defined"
 
+    def declared_nonfinite_local_energy_policy(self) -> str | None:
+        """Return the non-finite local-energy policy this method enforces, or ``None``.
+
+        Score-based methods (such as SR and SPRING) consume local energies
+        directly and override this hook to expose their resolved
+        ``nonfinite_local_energy_policy``.
+        :class:`~tpen.training.trainer.VMCTrainer` checks this declaration
+        before sampling or checkpoint restore so the trainer and update method
+        cannot silently run under disagreeing estimators. Methods that rely
+        solely on the trainer's objective return ``None``.
+        """
+
+        return None
+
     def set_step_scopes(
         self,
         *,

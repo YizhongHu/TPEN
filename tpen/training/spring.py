@@ -33,11 +33,13 @@ from tpen.dependencies import require_torch
 from tpen.nn.forward import MaterializedParameterScoreRequest
 from tpen.training.qgt import QGTOperator, SolveDiagnostics, solve_sample_space
 from tpen.training.score_geometry import (
+    NONFINITE_SCORE_ROW_POLICY,
     ScoreConventions,
     build_energy_residual,
     build_score_geometry_from_rows,
     flatten_parameter_score_blocks,
     layout_convention_fingerprint,
+    select_score_update_rows,
     unflatten_to_layout,
 )
 from tpen.training.statistics import IdentityStatisticsReducer, StatisticsReducer
@@ -63,7 +65,8 @@ torch = require_torch(feature="VMC SPRING projected-history update")
 
 
 # Bump when the persisted state envelope changes shape or meaning.
-SPRING_STATE_VERSION = "spring-state-1"
+# spring-state-2 adds `nonfinite_local_energy_policy` and `nonfinite_score_row_policy`.
+SPRING_STATE_VERSION = "spring-state-2"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -132,6 +135,10 @@ class SPRINGTelemetry(UpdateDiagnostics):
     history_decay: float
     history_advanced: bool
     diagnostics: SolveDiagnostics | None = None
+    n_nonfinite_energy_samples: int = 0
+    n_nonfinite_score_samples: int = 0
+    nonfinite_local_energy_policy: str = DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY
+    nonfinite_score_row_policy: str = NONFINITE_SCORE_ROW_POLICY
 
     def as_metrics(self, *, prefix: str = "spring") -> dict[str, Any]:
         """Return JSON-safe telemetry keys for a training metrics record.
@@ -157,6 +164,14 @@ class SPRINGTelemetry(UpdateDiagnostics):
             f"{prefix}_step": int(self.step),
             f"{prefix}_samples": int(self.n_samples),
             f"{prefix}_finite_samples": int(self.n_finite_samples),
+            f"{prefix}_nonfinite_energy_samples": int(self.n_nonfinite_energy_samples),
+            f"{prefix}_nonfinite_score_samples": int(self.n_nonfinite_score_samples),
+            f"{prefix}_nonfinite_local_energy_policy": json_safe_scalar(
+                self.nonfinite_local_energy_policy
+            ),
+            f"{prefix}_nonfinite_score_row_policy": json_safe_scalar(
+                self.nonfinite_score_row_policy
+            ),
             f"{prefix}_parameters": int(self.n_parameters),
             f"{prefix}_energy_gradient_norm": json_safe_scalar(self.energy_gradient_norm),
             f"{prefix}_update_direction_norm": json_safe_scalar(self.update_direction_norm),
@@ -211,6 +226,7 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         self.nonfinite_local_energy_policy = resolve_nonfinite_local_energy_policy(
             nonfinite_local_energy_policy
         )
+        self.nonfinite_score_row_policy = NONFINITE_SCORE_ROW_POLICY
         if not isinstance(policy, SPRINGPolicy):
             raise TypeError("SPRINGUpdate.policy must be an SPRINGPolicy")
         policy.validate()
@@ -270,6 +286,11 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
 
         return "energy_gradient_l2_preconditioned_direction_in_grad"
 
+    def declared_nonfinite_local_energy_policy(self) -> str:
+        """Return the non-finite local-energy policy enforced by this SPRING method."""
+
+        return self.nonfinite_local_energy_policy
+
     def describe(self) -> UpdateMethodDescription:
         """Add SPRING's resolved policy, including history decay, to the description."""
 
@@ -278,6 +299,8 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         settings.update(flatten_settings(self.policy.fingerprint(), prefix="policy_"))
         settings.update(flatten_settings(self.conventions.fingerprint(), prefix="conventions_"))
         settings["reducer_class"] = type(self.reducer).__qualname__
+        settings["nonfinite_local_energy_policy"] = self.nonfinite_local_energy_policy
+        settings["nonfinite_score_row_policy"] = self.nonfinite_score_row_policy
         return replace(base, settings=settings)
 
     def update_state(self) -> VMCUpdateState:
@@ -309,13 +332,15 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
                 self.conventions,
             ),
             "policy": self.policy.fingerprint(),
+            "nonfinite_local_energy_policy": self.nonfinite_local_energy_policy,
+            "nonfinite_score_row_policy": self.nonfinite_score_row_policy,
             "completed_updates": self.completed_updates,
             "history_dtype": str(self._history_dtype()),
             "history": [float(value) for value in self.history.detach().cpu().tolist()],
         }
 
     def load_method_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Restore state, rejecting version, identity, and history-shape drift."""
+        """Restore state, rejecting version, identity, policy, and history-shape drift."""
 
         if not isinstance(state, Mapping):
             raise TypeError("SPRINGUpdate state must be a mapping")
@@ -332,6 +357,18 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             )
         if state.get("policy") != self.policy.fingerprint():
             raise ValueError("SPRING checkpoint policy does not match the live method")
+        recorded_energy_policy = state.get("nonfinite_local_energy_policy")
+        if recorded_energy_policy != self.nonfinite_local_energy_policy:
+            raise ValueError(
+                "SPRING checkpoint nonfinite_local_energy_policy does not match the live method: "
+                f"recorded {recorded_energy_policy!r}, live {self.nonfinite_local_energy_policy!r}"
+            )
+        recorded_score_policy = state.get("nonfinite_score_row_policy")
+        if recorded_score_policy != self.nonfinite_score_row_policy:
+            raise ValueError(
+                "SPRING checkpoint nonfinite_score_row_policy does not match the live method: "
+                f"recorded {recorded_score_policy!r}, live {self.nonfinite_score_row_policy!r}"
+            )
         recorded_dtype = _parse_history_dtype(state.get("history_dtype"))
         expected_dtype = self._history_dtype()
         if recorded_dtype != expected_dtype:
@@ -382,17 +419,19 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             sample_shape=tuple(update_input.wavefunction.logabs.shape),
         )
 
-        energy_finite = torch.isfinite(local_energy)
-        if self.nonfinite_local_energy_policy == "fail" and not bool(energy_finite.all()):
-            n_bad = int((~energy_finite).sum().item())
-            raise RuntimeError(
-                f"SPRING refused a step: {n_bad} of {int(energy_finite.numel())} local-energy "
-                "samples are non-finite and the active policy is 'fail'. Masking them would "
-                "drop a systematically selected subsample, biasing the estimator by an "
-                "uncharacterised amount"
-            )
-        finite_mask = energy_finite & torch.isfinite(rows).all(dim=1)
-        n_finite = int(finite_mask.sum().item())
+        # Pin the finite row mask at the first (local-energy) evaluation and
+        # refuse any pinned row with non-finite parameter scores rather than
+        # silently re-masking (consolidated 377f6b0f / 02859027 ruling).
+        selection = select_score_update_rows(
+            local_energy=local_energy,
+            rows=rows,
+            nonfinite_local_energy_policy=self.nonfinite_local_energy_policy,
+            method_name="SPRING",
+        )
+        finite_mask = selection.finite_mask
+        n_finite = selection.n_finite
+        n_nonfinite_energy = selection.n_nonfinite_energy
+        n_nonfinite_score = selection.n_nonfinite_score_total
 
         if update_input.batch.n_electrons == 0:
             return self._skip(
@@ -401,6 +440,8 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
                 n_samples=n_samples,
                 n_finite=n_finite,
                 n_parameters=n_parameters,
+                n_nonfinite_energy=n_nonfinite_energy,
+                n_nonfinite_score=n_nonfinite_score,
             )
         if n_finite == 0:
             raise RuntimeError(
@@ -414,6 +455,8 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
                 n_samples=n_samples,
                 n_finite=n_finite,
                 n_parameters=n_parameters,
+                n_nonfinite_energy=n_nonfinite_energy,
+                n_nonfinite_score=n_nonfinite_score,
             )
         if n_finite != n_samples:
             rows = rows[finite_mask]
@@ -459,6 +502,8 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
                 n_parameters=n_parameters,
                 energy_gradient_norm=energy_gradient_norm,
                 diagnostics=diagnostics,
+                n_nonfinite_energy=n_nonfinite_energy,
+                n_nonfinite_score=n_nonfinite_score,
             )
 
         projected_history = direction + decayed
@@ -471,6 +516,8 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
                 n_parameters=n_parameters,
                 energy_gradient_norm=energy_gradient_norm,
                 diagnostics=diagnostics,
+                n_nonfinite_energy=n_nonfinite_energy,
+                n_nonfinite_score=n_nonfinite_score,
             )
         history_norm = float(torch.linalg.vector_norm(projected_history).item())
         if not _is_finite(history_norm):
@@ -482,6 +529,8 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
                 n_parameters=n_parameters,
                 energy_gradient_norm=energy_gradient_norm,
                 diagnostics=diagnostics,
+                n_nonfinite_energy=n_nonfinite_energy,
+                n_nonfinite_score=n_nonfinite_score,
             )
 
         direction_norm = history_norm
@@ -497,6 +546,10 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             step=update_input.step,
             n_samples=n_samples,
             n_finite_samples=n_finite,
+            n_nonfinite_energy_samples=n_nonfinite_energy,
+            n_nonfinite_score_samples=n_nonfinite_score,
+            nonfinite_local_energy_policy=self.nonfinite_local_energy_policy,
+            nonfinite_score_row_policy=self.nonfinite_score_row_policy,
             n_parameters=n_parameters,
             energy_gradient_norm=energy_gradient_norm,
             update_direction_norm=direction_norm,
@@ -541,6 +594,8 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         n_parameters: int,
         energy_gradient_norm: float = 0.0,
         diagnostics: SolveDiagnostics | None = None,
+        n_nonfinite_energy: int = 0,
+        n_nonfinite_score: int = 0,
     ) -> VMCUpdateResult:
         """Record a non-applied step without changing canonical history."""
 
@@ -550,6 +605,10 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             step=step,
             n_samples=n_samples,
             n_finite_samples=n_finite,
+            n_nonfinite_energy_samples=n_nonfinite_energy,
+            n_nonfinite_score_samples=n_nonfinite_score,
+            nonfinite_local_energy_policy=self.nonfinite_local_energy_policy,
+            nonfinite_score_row_policy=self.nonfinite_score_row_policy,
             n_parameters=n_parameters,
             energy_gradient_norm=energy_gradient_norm,
             update_direction_norm=0.0,

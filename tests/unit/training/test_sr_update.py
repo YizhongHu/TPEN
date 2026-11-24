@@ -303,31 +303,31 @@ def test_nonfinite_energy_samples_are_excluded_exactly_as_the_objective_does() -
     assert method.last_telemetry.n_finite_samples == 6
 
 
-def test_a_nonfinite_score_row_is_dropped_with_its_sample() -> None:
-    """One exploded score row cannot poison the whole QGT through its outer product."""
+def test_a_nonfinite_score_row_on_a_pinned_sample_refuses_the_step() -> None:
+    """Consolidated 377f6b0f/02859027 ruling: a bad score on a pinned row raises.
+
+    Previously ``test_a_nonfinite_score_row_is_dropped_with_its_sample`` asserted
+    that SR silently dropped row 2 and applied the step on the remaining rows.
+    Under the consolidated ``377f6b0f`` / ``02859027`` operator ruling
+    (``NONFINITE_SCORE_ROW_POLICY = "fail_on_pinned"``), the step pins its finite
+    row mask at the local-energy evaluation and refuses any pinned row whose
+    parameter scores are non-finite -- even under ``nonfinite_local_energy_policy="mask"``
+    -- leaving parameters bitwise unchanged and ``completed_updates`` untouched.
+    """
 
     parameter, features, energies = _problem(n_samples=7, n_parameters=3, seed=6)
     poisoned = features.clone()
     poisoned[2, 1] = float("nan")
-    keep = [0, 1, 3, 4, 5, 6]
 
     before = parameter.detach().clone()
     method = _method(parameter)
-    method.update(_step_input(parameter, poisoned, energies))
+    assert method.nonfinite_local_energy_policy == "mask"
 
-    expected = sr_direction(
-        features.numpy()[keep],
-        energies.numpy()[keep],
-        absolute=0.0,
-        relative=1.0e-2,
-    )
-    np.testing.assert_allclose(
-        (before - parameter.detach()).numpy(),
-        LEARNING_RATE * expected.direction,
-        rtol=SOLVE_TOLERANCE,
-        atol=SOLVE_TOLERANCE,
-    )
-    assert method.last_telemetry.n_finite_samples == 6
+    with pytest.raises(RuntimeError, match=r"non-finite parameter scores.*\[2\]"):
+        method.update(_step_input(parameter, poisoned, energies))
+
+    assert torch.equal(parameter.detach(), before)
+    assert method.completed_updates == 0
 
 
 def test_trust_cap_rescales_the_step_without_turning_it() -> None:
