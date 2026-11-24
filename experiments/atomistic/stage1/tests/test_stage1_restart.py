@@ -1,4 +1,4 @@
-"""Unit contracts for the Stage-1 restartable-start adapter."""
+"""Contracts for the configured Stage-1 train-resume gateway."""
 
 from __future__ import annotations
 
@@ -8,30 +8,22 @@ from types import SimpleNamespace
 import pytest
 from omegaconf import OmegaConf
 
-from experiments.atomistic.stage1.restart import (
-    RestartCause,
-    RestartApproval,
-    RestartRefusal,
-    StartDecision,
-    configure_attempt_local_diagnostics,
-    select_restart,
-)
-from experiments.toolkit.run_paths import resolve_run_dir
+from experiments.atomistic.stage1 import restart
 
 
-def _cfg(tmp_path: Path | None = None) -> object:
-    root = str(tmp_path or Path.cwd())
+def _cfg(tmp_path: Path) -> object:
     return OmegaConf.create(
         {
             "experiment": {"name": "stage1_he", "sector": "atomistic"},
-            "run": {"root": root, "run_id": "run-0", "layout": "nested"},
+            "run": {"root": str(tmp_path), "run_id": "run-0", "layout": "nested"},
             "trainer": {"max_steps": 100000},
+            "runtime": {"seed": 11},
+            "overlay_marker": "preserve-me",
+            "runner": {"_target_": "tpen.runner.Train"},
             "callbacks": [
                 {"_target_": "tpen.callback.InitialCheckpoint", "output_dir": "old"},
-                {"_target_": "tpen.callback.RawTrainingBatchRecorder", "path": "old-history"},
                 {"_target_": "tpen.callback.ParameterActivity", "output_path": "old-activity"},
             ],
-            "loggers": [{"_target_": "tpen.logging.JSONL", "path": "old-metrics.jsonl"}],
         }
     )
 
@@ -52,316 +44,129 @@ def _row(tmp_path: Path) -> dict[str, object]:
     }
 
 
-def test_fresh_selection_is_read_only_and_has_initial_marker(tmp_path: Path, monkeypatch) -> None:
-    from experiments.atomistic.stage1 import restart
-
-    monkeypatch.setattr(restart, "discover_published_checkpoint", lambda _: None)
-    selected = select_restart(cfg=_cfg(tmp_path), row=_row(tmp_path))
-    assert selected.decision is StartDecision.FRESH
-    assert selected.content_id == "initial"
-    assert not resolve_run_dir(_row(tmp_path)).exists()
-
-
-def test_config_run_dir_mismatch_refuses_before_lease_or_driver(
-    tmp_path: Path, monkeypatch,
-) -> None:
-    from experiments.atomistic.stage1 import restart
-
-    row = _row(tmp_path)
-    cfg = _cfg(tmp_path)
-    cfg.run.root = str(tmp_path / "wrong-root")
-    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
-    monkeypatch.setattr(restart, "validate_native_recovery_profile", lambda _cfg: None)
-    with pytest.raises(RestartRefusal, match="config-derived run directory differs") as refused:
-        restart.execute_restart(
-            cfg=cfg, row=row, config_path="train.yaml",
-            run=lambda *_a, **_k: pytest.fail("driver"),
-        )
-    assert refused.value.cause is RestartCause.RUN_DIRECTORY_MISMATCH
-    assert not (resolve_run_dir(row) / "attempts").exists()
-
-
-def test_empty_post_run_publication_has_typed_nonempty_park_cause(
-    tmp_path: Path, monkeypatch,
-) -> None:
-    from experiments.atomistic.stage1 import restart
-
-    row = _row(tmp_path)
-    cfg = _cfg(tmp_path)
-    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
-    monkeypatch.setattr(restart, "validate_native_recovery_profile", lambda _cfg: None)
-    monkeypatch.setattr(restart, "discover_published_checkpoint", lambda _path: None)
-    result = restart.execute_restart(
-        cfg=cfg, row=row, config_path="train.yaml", run=lambda *_a, **_k: 2,
+def _evidence(run_dir: Path, checkpoint_dir: Path, *, step: int = 0) -> object:
+    return SimpleNamespace(
+        verdict="incomplete",
+        refusal=None,
+        checkpoint={
+            "checkpoint_dir": str(checkpoint_dir),
+            "next_iteration": step,
+            "completed_updates": step,
+        },
+        checkpoint_ref=None,
+        run_dir=str(run_dir),
     )
-    assert result.outcome == "parked"
-    assert result.receipt["cause"] == RestartCause.NO_PUBLICATION.value
-    assert result.receipt["reason"]
 
 
-def test_attempt_diagnostics_are_never_shared_with_previous_attempt(tmp_path: Path) -> None:
-    cfg = _cfg(tmp_path)
-    configure_attempt_local_diagnostics(cfg, tmp_path / "attempt-2")
-    assert cfg.callbacks[1].path == str(tmp_path / "attempt-2" / "training_history")
-    assert cfg.callbacks[2].output_path == str(tmp_path / "attempt-2" / "parameter_activity.json")
-    assert cfg.loggers[0].path == str(tmp_path / "attempt-2" / "metrics.jsonl")
-
-
-def test_takeover_requires_terminal_quiescent_budget_and_identity() -> None:
-    approval = RestartApproval(
-        predecessor_content_id="content",
-        terminal_pbs_proof="pbs-terminal",
-        quiescent=True,
-        adopted_budget="budget-1",
-        lineage_id="lineage",
-        config_identity="config",
-        overlay_identity="overlay",
-        target_iterations=100000,
-        superseded_attempt_keys=("attempt-000000.json",),
-    )
-    approval.validate(
-        expected={
-            "predecessor_content_id": "content",
-            "lineage_id": "lineage",
-            "config_identity": "config",
-            "overlay_identity": "overlay",
-            "target_iterations": 100000,
-        }
-    )
-    with pytest.raises(RestartRefusal, match="quiescence"):
-        RestartApproval(
-            predecessor_content_id="content", terminal_pbs_proof="proof",
-            quiescent=False, adopted_budget="budget", lineage_id="lineage",
-            config_identity="config", overlay_identity="overlay", target_iterations=100000,
-            superseded_attempt_keys=("attempt-000000.json",),
-        ).validate(expected={"predecessor_content_id": "content"})
-
-
-@pytest.mark.parametrize(
-    "superseded_attempt_keys",
-    [(), ("attempt-000000.json", "attempt-000000.json"), ("",)],
-)
-def test_takeover_approval_requires_nonempty_unique_nonblank_scope(
-    superseded_attempt_keys: tuple[str, ...],
-) -> None:
-    approval = RestartApproval(
-        predecessor_content_id="initial",
-        terminal_pbs_proof="pbs-terminal",
-        quiescent=True,
-        adopted_budget="budget-1",
-        lineage_id="lineage",
-        config_identity="config",
-        overlay_identity="overlay",
-        target_iterations=100000,
-        superseded_attempt_keys=superseded_attempt_keys,
-    )
-    with pytest.raises(RestartRefusal) as refused:
-        approval.validate(
-            expected={
-                "predecessor_content_id": "initial",
-                "lineage_id": "lineage",
-                "config_identity": "config",
-                "overlay_identity": "overlay",
-                "target_iterations": 100000,
-            }
-        )
-    assert refused.value.cause is RestartCause.TAKEOVER_APPROVAL_SCOPE_MISMATCH
-
-
-def test_execute_restart_refuses_empty_takeover_scope_before_claim_or_driver(
-    tmp_path: Path, monkeypatch,
-) -> None:
-    from experiments.atomistic.stage1 import restart
-
+def test_missing_resume_refuses_before_runner_call(tmp_path: Path, monkeypatch) -> None:
     cfg = _cfg(tmp_path)
     row = _row(tmp_path)
-    run_dir = resolve_run_dir(row)
-    attempts = run_dir / "attempts"
-    attempts.mkdir(parents=True)
-    before = sorted(path.relative_to(attempts).as_posix() for path in attempts.rglob("*"))
-    calls: list[str] = []
+    calls: list[object] = []
+    refusal = SimpleNamespace(
+        verdict="refused",
+        refusal={"code": "missing-checkpoint", "reason": "checkpoint is absent"},
+        checkpoint=None,
+        checkpoint_ref=None,
+    )
     monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
-    monkeypatch.setattr(restart, "validate_native_recovery_profile", lambda _cfg: None)
-    monkeypatch.setattr(
-        restart,
-        "select_restart",
-        lambda **_kwargs: restart.RestartSelection(
-            StartDecision.FRESH, run_dir, None, None, None
-        ),
-    )
-    approval = RestartApproval(
-        predecessor_content_id="initial",
-        terminal_pbs_proof="pbs-terminal",
-        quiescent=True,
-        adopted_budget="budget-1",
-        lineage_id="he-lineage-0",
-        config_identity="a" * 64,
-        overlay_identity="none",
-        target_iterations=100000,
-        superseded_attempt_keys=(),
-    )
-    with pytest.raises(RestartRefusal) as refused:
+
+    with pytest.raises(restart.RestartRefusal, match="checkpoint is absent"):
         restart.execute_restart(
             cfg=cfg,
             row=row,
             config_path="train.yaml",
-            run=lambda *_a, **_k: calls.append("driver") or 0,
-            run_dir=run_dir,
-            takeover=approval,
+            inspector=lambda _path: refusal,
+            run=lambda *_a, **_k: calls.append(True) or 0,
         )
-    assert refused.value.cause is RestartCause.TAKEOVER_APPROVAL_SCOPE_MISMATCH
     assert calls == []
-    after = sorted(path.relative_to(attempts).as_posix() for path in attempts.rglob("*"))
-    assert after == before
 
 
-def test_execute_calls_profile_gate_before_driver_and_uses_durable_outcome(
-    tmp_path: Path, monkeypatch,
-) -> None:
-    from experiments.atomistic.stage1 import restart
-
+def test_exact_runner_load_and_overlay_survive_configured_restore(tmp_path: Path, monkeypatch) -> None:
     cfg = _cfg(tmp_path)
     row = _row(tmp_path)
-    run_dir = resolve_run_dir(row)
-    calls: list[object] = []
-    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        restart, "validate_native_recovery_profile", lambda _cfg: calls.append("profile")
-    )
-    monkeypatch.setattr(
-        restart,
-        "select_restart",
-        lambda **_kwargs: restart.RestartSelection(
-            StartDecision.FRESH, run_dir, None, None, None
-        ),
-    )
-
-    def fake_run(run_cfg, **_kwargs):
-        calls.append("driver")
-        run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "status.json").write_text('{"status":"completed"}', encoding="utf-8")
-        return 99
-
-    terminal = SimpleNamespace(next_iteration=100000, content_id="terminal-content")
-    discoveries = iter([terminal])
-    monkeypatch.setattr(restart, "discover_published_checkpoint", lambda _path: next(discoveries))
-    result = restart.execute_restart(
-        cfg=cfg, row=row, config_path="train.yaml", run=fake_run,
-        run_dir=run_dir, profile_validator=restart.validate_native_recovery_profile,
-    )
-    assert calls == ["profile", "driver"]
-    assert result.outcome == "completed"
-    assert result.exit_code == 99
-    assert result.receipt["published_content_id"] == "terminal-content"
-
-
-def test_occupied_lease_refuses_without_overwrite_or_driver(tmp_path: Path, monkeypatch) -> None:
-    from experiments.atomistic.stage1 import restart
-
-    cfg = _cfg(tmp_path)
-    row = _row(tmp_path)
-    run_dir = resolve_run_dir(row)
-    lease_dir = run_dir / "attempts"
-    lease_dir.mkdir(parents=True)
-    lease = lease_dir / "initial.json"
-    lease.write_text('{"owner":"first"}\n', encoding="utf-8")
-    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(restart, "validate_native_recovery_profile", lambda _cfg: None)
-    monkeypatch.setattr(
-        restart,
-        "select_restart",
-        lambda **_kwargs: restart.RestartSelection(
-            StartDecision.FRESH, run_dir, None, None, None
-        ),
-    )
-    with pytest.raises(RestartRefusal, match="occupied"):
-        restart.execute_restart(
-            cfg=cfg, row=row, config_path="train.yaml", run=lambda *_a, **_k: pytest.fail("driver"),
-            run_dir=run_dir,
-        )
-    assert lease.read_text(encoding="utf-8") == '{"owner":"first"}\n'
-
-
-def test_restore_passes_typed_request_and_drops_initial_checkpoint(tmp_path: Path, monkeypatch) -> None:
-    from experiments.atomistic.stage1 import restart
-
-    cfg = _cfg(tmp_path)
-    row = _row(tmp_path)
-    run_dir = resolve_run_dir(row)
-    request = object()
-    predecessor = SimpleNamespace(content_id="published-content")
-    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(restart, "validate_native_recovery_profile", lambda _cfg: None)
-    monkeypatch.setattr(
-        restart,
-        "select_restart",
-        lambda **_kwargs: restart.RestartSelection(
-            StartDecision.RESTORE, run_dir, predecessor, None, request
-        ),
-    )
+    run_dir = Path(tmp_path) / "stage1_he" / "atomistic" / "run-0"
+    checkpoint = run_dir / "checkpoints" / "step_000000"
+    checkpoint.mkdir(parents=True)
     observed: dict[str, object] = {}
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
 
     def fake_run(run_cfg, **kwargs):
-        observed["request"] = kwargs["restore_request"]
-        observed["initial_callbacks"] = [
-            item.get("_target_") for item in run_cfg.callbacks
-        ]
+        observed["load"] = OmegaConf.to_container(run_cfg.runner.load, resolve=True)
+        observed["overlay_marker"] = run_cfg.overlay_marker
+        observed["callback_targets"] = [item["_target_"] for item in run_cfg.callbacks]
+        observed["kwargs"] = kwargs
         return 0
 
-    monkeypatch.setattr(restart, "discover_published_checkpoint", lambda _path: None)
-    restart.execute_restart(
-        cfg=cfg, row=row, config_path="train.yaml", run=fake_run,
-        run_dir=run_dir,
+    result = restart.execute_restart(
+        cfg=cfg,
+        row=row,
+        config_path="train.yaml",
+        inspector=lambda path: _evidence(run_dir, checkpoint),
+        run=fake_run,
     )
-    assert observed == {"request": request, "initial_callbacks": [
-        "tpen.callback.RawTrainingBatchRecorder", "tpen.callback.ParameterActivity",
-    ]}
+
+    assert observed["load"] == {"mode": "train_resume", "path": str(checkpoint.resolve())}
+    assert observed["overlay_marker"] == "preserve-me"
+    assert observed["callback_targets"] == ["tpen.callback.ParameterActivity"]
+    assert observed["kwargs"] == {"config_path": "train.yaml", "command": "stage1 restart"}
+    assert result.runner_load == observed["load"]
+    assert result.exit_code == 0
 
 
-def test_newer_complete_checkpoint_is_parked_before_start(tmp_path: Path, monkeypatch) -> None:
-    from experiments.atomistic.stage1 import restart
-
-    row = _row(tmp_path)
-    run_dir = resolve_run_dir(row)
-    (run_dir / "checkpoints").mkdir(parents=True)
-    monkeypatch.setattr(restart, "discover_published_checkpoint", lambda _path: None)
-    monkeypatch.setattr(
-        restart,
-        "_complete_refs",
-        lambda _root: [SimpleNamespace(next_iteration=1000, checkpoint_dir=run_dir / "checkpoints" / "step_001000")],
-    )
-    selected = select_restart(cfg=_cfg(tmp_path), row=row, run_dir=run_dir)
-    assert selected.decision is StartDecision.PARK
-    assert "complete checkpoint is newer" in selected.reason
-
-
-def test_terminal_publication_cannot_hide_a_failed_durable_status(
-    tmp_path: Path, monkeypatch,
-) -> None:
-    from experiments.atomistic.stage1 import restart
-
+def test_row_and_config_run_identity_are_preserved(tmp_path: Path, monkeypatch) -> None:
     cfg = _cfg(tmp_path)
     row = _row(tmp_path)
-    run_dir = resolve_run_dir(row)
+    cfg.run.run_id = "different-run"
+    calls: list[object] = []
     monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
-    monkeypatch.setattr(restart, "validate_native_recovery_profile", lambda _cfg: None)
-    monkeypatch.setattr(
-        restart,
-        "select_restart",
-        lambda **_kwargs: restart.RestartSelection(
-            StartDecision.FRESH, run_dir, None, None, None
-        ),
-    )
 
-    def failed_run(run_cfg, **_kwargs):
-        run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "status.json").write_text('{"status":"failed"}', encoding="utf-8")
-        return 0
+    with pytest.raises(restart.RestartRefusal, match="run directory"):
+        restart.execute_restart(
+            cfg=cfg,
+            row=row,
+            config_path="train.yaml",
+            inspector=lambda _path: pytest.fail("inspection must not run"),
+            run=lambda *_a, **_k: calls.append(True) or 0,
+        )
+    assert calls == []
 
-    terminal = SimpleNamespace(next_iteration=100000, content_id="terminal-content")
-    monkeypatch.setattr(restart, "discover_published_checkpoint", lambda _path: terminal)
-    result = restart.execute_restart(
-        cfg=cfg, row=row, config_path="train.yaml", run=failed_run, run_dir=run_dir,
+
+def test_requested_resume_never_falls_back_to_fresh(tmp_path: Path, monkeypatch) -> None:
+    cfg = _cfg(tmp_path)
+    row = _row(tmp_path)
+    refusal = SimpleNamespace(
+        verdict="refused",
+        refusal={"code": "missing-run-dir", "reason": "run directory not found"},
+        checkpoint=None,
+        checkpoint_ref=None,
     )
-    assert result.outcome == "failed"
-    assert result.receipt["exit_code"] == 0
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+
+    with pytest.raises(restart.RestartRefusal) as error:
+        restart.execute_restart(
+            cfg=cfg,
+            row=row,
+            config_path="train.yaml",
+            inspector=lambda _path: refusal,
+            run=lambda *_a, **_k: pytest.fail("fresh fallback"),
+        )
+    assert error.value.cause is restart.RestartCause.MISSING_RESUME
+
+
+def test_incompatible_checkpoint_counters_refuse_before_runner(tmp_path: Path, monkeypatch) -> None:
+    cfg = _cfg(tmp_path)
+    row = _row(tmp_path)
+    run_dir = Path(tmp_path) / "stage1_he" / "atomistic" / "run-0"
+    checkpoint = run_dir / "checkpoints" / "step_100001"
+    checkpoint.mkdir(parents=True)
+    evidence = _evidence(run_dir, checkpoint, step=100001)
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+
+    with pytest.raises(restart.RestartRefusal, match="incompatible"):
+        restart.execute_restart(
+            cfg=cfg,
+            row=row,
+            config_path="train.yaml",
+            inspector=lambda _path: evidence,
+            run=lambda *_a, **_k: pytest.fail("incompatible resume launched"),
+        )

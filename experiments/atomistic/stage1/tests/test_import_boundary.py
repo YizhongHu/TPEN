@@ -9,17 +9,7 @@ HERE = Path(__file__).parents[1]
 
 
 _PUBLIC_IMPORTS = {
-    "tpen.run": {"run_from_config", "load_config"},
-}
-_RESTART_IMPORTS = {
-    "tpen.execution": {
-        "create_json_receipt", "discover_published_checkpoint", "ReceiptExistsError",
-        "OperationalRestoreRequest", "ScienceIntent", "CheckpointEvidence",
-        "select_recovery", "validate_native_recovery_profile",
-    },
-    "tpen.checkpoint": {
-        "list_complete_checkpoints", "CheckpointRef", "configured_load_mode",
-    },
+    "tpen.inspection": {"RunEvidence", "inspect_run"},
     "tpen.run": {"run_from_config", "load_config"},
 }
 
@@ -28,7 +18,7 @@ def _violations(path: Path, source: str) -> list[str]:
     """Return public-boundary violations for one study source file."""
 
     tree = ast.parse(source, filename=str(path))
-    allowed = _RESTART_IMPORTS if path.name == "restart.py" else _PUBLIC_IMPORTS
+    allowed = _PUBLIC_IMPORTS
     violations: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -65,6 +55,6 @@ def test_only_train_and_eval_use_the_public_tpen_gateway() -> None:
 
 def test_restart_deep_submodule_import_is_rejected() -> None:
     restart = HERE / "restart.py"
-    source = "from tpen.execution.invocation import create_json_receipt\n"
+    source = "from tpen.inspection._private import inspect_run\n"
     violations = _violations(restart, source)
-    assert violations == [f"{restart}: from tpen.execution.invocation"]
+    assert violations == [f"{restart}: from tpen.inspection._private"]
