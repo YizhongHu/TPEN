@@ -174,6 +174,28 @@ def test_fresh_train_stop_uses_runtime_planned_yield_without_changing_cfg(
     assert resolved["trainer"]["max_steps"] == 100_000
 
 
+def test_reached_prefix_stop_refuses_before_runner_call(tmp_path: Path) -> None:
+    """A published prefix cannot be asked to stop at its already-reached boundary."""
+
+    cfg = _cfg(tmp_path)
+    row = _row(tmp_path)
+    row["checkpoint_steps"] = [0, 1_000, 100_000]
+    row["execution"] = {"stop_at": 1_000}
+    run_dir = Path(tmp_path) / "stage1_he" / "atomistic" / "run-0"
+    checkpoint = run_dir / "checkpoints" / "step_001000"
+    checkpoint.mkdir(parents=True)
+    evidence = _evidence(run_dir, checkpoint, step=1_000)
+
+    with pytest.raises(restart.RestartRefusal, match="stale or already reached"):
+        restart.execute_restart(
+            cfg=cfg,
+            row=row,
+            config_path="train.yaml",
+            inspector=lambda _path: evidence,
+            run=lambda *_a, **_k: pytest.fail("stale prefix launched"),
+        )
+
+
 def test_recorder_configured_refuses_before_runner_call(tmp_path: Path, monkeypatch) -> None:
     """Deferred recorder resume is loud and never reaches inspection or launch."""
 
