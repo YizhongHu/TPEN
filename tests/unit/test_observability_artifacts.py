@@ -16,6 +16,7 @@ import pytest
 
 import tpen.artifacts as artifacts_mod
 import tpen.inspection as inspection_mod
+import tpen.observability_artifacts as obs_mod
 from tpen.artifacts import (
     ArtifactDestination,
     ArtifactManager,
@@ -39,6 +40,7 @@ from tpen.artifacts import (
 )
 from tpen.callback.base import claims_conflict
 from tpen.checkpoint.manifest import CheckpointManifest
+from tpen.durable_append import PartialAppendError, ends_without_newline
 from tpen.inspection import (
     ObservabilityBundleInspection,
     RunObservabilityInspection,
@@ -1674,3 +1676,630 @@ def test_reexports_and_import_firewall() -> None:
     )
     assert res_insp.returncode == 0, res_insp.stderr
     assert res_insp.stdout.strip() == "inspection-ok"
+
+
+# ---------------------------------------------------------------------------
+# 10. T2 review discriminating & coverage-gap tests (41211cc6)
+# ---------------------------------------------------------------------------
+
+
+def test_counter_missing_operand_breaks_interval(tmp_path: Path) -> None:
+    manager = _make_manager(tmp_path, run_id="counter-missing-operand")
+    base_s0 = _appendix_a_samples()[0]
+
+    s0 = copy.deepcopy(base_s0)
+    s0["sequence"] = 0
+    s0["read_start_ns"] = 1_000_999_990_000
+    s0["read_end_ns"] = 1_001_000_000_000
+    s0["readings"] = {
+        "cpu_user_s": {"status": "ok", "value": 100.0},
+        "cpu_system_s": {"status": "ok", "value": 5.0},
+    }
+
+    s1 = copy.deepcopy(s0)
+    s1["sequence"] = 1
+    s1["read_start_ns"] = 1_010_999_990_000
+    s1["read_end_ns"] = 1_011_000_000_000
+    # cpu_user_s omitted: missing operand in the middle sample.
+    s1["readings"] = {
+        "cpu_system_s": {"status": "ok", "value": 7.0},
+    }
+
+    s2 = copy.deepcopy(s0)
+    s2["sequence"] = 2
+    s2["read_start_ns"] = 1_020_999_990_000
+    s2["read_end_ns"] = 1_021_000_000_000
+    s2["readings"] = {
+        "cpu_user_s": {"status": "ok", "value": 124.0},
+        "cpu_system_s": {"status": "ok", "value": 9.0},
+    }
+
+    status = _appendix_a_status()
+    status["counts"] = {"attempted": 3, "written": 3, "dropped": 0, "failed": 0}
+    writer, _ = _write_complete_bundle(
+        manager,
+        samples=[s0, s1, s2],
+        status_dict=status,
+        data_completeness="complete",
+    )
+
+    bundle = inspect_observability_bundle(writer.bundle_dir)
+    cpu_system = bundle.summary.quantity("self-rusage", "cpu_system_s")
+    cpu_user = bundle.summary.quantity("self-rusage", "cpu_user_s")
+    assert cpu_system is not None and cpu_user is not None
+
+    assert cpu_system.valid_interval_count == 2
+    assert cpu_system.broken_interval_count == 0
+    assert math.isclose(cpu_system.valid_delta_total or 0.0, 4.0)
+
+    # Missing cpu_user_s at seq=1 must break intervals rather than bridging seq=0 -> seq=2.
+    assert cpu_user.valid_interval_count == 0
+    assert cpu_user.broken_interval_count >= 1
+    assert cpu_user.valid_delta_total is None
+    assert cpu_user.valid_rate_per_second is None
+
+
+def test_counter_sequence_gap_breaks_interval(tmp_path: Path) -> None:
+    manager = _make_manager(tmp_path, run_id="counter-seq-gap")
+    base_s0 = _appendix_a_samples()[0]
+
+    s0 = copy.deepcopy(base_s0)
+    s0["sequence"] = 0
+    s0["read_start_ns"] = 1_000_999_990_000
+    s0["read_end_ns"] = 1_001_000_000_000
+    s0["readings"] = {"cpu_user_s": {"status": "ok", "value": 100.0}}
+
+    # Skip seq=1 entirely to simulate a dropped sample.
+    s2 = copy.deepcopy(s0)
+    s2["sequence"] = 2
+    s2["read_start_ns"] = 1_020_999_990_000
+    s2["read_end_ns"] = 1_021_000_000_000
+    s2["readings"] = {"cpu_user_s": {"status": "ok", "value": 124.0}}
+
+    status = _appendix_a_status()
+    status["data_completeness"] = "partial"
+    status["counts"] = {"attempted": 3, "written": 2, "dropped": 1, "failed": 0}
+    writer, _ = _write_complete_bundle(
+        manager,
+        samples=[s0, s2],
+        status_dict=status,
+        data_completeness="partial",
+    )
+
+    bundle = inspect_observability_bundle(writer.bundle_dir)
+    cpu_user = bundle.summary.quantity("self-rusage", "cpu_user_s")
+    assert cpu_user is not None
+    assert cpu_user.valid_interval_count == 0
+    assert cpu_user.broken_interval_count == 1
+    assert cpu_user.valid_delta_total is None
+    assert cpu_user.valid_rate_per_second is None
+
+
+def test_closed_bundle_missing_descriptors_cannot_claim_complete_and_checks_descriptor_set_id(
+    tmp_path: Path,
+) -> None:
+    manager = _make_manager(tmp_path, run_id="missing-descriptors")
+    writer = ObservabilityBundleWriter(manager, INVOCATION_ID)
+    writer.write_open_manifest(_open_manifest())
+    writer.write_inventory(
+        ObservabilityInventory.from_mapping(_appendix_a_inventory())
+    )
+    # Intentionally omit write_descriptors() and write samples carrying a wrong descriptor_set_id.
+    wrong_samples = copy.deepcopy(_appendix_a_samples())
+    for raw in wrong_samples:
+        raw["descriptor_set_id"] = "wrong-descriptor-set"
+        res = writer.append_sample(ObservabilitySample.from_mapping(raw))
+        assert res.written is True
+    writer.write_status(ObservabilityStatus.from_mapping(_appendix_a_status()))
+    closed = writer.finalize_manifest(
+        _closed_manifest_template(data_completeness="complete")
+    )
+    assert not (writer.bundle_dir / "descriptors.json").exists()
+    assert closed.descriptor_set_id == "descriptors-example"
+
+    bundle = inspect_observability_bundle(writer.bundle_dir)
+    assert bundle.descriptors is None
+    assert bundle.derived_data_completeness != "complete"
+    assert len(bundle.interior_errors) >= 1
+    assert bundle.samples["resources-example"] == ()
+
+
+def test_reader_diagnoses_undeclared_clock_domain_against_inventory(
+    tmp_path: Path,
+) -> None:
+    manager = _make_manager(tmp_path, run_id="undeclared-clock-domain")
+    base_samples = _appendix_a_samples()
+    s0 = copy.deepcopy(base_samples[0])
+    s1 = copy.deepcopy(base_samples[3])
+    s0["clock_domain_id"] = "undeclared-foreign-clock"
+    s1["clock_domain_id"] = "undeclared-foreign-clock"
+
+    status = _appendix_a_status()
+    status["counts"] = {"attempted": 2, "written": 2, "dropped": 0, "failed": 0}
+    writer, _ = _write_complete_bundle(
+        manager,
+        samples=[s0, s1],
+        status_dict=status,
+        data_completeness="complete",
+    )
+
+    try:
+        bundle = inspect_observability_bundle(writer.bundle_dir)
+    except ObservabilitySchemaError:
+        return
+
+    assert bundle.derived_data_completeness != "complete"
+    assert bool(bundle.interior_errors) or any(
+        "clock" in diag.code for diag in bundle.diagnostics
+    )
+
+
+def test_closed_manifest_cannot_omit_inspected_artifacts_from_integrity_check(
+    tmp_path: Path,
+) -> None:
+    manager = _make_manager(tmp_path, run_id="manifest-omits-artifacts")
+    writer, _ = _write_complete_bundle(manager)
+
+    # Overwrite manifest.json with a closed complete manifest whose artifacts list is empty.
+    empty_closed_manifest = _closed_manifest_template(data_completeness="complete")
+    assert empty_closed_manifest.artifacts == ()
+    (writer.bundle_dir / "manifest.json").write_text(
+        json.dumps(empty_closed_manifest.to_dict(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    try:
+        bundle = inspect_observability_bundle(writer.bundle_dir)
+    except ObservabilityArtifactError:
+        return
+
+    assert bundle.derived_finalization != "confirmed"
+    assert bundle.derived_data_completeness != "complete"
+
+
+def test_deserializers_reject_explicit_untagged_null_on_optional_fields() -> None:
+    status_null_clock = copy.deepcopy(_appendix_a_status())
+    status_null_clock["coverage"]["clock_domain_id"] = None
+
+    cases: list[tuple[str, Any]] = [
+        (
+            "ObservabilityReading.detail=None",
+            lambda: ObservabilityReading.from_mapping(
+                {"status": "unavailable", "reason_code": "timeout", "detail": None}
+            ),
+        ),
+        (
+            "ObservabilityArtifactRef.bytes/sha256=None",
+            lambda: ObservabilityArtifactRef.from_mapping(
+                {"path": "inventory.json", "bytes": None, "sha256": None}
+            ),
+        ),
+        (
+            "ObservabilityArtifactRef.kind=None",
+            lambda: ObservabilityArtifactRef.from_mapping(
+                {"path": "inventory.json", "kind": None}
+            ),
+        ),
+        (
+            "ObservabilityStatus.unavailable_fields=None",
+            lambda: ObservabilityStatus.from_mapping(
+                {**_appendix_a_status(), "unavailable_fields": None}
+            ),
+        ),
+        (
+            "ObservabilityStatus.diagnostics=None",
+            lambda: ObservabilityStatus.from_mapping(
+                {**_appendix_a_status(), "diagnostics": None}
+            ),
+        ),
+        (
+            "ObservabilityStatus.coverage.clock_domain_id=None",
+            lambda: ObservabilityStatus.from_mapping(status_null_clock),
+        ),
+        (
+            "ObservabilityProfileStatus.max_rows=None",
+            lambda: ObservabilityProfileStatus.from_mapping(
+                {**_appendix_d_profile_status(), "max_rows": None}
+            ),
+        ),
+        (
+            "ObservabilityProfileStatus.artifacts=None",
+            lambda: ObservabilityProfileStatus.from_mapping(
+                {**_appendix_d_profile_status(), "artifacts": None}
+            ),
+        ),
+        (
+            "ObservabilityProfileStatus.truncation_reasons=None",
+            lambda: ObservabilityProfileStatus.from_mapping(
+                {**_appendix_d_profile_status(), "truncation_reasons": None}
+            ),
+        ),
+        (
+            "ObservabilityProfileStatus.stop_overshoot_bounds_seconds=None",
+            lambda: ObservabilityProfileStatus.from_mapping(
+                {
+                    **_appendix_d_profile_status(),
+                    "stop_overshoot_bounds_seconds": None,
+                }
+            ),
+        ),
+    ]
+
+    accepted: list[str] = []
+    for label, call in cases:
+        try:
+            call()
+        except ObservabilitySchemaError:
+            continue
+        accepted.append(label)
+
+    assert not accepted, (
+        f"deserializers accepted explicit untagged null on optional fields: {accepted}"
+    )
+
+
+def test_symlink_escape_refused_in_ownership_claim_and_profile_status_artifacts(
+    tmp_path: Path,
+) -> None:
+    # Sub-case A: symlinked resources/ directory under bundle_dir refused by ownership_claim.
+    manager = _make_manager(tmp_path, run_id="symlink-claim", routed=True)
+    sink = RunArtifactSink()
+    outside_dir = tmp_path / "outside_claim"
+    outside_dir.mkdir()
+    bundle_dir = sink.resolve_bundle_dir(manager, INVOCATION_ID)
+    bundle_dir.mkdir(parents=True)
+    (bundle_dir / "resources").symlink_to(outside_dir)
+
+    with pytest.raises((ObservabilityPathError, ArtifactRoutingError)):
+        sink.ownership_claim(manager, INVOCATION_ID, "resources-example")
+
+    # Sub-case B: open bundle profile_status referencing symlinked staging/trace.json refused.
+    manager2 = _make_manager(tmp_path, run_id="symlink-profile-status")
+    writer = ObservabilityBundleWriter(manager2, INVOCATION_ID)
+    observers = [
+        {
+            "observer_id": "profile-example",
+            "callback_position": 0,
+            "callback_type": "proposed TorchProfile",
+        }
+    ]
+    writer.write_open_manifest(_open_manifest(observers=observers))
+    outside_profile = tmp_path / "outside_profile"
+    outside_profile.mkdir()
+    (outside_profile / "trace.json").write_text("{}", encoding="utf-8")
+
+    pstatus_raw = _appendix_d_profile_status()
+    pstatus_raw["artifacts"] = [
+        {"path": "profiles/profile-example/window-0001/staging/trace.json"}
+    ]
+    writer.write_profile_status(ObservabilityProfileStatus.from_mapping(pstatus_raw))
+    win_dir = writer.bundle_dir / "profiles" / "profile-example" / "window-0001"
+    (win_dir / "staging").symlink_to(outside_profile)
+
+    with pytest.raises(ObservabilityPathError):
+        inspect_observability_bundle(writer.bundle_dir)
+
+
+def test_bounded_truncation_preserves_schema_validity_and_bounds_provenance_and_row_keys(
+    tmp_path: Path,
+) -> None:
+    # Sub-case A: leading-whitespace diagnostic truncated at max_text_chars=3 must remain valid.
+    sink_a = RunArtifactSink(max_text_chars=3, max_list_items=4)
+    writer_a = ObservabilityBundleWriter(
+        _make_manager(tmp_path, run_id="bounded-text-small"),
+        INVOCATION_ID,
+        sink=sink_a,
+    )
+    writer_a.write_open_manifest(_open_manifest())
+
+    status_raw = _appendix_a_status()
+    status_raw["diagnostics"] = ["   timeout reading nvidia-smi"]
+    status_path = writer_a.write_status(ObservabilityStatus.from_mapping(status_raw))
+    parsed_status = ObservabilityStatus.from_mapping(
+        json.loads(status_path.read_text(encoding="utf-8"))
+    )
+    assert parsed_status.diagnostics is not None
+    assert len(parsed_status.diagnostics) == 1
+    assert parsed_status.diagnostics[0].strip() != ""
+    assert len(parsed_status.diagnostics[0]) <= 3
+    assert "text_truncated" in parsed_status.truncation_reasons
+
+    pstatus_raw = _appendix_d_profile_status()
+    pstatus_raw["activity_diagnostics"] = [
+        "   requested device activity not accepted"
+    ]
+    pstatus_path = writer_a.write_profile_status(
+        ObservabilityProfileStatus.from_mapping(pstatus_raw)
+    )
+    parsed_pstatus = ObservabilityProfileStatus.from_mapping(
+        json.loads(pstatus_path.read_text(encoding="utf-8"))
+    )
+    assert len(parsed_pstatus.activity_diagnostics) == 1
+    assert parsed_pstatus.activity_diagnostics[0].strip() != ""
+    assert len(parsed_pstatus.activity_diagnostics[0]) <= 3
+    assert parsed_pstatus.truncation_reasons is not None
+    assert "text_truncated" in parsed_pstatus.truncation_reasons
+
+    # Sub-case B: profile summary must bound source_provenance and preserve distinct row keys.
+    sink_b = RunArtifactSink(max_text_chars=16, max_list_items=4)
+    writer_b = ObservabilityBundleWriter(
+        _make_manager(tmp_path, run_id="bounded-summary-prov"),
+        INVOCATION_ID,
+        sink=sink_b,
+    )
+    writer_b.write_open_manifest(_open_manifest())
+    summary = ObservabilityProfileSummary(
+        invocation_id=INVOCATION_ID,
+        observer_id="profile-example",
+        window_id="window-0001",
+        exporter="TorchOperatorSummary",
+        max_rows=10,
+        total_rows=1,
+        rows=({"self_cuda_time_total_us": 10.0, "self_cuda_time_total_pct": 0.5},),
+        source_provenance={"long_note": "z" * 200, "items": list(range(20))},
+    )
+    summary_path = writer_b.write_profile_summary(summary)
+    parsed_summary = ObservabilityProfileSummary.from_mapping(
+        json.loads(summary_path.read_text(encoding="utf-8"))
+    )
+    assert len(parsed_summary.source_provenance["long_note"]) <= 16
+    assert len(parsed_summary.source_provenance["items"]) <= 4
+    assert len(parsed_summary.rows[0]) == 2
+
+
+def test_first_sample_partial_append_error_is_honest_and_tracked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _make_manager(tmp_path, run_id="partial-append-first")
+    writer = ObservabilityBundleWriter(manager, INVOCATION_ID)
+    writer.write_open_manifest(_open_manifest())
+    writer.write_inventory(
+        ObservabilityInventory.from_mapping(_appendix_a_inventory())
+    )
+    writer.write_descriptors(
+        ObservabilityDescriptorSet.from_mapping(_appendix_a_descriptors())
+    )
+
+    def _torn_append(path: Path, record: str) -> None:
+        with path.open("ab") as handle:
+            handle.write(b'{"partial":"torn')
+        raise PartialAppendError("short write")
+
+    monkeypatch.setattr(obs_mod, "append_record", _torn_append)
+    sample0 = ObservabilitySample.from_mapping(_appendix_a_samples()[0])
+    with pytest.raises(PartialAppendError, match="short write"):
+        writer.append_sample(sample0)
+
+    status = _appendix_a_status()
+    status["lifecycle_state"] = "unsafe"
+    status["data_completeness"] = "unknown"
+    status["counts"] = {"attempted": 1, "written": 0, "dropped": 0, "failed": 1}
+    writer.write_status(ObservabilityStatus.from_mapping(status))
+
+    unsafe_raw = _appendix_a_manifest()
+    unsafe_raw["lifecycle_state"] = "unsafe"
+    unsafe_raw["data_completeness"] = "unknown"
+    unsafe_raw["artifacts"] = []
+    closed = writer.finalize_manifest(ObservabilityManifest.from_mapping(unsafe_raw))
+    assert "resources/resources-example.jsonl" in {
+        ref.path for ref in closed.artifacts
+    }
+
+
+def test_torn_tail_non_utf8_and_pre_append_repair_newline_byte_cap(
+    tmp_path: Path,
+) -> None:
+    # 1. Truncated non-UTF-8 torn tail is isolated cleanly without mutating disk.
+    manager = _make_manager(tmp_path, run_id="torn-tail-non-utf8")
+    writer = ObservabilityBundleWriter(manager, INVOCATION_ID)
+    writer.write_open_manifest(_open_manifest())
+    writer.write_inventory(
+        ObservabilityInventory.from_mapping(_appendix_a_inventory())
+    )
+    writer.write_descriptors(
+        ObservabilityDescriptorSet.from_mapping(_appendix_a_descriptors())
+    )
+    samples = [ObservabilitySample.from_mapping(s) for s in _appendix_a_samples()]
+    assert writer.append_sample(samples[0]).written is True
+
+    jsonl_path = writer.bundle_dir / "resources" / "resources-example.jsonl"
+    with jsonl_path.open("ab") as handle:
+        handle.write(b'{"schema":"tpen.run-observability/v1","bad":"\xc3')
+
+    before = _tree_snapshot(writer.bundle_dir)
+    bundle = inspect_observability_bundle(writer.bundle_dir)
+    assert _tree_snapshot(writer.bundle_dir) == before
+    assert len(bundle.samples["resources-example"]) == 1
+    assert len(bundle.torn_tails) == 1
+    assert bundle.torn_tails[0].code == "torn_tail"
+    assert bundle.torn_tails[0].line_number == 2
+    assert bundle.interior_errors == ()
+
+    # 2. Pre-append byte-cap accounts for the 1-byte repair newline (prefix_bytes=1).
+    line_len = len(
+        json.dumps(
+            samples[0].to_dict(),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+            ensure_ascii=True,
+        ).encode("ascii")
+    )
+    unterminated_prefix = b'{"torn":"bytes"'
+    assert len(unterminated_prefix) == 15
+
+    # Tight cap (15 + 1 + line_len): missing 1 byte for trailing newline -> refused.
+    tight_sink = RunArtifactSink(max_sample_bytes=15 + 1 + line_len)
+    tight_writer = ObservabilityBundleWriter(
+        _make_manager(tmp_path, run_id="repair-cap-tight"),
+        INVOCATION_ID,
+        sink=tight_sink,
+    )
+    tight_writer.write_open_manifest(_open_manifest())
+    tight_writer.write_inventory(
+        ObservabilityInventory.from_mapping(_appendix_a_inventory())
+    )
+    tight_writer.write_descriptors(
+        ObservabilityDescriptorSet.from_mapping(_appendix_a_descriptors())
+    )
+    tight_jsonl = tight_writer.bundle_dir / "resources" / "resources-example.jsonl"
+    tight_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    tight_jsonl.write_bytes(unterminated_prefix)
+    assert ends_without_newline(tight_jsonl) is True
+
+    res_tight = tight_writer.append_sample(samples[0])
+    assert res_tight.written is False
+    assert res_tight.capped is True
+    assert len(tight_jsonl.read_bytes()) == 15
+
+    # Exact cap (15 + 1 + line_len + 1): succeeds and terminates with newline.
+    exact_sink = RunArtifactSink(max_sample_bytes=15 + 1 + line_len + 1)
+    exact_writer = ObservabilityBundleWriter(
+        _make_manager(tmp_path, run_id="repair-cap-exact"),
+        INVOCATION_ID,
+        sink=exact_sink,
+    )
+    exact_writer.write_open_manifest(_open_manifest())
+    exact_writer.write_inventory(
+        ObservabilityInventory.from_mapping(_appendix_a_inventory())
+    )
+    exact_writer.write_descriptors(
+        ObservabilityDescriptorSet.from_mapping(_appendix_a_descriptors())
+    )
+    exact_jsonl = exact_writer.bundle_dir / "resources" / "resources-example.jsonl"
+    exact_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    exact_jsonl.write_bytes(unterminated_prefix)
+    assert ends_without_newline(exact_jsonl) is True
+
+    res_exact = exact_writer.append_sample(samples[0])
+    assert res_exact.written is True
+    assert res_exact.capped is False
+    assert len(exact_jsonl.read_bytes()) == 15 + 1 + line_len + 1
+    assert ends_without_newline(exact_jsonl) is False
+
+
+def test_atomic_write_cleans_temp_file_on_error_and_preserves_prior_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _make_manager(tmp_path, run_id="atomic-write-error")
+    writer = ObservabilityBundleWriter(manager, INVOCATION_ID)
+    manifest_path = writer.write_open_manifest(_open_manifest())
+    writer.write_inventory(
+        ObservabilityInventory.from_mapping(_appendix_a_inventory())
+    )
+    writer.write_descriptors(
+        ObservabilityDescriptorSet.from_mapping(_appendix_a_descriptors())
+    )
+    writer.write_status(ObservabilityStatus.from_mapping(_appendix_a_status()))
+    original_bytes = manifest_path.read_bytes()
+
+    def _fail_replace(src: Any, dst: Any) -> None:
+        raise OSError("simulated ENOSPC")
+
+    monkeypatch.setattr(obs_mod.os, "replace", _fail_replace)
+    with pytest.raises(OSError, match="simulated ENOSPC"):
+        writer.finalize_manifest(_closed_manifest_template())
+
+    assert manifest_path.read_bytes() == original_bytes
+    assert writer.finalized is False
+    assert list(writer.bundle_dir.rglob("*.tmp")) == []
+
+
+def test_counter_cross_clock_domain_breaks_interval_and_unsafe_lifecycle_inspection(
+    tmp_path: Path,
+) -> None:
+    # Bundle 1: cross-clock-domain counter samples break interval with clock_domain_mismatch.
+    manager1 = _make_manager(tmp_path, run_id="cross-clock-domain")
+    inv1 = _appendix_a_inventory()
+    dom_a = copy.deepcopy(inv1["clock_domains"][0])
+    dom_a["clock_domain_id"] = "clock-a"
+    dom_b = copy.deepcopy(inv1["clock_domains"][0])
+    dom_b["clock_domain_id"] = "clock-b"
+    inv1["clock_domains"] = [dom_a, dom_b]
+
+    base_samples = _appendix_a_samples()
+    s0 = copy.deepcopy(base_samples[0])
+    s0["clock_domain_id"] = "clock-a"
+    s1 = copy.deepcopy(base_samples[3])
+    s1["clock_domain_id"] = "clock-b"
+
+    status1 = _appendix_a_status()
+    status1["coverage"]["clock_domain_id"] = "clock-a"
+    status1["counts"] = {"attempted": 2, "written": 2, "dropped": 0, "failed": 0}
+
+    writer1 = ObservabilityBundleWriter(manager1, INVOCATION_ID)
+    writer1.write_open_manifest(_open_manifest())
+    writer1.write_inventory(ObservabilityInventory.from_mapping(inv1))
+    writer1.write_descriptors(
+        ObservabilityDescriptorSet.from_mapping(_appendix_a_descriptors())
+    )
+    assert writer1.append_sample(ObservabilitySample.from_mapping(s0)).written is True
+    assert writer1.append_sample(ObservabilitySample.from_mapping(s1)).written is True
+    writer1.write_status(ObservabilityStatus.from_mapping(status1))
+    writer1.finalize_manifest(_closed_manifest_template(data_completeness="complete"))
+
+    bundle1 = inspect_observability_bundle(writer1.bundle_dir)
+    cpu_user = bundle1.summary.quantity("self-rusage", "cpu_user_s")
+    assert cpu_user is not None
+    assert cpu_user.valid_interval_count == 0
+    assert cpu_user.broken_interval_count == 1
+    assert cpu_user.valid_rate_per_second is None
+    assert "clock_domain_mismatch" in {diag.code for diag in bundle1.diagnostics}
+
+    # Bundle 2a: unsafe lifecycle with recovered sample -> derived_data_completeness == "partial".
+    manager2 = _make_manager(tmp_path, run_id="unsafe-with-samples")
+    writer2 = ObservabilityBundleWriter(manager2, INVOCATION_ID)
+    writer2.write_open_manifest(_open_manifest())
+    writer2.write_inventory(
+        ObservabilityInventory.from_mapping(_appendix_a_inventory())
+    )
+    writer2.write_descriptors(
+        ObservabilityDescriptorSet.from_mapping(_appendix_a_descriptors())
+    )
+    assert (
+        writer2.append_sample(ObservabilitySample.from_mapping(base_samples[0])).written
+        is True
+    )
+    status2 = _appendix_a_status()
+    status2["lifecycle_state"] = "unsafe"
+    status2["data_completeness"] = "partial"
+    status2["counts"] = {"attempted": 1, "written": 1, "dropped": 0, "failed": 0}
+    writer2.write_status(ObservabilityStatus.from_mapping(status2))
+    unsafe_manifest_2 = _appendix_a_manifest()
+    unsafe_manifest_2["lifecycle_state"] = "unsafe"
+    unsafe_manifest_2["data_completeness"] = "partial"
+    unsafe_manifest_2["artifacts"] = []
+    writer2.finalize_manifest(ObservabilityManifest.from_mapping(unsafe_manifest_2))
+
+    bundle2 = inspect_observability_bundle(writer2.bundle_dir)
+    assert bundle2.derived_lifecycle_state == "unsafe"
+    assert bundle2.derived_finalization == "unsafe"
+    assert bundle2.derived_reason == "unsafe_lifecycle_state"
+    assert bundle2.derived_data_completeness == "partial"
+
+    # Bundle 2b: unsafe lifecycle with 0 samples and no profile statuses -> "unknown".
+    manager3 = _make_manager(tmp_path, run_id="unsafe-no-data")
+    writer3 = ObservabilityBundleWriter(manager3, INVOCATION_ID)
+    writer3.write_open_manifest(_open_manifest())
+    writer3.write_inventory(
+        ObservabilityInventory.from_mapping(_appendix_a_inventory())
+    )
+    writer3.write_descriptors(
+        ObservabilityDescriptorSet.from_mapping(_appendix_a_descriptors())
+    )
+    status3 = _appendix_a_status()
+    status3["lifecycle_state"] = "unsafe"
+    status3["data_completeness"] = "unknown"
+    status3["counts"] = {"attempted": 0, "written": 0, "dropped": 0, "failed": 0}
+    writer3.write_status(ObservabilityStatus.from_mapping(status3))
+    unsafe_manifest_3 = _appendix_a_manifest()
+    unsafe_manifest_3["lifecycle_state"] = "unsafe"
+    unsafe_manifest_3["data_completeness"] = "unknown"
+    unsafe_manifest_3["artifacts"] = []
+    writer3.finalize_manifest(ObservabilityManifest.from_mapping(unsafe_manifest_3))
+
+    bundle3 = inspect_observability_bundle(writer3.bundle_dir)
+    assert bundle3.derived_lifecycle_state == "unsafe"
+    assert bundle3.derived_finalization == "unsafe"
+    assert bundle3.derived_reason == "unsafe_lifecycle_state"
+    assert bundle3.derived_data_completeness == "unknown"
