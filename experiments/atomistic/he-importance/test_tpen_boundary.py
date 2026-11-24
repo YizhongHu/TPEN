@@ -66,10 +66,10 @@ EXPECTED_PRODUCTION_INVENTORY = {
     ("optimizer_grid.py", 367, "tpen.hi_schema"): InventoryEntry(
         "remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 238, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 249, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 749, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 762, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("run_stage_q.py", 128, "tpen.hi_schema"): InventoryEntry(
@@ -87,31 +87,31 @@ EXPECTED_TEST_INVENTORY = {
     ("test_launch.py", 21, "tpen.runner"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 956, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 957, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 988, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 989, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 1034, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 1035, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 1236, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 1246, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_train_config.py", 300, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 336, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: test-only schema validation for the independent HI grid oracle."
     ),
-    ("test_train_config.py", 363, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 399, "tpen.hi_schema"): InventoryEntry(
         "item 1c0b06fd: executed A9 schema measurement for the HI train-resume load shape."
     ),
-    ("test_train_config.py", 601, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 637, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 1038, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 1074, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 1131, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 1166, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("test_run_stage_q.py", 775, "tpen.hi_schema"): InventoryEntry(
@@ -1779,9 +1779,9 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
         ("train_config.py", "_reject_resolver_owned_overrides", "path in _RESOLVER_OWNED_OVERRIDE_PATHS"):
             ("path is a detached override key and the frozen resolver-owned path set is module-owned", 1),
         ("train_config.py", "_optimizer_entry", 'status not in {"available", "unavailable"}'):
-            ("status is read from the validated scientific-identity mapping and compared with module literals", 1),
+            ("status is read from the validated availability sidecar and compared with module literals", 1),
         ("train_config.py", "_optimizer_entry", 'status != "available"'):
-            ("status is read from the validated scientific-identity mapping and compared with a module literal", 1),
+            ("status is read from the validated availability sidecar and compared with a module literal", 1),
         ("train_config.py", "resolve_train_config", "stage_api.content_hash(manifest) != source_hash"):
             ("resolve_train_config's own _cell_from_source admission requires an exact-str hash on every direct and wrapped resolver route", 1),
         ("train_config.py", "resolve_train_config", "output_path.parent.parent == output_path"):

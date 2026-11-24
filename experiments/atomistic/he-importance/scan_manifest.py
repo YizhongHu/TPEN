@@ -15,8 +15,10 @@ _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-MANIFEST_SCHEMA = "tpen.hi.scan_manifest.v1"
-MANIFEST_PATH = _HERE / "o1_scan_manifest_v1.json"
+MANIFEST_SCHEMA = "tpen.hi.scan_manifest.v2"
+MANIFEST_V1_SCHEMA = "tpen.hi.scan_manifest.v1"
+MANIFEST_PATH = _HERE / "o1_scan_manifest_v2.json"
+MANIFEST_V1_PATH = _HERE / "o1_scan_manifest_v1.json"
 DESIGN_DOC_SHA256 = "76e6b7bcaf5454da120750e353fb268bbce07e6aeda6d2a601c86ddf7cc8046f"
 DESIGN_DOC_PATH = _REPO_ROOT / "docs" / "he-importance-scan-design-20260904.md"
 MANAGER_RULING = "Paseo msg c92c3a08 (2026-11-14): SR/CAD/DOC"
@@ -98,8 +100,8 @@ def _materialized_rows() -> dict[str, Any]:
         spec.loader.exec_module(module)
         return module
 
-    stage = load("hi_mf1_manifest_stage_coordinate", "stage_coordinate.py")
-    grid = load("hi_mf1_manifest_optimizer_grid", "optimizer_grid.py")
+    stage = load("hi_mf2_manifest_stage_coordinate", "stage_coordinate.py")
+    grid = load("hi_mf2_manifest_optimizer_grid", "optimizer_grid.py")
     availability = grid.roster_availability()
     declared = {
         (cell.family, _canonical(dict(cell.levels))): cell.cell_id
@@ -126,7 +128,7 @@ def _materialized_rows() -> dict[str, Any]:
         for cell in cells:
             identity = cell.manifest["scientific_identity"]
             optimizer = identity["optimizer"]
-            optimizer_cell = identity["optimizer_cell"]
+            optimizer_cell = cell.availability
             cell_id = declared[(optimizer["method"], _canonical(dict(optimizer["levels"])))]
             rows.append(
                 {
@@ -162,8 +164,16 @@ def _materialized_rows() -> dict[str, Any]:
     }
 
 
-def render_manifest() -> dict[str, Any]:
+def render_manifest(version: str = "v2") -> dict[str, Any]:
     """Render the complete deterministic O1 manifest from live study authorities."""
+
+    if version == "v1":
+        try:
+            return json.loads(MANIFEST_V1_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ScanManifestError(f"cannot read frozen v1 manifest: {error}") from error
+    if version != "v2":
+        raise ScanManifestError(f"unknown manifest version {version!r}")
 
     _validate_design_document()
     materialized = _materialized_rows()
@@ -193,6 +203,10 @@ def render_manifest() -> dict[str, Any]:
             },
             "source_aliases": _SOURCE_ALIASES,
             "coordinate_sources": _COORDINATE_SOURCES,
+            "supersedes": {
+                "schema": MANIFEST_V1_SCHEMA,
+                "content_hash": json.loads(MANIFEST_V1_PATH.read_text(encoding="utf-8"))["content_hash"],
+            },
         },
         "counts": {"rows": len(rows), "admitted": admitted, "unavailable": len(rows) - admitted},
         "cells": list(materialized["cells"]),
@@ -220,8 +234,8 @@ def load_manifest(path: Path = MANIFEST_PATH) -> dict[str, Any]:
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ScanManifestError(f"cannot read manifest {path}: {error}") from error
-    if not isinstance(manifest, Mapping) or manifest.get("schema") != MANIFEST_SCHEMA:
-        raise ScanManifestError(f"manifest schema is not {MANIFEST_SCHEMA!r}")
+    if not isinstance(manifest, Mapping) or manifest.get("schema") not in {MANIFEST_SCHEMA, MANIFEST_V1_SCHEMA}:
+        raise ScanManifestError(f"manifest schema is not {MANIFEST_SCHEMA!r} or {MANIFEST_V1_SCHEMA!r}")
     declared = manifest.get("content_hash")
     if not isinstance(declared, str) or content_hash(_body_without_hash(manifest)) != declared:
         raise ScanManifestError("manifest content hash mismatch")
@@ -244,6 +258,12 @@ def find_row(manifest: Mapping[str, Any], row_id: str) -> Mapping[str, Any]:
 
 def validate_live_row(manifest: Mapping[str, Any], row_id: str) -> Mapping[str, Any]:
     """Require the supplied file to equal a fresh live-authority render."""
+
+    if manifest.get("schema") == MANIFEST_V1_SCHEMA:
+        raise ScanManifestError(
+            "manifest v1 launch is refused; use the frozen v2 manifest "
+            f"{MANIFEST_PATH.name}"
+        )
 
     row = find_row(manifest, row_id)
     fresh = render_manifest()

@@ -80,6 +80,7 @@ class _OwnedLaunchCell:
     content_hash: str
     output_path: Any
     seed_streams: Mapping[str, Any]
+    availability: Mapping[str, Any]
 # This vocabulary is deliberately closed. Names outside this declaration belong
 # to the scientific manifest unless a future owner adds them and gives the
 # production consumer a representation for them.
@@ -187,7 +188,7 @@ def _has_buffer_capability(value: object) -> bool:
     return False
 
 
-def _source_cell(source: Any) -> tuple[Any, str]:
+def _source_cell(source: Any) -> tuple[Any, str, Mapping[str, Any]]:
     """Extract the materialized cell from a cell or a training packet."""
 
     cell = getattr(source, "cell", source)
@@ -199,7 +200,13 @@ def _source_cell(source: Any) -> tuple[Any, str]:
         raise LaunchValidationError("source must be a MaterializedCell or TrainingPacket") from error
     if type(content_hash) is not str:
         raise LaunchValidationError("source content_hash must be an exact str")
-    return cell, content_hash
+    try:
+        availability = cell.availability
+    except AttributeError as error:
+        raise LaunchValidationError("source availability must be a mapping") from error
+    if not isinstance(availability, Mapping):
+        raise LaunchValidationError("source availability must be a mapping")
+    return cell, content_hash, availability
 
 
 def execution_topology_facts(topology: object) -> dict[str, Any]:
@@ -413,12 +420,13 @@ def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any
     """Bind non-empty launch facts to a source row's designated subtree."""
 
     topology = _detach_topology_facts(topology)
-    cell, source_hash = _source_cell(source)
+    cell, source_hash, availability = _source_cell(source)
     owned_source = _OwnedLaunchCell(
         manifest=_STAGE_API._freeze(_detach_topology_facts(cell.manifest)),
         content_hash=source_hash,
         output_path=Path(cell.output_path),
         seed_streams=_detach_topology_facts(cell.seed_streams),
+        availability=_STAGE_API._freeze(_detach_topology_facts(availability)),
     )
     try:
         _STAGE_API.validate_materialized_manifest(owned_source.manifest)
@@ -437,6 +445,7 @@ def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any
             content_hash=bound_hash,
             output_path=Path(bound.output_path),
             seed_streams=_detach_topology_facts(bound.seed_streams),
+            availability=_STAGE_API._freeze(_detach_topology_facts(bound.availability)),
         )
         _reject_execution_facts_outside_topology(owned.manifest)
         return owned

@@ -487,11 +487,14 @@ def _cell_descriptor(cell: Any) -> FamilyCellDescriptor:
     identity = cell.manifest["scientific_identity"]
     optimizer = identity["optimizer"]
     slot_identity = identity["optimizer_cell"]
+    availability = getattr(cell, "availability", None)
+    if not isinstance(availability, Mapping):
+        raise ArchitectureStageFamilyError("cell.availability must be a mapping")
     slot = OptimizerSlot(
         method=str(optimizer["method"]),
-        status=str(slot_identity["status"]),
+        status=str(availability.get("status")),
         levels=stage_coordinate._thaw(optimizer.get("levels")),
-        unavailable_reason=slot_identity.get("unavailable_reason"),
+        unavailable_reason=availability.get("unavailable_reason"),
     )
     context = identity["context"]
     return FamilyCellDescriptor(
