@@ -161,6 +161,11 @@ CONFIGURED_RUN_SHIM = RUN_SHIM.replace(
 ).replace(
     _CONFIGURED_SHIM_IMPORT,
     _CONFIGURED_SHIM_BRANCH + _CONFIGURED_SHIM_IMPORT,
+).replace(
+    # The legacy shim remains byte-identical; configured sidecars encode an
+    # absent slot as JSON null rather than an empty identity.
+    "        'slot_id': os.environ.get('TPEN_PLACEMENT_SLOT_ID', ''),\n",
+    "        'slot_id': os.environ.get('TPEN_PLACEMENT_SLOT_ID') or None,\n",
 )
 class EvidenceUnavailable(RuntimeError):
     """Raised when a child cannot provide trustworthy public evidence."""

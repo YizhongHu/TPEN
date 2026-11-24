@@ -24,7 +24,7 @@ STAGE_Q = ROOT / "experiments" / "atomistic" / "he-importance" / "run_stage_q.py
 MANIFEST = ROOT / "experiments" / "atomistic" / "he-importance" / "o1_scan_manifest_v1.json"
 ROW = "0" * 64
 EXPECTED_RUN_SHIM_SHA256 = "066b37db2a22c1fd698327f21bbf2f55278023fd59f3e064323da057efa07c03"
-EXPECTED_CONFIGURED_RUN_SHIM_SHA256 = "a3d4e64194cc3364783ba12674a992f76b0822c25af893e8ceb6b4fa1cce1533"
+EXPECTED_CONFIGURED_RUN_SHIM_SHA256 = "07516593b65d3b6bc65fdf120b50771c434fc01ac42ce59e210155aa3a210fd4"
 
 
 def _program(**changes: str) -> ConfiguredProgram:
