@@ -12,6 +12,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from math import prod
 from typing import Any, Generic, Protocol, Self, TypeVar, runtime_checkable
 
 from tpen.data.batch import (
@@ -388,6 +389,17 @@ class StructuredCurvatureUpdateInput(VMCStepData):
         if type(self.curvature_available) is not bool:
             raise TypeError("StructuredCurvatureUpdateInput.curvature_available must be a bool")
 
+        if self.parameter_binding.parameters:
+            binding_device = self.parameter_binding.parameters[0].device
+            if any(
+                parameter.device != binding_device
+                for parameter in self.parameter_binding.parameters
+            ):
+                raise ValueError(
+                    "StructuredCurvatureUpdateInput parameter binding parameters must "
+                    "share one device"
+                )
+
         if not self.curvature_available:
             if self.kronecker_blocks or self.dense_blocks or self.energy_half_gradient:
                 raise ValueError(
@@ -436,6 +448,24 @@ class StructuredCurvatureUpdateInput(VMCStepData):
                 if ordinal in covered:
                     raise ValueError(f"Duplicate curvature coverage of parameter ordinal {ordinal}")
                 covered.add(ordinal)
+            weight_slot = slots[block.parameter_ordinals[0]]
+            expected_in = prod(weight_slot.shape[1:]) + (1 if block.has_bias else 0)
+            if (
+                len(weight_slot.shape) < 2
+                or weight_slot.shape[0] != block.out_dim
+                or expected_in != block.in_dim
+            ):
+                raise ValueError(
+                    f"KroneckerFactorBlock dimensions {(block.out_dim, block.in_dim)} disagree with "
+                    f"weight slot shape {weight_slot.shape} (has_bias={block.has_bias})"
+                )
+            if block.has_bias:
+                bias_slot = slots[block.parameter_ordinals[1]]
+                if bias_slot.shape != (block.out_dim,):
+                    raise ValueError(
+                        f"KroneckerFactorBlock bias slot shape {bias_slot.shape} disagrees with "
+                        f"out_dim={block.out_dim}"
+                    )
 
         for block in self.dense_blocks:
             if not isinstance(block, DenseFactorBlock):
@@ -443,12 +473,18 @@ class StructuredCurvatureUpdateInput(VMCStepData):
             block.validate()
             if block.F.dtype != self.solve_dtype or block.F.device != binding_device:
                 raise ValueError("DenseFactorBlock dtype/device disagrees with update input")
+            expected_dim = 0
             for ordinal in block.parameter_ordinals:
                 if ordinal >= len(slots):
                     raise ValueError(f"DenseFactorBlock ordinal {ordinal} out of range")
                 if ordinal in covered:
                     raise ValueError(f"Duplicate curvature coverage of parameter ordinal {ordinal}")
                 covered.add(ordinal)
+                expected_dim += slots[ordinal].numel
+            if expected_dim != block.dim:
+                raise ValueError(
+                    f"DenseFactorBlock dim {block.dim} disagrees with covered numel {expected_dim}"
+                )
 
         missing = sorted(set(range(len(slots))) - covered)
         if missing:

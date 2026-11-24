@@ -1566,6 +1566,25 @@ class VMCUpdateMethod(Generic[InputT], ABC):
                 f"{type(self).__name__} does not accept binary method tensor state"
             )
 
+    def validate_method_tensor_state_dict(
+        self,
+        state: Mapping[str, Any] | None,
+        *,
+        method_state: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Validate optional binary tensor state without mutating live method state.
+
+        Methods that persist binary tensor payloads in ``method_state.pt``
+        override this hook so checkpoint restore can verify JSON metadata and
+        binary tensors together before mutating any live object.
+        """
+
+        del method_state
+        if state is not None:
+            raise ValueError(
+                f"{type(self).__name__} does not accept binary method tensor state"
+            )
+
     def forward_request(self) -> Any | None:
         """Return the typed forward request this method's input requires.
 

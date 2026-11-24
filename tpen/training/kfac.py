@@ -648,8 +648,10 @@ class NativeKFACUpdate(VMCUpdateMethod[StructuredCurvatureUpdateInput]):
             ),
         }
 
-    def load_method_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Restore compact KFAC metadata, rejecting any version/policy/layout drift."""
+    def _parse_method_state(
+        self, state: Mapping[str, Any]
+    ) -> tuple[int, int, tuple[tuple[str, tuple[int, ...], tuple[int, ...]], ...] | None]:
+        """Validate and parse compact KFAC JSON metadata without mutating live state."""
 
         if not isinstance(state, Mapping):
             raise TypeError("NativeKFACUpdate state must be a mapping")
@@ -687,6 +689,12 @@ class NativeKFACUpdate(VMCUpdateMethod[StructuredCurvatureUpdateInput]):
 
         raw_sig = state.get("block_signature")
         parsed_sig = _parse_block_signature(raw_sig, expect_present=has_curvature_state)
+        return completed_updates, curvature_step, parsed_sig
+
+    def load_method_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore compact KFAC metadata, rejecting any version/policy/layout drift."""
+
+        completed_updates, curvature_step, parsed_sig = self._parse_method_state(state)
 
         self.completed_updates = completed_updates
         self.curvature_step = curvature_step
@@ -743,21 +751,32 @@ class NativeKFACUpdate(VMCUpdateMethod[StructuredCurvatureUpdateInput]):
             ],
         }
 
-    def load_method_tensor_state_dict(self, state: Mapping[str, Any] | None) -> None:
-        """Restore binary ``method_state.pt`` EMA factors and cached eigendecompositions."""
+    def _parse_method_tensor_state(
+        self,
+        state: Mapping[str, Any] | None,
+        *,
+        expected_curvature_step: int,
+        expected_block_signature: tuple[tuple[str, tuple[int, ...], tuple[int, ...]], ...] | None,
+    ) -> tuple[
+        list[dict[str, torch.Tensor]] | None,
+        list[dict[str, Any]] | None,
+        list[dict[str, torch.Tensor]] | None,
+        list[dict[str, Any]] | None,
+    ]:
+        """Validate and materialize ``method_state.pt`` tensors without mutating live state."""
 
-        if self._block_signature is None:
+        if expected_block_signature is None:
             if state is not None:
                 raise ValueError(
                     "NativeKFACUpdate received unexpected binary method_state.pt payload "
                     "for curvature_step == 0"
                 )
-            return
+            return None, None, None, None
 
         if state is None:
             raise ValueError(
                 "NativeKFACUpdate requires binary method_state.pt curvature tensor state "
-                f"for curvature_step={self.curvature_step}, but none was provided"
+                f"for curvature_step={expected_curvature_step}, but none was provided"
             )
         if not isinstance(state, Mapping):
             raise TypeError("NativeKFACUpdate binary tensor state must be a mapping")
@@ -770,10 +789,10 @@ class NativeKFACUpdate(VMCUpdateMethod[StructuredCurvatureUpdateInput]):
             raise ValueError(
                 "KFAC binary tensor state convention does not match live method"
             )
-        if state.get("curvature_step") != self.curvature_step:
+        if state.get("curvature_step") != expected_curvature_step:
             raise ValueError(
                 f"KFAC binary tensor state curvature_step {state.get('curvature_step')!r} "
-                f"disagrees with trainer metadata curvature_step={self.curvature_step}"
+                f"disagrees with trainer metadata curvature_step={expected_curvature_step}"
             )
         if state.get("solve_dtype") != str(self.policy.solve_dtype):
             raise ValueError(
@@ -781,13 +800,13 @@ class NativeKFACUpdate(VMCUpdateMethod[StructuredCurvatureUpdateInput]):
                 f"disagrees with live policy solve_dtype={str(self.policy.solve_dtype)!r}"
             )
         recorded_sig = _parse_block_signature(state.get("block_signature"), expect_present=True)
-        if recorded_sig != self._block_signature:
+        if recorded_sig != expected_block_signature:
             raise ValueError(
                 "KFAC binary tensor state block_signature disagrees with trainer metadata"
             )
 
-        kron_specs = [spec for spec in self._block_signature if spec[0] == "kronecker"]
-        dense_specs = [spec for spec in self._block_signature if spec[0] == "dense"]
+        kron_specs = [spec for spec in expected_block_signature if spec[0] == "kronecker"]
+        dense_specs = [spec for spec in expected_block_signature if spec[0] == "dense"]
 
         raw_kron_ema = state.get("kronecker_ema")
         raw_kron_eigs = state.get("kronecker_eigs")
@@ -823,13 +842,23 @@ class NativeKFACUpdate(VMCUpdateMethod[StructuredCurvatureUpdateInput]):
                 ema_entry.get("G"), shape=(out_dim, out_dim), dtype=solve_dtype, device=target_device, label="G_ema"
             )
             d_A = _validate_restored_tensor(
-                eig_entry.get("d_A"), shape=(in_dim,), dtype=solve_dtype, device=target_device, label="d_A"
+                eig_entry.get("d_A"),
+                shape=(in_dim,),
+                dtype=solve_dtype,
+                device=target_device,
+                label="d_A",
+                non_negative=True,
             )
             Q_A = _validate_restored_tensor(
                 eig_entry.get("Q_A"), shape=(in_dim, in_dim), dtype=solve_dtype, device=target_device, label="Q_A"
             )
             d_G = _validate_restored_tensor(
-                eig_entry.get("d_G"), shape=(out_dim,), dtype=solve_dtype, device=target_device, label="d_G"
+                eig_entry.get("d_G"),
+                shape=(out_dim,),
+                dtype=solve_dtype,
+                device=target_device,
+                label="d_G",
+                non_negative=True,
             )
             Q_G = _validate_restored_tensor(
                 eig_entry.get("Q_G"), shape=(out_dim, out_dim), dtype=solve_dtype, device=target_device, label="Q_G"
@@ -854,7 +883,12 @@ class NativeKFACUpdate(VMCUpdateMethod[StructuredCurvatureUpdateInput]):
                 ema_entry.get("F"), shape=(dim, dim), dtype=solve_dtype, device=target_device, label="F_ema"
             )
             d_F = _validate_restored_tensor(
-                eig_entry.get("d_F"), shape=(dim,), dtype=solve_dtype, device=target_device, label="d_F"
+                eig_entry.get("d_F"),
+                shape=(dim,),
+                dtype=solve_dtype,
+                device=target_device,
+                label="d_F",
+                non_negative=True,
             )
             Q_F = _validate_restored_tensor(
                 eig_entry.get("Q_F"), shape=(dim, dim), dtype=solve_dtype, device=target_device, label="Q_F"
@@ -865,10 +899,62 @@ class NativeKFACUpdate(VMCUpdateMethod[StructuredCurvatureUpdateInput]):
             restored_dense_ema.append({"F": F})
             restored_dense_eigs.append({"d_F": d_F, "Q_F": Q_F, "damping": damping})
 
-        self._kronecker_ema = restored_kron_ema
-        self._kronecker_eigs = restored_kron_eigs
-        self._dense_ema = restored_dense_ema
-        self._dense_eigs = restored_dense_eigs
+        return restored_kron_ema, restored_kron_eigs, restored_dense_ema, restored_dense_eigs
+
+    def validate_method_tensor_state_dict(
+        self,
+        state: Mapping[str, Any] | None,
+        *,
+        method_state: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Validate KFAC metadata and binary curvature state together without mutating live state."""
+
+        if method_state is not None:
+            _completed_updates, expected_cstep, expected_sig = self._parse_method_state(
+                method_state
+            )
+        else:
+            expected_cstep = self.curvature_step
+            expected_sig = self._block_signature
+        self._parse_method_tensor_state(
+            state,
+            expected_curvature_step=expected_cstep,
+            expected_block_signature=expected_sig,
+        )
+
+    def load_method_state_and_tensors(
+        self,
+        method_state: Mapping[str, Any],
+        method_tensor_state: Mapping[str, Any] | None,
+    ) -> None:
+        """Atomically validate and commit KFAC JSON metadata and ``method_state.pt`` tensors."""
+
+        completed_updates, curvature_step, parsed_sig = self._parse_method_state(method_state)
+        kron_ema, kron_eigs, dense_ema, dense_eigs = self._parse_method_tensor_state(
+            method_tensor_state,
+            expected_curvature_step=curvature_step,
+            expected_block_signature=parsed_sig,
+        )
+        self.completed_updates = completed_updates
+        self.curvature_step = curvature_step
+        self._block_signature = parsed_sig
+        self._kronecker_ema = kron_ema
+        self._kronecker_eigs = kron_eigs
+        self._dense_ema = dense_ema
+        self._dense_eigs = dense_eigs
+
+    def load_method_tensor_state_dict(self, state: Mapping[str, Any] | None) -> None:
+        """Restore binary ``method_state.pt`` EMA factors and cached eigendecompositions."""
+
+        kron_ema, kron_eigs, dense_ema, dense_eigs = self._parse_method_tensor_state(
+            state,
+            expected_curvature_step=self.curvature_step,
+            expected_block_signature=self._block_signature,
+        )
+        self._kronecker_ema = kron_ema
+        self._kronecker_eigs = kron_eigs
+        self._dense_ema = dense_ema
+        self._dense_eigs = dense_eigs
 
     def update(self, update_input: StructuredCurvatureUpdateInput) -> VMCUpdateResult:
         """Update EMA factors, optionally refresh eigenbases, and apply one KFAC step."""
@@ -884,6 +970,10 @@ class NativeKFACUpdate(VMCUpdateMethod[StructuredCurvatureUpdateInput]):
                 "NativeKFACUpdate supports real wavefunctions only (phase must be None)"
             )
         self._validate_binding(update_input)
+        # Re-verify plain-SGD invariants before mutating EMA or stepping so
+        # post-init or post-restore optimizer mutation cannot silently disagree
+        # with policy.learning_rate and predicted_kl_cap.
+        _validate_plain_sgd(self.optimizer, learning_rate=self.policy.learning_rate)
         if update_input.solve_dtype != self.policy.solve_dtype:
             raise ValueError(
                 f"StructuredCurvatureUpdateInput.solve_dtype={update_input.solve_dtype} "
@@ -1359,8 +1449,9 @@ def _validate_restored_tensor(
     dtype: torch.dtype,
     device: torch.device,
     label: str,
+    non_negative: bool = False,
 ) -> torch.Tensor:
-    """Validate shape, dtype, and finiteness of one tensor loaded from ``method_state.pt``."""
+    """Validate shape, dtype, finiteness, and optional non-negativity of a restored tensor."""
 
     if not isinstance(value, torch.Tensor):
         raise ValueError(f"KFAC binary tensor state entry {label!r} must be a torch.Tensor")
@@ -1374,6 +1465,8 @@ def _validate_restored_tensor(
         )
     if value.numel() > 0 and not bool(torch.isfinite(value).all()):
         raise ValueError(f"KFAC binary tensor state {label!r} contains non-finite values")
+    if non_negative and value.numel() > 0 and not bool((value >= 0).all()):
+        raise ValueError(f"KFAC binary tensor state {label!r} must be non-negative")
     return value.detach().to(device=device, dtype=dtype).clone()
 
 

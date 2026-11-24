@@ -231,7 +231,7 @@ def execute_unary(
             if session is not None:
                 session.record_mixing_kronecker(
                     weight=weight,
-                    flattened_input=input_values,
+                    flattened_input=input_values.detach(),
                     contribution=contribution,
                     label=f"execute_unary[{path_index}]",
                 )
@@ -309,10 +309,12 @@ def execute_binary(
                 n_supports = int(left_values.shape[2])
                 in_dim = int(left_values.shape[1]) * int(right_values.shape[1])
                 if n_supports == 0:
-                    flattened_input = left_values.new_empty((block.shape[0], in_dim, 0))
+                    flattened_input = left_values.detach().new_empty((block.shape[0], in_dim, 0))
                 else:
+                    # Detach operands before forming the flattened bilinear input so
+                    # KFAC capture never allocates a transient MulBackward0 node.
                     flattened_input = (
-                        left_values.unsqueeze(2) * right_values.unsqueeze(1)
+                        left_values.detach().unsqueeze(2) * right_values.detach().unsqueeze(1)
                     ).reshape(block.shape[0], in_dim, n_supports)
                 session.record_mixing_kronecker(
                     weight=weight,

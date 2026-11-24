@@ -203,11 +203,16 @@ def restore_checkpoint(
     device = runtime_device(context)
     rng_state = _read_rng_state(checkpoint_dir, manifest.files)
     require_restorable_rng_state(rng_state, device, checkpoint_dir)
-    # Read and validate trainer progress before loading any mutable component.
-    # A permissive trainer must not turn a malformed payload into a partially
-    # restored live run.
+    # Read and validate trainer progress and optional binary method state before
+    # loading any mutable component. A refused semantic restore must leave live
+    # model, optimizer, trainer, sampler, and update-method state unmutated.
     trainer_state = _read_trainer_state(checkpoint_dir, manifest.files)
     validate_manifest_state(manifest, trainer_state, mode=mode)
+    _validate_trainer_restore(
+        trainer,
+        trainer_state,
+        method_tensor_state=method_tensor_state,
+    )
 
     _load_model(checkpoint_dir, manifest.files, model, strict=strict_load, context=context)
     _load_optimizer(checkpoint_dir, manifest.files, optimizer)
@@ -390,6 +395,30 @@ def _read_method_tensor_state(
     return state
 
 
+def _validate_trainer_restore(
+    trainer: Any,
+    state: Mapping[str, Any],
+    *,
+    method_tensor_state: Mapping[str, Any] | None = None,
+) -> None:
+    """Pre-validate trainer capability and state compatibility before any mutation."""
+
+    if trainer is None:
+        raise ValueError("train_resume restore requires a trainer")
+    load_state_dict = getattr(trainer, "load_state_dict", None)
+    if not callable(load_state_dict):
+        raise TypeError("trainer must expose load_state_dict() for train_resume restore")
+    load_tensor_state = getattr(trainer, "load_method_tensor_state_dict", None)
+    if method_tensor_state is not None and not callable(load_tensor_state):
+        raise ValueError(
+            "checkpoint carries 'method_state' binary payload, but trainer does not "
+            "implement load_method_tensor_state_dict()"
+        )
+    validate_checkpoint_state = getattr(trainer, "validate_checkpoint_state", None)
+    if callable(validate_checkpoint_state):
+        validate_checkpoint_state(state, method_tensor_state=method_tensor_state)
+
+
 def _load_trainer(
     trainer: Any,
     state: Mapping[str, Any],
@@ -398,6 +427,10 @@ def _load_trainer(
 ) -> None:
     if trainer is None:
         raise ValueError("train_resume restore requires a trainer")
+    load_checkpoint_state = getattr(trainer, "load_checkpoint_state", None)
+    if callable(load_checkpoint_state):
+        load_checkpoint_state(state, method_tensor_state=method_tensor_state)
+        return
     load_state_dict = getattr(trainer, "load_state_dict", None)
     if not callable(load_state_dict):
         raise TypeError("trainer must expose load_state_dict() for train_resume restore")

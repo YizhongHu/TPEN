@@ -698,26 +698,10 @@ class VMCTrainer:
             return
         loader(state)
 
-    def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Restore trainer progress state for ``train_resume``.
-
-        Parameters
-        ----------
-        state : Mapping
-            Trainer state read from a checkpoint's ``trainer.json``. Both
-            ``next_iteration`` and ``completed_updates`` are required.
-
-        Raises
-        ------
-        KeyError
-            If either required key is missing. Checkpoints written before the
-            rename (``global_step``/``completed_steps``) are unsupported and
-            fail here rather than silently resuming from step 0.
-        ValueError or TypeError
-            If either value cannot be coerced to ``int``. Both coercions run
-            before either assignment, so a rejected state leaves the trainer's
-            progress counters unmutated.
-        """
+    def _parse_trainer_state_prefix(
+        self, state: Mapping[str, Any]
+    ) -> tuple[int, int, Any]:
+        """Validate and parse counters, non-finite policy, and optional layout without mutation."""
 
         for key in ("next_iteration", "completed_updates"):
             if key not in state:
@@ -769,6 +753,162 @@ class VMCTrainer:
                 raise ValueError(
                     "parameter layout restore requires update-state resolution before restore"
                 )
+        return next_iteration, completed_updates, restored_layout
+
+    def validate_checkpoint_state(
+        self,
+        state: Mapping[str, Any],
+        *,
+        method_tensor_state: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Validate trainer JSON state and optional binary tensor state without mutation.
+
+        Called by :func:`tpen.checkpoint.restore.restore_checkpoint` before
+        model or optimizer weights are loaded so any semantic refusal leaves
+        live model, optimizer, trainer, and update-method state untouched.
+        """
+
+        _next_iteration, _completed_updates, restored_layout = self._parse_trainer_state_prefix(
+            state
+        )
+        if restored_layout is not None:
+            if self._resolved_update_method is None or self._resolved_update_state is None:
+                raise RuntimeError("update state must be resolved before it can be rebuilt")
+            self._resolved_update_state.model_parameters.rebind(
+                tuple(self._resolved_model.parameters()),
+                layout=restored_layout,
+            )
+
+        if "update_method" in state:
+            if self._resolved_update_method is None:
+                raise ValueError(
+                    "update-method state restore requires update-state resolution "
+                    "before restore"
+                )
+            method = self._resolved_update_method
+            method_state = state["update_method"]
+            if not isinstance(method_state, Mapping):
+                raise TypeError("VMCUpdateMethod method state must be a mapping")
+            validator = getattr(method, "validate_method_tensor_state_dict", None)
+            if callable(validator):
+                validator(method_tensor_state, method_state=method_state)
+            elif method_tensor_state is not None:
+                loader = getattr(method, "load_method_tensor_state_dict", None)
+                if not callable(loader):
+                    raise ValueError(
+                        f"{type(method).__name__} does not support "
+                        "binary method tensor state restore"
+                    )
+        else:
+            if self._resolved_update_method is None:
+                if method_tensor_state is not None:
+                    raise ValueError(
+                        "method tensor state restore requires update-state resolution before restore"
+                    )
+                return
+            method = self._resolved_update_method
+            if method.method_state_dict():
+                raise ValueError(
+                    "checkpoint state has no 'update_method' payload, but the resolved "
+                    f"update method {type(method).__name__} owns "
+                    "persistent method state; refusing a partial resume"
+                )
+            validator = getattr(method, "validate_method_tensor_state_dict", None)
+            if callable(validator):
+                validator(method_tensor_state, method_state=None)
+            elif method_tensor_state is not None:
+                loader = getattr(method, "load_method_tensor_state_dict", None)
+                if not callable(loader):
+                    raise ValueError(
+                        f"{type(method).__name__} does not support "
+                        "binary method tensor state restore"
+                    )
+
+    def load_checkpoint_state(
+        self,
+        state: Mapping[str, Any],
+        *,
+        method_tensor_state: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Atomically validate and restore trainer JSON state and binary tensor state."""
+
+        next_iteration, completed_updates, restored_layout = self._parse_trainer_state_prefix(
+            state
+        )
+        if restored_layout is not None:
+            if self._resolved_update_method is None or self._resolved_update_state is None:
+                raise RuntimeError("update state must be resolved before it can be rebuilt")
+            self._resolved_update_state.model_parameters.rebind(
+                tuple(self._resolved_model.parameters()),
+                layout=restored_layout,
+            )
+
+        if "update_method" in state:
+            if self._resolved_update_method is None:
+                raise ValueError(
+                    "update-method state restore requires update-state resolution "
+                    "before restore"
+                )
+            method = self._resolved_update_method
+            method_state = state["update_method"]
+            combined_loader = getattr(method, "load_method_state_and_tensors", None)
+            if callable(combined_loader):
+                combined_loader(method_state, method_tensor_state)
+            else:
+                validator = getattr(method, "validate_method_tensor_state_dict", None)
+                if callable(validator):
+                    validator(method_tensor_state, method_state=method_state)
+                elif method_tensor_state is not None:
+                    loader = getattr(method, "load_method_tensor_state_dict", None)
+                    if not callable(loader):
+                        raise ValueError(
+                            f"{type(method).__name__} does not support "
+                            "binary method tensor state restore"
+                        )
+                method.load_method_state_dict(method_state)
+                self.load_method_tensor_state_dict(method_tensor_state)
+        else:
+            if (
+                self._resolved_update_method is not None
+                and self._resolved_update_method.method_state_dict()
+            ):
+                raise ValueError(
+                    "checkpoint state has no 'update_method' payload, but the resolved "
+                    f"update method {type(self._resolved_update_method).__name__} owns "
+                    "persistent method state; refusing a partial resume"
+                )
+            self.load_method_tensor_state_dict(method_tensor_state)
+
+        self._checkpoint_parameter_layout = restored_layout
+        if restored_layout is not None:
+            self.rebuild_update_state(model=self._resolved_model)
+        self.next_iteration = next_iteration
+        self.completed_updates = completed_updates
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore trainer progress state for ``train_resume``.
+
+        Parameters
+        ----------
+        state : Mapping
+            Trainer state read from a checkpoint's ``trainer.json``. Both
+            ``next_iteration`` and ``completed_updates`` are required.
+
+        Raises
+        ------
+        KeyError
+            If either required key is missing. Checkpoints written before the
+            rename (``global_step``/``completed_steps``) are unsupported and
+            fail here rather than silently resuming from step 0.
+        ValueError or TypeError
+            If either value cannot be coerced to ``int``. Both coercions run
+            before either assignment, so a rejected state leaves the trainer's
+            progress counters unmutated.
+        """
+
+        next_iteration, completed_updates, restored_layout = self._parse_trainer_state_prefix(
+            state
+        )
 
         # Restore method state before the layout rebind below, so a method
         # whose fingerprint disagrees with this checkpoint fails while the
