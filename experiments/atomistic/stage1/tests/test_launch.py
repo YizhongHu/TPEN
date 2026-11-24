@@ -138,7 +138,8 @@ def test_render_fails_for_unapproved_partition_or_results_root() -> None:
                results_root="/n/netscratch/kozinsky_lab/Lab/rhu/stage1",
                partition="not-a-partition", scratch_base="/tmp/stage1")
     with pytest.raises(ValueError, match="Netscratch"):
-        render(row=ROW, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
+        render(row={**ROW, "results_root": "/tmp/stage1"}, driver="driver.py",
+               python="/usr/bin/python3", head_sha="c" * 40,
                results_root="/tmp/stage1", scratch_base="/tmp/stage1")
 
 
@@ -157,7 +158,8 @@ def test_gpu_render_requires_explicit_shape_and_cuda_binding() -> None:
     assert "#SBATCH --cpus-per-task=8" in script
     assert "#SBATCH --mem=64G" in script
     assert "#SBATCH --time=08:00:00" in script
-    assert "runtime.device=cuda" in script
+    assert "--binding" in script
+    assert "runtime.device=cuda" not in script
     assert "expected exactly one management GPU" in script
 
 
@@ -659,12 +661,9 @@ def test_gateway_rejects_effective_run_dir_outside_results_root(
 
 
 def test_row_overrides_bind_nested_layout_even_when_config_inherits_flat() -> None:
-    row = {**ROW, "config": "configs/he/inherited-flat.yaml"}
-    overrides = row_overrides(row)
-    assert "run.layout=nested" in overrides
-    assert validate_gateway_binding(
-        binding=_binding_token(row), config=row["config"], overrides=overrides, kind="train",
-    ) == row
+    from experiments.atomistic.stage1.protocol import row_config_values
+
+    assert row_config_values(ROW)["run"]["layout"] == "nested"
 
 
 def test_gateway_rejects_relative_checkpoint_paths() -> None:

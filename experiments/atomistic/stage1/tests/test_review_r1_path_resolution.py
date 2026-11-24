@@ -311,7 +311,7 @@ def test_rendered_driver_resolves_config_from_any_submission_cwd(
     original_validate = module.validate_gateway_binding
 
     def spy_validate(*args: object, **kwargs: object) -> object:
-        validation_paths.append(str(row["config"]))
+        validation_paths.append(str(resolve_config_path(str(row["config"]))))
         return original_validate(*args, **kwargs)
 
     monkeypatch.setattr(module, "validate_gateway_binding", spy_validate)

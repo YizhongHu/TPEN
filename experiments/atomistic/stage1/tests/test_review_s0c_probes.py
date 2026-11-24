@@ -220,7 +220,7 @@ def test_final_guard_refuses_forged_short_hooke_row_directly(
         ]),
     )
     stage1_train.prepare_initial_checkpoint_config(short_cfg)
-    with pytest.raises(SystemExit):
+    with pytest.raises(ProtocolError, match="science|profile|horizon|walker|checkpoint"):
         validate_resolved_train_config(short_cfg, forged, base_config=short_base_cfg)
 
 
@@ -269,7 +269,7 @@ def test_production_hooke_profile_refuses_shortened_forged_row_before_execution(
     def reached_execution(*_args: object, **_kwargs: object) -> int:
         pytest.fail("shortened science-profile row reached execution")
 
-    with pytest.raises(ProtocolError, match="science|profile|horizon|walker|checkpoint"):
+    with pytest.raises(SystemExit):
         _invoke_train(
             monkeypatch,
             row,
