@@ -24,6 +24,7 @@ from experiments.atomistic.stage1.protocol import (
     build_manifest,
     bind_evaluation_manifest,
     config_identity,
+    derive_smoke_request,
     evaluation_seed,
     identity_expectations,
     smoke_seed,
@@ -58,6 +59,27 @@ def test_protocol_has_no_implicit_partial_defaults() -> None:
 
 def test_stage1_system_roster_includes_the_hooke_pair() -> None:
     assert SYSTEMS == ("hooke1", "hooke2", "qho2e", "he", "h2")
+
+
+def test_qualification_request_copies_train_recipe_and_adds_one_stop_datum() -> None:
+    row = next(row for row in _manifest() if row["kind"] == "train")
+    request = derive_smoke_request(
+        row, results_root="/external/stage1-qualification", stop_at=7,
+    )
+
+    assert request["kind"] == "train"
+    assert request["results_root"] == "/external/stage1-qualification"
+    assert request["execution"] == {"stop_at": 7}
+    for key, value in row.items():
+        if key != "results_root":
+            assert request[key] == value
+
+
+@pytest.mark.parametrize("stop_at", [0, 8, 101])
+def test_qualification_request_rejects_nonretained_or_terminal_stop(stop_at: int) -> None:
+    row = next(row for row in _manifest() if row["kind"] == "train")
+    with pytest.raises(ProtocolError, match="stop_at"):
+        derive_smoke_request(row, results_root="/external/stage1-qualification", stop_at=stop_at)
 
 
 def test_seed_and_row_identity_are_injective_for_non_default_coordinates() -> None:

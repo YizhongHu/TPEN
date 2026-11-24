@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 from omegaconf import OmegaConf
 
-from experiments.atomistic.stage1 import restart
+from experiments.atomistic.stage1 import restart, train as stage1_train
 from experiments.atomistic.stage1.launch import row_overrides
 from experiments.atomistic.stage1.protocol import (
     HOOKE_SCIENCE_PROFILE,
@@ -85,6 +85,14 @@ def _evidence(run_dir: Path, checkpoint_dir: Path, *, step: int = 0) -> object:
     )
 
 
+def test_train_cli_rejects_removed_restart_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LR-3 keeps no second CLI path for selecting a restart."""
+
+    monkeypatch.setattr(sys, "argv", ["stage1-train", "--binding", "ignored", "--restart"])
+    with pytest.raises(SystemExit):
+        stage1_train.main()
+
+
 def test_missing_resume_refuses_before_runner_call(tmp_path: Path, monkeypatch) -> None:
     cfg = _cfg(tmp_path)
     row = _row(tmp_path)
@@ -133,6 +141,37 @@ def test_row_update_horizon_mismatch_refuses_before_runner_call(
         )
     assert error.value.cause is restart.RestartCause.HORIZON_MISMATCH
     assert calls == []
+
+
+def test_fresh_train_stop_uses_runtime_planned_yield_without_changing_cfg(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A qualification stop is an operational callback, not a config edit."""
+
+    cfg = _cfg(tmp_path)
+    row = _row(tmp_path)
+    row["checkpoint_steps"] = [0, 1_000, 100_000]
+    row["execution"] = {"stop_at": 1_000}
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+    captured: dict[str, object] = {}
+
+    def fake_run(run_cfg, **kwargs):
+        captured["cfg"] = OmegaConf.to_container(run_cfg, resolve=True)
+        captured.update(kwargs)
+        return 2
+
+    assert restart.execute_train(
+        cfg=cfg, row=row, config_path="train.yaml", run=fake_run,
+    ) == 2
+    callbacks = captured["runtime_callbacks"]
+    assert isinstance(callbacks, tuple)
+    callback = callbacks[0]
+    assert type(callback).__name__ == "PlannedYield"
+    assert callback.target_iteration == 1_000
+    assert callback.target_iterations == 100_000
+    resolved = captured["cfg"]
+    assert isinstance(resolved, dict)
+    assert resolved["trainer"]["max_steps"] == 100_000
 
 
 def test_recorder_configured_refuses_before_runner_call(tmp_path: Path, monkeypatch) -> None:

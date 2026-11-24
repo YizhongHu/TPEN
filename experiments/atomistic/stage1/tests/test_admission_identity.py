@@ -23,6 +23,7 @@ from experiments.atomistic.stage1.protocol import (
     STAGE1_PROTOCOL,
     build_manifest,
     config_identities,
+    manifest_hash,
     overlay_path_for_system,
     overlay_sha256,
     planned_physical_system_ids,
@@ -250,6 +251,61 @@ def test_canonical_manifest_identity_is_byte_stable() -> None:
     metadata = __import__("json").loads(fixture.read_text(encoding="utf-8"))
     assert len(actual) == metadata["manifest_bytes"]
     assert hashlib.sha256(actual).hexdigest() == metadata["manifest_sha256"]
+
+
+def test_v3_rows_keep_identity_and_compose_after_v4_planner_addition() -> None:
+    """The v4 planner path does not invalidate existing v3 train rows."""
+
+    legacy_rows = _phase1_rows(system="he")
+    legacy_train = [row for row in legacy_rows if row["kind"] == "train"]
+    assert len(legacy_rows) == 4
+
+    # The planner's new production shape is the old train population with the
+    # compatibility smoke row omitted.  Compare the identity-bearing fields,
+    # not merely the row count, so adding the v4 path cannot silently alter a
+    # pre-existing v3 row hash, row id, or config identity.
+    v4_train = build_manifest(
+        protocol=Protocol(1, 2, 1, 2, 3, 4, 2, 2, 1),
+        source_sha="a" * 40,
+        config_sha256=config_identities(config_root=CONFIG_ROOT, systems=("he",)),
+        checkpoints=[0, 1],
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root="/external/stage1-review-r1",
+        systems=("he",),
+        phase=1,
+        include_smoke=False,
+    )
+    assert v4_train == legacy_train
+
+    expected_legacy_identity = {
+        "smoke": (
+            "64ab378e3465b621286feaa8ab9a30346dcf8c7f53de0c7db7ccdecc344a06ee",
+            "47eed69f5ef0658662accbe834d1dfbd4b3f90d08a4a720f9195c84be714a523",
+        ),
+        "train-lineage-0": (
+            "309ba3050eaf252c89127817419d52bd4cb966be0fad5536ad62388a2449deed",
+            "5912e1969658dbaa7e990d1fb2472369d6d738c3f71b992106f28fe1d488eb77",
+        ),
+        "train-lineage-1": (
+            "c0f9675275fb0d91512b615b21b4bb2d3696431f5afe1c7e1188c9cf2688a779",
+            "e86707988cf15ab56cbdc32dd25165a50b1debb3511e6ac8f21523e3547cac58",
+        ),
+        "train-lineage-2": (
+            "7fa73f0362f35d52c0473f32496c607d67d6475d57c7052b72e3cb0b2b4f3f62",
+            "d4b55a26670ae2853ffaf8d12e71df725d43b34dea720058ef036ecc83179502",
+        ),
+    }
+    for row in legacy_rows:
+        assert (row["row_id"], manifest_hash([row])) == expected_legacy_identity[row["run_id"]]
+        assert row["config_identity_rule"] == "stage1-config-v1"
+        assert row["config_sha256"] == config_identities(
+            config_root=CONFIG_ROOT, systems=("he",),
+        )["he"]
+        validate_gateway_binding(binding=_binding_token(row))
+        if row["kind"] == "train":
+            cfg = stage1_train.build_train_config(row)
+            assert OmegaConf.select(cfg, "run.run_id") == row["run_id"]
 
 
 @pytest.mark.parametrize("system", SYSTEMS)

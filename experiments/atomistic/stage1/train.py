@@ -119,22 +119,16 @@ def main() -> int:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--binding", required=True)
-    parser.add_argument(
-        "--restart", action="store_true",
-        help="run the admitted row through the Stage-1 restart protocol",
-    )
     args = parser.parse_args()
     row = validate_gateway_binding(binding=args.binding, expected_kinds={"smoke", "train"})
     cfg = build_train_config(row)
     config_path = resolve_config_path(str(row["config"]))
-    if args.restart:
-        from experiments.atomistic.stage1.restart import execute_restart
+    from experiments.atomistic.stage1.restart import execute_train
 
-        result = execute_restart(
-            cfg=cfg, row=row, config_path=config_path, command="stage1 restart",
-        )
-        return 0 if result.outcome == "completed" else 1
-    return run_from_config(cfg, config_path=str(config_path), command="stage1 train")
+    return execute_train(
+        cfg=cfg, row=row, config_path=config_path, command="stage1 train",
+        run=run_from_config,
+    )
 
 
 if __name__ == "__main__":

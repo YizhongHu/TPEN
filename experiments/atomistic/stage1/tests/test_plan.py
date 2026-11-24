@@ -169,9 +169,12 @@ def test_plan_main_phase1_then_phase2_round_trip(
     )
     assert plan_module.main() == 0
     phase2_doc = json.loads(phase2_path.read_text(encoding="utf-8"))
-    assert len(phase2_doc["rows"]) == 16
+    assert len(phase2_doc["rows"]) == 15
     assert phase2_doc["phase"] == 2
+    assert phase2_doc["schema"] == "stage1/v4"
     assert phase2_doc["config_identity_rule"] == "stage1-config-v1"
+    assert all(row["kind"] == "train" or row["kind"] == "eval"
+               for row in phase2_doc["rows"])
     eval_rows = [row for row in phase2_doc["rows"] if row["kind"] == "eval"]
     assert len(eval_rows) == 12
     assert all(row["phase1_manifest_hash"] == phase1_doc["manifest_hash"] for row in eval_rows)
