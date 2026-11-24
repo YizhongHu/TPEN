@@ -98,10 +98,10 @@ def test_sampler_scope_pairing_order_and_burn_in_conditions() -> None:
     assert _event_kinds(no_burn) == [SamplerProduction, SamplerProduction]
 
 
-def test_sampler_failures_pair_and_preserve_exception_and_burn_state() -> None:
+def test_sampler_failures_pair_and_preserve_exception_and_burn_state(monkeypatch) -> None:
     model = _FailingModel()
     emitter = _RecordingEmitter()
-    sampler = _sampler()
+    sampler = _sampler(burn_in=3, n_steps=2)
     model.fail = True
     with pytest.raises(RuntimeError, match="sampler model failure") as burn_error:
         sampler.collect_samples(model, emitter=emitter)
@@ -111,7 +111,13 @@ def test_sampler_failures_pair_and_preserve_exception_and_burn_state() -> None:
 
     model.fail = False
     sampler.collect_samples(model, emitter=emitter)
-    model.fail = True
+    def fail_production(model_arg, walkers, n_steps):
+        if n_steps == sampler.n_steps:
+            raise RuntimeError("sampler model failure")
+        return original_sample(model_arg, walkers, n_steps)
+
+    original_sample = sampler.sample
+    monkeypatch.setattr(sampler, "sample", fail_production)
     with pytest.raises(RuntimeError, match="sampler model failure") as production_error:
         sampler.collect_samples(model, emitter=emitter)
     assert production_error.value.args == ("sampler model failure",)
@@ -163,9 +169,12 @@ class _MetricContext:
 
 
 def _deliver(callback, event, count: int, context: _MetricContext) -> None:
-    callback.handle_occurrence_impl.__wrapped__(  # type: ignore[attr-defined]
-        callback, Occurrence(event, count, monotonic_time=float(count)), context
-    )
+    from typeguard import suppress_type_checks
+
+    with suppress_type_checks():
+        callback.handle_occurrence_impl(
+            Occurrence(event, count, monotonic_time=float(count)), context
+        )
 
 
 def test_sampling_scope_timing_correlates_training_and_evaluation_and_cleans_up() -> None:
