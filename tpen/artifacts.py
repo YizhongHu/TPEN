@@ -432,7 +432,12 @@ class RunContext:
     )
     invocation_id: str = field(default_factory=lambda: str(uuid4()))
     initial_readiness: InitVar[RunContextReadiness] = RunContextReadiness.READY
-    _readiness: RunContextReadiness = field(init=False, repr=False)
+    # Class-level default preserves READY semantics for legacy test doubles
+    # that subclass RunContext without calling super().__init__() or construct
+    # instances via object.__new__(RunContext).
+    _readiness: RunContextReadiness = field(
+        default=RunContextReadiness.READY, init=False, repr=False
+    )
     _checkpoint_hook: Callable[[], None] | None = field(
         default=None, init=False, repr=False
     )

@@ -58,6 +58,7 @@ from tpen.config_schema import ClosedSchemaError
 from tpen.distributed import ExecutionTopology, ProfileRecord, ProfileScope
 from tpen.events import DomainState, Event, Occurrence, Operation, Subscription
 from tpen.hi_schema import HI_TRAIN_SCHEMA
+from tpen.process_resources import ProcessResourceResult
 import tpen.run as run_mod
 from tpen.run import (
     _ManagedLifecycleRegistry,
@@ -136,9 +137,10 @@ class _CheckpointFailureRunner(Runner):
         from tpen.callback.checkpoint import CheckpointPublicationError
 
         del context
+        err = OSError("disk full")
+        setattr(err, "tpen_publication_stage", "commit")
         raise CheckpointPublicationError(
-            original=OSError("disk full"),
-            stage="commit",
+            err,
             next_iteration=3,
             completed_updates=3,
             target_iterations=10,
@@ -514,6 +516,25 @@ def test_run_context_readiness_transitions_and_gating(tmp_path: Path) -> None:
     assert preparing.readiness is RunContextReadiness.PREPARING
     assert preparing.invocation_id != ctx.invocation_id
 
+    profile_record = ProfileRecord(
+        scope=ProfileScope.PROCESS,
+        monotonic_time=0.0,
+        topology=ExecutionTopology.single_process(device="cpu"),
+        process=ProcessResourceResult(
+            user_cpu_seconds=0.1,
+            system_cpu_seconds=0.05,
+            read_block_operations=0,
+            write_block_operations=0,
+            voluntary_context_switches=1,
+            involuntary_context_switches=0,
+            peak_rss_mb=32.0,
+        ),
+    )
+    # Positive control: READY context reaches the profile-writer check rather than failing readiness.
+    with pytest.raises(RuntimeError, match="rank-local profile writer is not configured") as ready_exc:
+        ctx.write_profile(profile_record)
+    assert not isinstance(ready_exc.value, RunContextReadinessError)
+
     for state in (RunContextReadiness.PREPARING, RunContextReadiness.FINALIZING, RunContextReadiness.CLOSED):
         target = RunContext(
             cfg=ctx.cfg,
@@ -532,13 +553,7 @@ def test_run_context_readiness_transitions_and_gating(tmp_path: Path) -> None:
         with pytest.raises(RunContextReadinessError, match="log"):
             target.log({"x": 1.0})
         with pytest.raises(RunContextReadinessError, match="write_profile"):
-            target.write_profile(
-                ProfileRecord(
-                    scope=ProfileScope.PROCESS,
-                    monotonic_time=0.0,
-                    topology=ExecutionTopology.single_process(device="cpu"),
-                )
-            )
+            target.write_profile(profile_record)
         with pytest.raises(RunContextReadinessError, match="_dispatch_occurrence"):
             target._dispatch_occurrence(target._occurrence(event=_PulseEvent(), count=1))
         assert target._occurrence_counts == {}
@@ -587,6 +602,49 @@ def test_run_context_readiness_transitions_and_gating(tmp_path: Path) -> None:
             clock=ctx.clock,
             invocation_id="   ",
         )
+
+
+def test_run_context_subclass_and_new_default_to_ready(tmp_path: Path) -> None:
+    """Subclasses skipping super().__init__() and object.__new__(RunContext) default to READY."""
+
+    base = make_run_context(tmp_path)
+
+    class _NoSuperContext(RunContext):
+        def __init__(self) -> None:
+            self.artifact_manager = base.artifact_manager
+            self.metadata = base.metadata
+            self.clock = base.clock
+            self.callbacks = []
+            self._occurrence_counts = {}
+
+    sub = _NoSuperContext()
+    assert sub.readiness is RunContextReadiness.READY
+    assert sub._checkpoint_hook is None
+    sub._require_ready("emit")
+    sub._dispatch_occurrence(sub._occurrence(event=_PulseEvent(), count=1))
+    assert sub.emit(_PulseEvent()).count == 1
+    with pytest.raises(RunContextReadinessError):
+        sub._transition_readiness(RunContextReadiness.PREPARING)
+    sub._transition_readiness(RunContextReadiness.FINALIZING)
+    assert sub.readiness is RunContextReadiness.FINALIZING
+    assert RunContext._readiness is RunContextReadiness.READY
+    with pytest.raises(RunContextReadinessError, match="emit"):
+        sub._require_ready("emit")
+
+    raw = object.__new__(RunContext)
+    assert raw.readiness is RunContextReadiness.READY
+    assert raw._checkpoint_hook is None
+    raw._require_ready("write_profile")
+    raw.artifact_manager = base.artifact_manager
+    raw.metadata = base.metadata
+    raw.clock = base.clock
+    raw.callbacks = []
+    raw._dispatch_occurrence(raw._occurrence(event=_PulseEvent(), count=1))
+    with pytest.raises(RunContextReadinessError):
+        raw._transition_readiness(RunContextReadiness.PREPARING)
+    raw._transition_readiness(RunContextReadiness.FINALIZING)
+    assert raw.readiness is RunContextReadiness.FINALIZING
+    assert RunContext._readiness is RunContextReadiness.READY
 
 
 def test_build_run_metadata_include_hardware_false_skips_hardware_probe(
@@ -865,7 +923,9 @@ def test_preflight_run_identity_error_leaves_zero_dirs_or_scopes(tmp_path: Path)
         local_rank=0,
         local_size=2,
         node_rank=0,
-        node_count=1,
+        node_size=1,
+        host="localhost",
+        pid=1234,
         device="cpu",
     )
     with pytest.raises(RunIdentityError):
@@ -1261,12 +1321,11 @@ def test_ready_outcomes_yield_checkpoint_error_and_early_callback_failure(
         tmp_path / "ckpt", runner={"_target_": f"{__name__}._CheckpointFailureRunner"}
     )
     assert run_from_config(cfg_ckpt, runtime_callbacks=[m_ckpt]) == 1
-    assert (
-        json.loads((tmp_path / "ckpt" / "outputs" / "obs" / "unit" / "run_001" / "run-outcome.json").read_text())[
-            "status"
-        ]
-        == "unknown"
+    ckpt_outcome = json.loads(
+        (tmp_path / "ckpt" / "outputs" / "obs" / "unit" / "run_001" / "run-outcome.json").read_text()
     )
+    assert ckpt_outcome["status"] == "unknown"
+    assert ckpt_outcome["publication_stage"] == "commit"
     assert m_ckpt.handles[0].stop_requests == 1
 
     # Earlier callback failure still triggers stop + exit even with probability=0.0
