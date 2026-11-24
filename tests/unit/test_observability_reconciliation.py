@@ -194,6 +194,7 @@ def _make_context(
 def _base_manifest(
     *,
     invocation_id: str = INVOCATION_ID,
+    run_id: str = "o7-run",
     lifecycle_state: str = "open",
     data_completeness: str = "unknown",
     observers: list[dict[str, Any]] | None = None,
@@ -215,7 +216,7 @@ def _base_manifest(
         invocation_id=invocation_id,
         lifecycle_state=lifecycle_state,
         data_completeness=data_completeness,
-        run_id="o7-run",
+        run_id=run_id,
         producer={
             "name": "tpen.callback.resource_samples.ResourceSamples",
             "version": "1",
@@ -605,6 +606,7 @@ def _write_clean_bundle(
     tmp_path: Path,
     *,
     run_id: str = "clean-run",
+    manifest_run_id: str = "o7-run",
     invocation_id: str = INVOCATION_ID,
     busy_unavailable: bool = False,
     counts: dict[str, int] | None = None,
@@ -618,7 +620,9 @@ def _write_clean_bundle(
 ) -> tuple[ArtifactManager, ObservabilityBundleWriter]:
     manager = _make_manager(tmp_path, run_id=run_id)
     writer = ObservabilityBundleWriter(manager, invocation_id)
-    writer.write_open_manifest(_base_manifest(invocation_id=invocation_id))
+    writer.write_open_manifest(
+        _base_manifest(invocation_id=invocation_id, run_id=manifest_run_id)
+    )
     writer.write_inventory(_base_inventory(invocation_id=invocation_id))
     writer.write_descriptors(_base_descriptors(invocation_id=invocation_id))
     for pkt in _sample_packets(
@@ -641,6 +645,7 @@ def _write_clean_bundle(
     writer.finalize_manifest(
         _base_manifest(
             invocation_id=invocation_id,
+            run_id=manifest_run_id,
             lifecycle_state=lifecycle_state,
             data_completeness=data_completeness,
         )
@@ -828,6 +833,109 @@ def test_lifecycle_marker_open_finalized_roundtrip_and_tamper_detection(
     marker_path.write_text(json.dumps(bad_marker), encoding="utf-8")
     with pytest.raises(ObservabilitySchemaError, match="unsupported lifecycle_marker schema"):
         reconcile_observability_bundle(writer.bundle_dir)
+
+
+def test_open_marker_identity_mismatch_is_not_masked_as_interrupted(
+    tmp_path: Path,
+) -> None:
+    """A strict-valid marker identity mismatch is unsafe even while a run is open."""
+
+    manager = _make_manager(tmp_path, run_id="open-marker-precedence")
+    writer = ObservabilityBundleWriter(manager, INVOCATION_ID)
+    writer.write_open_manifest(_base_manifest())
+    writer.write_inventory(_base_inventory())
+    writer.write_descriptors(_base_descriptors())
+    assert writer.append_sample(_sample_packets()[0]).written is True
+
+    untouched = reconcile_observability_bundle(writer.bundle_dir)
+    assert untouched.reconciliation_state == "open_interrupted"
+    assert untouched.lifecycle_state == "open"
+
+    marker_path = writer.bundle_dir / LIFECYCLE_MARKER_FILENAME
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["run_id"] = "different-strict-valid-run-id"
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    mismatched = reconcile_observability_bundle(writer.bundle_dir)
+    assert mismatched.reconciliation_state == "failed"
+    assert mismatched.lifecycle_state == "unsafe"
+    assert mismatched.finalization == "unsafe"
+    assert mismatched.assessment_reason == "lifecycle_marker_identity_mismatch"
+    assert mismatched.lifecycle_marker.diagnostic_code == (
+        "lifecycle_marker_identity_mismatch"
+    )
+
+    # The same identity mismatch on an ordinary closed bundle is also unsafe;
+    # this control distinguishes marker identity from the crash-window signal.
+    _, closed_writer = _write_clean_bundle(
+        tmp_path, run_id="closed-marker-precedence"
+    )
+    closed_marker_path = closed_writer.bundle_dir / LIFECYCLE_MARKER_FILENAME
+    closed_marker = json.loads(closed_marker_path.read_text(encoding="utf-8"))
+    closed_marker["run_id"] = "different-strict-valid-run-id"
+    closed_marker_path.write_text(json.dumps(closed_marker), encoding="utf-8")
+    closed_mismatch = reconcile_observability_bundle(closed_writer.bundle_dir)
+    assert closed_mismatch.reconciliation_state == "failed"
+    assert closed_mismatch.lifecycle_state == "unsafe"
+    assert closed_mismatch.assessment_reason == "lifecycle_marker_identity_mismatch"
+
+
+def test_renderer_bounds_embedded_newlines_without_changing_identity(
+    tmp_path: Path,
+) -> None:
+    """Raw manifest text may contain newlines but rendered output stays bounded."""
+
+    manifest_run_id = "run-with\nembedded-newline"
+    _, newline_writer = _write_clean_bundle(
+        tmp_path,
+        run_id="renderer-newline",
+        manifest_run_id=manifest_run_id,
+    )
+    newline_bundle = reconcile_observability_bundle(newline_writer.bundle_dir)
+    newline_summary = newline_bundle.summary
+    identity_before = newline_summary.identity.to_dict()
+    rendered = render_operator_summary(
+        newline_summary, max_lines=3, max_line_chars=256
+    )
+    assert len(rendered.splitlines()) <= 3
+    assert newline_summary.identity.to_dict() == identity_before
+    assert newline_summary.identity.run_id == manifest_run_id
+    assert newline_summary.identity.invocation_id == INVOCATION_ID
+
+    # Ordinary text remains a green control under the same strict limits.
+    _, ordinary_writer = _write_clean_bundle(
+        tmp_path,
+        run_id="renderer-ordinary",
+        manifest_run_id="ordinary-run",
+    )
+    ordinary_summary = reconcile_observability_bundle(
+        ordinary_writer.bundle_dir
+    ).summary
+    ordinary_rendered = render_operator_summary(
+        ordinary_summary, max_lines=3, max_line_chars=256
+    )
+    assert len(ordinary_rendered.splitlines()) <= 3
+
+
+def test_renderer_bounds_mutant_is_detected_with_green_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bounded-render assertion detects an explicit truncation mutant."""
+
+    _, writer = _write_clean_bundle(tmp_path, run_id="renderer-mutant")
+    summary = reconcile_observability_bundle(writer.bundle_dir).summary
+    baseline = render_operator_summary(summary, max_lines=3, max_line_chars=256)
+    assert len(baseline.splitlines()) <= 3
+
+    def mutant(_summary: BoundedOperatorSummary, **_kwargs: Any) -> str:
+        return "\n".join(("mutant-line",) * 4)
+
+    monkeypatch.setattr(rec_mod, "render_operator_summary", mutant)
+    mutant_output = rec_mod.render_operator_summary(
+        summary, max_lines=3, max_line_chars=256
+    )
+    assert len(mutant_output.splitlines()) > 3
+    with pytest.raises(AssertionError):
+        assert len(mutant_output.splitlines()) <= 3
 
 
 # ---------------------------------------------------------------------------
