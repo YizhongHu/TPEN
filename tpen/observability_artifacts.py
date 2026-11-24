@@ -203,6 +203,21 @@ def _require_keys(
         )
 
 
+def _reject_explicit_null_optionals(
+    mapping: Mapping[str, Any],
+    optional_keys: set[str] | frozenset[str],
+    *,
+    context: str,
+) -> None:
+    """Reject explicit JSON ``null`` (``None``) values on present optional keys."""
+
+    for key in sorted(optional_keys):
+        if key in mapping and mapping[key] is None:
+            raise ObservabilitySchemaError(
+                f"{context}.{key} must not be null when present"
+            )
+
+
 def _require_bool(value: object, name: str) -> bool:
     if type(value) is not bool:
         raise ObservabilitySchemaError(
@@ -409,7 +424,7 @@ def validate_relative_path(
     if Path(value).is_absolute():
         raise ObservabilityPathError(f"{name} {value!r} must be relative")
     normalized = PurePosixPath(*segments).as_posix()
-    if forbid_manifest_self and normalized == MANIFEST_FILENAME:
+    if forbid_manifest_self and normalized.lower() == MANIFEST_FILENAME.lower():
         raise ObservabilityPathError(
             "manifest.artifacts must not reference manifest.json recursively"
         )
@@ -632,6 +647,7 @@ class ObservabilityReading:
             optional={"detail"},
             context="reading",
         )
+        _reject_explicit_null_optionals(mapping, {"detail"}, context="reading")
         return cls(
             status=status,
             reason_code=mapping["reason_code"],
@@ -729,6 +745,7 @@ class QuantityDescriptor:
             optional={"quality"},
             context="descriptor",
         )
+        _reject_explicit_null_optionals(mapping, {"quality"}, context="descriptor")
         raw_quality = mapping.get("quality", ())
         return cls(
             source_id=mapping["source_id"],
@@ -800,12 +817,14 @@ class ObservabilityArtifactRef:
         """Validate and construct an :class:`ObservabilityArtifactRef`."""
 
         mapping = _require_mapping(data, "artifact")
+        optional_keys = {"bytes", "sha256", "kind"}
         _require_keys(
             mapping,
             required={"path"},
-            optional={"bytes", "sha256", "kind"},
+            optional=optional_keys,
             context="artifact",
         )
+        _reject_explicit_null_optionals(mapping, optional_keys, context="artifact")
         return cls(
             path=mapping["path"],
             bytes=mapping.get("bytes"),
@@ -1504,6 +1523,10 @@ class ObservabilityStatus:
             raise ObservabilitySchemaError(
                 "status.coverage.acquisition_end_ns must be >= activation_ns"
             )
+        if "clock_domain_id" in coverage:
+            _require_nonempty_str(
+                coverage["clock_domain_id"], "status.coverage.clock_domain_id"
+            )
         if "missed_deadlines" in coverage:
             _require_int(
                 coverage["missed_deadlines"],
@@ -1662,6 +1685,9 @@ class ObservabilityStatus:
             },
             optional={"unavailable_fields", "diagnostics"},
             context="status",
+        )
+        _reject_explicit_null_optionals(
+            mapping, {"unavailable_fields", "diagnostics"}, context="status"
         )
         return cls(
             schema=mapping["schema"],
@@ -2002,6 +2028,27 @@ class ObservabilityProfileStatus:
         """Validate and construct an :class:`ObservabilityProfileStatus`."""
 
         mapping = _require_mapping(data, "profile_status")
+        optional_keys = frozenset(
+            {
+                "requested_start_ns",
+                "requested_end_ns",
+                "start_call_bracket_ns",
+                "stop_call_bracket_ns",
+                "backend_event_bounds",
+                "stop_overshoot_bounds_seconds",
+                "longest_checkpoint_gap_seconds",
+                "max_rows",
+                "activity_diagnostics",
+                "operation_id",
+                "operation_occurrences",
+                "durable_steps",
+                "export_mode",
+                "native_export_seconds",
+                "staging_bytes",
+                "artifacts",
+                "truncation_reasons",
+            }
+        )
         _require_keys(
             mapping,
             required={
@@ -2022,26 +2069,11 @@ class ObservabilityProfileStatus:
                 "exporter",
                 "export_status",
             },
-            optional={
-                "requested_start_ns",
-                "requested_end_ns",
-                "start_call_bracket_ns",
-                "stop_call_bracket_ns",
-                "backend_event_bounds",
-                "stop_overshoot_bounds_seconds",
-                "longest_checkpoint_gap_seconds",
-                "max_rows",
-                "activity_diagnostics",
-                "operation_id",
-                "operation_occurrences",
-                "durable_steps",
-                "export_mode",
-                "native_export_seconds",
-                "staging_bytes",
-                "artifacts",
-                "truncation_reasons",
-            },
+            optional=optional_keys,
             context="profile_status",
+        )
+        _reject_explicit_null_optionals(
+            mapping, optional_keys, context="profile_status"
         )
         return cls(
             schema=mapping["schema"],
@@ -2245,6 +2277,9 @@ class ObservabilityProfileSummary:
             optional={"source_provenance"},
             context="profile_summary",
         )
+        _reject_explicit_null_optionals(
+            mapping, {"source_provenance"}, context="profile_summary"
+        )
         return cls(
             schema=mapping["schema"],
             kind=mapping["kind"],
@@ -2400,11 +2435,19 @@ class RunArtifactSink:
 
         from tpen.callback.base import ResourceOwnershipClaim
 
+        valid_invocation = validate_identifier(invocation_id, "invocation_id")
         valid_observer = validate_identifier(
             observer_id, "observer_id", forbid_status_collision=True
         )
-        bundle_dir = self.resolve_bundle_dir(artifact_manager, invocation_id)
-        scope_path = bundle_dir / "resources" / f"{valid_observer}.jsonl"
+        bundle_dir = self.resolve_bundle_dir(artifact_manager, valid_invocation)
+        stream_rel = ("resources", f"{valid_observer}.jsonl")
+        full_rel = (*self.relative_dir.split("/"), valid_invocation, *stream_rel)
+        try:
+            scope_path = artifact_manager.path(*full_rel)
+        except ArtifactRoutingError as exc:
+            raise ObservabilityPathError(str(exc)) from exc
+        _check_no_symlinks_under(artifact_manager.run_dir, full_rel)
+        _check_no_symlinks_under(bundle_dir, stream_rel)
         return ResourceOwnershipClaim(
             kind="artifact_writer",
             scope=str(scope_path.resolve(strict=False)),
@@ -2437,9 +2480,22 @@ def _bound_text(
     if len(text) <= max_chars:
         return text
     _append_unique(reasons, reason_tag)
+    candidate_source = text
+    if candidate_source.strip():
+        # Strip leading whitespace if slicing the prefix would collapse to
+        # whitespace-only so non-empty schema strings remain valid.
+        prefix_len = max_chars - 3 if max_chars >= 4 else max_chars
+        if not candidate_source[:prefix_len].strip():
+            candidate_source = candidate_source.lstrip()
     if max_chars >= 4:
-        return text[: max_chars - 3] + "..."
-    return text[:max_chars]
+        if len(candidate_source) <= max_chars:
+            return candidate_source
+        result = candidate_source[: max_chars - 3] + "..."
+    else:
+        result = candidate_source[:max_chars]
+    if text.strip() and not result.strip():
+        result = "." * min(max_chars, 3)
+    return result
 
 
 def _bound_reason_list(
@@ -2479,6 +2535,35 @@ def _bound_str_sequence(
     )
 
 
+def _disambiguate_bounded_key(
+    bounded_key: str,
+    existing: set[str],
+    *,
+    max_chars: int,
+) -> str:
+    """Return a deterministic unique key not in ``existing`` within ``max_chars`` when possible."""
+
+    if bounded_key not in existing:
+        return bounded_key
+    suffix_idx = 2
+    while True:
+        suffix = f"~{suffix_idx}"
+        if len(suffix) < max_chars:
+            avail = max_chars - len(suffix)
+            if avail >= 4 and bounded_key.endswith("..."):
+                candidate = bounded_key[: avail - 3] + "..." + suffix
+            else:
+                candidate = bounded_key[:avail] + suffix
+        else:
+            compact = str(suffix_idx)
+            candidate = (
+                compact if len(compact) <= max_chars else f"{bounded_key}~{suffix_idx}"
+            )
+        if candidate not in existing:
+            return candidate
+        suffix_idx += 1
+
+
 def _bound_json_value(
     value: Any,
     *,
@@ -2489,12 +2574,24 @@ def _bound_json_value(
     if type(value) is str:
         return _bound_text(value, max_chars=max_chars, reasons=reasons)
     if isinstance(value, Mapping):
-        return {
-            _bound_text(str(k), max_chars=max_chars, reasons=reasons): _bound_json_value(
+        entries = sorted(value.items(), key=lambda pair: str(pair[0]))
+        if len(entries) > max_items:
+            _append_unique(reasons, "mapping_truncated")
+            entries = entries[:max_items]
+        bounded_map: dict[str, Any] = {}
+        seen_keys: set[str] = set()
+        for k, v in entries:
+            bounded_key = _bound_text(str(k), max_chars=max_chars, reasons=reasons)
+            if bounded_key in seen_keys:
+                _append_unique(reasons, "key_collision_disambiguated")
+                bounded_key = _disambiguate_bounded_key(
+                    bounded_key, seen_keys, max_chars=max_chars
+                )
+            seen_keys.add(bounded_key)
+            bounded_map[bounded_key] = _bound_json_value(
                 v, max_chars=max_chars, max_items=max_items, reasons=reasons
             )
-            for k, v in value.items()
-        }
+        return bounded_map
     if isinstance(value, (list, tuple)):
         items = list(value)
         if len(items) > max_items:
@@ -2807,9 +2904,12 @@ class ObservabilityBundleWriter:
             )
 
         target.parent.mkdir(parents=True, exist_ok=True)
-        append_record(target, line)
+        try:
+            append_record(target, line)
+        finally:
+            if target.exists():
+                self._written_artifacts[rel_path] = target
         self._sample_sequences[seq_key] = sample.sequence
-        self._written_artifacts[rel_path] = target
         return SampleAppendResult(
             written=True,
             bytes_written=needed_bytes,
@@ -2860,6 +2960,18 @@ class ObservabilityBundleWriter:
                 reasons=reasons,
             )
         )
+        bounded_writer = _bound_json_value(
+            status.writer,
+            max_chars=self.sink.max_text_chars,
+            max_items=self.sink.max_list_items,
+            reasons=reasons,
+        )
+        bounded_helper_cleanup = _bound_json_value(
+            status.helper_cleanup,
+            max_chars=self.sink.max_text_chars,
+            max_items=self.sink.max_list_items,
+            reasons=reasons,
+        )
         bounded_reasons = _bound_reason_list(
             reasons, max_items=self.sink.max_list_items
         )
@@ -2872,8 +2984,8 @@ class ObservabilityBundleWriter:
             coverage=status.coverage,
             counts=status.counts,
             truncation_reasons=bounded_reasons,
-            writer=status.writer,
-            helper_cleanup=status.helper_cleanup,
+            writer=bounded_writer,
+            helper_cleanup=bounded_helper_cleanup,
             application_outcome=status.application_outcome,
             invocation_outcome=status.invocation_outcome,
             export_status=status.export_status,
@@ -3009,6 +3121,12 @@ class ObservabilityBundleWriter:
             )
             for row in raw_rows
         )
+        bounded_provenance = _bound_json_value(
+            summary.source_provenance,
+            max_chars=self.sink.max_text_chars,
+            max_items=self.sink.max_list_items,
+            reasons=reasons,
+        )
         truncated = summary.truncated or bool(reasons) or (
             summary.total_rows > len(bounded_rows)
         )
@@ -3025,7 +3143,7 @@ class ObservabilityBundleWriter:
             rows=bounded_rows,
             truncated=truncated,
             truncation_reasons=bounded_reasons,
-            source_provenance=summary.source_provenance,
+            source_provenance=bounded_provenance,
         )
         payload = _dumps_canonical_json(bounded_summary.to_dict()).encode("ascii")
         if len(payload) > self.sink.max_status_bytes:
@@ -3393,6 +3511,64 @@ def _check_closed_manifest_artifacts(
                     f"expected {ref.sha256}, observed {digest}"
                 )
 
+    if manifest.lifecycle_state != "closed":
+        return
+
+    # On a closed manifest, every discovered core bundle artifact on disk must
+    # be accounted for and verified in manifest.artifacts.
+    accounted = {ref.path for ref in manifest.artifacts}
+    discovered: list[str] = []
+    for top_name in (INVENTORY_FILENAME, DESCRIPTORS_FILENAME):
+        top_path = _check_no_symlinks_under(bundle_dir, [top_name])
+        if top_path.exists() and top_path.is_file():
+            discovered.append(top_name)
+
+    resources_dir = _check_no_symlinks_under(bundle_dir, ["resources"])
+    if resources_dir.exists() and resources_dir.is_dir():
+        for entry in sorted(resources_dir.iterdir(), key=lambda p: p.name):
+            _check_no_symlinks_under(bundle_dir, ["resources", entry.name])
+            if entry.is_file() and entry.name.endswith(".jsonl"):
+                discovered.append(f"resources/{entry.name}")
+
+    status_dir = _check_no_symlinks_under(bundle_dir, ["status"])
+    if status_dir.exists() and status_dir.is_dir():
+        for entry in sorted(status_dir.iterdir(), key=lambda p: p.name):
+            _check_no_symlinks_under(bundle_dir, ["status", entry.name])
+            if entry.is_file() and entry.name.endswith(".json"):
+                discovered.append(f"status/{entry.name}")
+
+    profiles_dir = _check_no_symlinks_under(bundle_dir, ["profiles"])
+    if profiles_dir.exists() and profiles_dir.is_dir():
+        for obs_entry in sorted(profiles_dir.iterdir(), key=lambda p: p.name):
+            _check_no_symlinks_under(bundle_dir, ["profiles", obs_entry.name])
+            if not obs_entry.is_dir():
+                continue
+            for win_entry in sorted(obs_entry.iterdir(), key=lambda p: p.name):
+                _check_no_symlinks_under(
+                    bundle_dir, ["profiles", obs_entry.name, win_entry.name]
+                )
+                if not win_entry.is_dir():
+                    continue
+                for child_name in (
+                    PROFILE_STATUS_FILENAME,
+                    LEGACY_PROFILE_STATUS_FILENAME,
+                    PROFILE_SUMMARY_FILENAME,
+                ):
+                    child_path = _check_no_symlinks_under(
+                        bundle_dir,
+                        ["profiles", obs_entry.name, win_entry.name, child_name],
+                    )
+                    if child_path.exists() and child_path.is_file():
+                        discovered.append(
+                            f"profiles/{obs_entry.name}/{win_entry.name}/{child_name}"
+                        )
+
+    omitted = sorted(path for path in discovered if path not in accounted)
+    if omitted:
+        raise ObservabilityArtifactError(
+            f"closed manifest omits discovered bundle artifacts from manifest.artifacts: {omitted}"
+        )
+
 
 def _read_sample_stream(
     path: Path,
@@ -3400,7 +3576,9 @@ def _read_sample_stream(
     rel_path: str,
     expected_invocation_id: str,
     expected_observer_id: str,
+    expected_descriptor_set_id: str,
     descriptors: ObservabilityDescriptorSet | None,
+    declared_clock_domains: frozenset[str] | None,
     torn_tails: list[ObservabilityDiagnostic],
     interior_errors: list[ObservabilityDiagnostic],
     diagnostics: list[ObservabilityDiagnostic],
@@ -3525,22 +3703,42 @@ def _read_sample_stream(
             diagnostics.append(err)
             continue
 
+        if sample.descriptor_set_id != expected_descriptor_set_id:
+            err = ObservabilityDiagnostic(
+                code="invalid_interior_record",
+                message=(
+                    f"sample descriptor_set_id {sample.descriptor_set_id!r} does not match "
+                    f"expected descriptor_set_id {expected_descriptor_set_id!r}"
+                ),
+                path=rel_path,
+                line_number=line_idx,
+                observer_id=expected_observer_id,
+                source_id=sample.source_id,
+            )
+            interior_errors.append(err)
+            diagnostics.append(err)
+            continue
+
+        if (
+            declared_clock_domains is not None
+            and sample.clock_domain_id not in declared_clock_domains
+        ):
+            err = ObservabilityDiagnostic(
+                code="undeclared_clock_domain",
+                message=(
+                    f"sample clock_domain_id {sample.clock_domain_id!r} is not "
+                    "declared in inventory.clock_domains"
+                ),
+                path=rel_path,
+                line_number=line_idx,
+                observer_id=expected_observer_id,
+                source_id=sample.source_id,
+            )
+            interior_errors.append(err)
+            diagnostics.append(err)
+            continue
+
         if descriptors is not None:
-            if sample.descriptor_set_id != descriptors.descriptor_set_id:
-                err = ObservabilityDiagnostic(
-                    code="invalid_interior_record",
-                    message=(
-                        f"sample descriptor_set_id {sample.descriptor_set_id!r} does not match "
-                        f"bundle descriptors {descriptors.descriptor_set_id!r}"
-                    ),
-                    path=rel_path,
-                    line_number=line_idx,
-                    observer_id=expected_observer_id,
-                    source_id=sample.source_id,
-                )
-                interior_errors.append(err)
-                diagnostics.append(err)
-                continue
             mismatch_reason: str | None = None
             sample_subject_kind = sample.subject["kind"]
             for qty_id in sample.readings:
@@ -3652,8 +3850,8 @@ def _reduce_bundle_summary(
                 for sample, reading in qty_samples:
                     qty_clocks.add(sample.clock_domain_id)
                     if reading.status == "ok":
-                        assert reading.value is not None
-                        ok_values.append(reading.value)
+                        if reading.value is not None:
+                            ok_values.append(reading.value)
                     elif reading.status == "unavailable":
                         unavailable_count += 1
                         if reading.reason_code is not None:
@@ -3703,11 +3901,60 @@ def _reduce_bundle_summary(
                 elif desc.statistic == "counter":
                     delta_sum = 0.0
                     elapsed_sum = 0.0
-                    for (prev_sample, prev_reading), (curr_sample, curr_reading) in zip(
-                        qty_samples, qty_samples[1:]
-                    ):
-                        if prev_reading.status != "ok" or curr_reading.status != "ok":
+                    # Pair consecutive source samples in ``ordered`` (without
+                    # filtering out samples missing ``qty_id``) so missing
+                    # operands and sequence gaps break intervals explicitly.
+                    for prev_sample, curr_sample in zip(ordered, ordered[1:]):
+                        if curr_sample.sequence != prev_sample.sequence + 1:
                             broken_interval_count += 1
+                            diagnostics.append(
+                                ObservabilityDiagnostic(
+                                    code="sequence_gap",
+                                    message=(
+                                        f"sequence gap between {prev_sample.sequence} and "
+                                        f"{curr_sample.sequence} for {source_id}/{qty_id}"
+                                    ),
+                                    observer_id=observer_id,
+                                    source_id=source_id,
+                                )
+                            )
+                            continue
+                        prev_reading = prev_sample.readings.get(qty_id)
+                        curr_reading = curr_sample.readings.get(qty_id)
+                        if prev_reading is None or curr_reading is None:
+                            broken_interval_count += 1
+                            diagnostics.append(
+                                ObservabilityDiagnostic(
+                                    code="missing_operand",
+                                    message=(
+                                        f"missing counter operand between sequence "
+                                        f"{prev_sample.sequence} and {curr_sample.sequence} "
+                                        f"for {source_id}/{qty_id}"
+                                    ),
+                                    observer_id=observer_id,
+                                    source_id=source_id,
+                                )
+                            )
+                            continue
+                        if (
+                            prev_reading.status != "ok"
+                            or curr_reading.status != "ok"
+                            or prev_reading.value is None
+                            or curr_reading.value is None
+                        ):
+                            broken_interval_count += 1
+                            diagnostics.append(
+                                ObservabilityDiagnostic(
+                                    code="non_ok_operand",
+                                    message=(
+                                        f"non-ok counter operand between sequence "
+                                        f"{prev_sample.sequence} and {curr_sample.sequence} "
+                                        f"for {source_id}/{qty_id}"
+                                    ),
+                                    observer_id=observer_id,
+                                    source_id=source_id,
+                                )
+                            )
                             continue
                         if prev_sample.clock_domain_id != curr_sample.clock_domain_id:
                             broken_interval_count += 1
@@ -3741,8 +3988,6 @@ def _reduce_bundle_summary(
                                 )
                             )
                             continue
-                        assert prev_reading.value is not None
-                        assert curr_reading.value is not None
                         delta = float(curr_reading.value - prev_reading.value)
                         if delta < 0.0:
                             broken_interval_count += 1
@@ -3925,6 +4170,18 @@ def inspect_observability_bundle(bundle_dir: str | Path) -> ObservabilityBundleI
         )
 
     # Discover sample streams under resources/*.jsonl
+    declared_clock_domains: frozenset[str] | None = (
+        None
+        if inventory is None
+        else frozenset(str(dom["clock_domain_id"]) for dom in inventory.clock_domains)
+    )
+    expected_descriptor_set_id = (
+        descriptors.descriptor_set_id
+        if descriptors is not None
+        else manifest.descriptor_set_id
+    )
+    undeclared_clock_domains = False
+
     samples_by_observer: dict[str, tuple[ObservabilitySample, ...]] = {}
     resources_dir = _check_no_symlinks_under(root, ["resources"])
     if resources_dir.exists():
@@ -3945,7 +4202,9 @@ def inspect_observability_bundle(bundle_dir: str | Path) -> ObservabilityBundleI
                 rel_path=rel_path,
                 expected_invocation_id=manifest.invocation_id,
                 expected_observer_id=observer_id,
+                expected_descriptor_set_id=expected_descriptor_set_id,
                 descriptors=descriptors,
+                declared_clock_domains=declared_clock_domains,
                 torn_tails=torn_tails,
                 interior_errors=interior_errors,
                 diagnostics=diagnostics,
@@ -3979,6 +4238,24 @@ def inspect_observability_bundle(bundle_dir: str | Path) -> ObservabilityBundleI
                 raise ObservabilitySchemaError(
                     f"status observer_id {parsed_status.observer_id!r} does not match "
                     f"filename {entry.name!r}"
+                )
+            status_clock = parsed_status.coverage.get("clock_domain_id")
+            if (
+                declared_clock_domains is not None
+                and isinstance(status_clock, str)
+                and status_clock not in declared_clock_domains
+            ):
+                undeclared_clock_domains = True
+                diagnostics.append(
+                    ObservabilityDiagnostic(
+                        code="undeclared_clock_domain",
+                        message=(
+                            f"status coverage clock_domain_id {status_clock!r} is not "
+                            "declared in inventory.clock_domains"
+                        ),
+                        path=rel_path,
+                        observer_id=observer_id,
+                    )
                 )
             statuses[observer_id] = parsed_status
 
@@ -4046,6 +4323,24 @@ def inspect_observability_bundle(bundle_dir: str | Path) -> ObservabilityBundleI
                         raise ObservabilitySchemaError(
                             f"profile_status ({pstatus.observer_id!r}, {pstatus.window_id!r}) "
                             f"does not match path profiles/{observer_id}/{window_id}/"
+                        )
+                    for ref in pstatus.artifacts or ():
+                        _check_no_symlinks_under(root, ref.path.split("/"))
+                    if (
+                        declared_clock_domains is not None
+                        and pstatus.clock_domain_id not in declared_clock_domains
+                    ):
+                        undeclared_clock_domains = True
+                        diagnostics.append(
+                            ObservabilityDiagnostic(
+                                code="undeclared_clock_domain",
+                                message=(
+                                    f"profile_status clock_domain_id {pstatus.clock_domain_id!r} "
+                                    "is not declared in inventory.clock_domains"
+                                ),
+                                path=rel_status,
+                                observer_id=observer_id,
+                            )
                         )
                     profile_statuses.append(pstatus)
 
@@ -4134,7 +4429,17 @@ def inspect_observability_bundle(bundle_dir: str | Path) -> ObservabilityBundleI
         ]
         if interior_errors:
             derived_data_completeness = "partial" if has_recovered_data else "unknown"
-            derived_reason = "invalid_interior_records"
+            derived_reason = (
+                "undeclared_clock_domain"
+                if all(err.code == "undeclared_clock_domain" for err in interior_errors)
+                else "invalid_interior_records"
+            )
+        elif undeclared_clock_domains:
+            derived_data_completeness = "partial" if has_recovered_data else "unknown"
+            derived_reason = "undeclared_clock_domain"
+        elif descriptors is None and bool(samples_by_observer):
+            derived_data_completeness = "partial" if has_recovered_data else "unknown"
+            derived_reason = "missing_descriptors"
         elif "unknown" in completeness_values:
             derived_data_completeness = "unknown"
             derived_reason = None
