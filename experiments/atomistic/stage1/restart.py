@@ -32,7 +32,6 @@ class RestartCause(str, Enum):
     INVALID_RESUME = "invalid_resume_input"
     RUN_DIRECTORY_MISMATCH = "run_directory_mismatch"
     HORIZON_MISMATCH = "horizon_mismatch"
-    COMPLETED_LINEAGE = "completed_lineage"
 
 
 class RestartRefusal(ValueError):
@@ -187,7 +186,7 @@ def _checkpoint_facts(
     if next_iteration == target or completed_updates == target:
         raise RestartRefusal(
             "public checkpoint already reaches the full Stage-1 horizon",
-            cause=RestartCause.COMPLETED_LINEAGE,
+            cause=RestartCause.INVALID_RESUME,
         )
     return checkpoint_dir, next_iteration, completed_updates
 
@@ -263,7 +262,7 @@ def execute_restart(
     binding: str | None = None, overrides: list[str] | None = None,
     kind: str = "train", overlay: str | None = None,
     overlay_sha256: str | None = None, command: str = "stage1 restart",
-    run: Callable[..., int] = run_from_config,
+    run: Callable[..., int] | None = None,
     run_dir: str | Path | None = None,
     inspector: Callable[[str | Path], RunEvidence] = inspect_run,
 ) -> RestartResult:
@@ -278,7 +277,8 @@ def execute_restart(
     selection = select_restart(cfg=cfg, row=row, run_dir=run_dir, inspector=inspector)
     _remove_initial_checkpoint(cfg)
     runner_load = _set_resume_load(cfg, selection.checkpoint_dir)
-    exit_code = int(run(cfg, config_path=str(config_path), command=command))
+    runner = run_from_config if run is None else run
+    exit_code = int(runner(cfg, config_path=str(config_path), command=command))
     return RestartResult(
         selection=selection,
         outcome="completed" if exit_code == 0 else "failed",
