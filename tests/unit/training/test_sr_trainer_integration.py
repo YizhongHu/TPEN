@@ -527,7 +527,9 @@ def test_the_pair_disconnection_is_exactly_the_order_one_output_weights() -> Non
 
     torch.manual_seed(0)
     model = build_tiny_spenn()
-    batch = build_tiny_sampler().collect_samples(model, device=torch.device("cpu"))[0].make_batch()
+    batch = build_tiny_sampler().collect_samples(
+        model, device=torch.device("cpu"), emitter=None
+    )[0].make_batch()
     assert batch.n_electrons == 2
     assert disconnected_parameter_names(model, batch) == INACTIVE_PAIR_PARAMETERS
 

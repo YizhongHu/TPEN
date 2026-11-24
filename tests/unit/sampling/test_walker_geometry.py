@@ -131,7 +131,7 @@ def test_collect_samples_includes_geometry_and_metadata_stats() -> None:
     model = build_tiny_spenn()
     sampler = build_tiny_sampler()
 
-    walkers, stats = sampler.collect_samples(model)
+    walkers, stats = sampler.collect_samples(model, emitter=None)
 
     assert isinstance(stats, SamplerStats)
     # Geometry is a field of the typed record, not a flattened attribute set.
