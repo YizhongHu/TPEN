@@ -48,22 +48,38 @@ def test_pooled_variance_is_population_with_between_stream_term() -> None:
 def test_figures_have_signed_absolute_variance_panels_and_all_lineage_spreads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Semantic red on the current PR: it lacks the required absolute-error panel."""
+    """Check each panel's plotted stream and aggregate values, not just files."""
     import matplotlib.pyplot as plt
 
     calls: list[dict[str, object]] = []
+    axes: list[object] = []
 
     class Line:
         def get_color(self) -> str:
             return "synthetic-color"
 
     class Axis:
+        def __init__(self, panel: int):
+            self.panel = panel
+
         def plot(self, steps, values, **kwargs):
-            calls.append({"kind": "plot", "steps": list(steps), "values": list(values), "label": kwargs["label"]})
+            calls.append({
+                "kind": "plot",
+                "panel": self.panel,
+                "steps": list(steps),
+                "values": [tuple(point) for point in values],
+                "label": kwargs["label"],
+            })
             return (Line(),)
 
         def fill_between(self, steps, lows, highs, **kwargs):
-            calls.append({"kind": "spread", "steps": list(steps), "lows": list(lows), "highs": list(highs)})
+            calls.append({
+                "kind": "spread",
+                "panel": self.panel,
+                "steps": list(steps),
+                "lows": list(lows),
+                "highs": list(highs),
+            })
 
         def set_xlabel(self, _value):
             pass
@@ -84,10 +100,18 @@ def test_figures_have_signed_absolute_variance_panels_and_all_lineage_spreads(
         def savefig(self, path, **_kwargs):
             Path(path).write_bytes(b"synthetic figure")
 
-    monkeypatch.setattr(plt, "subplots", lambda **_kwargs: (Figure(), Axis()))
+    def subplots(**_kwargs):
+        axis = Axis(len(axes))
+        axes.append(axis)
+        return Figure(), axis
+
+    monkeypatch.setattr(plt, "subplots", subplots)
     monkeypatch.setattr(plt, "close", lambda _figure: None)
 
-    document = _collection([8.0, 11.0, 14.0, 15.0], [1.0] * 4, reference=10.0)
+    # The first lineage has both negative and positive stream errors.  Its
+    # signed aggregate is -0.25 while its absolute aggregate is 0.25, so a
+    # signed/absolute panel swap cannot pass by coincidence.
+    document = _collection([5.0, 9.0, 12.0, 13.0], [1.0] * 4, reference=10.0)
     document["records"] += [
         {**row, "lineage": 1, "statistics": {**row["statistics"], "mean": row["statistics"]["mean"] + 1.0}}
         for row in list(document["records"])
@@ -95,10 +119,28 @@ def test_figures_have_signed_absolute_variance_panels_and_all_lineage_spreads(
     analysis = summarize_collection(document)
     paths = write_trajectory_figures(analysis, tmp_path / "figures")
 
-    # Current PR returns only error_vs_step and variance_vs_step: expected
-    # semantic red, not HARNESS_INVALID, because all inputs are synthetic and
-    # the plotting spy is a complete deterministic test double.
     assert set(paths) == {"error_vs_step", "absolute_error_vs_step", "variance_vs_step"}
-    assert len([call for call in calls if call["kind"] == "plot"]) == 6
+    plot_calls = [call for call in calls if call["kind"] == "plot"]
+    assert len(plot_calls) == 6
+    assert len(axes) == 3
+
+    signed = [call for call in plot_calls if call["panel"] == 0]
+    absolute = [call for call in plot_calls if call["panel"] == 1]
+    variance = [call for call in plot_calls if call["panel"] == 2]
+    assert [call["values"][0] for call in signed] == [
+        (-5.0, -1.0, 2.0, 3.0, -0.25),
+        (-4.0, 0.0, 3.0, 4.0, 0.75),
+    ]
+    assert [call["values"][0] for call in absolute] == [
+        (5.0, 1.0, 2.0, 3.0, 0.25),
+        (4.0, 0.0, 3.0, 4.0, 0.75),
+    ]
+    # Every lineage contributes all four stream values plus its aggregate to
+    # the variance panel as well; a three-stream plot has only four columns.
+    assert [call["values"][0] for call in variance] == [
+        (1.0, 1.0, 1.0, 1.0, 1.0),
+        (1.0, 1.0, 1.0, 1.0, 1.0),
+    ]
+    assert [call["values"][0] for call in signed] != [call["values"][0] for call in absolute]
     assert len([call for call in calls if call["kind"] == "spread"]) == 6
     assert all(Path(path).is_file() for path in paths.values())

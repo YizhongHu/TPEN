@@ -27,6 +27,20 @@
       "old": "(\"absolute_error_vs_step.png\", \"absolute_error\", \"absolute_error\", \"stream_absolute_error_min\", \"stream_absolute_error_max\", \"absolute error (Ha)\"),",
       "new": "# absolute-error panel removed by mutation,",
       "killer": "experiments/atomistic/stage1/tests/test_analysis_review_r1.py::test_figures_have_signed_absolute_variance_panels_and_all_lineage_spreads"
+    },
+    {
+      "id": "signed-error-in-absolute-panel",
+      "target": "experiments/atomistic/stage1/analysis.py",
+      "old": "(\"absolute_error_vs_step.png\", \"absolute_error\", \"absolute_error\", \"stream_absolute_error_min\", \"stream_absolute_error_max\", \"absolute error (Ha)\"),",
+      "new": "(\"absolute_error_vs_step.png\", \"absolute_error\", \"signed_error\", \"stream_absolute_error_min\", \"stream_absolute_error_max\", \"absolute error (Ha)\"),",
+      "killer": "experiments/atomistic/stage1/tests/test_analysis_review_r1.py::test_figures_have_signed_absolute_variance_panels_and_all_lineage_spreads"
+    },
+    {
+      "id": "three-stream-traces",
+      "target": "experiments/atomistic/stage1/analysis.py",
+      "old": "for stream in range(4)",
+      "new": "for stream in range(3)",
+      "killer": "experiments/atomistic/stage1/tests/test_analysis_review_r1.py::test_figures_have_signed_absolute_variance_panels_and_all_lineage_spreads"
     }
   ]
 }
