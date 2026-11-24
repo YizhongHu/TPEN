@@ -318,7 +318,7 @@ MUTANTS = (
     {
         "id": "parsl-admits-configured-before-dfk",
         "target": "executor/src/tpen_executor/dispatch/parsl.py",
-        "old": "        super().validate(group, runs, lifecycle, env, timeout)\n",
+        "old": "        super(ParslDispatcher, self).validate(group, runs, lifecycle, env, timeout)\n",
         "new": "        pass\n",
         "killer": "test_configured_parsl_public_run_refuses_before_dfk_or_submission",
     },
