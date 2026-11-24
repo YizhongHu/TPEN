@@ -16,6 +16,21 @@ from tpen.sampling.trajectory import (
     parameter_fingerprint,
 )
 
+# Keep legacy two-value test call sites concise while exercising the new
+# required production keyword explicitly at this module boundary.
+_collect_observable_trajectory = collect_observable_trajectory
+_collect_observable_trajectory_with_diagnostics = collect_observable_trajectory_with_diagnostics
+
+
+def collect_observable_trajectory(*args, **kwargs):
+    kwargs.setdefault("emitter", None)
+    return _collect_observable_trajectory(*args, **kwargs)
+
+
+def collect_observable_trajectory_with_diagnostics(*args, **kwargs):
+    kwargs.setdefault("emitter", None)
+    return _collect_observable_trajectory_with_diagnostics(*args, **kwargs)
+
 
 def _stats(n_walkers: int, n_steps: int, seed: int = 7) -> SamplerStats:
     """Build the typed sampler record returned by the local fakes."""

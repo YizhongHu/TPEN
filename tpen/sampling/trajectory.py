@@ -354,7 +354,7 @@ def collect_observable_trajectory(
     device: torch.device | str | None = None,
     reset: bool = False,
     verify_model_unchanged: bool = True,
-    emitter: EventEmitter | None = None,
+    emitter: EventEmitter | None,
 ) -> tuple[ObservableTrajectory, SamplerStats]:
     """Collect a trajectory while preserving the established two-value API.
 
@@ -389,7 +389,7 @@ def collect_observable_trajectory_with_diagnostics(
     device: torch.device | str | None = None,
     reset: bool = False,
     verify_model_unchanged: bool = True,
-    emitter: EventEmitter | None = None,
+    emitter: EventEmitter | None,
 ) -> tuple[ObservableTrajectory, SamplerStats, SamplerTrajectoryDiagnostics]:
     """Collect a `[draw, walker]` observable trajectory from a fixed model.
 
