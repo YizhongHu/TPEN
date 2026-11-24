@@ -1013,6 +1013,7 @@ class _ResourceSamplesSession:
         self._rusage_thread_started = False
 
         self._linux_memory_probe: Any = None
+        self._linux_memory_init_error: LinuxMemoryUnavailable | None = None
         self._linux_memory_target_generation: LinuxProcessGeneration | None = None
         self._linux_memory_subject: dict[str, Any] = {}
         self._linux_memory_interval_ns = 0
@@ -1124,12 +1125,24 @@ class _ResourceSamplesSession:
                         reason_code="probe_init_failed",
                         status="error",
                     )
+                    self._linux_memory_init_error = bind_error
+                    self._linux_memory_probe = None
                     self._diagnostics.append(
                         f"{lm_cfg.source_id} bind_target failed: {type(exc).__name__}: {exc}"
                     )
                 else:
                     if bound_generation is None:
-                        bind_error = getattr(self._linux_memory_probe, "bind_error", None)
+                        raw_bind_error = getattr(
+                            self._linux_memory_probe, "bind_error", None
+                        )
+                        if isinstance(raw_bind_error, ResourceUnavailable):
+                            bind_error = raw_bind_error
+                        else:
+                            bind_error = LinuxMemoryUnavailable(
+                                reason=f"{lm_cfg.source_id} bind_target returned None",
+                                reason_code="target_bind_failed",
+                                status="unavailable",
+                            )
             else:
                 candidate_gen = getattr(
                     self._linux_memory_probe, "target_generation", None
@@ -1332,13 +1345,14 @@ class _ResourceSamplesSession:
 
         if self._callback.linux_memory.enabled:
             self._sample_linux_memory()
-            self._linux_memory_thread = threading.Thread(
-                target=self._linux_memory_loop,
-                name=f"tpen-obs-linux-memory-{self._observer_id}",
-                daemon=True,
-            )
-            self._linux_memory_thread.start()
-            self._linux_memory_thread_started = True
+            if self._linux_memory_init_error is None:
+                self._linux_memory_thread = threading.Thread(
+                    target=self._linux_memory_loop,
+                    name=f"tpen-obs-linux-memory-{self._observer_id}",
+                    daemon=True,
+                )
+                self._linux_memory_thread.start()
+                self._linux_memory_thread_started = True
 
         if self._callback.allocator.enabled:
             read_end_ns = self._sample_allocator()
@@ -1609,6 +1623,35 @@ class _ResourceSamplesSession:
         # Bracket probe.read() on the session's clock domain so sample timestamps
         # stay correlated with inventory.clock_domains and coverage windows.
         read_start_ns = int(self._monotonic_ns())
+        init_error = self._linux_memory_init_error
+        if init_error is not None or self._linux_memory_probe is None:
+            issue = (
+                init_error
+                if init_error is not None
+                else LinuxMemoryUnavailable(
+                    reason=f"{source_id} probe unavailable",
+                    reason_code="probe_init_failed",
+                    status="error",
+                )
+            )
+            read_end_ns = max(int(self._monotonic_ns()), read_start_ns)
+            readings = {
+                qty_id: ObservabilityReading(
+                    status=issue.status,
+                    reason_code=issue.reason_code,
+                    detail=issue.reason,
+                )
+                for qty_id in lm_cfg.quantities
+            }
+            self._enqueue_reading_packet(
+                source_id=source_id,
+                subject=self._linux_memory_subject,
+                read_start_ns=read_start_ns,
+                read_end_ns=read_end_ns,
+                readings=readings,
+            )
+            return
+
         try:
             reading = self._linux_memory_probe.read()
         except Exception as exc:
@@ -2036,7 +2079,10 @@ class _ResourceSamplesSession:
             if linux_memory_stopped and time.monotonic_ns() < deadline_ns:
                 if (
                     self._callback.linux_memory.enabled
-                    and self._linux_memory_probe is not None
+                    and (
+                        self._linux_memory_probe is not None
+                        or self._linux_memory_init_error is not None
+                    )
                     and self._writer is not None
                 ):
                     self._sample_linux_memory()

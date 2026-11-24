@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 import resource
 import socket
+import stat
 import sys
 import time
 from typing import Any, Union
@@ -471,7 +472,7 @@ def _generation_mismatch_detail(
     expected: LinuxProcessGeneration,
     observed: LinuxProcessGeneration,
     *,
-    exact_optional: bool = False,
+    exact_optional: bool = True,
 ) -> str | None:
     """Return a concise mismatch diagnostic when two generations do not match."""
 
@@ -507,11 +508,7 @@ def _generation_mismatch_detail(
                 f"pid_ns_inode changed (expected {expected.pid_ns_inode!r}, "
                 f"observed {observed.pid_ns_inode!r})"
             )
-    if (
-        expected.host_id is not None
-        and observed.host_id is not None
-        and expected.host_id != observed.host_id
-    ):
+    if expected.host_id is not None and observed.host_id != expected.host_id:
         return (
             f"host_id changed (expected {expected.host_id!r}, "
             f"observed {observed.host_id!r})"
@@ -917,7 +914,11 @@ class LinuxProcessMemoryProbe:
         return socket.gethostname() or "unknown-host"
 
     def _check_platform(self) -> LinuxMemoryUnavailable | None:
-        if self._uses_custom_proc_root:
+        if (
+            self._platform_name is None
+            and self._uses_custom_proc_root
+            and self._proc_root != DEFAULT_PROC_ROOT
+        ):
             return None
         plat = self._effective_platform()
         if not plat.startswith("linux"):
@@ -941,7 +942,37 @@ class LinuxProcessMemoryProbe:
         """Read at most ``max_read_bytes`` from ``path`` within ``deadline_ns``."""
 
         try:
+            # Refuse symlinks and non-regular files (FIFOs, sockets, devices)
+            # before opening so special files can never bypass max_read_seconds
+            # by blocking in open(2) or redirect reads outside procfs.
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                return LinuxMemoryUnavailable(
+                    reason=f"refusing symlinked procfs file {path}",
+                    reason_code="unsafe_procfs_file",
+                    status="error",
+                )
+            if not stat.S_ISREG(st.st_mode):
+                return LinuxMemoryUnavailable(
+                    reason=f"refusing non-regular procfs file {path}",
+                    reason_code="unsafe_procfs_file",
+                    status="error",
+                )
             with path.open("rb") as handle:
+                fileno_fn = getattr(handle, "fileno", None)
+                if callable(fileno_fn):
+                    try:
+                        fd = fileno_fn()
+                    except (OSError, ValueError):
+                        fd = None
+                    if isinstance(fd, int):
+                        fst = os.fstat(fd)
+                        if not stat.S_ISREG(fst.st_mode):
+                            return LinuxMemoryUnavailable(
+                                reason=f"refusing non-regular opened procfs file {path}",
+                                reason_code="unsafe_procfs_file",
+                                status="error",
+                            )
                 chunks: list[bytes] = []
                 total = 0
                 limit = self._max_read_bytes + 1
@@ -1018,14 +1049,18 @@ class LinuxProcessMemoryProbe:
         parsed_pid, start_ticks = parsed
 
         # Best-effort boot_id from /proc/sys/kernel/random/boot_id; still enforce
-        # input and time bounds if the file is present.
+        # input, file-type, and time bounds if the file is present.
         boot_id: str | None = None
         boot_path = self._proc_root / "sys" / "kernel" / "random" / "boot_id"
         boot_raw = self._read_bounded_bytes(
             boot_path, deadline_ns=deadline_ns, missing_is_process_exit=False
         )
         if isinstance(boot_raw, LinuxMemoryUnavailable):
-            if boot_raw.reason_code in ("input_limit_exceeded", "read_timeout"):
+            if boot_raw.reason_code in (
+                "input_limit_exceeded",
+                "read_timeout",
+                "unsafe_procfs_file",
+            ):
                 return boot_raw
         else:
             try:
@@ -1102,26 +1137,33 @@ class LinuxProcessMemoryProbe:
                 raise ValueError(
                     f"bind_target pid ({pid}) disagrees with configured pid ({self._pid})"
                 )
-
-        if self._bound_generation is not None:
-            if pid is not None and pid != self._bound_generation.pid:
+            if self._bound_generation is not None and pid != self._bound_generation.pid:
                 raise ValueError(
                     f"bind_target pid ({pid}) disagrees with bound generation pid "
                     f"({self._bound_generation.pid})"
                 )
-            self._bind_error = None
-            return self._bound_generation
 
         platform_issue = self._check_platform()
         if platform_issue is not None:
+            if pid is not None:
+                self._pid = pid
             self._bind_error = platform_issue
             return None
+
+        if self._bound_generation is not None:
+            if pid is not None:
+                self._pid = pid
+            self._bind_error = None
+            return self._bound_generation
 
         target_pid = (
             pid
             if pid is not None
             else (self._pid if self._pid is not None else os.getpid())
         )
+        # Lock validated target_pid before reading procfs so a failed bind
+        # cannot cause later read() calls to silently retarget to os.getpid().
+        self._pid = target_pid
         start_ns = int(self._monotonic_ns())
         deadline_ns = start_ns + self._max_read_ns
         gen = self._read_generation(target_pid, deadline_ns=deadline_ns)
@@ -1202,7 +1244,7 @@ class LinuxProcessMemoryProbe:
             self._bind_error = None
 
         pre_mismatch = _generation_mismatch_detail(
-            expected, gen_before, exact_optional=False
+            expected, gen_before, exact_optional=True
         )
         if pre_mismatch is not None:
             changed = LinuxMemoryUnavailable(
@@ -1283,7 +1325,7 @@ class LinuxProcessMemoryProbe:
             )
 
         post_mismatch = _generation_mismatch_detail(
-            expected, gen_after, exact_optional=False
+            expected, gen_after, exact_optional=True
         ) or _generation_mismatch_detail(gen_before, gen_after, exact_optional=True)
         if post_mismatch is not None:
             changed = LinuxMemoryUnavailable(
