@@ -28,7 +28,15 @@ from tpen.training.events import (
     UpdateSkipped,
 )
 from tpen.training.state import TrainerState
-from tpen.nn.forward import ParameterScoreRequest
+from tpen.training.step_requests import (
+    AutogradStepRequest,
+    HamiltonianTangentUpdateInput,
+    MaterializedHamiltonianTangentStepRequest,
+    ParameterScoreStepRequest,
+    ProducedVMCStep,
+    evaluate_hamiltonian_tangent_step,
+    resolve_step_request,
+)
 from tpen.training.optim import (
     UpdateMethodSpec,
     # Aliased because this trainer's own binding boundary below is also
@@ -159,6 +167,179 @@ def _detach_local_energy_value(result: Any) -> Any:
     return result
 
 
+class _TrainerStepProducer:
+    """Concrete trainer-owned producer for one VMC iteration.
+
+    Defined in :mod:`tpen.training.trainer` so module-level test seams
+    (``local_energy``, ``evaluate_local_energy_in_chunks``,
+    ``compute_vmc_objective``, ``_detach_local_energy_value``, and
+    ``_detach_wavefunction_output``) intercept every producer call directly.
+    """
+
+    def __init__(
+        self,
+        *,
+        trainer: VMCTrainer,
+        model: Any,
+        hamiltonian_terms: Any,
+        batch: Any,
+        step: int,
+        context: RunContext,
+        state: TrainerState,
+    ) -> None:
+        self._trainer = trainer
+        self._model = model
+        self._hamiltonian_terms = hamiltonian_terms
+        self._batch = batch
+        self._step = step
+        self._context = context
+        self._state = state
+
+    def _evaluate_detached_local_energy(
+        self,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+        """Run the configured local-energy path and hand off detached values."""
+
+        with self._context.scope(LocalEnergy(step=self._step), state=self._state):
+            if self._trainer.local_energy_chunk_size is None:
+                result = local_energy(
+                    self._hamiltonian_terms,
+                    self._model,
+                    self._batch,
+                    return_terms=self._trainer.return_terms,
+                )
+            else:
+                # Bounded route: each chunk's derivative graph is released
+                # before the next chunk is evaluated.
+                result = evaluate_local_energy_in_chunks(
+                    self._hamiltonian_terms,
+                    self._model,
+                    self._batch,
+                    return_terms=self._trainer.return_terms,
+                    chunk_size=self._trainer.local_energy_chunk_size,
+                )
+        # The objective deliberately differentiates through the wavefunction
+        # output, not through local energy.  Its closure re-evaluation builds
+        # a fresh local-energy graph when needed, so no consumer in this step
+        # needs to retain this one.
+        result = _detach_local_energy_value(result)
+        if isinstance(result, LocalEnergyResult):
+            return result.total, result.terms
+        return result, None
+
+    def produce_autograd_step(
+        self,
+        request: AutogradStepRequest,
+    ) -> ProducedVMCStep[AutogradUpdateInput]:
+        """Produce the historical live autograd objective and step payload."""
+
+        del request
+        total_local_energy, term_energies = self._evaluate_detached_local_energy()
+        with self._context.scope(Forward(step=self._step), state=self._state):
+            output = self._model(self._batch)
+        with self._context.scope(Objective(step=self._step), state=self._state):
+            objective = compute_vmc_objective(
+                output.logabs,
+                total_local_energy,
+                nonfinite_policy=self._trainer.nonfinite_local_energy_policy,
+            )
+        update_input = AutogradUpdateInput(
+            batch=self._batch,
+            wavefunction=output,
+            local_energy=total_local_energy,
+            step=self._step,
+            objective=objective.loss,
+            # A TRUE closure optimizer re-evaluates the objective one or more
+            # times per step at parameters it has already mutated in place, so
+            # it cannot use `objective.loss`: backward on that retained graph
+            # raises once the saved-tensor versions have moved. The
+            # re-evaluation is built over THIS step's fixed `batch` and carries
+            # the SAME resolved non-finite policy, so a second evaluation cannot
+            # resample, cannot advance the sampler RNG the resume path depends
+            # on, and cannot switch estimators midway through one step.
+            reevaluate=vmc_objective_reevaluation(
+                model=self._model,
+                hamiltonian_terms=self._hamiltonian_terms,
+                batch=self._batch,
+                primary_local_energy=total_local_energy,
+                nonfinite_policy=self._trainer.nonfinite_local_energy_policy,
+            ),
+        )
+        return ProducedVMCStep(
+            update_input=update_input,
+            objective=objective,
+            local_energy=total_local_energy,
+            term_energies=term_energies,
+            wavefunction_output=output,
+        )
+
+    def produce_parameter_score_step(
+        self,
+        request: ParameterScoreStepRequest,
+    ) -> ProducedVMCStep[ScoreUpdateInput]:
+        """Produce the detached parameter-score step payload in one forward."""
+
+        total_local_energy, term_energies = self._evaluate_detached_local_energy()
+        with self._context.scope(Forward(step=self._step), state=self._state):
+            packet = request.forward_request.evaluate(self._model, self._batch).detach()
+            output = packet.as_output()
+            parameter_scores = packet.parameter_scores
+        with self._context.scope(Objective(step=self._step), state=self._state):
+            objective = compute_vmc_objective(
+                output.logabs,
+                total_local_energy,
+                nonfinite_policy=self._trainer.nonfinite_local_energy_policy,
+            )
+        update_input = ScoreUpdateInput(
+            batch=self._batch,
+            wavefunction=output,
+            local_energy=total_local_energy,
+            step=self._step,
+            parameter_scores=parameter_scores,
+            parameter_binding=self._model.parameter_binding,
+        )
+        return ProducedVMCStep(
+            update_input=update_input,
+            objective=objective,
+            local_energy=total_local_energy,
+            term_energies=term_energies,
+            wavefunction_output=output,
+        )
+
+    def produce_materialized_hamiltonian_tangent_step(
+        self,
+        request: MaterializedHamiltonianTangentStepRequest,
+    ) -> ProducedVMCStep[HamiltonianTangentUpdateInput]:
+        """Produce detached scores and local-energy derivatives in one pass."""
+
+        # No synthetic 0s Forward scope is emitted: the single-pass tangent
+        # evaluator reuses the kinetic term's forward graph inside LocalEnergy.
+        with self._context.scope(LocalEnergy(step=self._step), state=self._state):
+            update_input, term_energies = evaluate_hamiltonian_tangent_step(
+                model=self._model,
+                hamiltonian_terms=self._hamiltonian_terms,
+                batch=self._batch,
+                step=self._step,
+                chunk_size=request.chunk_size,
+                trainer_chunk_size=self._trainer.local_energy_chunk_size,
+                return_terms=self._trainer.return_terms,
+                local_energy_fn=local_energy,
+            )
+        with self._context.scope(Objective(step=self._step), state=self._state):
+            objective = compute_vmc_objective(
+                update_input.wavefunction.logabs,
+                update_input.local_energy,
+                nonfinite_policy=self._trainer.nonfinite_local_energy_policy,
+            )
+        return ProducedVMCStep(
+            update_input=update_input,
+            objective=objective,
+            local_energy=update_input.local_energy,
+            term_energies=term_energies,
+            wavefunction_output=update_input.wavefunction,
+        )
+
+
 class VMCTrainer:
     """Run a fixed number of VMC optimization steps over an event stream.
 
@@ -243,7 +424,7 @@ class VMCTrainer:
         # resolved method and model here gives checkpoint restore one owner for
         # rebuilding direct parameter references after model weights load.
         self._resolved_model = None
-        self._resolved_update_method: VMCUpdateMethod[AutogradUpdateInput] | None = None
+        self._resolved_update_method: VMCUpdateMethod[Any] | None = None
         # The spec this run was BOUND from, kept only to detect a conflicting
         # late selector. It is NOT the lifecycle authority: the retained
         # `_resolved_update_method` above is, and it is what decides whether a
@@ -519,7 +700,7 @@ class VMCTrainer:
         model,
         optimizer: torch.optim.Optimizer,
         update_method: UpdateMethodSpec = None,
-    ) -> VMCUpdateMethod[AutogradUpdateInput]:
+    ) -> VMCUpdateMethod[Any]:
         """Bind one update method for this run, then keep returning that one.
 
         Parameters
@@ -666,10 +847,13 @@ class VMCTrainer:
         *,
         model,
         optimizer: torch.optim.Optimizer,
-        update_method: VMCUpdateMethod[AutogradUpdateInput],
+        update_method: VMCUpdateMethod[Any],
     ) -> VMCUpdateState:
         """Validate a selected method and return its single authority."""
 
+        # Validate the method's typed step request before inspecting state or
+        # sampling, including for stateless methods (`update_state() is None`).
+        resolve_step_request(update_method)
         owned_state = update_method.update_state()
         if owned_state is None:
             resolved_state = VMCUpdateState(
@@ -786,62 +970,26 @@ class VMCTrainer:
                     )
                 with context.scope(BuildBatch(step=step), state=state):
                     batch = walkers.make_batch()
-                with context.scope(LocalEnergy(step=step), state=state):
-                    if self.local_energy_chunk_size is None:
-                        result = local_energy(
-                            hamiltonian_terms,
-                            model,
-                            batch,
-                            return_terms=self.return_terms,
-                        )
-                    else:
-                        # Bounded route: each chunk's derivative graph is
-                        # released before the next chunk is evaluated.
-                        result = evaluate_local_energy_in_chunks(
-                            hamiltonian_terms,
-                            model,
-                            batch,
-                            return_terms=self.return_terms,
-                            chunk_size=self.local_energy_chunk_size,
-                        )
-                # The objective deliberately differentiates through the
-                # wavefunction output, not through local energy.  Its closure
-                # re-evaluation builds a fresh local-energy graph when needed,
-                # so no consumer in this step needs to retain this one.
-                result = _detach_local_energy_value(result)
-                if isinstance(result, LocalEnergyResult):
-                    total_local_energy = result.total
-                    term_energies = result.terms
-                else:
-                    total_local_energy = result
-                    term_energies = None
 
-                # `_detach_local_energy_value` already detached each term in
-                # the structured result. Reuse that mapping for callbacks so
-                # recorder-off training does not rebuild it on every step.
-                detached_term_energies = term_energies
+                # Dispatch on the typed step request declared by the method so
+                # each strategy produces its exact input record in one pass.
+                producer = _TrainerStepProducer(
+                    trainer=self,
+                    model=model,
+                    hamiltonian_terms=hamiltonian_terms,
+                    batch=batch,
+                    step=step,
+                    context=context,
+                    state=state,
+                )
+                request = resolve_step_request(selected_update_method)
+                produced = request.produce(producer)
 
-                # One forward, shaped by what the update method actually needs.
-                # A score method receives its raw per-sample score blocks in
-                # this same packet; running an ordinary forward and then
-                # recomputing derivatives would double the step's forward and
-                # derivative work.
-                forward_request = selected_update_method.forward_request()
-                with context.scope(Forward(step=step), state=state):
-                    if forward_request is None:
-                        output = model(batch)
-                        parameter_scores = None
-                    else:
-                        packet = forward_request.evaluate(model, batch)
-                        output = packet.as_output()
-                        parameter_scores = packet.parameter_scores
-                with context.scope(Objective(step=step), state=state):
-                    objective = compute_vmc_objective(
-                        output.logabs,
-                        total_local_energy,
-                        nonfinite_policy=self.nonfinite_local_energy_policy,
-                    )
+                objective = produced.objective
                 loss = objective.loss
+                total_local_energy = produced.local_energy
+                detached_term_energies = produced.term_energies
+                output = produced.wavefunction_output
 
                 # Read the parameter norm here, before any update, so the whole
                 # `train` record describes exactly one model version: the model
@@ -852,46 +1000,7 @@ class VMCTrainer:
                 # reports this same pre-update value.
                 param_norm = _parameter_norm(model)
 
-                # Dispatch on the typed request the method already declared,
-                # never on a name or a capability flag: a method cannot receive
-                # a score input without having asked for the score payload.
-                update_input: AutogradUpdateInput | ScoreUpdateInput
-                if isinstance(forward_request, ParameterScoreRequest):
-                    assert parameter_scores is not None
-                    update_input = ScoreUpdateInput(
-                        batch=batch,
-                        wavefunction=output,
-                        local_energy=total_local_energy,
-                        step=step,
-                        parameter_scores=parameter_scores,
-                        parameter_binding=model.parameter_binding,
-                    )
-                else:
-                    update_input = AutogradUpdateInput(
-                        batch=batch,
-                        wavefunction=output,
-                        local_energy=total_local_energy,
-                        step=step,
-                        objective=loss,
-                        # A TRUE closure optimizer re-evaluates the objective
-                        # one or more times per step at parameters it has
-                        # already mutated in place, so it cannot use `loss`:
-                        # backward on that retained graph raises once the
-                        # saved-tensor versions have moved. The re-evaluation
-                        # is built over THIS step's fixed `batch` and carries
-                        # the SAME resolved non-finite policy, so a second
-                        # evaluation cannot resample, cannot advance the
-                        # sampler RNG the resume path depends on, and cannot
-                        # switch estimators midway through one step.
-                        reevaluate=vmc_objective_reevaluation(
-                            model=model,
-                            hamiltonian_terms=hamiltonian_terms,
-                            batch=batch,
-                            primary_local_energy=total_local_energy,
-                            nonfinite_policy=self.nonfinite_local_energy_policy,
-                        ),
-                    )
-                update_result = selected_update_method.update(update_input)
+                update_result = selected_update_method.update(produced.update_input)
                 optimizer_step = False
                 if update_result.applied:
                     # The update counts only once `optimizer.step()` has
