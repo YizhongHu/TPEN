@@ -28,6 +28,7 @@ import copy
 import csv
 import json
 import math
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -40,10 +41,12 @@ from typeguard import TypeCheckError, suppress_type_checks
 
 from tpen.callback import OptimizerState
 from tpen.checkpoint import restore_checkpoint, save_checkpoint
+from tpen.events import Started
 from tpen.logging import CSV, JSONL, LogRecord
 from tpen.physics.kinetic import KineticEnergy
 from tpen.physics.potential import ElectronElectronInteraction, HarmonicTrap
 from tpen.training import SOAP, VMCTrainer, make_optimizer
+from tpen.training.events import TrainingIteration
 from tpen.training.soap import _project, _project_back, _qr_refresh_basis
 from tpen.training.state import TrainerState
 from tpen.training.update import (
@@ -138,56 +141,10 @@ def _oracle_soap_trajectory(
     q_mats = [torch.eye(d, dtype=param.dtype) if flag else None for d, flag in zip(shape, precond)]
     eigh_done = [False] * ndim
 
+    step_int = 0
     for step_int, grad in enumerate(grads, start=1):
-        for axis in range(ndim):
-            if gg[axis] is None:
-                continue
-            unfolded = _matricize(grad, axis)
-            gram = unfolded @ unfolded.T
-            gram = 0.5 * (gram + gram.T)
-            gg[axis] = s_beta * gg[axis] + (1.0 - s_beta) * gram
-
-        if step_int == 1:
-            for axis in range(ndim):
-                if gg[axis] is None:
-                    continue
-                sym = 0.5 * (gg[axis] + gg[axis].T)
-                if float(sym.abs().max().item()) > 0.0:
-                    q_mats[axis] = _oracle_eigh(sym)
-                    eigh_done[axis] = True
-        elif step_int % precondition_frequency == 0:
-            for axis in range(ndim):
-                if gg[axis] is None:
-                    continue
-                sym = 0.5 * (gg[axis] + gg[axis].T)
-                if float(sym.abs().max().item()) == 0.0:
-                    continue
-                if not eigh_done[axis]:
-                    q_mats[axis] = _oracle_eigh(sym)
-                    eigh_done[axis] = True
-                else:
-                    q_old = q_mats[axis]
-                    assert q_old is not None
-                    est_eig = torch.diag(q_old.T @ sym @ q_old)
-                    sort_idx = torch.argsort(est_eig, descending=True, stable=True)
-                    q_sorted = q_old[:, sort_idx]
-                    exp_avg_sq = exp_avg_sq.index_select(axis, sort_idx)
-                    max_eig = torch.clamp(est_eig.max(), min=0.0)
-                    if float(max_eig.item()) == 0.0:
-                        q_mats[axis] = q_sorted
-                    else:
-                        finfo = torch.finfo(sym.dtype)
-                        shift = torch.clamp(
-                            max_eig * math.sqrt(finfo.eps), min=math.sqrt(finfo.tiny)
-                        )
-                        eye = torch.eye(sym.shape[0], device=sym.device, dtype=sym.dtype)
-                        q_new, r_mat = torch.linalg.qr((sym + shift * eye) @ q_sorted)
-                        signs = torch.where(torch.diagonal(r_mat) < 0, -1.0, 1.0).to(
-                            dtype=q_new.dtype
-                        )
-                        q_mats[axis] = q_new * signs.unsqueeze(0)
-
-        # Explicit mode-by-mode forward projection: apply Q_k^T along each axis k
+        # Explicit mode-by-mode forward projection using the active eigenbasis Q
+        # (initially I on step 1, per Vyas et al., 2024, Algorithm 1).
         grad_proj = grad.clone()
         for axis in range(ndim):
             if q_mats[axis] is not None:
@@ -217,6 +174,48 @@ def _oracle_soap_trajectory(
         if weight_decay != 0.0:
             param = param * (1.0 - lr * weight_decay)
         param = param - lr * step_dir
+
+        # Post-step preconditioner update: update GG EMAs, initialize Q on the
+        # first nonzero step for each mode, and run QR refreshes on multiples
+        # of precondition_frequency.
+        for axis in range(ndim):
+            if gg[axis] is None:
+                continue
+            unfolded = _matricize(grad, axis)
+            gram = unfolded @ unfolded.T
+            gram = 0.5 * (gram + gram.T)
+            gg[axis] = s_beta * gg[axis] + (1.0 - s_beta) * gram
+
+        for axis in range(ndim):
+            if gg[axis] is None:
+                continue
+            sym = 0.5 * (gg[axis] + gg[axis].T)
+            if float(sym.abs().max().item()) == 0.0:
+                continue
+            if not eigh_done[axis]:
+                q_mats[axis] = _oracle_eigh(sym)
+                eigh_done[axis] = True
+            elif step_int % precondition_frequency == 0:
+                q_old = q_mats[axis]
+                assert q_old is not None
+                est_eig = torch.diag(q_old.T @ sym @ q_old)
+                sort_idx = torch.argsort(est_eig, descending=True, stable=True)
+                q_sorted = q_old[:, sort_idx]
+                exp_avg_sq = exp_avg_sq.index_select(axis, sort_idx)
+                max_eig = torch.clamp(est_eig.max(), min=0.0)
+                if float(max_eig.item()) == 0.0:
+                    q_mats[axis] = q_sorted
+                else:
+                    finfo = torch.finfo(sym.dtype)
+                    shift = torch.clamp(
+                        max_eig * math.sqrt(finfo.eps), min=math.sqrt(finfo.tiny)
+                    )
+                    eye = torch.eye(sym.shape[0], device=sym.device, dtype=sym.dtype)
+                    q_new, r_mat = torch.linalg.qr((sym + shift * eye) @ q_sorted)
+                    signs = torch.where(torch.diagonal(r_mat) < 0, -1.0, 1.0).to(
+                        dtype=q_new.dtype
+                    )
+                    q_mats[axis] = q_new * signs.unsqueeze(0)
 
     return param, {
         "exp_avg": exp_avg,
@@ -397,43 +396,29 @@ def test_2d_matrix_matches_independent_oracle_and_differs_from_adamw() -> None:
     p_adamw = nn.Parameter(init.clone())
     opt_adamw = torch.optim.AdamW([p_adamw], lr=2e-2, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.01)
 
-    for g in grads:
+    for idx, g in enumerate(grads, start=1):
         p_soap.grad = g.clone()
         opt_soap.step()
         p_adamw.grad = g.clone()
         opt_adamw.step()
+        if idx == 1:
+            # Post-step preconditioner order (Vyas et al. 2024 Algorithm 1):
+            # step 1 executes in Q = I (matching AdamW without 0 / eps SVD
+            # roundoff amplification) and initializes Q post-step for step 2+.
+            assert torch.allclose(p_soap.detach(), p_adamw.detach(), atol=1e-13, rtol=1e-13)
 
     ref_param, ref_state = _oracle_soap_trajectory(init, grads, **kwargs)
     st = opt_soap.state[p_soap]
     assert int(st["step"].item()) == 6
-    # On step 1 of a 2D matrix G_1, Q_0 and Q_1 are exact left/right singular
-    # vectors of G_1, so Q_0^T G_1 Q_1 = Sigma has mathematically zero
-    # off-diagonal entries (residual O(eps_mach * ||G_1||) ~ 1e-15 in float64).
-    # Dividing those O(1e-15) residuals by denom ~= eps = 1e-8 amplifies
-    # contraction-order differences (tensordot vs explicit unfold/matmul) by
-    # 1 / eps = 1e8 into O(lr * eps_mach * ||G_1|| / eps) ~ 1e-9 parameter
-    # differences, whereas state tensors never divide by eps and match at 1e-12.
-    assert torch.allclose(p_soap.detach(), ref_param, atol=1e-7, rtol=1e-7)
+    assert torch.allclose(p_soap.detach(), ref_param, atol=1e-12, rtol=1e-12)
     assert torch.allclose(st["exp_avg"], ref_state["exp_avg"], atol=1e-12, rtol=1e-12)
     assert torch.allclose(st["exp_avg_sq"], ref_state["exp_avg_sq"], atol=1e-12, rtol=1e-12)
     for axis in range(2):
         assert torch.allclose(st["GG"][axis], ref_state["GG"][axis], atol=1e-12, rtol=1e-12)
         assert torch.allclose(st["Q"][axis], ref_state["Q"][axis], atol=1e-12, rtol=1e-12)
 
-    # Discriminating control: rotated SOAP update materially differs from coordinatewise AdamW.
+    # Discriminating control: rotated SOAP steps 2..6 materially differ from coordinatewise AdamW.
     assert float((p_soap.detach() - p_adamw.detach()).abs().max().item()) > 1e-3
-
-    # Well-conditioned eps=1e-2 on the exact same 2D trajectory reduces step-1
-    # off-diagonal 0 / eps amplification to O(lr * eps_mach * ||G_1|| / 1e-2) ~ 1e-14,
-    # verifying full float64 machine-precision parity in the update formula itself.
-    kwargs_wc = {**kwargs, "eps": 1e-2}
-    p_wc = nn.Parameter(init.clone())
-    opt_wc = SOAP([p_wc], **kwargs_wc)
-    for g in grads:
-        p_wc.grad = g.clone()
-        opt_wc.step()
-    ref_wc, _ = _oracle_soap_trajectory(init, grads, **kwargs_wc)
-    assert torch.allclose(p_wc.detach(), ref_wc, atol=1e-12, rtol=1e-12)
 
 
 def test_rank3_tensor_unmerged_modes_and_mixed_precond_dim_match_oracle() -> None:
@@ -495,6 +480,160 @@ def test_rank3_tensor_unmerged_modes_and_mixed_precond_dim_match_oracle() -> Non
     assert st_mixed["GG"][1] is None and st_mixed["Q"][1] is None
     assert st_mixed["GG"][2] is not None and tuple(st_mixed["GG"][2].shape) == (3, 3)
     assert torch.allclose(p_mixed.detach(), ref_mixed, atol=1e-12, rtol=1e-12)
+
+
+def test_step1_float32_2d_does_not_amplify_svd_zero_roundoff() -> None:
+    """Step 1 in float32 stays close to float64 with no 0 / eps SVD noise blowup."""
+
+    gen = torch.Generator().manual_seed(7)
+    g32 = torch.randn(32, 32, generator=gen, dtype=torch.float32)
+
+    p64 = nn.Parameter(torch.zeros(32, 32, dtype=torch.float64))
+    opt64 = SOAP([p64], lr=1e-2, betas=(0.95, 0.95), eps=1e-8)
+    p64.grad = g32.to(torch.float64)
+    opt64.step()
+    delta64 = p64.detach().clone()
+
+    p32 = nn.Parameter(torch.zeros(32, 32, dtype=torch.float32))
+    opt32 = SOAP([p32], lr=1e-2, betas=(0.95, 0.95), eps=1e-8)
+    p32.grad = g32.clone()
+    opt32.step()
+    delta32 = p32.detach().to(torch.float64)
+
+    rel_err = float((delta32 - delta64).norm() / delta64.norm())
+    assert rel_err < 1e-4
+
+    # Step 1 matches AdamW cleanly and initializes orthonormal float32 Q post-step.
+    p32_adam = nn.Parameter(torch.zeros(32, 32, dtype=torch.float32))
+    opt32_adam = torch.optim.AdamW(
+        [p32_adam], lr=1e-2, betas=(0.95, 0.95), eps=1e-8, weight_decay=0.0
+    )
+    p32_adam.grad = g32.clone()
+    opt32_adam.step()
+    assert torch.allclose(p32.detach(), p32_adam.detach(), atol=1e-6, rtol=1e-6)
+    assert opt32.state[p32]["mode_eigh_done"] == [True, True]
+    eye32 = torch.eye(32, dtype=torch.float32)
+    for q in opt32.state[p32]["Q"]:
+        assert q is not None and q.dtype == torch.float32
+        assert torch.allclose(q.T @ q, eye32, atol=1e-5, rtol=1e-5)
+
+
+def test_step1_and_step2_ill_conditioned_float64_no_spurious_offdiag_step() -> None:
+    """Ill-conditioned float64 G_1 = U diag([1e3, 1e-2, 1e-3, 1e-3]) V^T avoids O(1) noise."""
+
+    h = (
+        torch.tensor(
+            [
+                [1.0, 1.0, 1.0, 1.0],
+                [1.0, -1.0, 1.0, -1.0],
+                [1.0, 1.0, -1.0, -1.0],
+                [1.0, -1.0, -1.0, 1.0],
+            ],
+            dtype=torch.float64,
+        )
+        / 2.0
+    )
+    c, s = math.cos(0.3), math.sin(0.3)
+    rot = torch.tensor(
+        [[c, -s, 0.0, 0.0], [s, c, 0.0, 0.0], [0.0, 0.0, c, s], [0.0, 0.0, -s, c]],
+        dtype=torch.float64,
+    )
+    u = rot @ h
+    v = rot.T @ h
+    sing = torch.tensor([1e3, 1e-2, 1e-3, 1e-3], dtype=torch.float64)
+    g1 = u @ torch.diag(sing) @ v.T
+
+    lr = 1e-2
+    eps = 1e-8
+    p = nn.Parameter(torch.zeros(4, 4, dtype=torch.float64))
+    opt = SOAP([p], lr=lr, betas=(0.95, 0.95), eps=eps, weight_decay=0.0, precondition_frequency=10)
+
+    # Step 1 executes in Q = I (exact AdamW, zero 0 / eps SVD amplification) and
+    # initializes orthonormal Q_1 post-step.
+    p.grad = g1.clone()
+    opt.step()
+    expected_step1 = -lr * (g1 / (g1.abs() + eps))
+    assert torch.allclose(p.detach(), expected_step1, atol=1e-13, rtol=1e-13)
+    q1 = [q.clone() for q in opt.state[p]["Q"]]
+    assert opt.state[p]["mode_eigh_done"] == [True, True]
+    for q in q1:
+        assert torch.allclose(q.T @ q, torch.eye(4, dtype=torch.float64), atol=1e-12)
+
+    # Step 2 runs in the rotated Q_1 basis; because exp_avg_sq already carries
+    # non-zero step-1 variance, off-diagonal step_dir_proj stays << 1e-2 rather
+    # than saturating at O(1).
+    p_after_1 = p.detach().clone()
+    p.grad = g1.clone()
+    opt.step()
+    step_dir_2 = -(p.detach() - p_after_1) / lr
+    step_dir_proj_2 = _project(step_dir_2, q1)
+    offdiag_mask = ~torch.eye(4, dtype=torch.bool)
+    assert float(step_dir_proj_2[offdiag_mask].abs().max().item()) < 1e-2
+    assert float(step_dir_proj_2[0, 0].abs().item()) > 1.0
+
+    # Diagonal ill-conditioned G_1 also produces exact zero off-diagonal step 1.
+    p_diag = nn.Parameter(torch.zeros(4, 4, dtype=torch.float64))
+    opt_diag = SOAP([p_diag], lr=lr, betas=(0.95, 0.95), eps=eps, weight_decay=0.0)
+    p_diag.grad = torch.diag(sing)
+    opt_diag.step()
+    step_dir_diag = -p_diag.detach() / lr
+    assert float(step_dir_diag[offdiag_mask].abs().max().item()) == 0.0
+
+
+def test_eigenvalue_crossing_permutes_exp_avg_sq_along_each_axis() -> None:
+    """Asymmetric multi-mode eigenvalue crossing permutes exp_avg_sq via index_select."""
+
+    init = torch.zeros(3, 3, dtype=torch.float64)
+    # Step 1: GG_0 = GG_1 = diag([25, 4, 0.25]) -> Q_0 = Q_1 = I_3.
+    g1 = torch.diag(torch.tensor([5.0, 2.0, 0.5], dtype=torch.float64))
+    # Step 2 (refresh): GG_0 = diag([0.04, 9, 100]) -> sort_idx_0 = [2, 1, 0];
+    #                   GG_1 = diag([100, 0.04, 9]) -> sort_idx_1 = [0, 2, 1].
+    g2 = torch.tensor([[0.0, 0.2, 0.0], [0.0, 0.0, 3.0], [10.0, 0.0, 0.0]], dtype=torch.float64)
+    g3 = torch.tensor([[1.0, -0.5, 0.2], [0.3, 2.0, -0.4], [-0.1, 0.6, 1.5]], dtype=torch.float64)
+
+    kwargs = dict(
+        lr=1e-2,
+        betas=(0.9, 0.95),
+        shampoo_beta=0.0,
+        eps=1e-8,
+        weight_decay=0.0,
+        precondition_frequency=2,
+        max_precond_dim=16,
+    )
+    p = nn.Parameter(init.clone())
+    opt = SOAP([p], **kwargs)
+
+    p.grad = g1.clone()
+    opt.step()
+    q_before = [q.clone() for q in opt.state[p]["Q"]]
+    assert opt.state[p]["mode_eigh_done"] == [True, True]
+
+    # Step 2 triggers post-step QR refresh with distinct non-identity permutations on both axes.
+    p.grad = g2.clone()
+    opt.step()
+    st_after_2 = opt.state[p]
+    expected_sorts = [torch.tensor([2, 1, 0]), torch.tensor([0, 2, 1])]
+    for axis, expected_sort in enumerate(expected_sorts):
+        gg = st_after_2["GG"][axis]
+        assert gg is not None
+        _, sort_idx = _qr_refresh_basis(0.5 * (gg + gg.T), q_before[axis])
+        assert not torch.equal(sort_idx, torch.arange(3))
+        assert torch.equal(sort_idx, expected_sort)
+
+    ref_p2, ref_st2 = _oracle_soap_trajectory(init, [g1, g2], **kwargs)
+    assert torch.allclose(p.detach(), ref_p2, atol=1e-12, rtol=1e-12)
+    assert torch.allclose(st_after_2["exp_avg_sq"], ref_st2["exp_avg_sq"], atol=1e-12, rtol=1e-12)
+    # Pin concrete permuted entries (unpermuted exp_avg_sq would keep ~1.1875 at (0, 0) instead of 5.0).
+    assert st_after_2["exp_avg_sq"][0, 0].item() == pytest.approx(5.0, abs=1e-12)
+    assert st_after_2["exp_avg_sq"][1, 1].item() == pytest.approx(0.45, abs=1e-12)
+    assert st_after_2["exp_avg_sq"][2, 0].item() == pytest.approx(1.1875, abs=1e-12)
+
+    # Step 3 consumes the permuted exp_avg_sq in the refreshed eigenbasis.
+    p.grad = g3.clone()
+    opt.step()
+    ref_p3, ref_st3 = _oracle_soap_trajectory(init, [g1, g2, g3], **kwargs)
+    assert torch.allclose(p.detach(), ref_p3, atol=1e-12, rtol=1e-12)
+    assert torch.allclose(opt.state[p]["exp_avg_sq"], ref_st3["exp_avg_sq"], atol=1e-12, rtol=1e-12)
 
 
 # ---------------------------------------------------------------------------
@@ -568,12 +707,11 @@ def test_precondition_1d_true_preconditions_vector() -> None:
     assert torch.allclose(st["Q"][0].T @ st["Q"][0], torch.eye(5, dtype=torch.float64), atol=1e-12)
     assert torch.allclose(st["exp_avg"], ref_state["exp_avg"], atol=1e-12, rtol=1e-12)
     assert torch.allclose(st["GG"][0], ref_state["GG"][0], atol=1e-12, rtol=1e-12)
-    # A 1D length-5 vector has rank-1 GG on step 1 (exact zero nullspace entries
-    # in grad_proj divided by eps=1e-8) and rank-2/rank-4 GG on refresh steps 2/4
-    # (shift-stabilized QR condition number 1 / sqrt(eps_mach) ~= 6.7e7 in float64).
-    # Together these give O(lr * sqrt(eps_mach)) + O(lr * eps_mach / eps) ~ 1e-10
-    # trajectory sensitivity between independent contraction paths, vs O(lr) ~ 6.5e-3
-    # drift without shift stabilization.
+    # A 1D length-5 vector has rank-2/rank-4 GG on post-step QR refresh steps
+    # 2/4 (shift-stabilized QR condition number 1 / sqrt(eps_mach) ~= 6.7e7 in
+    # float64), giving O(sqrt(eps_mach)) nullspace sensitivity between
+    # independent contraction paths vs O(lr) ~ 6.5e-3 drift without shift
+    # stabilization.
     assert torch.allclose(st["Q"][0], ref_state["Q"][0], atol=1e-5, rtol=1e-5)
     assert torch.allclose(p.detach(), ref, atol=1e-7, rtol=1e-7)
 
@@ -857,44 +995,77 @@ def test_zero_transitions_and_degenerate_factors() -> None:
         correct_bias=False,
     )
     st_nb = opt_nb.state[p_nb]
-    # Same step-1 exact-SVD off-diagonal 0 / eps amplification on 2D matrices:
-    # O(lr * (1 - beta1) * eps_mach * ||G_1|| / eps) ~ 1e-10 at eps=1e-8,
-    # while state tensors match at 1e-12 and well-conditioned eps=1e-2 matches at 1e-12.
-    assert torch.allclose(p_nb.detach(), ref_nb, atol=1e-7, rtol=1e-7)
+    assert torch.allclose(p_nb.detach(), ref_nb, atol=1e-12, rtol=1e-12)
     assert torch.allclose(st_nb["exp_avg"], ref_nb_state["exp_avg"], atol=1e-12, rtol=1e-12)
     assert torch.allclose(st_nb["exp_avg_sq"], ref_nb_state["exp_avg_sq"], atol=1e-12, rtol=1e-12)
     for axis in range(2):
         assert torch.allclose(st_nb["GG"][axis], ref_nb_state["GG"][axis], atol=1e-12, rtol=1e-12)
         assert torch.allclose(st_nb["Q"][axis], ref_nb_state["Q"][axis], atol=1e-12, rtol=1e-12)
 
-    p_nb_wc = nn.Parameter(init_nb.clone())
-    opt_nb_wc = SOAP(
-        [p_nb_wc],
-        lr=1e-2,
-        betas=(0.9, 0.95),
-        eps=1e-2,
-        precondition_frequency=2,
-        correct_bias=False,
+
+def test_delayed_zero_to_nonzero_initializes_q_immediately_with_large_precond_freq() -> None:
+    """Zero on step 1 -> nonzero on step 2 initializes Q immediately even at freq=10."""
+
+    init = torch.tensor(
+        [[0.4, -0.2, 0.7], [-0.5, 0.9, -0.1], [0.3, 0.6, -0.8]], dtype=torch.float64
     )
-    for g in grads_nb:
-        p_nb_wc.grad = g.clone()
-        opt_nb_wc.step()
-    ref_nb_wc, _ = _oracle_soap_trajectory(
-        init_nb,
-        grads_nb,
+    g1 = torch.zeros(3, 3, dtype=torch.float64)
+    g2 = torch.tensor(
+        [[1.0, 0.8, -0.4], [0.8, 2.0, 0.3], [-0.4, 0.3, 0.5]], dtype=torch.float64
+    )
+    g3 = torch.tensor(
+        [[-0.6, 1.2, 0.5], [0.9, -0.4, 1.1], [0.2, -0.7, 0.8]], dtype=torch.float64
+    )
+
+    kwargs = dict(
         lr=1e-2,
         betas=(0.9, 0.95),
-        shampoo_beta=-1.0,
-        eps=1e-2,
+        shampoo_beta=0.9,
+        eps=1e-8,
         weight_decay=0.0,
-        precondition_frequency=2,
-        max_precond_dim=128,
-        correct_bias=False,
+        precondition_frequency=10,
+        max_precond_dim=16,
     )
-    assert torch.allclose(p_nb_wc.detach(), ref_nb_wc, atol=1e-12, rtol=1e-12)
+    p = nn.Parameter(init.clone())
+    opt = SOAP([p], **kwargs)
+    p_adam = nn.Parameter(init.clone())
+    opt_adam = torch.optim.AdamW([p_adam], lr=1e-2, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0)
+
+    # Step 1: zero gradient keeps Q = I and mode_eigh_done = [False, False].
+    p.grad = g1.clone()
+    opt.step()
+    p_adam.grad = g1.clone()
+    opt_adam.step()
+    assert opt.state[p]["mode_eigh_done"] == [False, False]
+    eye3 = torch.eye(3, dtype=torch.float64)
+    for q in opt.state[p]["Q"]:
+        assert torch.equal(q, eye3)
+
+    # Step 2: first nonzero gradient executes in Q = I (matching AdamW) and
+    # immediately initializes Q post-step instead of waiting for step 10.
+    p.grad = g2.clone()
+    opt.step()
+    p_adam.grad = g2.clone()
+    opt_adam.step()
+    assert torch.allclose(p.detach(), p_adam.detach(), atol=1e-13, rtol=1e-13)
+    assert opt.state[p]["mode_eigh_done"] == [True, True]
+    for q in opt.state[p]["Q"]:
+        assert q is not None
+        assert torch.allclose(q.T @ q, eye3, atol=1e-12, rtol=1e-12)
+        assert float((q - eye3).abs().max().item()) > 1e-2
+
+    # Step 3: runs in the rotated eigenbasis Q (matches oracle, differs from AdamW).
+    p.grad = g3.clone()
+    opt.step()
+    p_adam.grad = g3.clone()
+    opt_adam.step()
+    ref_p, ref_st = _oracle_soap_trajectory(init, [g1, g2, g3], **kwargs)
+    assert torch.allclose(p.detach(), ref_p, atol=1e-12, rtol=1e-12)
+    assert torch.allclose(opt.state[p]["exp_avg_sq"], ref_st["exp_avg_sq"], atol=1e-12, rtol=1e-12)
+    assert float((p.detach() - p_adam.detach()).abs().max().item()) > 1e-4
 
 
-@pytest.mark.parametrize("bad_kind", ["nan", "pos_inf", "neg_inf", "sparse"])
+@pytest.mark.parametrize("bad_kind", ["nan", "pos_inf", "neg_inf", "sparse", "sparse_csr"])
 def test_atomic_refusal_on_nonfinite_or_sparse_gradient(bad_kind: str) -> None:
     p1 = nn.Parameter(torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float64))
     p2 = nn.Parameter(torch.tensor([[5.0, 6.0], [7.0, 8.0]], dtype=torch.float64))
@@ -916,13 +1087,16 @@ def test_atomic_refusal_on_nonfinite_or_sparse_gradient(bad_kind: str) -> None:
         p2.grad = torch.tensor([[1.0, float("inf")], [0.0, 0.0]], dtype=torch.float64)
     elif bad_kind == "neg_inf":
         p2.grad = torch.tensor([[1.0, float("-inf")], [0.0, 0.0]], dtype=torch.float64)
-    else:
+    elif bad_kind == "sparse":
         p2.grad = torch.sparse_coo_tensor(
             torch.tensor([[0], [1]]),
             torch.tensor([1.0], dtype=torch.float64),
             size=(2, 2),
-            check_invariants=True,
         )
+    else:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            p2.grad = torch.tensor([[0.0, 1.0], [0.0, 0.0]], dtype=torch.float64).to_sparse_csr()
 
     with pytest.raises(RuntimeError):
         opt.step()
@@ -1180,6 +1354,183 @@ def test_load_state_dict_validation_atomicity_and_deepcopy_isolation() -> None:
     assert torch.equal(opt.state[p]["Q"][0], snapshot_q0)
 
 
+def test_load_state_dict_preserves_float32_factors_for_bfloat16_and_float16() -> None:
+    """GG/Q float32 factors survive load_state_dict bitwise on bfloat16 and float16."""
+
+    gen = torch.Generator().manual_seed(17)
+    p_bf16 = nn.Parameter(torch.randn(4, 4, generator=gen, dtype=torch.bfloat16))
+    opt = SOAP([p_bf16], lr=1e-2, precondition_frequency=2)
+    g1_bf16 = torch.randn(4, 4, generator=gen, dtype=torch.bfloat16)
+    p_bf16.grad = g1_bf16.clone()
+    opt.step()
+    sd = opt.state_dict()
+
+    p_bf16_res = nn.Parameter(p_bf16.detach().clone())
+    opt_res = SOAP([p_bf16_res], lr=1e-2, precondition_frequency=2)
+    opt_res.load_state_dict(sd)
+
+    eye4_f32 = torch.eye(4, dtype=torch.float32)
+    for axis in range(2):
+        q_orig = opt.state[p_bf16]["Q"][axis]
+        q_res = opt_res.state[p_bf16_res]["Q"][axis]
+        gg_orig = opt.state[p_bf16]["GG"][axis]
+        gg_res = opt_res.state[p_bf16_res]["GG"][axis]
+        assert q_res is not None and gg_res is not None
+        assert q_res.dtype == torch.float32 and gg_res.dtype == torch.float32
+        assert torch.equal(q_res, q_orig)
+        assert torch.equal(gg_res, gg_orig)
+        assert float((q_res.T @ q_res - eye4_f32).abs().max().item()) < 1e-6
+
+    # Verify bitwise resume parity on step 2 (in rotated Q) and caller state_dict isolation.
+    sd_q0_before = sd["state"][0]["Q"][0].clone()
+    g2_bf16 = torch.randn(4, 4, generator=gen, dtype=torch.bfloat16)
+    p_bf16.grad = g2_bf16.clone()
+    p_bf16_res.grad = g2_bf16.clone()
+    opt.step()
+    opt_res.step()
+    assert torch.equal(p_bf16.detach(), p_bf16_res.detach())
+    assert torch.equal(opt.state[p_bf16]["Q"][0], opt_res.state[p_bf16_res]["Q"][0])
+    assert torch.equal(sd["state"][0]["Q"][0], sd_q0_before)
+
+    # float16 overflow check: finite float32 GG (160000 > 65504) must not overflow to inf.
+    p_f16 = nn.Parameter(torch.randn(4, 4, generator=gen, dtype=torch.float16))
+    opt16 = SOAP([p_f16], lr=1e-2, shampoo_beta=0.0, precondition_frequency=2)
+    p_f16.grad = torch.full((4, 4), 200.0, dtype=torch.float16)
+    opt16.step()
+    assert float(opt16.state[p_f16]["GG"][0].max().item()) > 65504.0
+
+    p_f16_res = nn.Parameter(p_f16.detach().clone())
+    opt16_res = SOAP([p_f16_res], lr=1e-2, shampoo_beta=0.0, precondition_frequency=2)
+    opt16_res.load_state_dict(opt16.state_dict())
+    for axis in range(2):
+        gg16 = opt16_res.state[p_f16_res]["GG"][axis]
+        q16 = opt16_res.state[p_f16_res]["Q"][axis]
+        assert gg16 is not None and q16 is not None
+        assert gg16.dtype == torch.float32 and q16.dtype == torch.float32
+        assert torch.isfinite(gg16).all()
+        assert torch.equal(gg16, opt16.state[p_f16]["GG"][axis])
+        assert torch.equal(q16, opt16.state[p_f16]["Q"][axis])
+
+
+def test_load_state_dict_hardening_refuses_malformed_inputs_atomically() -> None:
+    """Reject malformed state_dict shapes, layouts, dtypes, and stray/empty entries."""
+
+    # Shape (3, 1): axis 0 is preconditioned, axis 1 is unpreconditioned (None).
+    p = nn.Parameter(torch.ones(3, 1, dtype=torch.float64))
+    opt = SOAP([p], lr=1e-2, precondition_frequency=2)
+    p.grad = torch.tensor([[1.0], [-0.5], [0.8]], dtype=torch.float64)
+    opt.step()
+
+    snapshot = opt.state_dict()
+
+    def _assert_prior_state_untouched() -> None:
+        current = opt.state_dict()
+        assert current["param_groups"] == snapshot["param_groups"]
+        assert set(current["state"].keys()) == set(snapshot["state"].keys())
+        s0, s1 = snapshot["state"][0], current["state"][0]
+        assert torch.equal(s0["step"], s1["step"])
+        assert torch.equal(s0["exp_avg"], s1["exp_avg"])
+        assert torch.equal(s0["exp_avg_sq"], s1["exp_avg_sq"])
+        assert torch.equal(s0["GG"][0], s1["GG"][0])
+        assert torch.equal(s0["Q"][0], s1["Q"][0])
+        assert s1["GG"][1] is None and s1["Q"][1] is None
+        assert s1["mode_eigh_done"] == s0["mode_eigh_done"]
+
+    # Non-mapping state_dict raises TypeError (checked without typeguard interception).
+    with suppress_type_checks(), pytest.raises(TypeError):
+        opt.load_state_dict("not-a-mapping")  # type: ignore[arg-type]
+    _assert_prior_state_untouched()
+
+    # Missing top-level keys or invalid container types.
+    for malformed in (
+        {"state": {}},
+        {"param_groups": snapshot["param_groups"]},
+        {"state": [], "param_groups": snapshot["param_groups"]},
+        {"state": {}, "param_groups": "invalid"},
+    ):
+        with pytest.raises(ValueError):
+            opt.load_state_dict(malformed)
+        _assert_prior_state_untouched()
+
+    # Empty {} per-parameter state entry.
+    empty_entry = copy.deepcopy(snapshot)
+    empty_entry["state"][0] = {}
+    with pytest.raises(ValueError, match="must not be empty"):
+        opt.load_state_dict(empty_entry)
+    _assert_prior_state_untouched()
+
+    # Stray unmapped key in state_dict['state'].
+    stray_key = copy.deepcopy(snapshot)
+    stray_key["state"][999] = copy.deepcopy(snapshot["state"][0])
+    with pytest.raises(ValueError, match="unmapped"):
+        opt.load_state_dict(stray_key)
+    _assert_prior_state_untouched()
+
+    # Non-integer / bool / non-0D / complex / sparse step tensors.
+    sparse_step = torch.sparse_coo_tensor(
+        torch.tensor([[0]], dtype=torch.int64),
+        torch.tensor([1], dtype=torch.int64),
+        size=(1,),
+    )
+    for bad_step in (
+        torch.tensor(2.7, dtype=torch.float64),
+        torch.tensor(True, dtype=torch.bool),
+        torch.tensor([1], dtype=torch.int64),
+        torch.tensor(1 + 0j, dtype=torch.complex128),
+        sparse_step,
+        True,
+        -1,
+    ):
+        bad = copy.deepcopy(snapshot)
+        bad["state"][0]["step"] = bad_step
+        with pytest.raises(ValueError):
+            opt.load_state_dict(bad)
+        _assert_prior_state_untouched()
+
+    # Complex / non-floating / sparse COO / sparse CSR moment and factor tensors.
+    bad_complex = copy.deepcopy(snapshot)
+    bad_complex["state"][0]["exp_avg"] = torch.zeros(3, 1, dtype=torch.complex128)
+    with pytest.raises(ValueError):
+        opt.load_state_dict(bad_complex)
+    _assert_prior_state_untouched()
+
+    bad_int_moment = copy.deepcopy(snapshot)
+    bad_int_moment["state"][0]["exp_avg_sq"] = torch.zeros(3, 1, dtype=torch.int64)
+    with pytest.raises(ValueError):
+        opt.load_state_dict(bad_int_moment)
+    _assert_prior_state_untouched()
+
+    bad_sparse_gg = copy.deepcopy(snapshot)
+    bad_sparse_gg["state"][0]["GG"][0] = torch.sparse_coo_tensor(
+        torch.tensor([[0], [0]]), torch.tensor([1.0], dtype=torch.float64), size=(3, 3)
+    )
+    with pytest.raises(ValueError):
+        opt.load_state_dict(bad_sparse_gg)
+    _assert_prior_state_untouched()
+
+    bad_sparse_q = copy.deepcopy(snapshot)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        bad_sparse_q["state"][0]["Q"][0] = torch.eye(3, dtype=torch.float64).to_sparse_csr()
+    with pytest.raises(ValueError):
+        opt.load_state_dict(bad_sparse_q)
+    _assert_prior_state_untouched()
+
+    # mode_eigh_done[axis]=True on non-preconditioned (None) axis 1.
+    bad_eigh_done = copy.deepcopy(snapshot)
+    bad_eigh_done["state"][0]["mode_eigh_done"][1] = True
+    with pytest.raises(ValueError, match="mode_eigh_done"):
+        opt.load_state_dict(bad_eigh_done)
+    _assert_prior_state_untouched()
+
+    # Invalid param_group hyperparameter rolls back cleanly without mutating live groups.
+    bad_hparam = copy.deepcopy(snapshot)
+    bad_hparam["param_groups"][0]["lr"] = -1.0
+    with pytest.raises(ValueError, match="lr"):
+        opt.load_state_dict(bad_hparam)
+    _assert_prior_state_untouched()
+
+
 # ---------------------------------------------------------------------------
 # 9. OptimizerState callback compatibility with SOAP & refusal controls
 # ---------------------------------------------------------------------------
@@ -1274,3 +1625,106 @@ def test_optimizer_state_callback_still_refuses_sgd_lbfgs_and_non_legacy_method(
             bad_state,
             step=0,
         )
+
+
+def test_optimizer_state_callback_soap_in_real_vmc_trainer_fit() -> None:
+    """Real VMCTrainer.fit() exercises Started(TrainingIteration) and disconnected counts."""
+
+    class _DispatchingContext(_StubContext):
+        def __init__(self) -> None:
+            super().__init__()
+            self.logged: list[tuple[int | None, str, dict[str, Any]]] = []
+
+        def log(self, metrics, *, step=None, namespace="run") -> None:
+            super().log(metrics, step=step, namespace=namespace)
+            self.logged.append((step, namespace, dict(metrics)))
+
+        def _dispatch_occurrence(self, occurrence, *, state=None) -> None:
+            super()._dispatch_occurrence(occurrence, state=state)
+            for callback in self.callbacks:
+                callback.handle_occurrence(occurrence, self, state)
+
+    model = build_tiny_spenn()
+    named = pair_parameters_by_name(model)
+    mixing_names = [name for name in named if name.startswith("stack.layers.0.mixing.")]
+    expected_mixing_inactive = sum(1 for name in mixing_names if name in INACTIVE_PAIR_PARAMETERS)
+    expected_ungrouped_inactive = len(INACTIVE_PAIR_PARAMETERS) - expected_mixing_inactive
+    assert expected_mixing_inactive == 15
+    assert expected_ungrouped_inactive == 1
+
+    sampler = build_tiny_sampler()
+    terms = list(build_tiny_hamiltonian_terms().values())
+    optimizer = SOAP(model.parameters(), lr=1e-3, precondition_frequency=2)
+    context = _DispatchingContext()
+    context.callbacks = [OptimizerState({"mixing": ["stack.layers.0.mixing"]}, every_n_steps=1)]
+
+    trainer = VMCTrainer(max_steps=2, log_every_n_steps=1)
+    trainer.fit(
+        model=model,
+        sampler=sampler,
+        hamiltonian_terms=terms,
+        optimizer=optimizer,
+        context=context,
+        emit=lambda *_, **__: None,
+    )
+
+    assert trainer.completed_updates == 2
+    assert any(
+        isinstance(occ.event, Started) and isinstance(occ.event.operation, TrainingIteration)
+        for occ in context.occurrences
+    )
+
+    mixing_step1 = [
+        metrics
+        for step, ns, metrics in context.logged
+        if ns == "train/optimizer_state/mixing" and step == 1
+    ]
+    ungrouped_step1 = [
+        metrics
+        for step, ns, metrics in context.logged
+        if ns == "train/optimizer_state/ungrouped" and step == 1
+    ]
+    assert len(mixing_step1) == 1
+    assert len(ungrouped_step1) == 1
+
+    mix = mixing_step1[0]
+    assert mix["n_parameters"] == len(mixing_names)
+    assert mix["n_no_optimizer_state"] == expected_mixing_inactive
+    assert mix["step"] == 2
+    assert mix["step_mismatch"] is False
+    assert mix["exp_avg_nonfinite_count"] == 0
+    assert mix["exp_avg_sq_nonfinite_count"] == 0
+    assert mix["exp_avg_l2"] > 0.0
+    assert mix["exp_avg_sq_rms"] > 0.0
+
+    ung = ungrouped_step1[0]
+    assert ung["n_no_optimizer_state"] == expected_ungrouped_inactive
+    assert ung["step"] == 2
+    assert ung["step_mismatch"] is False
+
+    # Control: unsupported optimizer is refused at Started(TrainingIteration) before sampling.
+    bad_model = build_tiny_spenn()
+    bad_opt = torch.optim.SGD(bad_model.parameters(), lr=1e-3)
+    bad_sampler = build_tiny_sampler()
+    sampler_calls = 0
+    orig_collect = bad_sampler.collect_samples
+
+    def _counting_collect(*args: Any, **kwargs: Any) -> Any:
+        nonlocal sampler_calls
+        sampler_calls += 1
+        return orig_collect(*args, **kwargs)
+
+    bad_sampler.collect_samples = _counting_collect  # type: ignore[method-assign]
+    bad_ctx = _DispatchingContext()
+    bad_ctx.callbacks = [OptimizerState({"mixing": ["stack.layers.0.mixing"]}, every_n_steps=1)]
+    bad_trainer = VMCTrainer(max_steps=1, log_every_n_steps=1)
+    with pytest.raises(ValueError, match="Adam, AdamW, or SOAP"):
+        bad_trainer.fit(
+            model=bad_model,
+            sampler=bad_sampler,
+            hamiltonian_terms=list(build_tiny_hamiltonian_terms().values()),
+            optimizer=bad_opt,
+            context=bad_ctx,
+            emit=lambda *_, **__: None,
+        )
+    assert sampler_calls == 0

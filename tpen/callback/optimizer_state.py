@@ -147,20 +147,20 @@ def _optimizer_metrics(
 
 
 def _state_step(state: Mapping[str, Any]) -> int:
-    """Read one Adam step scalar without averaging it."""
+    """Read one Adam-style step scalar without averaging it."""
 
     value = state.get("step")
     if value is None or getattr(value, "numel", lambda: 0)() != 1:
-        raise ValueError("OptimizerState requires a scalar Adam state['step']")
+        raise ValueError("OptimizerState requires a scalar Adam-style state['step']")
     return int(value.item())
 
 
 def _state_tensor(state: Mapping[str, Any], key: str) -> Any:
-    """Read one required Adam moment tensor."""
+    """Read one required Adam-style moment tensor."""
 
     value = state.get(key)
     if value is None or not hasattr(value, "reshape"):
-        raise ValueError(f"OptimizerState requires Adam state[{key!r}]")
+        raise ValueError(f"OptimizerState requires Adam-style state[{key!r}]")
     return value
 
 

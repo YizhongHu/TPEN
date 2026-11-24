@@ -18,24 +18,28 @@ Design invariants
 - **Float64 preservation**: For ``torch.float64`` parameters, all factor EMAs,
   mode contractions, eigendecompositions, QR refreshes, and moment updates run
   in ``torch.float64``. Precision is never downgraded to ``float32``.
-- **Honest first-step update accounting**: On the first step with a gradient
-  (``step == 1``), SOAP updates ``GG``, initializes the eigenbasis ``Q_1`` via
-  exact symmetric eigendecomposition when ``GG`` is nonzero, and immediately
-  applies the rotated AdamW update. Step 1 is never silently skipped, so
+- **Honest first-step update accounting**: Following Vyas et al. (2024)
+  Algorithm 1's post-step preconditioner update order, step 1 executes an
+  unrotated AdamW update in the initial identity basis ``Q = I`` (avoiding
+  exact-SVD ``0 / eps`` roundoff-sign amplification on 2D and rank-deficient
+  tensors) and then updates ``GG`` and initializes ``Q_1`` via exact symmetric
+  eigendecomposition when ``GG`` is nonzero so step 2+ run in the rotated
+  eigenbasis. Step 1 is never silently skipped, so
   :class:`~tpen.training.trainer.VMCTrainer` ``completed_updates`` agrees with
   every active parameter's optimizer step count.
 - **Atomic pre-flight gradient validation**: Before mutating any optimizer
   state or parameter, ``step()`` checks every managed parameter with a present
-  gradient for complex/non-floating/sparse/non-finite entries and raises
-  ``RuntimeError`` without touching any parameter or state if any check fails.
-  Parameters with ``grad is None`` (such as disconnected even-electron TPEN
-  parameters) are skipped without allocating state.
+  gradient for complex/non-floating/sparse/non-strided/non-finite entries and
+  raises ``RuntimeError`` without touching any parameter or state if any check
+  fails. Parameters with ``grad is None`` (such as disconnected even-electron
+  TPEN parameters) are skipped without allocating state.
 """
 
 from __future__ import annotations
 
 import copy
 import math
+from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
@@ -44,6 +48,38 @@ from tpen.dependencies import require_torch
 torch = require_torch(feature="SOAP optimizer")
 
 _REQUIRED_STATE_KEYS = ("step", "exp_avg", "exp_avg_sq", "GG", "Q", "mode_eigh_done")
+_VALID_STEP_INT_DTYPES = (
+    torch.uint8,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+)
+
+
+def _validate_real_strided_float_tensor(
+    name: str,
+    value: Any,
+    expected_shape: tuple[int, ...],
+) -> torch.Tensor:
+    """Validate that a restored state entry is a dense real floating tensor."""
+
+    if not isinstance(value, torch.Tensor):
+        raise ValueError(f"SOAP state[{name}] must be a torch.Tensor")
+    if value.is_sparse or value.layout != torch.strided:
+        raise ValueError(
+            f"SOAP state[{name}] must be a dense strided tensor, got layout {value.layout}"
+        )
+    if value.is_complex() or not value.is_floating_point():
+        raise ValueError(
+            f"SOAP state[{name}] must be a real floating-point tensor, got dtype {value.dtype}"
+        )
+    if tuple(value.shape) != expected_shape:
+        raise ValueError(
+            f"SOAP state[{name}] shape {tuple(value.shape)} does not match "
+            f"expected shape {expected_shape}"
+        )
+    return value
 
 
 def _validate_float(
@@ -335,11 +371,13 @@ class SOAP(torch.optim.Optimizer):
         Decoupled AdamW-style weight decay coefficient (finite, ``>= 0``).
         Default is ``0.0``.
     precondition_frequency : int, optional
-        Refresh cadence in applied parameter steps (integer ``>= 1``). Exact
-        eigendecomposition initializes ``Q`` on step 1 (or on the first refresh
-        step after a nonzero gradient arrives), and subspace-iteration QR
-        refreshes run on steps divisible by ``precondition_frequency``. Default
-        is ``10``.
+        Refresh cadence in applied parameter steps (integer ``>= 1``). Per-mode
+        Gram EMAs ``GG`` and eigenbases ``Q`` update after each parameter step
+        (Vyas et al., 2024, Algorithm 1): exact eigendecomposition initializes
+        ``Q`` immediately after the first step where a mode's ``GG`` becomes
+        nonzero, and subspace-iteration QR refreshes run post-step on
+        subsequent steps divisible by ``precondition_frequency``. Default is
+        ``10``.
     max_precond_dim : int, optional
         Maximum axis size eligible for preconditioning (integer ``>= 1``). Axes
         with ``dim <= 1`` or ``dim > max_precond_dim`` are left unrotated.
@@ -410,6 +448,12 @@ class SOAP(torch.optim.Optimizer):
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
         """Restore optimizer state with strict shape, dtype, and device checks.
 
+        Validates and normalizes incoming ``GG`` and ``Q`` factors directly into
+        ``_factor_dtype(param.dtype)`` without routing them through
+        ``torch.optim.Optimizer.load_state_dict``'s parameter-dtype downcast,
+        preserving ``float32`` factors bitwise on ``float16`` / ``bfloat16``
+        parameters.
+
         Parameters
         ----------
         state_dict : Mapping of str to Any
@@ -420,38 +464,121 @@ class SOAP(torch.optim.Optimizer):
         TypeError
             If ``state_dict`` is not a mapping.
         ValueError
-            If any restored parameter group, state key, factor shape, or
-            ``mode_eigh_done`` metadata is malformed or disagrees with the live
-            parameter layout. On failure, the optimizer's prior state and
-            parameter groups are restored atomically.
+            If any restored parameter group, state key, factor shape, tensor
+            dtype/layout, or ``mode_eigh_done`` metadata is malformed or
+            disagrees with the live parameter layout. On failure, the
+            optimizer's prior state and parameter groups remain untouched.
         """
 
         if not isinstance(state_dict, Mapping):
             raise TypeError(f"SOAP.load_state_dict expects a mapping, got {type(state_dict)!r}")
 
-        # Snapshot current state and groups so any validation error leaves the
-        # live optimizer unmutated.
-        prior_state = self.state
-        prior_groups = self.param_groups
-        try:
-            super().load_state_dict(copy.deepcopy(dict(state_dict)))
-            for group in self.param_groups:
-                _validate_param_group(group)
-                max_precond_dim = group["max_precond_dim"]
-                precondition_1d = group["precondition_1d"]
-                for p in group["params"]:
-                    if p not in self.state or len(self.state[p]) == 0:
-                        continue
-                    self.state[p] = self._validate_and_normalize_param_state(
-                        p,
-                        self.state[p],
-                        max_precond_dim=max_precond_dim,
-                        precondition_1d=precondition_1d,
+        if "state" not in state_dict or "param_groups" not in state_dict:
+            raise ValueError("SOAP state_dict must contain 'state' and 'param_groups' keys")
+
+        raw_state_map = state_dict["state"]
+        raw_param_groups = state_dict["param_groups"]
+        if not isinstance(raw_state_map, Mapping):
+            raise ValueError(
+                f"SOAP state_dict['state'] must be a mapping, got {type(raw_state_map)!r}"
+            )
+        if isinstance(raw_param_groups, (str, bytes)) or not isinstance(
+            raw_param_groups, Sequence
+        ):
+            raise ValueError(
+                "SOAP state_dict['param_groups'] must be a sequence, "
+                f"got {type(raw_param_groups)!r}"
+            )
+
+        saved_groups = list(raw_param_groups)
+        live_groups = self.param_groups
+        if len(live_groups) != len(saved_groups):
+            raise ValueError("loaded state dict has a different number of parameter groups")
+
+        id_map: dict[Any, torch.Tensor] = {}
+        updated_groups: list[dict[str, Any]] = []
+        param_config: dict[torch.Tensor, tuple[int, bool]] = {}
+
+        for live_group, saved_group in zip(live_groups, saved_groups, strict=True):
+            if not isinstance(saved_group, Mapping):
+                raise ValueError(
+                    f"SOAP state_dict['param_groups'] entries must be mappings, got {type(saved_group)!r}"
+                )
+            if "params" not in saved_group:
+                raise ValueError("SOAP state_dict param_group is missing required 'params' key")
+            saved_params = saved_group["params"]
+            if isinstance(saved_params, (str, bytes)) or not isinstance(saved_params, Sequence):
+                raise ValueError(
+                    "SOAP state_dict param_group['params'] must be a sequence, "
+                    f"got {type(saved_params)!r}"
+                )
+            live_params = live_group["params"]
+            if len(live_params) != len(saved_params):
+                raise ValueError(
+                    "loaded state dict contains a parameter group that doesn't match "
+                    "the size of optimizer's group"
+                )
+
+            for live_param, saved_id in zip(live_params, saved_params, strict=True):
+                try:
+                    existing = id_map.get(saved_id)
+                except TypeError as exc:
+                    raise ValueError(
+                        f"SOAP state_dict parameter id must be hashable, got {saved_id!r}"
+                    ) from exc
+                if existing is not None and existing is not live_param:
+                    raise ValueError(
+                        f"SOAP state_dict contains duplicate parameter id {saved_id!r}"
                     )
-        except Exception:
-            self.state = prior_state
-            self.param_groups = prior_groups
-            raise
+                id_map[saved_id] = live_param
+
+            new_group: dict[str, Any] = {
+                key: copy.deepcopy(value)
+                for key, value in saved_group.items()
+                if key != "params"
+            }
+            missing_hparams = [key for key in self.defaults if key not in new_group]
+            if missing_hparams:
+                raise ValueError(
+                    f"SOAP state_dict param_group is missing required hyperparameter(s): "
+                    f"{missing_hparams}"
+                )
+            new_group["params"] = list(live_params)
+            _validate_param_group(new_group)
+            updated_groups.append(new_group)
+
+            cfg = (new_group["max_precond_dim"], new_group["precondition_1d"])
+            for live_param in live_params:
+                param_config[live_param] = cfg
+
+        new_state: defaultdict[torch.Tensor, dict[str, Any]] = defaultdict(dict)
+        for saved_id, raw_param_state in raw_state_map.items():
+            if saved_id not in id_map:
+                raise ValueError(
+                    f"SOAP state_dict['state'] contains unmapped parameter key {saved_id!r}"
+                )
+            if not isinstance(raw_param_state, Mapping):
+                raise ValueError(
+                    f"SOAP state_dict['state'][{saved_id!r}] must be a mapping, "
+                    f"got {type(raw_param_state)!r}"
+                )
+            if len(raw_param_state) == 0:
+                raise ValueError(
+                    f"SOAP state_dict['state'][{saved_id!r}] must not be empty"
+                )
+            live_param = id_map[saved_id]
+            max_precond_dim, precondition_1d = param_config[live_param]
+            new_state[live_param] = self._validate_and_normalize_param_state(
+                live_param,
+                raw_param_state,
+                max_precond_dim=max_precond_dim,
+                precondition_1d=precondition_1d,
+            )
+
+        # Atomic commit: live optimizer state and groups are updated only after
+        # every group and parameter state entry passes full validation.
+        self.param_groups = updated_groups
+        self.state = new_state
 
     @staticmethod
     def _validate_and_normalize_param_state(
@@ -469,9 +596,17 @@ class SOAP(torch.optim.Optimizer):
 
         step_raw = raw_state["step"]
         if isinstance(step_raw, torch.Tensor):
-            if step_raw.numel() != 1:
+            if step_raw.is_sparse or step_raw.layout != torch.strided:
                 raise ValueError(
-                    f"SOAP state['step'] must be scalar, got shape {tuple(step_raw.shape)}"
+                    f"SOAP state['step'] must be a dense strided tensor, got layout {step_raw.layout}"
+                )
+            if step_raw.ndim != 0:
+                raise ValueError(
+                    f"SOAP state['step'] must be a 0-D scalar tensor, got shape {tuple(step_raw.shape)}"
+                )
+            if step_raw.dtype not in _VALID_STEP_INT_DTYPES:
+                raise ValueError(
+                    f"SOAP state['step'] tensor must have an integer dtype, got {step_raw.dtype}"
                 )
             step_int = int(step_raw.item())
         elif not isinstance(step_raw, bool) and isinstance(step_raw, int):
@@ -486,14 +621,9 @@ class SOAP(torch.optim.Optimizer):
             "step": torch.tensor(step_int, dtype=torch.int64, device="cpu"),
         }
         for moment_key in ("exp_avg", "exp_avg_sq"):
-            tensor = raw_state[moment_key]
-            if not isinstance(tensor, torch.Tensor):
-                raise ValueError(f"SOAP state[{moment_key!r}] must be a torch.Tensor")
-            if tuple(tensor.shape) != tuple(param.shape):
-                raise ValueError(
-                    f"SOAP state[{moment_key!r}] shape {tuple(tensor.shape)} does not match "
-                    f"parameter shape {tuple(param.shape)}"
-                )
+            tensor = _validate_real_strided_float_tensor(
+                repr(moment_key), raw_state[moment_key], tuple(param.shape)
+            )
             normalized[moment_key] = tensor.detach().to(device=param.device, dtype=param.dtype).clone()
 
         precond_flags = _preconditioned_axes(
@@ -521,20 +651,25 @@ class SOAP(torch.optim.Optimizer):
                 raise ValueError(
                     f"SOAP state['mode_eigh_done'][{axis}] must be bool, got {done_flag!r}"
                 )
-            eigh_done_norm.append(done_flag)
 
             gg_item = gg_raw[axis]
             q_item = q_raw[axis]
             if is_precond:
-                for mat_name, mat in (("GG", gg_item), ("Q", q_item)):
-                    if not isinstance(mat, torch.Tensor) or tuple(mat.shape) != (dim, dim):
-                        raise ValueError(
-                            f"SOAP state[{mat_name!r}][{axis}] must be a Tensor of shape "
-                            f"{(dim, dim)}"
-                        )
-                gg_norm.append(gg_item.detach().to(device=param.device, dtype=factor_dtype).clone())
-                q_norm.append(q_item.detach().to(device=param.device, dtype=factor_dtype).clone())
+                gg_tensor = _validate_real_strided_float_tensor(
+                    f"'GG'][{axis}", gg_item, (dim, dim)
+                )
+                q_tensor = _validate_real_strided_float_tensor(
+                    f"'Q'][{axis}", q_item, (dim, dim)
+                )
+                gg_norm.append(gg_tensor.detach().to(device=param.device, dtype=factor_dtype).clone())
+                q_norm.append(q_tensor.detach().to(device=param.device, dtype=factor_dtype).clone())
+                eigh_done_norm.append(done_flag)
             else:
+                if done_flag:
+                    raise ValueError(
+                        f"SOAP axis {axis} (dim={dim}) is not preconditioned; "
+                        "mode_eigh_done entry must be False"
+                    )
                 if gg_item is not None or q_item is not None:
                     raise ValueError(
                         f"SOAP axis {axis} (dim={dim}) is not preconditioned; "
@@ -542,6 +677,7 @@ class SOAP(torch.optim.Optimizer):
                     )
                 gg_norm.append(None)
                 q_norm.append(None)
+                eigh_done_norm.append(False)
 
         normalized["GG"] = gg_norm
         normalized["Q"] = q_norm
@@ -560,7 +696,7 @@ class SOAP(torch.optim.Optimizer):
                     raise RuntimeError("SOAP does not support complex parameters or gradients")
                 if not p.is_floating_point() or not grad.is_floating_point():
                     raise RuntimeError("SOAP requires real floating-point parameters and gradients")
-                if grad.is_sparse:
+                if grad.is_sparse or grad.layout != torch.strided:
                     raise RuntimeError("SOAP does not support sparse gradients")
                 if not bool(torch.isfinite(grad).all()):
                     raise RuntimeError("SOAP encountered non-finite gradients")
@@ -649,54 +785,11 @@ class SOAP(torch.optim.Optimizer):
                     q_list: list[torch.Tensor | None] = state["Q"]
                     eigh_done: list[bool] = state["mode_eigh_done"]
 
-                    # Update per-mode Gram factor EMAs in factor_dtype (float64
-                    # whenever the parameter is float64).
-                    if any(gg is not None for gg in gg_list):
-                        grad_f = grad if grad.dtype == factor_dtype else grad.to(dtype=factor_dtype)
-                        for axis, gg in enumerate(gg_list):
-                            if gg is None:
-                                continue
-                            gram = _mode_gram(grad_f, axis)
-                            gg.mul_(effective_shampoo_beta).add_(
-                                gram, alpha=1.0 - effective_shampoo_beta
-                            )
-
-                        # Initialize Q on step 1 via exact eigh (when nonzero)
-                        # so step 1 performs a genuine rotated SOAP update;
-                        # refresh on subsequent multiples of precondition_frequency.
-                        if step_int == 1:
-                            for axis, gg in enumerate(gg_list):
-                                if gg is None:
-                                    continue
-                                sym = 0.5 * (gg + gg.T)
-                                if float(sym.abs().max().item()) == 0.0:
-                                    eigh_done[axis] = False
-                                else:
-                                    q_list[axis] = _eigh_basis(sym)
-                                    eigh_done[axis] = True
-                        elif step_int % precondition_frequency == 0:
-                            for axis, gg in enumerate(gg_list):
-                                if gg is None:
-                                    continue
-                                sym = 0.5 * (gg + gg.T)
-                                if float(sym.abs().max().item()) == 0.0:
-                                    continue
-                                if not eigh_done[axis]:
-                                    q_list[axis] = _eigh_basis(sym)
-                                    eigh_done[axis] = True
-                                else:
-                                    q_old = q_list[axis]
-                                    assert q_old is not None
-                                    q_new, sort_idx = _qr_refresh_basis(sym, q_old)
-                                    q_list[axis] = q_new
-                                    # Permute exp_avg_sq along this axis to stay
-                                    # aligned with the reordered eigenvectors.
-                                    state["exp_avg_sq"] = state["exp_avg_sq"].index_select(
-                                        axis, sort_idx
-                                    )
-
-                    # Avoid any cast when parameter and factor dtypes match
-                    # (always true for float64 and float32).
+                    # Step 1 of Algorithm 1 (Vyas et al., 2024): apply the
+                    # rotated AdamW parameter update in the current eigenbasis
+                    # Q (initially I on step 1, avoiding exact-SVD 0 / eps
+                    # roundoff amplification). Avoid any cast when parameter and
+                    # factor dtypes match (always true for float64 and float32).
                     if p.dtype == factor_dtype:
                         q_proj: Sequence[torch.Tensor | None] = q_list
                     else:
@@ -730,6 +823,40 @@ class SOAP(torch.optim.Optimizer):
                     if weight_decay != 0.0:
                         p.mul_(1.0 - lr * weight_decay)
                     p.add_(step_dir, alpha=-lr)
+
+                    # Step 2 of Algorithm 1: post-step preconditioner update.
+                    # Update per-mode Gram factor EMAs in factor_dtype (float64
+                    # whenever the parameter is float64), initialize Q via exact
+                    # eigh immediately after the first nonzero-gradient step for
+                    # each mode, and run QR refreshes on multiples of
+                    # precondition_frequency.
+                    if any(gg is not None for gg in gg_list):
+                        grad_f = grad if grad.dtype == factor_dtype else grad.to(dtype=factor_dtype)
+                        for axis, gg in enumerate(gg_list):
+                            if gg is None:
+                                continue
+                            gram = _mode_gram(grad_f, axis)
+                            gg.mul_(effective_shampoo_beta).add_(
+                                gram, alpha=1.0 - effective_shampoo_beta
+                            )
+
+                        for axis, gg in enumerate(gg_list):
+                            if gg is None:
+                                continue
+                            sym = 0.5 * (gg + gg.T)
+                            if float(sym.abs().max().item()) == 0.0:
+                                continue
+                            if not eigh_done[axis]:
+                                q_list[axis] = _eigh_basis(sym)
+                                eigh_done[axis] = True
+                            elif step_int % precondition_frequency == 0:
+                                q_old = q_list[axis]
+                                assert q_old is not None
+                                q_new, sort_idx = _qr_refresh_basis(sym, q_old)
+                                q_list[axis] = q_new
+                                # Permute exp_avg_sq along this axis to stay
+                                # aligned with the reordered eigenvectors.
+                                state["exp_avg_sq"] = state["exp_avg_sq"].index_select(axis, sort_idx)
 
         return loss
 
