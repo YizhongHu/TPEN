@@ -1,6 +1,10 @@
 """Batch state containers and geometry helpers."""
 
-from tpen.data.batch.electron_batch import ElectronBatch, slice_flat_batch
+from tpen.data.batch.electron_batch import (
+    ElectronBatch,
+    select_flat_batch_mask,
+    slice_flat_batch,
+)
 from tpen.data.batch.geometry import (
     TwoElectronAtomicGeometry,
     electron_nuclear_displacements,
@@ -45,6 +49,7 @@ __all__ = [
     "nuclear_potential",
     "pairwise_displacements",
     "pairwise_distances",
+    "select_flat_batch_mask",
     "slice_flat_batch",
     "two_electron_atomic_geometry",
     "two_electron_atomic_geometry_reference",

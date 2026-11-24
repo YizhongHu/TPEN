@@ -9,6 +9,7 @@ from tpen.data.real import Interaction, Update, zero_block
 from tpen.dependencies import require_torch, require_torch_nn
 from tpen.equivariance import EquivariantMap
 from tpen.nn.initialization import TorchInitializer
+from tpen.nn.structured_curvature import active_structured_curvature_session
 from tpen.data.paths import PathLayout, PathMetadata, VirtualPath, load_default_path_metadata
 
 torch = require_torch(feature="TPEN path aggregation")
@@ -163,6 +164,14 @@ class PathAggregation(EquivariantMap):
         # channel; batch and tuple indices pass through untouched, so the map
         # is shared over particles and cannot break equivariance.
         aggregated = torch.einsum("bcp...,cp->bc...", tensor, weight)
+        session = active_structured_curvature_session()
+        if session is not None:
+            session.record_path_aggregation(
+                weight=weight,
+                interaction_block=tensor,
+                aggregated=aggregated,
+                label=f"PathAggregation.o{order}",
+            )
         if self.activation is not None:
             aggregated = self.activation(aggregated)
         return aggregated

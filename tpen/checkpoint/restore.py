@@ -185,6 +185,14 @@ def restore_checkpoint(
         manifest.hashes,
         components=("model", "optimizer", "trainer", "sampler", "rng"),
     )
+    method_tensor_state: Mapping[str, Any] | None = None
+    if "method_state" in manifest.files:
+        _validate_optional_method_state_file(
+            checkpoint_dir,
+            manifest.files,
+            manifest.hashes,
+        )
+        method_tensor_state = _read_method_tensor_state(checkpoint_dir, manifest.files)
 
     # The RNG payload is read and validated before anything is restored. A
     # refused resume must leave the process unmutated, and `_load_sampler` is
@@ -195,15 +203,20 @@ def restore_checkpoint(
     device = runtime_device(context)
     rng_state = _read_rng_state(checkpoint_dir, manifest.files)
     require_restorable_rng_state(rng_state, device, checkpoint_dir)
-    # Read and validate trainer progress before loading any mutable component.
-    # A permissive trainer must not turn a malformed payload into a partially
-    # restored live run.
+    # Read and validate trainer progress and optional binary method state before
+    # loading any mutable component. A refused semantic restore must leave live
+    # model, optimizer, trainer, sampler, and update-method state unmutated.
     trainer_state = _read_trainer_state(checkpoint_dir, manifest.files)
     validate_manifest_state(manifest, trainer_state, mode=mode)
+    _validate_trainer_restore(
+        trainer,
+        trainer_state,
+        method_tensor_state=method_tensor_state,
+    )
 
     _load_model(checkpoint_dir, manifest.files, model, strict=strict_load, context=context)
     _load_optimizer(checkpoint_dir, manifest.files, optimizer)
-    _load_trainer(trainer, trainer_state)
+    _load_trainer(trainer, trainer_state, method_tensor_state=method_tensor_state)
     _load_sampler(checkpoint_dir, manifest.files, sampler, context)
     apply_rng_state(rng_state, device)
     return RestoreReport(
@@ -345,14 +358,92 @@ def _load_optimizer(checkpoint_dir: Path, files: dict[str, str], optimizer: Any)
     optimizer.load_state_dict(torch.load(path, map_location="cpu", weights_only=False))
 
 
-def _load_trainer(trainer: Any, state: Mapping[str, Any]) -> None:
+def _validate_optional_method_state_file(
+    checkpoint_dir: Path,
+    files: dict[str, str],
+    hashes: dict[str, str | None],
+) -> None:
+    """Validate an optional ``method_state.pt`` file and require its SHA-256 digest."""
+
+    path = _required_file(checkpoint_dir, files, "method_state")
+    expected = hashes.get("method_state_sha256")
+    if expected is None:
+        raise ValueError(
+            f"{checkpoint_dir}: manifest names 'method_state' without required 'method_state_sha256' digest"
+        )
+    actual = file_sha256(path)
+    if actual != expected:
+        raise ValueError(
+            f"{checkpoint_dir}: method_state checkpoint file digest mismatch "
+            f"(manifest {expected}, actual {actual})"
+        )
+
+
+def _read_method_tensor_state(
+    checkpoint_dir: Path, files: dict[str, str]
+) -> Mapping[str, Any]:
+    """Read optional binary method tensor state before mutating live consumers."""
+
+    import torch
+
+    path = _required_file(checkpoint_dir, files, "method_state")
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(state, Mapping):
+        raise TypeError(
+            f"{checkpoint_dir}: method_state.pt must contain a mapping, got {type(state).__name__}"
+        )
+    return state
+
+
+def _validate_trainer_restore(
+    trainer: Any,
+    state: Mapping[str, Any],
+    *,
+    method_tensor_state: Mapping[str, Any] | None = None,
+) -> None:
+    """Pre-validate trainer capability and state compatibility before any mutation."""
+
     if trainer is None:
         raise ValueError("train_resume restore requires a trainer")
     load_state_dict = getattr(trainer, "load_state_dict", None)
     if not callable(load_state_dict):
         raise TypeError("trainer must expose load_state_dict() for train_resume restore")
+    load_tensor_state = getattr(trainer, "load_method_tensor_state_dict", None)
+    if method_tensor_state is not None and not callable(load_tensor_state):
+        raise ValueError(
+            "checkpoint carries 'method_state' binary payload, but trainer does not "
+            "implement load_method_tensor_state_dict()"
+        )
+    validate_checkpoint_state = getattr(trainer, "validate_checkpoint_state", None)
+    if callable(validate_checkpoint_state):
+        validate_checkpoint_state(state, method_tensor_state=method_tensor_state)
+
+
+def _load_trainer(
+    trainer: Any,
+    state: Mapping[str, Any],
+    *,
+    method_tensor_state: Mapping[str, Any] | None = None,
+) -> None:
+    if trainer is None:
+        raise ValueError("train_resume restore requires a trainer")
+    load_checkpoint_state = getattr(trainer, "load_checkpoint_state", None)
+    if callable(load_checkpoint_state):
+        load_checkpoint_state(state, method_tensor_state=method_tensor_state)
+        return
+    load_state_dict = getattr(trainer, "load_state_dict", None)
+    if not callable(load_state_dict):
+        raise TypeError("trainer must expose load_state_dict() for train_resume restore")
 
     load_state_dict(state)
+    load_tensor_state = getattr(trainer, "load_method_tensor_state_dict", None)
+    if callable(load_tensor_state):
+        load_tensor_state(method_tensor_state)
+    elif method_tensor_state is not None:
+        raise ValueError(
+            "checkpoint carries 'method_state' binary payload, but trainer does not "
+            "implement load_method_tensor_state_dict()"
+        )
 
 
 def _read_trainer_state(checkpoint_dir: Path, files: dict[str, str]) -> dict[str, Any]:

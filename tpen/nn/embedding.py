@@ -13,6 +13,7 @@ from tpen.dependencies import require_torch, require_torch_nn
 from tpen.equivariance import EquivariantMap
 from tpen.nn.initialization import TorchInitializer
 from tpen.nn.mlp import MLP
+from tpen.nn.structured_curvature import active_structured_curvature_session
 
 torch = require_torch(feature="TPEN embedding modules")
 nn = require_torch_nn(feature="TPEN embedding modules")
@@ -188,6 +189,7 @@ class Embedding(EquivariantMap):
         device = particle_vectors.device
         dtype = particle_vectors.dtype
         blocks = [zero_block(batch_size=batch_size, device=device, dtype=dtype)]
+        session = active_structured_curvature_session()
         for order in range(1, self.max_order + 1):
             tuple_inputs = tuple_particle_inputs(particle_vectors, order)
             tuple_inputs = self._pair_tuple_inputs(
@@ -197,7 +199,11 @@ class Embedding(EquivariantMap):
                 batch_size=batch_size,
                 n_electrons=n_electrons,
             )
-            block = self.order_mlps[str(order)](tuple_inputs).movedim(-1, 1)
+            if session is not None and order >= 2:
+                with session.distinct_tuple_mask_scope(n_particles=n_electrons, order=order):
+                    block = self.order_mlps[str(order)](tuple_inputs).movedim(-1, 1)
+            else:
+                block = self.order_mlps[str(order)](tuple_inputs).movedim(-1, 1)
             block = block * no_repeated_particle_mask(n_electrons, order, device=device).reshape(
                 1,
                 1,

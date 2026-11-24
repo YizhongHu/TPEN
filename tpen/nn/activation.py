@@ -31,6 +31,7 @@ import math
 from tpen.dependencies import require_torch, require_torch_nn
 from tpen.nn.initialization import TorchInitializer
 from tpen.nn.mlp import MLP
+from tpen.nn.structured_curvature import active_structured_curvature_session
 
 torch = require_torch(feature="TPEN activations")
 nn = require_torch_nn(feature="TPEN activations")
@@ -245,7 +246,13 @@ class ChannelPreservingMLPActivation(nn.Module):
                 f"input channels {channels} do not match order {order} channels {spec.channels}"
             )
         moved = inputs.movedim(axes.channel_axis, -1)
-        activated = self.mlps[spec_index](moved)
+        session = active_structured_curvature_session()
+        if session is not None and order >= 2:
+            n_particles = int(inputs.shape[axes.tuple_axes_start])
+            with session.distinct_tuple_mask_scope(n_particles=n_particles, order=order):
+                activated = self.mlps[spec_index](moved)
+        else:
+            activated = self.mlps[spec_index](moved)
         return activated.movedim(-1, axes.channel_axis)
 
     def extra_repr(self) -> str:

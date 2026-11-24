@@ -34,6 +34,10 @@ from tpen.data.permutation import Permutation
 from tpen.dependencies import require_torch, require_torch_functional, require_torch_nn
 from tpen.nn.envelope import Envelope
 from tpen.nn.factor import LogAmplitudeFactor, _inverse_softplus
+from tpen.nn.structured_curvature import (
+    active_structured_curvature_session,
+    softplus_derivative,
+)
 
 torch = require_torch(feature="TPEN cusp modules")
 nn = require_torch_nn(feature="TPEN cusp modules")
@@ -877,7 +881,62 @@ class ElectronNucleusCusp(LogAmplitudeFactor):
             raise ValueError(
                 f"{type(self.law).__name__}.value must have shape {tuple(distance.shape)}, got {tuple(value.shape)}"
             )
+        session = active_structured_curvature_session()
+        if session is not None:
+            self._record_structured_curvature(distance, charges, session)
         return value.sum(dim=(1, 2))
+
+    def _record_structured_curvature(
+        self,
+        distance: torch.Tensor,
+        charges: torch.Tensor,
+        session,
+    ) -> None:
+        """Record exact per-sample scores for trainable electron-nucleus cusp laws."""
+
+        law = self.law
+        if isinstance(law, CurvatureElectronNucleusCuspLaw) and law.trainable:
+            d_s = distance.detach().to(dtype=session.solve_dtype)
+            c = law.curvature_coefficient.detach().to(device=d_s.device, dtype=session.solve_dtype)
+            r_param = law.curvature_range.detach().to(device=d_s.device, dtype=session.solve_dtype)
+            raw_r = law.raw_curvature_range.detach().to(device=d_s.device, dtype=session.solve_dtype)
+            denom = 1.0 + r_param * d_s
+            params: list[nn.Parameter] = []
+            cols: list[torch.Tensor] = []
+            if law.raw_curvature_coefficient.requires_grad:
+                params.append(law.raw_curvature_coefficient)
+                cols.append((d_s.square() / denom).sum(dim=(1, 2)))
+            if law.raw_curvature_range.requires_grad:
+                params.append(law.raw_curvature_range)
+                cols.append((-c * d_s.pow(3) / denom.square()).sum(dim=(1, 2)) * softplus_derivative(raw_r))
+            if params:
+                session.record_local_dense_scores(
+                    parameters=params,
+                    scores=torch.stack(cols, dim=1),
+                    label="CurvatureElectronNucleusCuspLaw",
+                )
+        elif isinstance(law, TailSafeElectronNucleusCuspLaw) and law.trainable:
+            d_s = distance.detach().to(dtype=session.solve_dtype)
+            z_s = charges.detach().to(device=d_s.device, dtype=session.solve_dtype)
+            r_param = law.curvature_range.detach().to(device=d_s.device, dtype=session.solve_dtype)
+            kappa = law.tail_slope_magnitude.detach().to(device=d_s.device, dtype=session.solve_dtype)
+            raw_r = law.raw_range.detach().to(device=d_s.device, dtype=session.solve_dtype)
+            raw_k = law.raw_kappa.detach().to(device=d_s.device, dtype=session.solve_dtype)
+            denom = 1.0 + r_param * d_s
+            params = []
+            cols = []
+            if law.raw_range.requires_grad:
+                params.append(law.raw_range)
+                cols.append(((z_s - kappa) * d_s.square() / denom.square()).sum(dim=(1, 2)) * softplus_derivative(raw_r))
+            if law.raw_kappa.requires_grad:
+                params.append(law.raw_kappa)
+                cols.append((-r_param * d_s.square() / denom).sum(dim=(1, 2)) * softplus_derivative(raw_k))
+            if params:
+                session.record_local_dense_scores(
+                    parameters=params,
+                    scores=torch.stack(cols, dim=1),
+                    label="TailSafeElectronNucleusCuspLaw",
+                )
 
     def analytic_evaluation(self, batch: ElectronBatch) -> ElectronNucleusCuspEvaluation:
         """Return opt-in closed-form radial data for local-energy consumers.
@@ -1047,12 +1106,33 @@ class ElectronElectronCusp(Envelope, LogAmplitudeFactor):
             scalars["raw_opposite_range"] = float(self.raw_opposite_range.item())
         return scalars
 
+    def _record_disabled_structured_curvature(self, flat_batch: ElectronBatch, session) -> None:
+        if not self.trainable_range:
+            return
+        trainable = [
+            param
+            for param in (self.raw_same_range, self.raw_opposite_range)
+            if param.requires_grad
+        ]
+        if trainable:
+            zeros = torch.zeros(
+                (flat_batch.batch_size, len(trainable)),
+                device=trainable[0].device,
+                dtype=session.solve_dtype,
+            )
+            session.record_local_dense_scores(
+                parameters=trainable,
+                scores=zeros,
+                label="ElectronElectronCusp",
+            )
+
     def envelope_value(self, batch: ElectronBatch) -> torch.Tensor:
         """Return the electron-electron cusp contribution."""
 
         distances = pairwise_distances(batch.positions, eps=self.eps).squeeze(-1)
         assert distances.shape == (batch.batch_size, batch.n_electrons, batch.n_electrons)
         tri = torch.triu(torch.ones_like(distances, dtype=torch.bool), diagonal=1)
+        same_spin: torch.Tensor | None = None
         if batch.spins is None:
             contribution = rational_pair_cusp(distances, self.spinless_coefficient, self.same_range_parameter)
         else:
@@ -1070,6 +1150,48 @@ class ElectronElectronCusp(Envelope, LogAmplitudeFactor):
             )
             contribution = rational_pair_cusp(distances, coefficients, ranges)
         output = contribution.masked_fill(~tri, 0.0).sum(dim=(1, 2))
+        session = active_structured_curvature_session()
+        if session is not None and self.trainable_range:
+            d_s = distances.detach().to(dtype=session.solve_dtype)
+            r_same = self.same_range_parameter.detach().to(device=d_s.device, dtype=session.solve_dtype)
+            raw_same = self.raw_same_range.detach().to(device=d_s.device, dtype=session.solve_dtype)
+            r_opp = self.opposite_range_parameter.detach().to(device=d_s.device, dtype=session.solve_dtype)
+            raw_opp = self.raw_opposite_range.detach().to(device=d_s.device, dtype=session.solve_dtype)
+            if same_spin is None:
+                same_col = (
+                    (-self.spinless_coefficient * d_s.square() / (1.0 + r_same * d_s).square())
+                    .masked_fill(~tri, 0.0)
+                    .sum(dim=(1, 2))
+                    * softplus_derivative(raw_same)
+                )
+                opp_col = torch.zeros_like(same_col)
+            else:
+                same_col = (
+                    (-self.same_spin_coefficient * d_s.square() / (1.0 + r_same * d_s).square())
+                    .masked_fill(~(tri & same_spin), 0.0)
+                    .sum(dim=(1, 2))
+                    * softplus_derivative(raw_same)
+                )
+                opp_col = (
+                    (-self.opposite_spin_coefficient * d_s.square() / (1.0 + r_opp * d_s).square())
+                    .masked_fill(~(tri & ~same_spin), 0.0)
+                    .sum(dim=(1, 2))
+                    * softplus_derivative(raw_opp)
+                )
+            params: list[nn.Parameter] = []
+            cols: list[torch.Tensor] = []
+            if self.raw_same_range.requires_grad:
+                params.append(self.raw_same_range)
+                cols.append(same_col)
+            if self.raw_opposite_range.requires_grad:
+                params.append(self.raw_opposite_range)
+                cols.append(opp_col)
+            if params:
+                session.record_local_dense_scores(
+                    parameters=params,
+                    scores=torch.stack(cols, dim=1),
+                    label="ElectronElectronCusp",
+                )
         assert output.shape == (batch.batch_size,)
         return output
 

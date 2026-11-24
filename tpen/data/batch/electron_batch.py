@@ -387,4 +387,39 @@ def slice_flat_batch(batch: ElectronBatch, start: int, end: int) -> ElectronBatc
     )
 
 
-__all__ = ["ElectronBatch", "slice_flat_batch"]
+def select_flat_batch_mask(batch: ElectronBatch, mask: torch.Tensor) -> ElectronBatch:
+    """Select rows of a flattened electron batch with a 1D boolean mask."""
+
+    if not isinstance(mask, torch.Tensor) or mask.dtype is not torch.bool or mask.ndim != 1:
+        raise ValueError("select_flat_batch_mask requires a 1D boolean torch.Tensor mask")
+    if int(mask.shape[0]) != batch.batch_size:
+        raise ValueError(
+            f"select_flat_batch_mask mask length {mask.shape[0]} disagrees with batch_size={batch.batch_size}"
+        )
+    mask = mask.to(device=batch.device)
+    positions = batch.positions[mask]
+    spins = None if batch.spins is None else batch.spins[mask]
+    nuclear_positions = batch.nuclear_positions
+    if nuclear_positions is not None and nuclear_positions.ndim == 3 and nuclear_positions.shape[0] == batch.batch_size:
+        nuclear_positions = nuclear_positions[mask]
+    nuclear_charges = batch.nuclear_charges
+    if nuclear_charges is not None and nuclear_charges.ndim == 2 and nuclear_charges.shape[0] == batch.batch_size:
+        nuclear_charges = nuclear_charges[mask]
+    aux: dict[str, Any] = {}
+    for key, value in batch.aux.items():
+        if isinstance(value, torch.Tensor) and value.shape[:1] == (batch.batch_size,):
+            aux[key] = value[mask.to(device=value.device)]
+        else:
+            aux[key] = value
+    return ElectronBatch(
+        positions=positions,
+        system=batch.system,
+        nuclear_positions=nuclear_positions,
+        nuclear_charges=nuclear_charges,
+        atomic_configuration=batch.atomic_configuration,
+        spins=spins,
+        aux=aux,
+    )
+
+
+__all__ = ["ElectronBatch", "select_flat_batch_mask", "slice_flat_batch"]
