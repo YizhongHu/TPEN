@@ -321,7 +321,11 @@ def _real_restart_child() -> None:
 def _run_real_restart_child(payload: dict[str, object]) -> dict[str, object]:
     """Launch one real phase and return its final JSON result."""
 
-    argument_path = Path(str(payload["row_path"])).with_suffix(".args.json")
+    row_path = Path(str(payload["row_path"]))
+    phase = str(payload["phase"])
+    argument_path = row_path.with_name(f"{row_path.stem}.{phase}.args.json")
+    stdout_path = row_path.with_name(f"{row_path.stem}.{phase}.stdout")
+    stderr_path = row_path.with_name(f"{row_path.stem}.{phase}.stderr")
     argument_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
     completed = subprocess.run(
         [
@@ -338,7 +342,13 @@ def _run_real_restart_child(payload: dict[str, object]) -> dict[str, object]:
         capture_output=True,
         check=False,
     )
-    assert completed.returncode == 0, completed.stderr
+    stdout_path.write_text(completed.stdout, encoding="utf-8")
+    stderr_path.write_text(completed.stderr, encoding="utf-8")
+    assert completed.returncode == 0, (
+        f"{phase} child exited {completed.returncode}; "
+        f"stdout={stdout_path}\n{completed.stdout}\n"
+        f"stderr={stderr_path}\n{completed.stderr}"
+    )
     return json.loads(completed.stdout.strip().splitlines()[-1])
 
 
@@ -365,7 +375,15 @@ def test_real_fresh_process_restore_parity_with_checkpoint_zero_and_overlay(
     assert fresh_result == {"outcome": "planned_yield", "exit_code": 2}
 
     resumed_result = _run_real_restart_child({**fresh_payload, "phase": "resumed"})
-    assert resumed_result == {"outcome": "completed", "exit_code": 0}
+    if resumed_result != {"outcome": "completed", "exit_code": 0}:
+        resumed_stderr = resumed_row_path.with_name("resumed-row.resumed.stderr")
+        resumed_stdout = resumed_row_path.with_name("resumed-row.resumed.stdout")
+        pytest.fail(
+            "resumed child did not complete:\n"
+            f"result={resumed_result!r}\n"
+            f"stdout_path={resumed_stdout}\n{resumed_stdout.read_text(encoding='utf-8')}\n"
+            f"stderr_path={resumed_stderr}\n{resumed_stderr.read_text(encoding='utf-8')}"
+        )
 
     reference_row = _real_restart_row(tmp_path / "reference", run_id="train-lineage-reference")
     reference_row_path = tmp_path / "reference-row.json"
