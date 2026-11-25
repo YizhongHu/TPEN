@@ -129,7 +129,7 @@ class _DisabledScope(AbstractContextManager[None]):
 class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
     """Invocation-local backend and range state."""
 
-    def __init__(self, callback: "NativeProfiler", context: RunContext) -> None:
+    def __init__(self, callback: "NativeProfiler", context: Any) -> None:
         self.callback = callback
         self.context = context
         self.backend: Any = None
