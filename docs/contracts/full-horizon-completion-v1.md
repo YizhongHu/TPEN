@@ -149,7 +149,10 @@ This is an upgrade/no-backfill boundary: a pre-PR completed attempt without a
 durable task-spec snapshot, start provenance, or required successor ledger is
 not backfilled into a completion record. A later fresh start may create these
 facts for its own attempt; absence of trusted final-path facts remains absence
-of completion.
+of completion. `begin_admitted_successor` may repair a missing ADMITTED
+provenance record from the validated durable admission when the current pointer
+already names the successor, but completion never backfills and a chain without
+a proven fresh root refuses.
 
 Write-once serialization is process-level: the writer holds the task's POSIX
 `lockf` advisory lock while reading, comparing, and publishing. Threads in one

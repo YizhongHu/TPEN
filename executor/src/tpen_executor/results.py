@@ -31,6 +31,22 @@ PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE = (
 PLACEMENT_NOT_SAMPLED_MESSAGE = (
     "GPU PLACEMENT NOT-SAMPLED: L1a intentionally does not sample devices; H-v2 performs its own delivered-GPU check."
 )
+
+
+def canonical_completed_at(value: str) -> str:
+    """Render a timezone-bearing UTC timestamp in the completion wire form."""
+
+    if type(value) is not str:
+        raise ValueError("completed_at must be a string")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("completed_at must be an ISO-8601 UTC timestamp") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise ValueError("completed_at must be a UTC timestamp")
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 # Declared-GPU v3 receipt warnings by reason class (mirrored by P8).  A v3
 # ``not-sampled`` receipt exists only for CPU-only slots, which carry no warning.
 PLACEMENT_V3_WARNINGS = {
@@ -510,12 +526,9 @@ class FullHorizonCompletionRecord:
         content_id = sha256_text(self.final_checkpoint["content_id"], "final_checkpoint.content_id")
         object.__setattr__(self, "final_checkpoint", _freeze({"path": path, "content_id": content_id}, "final_checkpoint"))
         object.__setattr__(self, "completed_at", text(self.completed_at, "completed_at"))
-        try:
-            parsed_completed_at = datetime.fromisoformat(self.completed_at.replace("Z", "+00:00"))
-        except ValueError as error:
-            raise ValueError("completed_at must be an ISO-8601 UTC timestamp") from error
-        if not self.completed_at.endswith("Z") or parsed_completed_at.tzinfo is None or parsed_completed_at.utcoffset() != timezone.utc.utcoffset(parsed_completed_at):
-            raise ValueError("completed_at must be a UTC timestamp ending in Z")
+        canonical_completed = canonical_completed_at(self.completed_at)
+        if self.completed_at != canonical_completed:
+            raise ValueError("completed_at must use canonical UTC rendering")
         object.__setattr__(self, "core_acceptance_digest", sha256_text(self.core_acceptance_digest, "core_acceptance_digest"))
         links = sequence(self.attempt_chain, "attempt_chain")
         normalized_links: list[Mapping[str, str]] = []
@@ -604,6 +617,8 @@ class FullHorizonCompletionRecord:
     @classmethod
     def decode(cls, data: bytes | str | dict[str, Any]) -> "FullHorizonCompletionRecord":
         record = cls.from_mapping(decode_json(data))
+        if isinstance(data, str):
+            data = data.encode("utf-8")
         if isinstance(data, bytes) and data != record.encode():
             raise ValueError("full-horizon completion record is not canonical")
         return record

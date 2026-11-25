@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
 from collections.abc import Mapping
-from datetime import datetime, timezone
 import fcntl
 import json
 import os
@@ -21,6 +20,7 @@ from .contracts import AllocationId, AttemptId, BackendJobId, GroupId, Invocatio
 from .results import (
     AcceptedSegment, CoreOutcomeRecord, FullHorizonCompletionRecord, ManifestAttempt, OutcomeReceipt, PLACEMENT_RECEIPT_TYPES, RemoteTeardownReceipt, RunManifest,
     SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3, StartProvenanceV1, StartReceipt,
+    canonical_completed_at,
     SuccessorAdmissionRecord, MemberPublicationV2, ReconciliationPublicationV2, decode_placement_receipt,
 )
 from .runners import CoreRunEvidence, EvidenceUnavailable
@@ -341,15 +341,12 @@ def _require_regular(path: str, name: str, error_type: type[Exception] = FenceRe
 
 def _canonical_completed_at(value: str) -> str:
     """Render a durable UTC outcome timestamp in the completion wire form."""
-    if type(value) is not str:
-        raise FenceRejected("final outcome timestamp is invalid")
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return canonical_completed_at(value)
     except ValueError as error:
+        if "UTC" in str(error):
+            raise FenceRejected("final outcome timestamp must be UTC") from error
         raise FenceRejected("final outcome timestamp is invalid") from error
-    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
-        raise FenceRejected("final outcome timestamp must be UTC")
-    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 @contextmanager

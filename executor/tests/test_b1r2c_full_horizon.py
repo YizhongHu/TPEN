@@ -136,9 +136,23 @@ MUTANTS = (
     {
         "id": "full-horizon-record-requires-canonical-bytes",
         "target": "executor/src/tpen_executor/results.py",
-        "old": "isinstance(data, bytes) and data != record.encode()",
+        "old": "data != record.encode()",
         "new": "False",
         "killer": "test_full_horizon_decode_rejects_noncanonical_bytes",
+    },
+    {
+        "id": "full-horizon-record-requires-canonical-string-input",
+        "target": "executor/src/tpen_executor/results.py",
+        "old": "isinstance(data, str)",
+        "new": "False",
+        "killer": "test_full_horizon_decode_rejects_noncanonical_bytes",
+    },
+    {
+        "id": "full-horizon-record-requires-canonical-completed-at",
+        "target": "executor/src/tpen_executor/results.py",
+        "old": "self.completed_at != canonical_completed",
+        "new": "False",
+        "killer": "test_completed_at_requires_canonical_rendering",
     },
     {
         "id": "full-horizon-record-rejects-disconnected-chain",
@@ -208,6 +222,8 @@ MUTANT_GUARDS = {
     "full-horizon-requires-successor-task-identity": "successor task identity",
     "full-horizon-record-rejects-cycles": "single visited-node path",
     "full-horizon-record-requires-canonical-bytes": "canonical completion bytes",
+    "full-horizon-record-requires-canonical-string-input": "canonical string completion bytes",
+    "full-horizon-record-requires-canonical-completed-at": "canonical completed_at rendering",
     "full-horizon-record-rejects-disconnected-chain": "continuous completion chain",
     "full-horizon-refuses-omitted-admission-history": "all admission history is present",
     "full-horizon-refuses-omitted-earliest-admission": "earliest admission is present",
@@ -245,6 +261,7 @@ INTENDED_ASSERTION_TRACES = {
     "test_completed_at_rejects_non_utc_or_naive": (
         "typed completed verdict", "durable core outcome", "canonical completed_at UTC validation",
     ),
+    "test_completed_at_requires_canonical_rendering": ("record completed_at canonical rendering",),
     "test_successor_request_digest_is_checked": ("typed completed verdict", "durable core outcome", "request digest recomputation"),
     "test_successor_target_horizon_is_checked": ("typed completed verdict", "durable core outcome", "fixed total horizon"),
     "test_checkpoint_counters_are_checked": ("typed completed verdict", "durable core outcome", "checkpoint counter agreement"),
@@ -375,6 +392,26 @@ def test_completed_at_rejects_non_utc_or_naive(tmp_path: Path, finished_at_utc: 
     with pytest.raises(FenceRejected, match="final outcome timestamp must be UTC"):
         _publish(store, group, fence, verdict, task)
     assert not (Path(store.root) / "groups" / group.identity / task.task_id / "full-horizon-completion.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("completed_at", "valid"),
+    (
+        ("2026-11-25T14:01:00Z", False),
+        ("2026-11-25T14:01:00.1Z", False),
+        ("2026-11-25T14:01:00.100000Z", True),
+    ),
+)
+def test_completed_at_requires_canonical_rendering(tmp_path: Path, completed_at: str, valid: bool) -> None:
+    store, group, fence, verdict, task = _single_fixture(tmp_path)
+    record = _publish(store, group, fence, verdict, task)
+    payload = record.to_dict()
+    payload["completed_at"] = completed_at
+    if valid:
+        assert FullHorizonCompletionRecord.from_mapping(payload).completed_at == completed_at
+    else:
+        with pytest.raises(ValueError, match="canonical UTC rendering"):
+            FullHorizonCompletionRecord.from_mapping(payload)
 
 
 def test_completion_refusal_is_side_effect_only() -> None:
@@ -591,11 +628,17 @@ def test_full_horizon_decode_rejects_cycle(tmp_path: Path) -> None:
         FullHorizonCompletionRecord.decode(canonical_bytes(payload))
 
 
-def test_full_horizon_decode_rejects_noncanonical_bytes(tmp_path: Path) -> None:
+@pytest.mark.parametrize("as_text", (False, True))
+def test_full_horizon_decode_rejects_noncanonical_bytes(tmp_path: Path, as_text: bool) -> None:
     store, group, fence, verdict, task = _single_fixture(tmp_path)
     record = _publish(store, group, fence, verdict, task)
+    noncanonical = json.dumps(record.to_dict()).encode("utf-8")
+    noncanonical_input = noncanonical.decode("utf-8") if as_text else noncanonical
     with pytest.raises(ValueError, match="not canonical"):
-        FullHorizonCompletionRecord.decode(json.dumps(record.to_dict()).encode("utf-8"))
+        FullHorizonCompletionRecord.decode(noncanonical_input)
+    canonical = record.encode()
+    canonical_input = canonical.decode("utf-8") if as_text else canonical
+    assert FullHorizonCompletionRecord.decode(canonical_input) == record
 
 
 def test_full_horizon_decode_rejects_disconnected_chain(tmp_path: Path) -> None:
