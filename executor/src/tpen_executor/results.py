@@ -405,6 +405,7 @@ class SuccessorAdmissionRecord:
 
     schema: ClassVar[str] = "tpen-executor/successor-admission-v1"
     schema_v2: ClassVar[str] = "tpen-executor/successor-admission-v2"
+    schema_v3: ClassVar[str] = "tpen-executor/successor-admission-v3"
     predecessor_task_id: str
     predecessor_attempt_id: AttemptId
     predecessor_content_id: str
@@ -413,6 +414,8 @@ class SuccessorAdmissionRecord:
     request_digest: str
     core_acceptance_digest: str
     successor_binding: Any = None
+    recovery_admission: Any = None
+    successor_request: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "predecessor_task_id", text(self.predecessor_task_id, "predecessor_task_id"))
@@ -430,6 +433,20 @@ class SuccessorAdmissionRecord:
             if (self.successor_binding.task_id != self.successor_task_id
                     or self.successor_binding.attempt_id != self.successor_attempt_id):
                 raise ValueError("successor binding crosses admission identity")
+        if self.recovery_admission is not None:
+            from .recovery import RecoveryAdmissionV1
+
+            if not isinstance(self.recovery_admission, RecoveryAdmissionV1):
+                raise TypeError("recovery_admission must be RecoveryAdmissionV1")
+            if self.recovery_admission.status != "admitted":
+                raise ValueError("parked recovery admission cannot be linked")
+            if (self.recovery_admission.predecessor_attempt_id != self.predecessor_attempt_id
+                    or self.recovery_admission.successor_attempt_id != self.successor_attempt_id):
+                raise ValueError("recovery admission crosses successor identity")
+        if self.successor_request is not None:
+            if not isinstance(self.successor_request, Mapping):
+                raise TypeError("successor_request must be a mapping")
+            object.__setattr__(self, "successor_request", _freeze(self.successor_request))
 
     @property
     def predecessor(self) -> dict[str, Any]:
@@ -439,7 +456,15 @@ class SuccessorAdmissionRecord:
             "task_id": self.predecessor_task_id,
             "attempt_id": self.predecessor_attempt_id.value,
             "content_id": self.predecessor_content_id,
+            **({"checkpoint_path": self.recovery_admission.checkpoint_path}
+               if self.recovery_admission is not None else {}),
         }
+
+    @property
+    def checkpoint_path(self) -> str | None:
+        """Return the admitted checkpoint without parsing a path string."""
+
+        return None if self.recovery_admission is None else self.recovery_admission.checkpoint_path
 
     @property
     def successor(self) -> dict[str, str]:
@@ -449,7 +474,10 @@ class SuccessorAdmissionRecord:
 
     def to_dict(self) -> dict[str, Any]:
         result = {
-            "schema": self.schema if self.successor_binding is None else self.schema_v2,
+            "schema": (
+                self.schema_v3 if self.recovery_admission is not None
+                else self.schema if self.successor_binding is None else self.schema_v2
+            ),
             "predecessor": self.predecessor,
             "successor": self.successor,
             "request_digest": self.request_digest,
@@ -457,6 +485,9 @@ class SuccessorAdmissionRecord:
         }
         if self.successor_binding is not None:
             result["successor_binding"] = self.successor_binding.to_dict()
+        if self.recovery_admission is not None:
+            result["recovery_admission"] = self.recovery_admission.to_dict()
+            result["successor_request"] = None if self.successor_request is None else thaw(self.successor_request)
         return result
 
     def encode(self) -> bytes:
@@ -468,21 +499,36 @@ class SuccessorAdmissionRecord:
 
         keys = {"schema", "predecessor", "successor", "request_digest", "core_acceptance_digest"}
         binding = None
+        recovery_admission = None
+        successor_request = None
         if isinstance(data, Mapping) and data.get("schema") == cls.schema_v2:
             fields(data, keys | {"successor_binding"}, cls.schema_v2, cls.__name__)
             binding = MemberInvocationV2.from_mapping(data["successor_binding"])
+        elif isinstance(data, Mapping) and data.get("schema") == cls.schema_v3:
+            fields(data, keys | {"successor_binding", "recovery_admission", "successor_request"}, cls.schema_v3, cls.__name__)
+            binding = MemberInvocationV2.from_mapping(data["successor_binding"])
+            from .recovery import RecoveryAdmissionV1
+
+            recovery_admission = RecoveryAdmissionV1.from_mapping(data["recovery_admission"])
+            successor_request = data["successor_request"]
         else:
             fields(data, keys, cls.schema, cls.__name__)
-        if not isinstance(data["predecessor"], Mapping) or set(data["predecessor"]) != {"task_id", "attempt_id", "content_id"}:
+        predecessor_keys = {"task_id", "attempt_id", "content_id"}
+        if recovery_admission is not None:
+            predecessor_keys.add("checkpoint_path")
+        if not isinstance(data["predecessor"], Mapping) or set(data["predecessor"]) != predecessor_keys:
             raise ValueError("SuccessorAdmissionRecord.predecessor keys differ")
         if not isinstance(data["successor"], Mapping) or set(data["successor"]) != {"task_id", "attempt_id"}:
             raise ValueError("SuccessorAdmissionRecord.successor keys differ")
         if any(type(data[key]) is not str for key in ("request_digest", "core_acceptance_digest")):
             raise TypeError("successor admission digests must be text")
-        if any(type(data["predecessor"][key]) is not str for key in ("task_id", "attempt_id", "content_id")):
+        if any(type(data["predecessor"][key]) is not str for key in predecessor_keys):
             raise TypeError("successor admission predecessor fields must be text")
         if any(type(data["successor"][key]) is not str for key in ("task_id", "attempt_id")):
             raise TypeError("successor admission successor fields must be text")
+        if (recovery_admission is not None
+                and data["predecessor"]["checkpoint_path"] != recovery_admission.checkpoint_path):
+            raise ValueError("SuccessorAdmissionRecord checkpoint path crosses recovery admission")
         return cls(
             data["predecessor"]["task_id"],
             AttemptId(data["predecessor"]["attempt_id"]),
@@ -492,6 +538,35 @@ class SuccessorAdmissionRecord:
             data["request_digest"],
             data["core_acceptance_digest"],
             binding,
+            recovery_admission,
+            successor_request,
+        )
+
+    @classmethod
+    def from_recovery_admission(
+        cls,
+        admission: Any,
+        *,
+        predecessor_task_id: str,
+        predecessor_content_id: str,
+        successor_task_id: str,
+        request_digest: str,
+        core_acceptance_digest: str,
+        successor_binding: Any,
+        successor_request: Mapping[str, Any] | None = None,
+    ) -> "SuccessorAdmissionRecord":
+        """Build the v3 link directly from the admitted R2 decision."""
+
+        from .recovery import RecoveryAdmissionV1
+
+        if not isinstance(admission, RecoveryAdmissionV1) or admission.status != "admitted":
+            raise ValueError("an admitted RecoveryAdmissionV1 is required")
+        if admission.successor_attempt_id is None:
+            raise ValueError("admitted recovery must name a successor")
+        return cls(
+            predecessor_task_id, admission.predecessor_attempt_id, predecessor_content_id,
+            successor_task_id, admission.successor_attempt_id, request_digest,
+            core_acceptance_digest, successor_binding, admission, successor_request,
         )
 
     @classmethod
@@ -1623,8 +1698,10 @@ class MemberPublicationV2:
         if self.reconciliation.action == "admit_successor":
             if not isinstance(self.admission, SuccessorAdmissionRecord) or self.admission.successor_binding is None:
                 raise ValueError("successor outcome requires a bound admission ledger")
-            if (self.admission.predecessor_task_id != self.evidence.task_id
-                    or self.admission.predecessor_attempt_id != self.evidence.attempt_id):
+            if self.admission.predecessor_task_id != self.evidence.task_id:
+                raise ValueError("publication crosses predecessor admission")
+            if (self.admission.recovery_admission is None
+                    and self.admission.predecessor_attempt_id != self.evidence.attempt_id):
                 raise ValueError("publication crosses predecessor admission")
         elif self.admission is not None:
             raise ValueError("non-successor outcome cannot carry admission")

@@ -128,8 +128,11 @@ Schema id: `tpen-executor/recovery-admission-v1`.
 | `grant_id` | non-empty grant id when present; `null` only without a grant |
 
 The admission record exposes `predecessor_attempt_id` and `checkpoint_path` as
-typed fields. Linked-result exposure of those fields is pending B1-R2B
-(4464489c); consumers do not parse path strings to recover lineage.
+typed fields. B1-R2B publishes these same fields through the versioned linked
+result `tpen-executor/successor-admission-v3`; consumers read the typed fields
+and do not parse path strings to recover lineage. The v3 record also carries
+the admitted R2 decision and the canonical successor request so C1 can read an
+unplanned-end admission without fabricating a core outcome.
 
 ## Admission predicate
 

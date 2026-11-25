@@ -917,6 +917,7 @@ class DirectoryStore:
         *,
         bindings: Mapping[str, MemberInvocationV2],
         successors: Mapping[str, tuple[Mapping[str, Any], str, MemberInvocationV2]] | None = None,
+        recovery_admissions: Mapping[str, Any] | None = None,
     ):
         """Publish one fake-core reconciliation, never launch or restore work.
 
@@ -942,11 +943,13 @@ class DirectoryStore:
             ))
 
         successors = {} if successors is None else dict(successors)
+        recovery_admissions = {} if recovery_admissions is None else dict(recovery_admissions)
         by_task = {item.task_id: item for item in inputs}
         expected = {member.task_id for member in group.members}
         if (allocation_attempt.group_id != group.group_id or set(by_task) != expected
                 or set(bindings) != {item.task_id for item in inputs if item.start_receipt is not None}
-                or set(successors) != {member.task_id for member in result.members if member.action == "admit_successor"}):
+                or set(successors) != {member.task_id for member in result.members if member.action == "admit_successor"}
+                or not set(recovery_admissions).issubset(set(successors))):
             return park("crossed-reconciliation-input")
         # Missing or untrusted core evidence cannot create even an admission
         # intent. Unknown but well-formed core outcomes may be durably parked.
@@ -967,12 +970,27 @@ class DirectoryStore:
                 if member.action == "admit_successor":
                     request, acceptance, successor = successors[member.task_id]
                     request = self._successor_request_shape(request)
-                    admission = SuccessorAdmissionRecord(
-                        member.task_id, member.attempt_id,
-                        request["core_evidence"]["checkpoint_ref"]["content_id"],
-                        request["successor"]["task_id"], AttemptId(request["successor"]["attempt_id"]),
-                        digest(request), acceptance, successor,
+                    recovery_admission = recovery_admissions.get(member.task_id) or getattr(
+                        by_task[member.task_id], "recovery_admission", None
                     )
+                    predecessor_content_id = request["core_evidence"]["checkpoint_ref"]["content_id"]
+                    if recovery_admission is None:
+                        admission = SuccessorAdmissionRecord(
+                            member.task_id, member.attempt_id, predecessor_content_id,
+                            request["successor"]["task_id"], AttemptId(request["successor"]["attempt_id"]),
+                            digest(request), acceptance, successor,
+                        )
+                    else:
+                        admission = SuccessorAdmissionRecord.from_recovery_admission(
+                            recovery_admission,
+                            predecessor_task_id=member.task_id,
+                            predecessor_content_id=predecessor_content_id,
+                            successor_task_id=request["successor"]["task_id"],
+                            request_digest=digest(request),
+                            core_acceptance_digest=acceptance,
+                            successor_binding=successor,
+                            successor_request=request,
+                        )
                 proposed.append(MemberPublicationV2(by_task[member.task_id], member, bindings.get(member.task_id), admission))
             candidate = ReconciliationPublicationV2(group, allocation_attempt, tuple(proposed))
             _ensure_directory(self.root)
@@ -1040,6 +1058,7 @@ class DirectoryStore:
                     actual = self.record_successor_admission(
                         fences[member.evidence.task_id], request, acceptance,
                         predecessor_binding=member.binding, successor_binding=successor,
+                        recovery_admission=recovery_admissions.get(member.evidence.task_id),
                     )
                     if actual.encode() != member.admission.encode():
                         raise FenceRejected("crossed-successor-admission")
@@ -1563,6 +1582,7 @@ class DirectoryStore:
         *,
         predecessor_binding: MemberInvocationV2 | None = None,
         successor_binding: MemberInvocationV2 | None = None,
+        recovery_admission: Any | None = None,
     ) -> SuccessorAdmissionRecord:
         """Record a core-accepted successor request exactly once.
 
@@ -1579,25 +1599,55 @@ class DirectoryStore:
         sha256_text(core_acceptance_digest, "core_acceptance_digest")
         request = self._successor_request_shape(request)
         request_digest = digest(request)
-        built = self.build_successor_admission_request(
-            fence,
-            AttemptId(request["successor"]["attempt_id"]),
-            request["science_input_digest"],
-            request["target_iterations"],
-        )
-        task_dir = self._task_dir_for_fence(fence)
-        lock_path = os.path.join(task_dir, _TASK_LOCK)
-        _existing(lock_path, "task lock") if os.path.lexists(lock_path) else None
-        with _task_lock(lock_path):
-            start, record = self._continuation_predecessor_locked(fence, task_dir)
-            rebuilt = self._successor_request_from_record(
-                record,
+        built = None
+        if recovery_admission is None:
+            built = self.build_successor_admission_request(
+                fence,
                 AttemptId(request["successor"]["attempt_id"]),
                 request["science_input_digest"],
                 request["target_iterations"],
             )
-            if digest(rebuilt) != request_digest or rebuilt != request or digest(built) != request_digest:
-                raise FenceRejected("successor admission request does not match fenced core outcome")
+        task_dir = self._task_dir_for_fence(fence)
+        lock_path = os.path.join(task_dir, _TASK_LOCK)
+        _existing(lock_path, "task lock") if os.path.lexists(lock_path) else None
+        with _task_lock(lock_path):
+            if recovery_admission is None:
+                start, record = self._continuation_predecessor_locked(fence, task_dir)
+                rebuilt = self._successor_request_from_record(
+                    record,
+                    AttemptId(request["successor"]["attempt_id"]),
+                    request["science_input_digest"],
+                    request["target_iterations"],
+                )
+                if digest(rebuilt) != request_digest or rebuilt != request or digest(built) != request_digest:
+                    raise FenceRejected("successor admission request does not match fenced core outcome")
+            else:
+                from .recovery import RecoveryAdmissionV1
+
+                if not isinstance(recovery_admission, RecoveryAdmissionV1) or recovery_admission.status != "admitted":
+                    raise FenceRejected("recovery admission is not admitted")
+                # The controller fence is the live failed attempt; R2's
+                # selected checkpoint may be a distinct predecessor attempt.
+                self._validate_fence(fence, task_dir)
+                predecessor_dir = _lexical(os.path.join(task_dir, recovery_admission.predecessor_attempt_id.value))
+                predecessor_start_path = os.path.join(predecessor_dir, "start.json")
+                _require_regular(predecessor_start_path, "recovery predecessor start")
+                start = StartReceipt.decode(Path(predecessor_start_path).read_bytes())
+                if (start.task_id != fence.task_id
+                        or start.attempt_id != recovery_admission.predecessor_attempt_id
+                        or start.group_digest != fence.group_digest
+                        or start.output_dir != predecessor_dir
+                        or recovery_admission.successor_attempt_id.value != request["successor"]["attempt_id"]):
+                    raise FenceRejected("recovery admission crosses fenced request")
+                if predecessor_binding is not None and predecessor_binding.attempt_id != start.attempt_id:
+                    # The controller's live-attempt echo is not the selected
+                    # checkpoint predecessor.  Re-read the predecessor echo
+                    # from its own fenced leaf below.
+                    predecessor_binding = None
+                if predecessor_binding is None:
+                    predecessor_invocation_path = os.path.join(start.output_dir, "invocation.json")
+                    if os.path.lexists(predecessor_invocation_path):
+                        predecessor_binding = MemberInvocationV2.decode(Path(predecessor_invocation_path).read_bytes())
             if predecessor_binding is not None or successor_binding is not None:
                 if not isinstance(predecessor_binding, MemberInvocationV2) or not isinstance(successor_binding, MemberInvocationV2):
                     raise FenceRejected("both invocation bindings are required")
@@ -1612,20 +1662,32 @@ class DirectoryStore:
                     raise FenceRejected("successor binding is crossed or not fresh")
             elif os.path.lexists(os.path.join(start.output_dir, "invocation.json")):
                 raise FenceRejected("v2 predecessor requires successor invocation binding")
-            segment_path = os.path.join(_lexical(fence.output_dir), "segment.json")
+            segment_path = os.path.join(_lexical(start.output_dir), "segment.json")
             if os.path.lexists(segment_path):
                 raise FenceRejected("planned-yield admission cannot coexist with an accepted segment")
             successor = request["successor"]
-            record = SuccessorAdmissionRecord(
-                start.task_id,
-                start.attempt_id,
-                request["core_evidence"]["checkpoint_ref"]["content_id"],
-                successor["task_id"],
-                AttemptId(successor["attempt_id"]),
-                request_digest,
-                core_acceptance_digest,
-                successor_binding,
-            )
+            if recovery_admission is None:
+                record = SuccessorAdmissionRecord(
+                    start.task_id,
+                    start.attempt_id,
+                    request["core_evidence"]["checkpoint_ref"]["content_id"],
+                    successor["task_id"],
+                    AttemptId(successor["attempt_id"]),
+                    request_digest,
+                    core_acceptance_digest,
+                    successor_binding,
+                )
+            else:
+                record = SuccessorAdmissionRecord.from_recovery_admission(
+                    recovery_admission,
+                    predecessor_task_id=start.task_id,
+                    predecessor_content_id=request["core_evidence"]["checkpoint_ref"]["content_id"],
+                    successor_task_id=successor["task_id"],
+                    request_digest=request_digest,
+                    core_acceptance_digest=core_acceptance_digest,
+                    successor_binding=successor_binding,
+                    successor_request=request,
+                )
             ledger_dir = _lexical(os.path.join(task_dir, _SUCCESSOR_ADMISSIONS))
             _ensure_directory(ledger_dir)
             existing_records = self._admission_records_for_task(task_dir, start.task_id)
@@ -1986,11 +2048,14 @@ class DirectoryStore:
                 if len(matching) != 1:
                     raise ValueError("successor admission references an unknown predecessor attempt")
                 predecessor = matching[0]
-                if predecessor.core_outcome is None or predecessor.core_outcome.outcome != "planned_yield":
-                    raise ValueError("successor admission requires a planned-yield core outcome")
-                checkpoint_ref = predecessor.core_outcome.evidence.get("checkpoint_ref")
-                if not isinstance(checkpoint_ref, Mapping) or admission.predecessor_content_id != checkpoint_ref.get("content_id"):
-                    raise ValueError("successor admission content identity disagrees with core outcome")
+                if admission.recovery_admission is None:
+                    if predecessor.core_outcome is None or predecessor.core_outcome.outcome != "planned_yield":
+                        raise ValueError("successor admission requires a planned-yield core outcome")
+                    checkpoint_ref = predecessor.core_outcome.evidence.get("checkpoint_ref")
+                    if not isinstance(checkpoint_ref, Mapping) or admission.predecessor_content_id != checkpoint_ref.get("content_id"):
+                        raise ValueError("successor admission content identity disagrees with core outcome")
+                elif admission.recovery_admission.status != "admitted":
+                    raise ValueError("recovery successor admission is not admitted")
                 if any(segment.attempt_id == admission.predecessor_attempt_id for segment in segments):
                     raise ValueError("successor admission cannot coexist with an accepted segment")
                 admissions[key] = admission
@@ -2130,6 +2195,17 @@ def read_successor_admission(
                 record.predecessor_attempt_id,
                 predecessor_dir,
             )
+            # R2 v3 publications carry the exact producer request, so an
+            # interrupted/unplanned predecessor does not need a fabricated
+            # CoreOutcomeRecord for C1 to read the admitted link.
+            if record.recovery_admission is not None and record.successor_request is not None:
+                request = thaw(record.successor_request)
+                if digest(request) != record.request_digest:
+                    raise AdmissionIntentMismatch("successor admission intent does not match request digest")
+                if (request.get("science_input_digest") != science_input_digest
+                        or request.get("target_iterations") != target_iterations):
+                    raise AdmissionIntentMismatch("successor admission intent does not match caller intent")
+                return {"record": thaw(record.to_dict()), "request": request}
             try:
                 _, core_record = store._continuation_predecessor_locked(predecessor, task_dir, current=False)
             except _AdmissionCoreIdentityMismatch as error:

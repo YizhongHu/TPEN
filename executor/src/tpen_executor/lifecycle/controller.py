@@ -17,7 +17,7 @@ from uuid import uuid4
 from .._records import frozen_record
 from ..allocations import AllocationAttemptV2, ConfiguredAllocation, ControllerGenerationV1, MemberInvocationV2
 from ..contracts import AllocationAttemptId, BackendJobId, GroupId, InvocationId, ReadyGroupV2
-from ..recovery import CoreAdmissionPort, CoreAdmissionVerdictV2, GroupReconciliationV2, MemberRecoveryInputV2, reconcile_group
+from ..recovery import CoreAdmissionPort, CoreAdmissionVerdictV2, GroupReconciliationV2, MemberRecoveryInputV2, admit_recovery, reconcile_group
 from ..results import SuccessorAdmissionRecord
 from ..storage import AttemptFence, ControllerGenerationRejected, DirectoryStore, FenceRejected, LaunchIntentAbsent, LaunchIntentRejected
 
@@ -167,6 +167,22 @@ def _require_current_controller(store: DirectoryStore, group: ReadyGroupV2, cont
     store.require_current_controller(group, generation=controller.generation, nonce=controller.claimant_nonce)
 
 
+def _apply_recovery_admission(item: MemberRecoveryInputV2, store: DirectoryStore) -> MemberRecoveryInputV2:
+    """Evaluate real R2 facts against the live store root before reconcile."""
+
+    request = item.recovery_input
+    if request is None:
+        return item
+    admission = admit_recovery(
+        request.evidence,
+        request.successor_attempt_id,
+        now_utc=request.now_utc,
+        trusted_store_root=store.root,
+        existing_successors=request.existing_successors,
+    )
+    return replace(item, recovery_admission=admission)
+
+
 def run_group_controller(
     binding: Any,
     observed_job_id: BackendJobId,
@@ -215,12 +231,16 @@ def run_group_controller(
         frozen_inputs = []
         for item in facts.member_inputs:
             try:
-                verdict = admission_port.admit(item)
+                admitted_item = _apply_recovery_admission(item, store)
+                # R2 facts are the complete recovery decision.  The legacy
+                # core selector remains available only to legacy callers.
+                verdict = None if admitted_item.recovery_input is not None else admission_port.admit(admitted_item)
                 if verdict is not None and not isinstance(verdict, CoreAdmissionVerdictV2):
                     verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "malformed-core-admission")
             except Exception:
+                admitted_item = replace(item, recovery_admission=None)
                 verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "core-admission-unavailable")
-            frozen_inputs.append(replace(item, core_verdict=verdict))
+            frozen_inputs.append(replace(admitted_item, core_verdict=verdict))
         checked = reconcile_group(group, tuple(frozen_inputs))
     except Exception:
         return _park(group, "admission-port-failed")
@@ -232,6 +252,7 @@ def run_group_controller(
                 invocation_path = Path(item.start_receipt.output_dir) / "invocation.json"
                 bindings[item.task_id] = MemberInvocationV2.decode(invocation_path.read_bytes())
         successor_requests = {}
+        recovery_admissions = {}
         for task_id, (request, acceptance, proposed) in facts.successor_requests.items():
             if next(member.action for member in checked.members if member.task_id == task_id) != "admit_successor":
                 continue
@@ -240,10 +261,13 @@ def run_group_controller(
                 next(task.lineage_id for task in group.members if task.task_id == task_id),
                 proposed.attempt_id, InvocationId(uuid4().hex),
             ))
-        published = store.publish_reconciliation(
-            group, attempt, tuple(frozen_inputs), bindings=bindings,
-            successors=successor_requests,
-        )
+            member_input = next(item for item in frozen_inputs if item.task_id == task_id)
+            if member_input.recovery_admission is not None:
+                recovery_admissions[task_id] = member_input.recovery_admission
+        publication_kwargs = {"bindings": bindings, "successors": successor_requests}
+        if recovery_admissions:
+            publication_kwargs["recovery_admissions"] = recovery_admissions
+        published = store.publish_reconciliation(group, attempt, tuple(frozen_inputs), **publication_kwargs)
         if published.encode() != checked.encode():
             return _park(group, "reconciliation-publication-conflict")
         durable_publication = store.read_reconciliation(group, attempt)
@@ -449,7 +473,8 @@ def run_group_controller(
                 rebuilt = replace(item, attempt_id=record.attempt_id, start_receipt=record.start_receipt,
                                   outcome_receipt=record.outcome_receipt)
             try:
-                verdict = admission_port.admit(rebuilt)
+                rebuilt = _apply_recovery_admission(rebuilt, store)
+                verdict = None if rebuilt.recovery_input is not None else admission_port.admit(rebuilt)
                 if verdict is not None and not isinstance(verdict, CoreAdmissionVerdictV2):
                     verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "malformed-core-admission")
             except Exception:
