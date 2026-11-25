@@ -34,8 +34,8 @@ class _FixedTrajectorySampler:
             charges=torch.ones(1, dtype=positions.dtype),
         )
 
-    def collect_samples(self, model, *, reset: bool, device: torch.device):
-        del model, reset
+    def collect_samples(self, model, *, reset: bool = False, device: torch.device = "cpu", emitter=None):
+        del model, reset, emitter
         positions = self.positions.to(device)
         walkers = Walkers(
             positions=positions,

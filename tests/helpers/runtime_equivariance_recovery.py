@@ -75,8 +75,8 @@ class _Sampler:
     def __init__(self) -> None:
         self.marker = 7
 
-    def collect_samples(self, model, *, device=None):
-        del model, device
+    def collect_samples(self, model, *, reset=False, device=None, emitter=None):
+        del model, reset, device, emitter
         return _Walkers(), SamplerStats(
             acceptance_rate=1.0,
             n_walkers=2,

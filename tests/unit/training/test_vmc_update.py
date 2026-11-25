@@ -700,8 +700,8 @@ class _OneElectronWalkers:
 
 
 class _OneElectronSampler:
-    def collect_samples(self, model, *, device=None):
-        del model, device
+    def collect_samples(self, model, *, reset=False, device=None, emitter=None):
+        del model, reset, device, emitter
         return _OneElectronWalkers(), None
 
 

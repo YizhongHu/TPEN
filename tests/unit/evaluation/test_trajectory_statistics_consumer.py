@@ -121,8 +121,10 @@ class CorrelatedHeliumSampler:
         *,
         reset: bool = False,
         device: torch.device | str | None = None,
+        emitter=None,
     ) -> tuple[Walkers, SamplerStats]:
         self.call_count += 1
+        del emitter
         noise = 0.05 * torch.randn(
             self.positions.shape, generator=self.generator, dtype=torch.float64
         )

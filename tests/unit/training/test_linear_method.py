@@ -287,8 +287,15 @@ class _FixedSampler:
     def __init__(self, batch: ElectronBatch) -> None:
         self._batch = batch
 
-    def collect_samples(self, model: Any, *, device: Any = None):
-        del model, device
+    def collect_samples(
+        self,
+        model: Any,
+        *,
+        reset: bool = False,
+        device: Any = None,
+        emitter=None,
+    ):
+        del model, reset, device, emitter
         return _FixedWalkers(self._batch), None
 
 
@@ -1892,7 +1899,7 @@ def test_real_tiny_tpen_hamiltonian_tangent_central_finite_difference_parity() -
 
     model, sampler, terms = _instantiate_tiny_tpen(cfg, seed=19)
     pair_parameters_by_name(model)
-    walkers, _ = sampler.collect_samples(model)
+    walkers, _ = sampler.collect_samples(model, emitter=None)
     batch = walkers.make_batch()
 
     update_input, term_map = evaluate_hamiltonian_tangent_step(

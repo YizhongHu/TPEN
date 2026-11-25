@@ -132,8 +132,8 @@ class _FixedSampler:
         self._batch = batch
         self.collect_calls = 0
 
-    def collect_samples(self, model: Any, *, device: Any = None):
-        del model, device
+    def collect_samples(self, model: Any, *, reset: bool = False, device: Any = None, emitter=None):
+        del model, reset, device, emitter
         self.collect_calls += 1
         return _FixedWalkers(self._batch), None
 

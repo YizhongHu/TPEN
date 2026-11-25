@@ -170,8 +170,8 @@ class _OneElectronSampler:
     def __init__(self) -> None:
         self.calls = 0
 
-    def collect_samples(self, model, *, device=None):
-        del model, device
+    def collect_samples(self, model, *, reset=False, device=None, emitter=None):
+        del model, reset, device, emitter
         self.calls += 1
         batch = ElectronBatch(
             positions=torch.tensor([[[0.2]], [[0.8]], [[1.4]]], dtype=torch.float64),

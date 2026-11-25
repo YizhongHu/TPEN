@@ -13,6 +13,8 @@ from tpen.dependencies import require_torch, require_torch_nn
 from tpen.sampling.diagnostics import summarize_walker_geometry
 from tpen.sampling.moves import GaussianMove
 from tpen.sampling.stats import SamplerStats
+from tpen.events import EventEmitter
+from tpen.sampling.events import SamplerBurnIn, SamplerProduction
 
 torch = require_torch(feature="Metropolis sampling")
 nn = require_torch_nn(feature="Metropolis sampling")
@@ -379,6 +381,7 @@ class MetropolisSampler(nn.Module):
         *,
         reset: bool = False,
         device=None,
+        emitter: EventEmitter | None,
     ) -> tuple[Walkers, SamplerStats]:
         """Advance the persistent chain and draw production samples.
 
@@ -413,9 +416,17 @@ class MetropolisSampler(nn.Module):
             with torch.no_grad():
                 self._walkers = self._walkers.update_cache(model)
         if not self._has_burned_in and self.burn_in:
-            self._walkers = self.sample(model, self._walkers, self.burn_in)
+            if emitter is None:
+                self._walkers = self.sample(model, self._walkers, self.burn_in)
+            else:
+                with emitter.scope(SamplerBurnIn(n_steps=self.burn_in)):
+                    self._walkers = self.sample(model, self._walkers, self.burn_in)
             self._has_burned_in = True
-        self._walkers = self.sample(model, self._walkers, self.n_steps)
+        if emitter is None:
+            self._walkers = self.sample(model, self._walkers, self.n_steps)
+        else:
+            with emitter.scope(SamplerProduction(n_steps=self.n_steps)):
+                self._walkers = self.sample(model, self._walkers, self.n_steps)
         stats = SamplerStats(
             acceptance_rate=self.acceptance_rate,
             n_walkers=self._walkers.batch_size,

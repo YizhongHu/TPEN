@@ -16,6 +16,18 @@ from tpen.sampling.metropolis import MetropolisSampler
 from tpen.sampling.moves import GaussianMove
 
 
+@pytest.fixture(autouse=True)
+def _explicitly_disable_sampling_scopes(monkeypatch):
+    """Keep legacy direct-call tests on the contract's scopes-off path."""
+
+    original = MetropolisSampler.collect_samples
+
+    def collect_samples(self, model, *, reset=False, device=None, emitter=None):
+        return original(self, model, reset=reset, device=device, emitter=emitter)
+
+    monkeypatch.setattr(MetropolisSampler, "collect_samples", collect_samples)
+
+
 class ShiftMove(nn.Module):
     def propose(
         self,

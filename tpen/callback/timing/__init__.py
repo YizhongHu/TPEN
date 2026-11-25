@@ -24,6 +24,10 @@ def __getattr__(name: str) -> object:
         from .diagnostic_timing import DiagnosticTiming
 
         return DiagnosticTiming
+    if name == "SamplingScopeTiming":
+        from .sampling_timing import SamplingScopeTiming
+
+        return SamplingScopeTiming
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -34,4 +38,5 @@ __all__ = [
     "RunTiming",
     "TrainPhaseTiming",
     "TrainStepTiming",
+    "SamplingScopeTiming",
 ]

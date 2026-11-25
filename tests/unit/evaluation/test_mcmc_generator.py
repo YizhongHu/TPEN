@@ -13,7 +13,8 @@ from tpen.sampling import SamplerStats
 
 
 class RecordingSampler:
-    def collect_samples(self, model, *, device=None):
+    def collect_samples(self, model, *, reset=False, device=None, emitter=None):
+        del reset, emitter
         positions = torch.zeros(2, 1, 3, dtype=torch.float64)
         walkers = Walkers(positions=positions)
         stats = SamplerStats(
