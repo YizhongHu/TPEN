@@ -1565,6 +1565,18 @@ def _apply_attempt_delta_load(config: Any, delta: object | None) -> None:
     )
 
 
+def _apply_attempt_delta_route(config: Any, delta: object | None) -> None:
+    """Apply the one closed physical output route after config resolution."""
+
+    if delta is not None:
+        # train_config deliberately rejects resolver-owned run.dir overrides;
+        # this is the authenticated executor leaf allowance, applied only
+        # after the science configuration has been resolved.
+        OmegaConf.update(
+            config, "run.dir", str(getattr(delta, "attempt_core_dir")), merge=False
+        )
+
+
 def execute(
     args: argparse.Namespace,
     *,
@@ -1696,9 +1708,8 @@ def execute(
     if delta is not None:
         # The executor owns the physical leaf.  Keep the authenticated cell
         # identity intact and apply only the closed operational route overlay.
-        resolved = train_config.resolve_train_config(
-            packet, overrides={"run.dir": str(delta.attempt_core_dir)}
-        )
+        resolved = train_config.resolve_train_config(packet)
+        _apply_attempt_delta_route(resolved, delta)
         _apply_attempt_delta_load(resolved, delta)
     recorded_resolved = OmegaConf.to_container(resolved, resolve=True)
     report = {
@@ -1756,6 +1767,7 @@ def execute(
     ) -> int:
         """Validate launch.py's late resolution before delegating to TPEN."""
 
+        _apply_attempt_delta_route(config, delta)
         _require_truthful_cell(selection.cell, config)
         _apply_attempt_delta_load(config, delta)
         launched_resolved = OmegaConf.to_container(config, resolve=True)
@@ -1776,7 +1788,7 @@ def execute(
             _execution_facts(),
             runner=_guarded_runner,
             runtime_callbacks=runtime_callbacks,
-            overrides=None if delta is None else {"run.dir": str(delta.attempt_core_dir)},
+            overrides=None,
         )
     else:
         exit_code = launch.launch_train(
@@ -1784,7 +1796,7 @@ def execute(
             _execution_facts(),
             runner=_guarded_runner,
             runtime_callbacks=runtime_callbacks,
-            overrides=None if delta is None else {"run.dir": str(delta.attempt_core_dir)},
+            overrides=None,
         )
     if exit_code == 0:
         resolved_snapshot = output_path / "resolved_config.yaml"
