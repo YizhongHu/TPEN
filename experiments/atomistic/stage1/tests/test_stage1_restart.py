@@ -847,7 +847,7 @@ def test_real_fresh_process_restore_parity_with_checkpoint_zero_and_overlay(
     missing_publication = inspect_run(resolve_run_dir(resumed_row))
     assert missing_publication.verdict == "refused"
     assert missing_publication.refusal is not None
-    assert missing_publication.refusal["code"] == "corrupt-publication-catalog"
+    assert missing_publication.refusal["code"] == "unpublished-checkpoint-ref"
     catalog.write_bytes(catalog_bytes)
 
     resumed_result = _run_real_restart_child({**fresh_payload, "phase": "resumed"})
