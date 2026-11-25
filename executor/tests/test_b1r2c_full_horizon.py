@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from tpen_executor._codec import digest
+from tpen_executor._codec import canonical_bytes, digest
 from tpen_executor.allocations import AllocationAttemptV2, MemberInvocationV2
 from tpen_executor.contracts import AllocationAttemptId, ExecutionPlanV2, GroupId, InvocationId, AttemptId, ReadyGroup, ReadyGroupV2
 from tpen_executor.lifecycle.controller import _publish_full_horizon_side_effect
@@ -19,7 +19,8 @@ from tpen_executor.recovery import (
     RecoverySchedulerEndV1,
     CoreAdmissionVerdictV2,
 )
-from tpen_executor.storage import DirectoryStore, FenceRejected, FullHorizonFork
+from tpen_executor.results import FullHorizonCompletionRecord
+from tpen_executor.storage import DirectoryStore, FenceRejected, FullHorizonFork, read_successor_admission
 
 from test_core_evidence_v3 import _typed_evidence_payload
 from test_review_p8_executor_r1 import setup_store
@@ -82,6 +83,62 @@ MUTANTS = (
         "new": "False",
         "killer": "test_non_iteration_horizon_is_rejected",
     },
+    {
+        "id": "full-horizon-requires-request-digest",
+        "target": "executor/src/tpen_executor/storage.py",
+        "old": "digest(request) != admission.request_digest",
+        "new": "False",
+        "killer": "test_successor_request_digest_is_checked",
+    },
+    {
+        "id": "full-horizon-requires-request-horizon",
+        "target": "executor/src/tpen_executor/storage.py",
+        "old": "request_target != stored_task.target_horizon",
+        "new": "False",
+        "killer": "test_successor_target_horizon_is_checked",
+    },
+    {
+        "id": "full-horizon-requires-checkpoint-counter-agreement",
+        "target": "executor/src/tpen_executor/storage.py",
+        "old": 'any(checkpoint.get(name) != checkpoint_ref.get(name) for name in ("completed_updates", "next_iteration"))',
+        "new": "False",
+        "killer": "test_checkpoint_counters_are_checked",
+    },
+    {
+        "id": "full-horizon-requires-successor-group-binding",
+        "target": "executor/src/tpen_executor/storage.py",
+        "old": "binding.group_digest != fence.group_digest",
+        "new": "False",
+        "killer": "test_crossed_successor_group_is_rejected",
+    },
+    {
+        "id": "full-horizon-requires-successor-task-identity",
+        "target": "executor/src/tpen_executor/storage.py",
+        "old": "admission.predecessor_task_id != task.task_id or admission.successor_task_id != task.task_id",
+        "new": "False",
+        "killer": "test_crossed_successor_task_is_rejected",
+    },
+    {
+        "id": "full-horizon-record-rejects-cycles",
+        "target": "executor/src/tpen_executor/results.py",
+        "old": "successor in visited_nodes",
+        "new": "False",
+        "killer": "test_full_horizon_decode_rejects_cycle",
+    },
+    {
+        "id": "full-horizon-record-requires-canonical-bytes",
+        "target": "executor/src/tpen_executor/results.py",
+        "old": "isinstance(data, bytes) and data != record.encode()",
+        "new": "False",
+        "killer": "test_full_horizon_decode_rejects_noncanonical_bytes",
+    },
+    {
+        "id": "full-horizon-record-rejects-disconnected-chain",
+        "target": "executor/src/tpen_executor/results.py",
+        "old": "previous_successor is not None and predecessor != previous_successor",
+        "new": "False",
+        "killer": "test_full_horizon_decode_rejects_disconnected_chain",
+    },
 )
 
 MUTANT_GUARDS = {
@@ -93,6 +150,14 @@ MUTANT_GUARDS = {
     "full-horizon-refuses-conflicting-replay": "write-once conflict refusal",
     "full-horizon-refusal-is-side-effect-only": "controller swallows per-task refusal",
     "full-horizon-requires-iteration-units": "TaskSpec iteration units",
+    "full-horizon-requires-request-digest": "successor request digest recomputation",
+    "full-horizon-requires-request-horizon": "successor request fixed total horizon",
+    "full-horizon-requires-checkpoint-counter-agreement": "checkpoint counter agreement",
+    "full-horizon-requires-successor-group-binding": "successor group binding",
+    "full-horizon-requires-successor-task-identity": "successor task identity",
+    "full-horizon-record-rejects-cycles": "single visited-node path",
+    "full-horizon-record-requires-canonical-bytes": "canonical completion bytes",
+    "full-horizon-record-rejects-disconnected-chain": "continuous completion chain",
 }
 
 
@@ -117,6 +182,14 @@ INTENDED_ASSERTION_TRACES = {
     "test_symlinked_core_outcome_is_rejected": (
         "typed completed verdict", "durable core outcome", "symlink core-outcome regular-file guard",
     ),
+    "test_successor_request_digest_is_checked": ("typed completed verdict", "durable core outcome", "request digest recomputation"),
+    "test_successor_target_horizon_is_checked": ("typed completed verdict", "durable core outcome", "fixed total horizon"),
+    "test_checkpoint_counters_are_checked": ("typed completed verdict", "durable core outcome", "checkpoint counter agreement"),
+    "test_crossed_successor_group_is_rejected": ("typed completed verdict", "durable core outcome", "successor group binding"),
+    "test_crossed_successor_task_is_rejected": ("typed completed verdict", "durable core outcome", "successor task binding"),
+    "test_full_horizon_decode_rejects_cycle": ("single visited-node path",),
+    "test_full_horizon_decode_rejects_noncanonical_bytes": ("canonical completion bytes",),
+    "test_full_horizon_decode_rejects_disconnected_chain": ("continuous completion chain",),
 }
 
 
@@ -268,12 +341,129 @@ def test_checkpoint_path_crossing_is_rejected(tmp_path: Path) -> None:
 
 
 def test_successor_science_lineage_is_checked(tmp_path: Path) -> None:
-    store, group, _predecessor, final, verdict, task = _chain_fixture(tmp_path, science_input="b" * 64)
+    store, group, _predecessor, _middle, final, verdict, task = _chain_fixture(tmp_path, science_input="b" * 64)
     with pytest.raises(FenceRejected, match="science lineage"):
         _publish(store, group, final, verdict, task)
 
 
-def _chain_fixture(tmp_path: Path, *, science_input: str | None = None, request_target: int = 10):
+def test_successor_request_digest_is_checked(tmp_path: Path) -> None:
+    store, group, predecessor, _middle, final, verdict, task = _chain_fixture(tmp_path)
+    ledger_path = (
+        Path(predecessor.output_dir).parent / "successor-admissions" / predecessor.attempt_id.value
+        / "successor-admission.json"
+    )
+    payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+    payload["request_digest"] = "f" * 64
+    ledger_path.write_bytes(canonical_bytes(payload))
+    with pytest.raises(FenceRejected, match="request digest"):
+        _publish(store, group, final, verdict, task)
+    assert not ledger_path.parent.parent.parent.joinpath("full-horizon-completion.json").exists()
+
+
+def test_successor_target_horizon_is_checked(tmp_path: Path) -> None:
+    store, group, _predecessor, _middle, final, verdict, task = _chain_fixture(tmp_path, request_target=2)
+    with pytest.raises(FenceRejected, match="target_iterations disagrees with TaskSpec horizon"):
+        _publish(store, group, final, verdict, task)
+    assert not Path(store.root, "groups", group.identity, task.task_id, "full-horizon-completion.json").exists()
+
+
+def test_checkpoint_counters_are_checked(tmp_path: Path) -> None:
+    store, group, fence, verdict, task = _single_fixture(tmp_path)
+    path = Path(fence.output_dir) / "core-outcome.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["evidence"]["checkpoint_ref"]["completed_updates"] = 0
+    payload["evidence"]["checkpoint_ref"]["next_iteration"] = 0
+    path.write_bytes(canonical_bytes(payload))
+    with pytest.raises(FenceRejected, match="checkpoint counters"):
+        _publish(store, group, fence, verdict, task)
+
+
+def test_crossed_successor_group_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store, group, _predecessor, _middle, final, verdict, task = _chain_fixture(tmp_path)
+    task_dir = Path(final.output_dir).parent
+    records = store._admission_records_for_task(str(task_dir), task.task_id)
+    crossed_binding = replace(records[0].successor_binding, group_digest=digest("foreign-group"))
+    crossed = replace(records[0], successor_binding=crossed_binding)
+    monkeypatch.setattr(store, "_admission_records_for_task", lambda *_args: (crossed, records[1]))
+    with pytest.raises(FenceRejected, match="crosses final group"):
+        _publish(store, group, final, verdict, task)
+
+
+def test_crossed_successor_task_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store, group, _predecessor, _middle, final, verdict, task = _chain_fixture(tmp_path)
+    task_dir = Path(final.output_dir).parent
+    records = store._admission_records_for_task(str(task_dir), task.task_id)
+    request = json.loads(json.dumps(records[0].successor_request))
+    request["predecessor"]["task_id"] = "foreign-task"
+    crossed = replace(
+        records[0], predecessor_task_id="foreign-task", successor_request=request,
+        request_digest=digest(request),
+    )
+    monkeypatch.setattr(store, "_admission_records_for_task", lambda *_args: (crossed, records[1]))
+    with pytest.raises(FenceRejected, match="crosses task identity"):
+        _publish(store, group, final, verdict, task)
+
+
+def test_full_horizon_decode_rejects_cycle(tmp_path: Path) -> None:
+    store, group, fence, verdict, task = _single_fixture(tmp_path)
+    record = _publish(store, group, fence, verdict, task)
+    payload = record.to_dict()
+    payload["final_attempt_id"] = "attempt-p"
+    payload["attempt_chain"] = [
+        {"predecessor_attempt_id": "attempt-p", "successor_attempt_id": "attempt-c", "request_digest": "a" * 64},
+        {"predecessor_attempt_id": "attempt-c", "successor_attempt_id": "attempt-p", "request_digest": "b" * 64},
+    ]
+    with pytest.raises(ValueError, match="cycle"):
+        FullHorizonCompletionRecord.decode(canonical_bytes(payload))
+
+
+def test_full_horizon_decode_rejects_noncanonical_bytes(tmp_path: Path) -> None:
+    store, group, fence, verdict, task = _single_fixture(tmp_path)
+    record = _publish(store, group, fence, verdict, task)
+    with pytest.raises(ValueError, match="not canonical"):
+        FullHorizonCompletionRecord.decode(json.dumps(record.to_dict()).encode("utf-8"))
+
+
+def test_full_horizon_decode_rejects_disconnected_chain(tmp_path: Path) -> None:
+    store, group, fence, verdict, task = _single_fixture(tmp_path)
+    record = _publish(store, group, fence, verdict, task)
+    payload = record.to_dict()
+    payload["final_attempt_id"] = "attempt-d"
+    payload["attempt_chain"] = [
+        {"predecessor_attempt_id": "attempt-a", "successor_attempt_id": "attempt-b", "request_digest": "a" * 64},
+        {"predecessor_attempt_id": "attempt-c", "successor_attempt_id": "attempt-d", "request_digest": "b" * 64},
+    ]
+    with pytest.raises(ValueError, match="continuous"):
+        FullHorizonCompletionRecord.decode(canonical_bytes(payload))
+
+
+def _recovery_link(
+    task, group, allocation, predecessor, evidence, successor_id: AttemptId, label: str,
+):
+    predecessor_ref = evidence.checkpoint_ref
+    assert predecessor_ref is not None
+    checkpoint = RecoveryCheckpointFactsV1(
+        predecessor_ref["checkpoint_dir"], predecessor_ref["content_id"], 1, 1,
+        "c" * 64, task.science_digest, "d" * 64,
+    )
+    scheduler_end = RecoverySchedulerEndV1(
+        task.task_id, group.identity, predecessor.attempt_id, "slurm", allocation.allocation_id.value,
+        allocation.backend_job_id.value, "failed", "2026-11-25T14:01:00Z", "writer", "2026-11-25T14:01:00Z",
+    )
+    recovery_evidence = RecoveryEvidenceV1(
+        "planned_yield", task.task_id, group.identity, AttemptId(f"attempt-current-{label}"),
+        predecessor.attempt_id, allocation.allocation_id.value, allocation.backend_job_id.value,
+        "slurm", checkpoint, scheduler_end, None, 1, 10,
+    )
+    recovery_admission = RecoveryAdmissionV1(
+        "admitted", "recovery-evidence-valid", digest(recovery_evidence.to_dict()),
+        predecessor.attempt_id, predecessor_ref["checkpoint_dir"], successor_id, f"grant-{label}",
+    )
+    predecessor_binding = MemberInvocationV2.decode(Path(predecessor.output_dir, "invocation.json").read_bytes())
+    return predecessor_binding, recovery_admission, recovery_evidence
+
+
+def _chain_fixture(tmp_path: Path, *, science_input: str | None = None, request_target: int = 1):
     base_store, base_group, allocation = setup_store(tmp_path)
     task = replace(base_group.members[0], target_horizon_units="iterations")
     plan_ref = {"members": ["a"], "plan": "b1r2c"}
@@ -288,57 +478,83 @@ def _chain_fixture(tmp_path: Path, *, science_input: str | None = None, request_
     predecessor_evidence = _evidence(predecessor_core, outcome="planned_yield")
     store.record_core_outcome(predecessor, predecessor_evidence)
 
-    successor_id = AttemptId("attempt-successor")
-    request = store.build_successor_admission_request(predecessor, successor_id, science_input or task.science_digest, request_target)
-    predecessor_ref = predecessor_evidence.checkpoint_ref
-    assert predecessor_ref is not None
-    checkpoint = RecoveryCheckpointFactsV1(
-        predecessor_ref["checkpoint_dir"], predecessor_ref["content_id"], 1, 1,
-        "c" * 64, task.science_digest, "d" * 64,
+    middle_id = AttemptId("attempt-middle")
+    request = store.build_successor_admission_request(
+        predecessor, middle_id, science_input or task.science_digest, request_target,
     )
-    scheduler_end = RecoverySchedulerEndV1(
-        task.task_id, group.identity, predecessor.attempt_id, "slurm", allocation.allocation_id.value,
-        allocation.backend_job_id.value, "failed", "2026-11-25T14:01:00Z", "writer", "2026-11-25T14:01:00Z",
+    predecessor_binding, recovery_admission, recovery_evidence = _recovery_link(
+        task, group, allocation, predecessor, predecessor_evidence, middle_id, "one",
     )
-    recovery_evidence = RecoveryEvidenceV1(
-        "planned_yield", task.task_id, group.identity, AttemptId("attempt-current"), predecessor.attempt_id,
-        allocation.allocation_id.value, allocation.backend_job_id.value, "slurm", checkpoint, scheduler_end,
-        None, 1, 10,
-    )
-    recovery_admission = RecoveryAdmissionV1(
-        "admitted", "recovery-evidence-valid", digest(recovery_evidence.to_dict()), predecessor.attempt_id,
-        predecessor_ref["checkpoint_dir"], successor_id, "grant-1",
-    )
-    predecessor_binding = MemberInvocationV2.decode(Path(predecessor.output_dir, "invocation.json").read_bytes())
     lease2 = AllocationAttemptV2(group.group_id, AllocationAttemptId("lease-2"), allocation.allocation_id, allocation.backend_job_id, "controller", "2026-11-25T14:02:00Z")
-    successor_binding = MemberInvocationV2(
-        lease2, group.identity, task.task_id, task.lineage_id, successor_id, InvocationId("invocation-successor"),
+    middle_binding = MemberInvocationV2(
+        lease2, group.identity, task.task_id, task.lineage_id, middle_id, InvocationId("invocation-middle"),
     )
-    admission = store.record_successor_admission(
+    first_admission = store.record_successor_admission(
         predecessor, request, "e" * 64,
         predecessor_binding=predecessor_binding,
-        successor_binding=successor_binding,
+        successor_binding=middle_binding,
         recovery_admission=recovery_admission,
         recovery_evidence=recovery_evidence,
     )
-    final = store.begin_admitted_successor(
+    middle = store.begin_admitted_successor(
         group, "a", allocation, "2026-11-25T14:02:00Z", "local",
-        allocation_attempt=lease2, admission=admission, current_fence=predecessor,
+        allocation_attempt=lease2, admission=first_admission, current_fence=predecessor,
+    )
+    middle_core = Path(middle.output_dir) / "core"
+    middle_core.mkdir()
+    store.finish_attempt(middle, "failed", "2026-11-25T14:03:00Z")
+    middle_evidence = _evidence(middle_core, outcome="planned_yield")
+    store.record_core_outcome(middle, middle_evidence)
+
+    final_id = AttemptId("attempt-final")
+    final_request = store.build_successor_admission_request(
+        middle, final_id, science_input or task.science_digest, request_target,
+    )
+    middle_binding, final_recovery_admission, final_recovery_evidence = _recovery_link(
+        task, group, allocation, middle, middle_evidence, final_id, "two",
+    )
+    lease3 = AllocationAttemptV2(group.group_id, AllocationAttemptId("lease-3"), allocation.allocation_id, allocation.backend_job_id, "controller", "2026-11-25T14:04:00Z")
+    final_binding = MemberInvocationV2(
+        lease3, group.identity, task.task_id, task.lineage_id, final_id, InvocationId("invocation-final"),
+    )
+    second_admission = store.record_successor_admission(
+        middle, final_request, "f" * 64,
+        predecessor_binding=middle_binding,
+        successor_binding=final_binding,
+        recovery_admission=final_recovery_admission,
+        recovery_evidence=final_recovery_evidence,
+    )
+    final = store.begin_admitted_successor(
+        group, "a", allocation, "2026-11-25T14:04:00Z", "local",
+        allocation_attempt=lease3, admission=second_admission, current_fence=middle,
     )
     final_core = Path(final.output_dir) / "core"
     final_core.mkdir()
-    store.finish_attempt(final, "completed", "2026-11-25T14:03:00Z")
+    store.finish_attempt(final, "completed", "2026-11-25T14:05:00Z")
     store.record_core_outcome(final, _evidence(final_core))
-    return store, group, predecessor, final, _verdict(), task
+    return store, group, predecessor, middle, final, _verdict(), task
 
 
 def test_p_to_c_to_s_chain_is_read_from_durable_v3_ledger(tmp_path: Path) -> None:
-    store, group, predecessor, final, verdict, task = _chain_fixture(tmp_path)
+    store, group, predecessor, middle, final, verdict, task = _chain_fixture(tmp_path)
 
     record = _publish(store, group, final, verdict, task)
     assert record.final_attempt_id == final.attempt_id
-    assert record.attempt_chain[0]["predecessor_attempt_id"] == predecessor.attempt_id.value
-    assert record.attempt_chain[0]["successor_attempt_id"] == final.attempt_id.value
+    assert len(record.attempt_chain) == 2
+    assert [(link["predecessor_attempt_id"], link["successor_attempt_id"]) for link in record.attempt_chain] == [
+        (predecessor.attempt_id.value, middle.attempt_id.value),
+        (middle.attempt_id.value, final.attempt_id.value),
+    ]
+    first = read_successor_admission(
+        middle.output_dir, task_id=task.task_id, attempt_id=middle.attempt_id.value,
+        group_digest=group.identity, science_input_digest=task.science_digest, target_iterations=task.target_horizon,
+    )
+    second = read_successor_admission(
+        final.output_dir, task_id=task.task_id, attempt_id=final.attempt_id.value,
+        group_digest=group.identity, science_input_digest=task.science_digest, target_iterations=task.target_horizon,
+    )
+    assert record.attempt_chain[0]["request_digest"] == digest(first["request"])
+    assert record.attempt_chain[1]["request_digest"] == digest(second["request"])
 
 
 def test_mutant_rows_are_unique_and_compile_as_expression_replacements() -> None:
