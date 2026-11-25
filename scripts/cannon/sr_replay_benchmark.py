@@ -36,7 +36,7 @@ from tpen.training.score_geometry import (
     flatten_parameter_score_blocks,
 )
 from tpen.training.sr import SRPolicy, SRTelemetry, StochasticReconfigurationUpdate
-from tpen.training.update import ScoreUpdateInput
+from tpen.training.update import ModelParameterBinding, ScoreUpdateInput
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -288,9 +288,13 @@ def _dense_trial(case: Case, *, include_reference: bool) -> Trial:
         reference_trace = float(operator.trace().item())
         reference_damping = float(dense_diag.shift)
     optimizer = torch.optim.SGD(model.parameters(), lr=case.policy.learning_rate)
+    model_parameters = ModelParameterBinding(
+        parameters=tuple(model.parameters()),
+        layout=model.parameter_binding.layout,
+    )
     method = StochasticReconfigurationUpdate(
         optimizer,
-        model_parameters=model.parameter_binding,
+        model_parameters=model_parameters,
         policy=case.policy,
     )
     update_input = ScoreUpdateInput(
