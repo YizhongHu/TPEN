@@ -689,6 +689,12 @@ def test_restore_rejects_incompatible_parameter_layout(tmp_path, kind: str) -> N
     optimizer.state[next(iter(model.parameters()))]["sentinel"] = torch.tensor(
         -23.0, dtype=torch.float64
     )
+    from tests.unit.training.test_method_state_restore_prevalidation import (
+        _assert_snapshot_unchanged,
+        _snapshot,
+    )
+
+    before = _snapshot(model, optimizer)
     binding = update.model_parameters
     before_method_state = copy.deepcopy(update.method_state_dict())
     before_trainer_state = copy.deepcopy(trainer.state_dict())
@@ -712,6 +718,7 @@ def test_restore_rejects_incompatible_parameter_layout(tmp_path, kind: str) -> N
             sampler=sampler,
         )
 
+    _assert_snapshot_unchanged(before, model, optimizer)
     assert trainer.state_dict()["next_iteration"] == 0
     assert trainer.state_dict()["completed_updates"] == 0
     assert update.model_parameters is binding
