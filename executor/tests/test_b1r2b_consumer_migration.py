@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -454,7 +455,14 @@ def test_c22_load_path_is_exact_admitted_checkpoint(tmp_path: Path) -> None:
 
 
 def test_mutant_sources_compile_and_killers_are_declared() -> None:
-    names = {name for name, value in globals().items() if name.startswith("test_") and callable(value)}
+    names = set()
+    for path in Path(__file__).parent.glob("test_*.py"):
+        tree = ast.parse(path.read_text())
+        names.update(
+            node.name for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test_")
+        )
     assert len({row["id"] for row in MUTANTS}) == len(MUTANTS)
     for row in MUTANTS:
         source = Path(__file__).parents[1].joinpath(row["target"].split("executor/", 1)[1]).read_text()
