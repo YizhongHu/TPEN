@@ -66,7 +66,14 @@ class _StatefulMethod(VMCUpdateMethod[Any]):
     def method_state_dict(self) -> Mapping[str, Any]:
         return {"step": self.step, "fingerprint": self.fingerprint}
 
+    def validate_method_state_dict(self, state: Mapping[str, Any]) -> None:
+        if set(state) != {"step", "fingerprint"}:
+            raise ValueError("invalid method state")
+        int(state["step"])
+        str(state["fingerprint"])
+
     def load_method_state_dict(self, state: Mapping[str, Any]) -> None:
+        self.validate_method_state_dict(state)
         self.step = int(state["step"])
         self.fingerprint = str(state["fingerprint"])
 

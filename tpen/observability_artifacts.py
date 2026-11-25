@@ -61,6 +61,9 @@ OBSERVABILITY_ALL_RECORD_KINDS: frozenset[str] = (
 )
 
 OBSERVABILITY_LIFECYCLE_STATES: frozenset[str] = frozenset({"open", "closed", "unsafe"})
+OBSERVABILITY_PROFILE_LIFECYCLE_STATES: frozenset[str] = frozenset(
+    {"open", "closed", "unsafe", "not_started"}
+)
 OBSERVABILITY_LIFECYCLE_MARKER_STATES: frozenset[str] = frozenset(
     {"open", "finalized", "unsafe"}
 )
@@ -1899,7 +1902,7 @@ class ObservabilityProfileStatus:
             )
         _require_choice(
             self.lifecycle_state,
-            OBSERVABILITY_LIFECYCLE_STATES,
+            OBSERVABILITY_PROFILE_LIFECYCLE_STATES,
             "profile_status.lifecycle_state",
         )
         _require_choice(
@@ -4841,6 +4844,7 @@ __all__ = [
     "OBSERVABILITY_DATA_COMPLETENESS",
     "OBSERVABILITY_LIFECYCLE_MARKER_STATES",
     "OBSERVABILITY_LIFECYCLE_STATES",
+    "OBSERVABILITY_PROFILE_LIFECYCLE_STATES",
     "OBSERVABILITY_PROFILE_WINDOW_KINDS",
     "OBSERVABILITY_READING_STATUSES",
     "OBSERVABILITY_RECORD_KINDS",

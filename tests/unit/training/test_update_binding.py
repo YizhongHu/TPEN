@@ -92,8 +92,8 @@ class _FixedSampler:
         )
         self._batch = ElectronBatch(positions=positions, spins=batch.spins)
 
-    def collect_samples(self, model, *, device=None):
-        del model, device
+    def collect_samples(self, model, *, reset=False, device=None, emitter=None):
+        del model, reset, device, emitter
         return _FixedWalkers(self._batch), None
 
     def mcmc_state_dict(self) -> dict[str, Any]:
@@ -162,7 +162,13 @@ class _CountingLegacyUpdate(LegacyAutogradUpdate):
     def method_state_dict(self):
         return {"updates_applied": int(self.updates_applied)}
 
+    def validate_method_state_dict(self, state):
+        if set(state) != {"updates_applied"}:
+            raise ValueError("invalid counting legacy method state")
+        int(state["updates_applied"])
+
     def load_method_state_dict(self, state):
+        self.validate_method_state_dict(state)
         self.restored_from = int(state["updates_applied"])
         self.updates_applied = int(state["updates_applied"])
 

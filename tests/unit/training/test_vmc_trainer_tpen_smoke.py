@@ -16,7 +16,7 @@ from tpen.events import DomainState, Ended, Occurrence, Started
 from tpen.physics.kinetic import KineticEnergy
 from tpen.physics.potential import ElectronElectronInteraction, HarmonicTrap
 from tpen.physics.hamiltonian import LocalEnergyResult
-from tpen.sampling import SamplerStats
+from tpen.sampling import SamplerBurnIn, SamplerProduction, SamplerStats
 from tpen.training.events import (
     Backward,
     BuildBatch,
@@ -79,7 +79,9 @@ class _VacuumWalkers:
 class _VacuumSampler:
     """Sampler stand-in returning one fixed zero-electron walker set."""
 
-    def collect_samples(self, model, *, device=None):
+    def collect_samples(self, model, *, reset=False, device=None, emitter=None):
+        del emitter
+        del reset
         del model, device
         walkers = _VacuumWalkers()
         stats = SamplerStats(
@@ -288,10 +290,12 @@ def test_vmc_optimizer_update_does_not_leave_stale_sampler_cache() -> None:
             observed.append((walkers.logabs.clone(), output.logabs.clone()))
         return original_step(current_model, walkers)
 
-    def collect(self, current_model, *, reset=False, device=None):
+    def collect(self, current_model, *, reset=False, device=None, emitter=None):
         nonlocal collection_number, first_cache
         collection_number += 1
-        result = original_collect(current_model, reset=reset, device=device)
+        result = original_collect(
+            current_model, reset=reset, device=device, emitter=emitter
+        )
         if collection_number == 1:
             assert result[0].logabs is not None
             first_cache = result[0].logabs.clone()
@@ -386,6 +390,10 @@ def test_vmc_trainer_scopes_every_training_phase() -> None:
     assert _occurrence_labels(context.occurrences) == [
         ("started", TrainingIteration),
         ("started", CollectSamples),
+        ("started", SamplerBurnIn),
+        ("ended", SamplerBurnIn),
+        ("started", SamplerProduction),
+        ("ended", SamplerProduction),
         ("ended", CollectSamples),
         ("started", BuildBatch),
         ("ended", BuildBatch),
@@ -406,7 +414,7 @@ def test_vmc_trainer_scopes_every_training_phase() -> None:
         ("ended", TrainingIteration),
     ]
     # One iteration means every concrete type is at its first occurrence.
-    assert [occurrence.count for occurrence in context.occurrences] == [1] * 20
+    assert [occurrence.count for occurrence in context.occurrences] == [1] * 24
     completion_index = next(
         index
         for index, (kind, event) in enumerate(context.trace)
@@ -426,8 +434,9 @@ def test_vmc_trainer_step_end_failure_skips_completion_but_ends_iteration() -> N
     model = build_tiny_spenn()
 
     class _FailingSampler:
-        def collect_samples(self, model, *, device=None):
-            del model, device
+        def collect_samples(self, model, *, reset=False, device=None, emitter=None):
+            del emitter
+            del model, device, reset
             raise RuntimeError("sample collection failed")
 
     sampler = _FailingSampler()

@@ -135,9 +135,14 @@ after the jobs start.  Queue wait dominates: earlier `sbatch --test-only`
 start estimates on these partitions were days out, so submit the train jobs
 as soon as the source and approval gates pass.
 
-Resources per GPU job: `--cpus-per-task=4 --mem=32G` (calibration peak GPU
-memory was 1.4 to 1.7 GiB; host memory has not been measured, so 32G is a
-conservative request, not a measurement).
+Resources per GPU job: `--cpus-per-task=1 --mem=4G` by default.  The
+2026-11-25 Cannon `jobstats` sweeps measured one effective CPU and at most
+1.2 GB host memory for the ten flagged evaluation jobs, and 1.5 GB for nine
+representative 100,000-update Hooke-1e/Hooke-2e/QHO-2e training lineages
+including checkpoint-completion phases.  The 4G default therefore retains a
+2.5 GB margin over the observed training maximum (and 2.8 GB over evaluation).
+The same 4G default applies to train and eval rows; provide a larger request
+only when a measured workload requires it.
 
 Eval batching.  Default: one eval job runs the 12 rendered stream scripts
 sequentially (about 4 min each), stopping at the first failure.  Alternative
@@ -227,7 +232,7 @@ job, and the train rows run the same config, launch path and guard.  Then:
 - render each train row once here (the step-2 command with this job's
   `BOOT_ROOT`) and record the `#SBATCH` block; it must be exactly
   `--partition=seas_gpu,kozinsky_gpu,gpu --nodes=1 --ntasks=1
-  --cpus-per-task=4 --mem=32G --time=12:00:00 --gres=gpu:1 --constraint=a100
+  --cpus-per-task=1 --mem=4G --time=12:00:00 --gres=gpu:1 --constraint=a100
   --no-requeue`;
 - dry-execute the full train wrapper body (step 2) with only the GPU guard
   and driver run stubbed, so a literal `\${VAR}` or a wrong path fails here
@@ -259,7 +264,7 @@ block is the rendered block recorded in step 1 plus only `--job-name`,
      --checkout-root "$BOOT_ROOT/checkout" --python "$PY" \
      --head-sha "$SOURCE_SHA" --results-root "$RESULTS_ROOT" \
      --partition seas_gpu,kozinsky_gpu,gpu \
-     --cpus-per-task 4 --mem 32G --time 12:00:00
+     --cpus-per-task 1 --mem 4G --time 12:00:00
    ```
 
    Like `plan.py`, `launch.py` has no `sys.path` self-fix: run it as a module

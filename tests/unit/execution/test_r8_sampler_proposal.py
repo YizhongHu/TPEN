@@ -84,7 +84,7 @@ def _run_traced(model, *, burn_in=0, n_steps=1):
     sampler = _sampler(move, burn_in=burn_in, n_steps=n_steps)
     trace = NativeTrace(phase="recovery", seed=17, resume_step=3)
     with install_native_trace(trace):
-        walkers, _stats = sampler.collect_samples(model)
+        walkers, _stats = sampler.collect_samples(model, emitter=None)
     return move, walkers, trace
 
 
@@ -138,16 +138,16 @@ def test_real_sampler_state_restore_preserves_first_proposal_and_omission_diverg
     baseline_move = _RecordingGaussianMove()
     baseline = _sampler(baseline_move, seed=17)
     state = baseline.mcmc_state_dict()
-    baseline.collect_samples(_AcceptEveryProposal())
+    baseline.collect_samples(_AcceptEveryProposal(), emitter=None)
 
     restored_move = _RecordingGaussianMove()
     restored = _sampler(restored_move, seed=91)
     restored.load_mcmc_state_dict(state, device="cpu")
-    restored.collect_samples(_AcceptEveryProposal())
+    restored.collect_samples(_AcceptEveryProposal(), emitter=None)
 
     omitted_move = _RecordingGaussianMove()
     omitted = _sampler(omitted_move, seed=91)
-    omitted.collect_samples(_AcceptEveryProposal())
+    omitted.collect_samples(_AcceptEveryProposal(), emitter=None)
 
     assert torch.equal(baseline_move.proposals[0], restored_move.proposals[0])
     assert not torch.equal(baseline_move.proposals[0], omitted_move.proposals[0])

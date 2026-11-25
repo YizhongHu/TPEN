@@ -49,7 +49,9 @@ from tpen.physics.potential import (
 )
 from tpen.physics.receipt import ExecutionReceipt, encode_ordered_contribution_sequence
 from tpen.physics.system import ParticleSpec, build_system_descriptor
+from tpen.events import EventEmitter
 from tpen.sampling.metropolis import MetropolisSampler
+from tpen.sampling.stats import SamplerStats
 from tpen.statistics.trajectory import ObservableTrajectory
 from tests.unit.evaluation.test_trajectory_record_inspection import _write_v1_artifact
 
@@ -1025,9 +1027,24 @@ class _OrderedContributionEvaluator:
         return result if return_terms else result.total
 
 
+class _UnusedSamplingCollector:
+    """Satisfy the generator's typed sampler boundary without sampling."""
+
+    def collect_samples(
+        self,
+        model: torch.nn.Module,
+        *,
+        reset: bool = False,
+        device: torch.device | str | None = None,
+        emitter: EventEmitter | None,
+    ) -> tuple[Walkers, SamplerStats]:
+        del model, reset, device, emitter
+        raise AssertionError("the local-energy reconstruction test must not sample")
+
+
 def test_generator_reconstructs_total_in_receipt_contribution_order() -> None:
     generator = TrajectoryMCMCGenerator(
-        sampler=object(),
+        sampler=_UnusedSamplingCollector(),
         hamiltonian_terms=_TERMS,
         n_draws=1,
         evaluator=_OrderedContributionEvaluator(),

@@ -53,7 +53,6 @@ from tpen_executor import cli, composition
 from tpen_executor.contracts import AllocationId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
 from tpen_executor.dispatch import LocalDispatcher
 from tpen_executor.dispatch import parsl as parsl_dispatch
-from tpen_executor.dispatch.contract import ConfiguredProgramRouteRefused
 from tpen_executor.dispatch.transport import LeafRequest, LeafResult, LeafTeardownReceipt, run_leaf
 from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.lifecycle import AttachedAllocation
@@ -307,6 +306,7 @@ def _configured_run(tmp_path: Path, task_id: str = "member") -> ConfiguredRun:
         str(root / "experiments/atomistic/he-importance/o1_scan_manifest_v1.json"),
         "0" * 64,
         str(tmp_path / "configured-output"),
+        load={"mode": "fresh", "path": None},
     )
     return ConfiguredRun(task_id, "", (), program)
 
@@ -1348,18 +1348,19 @@ def test_an_invalid_worker_mask_is_refused_before_science(
 # ------------------------------------------------------- unchanged routes
 
 
-def test_configured_parsl_public_run_refuses_before_dfk_or_submission(
+def test_configured_parsl_public_admission_accepts_typed_binding_before_dfk(
     tmp_path: Path, fake_parsl: _Parsl,
 ) -> None:
-    """Configured in-process Parsl admission fails before any backend call."""
+    """Configured Parsl admission validates before backend construction."""
 
     group = _group("s3b-configured-refuse", "member")
     lifecycle = _lifecycle(tmp_path)
     dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path), binding=BINDING)
-    with pytest.raises(ConfiguredProgramRouteRefused, match="until C2.2"):
-        dispatcher.run(group, {"member": _configured_run(tmp_path)}, lifecycle, timeout=60)
+    dispatcher.validate(group, {"member": _configured_run(tmp_path)}, lifecycle, timeout=60)
     assert fake_parsl.dfks == []
     assert fake_parsl.submissions == []
+    with pytest.raises(ValueError):
+        dispatcher.validate(group, {}, lifecycle, timeout=60)
     legacy_group = _group("s3b-configured-legacy", "member")
     legacy = _runs(tmp_path, "member")
     manifest = dispatcher.run(legacy_group, legacy, lifecycle, timeout=60)

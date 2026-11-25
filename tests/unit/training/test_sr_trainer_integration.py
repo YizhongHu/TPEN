@@ -86,8 +86,8 @@ class _FixedSampler:
         spins = torch.tensor([[1.0, -1.0, 1.0]] * n_walkers, dtype=torch.float64)
         self._batch = ElectronBatch(positions=positions, spins=spins)
 
-    def collect_samples(self, model, *, device=None):
-        del model, device
+    def collect_samples(self, model, *, reset=False, device=None, emitter=None):
+        del model, reset, device, emitter
         return _FixedWalkers(self._batch), None
 
 
@@ -527,7 +527,9 @@ def test_the_pair_disconnection_is_exactly_the_order_one_output_weights() -> Non
 
     torch.manual_seed(0)
     model = build_tiny_spenn()
-    batch = build_tiny_sampler().collect_samples(model, device=torch.device("cpu"))[0].make_batch()
+    batch = build_tiny_sampler().collect_samples(
+        model, device=torch.device("cpu"), emitter=None
+    )[0].make_batch()
     assert batch.n_electrons == 2
     assert disconnected_parameter_names(model, batch) == INACTIVE_PAIR_PARAMETERS
 

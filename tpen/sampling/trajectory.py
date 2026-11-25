@@ -30,6 +30,8 @@ import torch
 from tpen.data.batch.geometry import electron_nuclear_displacements
 from tpen.data.batch.walkers import Walkers
 from tpen.sampling.stats import SamplerStats
+from tpen.events import EventEmitter
+from tpen.sampling.protocols import SamplingCollector
 from tpen.statistics.trajectory import ObservableTrajectory
 
 __all__ = [
@@ -341,7 +343,7 @@ def _frozen_eval(model: torch.nn.Module) -> Iterator[None]:
 
 
 def collect_observable_trajectory(
-    sampler: object,
+    sampler: SamplingCollector,
     model: torch.nn.Module,
     observable: Callable[[Walkers], torch.Tensor],
     *,
@@ -351,6 +353,7 @@ def collect_observable_trajectory(
     device: torch.device | str | None = None,
     reset: bool = False,
     verify_model_unchanged: bool = True,
+    emitter: EventEmitter | None,
 ) -> tuple[ObservableTrajectory, SamplerStats]:
     """Collect a trajectory while preserving the established two-value API.
 
@@ -369,12 +372,13 @@ def collect_observable_trajectory(
         device=device,
         reset=reset,
         verify_model_unchanged=verify_model_unchanged,
+        emitter=emitter,
     )
     return trajectory, stats
 
 
 def collect_observable_trajectory_with_diagnostics(
-    sampler: object,
+    sampler: SamplingCollector,
     model: torch.nn.Module,
     observable: Callable[[Walkers], torch.Tensor],
     *,
@@ -384,6 +388,7 @@ def collect_observable_trajectory_with_diagnostics(
     device: torch.device | str | None = None,
     reset: bool = False,
     verify_model_unchanged: bool = True,
+    emitter: EventEmitter | None,
 ) -> tuple[ObservableTrajectory, SamplerStats, SamplerTrajectoryDiagnostics]:
     """Collect a `[draw, walker]` observable trajectory from a fixed model.
 
@@ -394,8 +399,8 @@ def collect_observable_trajectory_with_diagnostics(
 
     Parameters
     ----------
-    sampler : object
-        Sampler exposing ``collect_samples(model, *, reset=..., device=...)``
+    sampler : SamplingCollector
+        Typed sampler exposing ``collect_samples(model, *, reset=..., device=..., emitter=...)``
         returning ``(Walkers, SamplerStats)``.
     model : torch.nn.Module
         Wavefunction model, held fixed for the whole collection.
@@ -442,9 +447,6 @@ def collect_observable_trajectory_with_diagnostics(
         If `verify_model_unchanged` is set and any parameter moved.
     """
 
-    collect = getattr(sampler, "collect_samples", None)
-    if not callable(collect):
-        raise TypeError("sampler must expose collect_samples(model, *, reset=..., device=...)")
     if n_draws < 1:
         raise ValueError(f"n_draws must be at least 1, got {n_draws}")
     if discard_draws < 0:
@@ -460,10 +462,11 @@ def collect_observable_trajectory_with_diagnostics(
         for draw_index in range(discard_draws + n_draws):
             # `reset` applies to the first call only: re-seeding mid-collection
             # would restart the chain and destroy the draw axis being built.
-            walkers, stats = collect(
+            walkers, stats = sampler.collect_samples(
                 model,
                 reset=reset and draw_index == 0,
                 device=device,
+                emitter=emitter,
             )
             if not isinstance(stats, SamplerStats):
                 raise TypeError(

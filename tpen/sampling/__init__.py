@@ -14,6 +14,8 @@ from tpen.sampling.trajectory import (
     collect_observable_trajectory_with_diagnostics,
     parameter_fingerprint,
 )
+from tpen.sampling.events import SamplerBurnIn, SamplerProduction
+from tpen.sampling.protocols import SamplingCollector
 
 __all__ = [
     "GaussianMove",
@@ -30,4 +32,7 @@ __all__ = [
     "parameter_fingerprint",
     "summarize_walker_geometry",
     "warmup",
+    "SamplerBurnIn",
+    "SamplerProduction",
+    "SamplingCollector",
 ]

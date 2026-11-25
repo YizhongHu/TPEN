@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from typeguard import TypeCheckError
 
 from tpen.data.atomic_configuration import AtomicConfiguration
 from tpen.data.batch.electron_batch import ElectronBatch
@@ -15,6 +16,21 @@ from tpen.sampling.trajectory import (
     collect_observable_trajectory_with_diagnostics,
     parameter_fingerprint,
 )
+
+# Keep legacy two-value test call sites concise while exercising the new
+# required production keyword explicitly at this module boundary.
+_collect_observable_trajectory = collect_observable_trajectory
+_collect_observable_trajectory_with_diagnostics = collect_observable_trajectory_with_diagnostics
+
+
+def collect_observable_trajectory(*args, **kwargs):
+    kwargs.setdefault("emitter", None)
+    return _collect_observable_trajectory(*args, **kwargs)
+
+
+def collect_observable_trajectory_with_diagnostics(*args, **kwargs):
+    kwargs.setdefault("emitter", None)
+    return _collect_observable_trajectory_with_diagnostics(*args, **kwargs)
 
 
 def _stats(n_walkers: int, n_steps: int, seed: int = 7) -> SamplerStats:
@@ -38,9 +54,10 @@ class FakeSampler:
         *,
         reset: bool,
         device: torch.device | str | None,
+        emitter=None,
     ) -> tuple[Walkers, SamplerStats]:
         """Return real typed records with deterministic, varying walker values."""
-        self.calls.append({"reset": reset, "device": device})
+        self.calls.append({"reset": reset, "device": device, "emitter": emitter})
         draw = self.draw_index
         self.draw_index += 1
         positions = torch.arange(self.n_walkers, dtype=torch.float32).reshape(self.n_walkers, 1, 1)
@@ -185,7 +202,7 @@ def test_collection_freezes_parameters_but_leaves_autograd_enabled(initial_train
 @pytest.mark.parametrize("sampler", [object(), None])
 def test_sampler_without_collect_samples_raises_type_error(sampler: object) -> None:
     """Require the public sampler collection contract."""
-    with pytest.raises(TypeError, match="collect_samples"):
+    with pytest.raises(TypeCheckError, match="collect_samples"):
         collect_observable_trajectory(sampler, TinyModel(), _position_observable, observable_name="x", n_draws=1)
 
 
@@ -270,6 +287,7 @@ class AtomicDrawSampler:
         *,
         reset: bool,
         device: torch.device | str | None,
+        emitter=None,
     ) -> tuple[Walkers, SamplerStats]:
         radius = self.states[self.index]
         acceptance_rate = self.acceptance_rates[self.index]
@@ -344,8 +362,9 @@ class WrongWalkerCountSampler(FakeSampler):
         *,
         reset: bool,
         device: torch.device | str | None,
+        emitter=None,
     ) -> tuple[Walkers, SamplerStats]:
-        walkers, stats = super().collect_samples(model, reset=reset, device=device)
+        walkers, stats = super().collect_samples(model, reset=reset, device=device, emitter=emitter)
         return walkers, _stats(walkers.batch_size + 1, stats.n_steps)
 
 

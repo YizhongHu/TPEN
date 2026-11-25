@@ -1624,3 +1624,12 @@ train/energy
 ```
 
 Do not maintain multiple primary names for the same metric. If a downstream tool needs flattened names, flatten only at export time.
+### Sampler scope attribution
+
+`SamplingScopeTiming` reports `sampler_burn_in_time_sec` and
+`sampler_production_time_sec` under `train/perf` or `eval/perf/<task>` from the
+typed `SamplerBurnIn` and `SamplerProduction` operations. These are nested
+attribution subsets of the existing `sampling_time_sec` and `generator_time_sec`
+totals; they must not be added to, substituted for, or double-counted in those
+parent totals. Burn-in is present only for a transition that actually ran, so a
+restored burned chain reports production attribution without synthetic history.

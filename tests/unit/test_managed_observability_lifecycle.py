@@ -48,6 +48,7 @@ from tpen.callback import (
     Cadence,
     Callback,
     ManagedLifecycleError,
+    NativeProfiler,
     ResourceOwnershipClaim,
     ResourceOwnershipConflictError,
     ResourceUsage,
@@ -910,6 +911,49 @@ def test_preflight_hi_firewall_refuses_before_dirs_or_scope_enter(tmp_path: Path
         run_from_config(cfg, raise_exceptions=True, runtime_callbacks=[managed])
     assert managed.enter_readiness == []
     assert not (tmp_path / "outputs").exists()
+
+
+def test_native_profiler_routed_preflight_claims_real_profile_artifacts(
+    tmp_path: Path,
+) -> None:
+    """The public managed boundary admits NativeProfiler and rejects its conflict."""
+
+    window = {"start_step": 0, "warmup_steps": 0, "active_steps": 1}
+    cfg = _base_cfg(
+        tmp_path,
+        callbacks=[
+            {"_target_": "tpen.callback.NativeProfiler", "enabled": True, "window": window},
+            {"_target_": "tpen.callback.NativeProfiler", "enabled": True, "window": window},
+        ],
+    )
+    destination = ArtifactDestination(physical_root=tmp_path / "physical")
+    with pytest.raises(ResourceOwnershipConflictError, match="torch_profiler"):
+        run_from_config(cfg, artifact_destination=destination, raise_exceptions=True)
+    assert not (tmp_path / "outputs").exists()
+    assert not (tmp_path / "physical").exists()
+
+
+def test_native_profiler_and_resource_samples_conflict_on_shared_manifest(
+    tmp_path: Path,
+) -> None:
+    """The public managed boundary rejects a real cross-callback manifest conflict."""
+
+    window = {"start_step": 0, "warmup_steps": 0, "active_steps": 1}
+    cfg = _base_cfg(
+        tmp_path,
+        callbacks=[
+            {"_target_": "tpen.callback.NativeProfiler", "enabled": True, "window": window},
+            {
+                "_target_": "tpen.callback.ResourceSamples",
+                "sink": {"relative_dir": "native-profiling"},
+            },
+        ],
+    )
+    destination = ArtifactDestination(physical_root=tmp_path / "physical")
+    with pytest.raises(ResourceOwnershipConflictError, match="artifact_writer"):
+        run_from_config(cfg, artifact_destination=destination, raise_exceptions=True)
+    assert not (tmp_path / "outputs").exists()
+    assert not (tmp_path / "physical").exists()
 
 
 def test_preflight_destination_freshness_and_routed_unregistered_managed_callback(

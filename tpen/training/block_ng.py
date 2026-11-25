@@ -261,6 +261,12 @@ class BlockDiagonalNaturalGradientUpdate(VMCUpdateMethod[ScoreUpdateInput]):
     def load_method_state_dict(self, state: Mapping[str, Any]) -> None:
         """Restore persistent method state, rejecting a different method identity."""
 
+        self.validate_method_state_dict(state)
+        self.completed_updates = state["completed_updates"]
+
+    def validate_method_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Validate persistent method state without mutating live state."""
+
         if not isinstance(state, Mapping):
             raise TypeError("Block-NG method state must be a mapping")
         if state.get("version") != BLOCK_NG_STATE_VERSION:
@@ -277,7 +283,6 @@ class BlockDiagonalNaturalGradientUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         completed_updates = state.get("completed_updates")
         if type(completed_updates) is not int or completed_updates < 0:
             raise ValueError("Block-NG completed_updates must be a non-negative integer")
-        self.completed_updates = completed_updates
 
     def update(self, update_input: ScoreUpdateInput) -> VMCUpdateResult:
         """Build current Fisher blocks, solve them, and apply one SGD step."""
