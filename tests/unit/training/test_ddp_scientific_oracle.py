@@ -52,6 +52,7 @@ from tpen.training.update import (
     VMCUpdateState,
 )
 from tpen.training.vmc import compute_vmc_objective
+from tpen.sampling.events import SamplerBurnIn, SamplerProduction
 from tests.helpers.hooke_models import build_tiny_sampler, build_tiny_spenn
 from tests.helpers.run_context import RecordingLogger, make_run_context
 from tests.helpers.vmc_scientific_oracle import (
@@ -843,6 +844,10 @@ def test_ordinary_shape_typed_event_sequence_matches_explicit_expected_order() -
     expected = [
         ("started", TrainingIteration),
         ("started", CollectSamples),
+        ("started", SamplerBurnIn),
+        ("ended", SamplerBurnIn),
+        ("started", SamplerProduction),
+        ("ended", SamplerProduction),
         ("ended", CollectSamples),
         ("started", BuildBatch),
         ("ended", BuildBatch),
