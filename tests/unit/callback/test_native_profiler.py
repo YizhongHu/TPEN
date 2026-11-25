@@ -198,6 +198,83 @@ def test_missed_window_does_not_start_backend(tmp_path) -> None:
     assert backend.calls == []
 
 
+def test_first_observed_warmup_step_after_window_start_is_not_started(tmp_path) -> None:
+    """Resume after start_step must not shift the requested capture window."""
+    backend = _FakeBackend()
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(start_step=5, warmup_steps=2, active_steps=2),
+        backend_factory=lambda: backend,
+    )
+    context = make_run_context(tmp_path)
+    with callback.run_scope(context):
+        callback.handle_occurrence(Occurrence(Started(TrainingIteration(6)), 1), context)
+        callback.handle_occurrence(Occurrence(Ended(TrainingIteration(6)), 1), context)
+
+    assert backend.calls == []
+    payload = json.loads(next(context.run_dir.rglob("profile-status.json")).read_text())
+    assert payload["status"] == "not_started"
+
+
+def test_request_stop_before_window_prevents_activation(tmp_path) -> None:
+    backend = _FakeBackend()
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 1, 1),
+        backend_factory=lambda: backend,
+    )
+    context = make_run_context(tmp_path)
+    with callback.run_scope(context) as session:
+        session.request_stop()
+        callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
+        callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
+    assert backend.calls == []
+
+
+def test_final_active_iteration_stops_backend_before_next_callback_event(tmp_path) -> None:
+    backend = _FakeBackend()
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        backend_factory=lambda: backend,
+    )
+    context = make_run_context(tmp_path)
+    with callback.run_scope(context):
+        callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
+        callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
+        assert backend.calls == ["start", "step", "stop"]
+
+
+def test_out_of_order_ended_occurrence_does_not_pop_unrelated_range(tmp_path) -> None:
+    backend = _FakeBackend()
+    callback = NativeProfiler(enabled=True, backend_factory=lambda: backend)
+    context = make_run_context(tmp_path)
+    with callback.run_scope(context):
+        callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
+        callback.handle_occurrence(Occurrence(Started(CollectSamples(0)), 1), context)
+        callback.handle_occurrence(Occurrence(Started(SamplerBurnIn(2)), 1), context)
+        callback.handle_occurrence(Occurrence(Ended(CollectSamples(0)), 99), context)
+        assert "end:SamplerBurnIn" not in backend.calls
+        callback.handle_occurrence(Occurrence(Ended(SamplerBurnIn(2)), 1), context)
+        callback.handle_occurrence(Occurrence(Ended(CollectSamples(0)), 1), context)
+        callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
+    range_calls = [call for call in backend.calls if call.startswith(("start:", "end:"))]
+    assert range_calls[-3:] == ["end:SamplerBurnIn", "end:CollectSamples", "end:TrainingIteration"]
+
+
+def test_open_manifest_is_visible_while_capture_is_active(tmp_path) -> None:
+    backend = _FakeBackend()
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        backend_factory=lambda: backend,
+    )
+    context = make_run_context(tmp_path)
+    with callback.run_scope(context):
+        callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
+        assert list((context.run_dir / "native-profiling").rglob("manifest.json"))
+
+
 def test_window_counts_and_overshoot_are_recorded(tmp_path) -> None:
     backend = _FakeBackend()
     callback = NativeProfiler(enabled=True, window=TrainingIterationWindow(2, 1, 1), backend_factory=lambda: backend)
