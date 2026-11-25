@@ -1030,6 +1030,18 @@ def test_external_artifact_registration_preserves_trace_kind_and_integrity(tmp_p
     assert ref.sha256 == hashlib.sha256(target.read_bytes()).hexdigest()
 
 
+def test_external_artifact_parent_is_created_only_after_reservation(tmp_path: Path) -> None:
+    manager = _make_manager(tmp_path)
+    writer = ObservabilityBundleWriter(manager, INVOCATION_ID)
+    rel_path = "profiles/native-profiler/step-0-0/chrome-trace.json"
+    target = writer.reserve_external_artifact(rel_path, kind="trace")
+    assert not target.parent.exists()
+
+    prepared = writer.prepare_external_artifact(rel_path)
+    assert prepared == target
+    assert target.parent.is_dir()
+
+
 # ---------------------------------------------------------------------------
 # 5. Open / interrupted / torn-tail vs interior corrupt records (strictly read-only)
 # ---------------------------------------------------------------------------

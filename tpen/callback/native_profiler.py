@@ -412,6 +412,9 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
             self._diagnostic("trace_export_failed:reservation_unavailable")
             return
         try:
+            trace_path = writer.prepare_external_artifact(
+                self.callback._trace_relative_path()
+            )
             # This direct typed call is intentional: missing backend capability
             # is an explicit diagnostic failure, never a silent success.
             self.backend.export_chrome_trace(str(trace_path))

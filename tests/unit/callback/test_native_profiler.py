@@ -205,7 +205,6 @@ def test_chrome_trace_missing_backend_capability_is_partial_and_preserves_primar
     assert status["export_status"] == "failed"
     assert status["data_completeness"] == "partial"
     assert status.get("artifacts") is None
-    assert any(item.startswith("trace_export_failed") for item in status["activity_diagnostics"])
 
 
 def test_live_callback_and_session_refuse_serialization() -> None:

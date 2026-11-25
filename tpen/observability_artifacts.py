@@ -3061,6 +3061,65 @@ class ObservabilityBundleWriter:
         self._written_artifacts[normalized] = target
         return ref
 
+    def prepare_external_artifact(self, rel_path: str) -> Path:
+        """Create a reserved artifact's parent directory after validation.
+
+        Reservation remains read-only. This separate writer-owned operation is
+        the only place that creates the missing directory tail for an external
+        backend, and it rechecks every component after each ``mkdir`` so a
+        symlink race cannot redirect the backend outside the resolved bundle.
+        """
+
+        self._require_not_finalized("prepare an external artifact")
+        normalized = validate_relative_path(
+            rel_path, "external_artifact_path", forbid_manifest_self=True
+        )
+        if normalized not in self._artifact_kinds:
+            raise ObservabilityArtifactError(
+                f"external artifact {normalized!r} was not reserved"
+            )
+        target = self._safe_artifact_path(normalized)
+        resolved_run = self._artifact_manager.run_dir.resolve(strict=False)
+        resolved_bundle = self.bundle_dir.resolve(strict=False)
+        current = self._artifact_manager.run_dir
+        all_parts = (
+            *self.sink.relative_dir.split("/"),
+            self.invocation_id,
+            *Path(normalized).parent.parts,
+        )
+        for part in all_parts:
+            current = current / part
+            if current.is_symlink():
+                raise ObservabilityPathError(
+                    f"refusing symlinked external artifact parent {current!s}"
+                )
+            if current.exists() and not current.is_dir():
+                raise ObservabilityPathError(
+                    f"external artifact parent {current!s} is not a directory"
+                )
+            current.mkdir(exist_ok=True)
+            if current.is_symlink():
+                raise ObservabilityPathError(
+                    f"refusing symlinked external artifact parent {current!s}"
+                )
+            resolved_current = current.resolve(strict=False)
+            try:
+                resolved_current.relative_to(resolved_run)
+            except ValueError as exc:
+                raise ObservabilityPathError(
+                    f"external artifact parent {current!s} resolves outside run "
+                    f"{resolved_run!s}"
+                ) from exc
+        try:
+            current.resolve(strict=False).relative_to(resolved_bundle)
+        except ValueError as exc:
+            raise ObservabilityPathError(
+                f"external artifact parent {current!s} resolves outside bundle "
+                f"{resolved_bundle!s}"
+            ) from exc
+        _check_no_symlinks_under(self.bundle_dir, normalized.split("/"))
+        return target
+
     def _atomic_write_bytes(self, target: Path, payload: bytes) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.is_symlink():
