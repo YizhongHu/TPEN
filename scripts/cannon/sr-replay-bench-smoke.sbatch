@@ -1,5 +1,5 @@
 #!/bin/bash
-# One complete CPU smoke control for Slice 1.  The caller supplies only the
+# One complete CPU diagnostic smoke control for Slice 1.  The caller supplies only the
 # unique evidence root, staged source archive, and immutable shared environment.
 # Staging contract: SOURCE_ARCHIVE is the exact basename written below
 # STAGE_ROOT (default: source.tar); the submitter must export the same value.
@@ -60,4 +60,6 @@ echo "python=$(command -v python)"
 "$OVERLAY_PYTHON" -I "$CHECKOUT/scripts/cannon/sr_replay_benchmark.py" \
   --device cpu \
   --smoke \
+  --diagnostic \
+  --diagnostic-cell 8 8 \
   --output "$RUN_ROOT/sr-replay-benchmark.json"

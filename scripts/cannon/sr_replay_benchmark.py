@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
+import random
 import resource
 import sys
 import time
@@ -43,6 +45,8 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "experiments/atomistic/stage1/configs/he/train.yaml"
 GI_B = 1024**3
 MIB_B = 1024**2
+DIAGNOSTIC_K = 32
+DIAGNOSTIC_RANDOM = 32
 
 
 class HarnessInvalid(RuntimeError):
@@ -72,6 +76,7 @@ class Trial:
     damping: float | None
     diagnostics: dict[str, Any]
     memory: dict[str, int | None]
+    design_cpu: torch.Tensor | None
 
 
 def _require_type(value: Any, expected: type, path: str) -> None:
@@ -265,17 +270,20 @@ def _timed(device: torch.device, fn: Any) -> tuple[float, float | None, bool, An
     return event_elapsed, event_elapsed, True, value, _memory_snapshot(device)
 
 
-def _dense_trial(case: Case, *, include_reference: bool) -> Trial:
+def _dense_trial(case: Case, *, include_reference: bool, retain_design: bool = False) -> Trial:
     model = case.model
     request = MaterializedParameterScoreRequest(chunk_size=case.policy.score_chunk_size)
     packet = model.evaluate_materialized_parameter_score_request(request=request, batch=case.batch).detach()
     reference_gram = None
     reference_trace = None
     reference_damping = None
+    design_cpu = None
     if include_reference:
         # The dense reference is parity-only; it must not be part of the timed current path.
         rows = flatten_parameter_score_blocks(packet.parameter_scores, sample_shape=tuple(packet.output.logabs.shape))
         geometry = build_score_geometry_from_rows(rows, layout=packet.parameter_scores.layout)
+        if retain_design:
+            design_cpu = geometry.design.detach().to("cpu", dtype=torch.float64)
         residual = build_energy_residual(case.local_energy, geometry=geometry)
         operator = QGTOperator(geometry)
         _, dense_diag = solve_sample_space(
@@ -333,6 +341,7 @@ def _dense_trial(case: Case, *, include_reference: bool) -> Trial:
             "dtype": telemetry.diagnostics.dtype,
         },
         memory={},
+        design_cpu=design_cpu,
     )
 
 
@@ -341,6 +350,9 @@ def _replay_trial(case: Case, *, panel_size: int) -> Trial:
     p = case.model.parameter_binding.layout.total_numel
     all_indices = torch.arange(n, device=case.batch.positions.device)
     panels = [all_indices[start : start + panel_size] for start in range(0, n, panel_size)]
+    coverage = torch.bincount(torch.cat(panels).cpu(), minlength=n)
+    if not torch.equal(coverage, torch.ones(n, dtype=coverage.dtype)):
+        raise HarnessInvalid(f"replay row coverage is not exactly once: {coverage.tolist()}")
     score_sum = torch.zeros(p, dtype=torch.float64, device=case.batch.positions.device)
     for indices in panels:
         score_sum += _score_rows(case.model, case.batch, indices, chunk_size=indices.numel()).sum(dim=0)
@@ -400,8 +412,12 @@ def _replay_trial(case: Case, *, panel_size: int) -> Trial:
             "max_eigenvalue": float(max_eigenvalue),
             "min_retained_eigenvalue": float(min_retained),
             "dtype": str(gram.dtype),
+            "row_coverage_counts": [int(value) for value in coverage.tolist()],
+            "row_panel_count": len(panels),
+            "row_panel_sizes": [int(panel.numel()) for panel in panels],
         },
         memory={},
+        design_cpu=None,
     )
 
 
@@ -424,6 +440,139 @@ def _assert_parity(dense: Trial, replay: Trial) -> None:
             )
 
 
+def _diagnostic_entries(
+    dense_gram: torch.Tensor,
+    replay_gram: torch.Tensor,
+    design_cpu: torch.Tensor,
+    *,
+    seed: int,
+) -> dict[str, Any]:
+    """Compare selected Gram entries with a CPU ``math.fsum`` reference."""
+
+    dense_cpu = dense_gram.detach().to("cpu", dtype=torch.float64)
+    replay_cpu = replay_gram.detach().to("cpu", dtype=torch.float64)
+    mismatch = (dense_cpu - replay_cpu).abs()
+    n, p = design_cpu.shape
+    flat_order = torch.argsort(mismatch.reshape(-1), descending=True).tolist()
+    worst = flat_order[: min(DIAGNOSTIC_K, n * n)]
+    rng = random.Random(seed)
+    random_indices = rng.sample(range(n * n), min(DIAGNOSTIC_RANDOM, n * n))
+    selected: dict[int, set[str]] = {}
+    for index in worst:
+        selected.setdefault(int(index), set()).add("worst")
+    for index in random_indices:
+        selected.setdefault(int(index), set()).add("random")
+
+    eps = torch.finfo(torch.float64).eps
+    entries: list[dict[str, Any]] = []
+    for flat_index, kinds in selected.items():
+        i, j = divmod(flat_index, n)
+        row_i = design_cpu[i].tolist()
+        row_j = design_cpu[j].tolist()
+        g_ref = math.fsum(float(a) * float(b) for a, b in zip(row_i, row_j))
+        s_ij = math.fsum(abs(float(a)) * abs(float(b)) for a, b in zip(row_i, row_j))
+        scale = float(p) * eps * s_ij
+        dense_error = float(dense_cpu[i, j].item()) - g_ref
+        replay_error = float(replay_cpu[i, j].item()) - g_ref
+        entries.append(
+            {
+                "i": i,
+                "j": j,
+                "selection": sorted(kinds),
+                "dense_minus_reference": dense_error,
+                "replay_minus_reference": replay_error,
+                "abs_g_reference": abs(g_ref),
+                "S_ij": s_ij,
+                "P_times_eps_times_S": scale,
+                "dense_error_over_P_eps_S": dense_error / scale if scale else (0.0 if dense_error == 0.0 else math.inf),
+                "replay_error_over_P_eps_S": replay_error / scale if scale else (0.0 if replay_error == 0.0 else math.inf),
+                "farther_from_reference": "dense" if abs(dense_error) > abs(replay_error) else "replay" if abs(replay_error) > abs(dense_error) else "tie",
+            }
+        )
+
+    dense_errors = [abs(entry["dense_minus_reference"]) for entry in entries]
+    replay_errors = [abs(entry["replay_minus_reference"]) for entry in entries]
+    dense_ratios = [abs(entry["dense_error_over_P_eps_S"]) for entry in entries]
+    replay_ratios = [abs(entry["replay_error_over_P_eps_S"]) for entry in entries]
+    farther_counts = {"dense": 0, "replay": 0, "tie": 0}
+    for entry in entries:
+        farther_counts[entry["farther_from_reference"]] += 1
+    return {
+        "K_worst": DIAGNOSTIC_K,
+        "random_count": DIAGNOSTIC_RANDOM,
+        "selected_count": len(entries),
+        "reference": "math.fsum(float(x_i[k]) * float(x_j[k]) for k in range(P))",
+        "eps": float(eps),
+        "entries": entries,
+        "summary": {
+            "max_abs_dense_error": max(dense_errors, default=0.0),
+            "max_abs_replay_error": max(replay_errors, default=0.0),
+            "max_abs_dense_error_over_P_eps_S": max(dense_ratios, default=0.0),
+            "max_abs_replay_error_over_P_eps_S": max(replay_ratios, default=0.0),
+            "mean_abs_dense_error": sum(dense_errors) / len(dense_errors) if dense_errors else 0.0,
+            "mean_abs_replay_error": sum(replay_errors) / len(replay_errors) if replay_errors else 0.0,
+            "farther_from_reference_counts": farther_counts,
+        },
+    }
+
+
+def _bound_check(
+    dense_gram: torch.Tensor,
+    replay_gram: torch.Tensor,
+    design_cpu: torch.Tensor,
+) -> dict[str, Any]:
+    """Check the non-gating first-order summation bound for every entry."""
+
+    dense_cpu = dense_gram.detach().to("cpu", dtype=torch.float64)
+    replay_cpu = replay_gram.detach().to("cpu", dtype=torch.float64)
+    abs_design = design_cpu.abs()
+    s_matrix = abs_design @ abs_design.transpose(0, 1)
+    eps = torch.finfo(torch.float64).eps
+    p = design_cpu.shape[1]
+    difference = (dense_cpu - replay_cpu).abs()
+    denominator = 4.0 * float(p) * eps * s_matrix
+    ratio = torch.zeros_like(difference)
+    positive = denominator > 0.0
+    ratio[positive] = difference[positive] / denominator[positive]
+    ratio[~positive] = torch.where(difference[~positive] == 0.0, torch.zeros_like(difference[~positive]), torch.full_like(difference[~positive], math.inf))
+    return {
+        "bound": "4 * P * eps * S_ij",
+        "pass": bool(torch.all(difference <= denominator).item()),
+        "max_ratio": float(torch.max(ratio).item()),
+        "violating_entries": int(torch.count_nonzero(difference > denominator).item()),
+        "P": int(p),
+        "eps": float(eps),
+    }
+
+
+def _diagnostic_report(case: Case, dense: Trial, replay: Trial, *, seed: int) -> dict[str, Any]:
+    design_cpu = dense.design_cpu
+    if dense.gram is None or replay.gram is None or design_cpu is None:
+        raise HarnessInvalid("diagnostic requires dense and replay Gram matrices")
+    trace_diff = float(replay.trace) - float(dense.trace)
+    lambda_diff = float(replay.damping) - float(dense.damping)
+    return {
+        "cell": {"N": case.n_walkers, "P": int(design_cpu.shape[1]), "channel_width": case.channel_width},
+        "row_structure": {
+            "coverage_asserted": True,
+            "coverage_counts": replay.diagnostics.get("row_coverage_counts"),
+            "panel_count": replay.diagnostics.get("row_panel_count"),
+            "panel_sizes": replay.diagnostics.get("row_panel_sizes"),
+        },
+        "trace_lambda_compare": {
+            "trace_dense": float(dense.trace),
+            "trace_replay": float(replay.trace),
+            "trace_difference": trace_diff,
+            "lambda_dense": float(dense.damping),
+            "lambda_replay": float(replay.damping),
+            "lambda_difference": lambda_diff,
+            "pass": abs(trace_diff) <= 1.0e-11 * max(abs(float(dense.trace)), 1.0) and abs(lambda_diff) <= 1.0e-11 * max(abs(float(dense.damping)), 1.0),
+        },
+        "entry_reference": _diagnostic_entries(dense.gram, replay.gram, design_cpu, seed=seed),
+        "bound_check": _bound_check(dense.gram, replay.gram, design_cpu),
+    }
+
+
 def _json_tensor_stats(values: list[float]) -> dict[str, Any]:
     return {
         "samples_seconds": values,
@@ -444,14 +593,32 @@ def _run_cell(
     warmups: int,
     repetitions: int,
     seed: int,
+    diagnostic: bool = False,
 ) -> dict[str, Any]:
     case = _make_case(cfg, width=width, n_walkers=n_walkers, device=device, seed=seed)
     p = case.model.parameter_binding.layout.total_numel
     _restore(case)
-    dense_parity = _dense_trial(case, include_reference=True)
+    dense_parity = _dense_trial(case, include_reference=True, retain_design=diagnostic)
     _restore(case)
     replay_parity = _replay_trial(case, panel_size=panel_size)
-    _assert_parity(dense_parity, replay_parity)
+    parity_error: str | None = None
+    try:
+        _assert_parity(dense_parity, replay_parity)
+    except HarnessInvalid as exc:
+        parity_error = str(exc)
+    diagnostic_report = _diagnostic_report(case, dense_parity, replay_parity, seed=seed) if diagnostic else None
+    if parity_error is not None:
+        if not diagnostic:
+            raise HarnessInvalid(parity_error)
+        return {
+            "N": n_walkers,
+            "channel_width": width,
+            "P": p,
+            "panel_size": panel_size,
+            "parity": {"status": "FAIL", "error": parity_error, "gram_trace_lambda_rtol": 1.0e-11, "gram_trace_lambda_atol": 1.0e-11},
+            "diagnostic": diagnostic_report,
+            "timing": {"status": "UNMEASURED_PARITY_FAILURE"},
+        }
     dense_times: list[float] = []
     replay_times: list[float] = []
     dense_memory: list[dict[str, int | None]] = []
@@ -483,7 +650,7 @@ def _run_cell(
     dense_stats = _json_tensor_stats(dense_times)
     replay_stats = _json_tensor_stats(replay_times)
     ratio = replay_stats["mean_seconds"] / dense_stats["mean_seconds"]
-    return {
+    cell = {
         "N": n_walkers,
         "channel_width": width,
         "P": p,
@@ -499,6 +666,13 @@ def _run_cell(
             "gram_trace_lambda_atol": 1.0e-11,
             "discrete_fields": "exact",
         },
+        "structure": {
+            "row_coverage_counts": replay_parity.diagnostics.get("row_coverage_counts"),
+            "row_panel_count": replay_parity.diagnostics.get("row_panel_count"),
+            "row_panel_sizes": replay_parity.diagnostics.get("row_panel_sizes"),
+            "trace": {"dense": float(dense_parity.trace), "replay": float(replay_parity.trace)},
+            "lambda": {"dense": float(dense_parity.damping), "replay": float(replay_parity.damping)},
+        },
         "timing": {
             "cuda_events": device.type == "cuda",
             "host_crosscheck": True,
@@ -507,6 +681,9 @@ def _run_cell(
             "paired_repetitions": repetitions,
         },
     }
+    if diagnostic_report is not None:
+        cell["diagnostic"] = diagnostic_report
+    return cell
 
 
 def _memory_gate(cells: list[dict[str, Any]], *, device: torch.device) -> dict[str, Any]:
@@ -554,6 +731,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--walkers", type=int, nargs=2, default=(64, 128))
     parser.add_argument("--channels", type=int, nargs=2, default=(16, 32))
     parser.add_argument("--smoke", action="store_true", help="tiny CPU-only correctness/timing smoke; not evidence")
+    parser.add_argument("--diagnostic", action="store_true", help="report exact-reference Gram diagnostics for one cell")
+    parser.add_argument("--diagnostic-cell", type=int, nargs=2, metavar=("N", "CHANNELS"), help="N and channel width for --diagnostic")
     return parser.parse_args()
 
 
@@ -563,17 +742,22 @@ def _human_summary(result: dict[str, Any]) -> str:
         f"status={result['status']} device={result.get('device', 'unknown')} cells={len(result['cells'])}",
     ]
     for cell in result["cells"]:
-        lines.append(
-            "N={N} P={P} channels={channel_width}: dense={dense:.6g}s replay={replay:.6g}s ratio={ratio:.6g} parity={parity}".format(
-                N=cell["N"],
-                P=cell["P"],
-                channel_width=cell["channel_width"],
-                dense=cell["dense"]["mean_seconds"],
-                replay=cell["replay"]["mean_seconds"],
-                ratio=cell["slowdown_replay_over_dense"],
-                parity=cell["parity"]["status"],
+        if "dense" in cell and "replay" in cell:
+            lines.append(
+                "N={N} P={P} channels={channel_width}: dense={dense:.6g}s replay={replay:.6g}s ratio={ratio:.6g} parity={parity}".format(
+                    N=cell["N"],
+                    P=cell["P"],
+                    channel_width=cell["channel_width"],
+                    dense=cell["dense"]["mean_seconds"],
+                    replay=cell["replay"]["mean_seconds"],
+                    ratio=cell["slowdown_replay_over_dense"],
+                    parity=cell["parity"]["status"],
+                )
             )
-        )
+        else:
+            lines.append(
+                f"N={cell['N']} P={cell['P']} channels={cell['channel_width']}: timing=UNMEASURED parity={cell['parity']['status']}"
+            )
     gate = result.get("memory_gate")
     if gate:
         lines.append(f"memory_gate={gate.get('status', 'unknown')}")
@@ -620,6 +804,12 @@ def main() -> int:
             device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else args.device)
             if device.type != "cuda":
                 raise HarnessInvalid("production benchmark requires CUDA; use --smoke for CPU")
+        if args.diagnostic:
+            if args.diagnostic_cell is None:
+                raise HarnessInvalid("--diagnostic requires --diagnostic-cell N CHANNELS")
+            walkers = (args.diagnostic_cell[0],)
+            channels = (args.diagnostic_cell[1],)
+            result["diagnostic"] = {"cell": {"N": walkers[0], "channel_width": channels[0]}, "K_worst": DIAGNOSTIC_K, "random_count": DIAGNOSTIC_RANDOM}
         if args.panel_size < 1 or warmups < 0 or repetitions < 1:
             raise HarnessInvalid("panel size, warmups, and repetitions must be positive where applicable")
         for n in walkers:
@@ -640,6 +830,7 @@ def main() -> int:
                         warmups=warmups,
                         repetitions=repetitions,
                         seed=args.seed,
+                        diagnostic=args.diagnostic,
                     )
                 )
         result["device"] = str(device)
