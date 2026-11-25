@@ -148,6 +148,32 @@ def _r2_setup(tmp_path: Path, *, outcome: bool = True):
     return store, group, allocation, facts, _binding(group, allocation.backend_job_id), evidence, successor_binding, current
 
 
+def _controller_diagnostic(store, group, result) -> str:
+    """Render complete controller and durable-store context for a failed assertion."""
+
+    try:
+        manifest = repr(store.manifest(group))
+    except Exception as error:
+        manifest = f"<manifest-error {type(error).__name__}: {error}>"
+    records = {}
+    record_names = {
+        "current-attempt.json", "start.json", "outcome.json", "invocation.json",
+        "launch-intent.json", "controller-outcome.json", "successor-admission.json",
+    }
+    for path in sorted(Path(store.root).rglob("*.json")):
+        if path.name not in record_names and ".reconciliation-publications" not in path.parts:
+            continue
+        key = str(path.relative_to(store.root))
+        try:
+            records[key] = json.loads(path.read_text())
+        except Exception as error:
+            records[key] = f"<record-error {type(error).__name__}: {error}>"
+    return (
+        f"reconciliation={result.reconciliation!r}; member_outcomes={result.member_outcomes!r}; "
+        f"member_reasons={result.member_reasons!r}; manifest={manifest}; durable_records={records!r}"
+    )
+
+
 def test_r2_link_round_trip_preserves_typed_lineage(tmp_path: Path) -> None:
     store, group, lease, _inputs, bindings, successors, fences = _fixture(tmp_path, ("successor",), remote=False)
     predecessor = fences["successor"]
@@ -262,9 +288,10 @@ def test_r2_input_uses_admit_recovery_not_legacy_selector(tmp_path: Path, monkey
 
     monkeypatch.setattr(controller_module, "admit_recovery", admit)
     result = run_group_controller(binding, allocation.backend_job_id, facts, store, port, executor)
-    assert result.member_outcomes == (("successor", "collected"),)
-    assert admissions and all(result.status == "admitted" and root == store.root for result, root in admissions)
-    assert port.calls == []
+    diagnostic = _controller_diagnostic(store, group, result)
+    assert result.member_outcomes == (("successor", "collected"),), diagnostic
+    assert admissions and all(result.status == "admitted" and root == store.root for result, root in admissions), diagnostic
+    assert port.calls == [], diagnostic
     legacy_group, legacy_alloc, legacy_facts, legacy_binding, legacy_store = _real_fresh(tmp_path / "legacy")
     legacy_port = RecordingAdmission()
     legacy_executor = BoundaryExecutor([])
@@ -288,9 +315,10 @@ def test_r2_launch_requires_durable_publication(tmp_path: Path, monkeypatch, pub
     monkeypatch.setattr(DirectoryStore, "publish_reconciliation", publish)
     executor = BoundaryExecutor(order)
     result = run_group_controller(binding, allocation.backend_job_id, facts, store, RecordingAdmission(), executor)
-    assert order == ["publish"]
-    assert executor.calls == []
-    assert all(member.action == "park" for member in result.reconciliation.members)
+    diagnostic = _controller_diagnostic(store, group, result)
+    assert order == ["publish"], diagnostic
+    assert executor.calls == [], diagnostic
+    assert all(member.action == "park" for member in result.reconciliation.members), diagnostic
 
 
 def test_r2_success_publishes_before_submit(tmp_path: Path, monkeypatch) -> None:
@@ -305,8 +333,9 @@ def test_r2_success_publishes_before_submit(tmp_path: Path, monkeypatch) -> None
     monkeypatch.setattr(DirectoryStore, "publish_reconciliation", publish)
     executor = BoundaryExecutor(order)
     result = run_group_controller(binding, allocation.backend_job_id, facts, store, RecordingAdmission(), executor)
-    assert result.member_outcomes == (("successor", "collected"),)
-    assert order == ["publish", "submit"]
+    diagnostic = _controller_diagnostic(store, group, result)
+    assert result.member_outcomes == (("successor", "collected"),), diagnostic
+    assert order == ["publish", "submit"], diagnostic
 
 
 def test_r2_park_refuses_before_submit(tmp_path: Path) -> None:
@@ -323,22 +352,24 @@ def test_r2_park_refuses_before_submit(tmp_path: Path) -> None:
             trusted_store_root=store.root,
         )),),
     )
-    assert direct.members[0].action == "park"
+    assert direct.members[0].action == "park", f"direct_reconciliation={direct!r}; store={store.root}"
     executor = BoundaryExecutor([])
     result = run_group_controller(binding, allocation.backend_job_id, facts, store, RecordingAdmission(), executor)
     member = result.reconciliation.members[0]
-    assert executor.calls == []
-    assert member.action == "park"
-    assert member.reason_code == "checkpoint-unavailable"
+    diagnostic = _controller_diagnostic(store, group, result)
+    assert executor.calls == [], diagnostic
+    assert member.action == "park", diagnostic
+    assert member.reason_code == "checkpoint-unavailable", diagnostic
 
 
 def test_interrupted_r2_outcome_stays_observed_absence(tmp_path: Path) -> None:
     store, group, allocation, facts, binding, _evidence, _successor, current = _r2_setup(tmp_path, outcome=False)
     executor = BoundaryExecutor([])
     result = run_group_controller(binding, allocation.backend_job_id, facts, store, RecordingAdmission(), executor)
-    assert result.member_outcomes == (("successor", "collected"),)
-    assert not Path(current.output_dir, "outcome.json").exists()
-    assert not Path(current.output_dir, "core-outcome.json").exists()
+    diagnostic = _controller_diagnostic(store, group, result)
+    assert result.member_outcomes == (("successor", "collected"),), diagnostic
+    assert not Path(current.output_dir, "outcome.json").exists(), diagnostic
+    assert not Path(current.output_dir, "core-outcome.json").exists(), diagnostic
 
 
 def test_duplicate_controller_replay_is_idempotent(tmp_path: Path) -> None:
@@ -380,10 +411,11 @@ def test_c22_load_path_is_exact_admitted_checkpoint(tmp_path: Path) -> None:
     store, group, allocation, facts, binding, evidence, _successor, _current = _r2_setup(tmp_path)
     executor = BoundaryExecutor([])
     result = run_group_controller(binding, allocation.backend_job_id, facts, store, RecordingAdmission(), executor)
-    assert result.member_outcomes == (("successor", "collected"),)
+    diagnostic = _controller_diagnostic(store, group, result)
+    assert result.member_outcomes == (("successor", "collected"),), diagnostic
     record_path = next(Path(store.root).rglob("successor-admission.json"))
     record = SuccessorAdmissionRecord.decode(record_path.read_bytes())
-    assert executor.checkpoint_paths == [record.checkpoint_path]
+    assert executor.checkpoint_paths == [record.checkpoint_path], diagnostic
 
 
 def test_mutant_sources_compile_and_killers_are_declared() -> None:
