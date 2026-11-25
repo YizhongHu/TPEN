@@ -44,7 +44,7 @@ def _v2_train_row() -> tuple[dict[str, object], object]:
         checkpoints=[0, 1],
         lineage_seeds=[11, 12, 13],
         checkpoint_sha256={},
-        results_root="/n/netscratch/kozinsky_lab/Lab/r1-review",
+        results_root="/external/stage1-review",
         systems=("he",),
         phase=1,
         device="cpu",
