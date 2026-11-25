@@ -28,7 +28,7 @@ mkdir -p "$WORK_ROOT"
 cleanup() { rm -rf "$WORK_ROOT"; }
 trap cleanup EXIT
 
-COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -xf "$STAGE_ROOT/source.tar" -C "$WORK_ROOT"
+tar -xf "$STAGE_ROOT/source.tar" -C "$WORK_ROOT"
 CHECKOUT="$WORK_ROOT/tpen"
 cd "$CHECKOUT"
 
