@@ -501,11 +501,10 @@ def run_group_controller(
             record = _collected_attempt_record(manifest.attempts, item.task_id, attempt_id)
             if record is None:
                 raise ValueError("collected attempt is absent from durable manifest")
-            rebuilt = _apply_recovery_admission(item, store)
-            if record is not None:
+            try:
+                rebuilt = _apply_recovery_admission(item, store)
                 rebuilt = replace(rebuilt, attempt_id=record.attempt_id, start_receipt=record.start_receipt,
                                   outcome_receipt=record.outcome_receipt)
-            try:
                 verdict = None if item.recovery_input is not None else admission_port.admit(rebuilt)
                 if verdict is not None and not isinstance(verdict, CoreAdmissionVerdictV2):
                     verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "malformed-core-admission")
