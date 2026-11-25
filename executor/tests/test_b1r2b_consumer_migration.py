@@ -37,7 +37,7 @@ MUTANTS = (
     {"id": "r2-current-fence-required", "target": "executor/src/tpen_executor/storage.py", "old": "current_attempt_id = current_fence.attempt_id.value", "new": "current_attempt_id = admission.predecessor_attempt_id.value", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
     {"id": "preserve-typed-park-reason", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "elif member.action == \"park\":", "new": "elif False:", "killer": "test_controller_propagates_typed_park_reason"},
     {"id": "retain-r2-input-on-park", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "return replace(item, recovery_input=None, recovery_admission=admission)", "new": "return replace(item, recovery_admission=admission)", "killer": "test_controller_propagates_typed_park_reason"},
-    {"id": "skip-r2-final-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "verdict = None if item.recovery_input is not None else admission_port.admit(rebuilt)", "new": "verdict = admission_port.admit(rebuilt)", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
+    {"id": "skip-r2-final-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "verdict = None if item.recovery_input is not None else admission_port.admit(rebuilt)", "new": "verdict = admission_port.admit(rebuilt)", "killer": "test_r2_final_reconciliation_does_not_use_legacy_selector"},
     {"id": "require-r2-fence-for-legacy", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if admission_record.recovery_admission is not None:", "new": "if True:", "killer": "test_successor_uses_admitted_start_only"},
 )
 
@@ -316,6 +316,26 @@ def test_r2_input_uses_admit_recovery_not_legacy_selector(tmp_path: Path, monkey
     legacy_executor = BoundaryExecutor([])
     run_group_controller(legacy_binding, legacy_alloc.backend_job_id, legacy_facts, legacy_store, legacy_port, legacy_executor)
     assert legacy_port.calls and legacy_port.calls == ["successor"] * len(legacy_port.calls)
+
+
+def test_r2_final_reconciliation_does_not_use_legacy_selector(tmp_path: Path, monkeypatch) -> None:
+    store, group, allocation, facts, binding, _evidence, _successor, _current = _r2_setup(tmp_path)
+    port = RecordingAdmission()
+    executor = BoundaryExecutor([])
+    reconciliations = []
+    original_reconcile = controller_module.reconcile_group
+
+    def reconcile(group, inputs, **kwargs):
+        reconciliations.append(tuple((item.recovery_input, item.recovery_admission) for item in inputs))
+        return original_reconcile(group, inputs, **kwargs)
+
+    monkeypatch.setattr(controller_module, "reconcile_group", reconcile)
+    result = run_group_controller(binding, allocation.backend_job_id, facts, store, port, executor)
+    diagnostic = _controller_diagnostic(store, group, result)
+    assert len(reconciliations) == 2, diagnostic
+    final_input = reconciliations[-1][0]
+    assert final_input[0] is None and final_input[1] is not None, diagnostic
+    assert port.calls == [], diagnostic
 
 
 @pytest.mark.parametrize("publication_mode", ["raise", "park"])
