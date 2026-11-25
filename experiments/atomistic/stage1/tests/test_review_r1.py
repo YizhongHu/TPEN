@@ -315,7 +315,7 @@ def test_v2_derived_document_binds_only_derived_evidence(
 ) -> None:
     """Derived v4 evidence retains profile/root identity and rejects substitutions."""
 
-    protocol = Protocol(1, 2, 1, 2, 3, 4, 2, 2, 1)
+    protocol = Protocol(1, 2, 2, 2, 3, 4, 2, 2, 1)
     config_root = Path(__file__).parents[1] / "configs"
     overlay = overlay_path_for_system("he", profile=OVERLAY_PROFILE_V2)
     source_rows = build_manifest(
