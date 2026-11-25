@@ -8,6 +8,7 @@ import json
 import pickle
 import subprocess
 import sys
+import warnings
 
 import pytest
 
@@ -369,36 +370,55 @@ def test_backend_failures_clear_session_and_preserve_primary(failure: str, tmp_p
     assert callback._active_session is None  # type: ignore[attr-defined]
 
 
-def test_real_torch_profiler_adapter_emits_fixed_ranges_and_stops_at_window_end(tmp_path) -> None:
+@pytest.mark.parametrize("warmup_steps", [0, 1, 2])
+def test_real_torch_profiler_adapter_emits_phases_and_fixed_ranges(
+    warmup_steps: int, tmp_path
+) -> None:
     """The CPU adapter must use module-level record_function on Cannon's torch."""
 
     import torch
+    from torch.profiler import ProfilerAction
 
     callback = NativeProfiler(
         enabled=True,
-        window=TrainingIterationWindow(0, 1, 1),
+        window=TrainingIterationWindow(0, warmup_steps, 2),
         summary=TorchOperatorSummary(max_rows=256),
     )
     context = make_run_context(tmp_path)
-    with callback.run_scope(context):
-        callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
-        with torch.profiler.record_function("warmup_only"):
-            _ = torch.ones(4) + 1
-        callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
-        callback.handle_occurrence(Occurrence(Started(TrainingIteration(1)), 1), context)
-        with torch.profiler.record_function("active_only"):
-            _ = torch.ones(4) + 2
-        callback.handle_occurrence(Occurrence(Ended(TrainingIteration(1)), 1), context)
-        callback.handle_occurrence(Occurrence(Started(TrainingIteration(2)), 1), context)
-        with torch.profiler.record_function("post_window_only"):
-            _ = torch.ones(4) + 3
-        callback.handle_occurrence(Occurrence(Ended(TrainingIteration(2)), 1), context)
-        callback.handle_occurrence(Occurrence(Started(CollectSamples(0)), 1), context)
-        callback.handle_occurrence(Occurrence(Ended(CollectSamples(0)), 1), context)
+    observed_actions = []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with callback.run_scope(context) as session:
+            for step in range(warmup_steps + 2):
+                callback.handle_occurrence(Occurrence(Started(TrainingIteration(step)), 1), context)
+                assert session.backend is not None  # activation precedes the range
+                observed_actions.append(session.backend._raw.current_action)  # type: ignore[attr-defined]
+                with torch.profiler.record_function(
+                    "warmup_only" if step < warmup_steps else f"active_only_{step - warmup_steps}"
+                ):
+                    _ = torch.ones(4) + step
+                callback.handle_occurrence(Occurrence(Ended(TrainingIteration(step)), 1), context)
+            callback.handle_occurrence(Occurrence(Started(TrainingIteration(warmup_steps + 2)), 1), context)
+            with torch.profiler.record_function("post_window_only"):
+                _ = torch.ones(4) + 3
+            callback.handle_occurrence(Occurrence(Ended(TrainingIteration(warmup_steps + 2)), 1), context)
+            callback.handle_occurrence(Occurrence(Started(CollectSamples(0)), 1), context)
+            callback.handle_occurrence(Occurrence(Ended(CollectSamples(0)), 1), context)
+
+    expected_actions = (
+        [ProfilerAction.RECORD, ProfilerAction.RECORD_AND_SAVE]
+        if warmup_steps == 0
+        else [ProfilerAction.WARMUP] * warmup_steps
+        + [ProfilerAction.RECORD, ProfilerAction.RECORD_AND_SAVE]
+    )
+    assert observed_actions == expected_actions
+    if warmup_steps >= 1:
+        assert all("Profiler won't be using warmup" not in str(w.message) for w in caught)
     payload = json.loads(next(context.run_dir.rglob("summary.json")).read_text())
     names = {row["name"] for row in payload["rows"]}
-    assert "active_only" in names
-    assert "warmup_only" not in names
+    assert {f"active_only_{i}" for i in range(2)} <= names
+    if warmup_steps:
+        assert "warmup_only" not in names
     assert "post_window_only" not in names
     assert payload["truncated"] is False
 
