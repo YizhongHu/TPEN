@@ -77,6 +77,7 @@ class Trial:
     diagnostics: dict[str, Any]
     memory: dict[str, int | None]
     design_cpu: torch.Tensor | None
+    centering_mean_cpu: torch.Tensor | None
 
 
 def _require_type(value: Any, expected: type, path: str) -> None:
@@ -278,12 +279,15 @@ def _dense_trial(case: Case, *, include_reference: bool, retain_design: bool = F
     reference_trace = None
     reference_damping = None
     design_cpu = None
+    centering_mean_cpu = None
     if include_reference:
         # The dense reference is parity-only; it must not be part of the timed current path.
         rows = flatten_parameter_score_blocks(packet.parameter_scores, sample_shape=tuple(packet.output.logabs.shape))
         geometry = build_score_geometry_from_rows(rows, layout=packet.parameter_scores.layout)
         if retain_design:
             design_cpu = geometry.design.detach().to("cpu", dtype=torch.float64)
+            # Keep the O(P) mean paired with the already-retained diagnostic design.
+            centering_mean_cpu = (rows.sum(dim=0) / float(rows.shape[0])).detach().to("cpu", dtype=torch.float64)
         residual = build_energy_residual(case.local_energy, geometry=geometry)
         operator = QGTOperator(geometry)
         _, dense_diag = solve_sample_space(
@@ -342,10 +346,11 @@ def _dense_trial(case: Case, *, include_reference: bool, retain_design: bool = F
         },
         memory={},
         design_cpu=design_cpu,
+        centering_mean_cpu=centering_mean_cpu,
     )
 
 
-def _replay_trial(case: Case, *, panel_size: int) -> Trial:
+def _replay_trial(case: Case, *, panel_size: int, retain_centering_mean: bool = False) -> Trial:
     n = case.n_walkers
     p = case.model.parameter_binding.layout.total_numel
     all_indices = torch.arange(n, device=case.batch.positions.device)
@@ -418,6 +423,7 @@ def _replay_trial(case: Case, *, panel_size: int) -> Trial:
         },
         memory={},
         design_cpu=None,
+        centering_mean_cpu=mean.detach().to("cpu", dtype=torch.float64) if retain_centering_mean else None,
     )
 
 
@@ -549,8 +555,17 @@ def _diagnostic_report(case: Case, dense: Trial, replay: Trial, *, seed: int) ->
     design_cpu = dense.design_cpu
     if dense.gram is None or replay.gram is None or design_cpu is None:
         raise HarnessInvalid("diagnostic requires dense and replay Gram matrices")
+    if dense.centering_mean_cpu is None or replay.centering_mean_cpu is None:
+        raise HarnessInvalid("diagnostic requires dense and replay centering means")
     trace_diff = float(replay.trace) - float(dense.trace)
     lambda_diff = float(replay.damping) - float(dense.damping)
+    mean_difference = dense.centering_mean_cpu - replay.centering_mean_cpu
+    max_abs_mean_difference = float(mean_difference.abs().max().item())
+    max_abs_mean = float(
+        torch.maximum(dense.centering_mean_cpu.abs(), replay.centering_mean_cpu.abs()).max().item()
+    )
+    eps = torch.finfo(torch.float64).eps
+    eps_max_abs_mean = eps * max_abs_mean
     return {
         "cell": {"N": case.n_walkers, "P": int(design_cpu.shape[1]), "channel_width": case.channel_width},
         "row_structure": {
@@ -567,6 +582,17 @@ def _diagnostic_report(case: Case, dense: Trial, replay: Trial, *, seed: int) ->
             "lambda_replay": float(replay.damping),
             "lambda_difference": lambda_diff,
             "pass": abs(trace_diff) <= 1.0e-11 * max(abs(float(dense.trace)), 1.0) and abs(lambda_diff) <= 1.0e-11 * max(abs(float(dense.damping)), 1.0),
+        },
+        "centering_mean_compare": {
+            "max_abs_mean_difference": max_abs_mean_difference,
+            "max_abs_mean": max_abs_mean,
+            "eps": float(eps),
+            "eps_times_max_abs_mean": eps_max_abs_mean,
+            "ratio_to_eps_times_max_abs_mean": (
+                max_abs_mean_difference / eps_max_abs_mean
+                if eps_max_abs_mean
+                else (0.0 if max_abs_mean_difference == 0.0 else math.inf)
+            ),
         },
         "entry_reference": _diagnostic_entries(dense.gram, replay.gram, design_cpu, seed=seed),
         "bound_check": _bound_check(dense.gram, replay.gram, design_cpu),
@@ -600,7 +626,7 @@ def _run_cell(
     _restore(case)
     dense_parity = _dense_trial(case, include_reference=True, retain_design=diagnostic)
     _restore(case)
-    replay_parity = _replay_trial(case, panel_size=panel_size)
+    replay_parity = _replay_trial(case, panel_size=panel_size, retain_centering_mean=diagnostic)
     parity_error: str | None = None
     try:
         _assert_parity(dense_parity, replay_parity)
@@ -686,7 +712,11 @@ def _run_cell(
     return cell
 
 
-def _memory_gate(cells: list[dict[str, Any]], *, device: torch.device) -> dict[str, Any]:
+def _memory_gate(
+    cells: list[dict[str, Any]], *, device: torch.device, diagnostic: bool = False
+) -> dict[str, Any]:
+    if diagnostic:
+        return {"status": "NOT_APPLICABLE_DIAGNOSTIC_SINGLE_CELL"}
     if device.type != "cuda":
         return {"status": "UNMEASURED_CPU_NON_EVIDENCE"}
     # Slice 1 plan: "accept the prototype result only if all four allocator peaks fit below 18 GiB ... and the measured increment in (N) is invariant ... and the measured increment in (P) is invariant ..."
@@ -834,10 +864,14 @@ def main() -> int:
                     )
                 )
         result["device"] = str(device)
-        result["memory_gate"] = _memory_gate(result["cells"], device=device)
-        result["status"] = "PASS" if result["memory_gate"]["status"] in ("PASS", "UNMEASURED_CPU_NON_EVIDENCE") else "FAIL"
-        if args.smoke:
-            result["status"] = "CPU_SMOKE_PASS"
+        result["memory_gate"] = _memory_gate(result["cells"], device=device, diagnostic=args.diagnostic)
+        if args.diagnostic:
+            parity_status = "PASS" if all(cell["parity"]["status"] == "PASS" for cell in result["cells"]) else "FAIL"
+            result["status"] = f"DIAGNOSTIC_COMPLETE_PARITY_{parity_status}"
+        else:
+            result["status"] = "PASS" if result["memory_gate"]["status"] in ("PASS", "UNMEASURED_CPU_NON_EVIDENCE") else "FAIL"
+            if args.smoke:
+                result["status"] = "CPU_SMOKE_PASS"
     except (HarnessInvalid, RuntimeError, ValueError, torch.cuda.OutOfMemoryError) as exc:
         result["status"] = "HARNESS_INVALID"
         result["error"] = f"{type(exc).__name__}: {exc}"
@@ -849,7 +883,7 @@ def main() -> int:
     summary_path.write_text(summary, encoding="utf-8")
     print(summary, end="")
     print(json.dumps({"status": result["status"], "output": str(output), "summary": str(summary_path), "cells": len(result["cells"])}, sort_keys=True))
-    return 0 if result["status"] in ("PASS", "CPU_SMOKE_PASS") else 2
+    return 0 if result["status"] in ("PASS", "CPU_SMOKE_PASS", "DIAGNOSTIC_COMPLETE_PARITY_PASS") else 2
 
 
 if __name__ == "__main__":

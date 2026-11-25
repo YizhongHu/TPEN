@@ -64,3 +64,39 @@ echo "python=$(command -v python)"
   --diagnostic \
   --diagnostic-cell 8 8 \
   --output "$RUN_ROOT/sr-replay-benchmark.json"
+
+"$OVERLAY_PYTHON" -I - "$CHECKOUT" <<'PY'
+import importlib.util
+import sys
+
+import torch
+
+checkout = sys.argv[1]
+sys.path.insert(0, checkout)
+module_path = f"{checkout}/scripts/cannon/sr_replay_benchmark.py"
+spec = importlib.util.spec_from_file_location("sr_replay_benchmark_smoke", module_path)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+cell = {
+    "N": 128,
+    "P": 961284,
+    "channel_width": 32,
+    "panel_size": 16,
+    "parity": {"status": "FAIL", "error": "synthetic diagnostic parity failure"},
+    "diagnostic": {"centering_mean_compare": {}},
+    "timing": {"status": "UNMEASURED_PARITY_FAILURE"},
+}
+result = {"status": "UNMEASURED", "device": "cuda", "cells": [cell]}
+result["memory_gate"] = module._memory_gate(
+    result["cells"], device=torch.device("cuda"), diagnostic=True
+)
+parity_status = "PASS" if all(item["parity"]["status"] == "PASS" for item in result["cells"]) else "FAIL"
+result["status"] = f"DIAGNOSTIC_COMPLETE_PARITY_{parity_status}"
+summary = module._human_summary(result)
+assert result["memory_gate"]["status"] == "NOT_APPLICABLE_DIAGNOSTIC_SINGLE_CELL"
+assert result["status"] == "DIAGNOSTIC_COMPLETE_PARITY_FAIL"
+assert "timing=UNMEASURED parity=FAIL" in summary
+print("synthetic_diagnostic_parity_fail=PASS")
+PY
