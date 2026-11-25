@@ -38,7 +38,7 @@ MUTANTS = (
         "target": "executor/src/tpen_executor/storage.py",
         "old": '_require_regular(core_path, "core outcome record")',
         "new": "None",
-        "killer": "test_rc0_only_or_unknown_verdict_is_rejected",
+        "killer": "test_symlinked_core_outcome_is_rejected",
     },
     {
         "id": "full-horizon-requires-target-progress",
@@ -98,8 +98,7 @@ MUTANT_GUARDS = {
 
 INTENDED_ASSERTION_TRACES = {
     "test_rc0_only_or_unknown_verdict_is_rejected": (
-        "typed completed verdict", "durable core outcome", "missing core-outcome unreadable guard",
-        "symlink core-outcome regular-file guard", "durable outcome receipt",
+        "typed completed verdict", "missing core-outcome regular-file guard",
     ),
     "test_under_target_progress_is_rejected": (
         "typed completed verdict", "durable core outcome", "checkpoint_ref", "target progress",
@@ -115,6 +114,9 @@ INTENDED_ASSERTION_TRACES = {
     ),
     "test_completion_refusal_is_side_effect_only": ("per-task completion publication", "refusal is swallowed"),
     "test_non_iteration_horizon_is_rejected": ("typed completed verdict", "durable core outcome", "non-iteration units"),
+    "test_symlinked_core_outcome_is_rejected": (
+        "typed completed verdict", "durable core outcome", "symlink core-outcome regular-file guard",
+    ),
 }
 
 
@@ -223,11 +225,11 @@ def test_rc0_only_or_unknown_verdict_is_rejected(tmp_path: Path) -> None:
     no_core_fence = no_core_store.begin_attempt(no_core_group, "a", allocation, "2026-11-25T14:00:00Z")
     Path(no_core_fence.output_dir, "core").mkdir()
     no_core_store.finish_attempt(no_core_fence, "completed", "2026-11-25T14:01:00Z")
-    # A missing record reaches the later decode/read guard after the regular-file
-    # check and therefore has a distinct unreadable-evidence diagnosis.
-    with pytest.raises(FenceRejected, match="final completion evidence is unreadable"):
+    with pytest.raises(FenceRejected, match="core outcome record is missing"):
         _publish(no_core_store, no_core_group, no_core_fence, _verdict(), no_core_group.members[0])
 
+
+def test_symlinked_core_outcome_is_rejected(tmp_path: Path) -> None:
     # Keep the _require_regular guard's killer independent from the missing-file
     # path: the symlink target is a valid record from this same attempt, so a
     # mutant that removes only the regular-file guard reads otherwise-consistent
