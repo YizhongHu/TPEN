@@ -20,7 +20,7 @@ import tpen_executor.lifecycle.controller as controller_module
 from tpen_executor.recovery import CoreAdmissionVerdictV2, RecoveryAdmissionInputV1, RecoveryGrantV1, admit_recovery
 from tpen_executor.results import OutcomeReceipt, StartReceipt, SuccessorAdmissionRecord
 from tpen_executor.lifecycle.local_executor import LeafSubmissionError, LocalLeafExecutor
-from tpen_executor.storage import AdmissionFork, AdmissionUnreadable, DirectoryStore, FenceRejected, read_successor_admission
+from tpen_executor.storage import AdmissionFork, DirectoryStore, FenceRejected, read_successor_admission
 
 from test_b1a_b_publication import _fixture
 from test_b1r2a_recovery_admission import _facts
@@ -260,7 +260,7 @@ def test_r2_adapter_without_admitted_boundary_refuses(tmp_path: Path) -> None:
     diagnostic = _controller_diagnostic(store, group, result)
     assert executor.calls == [], diagnostic
     assert result.member_outcomes == (("successor", "parked"),), diagnostic
-    assert result.member_reasons[0][1].startswith("member-transition:executor-launch:LeafSubmissionError"), diagnostic
+    assert result.member_reasons[0][1].startswith("executor-launch:LeafSubmissionError"), diagnostic
 
 
 def test_crossed_r2_request_is_refused_before_ledger(tmp_path: Path) -> None:
@@ -296,18 +296,26 @@ def test_reader_rejects_crossed_embedded_request_with_recomputed_digest(tmp_path
         current, request, acceptance,
         successor_binding=successor_binding, recovery_admission=item.recovery_admission,
     )
+    successor = store.begin_admitted_successor(
+        group, "successor",
+        ConfiguredAllocation(successor_binding.allocation_attempt.allocation_id, successor_binding.allocation_attempt.backend_job_id, {}),
+        "2026-11-24T00:03:00Z", "local", allocation_attempt=successor_binding.allocation_attempt,
+        admission=record, current_fence=current,
+    )
     ledger = Path(store.root) / "groups" / group.identity / "successor" / "successor-admissions" / record.predecessor_attempt_id.value / "successor-admission.json"
     wire = json.loads(ledger.read_bytes())
     wire["successor_request"]["predecessor"]["attempt_id"] = "crossed-predecessor"
     wire["request_digest"] = digest(wire["successor_request"])
     ledger.write_bytes(canonical_bytes(wire))
-    with pytest.raises(AdmissionUnreadable, match="successor admission") as error:
-        read_successor_admission(
-            current.output_dir, task_id="successor", attempt_id=record.successor_attempt_id.value,
-            group_digest=group.identity, science_input_digest=request["science_input_digest"],
-            target_iterations=request["target_iterations"],
-        )
-    assert "successor admission" in str(error.value), f"error={error.value!r}; wire={wire!r}"
+    clean = read_successor_admission(
+        successor.output_dir, task_id="successor", attempt_id=record.successor_attempt_id.value,
+        group_digest=group.identity, science_input_digest=request["science_input_digest"],
+        target_iterations=request["target_iterations"],
+    )
+    assert clean["record"]["successor"]["attempt_id"] == record.successor_attempt_id.value, f"clean={clean!r}"
+    with pytest.raises(ValueError, match="successor_request crosses admission identity") as error:
+        SuccessorAdmissionRecord.from_mapping(wire)
+    assert "successor_request crosses admission identity" in str(error.value), f"error={error.value!r}; wire={wire!r}"
 
 
 def test_crossed_r2_successor_link_is_rejected(tmp_path: Path) -> None:
