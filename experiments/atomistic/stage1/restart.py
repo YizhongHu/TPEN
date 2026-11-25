@@ -24,6 +24,7 @@ from experiments.atomistic.stage1.train import build_train_config
 from experiments.toolkit.run_paths import resolve_run_dir
 from tpen.inspection import RunEvidence, inspect_run
 from tpen.run import run_from_config
+from tpen.callback import PlannedYield
 
 
 class RestartCause(str, Enum):
@@ -78,6 +79,39 @@ class RestartResult:
     outcome: str
     exit_code: int
     runner_load: Mapping[str, str]
+
+
+def _stop_at(row: Mapping[str, Any], target: int) -> int | None:
+    """Validate and return the optional operational prefix boundary."""
+
+    execution = row.get("execution")
+    if execution is None:
+        return None
+    if not isinstance(execution, Mapping) or set(execution) != {"stop_at"}:
+        raise RestartRefusal(
+            "execution must contain only the optional stop_at datum",
+            cause=RestartCause.INVALID_RESUME,
+        )
+    stop_at = execution.get("stop_at")
+    if type(stop_at) is not int or stop_at <= 0 or stop_at >= target:
+        raise RestartRefusal(
+            "execution.stop_at must be a positive retained boundary below H",
+            cause=RestartCause.HORIZON_MISMATCH,
+        )
+    steps = row.get("checkpoint_steps")
+    if not isinstance(steps, (list, tuple)) or stop_at not in steps:
+        raise RestartRefusal(
+            "execution.stop_at must name a retained checkpoint",
+            cause=RestartCause.INVALID_RESUME,
+        )
+    return stop_at
+
+
+def _runtime_callbacks(row: Mapping[str, Any], target: int) -> tuple[object, ...]:
+    """Translate the row-owned stop datum to the existing public callback."""
+
+    stop_at = _stop_at(row, target)
+    return () if stop_at is None else (PlannedYield(stop_at, target),)
 
 
 def _configured_recorder_overlay(cfg: Any, overlay: str | None) -> str | None:
@@ -194,6 +228,14 @@ def _checkpoint_facts(
 ) -> tuple[Path, int, int]:
     """Validate public checkpoint facts without inspecting core files."""
 
+    # A continuation is admitted only from the published-prefix outcome.  The
+    # attribute guard preserves the small legacy unit doubles used by the
+    # pre-v4 restart tests; real ``RunEvidence`` always carries ``outcome``.
+    if hasattr(evidence, "outcome") and evidence.outcome != "planned_yield":
+        raise RestartRefusal(
+            "requested continuation requires a planned_yield outcome",
+            cause=RestartCause.INVALID_RESUME,
+        )
     if evidence.verdict == "refused" or evidence.refusal is not None:
         reason = (
             evidence.refusal.get("reason", "public run inspection refused")
@@ -325,18 +367,64 @@ def execute_restart(
             overlay=overlay, overlay_sha256=overlay_sha256,
         )
     validate_resolved_train_config(cfg, row)
+    target = _target_iterations(cfg, row)
     _refuse_unsupported_resume_callbacks(cfg, overlay)
     selection = select_restart(cfg=cfg, row=row, run_dir=run_dir, inspector=inspector)
+    callbacks = _runtime_callbacks(row, target)
+    stop_at = _stop_at(row, target)
+    if stop_at is not None and stop_at <= max(selection.next_iteration, selection.completed_updates):
+        raise RestartRefusal(
+            "execution.stop_at is stale or already reached by the selected checkpoint",
+            cause=RestartCause.INVALID_RESUME,
+        )
     _remove_initial_checkpoint(cfg)
     runner_load = _set_resume_load(cfg, selection.checkpoint_dir)
     runner = run_from_config if run is None else run
-    exit_code = int(runner(cfg, config_path=str(config_path), command=command))
+    kwargs: dict[str, Any] = {"config_path": str(config_path), "command": command}
+    if callbacks:
+        kwargs["runtime_callbacks"] = callbacks
+    exit_code = int(runner(cfg, **kwargs))
+    outcome = {
+        0: "completed",
+        1: "failed",
+        2: "planned_yield",
+    }.get(exit_code, "failed")
     return RestartResult(
         selection=selection,
-        outcome="completed" if exit_code == 0 else "failed",
+        outcome=outcome,
         exit_code=exit_code,
         runner_load=runner_load,
     )
+
+
+def execute_train(
+    *, cfg: Any, row: Mapping[str, Any], config_path: str | Path,
+    command: str = "stage1 train", run: Callable[..., int] | None = None,
+    inspector: Callable[[str | Path], RunEvidence] = inspect_run,
+) -> int:
+    """Run a fresh or resumed row through one shared S1-R-shaped path.
+
+    New rows use the public configured gateway, with the optional stop datum
+    supplied as a runtime callback.  An existing run directory is treated as
+    a continuation and must pass the same public inspection gates; it never
+    silently falls back to a fresh lineage.
+    """
+
+    validate_resolved_train_config(cfg, row)
+    target = _target_iterations(cfg, row)
+    admitted = _admitted_run_dir(cfg, row, None)
+    if admitted.exists():
+        _refuse_unsupported_resume_callbacks(cfg, row.get("overlay"))
+        return execute_restart(
+            cfg=cfg, row=row, config_path=config_path, command=command,
+            run=run, inspector=inspector,
+        ).exit_code
+    callbacks = _runtime_callbacks(row, target)
+    runner = run_from_config if run is None else run
+    kwargs: dict[str, Any] = {"config_path": str(config_path), "command": command}
+    if callbacks:
+        kwargs["runtime_callbacks"] = callbacks
+    return int(runner(cfg, **kwargs))
 
 
 def restart_train_from_row(
@@ -362,5 +450,6 @@ def restart_train_from_row(
 __all__ = [
     "RestartCause", "RestartRefusal", "RestartResult", "RestartSelection",
     "StartDecision", "configure_attempt_local_diagnostics", "execute_restart",
+    "execute_train",
     "restart_train_from_row", "select_restart",
 ]

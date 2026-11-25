@@ -58,6 +58,8 @@ OVERLAY_COMPOSITION_ORDER = (
     "base-config -> declared train diagnostics overlay -> manifest overrides"
 )
 CHECKPOINT_EVIDENCE_SCHEMA = "stage1-checkpoint-evidence/v1"
+MANIFEST_SCHEMA = "stage1/v4"
+LEGACY_MANIFEST_SCHEMA = "stage1/v3"
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 # Coordinate bounds are retained in the manifest contract.  The resulting
@@ -944,6 +946,50 @@ def row_config_values(row: Mapping[str, Any]) -> dict[str, Any]:
     return values
 
 
+def derive_smoke_request(
+    train_row: Mapping[str, Any], *, results_root: str, stop_at: int,
+) -> dict[str, Any]:
+    """Derive one isolated prefix request from an admitted train row.
+
+    A qualification request is intentionally still a ``train`` row.  Its
+    science recipe, identity, seeds, horizon, overlay and checkpoint schedule
+    are copied byte-for-byte; only the isolated destination and the one
+    operational stop coordinate are added.  The request is kept separate from
+    the science manifest so reusing a lineage seed cannot enter its collision
+    domain.
+
+    Parameters
+    ----------
+    train_row : mapping
+        One planner-produced train row.
+    results_root : str
+        An isolated results root that differs from the source row's root.
+    stop_at : int
+        A positive retained checkpoint strictly below the fixed train horizon.
+    """
+
+    if train_row.get("kind") != "train":
+        raise ProtocolError("smoke qualification must be derived from a train row")
+    source_root = _safe_results_root(train_row.get("results_root"))
+    isolated_root = _safe_results_root(results_root)
+    if Path(source_root).resolve() == Path(isolated_root).resolve():
+        raise ProtocolError("smoke qualification requires an isolated results_root")
+    if type(stop_at) is not int or stop_at <= 0:
+        raise ProtocolError("execution.stop_at must be a positive integer")
+    horizon = train_row.get("updates")
+    if type(horizon) is not int or horizon <= 0 or stop_at >= horizon:
+        raise ProtocolError("execution.stop_at must be below the fixed train horizon")
+    steps = train_row.get("checkpoint_steps")
+    if (not isinstance(steps, list) or
+            any(type(step) is not int for step in steps) or stop_at not in steps):
+        raise ProtocolError("execution.stop_at must name a retained checkpoint")
+    request = copy.deepcopy(dict(train_row))
+    request["results_root"] = isolated_root
+    request["execution"] = {"stop_at": stop_at}
+    _validate_run_identity(request)
+    return request
+
+
 def _is_overlay_owned_override(key: str) -> bool:
     """Identify override paths reserved by the declared train overlay."""
 
@@ -1086,6 +1132,20 @@ def validate_gateway_binding(*, binding: str, config: str | None = None,
         if row.get("checkpoint_steps"):
             steps = ",".join(str(step) for step in row["checkpoint_steps"])
             expected.add(f"checkpoint_steps=[{steps}]")
+        execution = row.get("execution")
+        if execution is not None:
+            if not isinstance(execution, Mapping) or set(execution) != {"stop_at"}:
+                raise ProtocolError(
+                    "execution must contain only the optional stop_at datum"
+                )
+            stop_at = execution.get("stop_at")
+            if (type(stop_at) is not int or stop_at <= 0
+                    or type(row.get("updates")) is not int
+                    or stop_at >= row["updates"]
+                    or stop_at not in row.get("checkpoint_steps", ())):
+                raise ProtocolError(
+                    "execution.stop_at must be a positive retained boundary below H"
+                )
     if overrides is None:
         return row
     override_map: dict[str, str] = {}
@@ -1433,13 +1493,21 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                    overlay: str | Path | None = None,
                    overlay_sha256: str | None = None,
                    science_profile: str | None = None,
-                   evaluation_selection: str | None = None) -> list[dict[str, Any]]:
-    """Expand systems into validated smoke, train, and eval rows.
+                   evaluation_selection: str | None = None,
+                   include_smoke: bool = True,
+                   auto_overlay: bool = False) -> list[dict[str, Any]]:
+    """Expand systems into validated train and eval rows.
 
     Parameters are explicit rather than defaulted so a missing identity or
     checkpoint binding fails before a launch script can be rendered. The
     explicit physical-ID map is retained for unit fixtures; production
     planning leaves it unset so train/eval parity is always checked here.
+
+    ``include_smoke`` is retained for v3 fixture and reader compatibility.
+    New production planning sets it to ``False`` and derives any bounded
+    qualification with :func:`derive_smoke_request`. ``auto_overlay`` makes
+    the planner select each system's committed overlay instead of requiring a
+    caller to repeat its path and digest.
     """
 
     protocol.validate()
@@ -1484,6 +1552,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         raise ProtocolError("overlay and overlay_sha256 must be supplied together")
     overlay_name: str | None = None
     overlay_digest: str | None = None
+    overlays_by_system: dict[str, tuple[str, str]] = {}
     if overlay is not None:
         expected_paths = {overlay_path_for_system(system) for system in selected}
         if len(expected_paths) != 1:
@@ -1494,6 +1563,17 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
             expected_sha256=overlay_sha256,
             system=expected_system,
         )
+        overlays_by_system = {
+            system: (overlay_name, overlay_digest) for system in selected
+        }
+    elif auto_overlay:
+        for system in selected:
+            committed = overlay_path_for_system(system)
+            digest = _sha256_file(resolve_overlay_path(committed))
+            relative, checked_digest, _ = _overlay_binding(
+                overlay=committed, expected_sha256=digest, system=system,
+            )
+            overlays_by_system[system] = (relative, checked_digest)
     elif science_profile == HOOKE_SCIENCE_PROFILE:
         raise ProtocolError("Hooke science train rows require the Hooke diagnostics overlay")
     if science_profile == HOOKE_SCIENCE_PROFILE and (
@@ -1553,7 +1633,9 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
     # Otherwise an excluded system can hide a seed collision from the plan.
     protocol_seeds: set[int] = set()
     for spec in SYSTEM_SPECS:
-        candidate_seeds = [smoke_seed(system=spec.name)]
+        candidate_seeds = []
+        if include_smoke:
+            candidate_seeds.append(smoke_seed(system=spec.name))
         candidate_seeds.extend(
             training_seed(system=spec.name, lineage=lineage, lineage_seed=seed)
             for lineage, seed in enumerate(lineage_seeds)
@@ -1591,24 +1673,24 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         if spec.name not in selected:
             continue
         spec.validate()
-        seed = smoke_seed(system=spec.name)
-        if seed in seen_seeds:
-            raise ProtocolError("seed collision across Stage-1 rows")
-        seen_seeds.add(seed)
-        rows.append({
-            "row_id": stable_row_id(system=spec.name, kind="smoke"),
-            "system": spec.name, "system_id": spec.system_id, "kind": "smoke",
-            "seed": seed, "source_sha": source_sha, "config_sha256": config_ids[spec.name],
-            "config_identity_rule": config_identity_rule,
-            # A smoke is the real system train config with a deliberately
-            # small budget.  Keeping one config source prevents its physics
-            # from drifting away from the train/eval pair.
-            "config": f"configs/{spec.name}/train.yaml", "results_root": root,
-            "experiment_name": "stage1", "sector": spec.name, "run_id": "smoke",
-            "updates": protocol.smoke_updates,
-            "walkers": protocol.smoke_walkers,
-            "checkpoint_steps": [protocol.smoke_updates],
-        })
+        if include_smoke:
+            seed = smoke_seed(system=spec.name)
+            if seed in seen_seeds:
+                raise ProtocolError("seed collision across Stage-1 rows")
+            seen_seeds.add(seed)
+            rows.append({
+                "row_id": stable_row_id(system=spec.name, kind="smoke"),
+                "system": spec.name, "system_id": spec.system_id, "kind": "smoke",
+                "seed": seed, "source_sha": source_sha, "config_sha256": config_ids[spec.name],
+                "config_identity_rule": config_identity_rule,
+                # v3 compatibility only. New qualification requests are
+                # derived from a train row and retain its full recipe.
+                "config": f"configs/{spec.name}/train.yaml", "results_root": root,
+                "experiment_name": "stage1", "sector": spec.name, "run_id": "smoke",
+                "updates": protocol.smoke_updates,
+                "walkers": protocol.smoke_walkers,
+                "checkpoint_steps": [protocol.smoke_updates],
+            })
         for lineage, seed in enumerate(lineage_seeds):
             train_seed = training_seed(system=spec.name, lineage=lineage, lineage_seed=seed)
             if train_seed in seen_seeds:
@@ -1640,9 +1722,8 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                     ),
                 })
                 _validate_hooke_science_train_row(row)
-            if overlay_name is not None:
-                row["overlay"] = overlay_name
-                row["overlay_sha256"] = overlay_digest
+            if spec.name in overlays_by_system:
+                row["overlay"], row["overlay_sha256"] = overlays_by_system[spec.name]
             rows.append(row)
             train_row = rows[-1]
             if phase == 1:
