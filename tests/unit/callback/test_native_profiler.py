@@ -232,7 +232,10 @@ def test_chrome_trace_missing_backend_capability_is_partial_and_preserves_primar
     assert status.get("artifacts") is None
 
 
-def test_failed_trace_reservation_has_zero_writer_mutation(tmp_path) -> None:
+@pytest.mark.parametrize("blocker_kind", ["symlink", "regular"])
+def test_failed_trace_reservation_has_zero_writer_mutation(
+    tmp_path, blocker_kind: str
+) -> None:
     context = make_run_context(tmp_path)
     callback = NativeProfiler(
         enabled=True,
@@ -248,17 +251,75 @@ def test_failed_trace_reservation_has_zero_writer_mutation(tmp_path) -> None:
     sentinel = outside / "sentinel.txt"
     sentinel.write_text("untouched", encoding="utf-8")
     bundle.mkdir(parents=True)
-    (bundle / "profiles").symlink_to(outside, target_is_directory=True)
+    target = bundle / callback._trace_relative_path()
+    if blocker_kind == "symlink":
+        (bundle / "profiles").symlink_to(outside, target_is_directory=True)
+    else:
+        target.parent.mkdir(parents=True)
+        target.write_text("pre-existing", encoding="utf-8")
     before = _tree_state(context.run_dir)
 
-    with callback.run_scope(context):
+    with callback.run_scope(context) as session:
         callback.handle_occurrence(
             Occurrence(Started(TrainingIteration(0)), 1), context
+        )
+        assert session is not None
+        assert session.writer is None  # type: ignore[union-attr]
+        assert any(
+            diagnostic.startswith("trace_reservation_failed")
+            for diagnostic in session._diagnostics  # type: ignore[union-attr]
         )
 
     assert _tree_state(context.run_dir) == before
     assert sentinel.read_text(encoding="utf-8") == "untouched"
     assert not (outside / "native-profiler").exists()
+
+
+@pytest.mark.parametrize("blocker_kind", ["symlink", "regular"])
+def test_failed_trace_reservation_latches_nonwriting_after_blocker_removed(
+    tmp_path, blocker_kind: str
+) -> None:
+    context = make_run_context(tmp_path)
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        trace=ChromeTraceExport(),
+        backend_factory=_FakeBackend,
+    )
+    bundle = callback.sink.resolve_bundle_dir(
+        context.artifact_manager, context.invocation_id
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    bundle.mkdir(parents=True)
+    target = bundle / callback._trace_relative_path()
+    if blocker_kind == "symlink":
+        (bundle / "profiles").symlink_to(outside, target_is_directory=True)
+    else:
+        target.parent.mkdir(parents=True)
+        target.write_text("pre-existing", encoding="utf-8")
+
+    with callback.run_scope(context) as session:
+        callback.handle_occurrence(
+            Occurrence(Started(TrainingIteration(0)), 1), context
+        )
+        assert session is not None
+        assert session.writer is None  # type: ignore[union-attr]
+        assert any(
+            diagnostic.startswith("trace_reservation_failed")
+            for diagnostic in session._diagnostics  # type: ignore[union-attr]
+        )
+        if blocker_kind == "symlink":
+            (bundle / "profiles").unlink()
+        else:
+            target.unlink()
+        after_removal = _tree_state(context.run_dir)
+
+    assert _tree_state(context.run_dir) == after_removal
+    assert not any(
+        path.name in {"manifest.json", "summary.json", "profile-status.json"}
+        for path in context.run_dir.rglob("*")
+    )
 
 
 def test_trace_target_created_after_reservation_is_not_overwritten(tmp_path) -> None:
@@ -523,6 +584,54 @@ def test_trace_diagnostic_failure_preserves_primary_and_summary(
     assert status.get("artifacts") is None
     assert not any(ref.get("kind") == "trace" for ref in manifest["artifacts"])
     assert summary["total_rows"] == 20
+
+
+def test_trace_temp_cleanup_failure_preserves_primary_and_terminal_persistence(
+    tmp_path, monkeypatch
+) -> None:
+    def fail_discard(
+        self: ObservabilityBundleWriter, temp_path: Path
+    ) -> None:
+        del self, temp_path
+        raise OSError("injected temp discard failure")
+
+    monkeypatch.setattr(
+        ObservabilityBundleWriter,
+        "discard_external_artifact_temp",
+        fail_discard,
+    )
+    context = make_run_context(tmp_path)
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        trace=ChromeTraceExport(),
+        backend_factory=_FakeBackend,
+    )
+    primary = RuntimeError("application primary")
+    with pytest.raises(RuntimeError) as raised:
+        with callback.run_scope(context):
+            callback.handle_occurrence(
+                Occurrence(Started(TrainingIteration(0)), 1), context
+            )
+            callback.handle_occurrence(
+                Occurrence(Ended(TrainingIteration(0)), 1), context
+            )
+            raise primary
+
+    assert raised.value is primary
+    status = json.loads(next(context.run_dir.rglob("profile-status.json")).read_text())
+    summary = json.loads(next(context.run_dir.rglob("summary.json")).read_text())
+    manifest = json.loads(next(context.run_dir.rglob("manifest.json")).read_text())
+    assert status["export_status"] == "failed"
+    assert status["data_completeness"] == "partial"
+    assert status.get("artifacts") is None
+    assert any(
+        diagnostic.startswith("trace_temp_cleanup_failed")
+        for diagnostic in status["activity_diagnostics"]
+    )
+    assert summary["total_rows"] == 20
+    assert manifest["lifecycle_state"] not in {"open", "unknown"}
+    assert not any(ref.get("kind") == "trace" for ref in manifest["artifacts"])
 
 
 def test_live_callback_and_session_refuse_serialization() -> None:

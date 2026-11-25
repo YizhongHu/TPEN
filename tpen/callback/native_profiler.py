@@ -252,6 +252,7 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
         self._activation_ns = 0
         self._closed = False
         self._activation_failed = False
+        self._writer_open_failed: bool = False
         self.trace_path: Path | None = None
         self.trace_ref: ObservabilityArtifactRef | None = None
 
@@ -301,16 +302,22 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
     def _open_writer(self) -> None:
         if self.writer is not None:
             return
-        writer = self.callback._new_writer(self.context)
-        trace_path: Path | None = None
-        if self.callback.trace is not None:
-            # Keep the writer local until reservation succeeds. A rejected
-            # reservation therefore has no writer capable of later publishing
-            # summary, status, or manifest records into that bundle.
-            trace_path = writer.reserve_external_artifact(
-                self.callback._trace_relative_path(), kind="trace"
-            )
-        writer.write_open_manifest(self.callback._open_manifest(self.context))
+        try:
+            writer = self.callback._new_writer(self.context)
+            trace_path: Path | None = None
+            if self.callback.trace is not None:
+                # Keep the writer local until reservation succeeds. A rejected
+                # reservation therefore has no writer capable of later publishing
+                # summary, status, or manifest records into that bundle.
+                trace_path = writer.reserve_external_artifact(
+                    self.callback._trace_relative_path(), kind="trace"
+                )
+            writer.write_open_manifest(self.callback._open_manifest(self.context))
+        except BaseException:
+            # Activation rejection is terminal for this invocation. Finalization
+            # must not retry admission after the original blocker changes.
+            self._writer_open_failed = True
+            raise
         self.writer = writer
         self.trace_path = trace_path
 
@@ -437,7 +444,12 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
             self._diagnostic("trace_export_failed", exc)
         finally:
             if temp_path is not None:
-                writer.discard_external_artifact_temp(temp_path)
+                try:
+                    writer.discard_external_artifact_temp(temp_path)
+                except BaseException as exc:
+                    # Temporary cleanup is diagnostic-only; it must not prevent
+                    # summary, status, or final-manifest publication.
+                    self._diagnostic("trace_temp_cleanup_failed", exc)
 
 
 class NativeProfiler(Callback):
@@ -671,7 +683,8 @@ class NativeProfiler(Callback):
         """Persist bounded status and summary without replacing application errors."""
 
         try:
-            session._open_writer()
+            if not session._writer_open_failed:
+                session._open_writer()
             writer = session.writer
             if writer is None or self.window is None:
                 return
