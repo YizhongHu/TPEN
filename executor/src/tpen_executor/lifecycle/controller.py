@@ -332,6 +332,8 @@ def run_group_controller(
             outcomes.append((member.task_id, member.action))
         elif member.action in {"start_fresh", "admit_successor"}:
             pending.append(member)
+        elif member.action == "park":
+            _park_member(member.task_id, member.reason_code)
         else:
             _park_member(member.task_id, "reconcile-action")
 
@@ -361,10 +363,21 @@ def run_group_controller(
                     admission_record = next((item.admission for item in durable_publication.members if item.evidence.task_id == member.task_id), None)
                     if not isinstance(admission_record, SuccessorAdmissionRecord) or admission_record.successor_binding is None:
                         raise LaunchIntentRejected("successor admission unavailable")
+                    member_input = next(item for item in frozen_inputs if item.task_id == member.task_id)
+                    if member_input.attempt_id is None or member_input.start_receipt is None:
+                        raise LaunchIntentRejected("recovery current fence unavailable")
+                    current_fence = AttemptFence(
+                        store.root,
+                        group.identity,
+                        member.task_id,
+                        member_input.start_receipt.allocation_id.value,
+                        member_input.attempt_id,
+                        member_input.start_receipt.output_dir,
+                    )
                     fence = store.begin_admitted_successor_current_controller(
                         group, member.task_id, allocation, facts.observed_at_utc, "local",
                         allocation_attempt=admission_record.successor_binding.allocation_attempt, admission=admission_record,
-                        controller_record=controller,
+                        current_fence=current_fence, controller_record=controller,
                     )
                     invocation = admission_record.successor_binding
                 try:

@@ -632,13 +632,15 @@ class DirectoryStore:
                                                     transport_kind: str | None, *,
                                                     allocation_attempt: AllocationAttemptV2,
                                                     admission: SuccessorAdmissionRecord,
+                                                    current_fence: AttemptFence | None = None,
                                                     controller_record: ControllerGenerationV1) -> AttemptFence:
         """Consume an admitted successor while holding controller then task locks."""
         directory = self._controller_dir(controller_record.group_id)
         with _task_lock(os.path.join(directory, _CONTROLLER_LOCK)):
             self._current_controller_locked(directory, group.group_id, controller_record)
             return self.begin_admitted_successor(group, task_id, allocation, started_at_utc, transport_kind,
-                                                 allocation_attempt=allocation_attempt, admission=admission)
+                                                 allocation_attempt=allocation_attempt, admission=admission,
+                                                 current_fence=current_fence)
 
     @staticmethod
     def _validate_task_id(task_id: str) -> None:
@@ -777,6 +779,7 @@ class DirectoryStore:
         *,
         allocation_attempt: AllocationAttemptV2,
         admission: SuccessorAdmissionRecord,
+        current_fence: AttemptFence | None = None,
         controller_record: ControllerGenerationV1 | None = None,
     ) -> AttemptFence:
         """Start the exact successor recorded by the durable CX-04 admission.
@@ -825,6 +828,17 @@ class DirectoryStore:
                 predecessor_start.allocation_id.value,
                 admission.predecessor_attempt_id, predecessor_dir,
             )
+            if current_fence is not None:
+                if (
+                    current_fence.root != self.root
+                    or current_fence.group_digest != group.identity
+                    or current_fence.task_id != task_id
+                ):
+                    raise FenceRejected("crossed current attempt fence")
+                self._validate_fence(current_fence, task_dir)
+                current_attempt_id = current_fence.attempt_id.value
+            else:
+                current_attempt_id = admission.predecessor_attempt_id.value
             pointer = os.path.join(task_dir, "current-attempt.json")
             current = None
             if os.path.lexists(pointer):
@@ -839,29 +853,30 @@ class DirectoryStore:
             invocation_bytes = binding.encode()
             if os.path.lexists(output_dir):
                 _require_directory(output_dir, "admitted successor attempt")
-                if current not in {successor.attempt_id.value, admission.predecessor_attempt_id.value}:
+                if current not in {successor.attempt_id.value, current_attempt_id}:
                     raise FenceRejected("admitted successor attempt is not current")
-                if current == admission.predecessor_attempt_id.value:
-                    self._validate_fence(predecessor_fence, task_dir)
+                if current == current_attempt_id:
+                    self._validate_fence(current_fence or predecessor_fence, task_dir)
                 for name, expected in (("start.json", start_bytes), ("invocation.json", invocation_bytes)):
                     path = os.path.join(output_dir, name)
                     if os.path.lexists(path):
                         _require_regular(path, name)
                         if Path(path).read_bytes() != expected:
                             raise AdmissionFork("admitted successor start differs")
-                    elif current == admission.predecessor_attempt_id.value:
+                    elif current == current_attempt_id:
                         _write_new(path, expected)
                     else:
                         raise FenceRejected("admitted successor receipt is missing")
-                if current == admission.predecessor_attempt_id.value:
+                if current == current_attempt_id:
                     _fsync_directory(output_dir)
                     _write_pointer(pointer, successor.attempt_id.value)
                 return AttemptFence(self.root, group.identity, task_id, allocation.allocation_id.value,
                                     successor.attempt_id, output_dir)
-            if current != admission.predecessor_attempt_id.value:
-                raise FenceRejected("admission predecessor is not current")
-            # Validate the predecessor fence while its task lock is held.
-            self._validate_fence(predecessor_fence, task_dir)
+            if current != current_attempt_id:
+                raise FenceRejected("admission current attempt is not fenced")
+            # Validate the live current fence (R2) or predecessor fence (legacy)
+            # while its task lock is held.
+            self._validate_fence(current_fence or predecessor_fence, task_dir)
             _mkdir_new(output_dir)
             _write_new(os.path.join(output_dir, "start.json"), start_bytes)
             _write_new(os.path.join(output_dir, "invocation.json"), invocation_bytes)

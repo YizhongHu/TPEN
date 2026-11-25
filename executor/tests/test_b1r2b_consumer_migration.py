@@ -33,6 +33,8 @@ MUTANTS = (
     {"id": "r2-park-submit-bypass", "target": "executor/src/tpen_executor/recovery.py", "old": "return _park(member, member.recovery_admission.reason)", "new": 'return MemberReconciliationV2(member.task_id, "admit_successor", "recovery-admitted", member.attempt_id)', "killer": "test_r2_park_refuses_before_submit"},
     {"id": "fabricate-interrupted-outcome", "target": "executor/src/tpen_executor/storage.py", "old": "if item.outcome_receipt is None:", "new": "if False:", "killer": "test_interrupted_r2_outcome_stays_observed_absence"},
     {"id": "cross-c2-2-load-path", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "admission_record.checkpoint_path,", "new": '"crossed",', "killer": "test_c22_load_path_is_exact_admitted_checkpoint"},
+    {"id": "r2-current-fence-required", "target": "executor/src/tpen_executor/storage.py", "old": "current_attempt_id = current_fence.attempt_id.value", "new": "current_attempt_id = admission.predecessor_attempt_id.value", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
+    {"id": "preserve-typed-park-reason", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "elif member.action == \"park\":", "new": "elif False:", "killer": "test_controller_propagates_typed_park_reason"},
 )
 
 
@@ -360,6 +362,26 @@ def test_r2_park_refuses_before_submit(tmp_path: Path) -> None:
     assert executor.calls == [], diagnostic
     assert member.action == "park", diagnostic
     assert member.reason_code == "checkpoint-unavailable", diagnostic
+
+
+def test_controller_propagates_typed_park_reason(tmp_path: Path) -> None:
+    store, group, allocation, facts, binding, evidence, _successor, _current = _r2_setup(tmp_path)
+    unavailable = replace(evidence, checkpoint=replace(evidence.checkpoint, committed=False))
+    item = replace(
+        facts.member_inputs[0],
+        recovery_input=replace(facts.member_inputs[0].recovery_input, evidence=unavailable),
+    )
+    result = run_group_controller(
+        binding,
+        allocation.backend_job_id,
+        replace(facts, member_inputs=(item,)),
+        store,
+        RecordingAdmission(),
+        BoundaryExecutor([]),
+    )
+    diagnostic = _controller_diagnostic(store, group, result)
+    assert result.member_outcomes == (("successor", "parked"),), diagnostic
+    assert result.member_reasons == (("successor", "checkpoint-unavailable"),), diagnostic
 
 
 def test_interrupted_r2_outcome_stays_observed_absence(tmp_path: Path) -> None:
