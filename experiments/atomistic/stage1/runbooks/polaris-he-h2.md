@@ -166,7 +166,65 @@ overlay identities, lineage, results root, and the manager-relayed
 `APPROVAL_ID`.  Do not pass a phase manifest to the wrapper's train/eval
 consumer.
 
-### 2. One selected-lineage train control
+### 2. Bounded ramp-up control on free `debug-scaling`
+
+Run the bounded ramp-up through the same wrapper and selected-lineage route
+before requesting any capacity approval.  `derive_smoke_request` changes only
+the isolated output root and the retained `execution.stop_at`; it does not
+invent a second recipe, seed, walker budget, or checkpoint schedule.  The
+example below uses the retained 50,000-update boundary and must be adapted
+only to the approved selected row and run root.
+
+```bash
+SMOKE_RESULTS_ROOT="$RESULTS_ROOT/ramp-up-r1"
+SMOKE_SELECTED_ROW="$SMOKE_RESULTS_ROOT/plan/selected-train.json"
+mkdir -p "$SMOKE_RESULTS_ROOT"/plan
+"$PYBIN" - "$RESULTS_ROOT/plan/selected-train.json" "$SMOKE_SELECTED_ROW" "$SMOKE_RESULTS_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from experiments.atomistic.stage1.protocol import derive_smoke_request
+
+source, target, results_root = map(Path, sys.argv[1:])
+row = json.loads(source.read_text(encoding="utf-8"))
+request = derive_smoke_request(row, results_root=str(results_root), stop_at=50_000)
+target.write_text(json.dumps(request, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+PY
+sha256sum "$SMOKE_SELECTED_ROW" > "$SMOKE_SELECTED_ROW.sha256"
+qsub -A HetRxnEnergy -q debug-scaling \
+  -l select=1:system=polaris:ngpus=4:ncpus=64,walltime=00:55:00,filesystems=home:eagle,place=scatter \
+  -o "$SMOKE_RESULTS_ROOT/logs/train-ramp.pbs.out" -e "$SMOKE_RESULTS_ROOT/logs/train-ramp.pbs.err" \
+  -v MODE=train,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$SMOKE_RESULTS_ROOT",EXPECTED_QUEUE=debug-scaling,PYBIN="$PYBIN",SELECTED_ROW="$SMOKE_SELECTED_ROW",APPROVAL_ID="$APPROVAL_ID" \
+  "$RESULTS_ROOT/inputs/pbs_stage1.sh"
+```
+
+The bounded control is compute-skipped only when explicitly run in
+`DRY_EXEC=1`; a submitted ramp-up must retain the PBS stdout/stderr, qstat
+terminal record, wrapper receipts, row log/status, and the selected-row hash.
+It is a ladder rung, not a science result or capacity approval.
+
+### 3. Capacity-approval gate
+
+Before requesting any `capacity` approval, the operator must have all three
+non-empty, retained artifacts from the planned and passed ramp-up ladder and
+the smoke/science comparison.  These are evidence gates, not proxy values for
+the later science run:
+
+```bash
+RAMP_UP_PLAN_RECEIPT="$RESULTS_ROOT/plan/ramp-up-planned.receipt"
+RAMP_UP_PASS_RECEIPT="$RESULTS_ROOT/plan/ramp-up-passed.receipt"
+SMOKE_SCIENCE_ARTIFACT_DIFF="$RESULTS_ROOT/plan/smoke-science-artifact-diff.txt"
+test -s "$RAMP_UP_PLAN_RECEIPT" || { echo "missing planned ramp-up receipt" >&2; exit 2; }
+test -s "$RAMP_UP_PASS_RECEIPT" || { echo "missing passed ramp-up receipt" >&2; exit 2; }
+test -s "$SMOKE_SCIENCE_ARTIFACT_DIFF" || { echo "missing smoke/science artifact diff" >&2; exit 2; }
+```
+
+Do not request or submit the paid run until those checks pass and a fresh
+manager-relayed approval names the exact source SHA, selected row, Eagle root,
+queue, node/GPU shape, and wall cap.  Paid runs remain an operator decision.
+
+### 4. One selected-lineage train control
 
 This is the first nonfree action and needs fresh approval naming the exact
 source SHA, selected row, Eagle root, queue, one-node/four-GPU shape, and wall
@@ -189,7 +247,7 @@ GPU/CPU slice.  The unbounded train row and a bounded request use this exact
 same train -> S1-R restart -> public gateway route; they differ only in the
 row's `execution.stop_at` and isolated output root.
 
-### 3. One selected eval row on free `debug`
+### 5. One selected eval row on free `debug`
 
 After the checkpoint owner publishes an eval manifest, materialize one
 approved eval row in the same way.  This is a subset consumer only; it does not
@@ -212,7 +270,7 @@ qsub -A HetRxnEnergy -q debug \
   "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 ```
 
-### 4. Collection on free `debug`
+### 6. Collection on free `debug`
 
 Collection is a CPU-only command inside the same exact-SHA job-local
 environment.  It writes only the named collection output beneath Eagle.

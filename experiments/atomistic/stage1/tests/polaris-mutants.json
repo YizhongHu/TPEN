@@ -79,7 +79,7 @@
   {
     "id": "polaris-cuda-row-admission-dropped",
     "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
-    "old": "# Replace launch.render's GPU-row admission before any guard or driver.\n    if row.get(\"device\") != \"cuda\":\n        raise SystemExit(f\"row {row.get('row_id', '<unknown>')} must have device=cuda\")",
+    "old": "if row.get(\"device\") != \"cuda\":\n    raise SystemExit(f\"row {row.get('row_id', '<unknown>')} must have device=cuda\")",
     "new": "# Mutant drops launch.render's GPU-row admission.\nif False:\n    raise SystemExit(\"mutated row admission\")",
     "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
   },

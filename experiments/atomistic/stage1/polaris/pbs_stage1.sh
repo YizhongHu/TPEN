@@ -25,6 +25,8 @@ SOURCE_SHA="${SOURCE_SHA:-}"
 CHECKOUT_ROOT="${CHECKOUT_ROOT:-}"
 RESULTS_ROOT="${RESULTS_ROOT:-}"
 SELECTED_ROW="${SELECTED_ROW:-}"
+SELECTED_ROW_SOURCE=""
+ADMITTED_ROW=""
 APPROVAL_ID="${APPROVAL_ID:-}"
 EXPECTED_QUEUE="${EXPECTED_QUEUE:-}"
 PBS_JOBID="${PBS_JOBID:-}"
@@ -172,6 +174,41 @@ validate_selected_row_or_die() {
   fi
 }
 
+admit_selected_row() {
+  require_value SELECTED_ROW
+  [[ "$SELECTED_ROW" == /* ]] || die "SELECTED_ROW must be absolute"
+  SELECTED_ROW_SOURCE="$SELECTED_ROW"
+  mkdir -p -- "$RESULTS_ROOT/plan"
+  assert_contained_path "$RESULTS_ROOT/plan/admitted-${MODE}-row.json" \
+    "$RESULTS_ROOT" ADMITTED_ROW
+  [[ ! -e "$ADMITTED_ROW" && ! -L "$ADMITTED_ROW" ]] ||
+    die "admitted selected-row snapshot already exists: $ADMITTED_ROW"
+  "$PYBIN" - "$SELECTED_ROW" "$ADMITTED_ROW" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+source, target = (Path(value) for value in sys.argv[1:])
+payload = source.read_bytes()
+target.parent.mkdir(parents=True, exist_ok=True)
+fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+except BaseException:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    raise
+PY
+  SELECTED_ROW="$ADMITTED_ROW"
+  printf 'POLARIS_ADMISSION selected_row=%s source=%s\n' \
+    "$SELECTED_ROW" "$SELECTED_ROW_SOURCE"
+}
+
 require_approval_or_die() {
   require_value APPROVAL_ID
   if [[ "$APPROVAL_ID" =~ [^A-Za-z0-9._:/-] ]]; then
@@ -211,6 +248,9 @@ write_job_receipt() {
     printf 'RESULTS_ROOT=%s\n' "$RESULTS_ROOT"
     if [[ -n "$SELECTED_ROW" ]]; then
       printf 'SELECTED_ROW=%s\n' "$SELECTED_ROW"
+    fi
+    if [[ -n "$SELECTED_ROW_SOURCE" ]]; then
+      printf 'SELECTED_ROW_SOURCE=%s\n' "$SELECTED_ROW_SOURCE"
     fi
     if [[ -n "$APPROVAL_ID" ]]; then
       printf 'APPROVAL_ID=%s\n' "$APPROVAL_ID"
@@ -589,6 +629,7 @@ main() {
       assert_results_root
       assert_pbs_context
       validate_mode_paths
+      admit_selected_row
       validate_selected_row_or_die "$SELECTED_ROW" train
       require_approval_or_die
       prepare_job
@@ -631,6 +672,7 @@ main() {
       assert_results_root
       assert_pbs_context
       validate_mode_paths
+      admit_selected_row
       validate_selected_row_or_die "$SELECTED_ROW" "$MODE"
       require_approval_or_die
       prepare_job
