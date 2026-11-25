@@ -870,7 +870,7 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
     assert len(statuses) == 2
     status_rows = set()
     for status in statuses:
-        fields = dict(field.split("=", 1) for field in status.read_text().splitlines())
+        fields = dict(field.split("=", 1) for field in status.read_text().split())
         status_rows.add(fields["row_id"])
         assert status.name.startswith(f"row-{fields['row_id']}-")
     assert status_rows == {train_row["row_id"], eval_row["row_id"]}
