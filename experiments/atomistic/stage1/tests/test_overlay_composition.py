@@ -131,6 +131,75 @@ def test_hooke_overlay_is_system_qualified_and_has_amplitude_risk() -> None:
     assert amplitude[0].start_step == 0
 
 
+@pytest.mark.parametrize("system", protocol_module.SYSTEMS)
+def test_diagnostics_v2_places_recorder_before_checkpoint_and_initial_checkpoint(
+    system: str,
+) -> None:
+    """The opt-in v2 profile orders durable capture before publication."""
+
+    overlay = CONFIG_ROOT / protocol_module.overlay_path_for_system(
+        system, profile=protocol_module.OVERLAY_PROFILE_V2,
+    )
+    cfg = load_config(str(CONFIG_ROOT / system / "train.yaml"))
+    cfg.checkpoint_steps = [0, 1]
+    protocol_module.compose_train_overlay(
+        cfg,
+        overlay=str(overlay),
+        expected_sha256=overlay_sha256(overlay),
+        overlay_profile=protocol_module.OVERLAY_PROFILE_V2,
+    )
+    stage1_train.prepare_initial_checkpoint_config(cfg)
+    targets = [entry["_target_"] for entry in cfg.callbacks]
+    checkpoint_indices = [i for i, target in enumerate(targets) if target == "tpen.callback.Checkpoint"]
+    recorder_indices = [
+        i for i, target in enumerate(targets)
+        if target == "tpen.callback.RawTrainingBatchRecorder"
+    ]
+    assert checkpoint_indices
+    assert recorder_indices == [i - 1 for i in checkpoint_indices]
+    assert max(recorder_indices) < targets.index("tpen.callback.InitialCheckpoint")
+    assert cfg.stage1_overlay.profile == protocol_module.OVERLAY_PROFILE_V2
+    assert cfg.stage1_overlay.composition_order == protocol_module.OVERLAY_V2_COMPOSITION_ORDER
+
+
+def test_diagnostics_v2_manifest_is_explicit_and_v1_stays_default() -> None:
+    """v2 rows carry a visible profile while the v1 row shape is unchanged."""
+
+    v1 = _phase1(overlay=True)
+    assert all("overlay_profile" not in row for row in v1 if row["kind"] == "train")
+    v2_overlay = CONFIG_ROOT / protocol_module.overlay_path_for_system(
+        "he", profile=protocol_module.OVERLAY_PROFILE_V2,
+    )
+    v2 = build_manifest(
+        protocol=_protocol(),
+        source_sha="a" * 40,
+        config_sha256=config_identities(config_root=CONFIG_ROOT, systems=("he",)),
+        checkpoints=[0, 1],
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root="/n/netscratch/kozinsky_lab/Lab/rhu/stage1-overlay-v2-test",
+        systems=("he",),
+        phase=1,
+        device="cpu",
+        overlay=str(v2_overlay),
+        overlay_sha256=overlay_sha256(v2_overlay),
+        overlay_profile=protocol_module.OVERLAY_PROFILE_V2,
+    )
+    train_rows = [row for row in v2 if row["kind"] == "train"]
+    assert {row["overlay_profile"] for row in train_rows} == {protocol_module.OVERLAY_PROFILE_V2}
+    assert {row["overlay"] for row in train_rows} == {
+        protocol_module.OVERLAY_V2_RELATIVE_PATH,
+    }
+    assert overlay_sha256(v2_overlay) != overlay_sha256(OVERLAY)
+
+
+def test_unknown_diagnostics_v2_profile_is_rejected() -> None:
+    """A profile marker cannot silently select an unallowlisted composition."""
+
+    with pytest.raises(ProtocolError, match="unknown diagnostics overlay profile"):
+        protocol_module.overlay_path_for_system("he", profile="diagnostics-v99")
+
+
 def test_hooke_manifest_requires_its_overlay_and_rejects_he_overlay() -> None:
     """Planner admission is finite and system-qualified."""
 

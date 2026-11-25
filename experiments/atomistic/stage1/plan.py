@@ -15,6 +15,7 @@ if _REPO_ROOT not in sys.path:
 
 from experiments.atomistic.stage1.protocol import (
     HOOKE_SYSTEMS, QHO_Q21, SYSTEMS, STAGE1_PROTOCOL,
+    OVERLAY_PROFILE_V1, OVERLAY_PROFILES,
     bind_evaluation_manifest, build_manifest, config_identities, manifest_hash,
     overlay_sha256,
 )
@@ -34,6 +35,8 @@ def main() -> int:
     parser.add_argument("--device", choices=("cpu", "cuda"))
     parser.add_argument("--overlay", help="canonical train-side diagnostics overlay")
     parser.add_argument("--overlay-sha256", help="expected exact overlay digest")
+    parser.add_argument("--overlay-profile", choices=OVERLAY_PROFILES,
+                        default=OVERLAY_PROFILE_V1)
     parser.add_argument("--systems", nargs="+", choices=SYSTEMS)
     parser.add_argument("--phase1-manifest", type=Path,
                         help="phase-1 manifest to bind during phase 2")
@@ -62,6 +65,8 @@ def main() -> int:
         parser.error("Hooke production phase 1 requires --science-profile hooke-hv2-v1")
     if args.overlay_sha256 is not None and args.overlay is None:
         raise ValueError("--overlay-sha256 requires --overlay")
+    if args.overlay is None and args.overlay_profile != OVERLAY_PROFILE_V1:
+        parser.error("--overlay-profile requires --overlay")
     effective_overlay_sha = (
         None if args.overlay is None else args.overlay_sha256 or overlay_sha256(args.overlay)
     )
@@ -76,6 +81,7 @@ def main() -> int:
                               results_root=args.results_root, systems=systems, phase=1,
                               device=args.device, overlay=args.overlay,
                               overlay_sha256=effective_overlay_sha,
+                              overlay_profile=args.overlay_profile,
                               science_profile=args.science_profile,
                               evaluation_selection=args.evaluation_selection)
     else:
@@ -116,6 +122,7 @@ def main() -> int:
                                   results_root=args.results_root, systems=systems, phase=2,
                                   device=args.device, overlay=args.overlay,
                                   overlay_sha256=effective_overlay_sha,
+                                  overlay_profile=args.overlay_profile,
                                   science_profile=args.science_profile,
                                   evaluation_selection=args.evaluation_selection)
     args.output.parent.mkdir(parents=True, exist_ok=True)

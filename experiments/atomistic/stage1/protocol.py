@@ -48,14 +48,26 @@ HE_H2_SYSTEMS = frozenset({"he", "h2"})
 HOOKE_SYSTEMS = frozenset({"hooke1", "hooke2", "qho2e"})
 OVERLAY_RELATIVE_PATH = "configs/overlays/diagnostics-v1.yaml"
 HOOKE_OVERLAY_RELATIVE_PATH = "configs/overlays/hooke-diagnostics-v1.yaml"
+OVERLAY_V2_RELATIVE_PATH = "configs/overlays/diagnostics-v2.yaml"
+HOOKE_OVERLAY_V2_RELATIVE_PATH = "configs/overlays/hooke-diagnostics-v2.yaml"
+OVERLAY_PROFILE_V1 = "diagnostics-v1"
+OVERLAY_PROFILE_V2 = "diagnostics-v2"
+OVERLAY_PROFILES = (OVERLAY_PROFILE_V1, OVERLAY_PROFILE_V2)
 OVERLAY_SYSTEMS = frozenset({"he", "h2"})
 HOOKE_OVERLAY_SYSTEMS = HOOKE_SYSTEMS
 OVERLAY_PATH_BY_SYSTEM = {
     **{system: OVERLAY_RELATIVE_PATH for system in OVERLAY_SYSTEMS},
     **{system: HOOKE_OVERLAY_RELATIVE_PATH for system in HOOKE_OVERLAY_SYSTEMS},
 }
+OVERLAY_V2_PATH_BY_SYSTEM = {
+    **{system: OVERLAY_V2_RELATIVE_PATH for system in OVERLAY_SYSTEMS},
+    **{system: HOOKE_OVERLAY_V2_RELATIVE_PATH for system in HOOKE_OVERLAY_SYSTEMS},
+}
 OVERLAY_COMPOSITION_ORDER = (
     "base-config -> declared train diagnostics overlay -> manifest overrides"
+)
+OVERLAY_V2_COMPOSITION_ORDER = (
+    "base-config -> recorder-before-checkpoint diagnostics-v2 overlay -> manifest overrides"
 )
 CHECKPOINT_EVIDENCE_SCHEMA = "stage1-checkpoint-evidence/v1"
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
@@ -178,17 +190,27 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def overlay_path_for_system(system: str) -> str:
-    """Return the only committed overlay admitted for one Stage-1 system."""
+def overlay_path_for_system(system: str, *, profile: str = OVERLAY_PROFILE_V1) -> str:
+    """Return the committed overlay admitted for one system and profile.
 
+    The default deliberately remains the v1 composition so existing planners
+    and manifests retain their historical identity and byte shape.
+    """
+
+    paths = OVERLAY_PATH_BY_SYSTEM if profile == OVERLAY_PROFILE_V1 else (
+        OVERLAY_V2_PATH_BY_SYSTEM if profile == OVERLAY_PROFILE_V2 else None
+    )
+    if paths is None:
+        raise ProtocolError(f"unknown diagnostics overlay profile {profile!r}")
     try:
-        return OVERLAY_PATH_BY_SYSTEM[system]
+        return paths[system]
     except KeyError as exc:
         raise ProtocolError(f"no diagnostics overlay is approved for {system!r}") from exc
 
 
 def _overlay_binding(*, overlay: str | Path, expected_sha256: object,
-                     system: str | None = None) -> tuple[str, str, Path]:
+                     system: str | None = None,
+                     profile: str = OVERLAY_PROFILE_V1) -> tuple[str, str, Path]:
     """Validate one finite canonical overlay and its exact content digest.
 
     ``system`` is supplied at planner/gateway boundaries so a valid overlay
@@ -197,13 +219,18 @@ def _overlay_binding(*, overlay: str | Path, expected_sha256: object,
     allowlist still applies in that mode.
     """
 
+    if profile not in OVERLAY_PROFILES:
+        raise ProtocolError(f"unknown diagnostics overlay profile {profile!r}")
     path = resolve_overlay_path(overlay).resolve()
     allowed = (
-        {resolve_overlay_path(overlay_path_for_system(system)).resolve()}
+        {resolve_overlay_path(overlay_path_for_system(system, profile=profile)).resolve()}
         if system is not None
         else {
             resolve_overlay_path(candidate).resolve()
-            for candidate in set(OVERLAY_PATH_BY_SYSTEM.values())
+            for candidate in set(
+                OVERLAY_PATH_BY_SYSTEM.values()
+                if profile == OVERLAY_PROFILE_V1 else OVERLAY_V2_PATH_BY_SYSTEM.values()
+            )
         }
     )
     if path not in allowed:
@@ -291,7 +318,7 @@ def _expected_overlay_callbacks(relative: str) -> list[dict[str, Any]]:
             "fail_fast": False,
         },
     ]
-    if relative == HOOKE_OVERLAY_RELATIVE_PATH:
+    if relative in {HOOKE_OVERLAY_RELATIVE_PATH, HOOKE_OVERLAY_V2_RELATIVE_PATH}:
         callbacks.append({
             "_target_": "tpen.callback.AmplitudeRiskFraction",
             "thresholds": [-3, -4, -5, -7, -10],
@@ -358,7 +385,10 @@ def _iter_mapping_leaves(value: Mapping[str, Any], prefix: str) -> Iterator[tupl
             yield dotted, nested
 
 
-def compose_train_overlay(cfg: Any, *, overlay: str | Path, expected_sha256: str) -> Any:
+def compose_train_overlay(
+    cfg: Any, *, overlay: str | Path, expected_sha256: str,
+    overlay_profile: str = OVERLAY_PROFILE_V1,
+) -> Any:
     """Compose the approved train overlay without touching physics sections.
 
     The overlay owns train-side runtime/sampler/optimizer/trainer leaves plus
@@ -369,7 +399,7 @@ def compose_train_overlay(cfg: Any, *, overlay: str | Path, expected_sha256: str
     """
 
     relative, digest, path = _overlay_binding(
-        overlay=overlay, expected_sha256=expected_sha256
+        overlay=overlay, expected_sha256=expected_sha256, profile=overlay_profile,
     )
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
@@ -390,6 +420,27 @@ def compose_train_overlay(cfg: Any, *, overlay: str | Path, expected_sha256: str
         overlay_entries = copy.deepcopy(payload[key])
         if not isinstance(base_entries, list) or not isinstance(overlay_entries, list):
             raise ProtocolError(f"overlay {key} must be lists")
+        if key == "callbacks" and overlay_profile == OVERLAY_PROFILE_V2:
+            recorder = [
+                entry for entry in overlay_entries
+                if entry.get("_target_") == "tpen.callback.RawTrainingBatchRecorder"
+            ]
+            if len(recorder) != 1:
+                raise ProtocolError("diagnostics-v2 overlay must declare one recorder")
+            overlay_entries = [
+                entry for entry in overlay_entries
+                if entry.get("_target_") != "tpen.callback.RawTrainingBatchRecorder"
+            ]
+            composed_entries: list[Any] = []
+            checkpoint_count = 0
+            for entry in base_entries:
+                if isinstance(entry, Mapping) and entry.get("_target_") == "tpen.callback.Checkpoint":
+                    composed_entries.extend(copy.deepcopy(recorder))
+                    checkpoint_count += 1
+                composed_entries.append(entry)
+            if checkpoint_count == 0:
+                raise ProtocolError("diagnostics-v2 composition requires a base Checkpoint")
+            base_entries = composed_entries
         # Both callback and logger entries are additive.  In particular, the
         # diagnostics overlay must never discard base callbacks such as the
         # resolved-config snapshot or checkpoint publisher.
@@ -398,12 +449,18 @@ def compose_train_overlay(cfg: Any, *, overlay: str | Path, expected_sha256: str
         )
 
     provenance = {
-        "schema": "stage1-overlay/v1",
+        "schema": "stage1-overlay/v1" if overlay_profile == OVERLAY_PROFILE_V1
+        else "stage1-overlay/v2",
         "path": relative,
         "sha256": digest,
-        "composition_order": OVERLAY_COMPOSITION_ORDER,
+        "composition_order": (
+            OVERLAY_COMPOSITION_ORDER if overlay_profile == OVERLAY_PROFILE_V1
+            else OVERLAY_V2_COMPOSITION_ORDER
+        ),
         "stream": "train",
     }
+    if overlay_profile == OVERLAY_PROFILE_V2:
+        provenance["profile"] = OVERLAY_PROFILE_V2
     for dotted, value in _iter_mapping_leaves(provenance, "stage1_overlay"):
         OmegaConf.update(cfg, dotted, value, merge=False, force_add=True)
     return cfg
@@ -1010,6 +1067,9 @@ def validate_gateway_binding(*, binding: str, config: str | None = None,
         raise ProtocolError("gateway config does not match binding")
     declared_overlay = row.get("overlay")
     declared_overlay_sha = row.get("overlay_sha256")
+    overlay_profile = str(row.get("overlay_profile", OVERLAY_PROFILE_V1))
+    if overlay_profile not in OVERLAY_PROFILES:
+        raise ProtocolError(f"unknown diagnostics overlay profile {overlay_profile!r}")
     if (declared_overlay is None) != (declared_overlay_sha is None):
         raise ProtocolError("binding overlay declaration is incomplete")
     if declared_overlay is None or declared_overlay_sha is None:
@@ -1025,6 +1085,7 @@ def validate_gateway_binding(*, binding: str, config: str | None = None,
             overlay=declared_overlay,
             expected_sha256=declared_overlay_sha,
             system=str(row.get("system")),
+            profile=overlay_profile,
         )
     if effective_kind == "train" and _is_hooke_science_row(row) and declared_overlay is None:
         raise ProtocolError("Hooke science train rows require the Hooke diagnostics overlay")
@@ -1133,6 +1194,7 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
         overlay=str(row["overlay"]),
         expected_sha256=row["overlay_sha256"],
         system=str(row.get("system")),
+        profile=str(row.get("overlay_profile", OVERLAY_PROFILE_V1)),
     )
     if _is_hooke_science_row(row):
         # The final guard is also a public boundary: callers can bypass the
@@ -1152,20 +1214,41 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
 
     if select("stage1_overlay.path") != relative or select("stage1_overlay.sha256") != digest:
         raise ProtocolError("resolved train config overlay provenance does not match binding")
-    if select("stage1_overlay.composition_order") != OVERLAY_COMPOSITION_ORDER:
+    overlay_profile = str(row.get("overlay_profile", OVERLAY_PROFILE_V1))
+    expected_order = (
+        OVERLAY_COMPOSITION_ORDER if overlay_profile == OVERLAY_PROFILE_V1
+        else OVERLAY_V2_COMPOSITION_ORDER
+    )
+    if select("stage1_overlay.composition_order") != expected_order:
         raise ProtocolError("resolved train config composition order is not canonical")
+    if overlay_profile == OVERLAY_PROFILE_V2 and select("stage1_overlay.profile") != OVERLAY_PROFILE_V2:
+        raise ProtocolError("resolved train config overlay profile does not match binding")
 
     unresolved = OmegaConf.to_container(cfg, resolve=False)
     if not isinstance(unresolved, Mapping):
         raise ProtocolError("unresolved train config is not a mapping")
     expected_callbacks = _expected_overlay_callbacks(relative)
     callbacks = unresolved.get("callbacks")
+    if not isinstance(callbacks, list):
+        raise ProtocolError("resolved diagnostics callback profile drifted")
+    if overlay_profile == OVERLAY_PROFILE_V2:
+        targets = [entry.get("_target_") if isinstance(entry, Mapping) else None for entry in callbacks]
+        checkpoint_indices = [index for index, target in enumerate(targets) if target == "tpen.callback.Checkpoint"]
+        recorder_indices = [
+            index for index, target in enumerate(targets)
+            if target == "tpen.callback.RawTrainingBatchRecorder"
+        ]
+        if not checkpoint_indices or recorder_indices != [index - 1 for index in checkpoint_indices]:
+            raise ProtocolError("resolved diagnostics callback profile drifted")
+        expected_callbacks = [
+            entry for entry in expected_callbacks
+            if entry.get("_target_") != "tpen.callback.RawTrainingBatchRecorder"
+        ]
     overlay_start = None
-    if isinstance(callbacks, list):
-        for index in range(len(callbacks) - len(expected_callbacks) + 1):
-            if callbacks[index:index + len(expected_callbacks)] == expected_callbacks:
-                overlay_start = index
-                break
+    for index in range(len(callbacks) - len(expected_callbacks) + 1):
+        if callbacks[index:index + len(expected_callbacks)] == expected_callbacks:
+            overlay_start = index
+            break
     if overlay_start is None:
         raise ProtocolError("resolved diagnostics callback profile drifted")
     trailing_callbacks = callbacks[overlay_start + len(expected_callbacks):]
@@ -1433,7 +1516,8 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                    overlay: str | Path | None = None,
                    overlay_sha256: str | None = None,
                    science_profile: str | None = None,
-                   evaluation_selection: str | None = None) -> list[dict[str, Any]]:
+                   evaluation_selection: str | None = None,
+                   overlay_profile: str = OVERLAY_PROFILE_V1) -> list[dict[str, Any]]:
     """Expand systems into validated smoke, train, and eval rows.
 
     Parameters are explicit rather than defaulted so a missing identity or
@@ -1482,10 +1566,16 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         raise ProtocolError("He/H2 production phase 2 requires the exact roster-B checkpoints")
     if (overlay is None) != (overlay_sha256 is None):
         raise ProtocolError("overlay and overlay_sha256 must be supplied together")
+    if overlay_profile not in OVERLAY_PROFILES:
+        raise ProtocolError(f"unknown diagnostics overlay profile {overlay_profile!r}")
+    if overlay is None and overlay_profile != OVERLAY_PROFILE_V1:
+        raise ProtocolError("diagnostics overlay profile requires an overlay")
     overlay_name: str | None = None
     overlay_digest: str | None = None
     if overlay is not None:
-        expected_paths = {overlay_path_for_system(system) for system in selected}
+        expected_paths = {
+            overlay_path_for_system(system, profile=overlay_profile) for system in selected
+        }
         if len(expected_paths) != 1:
             raise ProtocolError("one declared overlay cannot mix system-qualified profiles")
         expected_system = next(iter(selected))
@@ -1493,6 +1583,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
             overlay=overlay,
             expected_sha256=overlay_sha256,
             system=expected_system,
+            profile=overlay_profile,
         )
     elif science_profile == HOOKE_SCIENCE_PROFILE:
         raise ProtocolError("Hooke science train rows require the Hooke diagnostics overlay")
@@ -1643,6 +1734,8 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
             if overlay_name is not None:
                 row["overlay"] = overlay_name
                 row["overlay_sha256"] = overlay_digest
+                if overlay_profile != OVERLAY_PROFILE_V1:
+                    row["overlay_profile"] = overlay_profile
             rows.append(row)
             train_row = rows[-1]
             if phase == 1:
