@@ -54,9 +54,14 @@ class _StatefulVMCUpdateMethod(VMCUpdateMethod[AutogradUpdateInput]):
             "fingerprint": self.fingerprint,
         }
 
-    def load_method_state_dict(self, state: Mapping[str, object]) -> None:
+    def validate_method_state_dict(self, state: Mapping[str, object]) -> None:
         if state.get("version") != 1:
             raise ValueError("unsupported method-state version")
+        int(state["counter"])
+        str(state["fingerprint"])
+
+    def load_method_state_dict(self, state: Mapping[str, object]) -> None:
+        self.validate_method_state_dict(state)
         self.counter = int(state["counter"])
         self.fingerprint = str(state["fingerprint"])
 

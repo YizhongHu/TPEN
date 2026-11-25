@@ -182,7 +182,11 @@ def test_other_stateful_method_validation_is_non_mutating_and_loader_reuses_it(f
 
 
 def test_base_method_validator_and_loader_agree_on_empty_and_nonempty_state() -> None:
-    method = object.__new__(VMCUpdateMethod)
+    class _ConcreteStatelessMethod(VMCUpdateMethod[Any]):
+        def update(self, update_input: Any) -> VMCUpdateResult:
+            raise AssertionError("not reached")
+
+    method = _ConcreteStatelessMethod()
 
     method.validate_method_state_dict({})
     method.load_method_state_dict({})

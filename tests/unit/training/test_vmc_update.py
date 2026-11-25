@@ -650,7 +650,7 @@ def test_restore_rejects_incompatible_parameter_layout(tmp_path, kind: str) -> N
         from tests.unit.training.test_nonfinite_score_row_policy import _build_checkpoint_run
 
         model, update, trainer, sampler = _build_checkpoint_run(
-            "sr", max_steps=2, seed=99, nonfinite_local_energy_policy="fail"
+            "sr", max_steps=2, seed=0, nonfinite_local_energy_policy="fail"
         )
         optimizer = update.optimizer
         trainer.resolve_update_state(model=model, optimizer=optimizer)
