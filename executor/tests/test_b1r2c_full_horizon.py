@@ -98,7 +98,8 @@ MUTANT_GUARDS = {
 
 INTENDED_ASSERTION_TRACES = {
     "test_rc0_only_or_unknown_verdict_is_rejected": (
-        "typed completed verdict", "durable core outcome", "durable outcome receipt",
+        "typed completed verdict", "durable core outcome", "missing core-outcome unreadable guard",
+        "symlink core-outcome regular-file guard", "durable outcome receipt",
     ),
     "test_under_target_progress_is_rejected": (
         "typed completed verdict", "durable core outcome", "checkpoint_ref", "target progress",
@@ -222,8 +223,23 @@ def test_rc0_only_or_unknown_verdict_is_rejected(tmp_path: Path) -> None:
     no_core_fence = no_core_store.begin_attempt(no_core_group, "a", allocation, "2026-11-25T14:00:00Z")
     Path(no_core_fence.output_dir, "core").mkdir()
     no_core_store.finish_attempt(no_core_fence, "completed", "2026-11-25T14:01:00Z")
-    with pytest.raises(FenceRejected, match="core outcome record"):
+    # A missing record reaches the later decode/read guard after the regular-file
+    # check and therefore has a distinct unreadable-evidence diagnosis.
+    with pytest.raises(FenceRejected, match="final completion evidence is unreadable"):
         _publish(no_core_store, no_core_group, no_core_fence, _verdict(), no_core_group.members[0])
+
+    # Keep the _require_regular guard's killer independent from the missing-file
+    # path: the symlink target is a valid record from this same attempt, so a
+    # mutant that removes only the regular-file guard reads otherwise-consistent
+    # evidence and reaches the intended DID NOT RAISE assertion.
+    symlink_store, symlink_group, symlink_fence, symlink_verdict, symlink_task = _single_fixture(tmp_path / "symlink")
+    symlink_core = Path(symlink_fence.output_dir) / "core-outcome.json"
+    valid_core = tmp_path / "valid-core-outcome.json"
+    valid_core.write_bytes(symlink_core.read_bytes())
+    symlink_core.unlink()
+    symlink_core.symlink_to(valid_core)
+    with pytest.raises(FenceRejected, match="core outcome record"):
+        _publish(symlink_store, symlink_group, symlink_fence, symlink_verdict, symlink_task)
 
 
 def test_non_iteration_horizon_is_rejected(tmp_path: Path) -> None:
