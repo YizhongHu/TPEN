@@ -322,7 +322,7 @@ def test_v2_derived_document_binds_only_derived_evidence(
         protocol=protocol,
         source_sha="a" * 40,
         config_sha256=config_identities(config_root=config_root, systems=("he",)),
-        checkpoints=[0, 1],
+        checkpoints=[0, 1, 2],
         lineage_seeds=[11, 12, 13],
         checkpoint_sha256={},
         results_root=str(tmp_path / "source"),
