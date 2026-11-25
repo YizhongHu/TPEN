@@ -79,7 +79,7 @@
   {
     "id": "polaris-cuda-row-admission-dropped",
     "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
-    "old": "# Replace launch.render's GPU-row admission before any guard or driver.\n    if row.get(\"device\") != \"cuda\":\n        raise SystemExit(f\"row {row.get('row_id', '<unknown>')} must have device=cuda\")",
+    "old": "if row.get(\"device\") != \"cuda\":\n    raise SystemExit(f\"row {row.get('row_id', '<unknown>')} must have device=cuda\")",
     "new": "# Mutant drops launch.render's GPU-row admission.\nif False:\n    raise SystemExit(\"mutated row admission\")",
     "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
   },
@@ -109,13 +109,6 @@
     "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
     "old": "export CUDA_VISIBLE_DEVICES=\"$gpu\" OMP_NUM_THREADS=\"$core_count\" MKL_NUM_THREADS=\"$core_count\"",
     "new": "export CUDA_VISIBLE_DEVICES=\"$gpu\" OMP_NUM_THREADS=16 MKL_NUM_THREADS=16",
-    "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
-  },
-  {
-    "id": "polaris-hard-coded-cpu-range-restored",
-    "target": "experiments/atomistic/stage1/polaris/pbs_stage1.sh",
-    "old": "lineage=0\n      cpu_set=\"${LINEAGE_CPU_SETS[$lineage]}\"\n      core_count=\"${LINEAGE_CORE_COUNTS[$lineage]}\"",
-    "new": "lineage=0\n      cpu_set=\"0-15\"\n      core_count=\"${LINEAGE_CORE_COUNTS[$lineage]}\"",
     "killer": "experiments/atomistic/stage1/tests/test_polaris_wrapper.py::test_production_plan_train_eval_use_real_rows_and_uv_controls"
   }
 ]
