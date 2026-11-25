@@ -16,6 +16,7 @@ from tpen.evaluation.events import EvaluationTaskRun
 from tpen.events import Ended, Occurrence, Started
 from tpen.sampling import MetropolisSampler
 from tpen.sampling.events import SamplerBurnIn, SamplerProduction
+from tpen.sampling.protocols import SamplingCollector
 from tpen.sampling.trajectory import (
     collect_observable_trajectory,
     collect_observable_trajectory_with_diagnostics,

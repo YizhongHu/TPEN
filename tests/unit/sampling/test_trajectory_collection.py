@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from typeguard import TypeCheckError
 
 from tpen.data.atomic_configuration import AtomicConfiguration
 from tpen.data.batch.electron_batch import ElectronBatch
@@ -201,7 +202,7 @@ def test_collection_freezes_parameters_but_leaves_autograd_enabled(initial_train
 @pytest.mark.parametrize("sampler", [object(), None])
 def test_sampler_without_collect_samples_raises_type_error(sampler: object) -> None:
     """Require the public sampler collection contract."""
-    with pytest.raises(TypeError, match="collect_samples"):
+    with pytest.raises(TypeCheckError, match="collect_samples"):
         collect_observable_trajectory(sampler, TinyModel(), _position_observable, observable_name="x", n_draws=1)
 
 
