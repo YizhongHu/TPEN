@@ -604,11 +604,24 @@ class NativeProfiler(Callback):
                 source_provenance={"requested_activities": list(requested), "accepted_activities": list(accepted)},
             ))
             writer.write_profile_status(ObservabilityProfileStatus(
-                session.context.invocation_id, self.observer_id, window_id, "operation", requested, accepted,
-                {op.__name__: count for op, count in session._typed_counts.items()}, "process-monotonic",
-                session._activation_ns, lifecycle_state, completeness, "diagnostic", "TorchOperatorSummary",
-                self.summary.max_rows,
-                "failed" if any(item.startswith(("backend_", "persistence_")) for item in diagnostics) else "complete",
+                invocation_id=session.context.invocation_id,
+                observer_id=self.observer_id,
+                window_id=window_id,
+                window_kind="operation",
+                requested_activities=requested,
+                accepted_activities=accepted,
+                observed_event_counts={op.__name__: count for op, count in session._typed_counts.items()},
+                clock_domain_id="process-monotonic",
+                activation_ns=session._activation_ns,
+                lifecycle_state=lifecycle_state,
+                data_completeness=completeness,
+                guarantee_class="diagnostic",
+                exporter="TorchOperatorSummary",
+                export_status=(
+                    "failed"
+                    if any(item.startswith(("backend_", "persistence_")) for item in diagnostics)
+                    else "complete"
+                ),
                 requested_start_ns=session._start_bracket_ns[0] if session._start_bracket_ns else None,
                 requested_end_ns=session._stop_bracket_ns[1] if session._stop_bracket_ns else None,
                 start_call_bracket_ns=session._start_bracket_ns, stop_call_bracket_ns=session._stop_bracket_ns,

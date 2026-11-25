@@ -352,6 +352,7 @@ def test_backend_failures_clear_session_and_preserve_primary(failure: str, tmp_p
             if failure == "step":
                 callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
                 callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
+                raise primary
             elif failure == "start":
                 raise primary
             else:
@@ -407,11 +408,12 @@ def test_matched_out_of_order_range_is_unwound_once_on_exit(tmp_path) -> None:
         backend_factory=lambda: backend,
     )
     context = make_run_context(tmp_path)
-    with callback.run_scope(context):
+    session = callback.run_scope(context)
+    with session:
         callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
         callback.handle_occurrence(Occurrence(Started(CollectSamples(0)), 1), context)
         callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
-        assert "end:CollectSamples" not in backend.calls
+    assert "range_lifo_mismatch:TrainingIteration:1" in session._diagnostics  # type: ignore[attr-defined]
     assert backend.calls.count("end:CollectSamples") == 1
     assert backend.calls.count("end:TrainingIteration") == 1
 
