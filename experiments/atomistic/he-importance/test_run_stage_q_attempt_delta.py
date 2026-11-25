@@ -114,7 +114,7 @@ def test_attempt_delta_parser_rejects_before_any_stage_work() -> None:
 
 def test_execute_delta_fresh_and_resume_use_only_physical_core(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manifest = runner.scan_manifest.load_manifest()
-    row_id = next(row["row_id"] for row in manifest["rows"] if row["context"] == "O-raw" and row["seed_label"] == 810001 and row["status"] == "available")
+    row_id = next(row["row_id"] for row in manifest["rows"] if row["context"] == "O-raw" and row["seed_label"] == 820001 and row["status"] == "available")
     logical_cells = runner.stage_coordinate.materialize_intended_configurations(
         tmp_path / "campaign",
         availability=runner.optimizer_grid.roster_availability(),
