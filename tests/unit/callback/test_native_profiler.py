@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import pickle
 import subprocess
 import sys
@@ -18,6 +19,13 @@ from tpen.callback import (
     claims_conflict,
 )
 from tpen.events import Ended, Occurrence, Started
+from tpen.observability_artifacts import (
+    ObservabilityBundleWriter,
+    ObservabilityManifest,
+    RunArtifactSink,
+    inspect_run_observability,
+)
+from tpen.observability_reconciliation import reconcile_run_observability
 from tpen.sampling.events import SamplerBurnIn, SamplerProduction
 from tpen.training.events import CollectSamples, TrainingIteration
 
@@ -50,6 +58,31 @@ class _FakeBackend:
                 return False
 
         return _Range()
+
+
+class _FailingBackend(_FakeBackend):
+    def __init__(self, failure: str) -> None:
+        super().__init__()
+        self.failure = failure
+
+    def start(self) -> None:
+        if self.failure == "start":
+            raise RuntimeError("start failed")
+        super().start()
+
+    def step(self) -> None:
+        if self.failure == "step":
+            raise RuntimeError("step failed")
+        super().step()
+
+    def stop(self) -> None:
+        if self.failure == "stop":
+            raise RuntimeError("stop failed")
+        super().stop()
+
+    def export_chrome_trace(self, _path: str) -> None:
+        if self.failure == "export":
+            raise RuntimeError("export failed")
 
 
 def test_window_uses_durable_numeric_selection() -> None:
@@ -114,21 +147,16 @@ def test_typed_ranges_nest_in_fixed_order_and_skip_absent_sampler(tmp_path) -> N
     context = make_run_context(tmp_path)
     session = callback.run_scope(context)
     with session:
-        for count, event in enumerate(
-            (
-                Started(TrainingIteration(0)),
-                Started(CollectSamples(0)),
-                Started(SamplerBurnIn(2)),
-                Ended(SamplerBurnIn(2)),
-                Started(SamplerProduction(3)),
-                Ended(SamplerProduction(3)),
-                Ended(CollectSamples(0)),
-                Ended(TrainingIteration(0)),
-            ),
-            1,
-        ):
+        events = (
+            (1, Started(TrainingIteration(0))), (1, Started(CollectSamples(0))),
+            (1, Started(SamplerBurnIn(2))), (1, Ended(SamplerBurnIn(2))),
+            (1, Started(SamplerProduction(3))), (1, Ended(SamplerProduction(3))),
+            (1, Ended(CollectSamples(0))), (1, Ended(TrainingIteration(0))),
+        )
+        for count, event in events:
             callback.handle_occurrence(Occurrence(event, count), context)
-    assert backend.calls[1:9] == [
+    range_calls = [call for call in backend.calls if call.startswith(("start:", "end:"))]
+    assert range_calls == [
         "start:TrainingIteration", "start:CollectSamples", "start:SamplerBurnIn",
         "end:SamplerBurnIn", "start:SamplerProduction", "end:SamplerProduction",
         "end:CollectSamples", "end:TrainingIteration",
@@ -147,7 +175,10 @@ def test_disabled_fresh_process_does_not_load_torch_profiler() -> None:
         "p=NativeProfiler(enabled=False); assert p.ownership_claims()==[]; "
         "assert 'torch.profiler' not in sys.modules"
     )
-    result = subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+    result = subprocess.run(
+        [sys.executable, "-c", code], check=True, capture_output=True, text=True,
+        cwd=os.getcwd(), env={**os.environ, "PYTHONPATH": os.getcwd()},
+    )
     assert result.stderr == ""
 
 
@@ -163,4 +194,58 @@ def test_missed_window_does_not_start_backend(tmp_path) -> None:
         callback.handle_occurrence(Occurrence(Started(TrainingIteration(9)), 1), context)
         callback.handle_occurrence(Occurrence(Ended(TrainingIteration(9)), 1), context)
     assert backend.calls == []
+
+
+def test_window_counts_and_overshoot_are_recorded(tmp_path) -> None:
+    backend = _FakeBackend()
+    callback = NativeProfiler(enabled=True, window=TrainingIterationWindow(2, 1, 1), backend_factory=lambda: backend)
+    context = make_run_context(tmp_path)
+    with callback.run_scope(context):
+        for step in (2, 3, 4):
+            callback.handle_occurrence(Occurrence(Started(TrainingIteration(step)), 1), context)
+            callback.handle_occurrence(Occurrence(Ended(TrainingIteration(step)), 1), context)
+    status = next(context.run_dir.rglob("profile-status.json")).read_text()
+    assert '"durable_steps":[2,3,4]' in status
+    assert "overshoot_steps=1" in status
+
+
+def test_open_partial_native_bundle_is_read_only_reconcilable(tmp_path) -> None:
+    context = make_run_context(tmp_path)
+    sink = RunArtifactSink(relative_dir="native-profiling")
+    writer = ObservabilityBundleWriter(context.artifact_manager, context.invocation_id, sink=sink)
+    manifest = ObservabilityManifest(
+        invocation_id=context.invocation_id, lifecycle_state="open", data_completeness="unknown",
+        run_id=context.metadata.run_id, producer={"name": "test"},
+        configuration_digest="0" * 64, inventory_id="inventory-test",
+        descriptor_set_id="descriptors-test", observers=({"observer_id": "native-profiler"},), limits={},
+    )
+    writer.write_open_manifest(manifest)
+    inspected = inspect_run_observability(context.run_dir, relative_dir="native-profiling")
+    reconciled = reconcile_run_observability(context.run_dir, relative_dir="native-profiling")
+    assert inspected.status == "present"
+    assert reconciled.reconciliation_state == "open_interrupted"
+
+
+@pytest.mark.parametrize("failure", ["start", "step", "stop", "export"])
+def test_backend_failures_clear_session_and_preserve_primary(failure: str, tmp_path) -> None:
+    backend = _FailingBackend(failure)
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        chrome_trace=ChromeTraceExport() if failure == "export" else None,
+        backend_factory=lambda: backend,
+    )
+    context = make_run_context(tmp_path)
+    primary = RuntimeError("application failed")
+    expected = "application failed" if failure in {"stop", "export"} else f"{failure} failed"
+    with pytest.raises(RuntimeError, match=expected):
+        with callback.run_scope(context) as session:
+            session._start()  # type: ignore[attr-defined]
+            if failure == "step":
+                session.checkpoint()  # type: ignore[attr-defined]
+            elif failure == "start":
+                raise primary
+            else:
+                raise primary
+    assert callback._active_session is None  # type: ignore[attr-defined]
 

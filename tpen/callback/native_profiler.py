@@ -142,6 +142,7 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
         self._range_contexts: list[Any] = []
         self._typed_counts: dict[type[Any], int] = {}
         self._steps: list[int] = []
+        self._overshoot_steps = 0
         self._primary_error: BaseException | None = None
 
     def __getstate__(self) -> Any:
@@ -332,6 +333,8 @@ class NativeProfiler(Callback):
                     range_context.__enter__()
                     session._range_contexts.append(range_context)
             elif phase == "after":
+                if session.started:
+                    session._overshoot_steps += 1
                 session.request_stop()
             else:
                 session.missed_window = True
@@ -380,11 +383,22 @@ class NativeProfiler(Callback):
         writer.write_open_manifest(ObservabilityManifest(lifecycle_state="open", data_completeness="unknown", **manifest_base))
         writer.write_profile_summary(ObservabilityProfileSummary(session.context.invocation_id, self.observer_id, window_id,
             "TorchOperatorSummary", self.summary.max_rows, len(rows), tuple(rows)))
+        if self.chrome_trace is not None and session.started:
+            trace_path = writer.bundle_dir / self.chrome_trace.relative_path
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            resolved_bundle = writer.bundle_dir.resolve()
+            resolved_trace = trace_path.resolve()
+            resolved_trace.relative_to(resolved_bundle)
+            export = getattr(session.backend, "export_chrome_trace", None)
+            if callable(export):
+                export(str(trace_path))
         counts = {op.__name__: count for op, count in session._typed_counts.items()}
         writer.write_profile_status(ObservabilityProfileStatus(session.context.invocation_id, self.observer_id, window_id,
             "operation", ("CPU",), ("CPU",) if session.started else (), counts, "process-monotonic", now,
             status, completeness, "diagnostic", "TorchOperatorSummary", "complete" if session.stopped else "partial",
-            durable_steps=tuple(session._steps), max_rows=self.summary.max_rows, export_mode="chrome_trace" if self.chrome_trace else "summary"))
+            durable_steps=tuple(session._steps), max_rows=self.summary.max_rows,
+            export_mode="chrome_trace" if self.chrome_trace else "summary",
+            activity_diagnostics=(f"overshoot_steps={session._overshoot_steps}",)))
         writer.finalize_manifest(ObservabilityManifest(lifecycle_state="closed" if session.stopped else "unsafe",
             data_completeness=completeness, **manifest_base))
 
