@@ -296,8 +296,10 @@ def test_r2_input_uses_admit_recovery_not_legacy_selector(tmp_path: Path, monkey
     assert result.member_outcomes == (("successor", "collected"),), diagnostic
     assert admissions and all(result.status == "admitted" and root == store.root for result, root in admissions), diagnostic
     assert port.calls == [], diagnostic
+    legacy_root = tmp_path / "legacy"
+    legacy_root.mkdir()
     legacy_store, legacy_group, legacy_lease, legacy_inputs, _legacy_bindings, legacy_successors, _legacy_fences = _fixture(
-        tmp_path / "legacy", ("successor",), remote=False,
+        legacy_root, ("successor",), remote=False,
     )
     legacy_alloc = ConfiguredAllocation(legacy_lease.allocation_id, legacy_lease.backend_job_id, {})
     legacy_facts = GroupControllerFactsV1(
