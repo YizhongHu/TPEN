@@ -27,7 +27,7 @@ MUTANTS = (
     {"id": "omit-r2-checkpoint-link", "target": "executor/src/tpen_executor/results.py", "old": '"checkpoint_path": self.recovery_admission.checkpoint_path', "new": '"checkpoint_path": "crossed"', "killer": "test_r2_link_round_trip_preserves_typed_lineage"},
     {"id": "accept-crossed-r2-attempt", "target": "executor/src/tpen_executor/results.py", "old": "self.recovery_admission.predecessor_attempt_id != self.predecessor_attempt_id", "new": "False", "killer": "test_crossed_r2_link_is_rejected"},
     {"id": "skip-r2-controller-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "verdict = None if admitted_item.recovery_input is not None else admission_port.admit(admitted_item)", "new": "verdict = admission_port.admit(admitted_item)", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
-    {"id": "launch-before-r2-publication", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "durable_publication = store.read_reconciliation(group, attempt)", "new": "durable_publication = published", "killer": "test_r2_launch_requires_durable_publication"},
+    {"id": "launch-before-r2-publication", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if published.encode() != checked.encode():", "new": "if False:", "killer": "test_r2_launch_requires_durable_publication"},
     {"id": "r2-park-submit-bypass", "target": "executor/src/tpen_executor/recovery.py", "old": "return _park(member, member.recovery_admission.reason)", "new": 'return MemberReconciliationV2(member.task_id, "admit_successor", "recovery-admitted", member.attempt_id)', "killer": "test_r2_park_refuses_before_submit"},
     {"id": "fabricate-interrupted-outcome", "target": "executor/src/tpen_executor/storage.py", "old": "if item.outcome_receipt is None:", "new": "if False:", "killer": "test_interrupted_r2_outcome_stays_observed_absence"},
     {"id": "cross-c2-2-load-path", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "admission_record.checkpoint_path,", "new": '"crossed",', "killer": "test_c22_load_path_is_exact_admitted_checkpoint"},
@@ -286,6 +286,16 @@ def test_r2_park_refuses_before_submit(tmp_path: Path) -> None:
     unavailable = replace(evidence, checkpoint=replace(evidence.checkpoint, committed=False))
     item = replace(facts.member_inputs[0], recovery_input=replace(facts.member_inputs[0].recovery_input, evidence=unavailable))
     facts = replace(facts, member_inputs=(item,))
+    direct = controller_module.reconcile_group(
+        group,
+        (replace(item, recovery_input=None, recovery_admission=admit_recovery(
+            unavailable,
+            item.recovery_input.successor_attempt_id,
+            now_utc=item.recovery_input.now_utc,
+            trusted_store_root=store.root,
+        )),),
+    )
+    assert direct.members[0].action == "park"
     executor = BoundaryExecutor([])
     result = run_group_controller(binding, allocation.backend_job_id, facts, store, RecordingAdmission(), executor)
     member = result.reconciliation.members[0]
