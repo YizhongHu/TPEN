@@ -143,11 +143,16 @@ def test_render_fails_for_unapproved_partition_or_results_root() -> None:
                results_root="/tmp/stage1", scratch_base="/tmp/stage1")
 
 
-def test_gpu_render_requires_explicit_shape_and_cuda_binding() -> None:
+def test_gpu_render_defaults_to_measured_shape_and_cuda_binding() -> None:
     gpu_row = {**ROW, "device": "cuda"}
-    with pytest.raises(ValueError, match="cpus_per_task"):
-        render(row=gpu_row, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
-               results_root=ROW["results_root"], partition="seas_gpu")
+    script = render(row=gpu_row, driver="driver.py", python="/usr/bin/python3",
+                    head_sha="c" * 40, results_root=ROW["results_root"],
+                    partition="seas_gpu", time="12:00:00")
+    assert "#SBATCH --nodes=1" in script
+    assert "#SBATCH --ntasks=1" in script
+    assert "#SBATCH --cpus-per-task=1" in script
+    assert "#SBATCH --mem=4G" in script
+
     script = render(
         row=gpu_row, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
         results_root=ROW["results_root"], partition="seas_gpu,kozinsky_gpu",

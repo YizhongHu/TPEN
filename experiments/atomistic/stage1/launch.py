@@ -28,6 +28,8 @@ GPU_PARTITIONS = frozenset(ALLOWED_PARTITIONS[1:])
 _MAX_CPUS = 256
 _MAX_MEMORY_GIB = 2048
 _MAX_TIME_SECONDS = 7 * 24 * 60 * 60
+_DEFAULT_GPU_CPUS = 1
+_DEFAULT_GPU_MEMORY = "4G"
 FACILITY_RESULTS_PREFIX = "/n/netscratch/kozinsky_lab/Lab/rhu/"
 _SAFE_RENDERED_VALUE = re.compile(r"[A-Za-z0-9_./:+,@=\[\]-]+\Z")
 
@@ -103,7 +105,17 @@ def _partition_names(partition: str) -> list[str]:
 
 def _validate_gpu_resources(*, cpus_per_task: int | None, mem: str | None,
                             time: str | None) -> tuple[int, str, str]:
-    """Validate the explicit resource shape required for GPU rows."""
+    """Validate GPU resources, applying the measured Stage-1 defaults.
+
+    The default one CPU and 4 GiB request is based on the 2026-11-25 Cannon
+    ``jobstats`` sweep: the flagged jobs used one effective CPU and at most
+    1.2 GiB host memory.  Callers may still provide a larger measured shape.
+    """
+
+    if cpus_per_task is None:
+        cpus_per_task = _DEFAULT_GPU_CPUS
+    if mem is None:
+        mem = _DEFAULT_GPU_MEMORY
 
     if not isinstance(cpus_per_task, int) or not 1 <= cpus_per_task <= _MAX_CPUS:
         raise ValueError(f"cpus_per_task must be between 1 and {_MAX_CPUS}")
@@ -206,8 +218,8 @@ def _resolve_driver_path(driver: str, checkout_root: str) -> str:
 
 def render(*, row: Mapping[str, Any], checkout_root: str, python: str,
            partition: str = "test",
-           scratch_base: str = "/scratch", cpus_per_task: int | None = None,
-           mem: str | None = None, time: str | None = None,
+           scratch_base: str = "/scratch", cpus_per_task: int | None = 1,
+           mem: str | None = "4G", time: str | None = None,
            # Compatibility-only parameters for callers pinned to LR-1.  They
            # are checked against the row and never become application inputs.
            driver: str | None = None, head_sha: str | None = None,
