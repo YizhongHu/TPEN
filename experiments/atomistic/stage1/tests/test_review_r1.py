@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 import subprocess
@@ -14,11 +15,22 @@ from omegaconf import OmegaConf
 from experiments.atomistic.stage1 import restart
 from experiments.atomistic.stage1.launch import row_overrides
 from experiments.atomistic.stage1.protocol import (
+    CHECKPOINT_EVIDENCE_SCHEMA,
     HOOKE_SCIENCE_PROFILE,
+    MANIFEST_SCHEMA,
+    OVERLAY_PROFILE_V1,
+    OVERLAY_PROFILE_V2,
+    QHO_EVAL_SELECTION,
     STAGE1_PROTOCOL,
+    Protocol,
+    bind_evaluation_manifest,
     build_manifest,
     config_identities,
     derive_smoke_request,
+    manifest_hash,
+    overlay_path_for_system,
+    overlay_sha256,
+    planned_physical_system_ids,
 )
 from experiments.atomistic.stage1.train import build_train_config
 
@@ -27,7 +39,7 @@ PLAN = Path(__file__).parents[1] / "plan.py"
 
 
 def _run_phase1_plan(
-    tmp_path: Path, *systems: str,
+    tmp_path: Path, *systems: str, overlay_profile: str | None = None,
 ) -> tuple[int, list[dict[str, object]] | None, str]:
     output = tmp_path / ("-".join(systems) if systems else "all") / "manifest.json"
     output.parent.mkdir(parents=True)
@@ -42,6 +54,8 @@ def _run_phase1_plan(
     ]
     if systems:
         command.extend(("--systems", *systems))
+    if overlay_profile is not None:
+        command.extend(("--overlay-profile", overlay_profile))
     completed = subprocess.run(command, check=False, capture_output=True, text=True)
     if completed.returncode:
         return completed.returncode, None, completed.stderr
@@ -149,20 +163,31 @@ def _normalise_roots(value: object, roots: tuple[str, ...]) -> object:
     return value
 
 
-@pytest.mark.parametrize("system", ("hooke1", "hooke2", "he", "h2"))
+@pytest.mark.parametrize(
+    ("system", "science_profile", "evaluation_selection"),
+    (
+        ("hooke1", HOOKE_SCIENCE_PROFILE, "A37"),
+        ("hooke2", HOOKE_SCIENCE_PROFILE, "A37"),
+        ("qho2e", HOOKE_SCIENCE_PROFILE, QHO_EVAL_SELECTION),
+        ("he", None, None),
+        ("h2", None, None),
+    ),
+)
+@pytest.mark.parametrize("overlay_profile", (OVERLAY_PROFILE_V1, OVERLAY_PROFILE_V2))
 def test_derived_smoke_composition_preserves_science_recipe(
-    tmp_path: Path, system: str,
+    tmp_path: Path, system: str, science_profile: str | None,
+    evaluation_selection: str | None, overlay_profile: str,
 ) -> None:
     """A derived prefix changes only destination and execution.stop_at."""
 
     source_root = tmp_path / "science" / system
     isolated_root = tmp_path / "smoke" / system
-    hooke = system in {"hooke1", "hooke2"}
+    hooke = science_profile is not None
     kwargs: dict[str, object] = {}
     if hooke:
         kwargs.update({
-            "science_profile": HOOKE_SCIENCE_PROFILE,
-            "evaluation_selection": "A37",
+            "science_profile": science_profile,
+            "evaluation_selection": evaluation_selection,
         })
     rows = build_manifest(
         protocol=STAGE1_PROTOCOL,
@@ -179,9 +204,16 @@ def test_derived_smoke_composition_preserves_science_recipe(
         device="cpu",
         include_smoke=False,
         auto_overlay=True,
+        overlay_profile=overlay_profile,
         **kwargs,
     )
     source = next(row for row in rows if row["kind"] == "train")
+    expected_overlay = overlay_path_for_system(system, profile=overlay_profile)
+    assert source["overlay"] == expected_overlay
+    assert source["overlay_sha256"] == overlay_sha256(expected_overlay)
+    assert source.get("overlay_profile") == (
+        None if overlay_profile == OVERLAY_PROFILE_V1 else overlay_profile
+    )
     derived = derive_smoke_request(source, results_root=str(isolated_root), stop_at=1000)
     config_root = Path(__file__).parents[1] / "configs"
     source_cfg = build_train_config(
@@ -208,6 +240,7 @@ def test_derived_smoke_composition_preserves_science_recipe(
     assert derived["updates"] == 100000
     assert derived["checkpoint_steps"] == source["checkpoint_steps"]
     assert derived.get("overlay") == source.get("overlay")
+    assert derived.get("overlay_profile") == source.get("overlay_profile")
     assert derived.get("seed") == source.get("seed")
     later = derive_smoke_request(source, results_root=str(isolated_root), stop_at=2_000)
     later_cfg = build_train_config(
@@ -222,7 +255,8 @@ def test_derived_smoke_composition_preserves_science_recipe(
     assert later_doc == source_doc
     for identity_key in (
         "config_sha256", "system_id", "overlay", "overlay_sha256", "science_profile",
-        "seed", "lineage_seed", "sampler_seed", "updates", "walkers", "checkpoint_steps",
+        "overlay_profile", "seed", "lineage_seed", "sampler_seed", "updates", "walkers",
+        "checkpoint_steps",
     ):
         assert later.get(identity_key) == source.get(identity_key)
     assert later["execution"] == {"stop_at": 2_000}
@@ -230,6 +264,137 @@ def test_derived_smoke_composition_preserves_science_recipe(
         assert derived["science_profile"] == HOOKE_SCIENCE_PROFILE
         assert derived["lineage_seed"] == source["lineage_seed"]
         assert derived["sampler_seed"] == source["sampler_seed"]
+    if overlay_profile == OVERLAY_PROFILE_V2:
+        callbacks = OmegaConf.to_container(derived_cfg.callbacks, resolve=True)
+        targets = [entry["_target_"] for entry in callbacks]
+        recorder_indices = [
+            index for index, target in enumerate(targets)
+            if target == "tpen.callback.RawTrainingBatchRecorder"
+        ]
+        checkpoint_indices = [
+            index for index, target in enumerate(targets)
+            if target == "tpen.callback.Checkpoint"
+        ]
+        initial_indices = [
+            index for index, target in enumerate(targets)
+            if target == "tpen.callback.InitialCheckpoint"
+        ]
+        assert recorder_indices == [index - 1 for index in checkpoint_indices]
+        assert checkpoint_indices
+        assert initial_indices and max(checkpoint_indices) < initial_indices[0]
+        assert max(recorder_indices) < initial_indices[0]
+
+
+@pytest.mark.parametrize("system", ("he", "hooke1"))
+def test_production_planner_cli_auto_selects_v2_overlay(
+    tmp_path: Path, system: str,
+) -> None:
+    """The real planner selects each v2 overlay from profile alone."""
+
+    output = tmp_path / system / "manifest.json"
+    command = [
+        sys.executable, str(PLAN), "--output", str(output),
+        "--source-sha", "a" * 40, "--results-root", str(output.parent / "results"),
+        "--phase", "1", "--lineage-seeds", "11", "12", "13", "--systems", system,
+        "--overlay-profile", OVERLAY_PROFILE_V2,
+    ]
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert document["schema"] == MANIFEST_SCHEMA
+    assert {row["kind"] for row in document["rows"]} == {"train"}
+    train_rows = document["rows"]
+    assert {row["overlay_profile"] for row in train_rows} == {OVERLAY_PROFILE_V2}
+    assert {row["overlay"] for row in train_rows} == {
+        overlay_path_for_system(system, profile=OVERLAY_PROFILE_V2)
+    }
+
+
+def test_v2_derived_document_binds_only_derived_evidence(
+    tmp_path: Path,
+) -> None:
+    """Derived v4 evidence retains profile/root identity and rejects substitutions."""
+
+    protocol = Protocol(1, 2, 1, 2, 3, 4, 2, 2, 1)
+    config_root = Path(__file__).parents[1] / "configs"
+    overlay = overlay_path_for_system("he", profile=OVERLAY_PROFILE_V2)
+    source_rows = build_manifest(
+        protocol=protocol,
+        source_sha="a" * 40,
+        config_sha256=config_identities(config_root=config_root, systems=("he",)),
+        checkpoints=[0, 1],
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root=str(tmp_path / "source"),
+        systems=("he",),
+        phase=1,
+        device="cpu",
+        overlay=overlay,
+        overlay_sha256=overlay_sha256(overlay),
+        overlay_profile=OVERLAY_PROFILE_V2,
+    )
+    source = next(row for row in source_rows if row["kind"] == "train")
+    derived = derive_smoke_request(
+        source, results_root=str(tmp_path / "derived"), stop_at=1,
+    )
+    assert derived["overlay_profile"] == OVERLAY_PROFILE_V2
+    phase1_document = {
+        "schema": MANIFEST_SCHEMA,
+        "phase": 1,
+        "manifest_hash": manifest_hash([derived]),
+        "rows": [derived],
+    }
+    document_path = tmp_path / "derived-v4.json"
+    document_path.write_text(json.dumps(phase1_document), encoding="utf-8")
+    read_document = json.loads(document_path.read_text(encoding="utf-8"))
+    derived_rows = read_document["rows"]
+    derived_hash = manifest_hash(derived_rows)
+    evidence = {
+        "schema": CHECKPOINT_EVIDENCE_SCHEMA,
+        "phase1_manifest_hash": derived_hash,
+        "phase1_train_row_hashes": {
+            f"{derived['system']}:{derived['lineage']}": manifest_hash([derived]),
+        },
+        "checkpoints": {f"he:{derived['lineage']}:1": "b" * 64},
+    }
+    eval_rows = bind_evaluation_manifest(
+        phase1_rows=derived_rows,
+        checkpoints=[1],
+        checkpoint_evidence=evidence,
+        expected_physical_system_id=planned_physical_system_ids(),
+        source_sha="a" * 40,
+        config_sha256=config_identities(config_root=config_root, systems=("he",)),
+        protocol=protocol,
+        phase1_manifest_hash=derived_hash,
+        device="cpu",
+    )
+    assert eval_rows
+    assert all(row["phase1_manifest_hash"] == derived_hash for row in eval_rows)
+    assert all(
+        row["phase1_train_row_hash"] == manifest_hash([derived]) for row in eval_rows
+    )
+    assert all(
+        Path(row["checkpoint_dir"]).is_relative_to(tmp_path / "derived")
+        for row in eval_rows
+    )
+
+    for replacement in (source, {**derived, "overlay_profile": OVERLAY_PROFILE_V1}):
+        invalid = copy.deepcopy(evidence)
+        invalid["phase1_train_row_hashes"] = {
+            f"{replacement['system']}:{replacement['lineage']}": manifest_hash([replacement]),
+        }
+        with pytest.raises(ValueError, match="checkpoint evidence train identity"):
+            bind_evaluation_manifest(
+                phase1_rows=derived_rows,
+                checkpoints=[1],
+                checkpoint_evidence=invalid,
+                expected_physical_system_id=planned_physical_system_ids(),
+                source_sha="a" * 40,
+                config_sha256=config_identities(config_root=config_root, systems=("he",)),
+                protocol=protocol,
+                phase1_manifest_hash=derived_hash,
+                device="cpu",
+            )
 
 
 @pytest.mark.parametrize(

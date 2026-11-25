@@ -1652,7 +1652,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         raise ProtocolError("overlay and overlay_sha256 must be supplied together")
     if overlay_profile not in OVERLAY_PROFILES:
         raise ProtocolError(f"unknown diagnostics overlay profile {overlay_profile!r}")
-    if overlay is None and overlay_profile != OVERLAY_PROFILE_V1:
+    if overlay is None and overlay_profile != OVERLAY_PROFILE_V1 and not auto_overlay:
         raise ProtocolError("diagnostics overlay profile requires an overlay")
     overlay_name: str | None = None
     overlay_digest: str | None = None
@@ -1679,6 +1679,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
             digest = _sha256_file(resolve_overlay_path(committed))
             relative, checked_digest, _ = _overlay_binding(
                 overlay=committed, expected_sha256=digest, system=system,
+                profile=overlay_profile,
             )
             overlays_by_system[system] = (relative, checked_digest)
     elif science_profile == HOOKE_SCIENCE_PROFILE:

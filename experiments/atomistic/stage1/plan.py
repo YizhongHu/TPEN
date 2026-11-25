@@ -97,8 +97,6 @@ def main() -> int:
     if args.overlay_sha256 is not None and args.overlay is None:
         raise ValueError("--overlay-sha256 requires --overlay")
     effective_overlay_profile = args.overlay_profile or OVERLAY_PROFILE_V1
-    if args.overlay is None and effective_overlay_profile != OVERLAY_PROFILE_V1:
-        parser.error("--overlay-profile requires --overlay")
     effective_overlay_sha = (
         None if args.overlay is None else args.overlay_sha256 or overlay_sha256(args.overlay)
     )
