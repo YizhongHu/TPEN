@@ -2856,6 +2856,7 @@ class ObservabilityBundleWriter:
         self._writer_truncation_reasons: dict[str, list[str]] = {}
         self._pending_bytes: dict[str, int] = {}
         self._written_artifacts: dict[str, Path] = {}
+        self._artifact_kinds: dict[str, str | None] = {}
 
     def __getstate__(self) -> Any:
         """Refuse serialization of live observability bundle writers."""
@@ -2957,6 +2958,270 @@ class ObservabilityBundleWriter:
         _check_no_symlinks_under(self._artifact_manager.run_dir, rel_parts)
         _check_no_symlinks_under(bundle_dir, normalized.split("/"))
         return candidate
+
+    def reserve_external_artifact(self, rel_path: str, *, kind: str) -> Path:
+        """Reserve an existing-backend artifact destination without writing it.
+
+        The reservation is intentionally read-only. It validates containment,
+        rejects every existing symlink component, refuses collisions with the
+        bundle's code-owned filenames, and refuses an existing target before a
+        caller can create a directory or file.
+
+        Parameters
+        ----------
+        rel_path : str
+            Safe bundle-relative destination for the external artifact.
+        kind : str
+            Existing artifact kind recorded when the file is registered.
+
+        Returns
+        -------
+        pathlib.Path
+            The validated physical destination.
+
+        Raises
+        ------
+        ObservabilityPathError
+            If the destination is unsafe, reserved, symlinked, or occupied.
+        """
+
+        self._require_not_finalized("reserve an external artifact")
+        normalized = validate_relative_path(
+            rel_path, "external_artifact_path", forbid_manifest_self=True
+        )
+        # External writers must never be allowed to overwrite one of the
+        # writer-owned records, even when the relative path is nested.
+        if Path(normalized).name.lower() in {
+            MANIFEST_FILENAME.lower(),
+            LIFECYCLE_MARKER_FILENAME.lower(),
+            PROFILE_STATUS_FILENAME.lower(),
+            LEGACY_PROFILE_STATUS_FILENAME.lower(),
+            PROFILE_SUMMARY_FILENAME.lower(),
+        }:
+            raise ObservabilityPathError(
+                f"external artifact path {normalized!r} collides with a reserved bundle filename"
+            )
+        if normalized in self._written_artifacts or normalized in self._artifact_kinds:
+            raise ObservabilityPathError(
+                f"external artifact path {normalized!r} is already reserved"
+            )
+        # _safe_artifact_path performs the routed-path and no-symlink checks;
+        # resolve again here so this public reservation explicitly proves the
+        # physical candidate remains inside the resolved bundle directory.
+        target = self._safe_artifact_path(normalized)
+        resolved_bundle = self.bundle_dir.resolve(strict=False)
+        resolved_target = target.resolve(strict=False)
+        try:
+            resolved_target.relative_to(resolved_bundle)
+        except ValueError as exc:
+            raise ObservabilityPathError(
+                f"external artifact {target!s} resolves outside bundle {resolved_bundle!s}"
+            ) from exc
+        if target.exists() or target.is_symlink():
+            raise ObservabilityPathError(
+                f"refusing existing external artifact target {target!s}"
+            )
+        # Construct once to validate the existing wire-level kind without
+        # creating a partial reference.
+        ObservabilityArtifactRef(path=normalized, kind=kind)
+        self._artifact_kinds[normalized] = kind
+        return target
+
+    def register_external_artifact(
+        self, rel_path: str, *, kind: str
+    ) -> ObservabilityArtifactRef:
+        """Register a reserved regular file with exact bytes and SHA-256.
+
+        Registration repeats the containment and symlink checks after the
+        external backend returns, closing the validation-to-write race at the
+        audited writer boundary.
+        """
+
+        self._require_not_finalized("register an external artifact")
+        normalized = validate_relative_path(
+            rel_path, "external_artifact_path", forbid_manifest_self=True
+        )
+        reserved_kind = self._artifact_kinds.get(normalized)
+        if reserved_kind != kind:
+            raise ObservabilityArtifactError(
+                f"external artifact {normalized!r} was not reserved with kind {kind!r}"
+            )
+        target = self._safe_artifact_path(normalized)
+        if not target.exists() or not target.is_file() or target.is_symlink():
+            raise ObservabilityArtifactError(
+                f"external artifact {normalized!r} is missing or not a regular file"
+            )
+        raw_bytes = target.read_bytes()
+        ref = ObservabilityArtifactRef(
+            path=normalized,
+            bytes=len(raw_bytes),
+            sha256=hashlib.sha256(raw_bytes).hexdigest(),
+            kind=kind,
+        )
+        self._written_artifacts[normalized] = target
+        return ref
+
+    def prepare_external_artifact(self, rel_path: str) -> Path:
+        """Create only the reserved artifact's missing profile-directory tail.
+
+        The run, sink, and invocation ancestors are established by activation;
+        their loss is an error rather than an invitation to recreate them. The
+        remaining ``profiles/<observer>/<window>`` tail is opened and created
+        relative to directory file descriptors with ``O_NOFOLLOW``. This pins
+        each checked parent while the tail is made and prevents a swapped
+        parent from redirecting ``mkdir`` outside the bundle.
+
+        The backend still receives a path string for its own write. A
+        path-based backend write can race with a later parent replacement, so
+        registration remains a required post-write containment, symlink, and
+        integrity audit; this method does not claim to eliminate that residual
+        limitation.
+        """
+
+        self._require_not_finalized("prepare an external artifact")
+        normalized = validate_relative_path(
+            rel_path, "external_artifact_path", forbid_manifest_self=True
+        )
+        if normalized not in self._artifact_kinds:
+            raise ObservabilityArtifactError(
+                f"external artifact {normalized!r} was not reserved"
+            )
+        target = self._safe_artifact_path(normalized)
+        run_dir = self._artifact_manager.run_dir
+        established = (*self.sink.relative_dir.split("/"), self.invocation_id)
+        if not run_dir.exists() or not run_dir.is_dir():
+            raise ObservabilityPathError(
+                f"established observability run directory is missing: {run_dir!s}"
+            )
+        if not self.bundle_dir.exists() or not self.bundle_dir.is_dir():
+            raise ObservabilityPathError(
+                f"established observability bundle directory is missing: {self.bundle_dir!s}"
+            )
+        _check_no_symlinks_under(run_dir, established)
+
+        directory_flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+        )
+
+        def open_at(parent_fd: int, name: str) -> int:
+            try:
+                return os.open(name, directory_flags, dir_fd=parent_fd)
+            except OSError as exc:
+                raise ObservabilityPathError(
+                    f"cannot open established external-artifact directory {name!r}: {exc}"
+                ) from exc
+
+        current_fd: int | None = None
+        try:
+            try:
+                current_fd = os.open(run_dir, directory_flags)
+            except OSError as exc:
+                raise ObservabilityPathError(
+                    f"cannot open established observability run directory {run_dir!s}: {exc}"
+                ) from exc
+
+            # Existing ancestors are opened only through pinned descriptors.
+            for part in established:
+                next_fd = open_at(current_fd, part)
+                os.close(current_fd)
+                current_fd = next_fd
+
+            # Only the profile tail may be created. An existing child must be
+            # a real directory and cannot be reached through a symlink.
+            for part in Path(normalized).parent.parts:
+                try:
+                    next_fd = open_at(current_fd, part)
+                except ObservabilityPathError as exc:
+                    if not isinstance(exc.__cause__, FileNotFoundError):
+                        raise
+                    try:
+                        os.mkdir(part, mode=0o755, dir_fd=current_fd)
+                    except FileExistsError:
+                        pass
+                    next_fd = open_at(current_fd, part)
+                os.close(current_fd)
+                current_fd = next_fd
+        finally:
+            if current_fd is not None:
+                os.close(current_fd)
+
+        # Recheck the path after tail creation. If a test or external process
+        # swapped a path component, fail before handing it to the backend.
+        _check_no_symlinks_under(self.bundle_dir, normalized.split("/"))
+        return target
+
+    def create_external_artifact_temp(self, rel_path: str) -> Path:
+        """Create a writer-owned temporary file beside a reserved artifact.
+
+        The external backend writes this temporary path. The fixed destination
+        remains untouched until :meth:`publish_external_artifact` links the
+        completed file with no-clobber semantics.
+        """
+
+        target = self.prepare_external_artifact(rel_path)
+        try:
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+            )
+        except OSError as exc:
+            raise ObservabilityArtifactError(
+                f"cannot create external-artifact temporary file beside {target!s}: {exc}"
+            ) from exc
+        os.close(fd)
+        return Path(temp_name)
+
+    def discard_external_artifact_temp(self, temp_path: Path) -> None:
+        """Remove a writer-owned temporary external-artifact file if present."""
+
+        if not isinstance(temp_path, Path):
+            raise TypeError("temp_path must be a pathlib.Path")
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def publish_external_artifact(
+        self, rel_path: str, temp_path: Path
+    ) -> ObservabilityArtifactRef:
+        """Publish a completed temporary artifact without replacing a target.
+
+        ``os.link`` is deliberately used instead of ``os.replace``: a target
+        created after reservation causes publication to fail and is never
+        overwritten. The temporary link is removed after the publish attempt;
+        registration then computes the audited bytes and SHA-256 of the fixed
+        destination.
+        """
+
+        self._require_not_finalized("publish an external artifact")
+        if not isinstance(temp_path, Path):
+            raise TypeError("temp_path must be a pathlib.Path")
+        normalized = validate_relative_path(
+            rel_path, "external_artifact_path", forbid_manifest_self=True
+        )
+        if self._artifact_kinds.get(normalized) != "trace":
+            raise ObservabilityArtifactError(
+                f"external artifact {normalized!r} was not reserved as a trace"
+            )
+        if temp_path.is_symlink() or not temp_path.exists() or not temp_path.is_file():
+            raise ObservabilityArtifactError(
+                f"external artifact temporary file {temp_path!s} is not regular"
+            )
+        target = self._safe_artifact_path(normalized)
+        try:
+            os.link(temp_path, target, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise ObservabilityArtifactError(
+                f"external artifact target {target!s} appeared before publication"
+            ) from exc
+        except OSError as exc:
+            raise ObservabilityArtifactError(
+                f"cannot publish external artifact {normalized!r}: {exc}"
+            ) from exc
+        finally:
+            self.discard_external_artifact_temp(temp_path)
+        return self.register_external_artifact(normalized, kind="trace")
 
     def _atomic_write_bytes(self, target: Path, payload: bytes) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -3465,6 +3730,9 @@ class ObservabilityBundleWriter:
             ordered_paths = sorted(all_paths)
 
         refs: list[ObservabilityArtifactRef] = []
+        supplied_kinds = {
+            ref.path: ref.kind for ref in manifest.artifacts if ref.kind is not None
+        }
         for rel_path in ordered_paths:
             target = self._safe_artifact_path(rel_path)
             if not target.exists() or not target.is_file():
@@ -3475,7 +3743,10 @@ class ObservabilityBundleWriter:
             digest = hashlib.sha256(raw_bytes).hexdigest()
             refs.append(
                 ObservabilityArtifactRef(
-                    path=rel_path, bytes=len(raw_bytes), sha256=digest
+                    path=rel_path,
+                    bytes=len(raw_bytes),
+                    sha256=digest,
+                    kind=self._artifact_kinds.get(rel_path, supplied_kinds.get(rel_path)),
                 )
             )
 
