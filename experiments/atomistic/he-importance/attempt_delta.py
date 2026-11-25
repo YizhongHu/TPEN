@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import posixpath
 from pathlib import Path
 from typing import Any
 
@@ -52,29 +53,24 @@ def _absolute_normalized(value: object, field: str) -> Path:
     if type(value) is not str or not value:
         raise AttemptDeltaError(f"{field} must be a non-empty absolute path")
     path = Path(value)
-    if not path.is_absolute() or path != Path(os_path_norm(value)):
+    if not path.is_absolute() or path != Path(_os_path_norm(value)):
         raise AttemptDeltaError(f"{field} must be absolute and normalized")
     return path
 
 
-def os_path_norm(value: str) -> str:
+def _os_path_norm(value: str) -> str:
     """Normalize a path without resolving symlinks or touching the filesystem."""
-
-    import posixpath
 
     return posixpath.normpath(value)
 
 
-def parse_attempt_delta(raw: str | bytes, *, expected_row_id: str | None = None) -> AttemptDelta:
+def parse_attempt_delta(raw: str | bytes) -> AttemptDelta:
     """Parse and validate one canonical ``--attempt-delta`` JSON argument.
 
     Parameters
     ----------
     raw
         Canonical JSON text supplied by the configured executor program.
-    expected_row_id
-        Optional HI cell identity.  When provided, the delta task identity is
-        checked against it only when the caller uses the same value as task id.
     """
 
     try:
@@ -88,8 +84,6 @@ def parse_attempt_delta(raw: str | bytes, *, expected_row_id: str | None = None)
     attempt_id = _single_component(value["attempt_id"], "attempt_id")
     group_digest = _single_component(value["group_digest"], "group_digest")
     task_id = _single_component(value["task_id"], "task_id")
-    if expected_row_id is not None and task_id != expected_row_id:
-        raise AttemptDeltaError("attempt delta task_id does not match the selected row")
     core = _absolute_normalized(value["attempt_core_dir"], "attempt_core_dir")
     if (
         len(core.parts) < 4

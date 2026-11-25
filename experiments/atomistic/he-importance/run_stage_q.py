@@ -146,9 +146,6 @@ architecture_stage_family = importlib.import_module(
 attempt_delta = importlib.import_module(
     "experiments.atomistic.he-importance.attempt_delta"
 )
-full_horizon_completion = importlib.import_module(
-    "experiments.atomistic.he-importance.full_horizon_completion"
-)
 
 
 def _require_executable_stage(stage: str) -> None:
@@ -1525,6 +1522,35 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _cell_science_report(report: Mapping[str, object]) -> dict[str, object]:
+    """Return C with operational run-path fields removed from the comparison."""
+
+    result = dict(report)
+    resolved = result.get("resolved_config")
+    if isinstance(resolved, Mapping):
+        resolved_copy = json.loads(json.dumps(resolved, sort_keys=True, default=str))
+        run = resolved_copy.get("run")
+        if isinstance(run, dict):
+            for key in ("dir", "root", "run_id"):
+                run.pop(key, None)
+        result["resolved_config"] = resolved_copy
+    return result
+
+
+def _apply_attempt_delta_load(config: Any, delta: object | None) -> None:
+    """Apply the one closed train-resume load step after config resolution."""
+
+    if delta is None or getattr(delta, "load_mode") == "fresh":
+        return
+    OmegaConf.update(
+        config,
+        "runner.load",
+        {"mode": "train_resume", "path": str(getattr(delta, "load_path"))},
+        merge=False,
+        force_add=True,
+    )
+
+
 def execute(
     args: argparse.Namespace,
     *,
@@ -1659,6 +1685,7 @@ def execute(
         resolved = train_config.resolve_train_config(
             packet, overrides={"run.dir": str(delta.attempt_core_dir)}
         )
+        _apply_attempt_delta_load(resolved, delta)
     recorded_resolved = OmegaConf.to_container(resolved, resolve=True)
     report = {
         "selection": selection.receipt(),
@@ -1672,26 +1699,22 @@ def execute(
         },
         "resolved_config": recorded_resolved,
     }
-    c_report = report
-    if delta is not None:
-        # C is cell-owned science identity; per-attempt operational facts stay
-        # in the report captured under the executor-owned physical leaf.
-        c_report = {key: report[key] for key in ("selection", "walkers", "roster_vs_design", "train_packet")}
+    c_report = _cell_science_report(report) if delta is not None else report
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
     if args.dry_run:
         return 0
 
-    output_path = Path(packet.cell.output_path)
-    _refuse_occupied_output_path(output_path)
+    output_path = delta.attempt_core_dir if delta is not None else Path(packet.cell.output_path)
     receipt_path = _selection_receipt_path(output_root, packet.cell.content_hash)
     if delta is not None and delta.load_mode == "train_resume":
         _validate_cell_selection_receipt(output_root, packet.cell.content_hash, c_report)
     elif delta is None:
         _write_cell_selection_receipt(output_root, packet.cell.content_hash, report)
-    elif receipt_path.exists():
+    elif receipt_path.exists() or receipt_path.is_symlink():
         _validate_cell_selection_receipt(output_root, packet.cell.content_hash, c_report)
     else:
         _write_cell_selection_receipt(output_root, packet.cell.content_hash, c_report)
+    _refuse_occupied_output_path(output_path)
     if delta is not None:
         _write_json(output_path / "attempt_report.json", {"attempt_delta": {
             "attempt_core_dir": str(delta.attempt_core_dir),
@@ -1700,7 +1723,7 @@ def execute(
             "load": {"mode": delta.load_mode, "path": None if delta.load_path is None else str(delta.load_path)},
             "schema": attempt_delta.SCHEMA,
             "task_id": delta.task_id,
-        }, "resolved_config": recorded_resolved})
+        }, "row_id": packet.cell.content_hash, "resolved_config": recorded_resolved})
 
     def _guarded_runner(
         config: Any,
@@ -1711,6 +1734,7 @@ def execute(
         """Validate launch.py's late resolution before delegating to TPEN."""
 
         _require_truthful_cell(selection.cell, config)
+        _apply_attempt_delta_load(config, delta)
         launched_resolved = OmegaConf.to_container(config, resolve=True)
         if launched_resolved != recorded_resolved:
             raise StageQSelectionError(

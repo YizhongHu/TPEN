@@ -77,6 +77,8 @@ def qualify(manifest_path: Path, evidence: Path, *, artifact_root: Path | None =
             for attempt_report in derived_attempts:
                 try:
                     report = _json(attempt_report)
+                    if report.get("row_id") != row_id:
+                        continue
                     delta = report["attempt_delta"]
                     cell_complete = cell_complete or _FULL_HORIZON.read_full_horizon_completion(
                         Path(delta["attempt_core_dir"]),
@@ -85,7 +87,11 @@ def qualify(manifest_path: Path, evidence: Path, *, artifact_root: Path | None =
                         science_digest=row_id,
                         target_iterations=cell["updates"],
                     )
-                except (KeyError, OSError, ValueError, TypeError):
+                except _FULL_HORIZON.FullHorizonCompletionError:
+                    # A crossed or malformed completion record is an invalid
+                    # qualification input, not evidence of ordinary absence.
+                    raise
+                except (KeyError, OSError, TypeError, json.JSONDecodeError):
                     continue
         else:
             cell_complete = cell_complete or any(
