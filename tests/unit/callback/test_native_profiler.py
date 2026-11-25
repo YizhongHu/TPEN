@@ -213,7 +213,8 @@ def test_first_observed_warmup_step_after_window_start_is_not_started(tmp_path) 
 
     assert backend.calls == []
     payload = json.loads(next(context.run_dir.rglob("profile-status.json")).read_text())
-    assert payload["status"] == "not_started"
+    assert payload["lifecycle_state"] == "not_started"
+    assert "window_start_not_observed" in payload["activity_diagnostics"]
 
 
 def test_request_stop_before_window_prevents_activation(tmp_path) -> None:
@@ -242,7 +243,13 @@ def test_final_active_iteration_stops_backend_before_next_callback_event(tmp_pat
     with callback.run_scope(context):
         callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
         callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
-        assert backend.calls == ["start", "step", "stop"]
+        assert backend.calls.count("stop") == 1
+        ranges_before = [call for call in backend.calls if call.startswith(("start:", "end:"))]
+        callback.handle_occurrence(Occurrence(Started(CollectSamples(0)), 1), context)
+        callback.handle_occurrence(Occurrence(Ended(CollectSamples(0)), 1), context)
+        ranges_after = [call for call in backend.calls if call.startswith(("start:", "end:"))]
+        assert ranges_after == ranges_before
+    assert backend.calls.count("stop") == 1
 
 
 def test_out_of_order_ended_occurrence_does_not_pop_unrelated_range(tmp_path) -> None:
