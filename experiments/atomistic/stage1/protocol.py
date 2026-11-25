@@ -427,16 +427,24 @@ def compose_train_overlay(
             ]
             if len(recorder) != 1:
                 raise ProtocolError("diagnostics-v2 overlay must declare one recorder")
+            checkpoint_count = sum(
+                isinstance(entry, Mapping)
+                and entry.get("_target_") == "tpen.callback.Checkpoint"
+                for entry in base_entries
+            )
+            if checkpoint_count > 1:
+                raise ProtocolError(
+                    "diagnostics-v2 composition does not support multiple base "
+                    "Checkpoint publishers"
+                )
             overlay_entries = [
                 entry for entry in overlay_entries
                 if entry.get("_target_") != "tpen.callback.RawTrainingBatchRecorder"
             ]
             composed_entries: list[Any] = []
-            checkpoint_count = 0
             for entry in base_entries:
                 if isinstance(entry, Mapping) and entry.get("_target_") == "tpen.callback.Checkpoint":
                     composed_entries.extend(copy.deepcopy(recorder))
-                    checkpoint_count += 1
                 composed_entries.append(entry)
             if checkpoint_count == 0:
                 raise ProtocolError("diagnostics-v2 composition requires a base Checkpoint")
@@ -1239,6 +1247,14 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
             if target == "tpen.callback.RawTrainingBatchRecorder"
         ]
         if not checkpoint_indices or recorder_indices != [index - 1 for index in checkpoint_indices]:
+            raise ProtocolError("resolved diagnostics callback profile drifted")
+        expected_recorder = next(
+            entry for entry in expected_callbacks
+            if entry.get("_target_") == "tpen.callback.RawTrainingBatchRecorder"
+        )
+        if any(entry != expected_recorder for entry in (
+            callbacks[index] for index in recorder_indices
+        )):
             raise ProtocolError("resolved diagnostics callback profile drifted")
         expected_callbacks = [
             entry for entry in expected_callbacks

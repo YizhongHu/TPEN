@@ -17,7 +17,7 @@ from experiments.atomistic.stage1.protocol import (
     HOOKE_SYSTEMS, QHO_Q21, SYSTEMS, STAGE1_PROTOCOL,
     OVERLAY_PROFILE_V1, OVERLAY_PROFILES,
     bind_evaluation_manifest, build_manifest, config_identities, manifest_hash,
-    overlay_sha256,
+    overlay_sha256, resolve_overlay_path,
 )
 
 
@@ -36,7 +36,7 @@ def main() -> int:
     parser.add_argument("--overlay", help="canonical train-side diagnostics overlay")
     parser.add_argument("--overlay-sha256", help="expected exact overlay digest")
     parser.add_argument("--overlay-profile", choices=OVERLAY_PROFILES,
-                        default=OVERLAY_PROFILE_V1)
+                        default=None)
     parser.add_argument("--systems", nargs="+", choices=SYSTEMS)
     parser.add_argument("--phase1-manifest", type=Path,
                         help="phase-1 manifest to bind during phase 2")
@@ -65,7 +65,8 @@ def main() -> int:
         parser.error("Hooke production phase 1 requires --science-profile hooke-hv2-v1")
     if args.overlay_sha256 is not None and args.overlay is None:
         raise ValueError("--overlay-sha256 requires --overlay")
-    if args.overlay is None and args.overlay_profile != OVERLAY_PROFILE_V1:
+    effective_overlay_profile = args.overlay_profile or OVERLAY_PROFILE_V1
+    if args.overlay is None and effective_overlay_profile != OVERLAY_PROFILE_V1:
         parser.error("--overlay-profile requires --overlay")
     effective_overlay_sha = (
         None if args.overlay is None else args.overlay_sha256 or overlay_sha256(args.overlay)
@@ -81,7 +82,7 @@ def main() -> int:
                               results_root=args.results_root, systems=systems, phase=1,
                               device=args.device, overlay=args.overlay,
                               overlay_sha256=effective_overlay_sha,
-                              overlay_profile=args.overlay_profile,
+                              overlay_profile=effective_overlay_profile,
                               science_profile=args.science_profile,
                               evaluation_selection=args.evaluation_selection)
     else:
@@ -98,6 +99,39 @@ def main() -> int:
             phase1_systems = tuple(dict.fromkeys(
                 str(row["system"]) for row in phase1_rows if row.get("kind") == "train"
             ))
+            phase1_train_rows = [row for row in phase1_rows if row.get("kind") == "train"]
+            phase1_profiles = {
+                str(row.get("overlay_profile", OVERLAY_PROFILE_V1))
+                for row in phase1_train_rows
+            }
+            if len(phase1_profiles) != 1:
+                raise ValueError("phase-1 rows must use one diagnostics overlay profile")
+            phase1_profile = next(iter(phase1_profiles))
+            if args.overlay_profile is not None and args.overlay_profile != phase1_profile:
+                raise ValueError(
+                    "explicit --overlay-profile conflicts with the phase-1 manifest"
+                )
+            phase1_overlays = {row.get("overlay") for row in phase1_train_rows}
+            phase1_overlay_shas = {row.get("overlay_sha256") for row in phase1_train_rows}
+            if args.overlay is not None:
+                if len(phase1_overlays) != 1 or len(phase1_overlay_shas) != 1:
+                    raise ValueError(
+                        "explicit --overlay conflicts with the phase-1 manifest"
+                    )
+                phase1_overlay = next(iter(phase1_overlays))
+                phase1_overlay_sha = next(iter(phase1_overlay_shas))
+                if phase1_overlay is None or phase1_overlay_sha is None:
+                    raise ValueError(
+                        "explicit --overlay conflicts with the phase-1 manifest"
+                    )
+                if (resolve_overlay_path(args.overlay).resolve()
+                        != resolve_overlay_path(str(phase1_overlay)).resolve()
+                        or (args.overlay_sha256 is not None
+                            and args.overlay_sha256 != phase1_overlay_sha)
+                        or overlay_sha256(args.overlay) != phase1_overlay_sha):
+                    raise ValueError(
+                        "explicit --overlay conflicts with the phase-1 manifest"
+                    )
             config_sha256 = config_identities(config_root=config_root, systems=phase1_systems)
             _compare_legacy_config_sha256(args.config_sha256, config_sha256)
             eval_rows = bind_evaluation_manifest(
@@ -122,7 +156,7 @@ def main() -> int:
                                   results_root=args.results_root, systems=systems, phase=2,
                                   device=args.device, overlay=args.overlay,
                                   overlay_sha256=effective_overlay_sha,
-                                  overlay_profile=args.overlay_profile,
+                                  overlay_profile=effective_overlay_profile,
                                   science_profile=args.science_profile,
                                   evaluation_selection=args.evaluation_selection)
     args.output.parent.mkdir(parents=True, exist_ok=True)
