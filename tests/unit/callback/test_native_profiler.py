@@ -340,7 +340,7 @@ def test_backend_failures_clear_session_and_preserve_primary(failure: str, tmp_p
     backend = _FailingBackend(failure)
     callback = NativeProfiler(
         enabled=True,
-        window=TrainingIterationWindow(0, 0, 1),
+        window=TrainingIterationWindow(0, 0, 2 if failure == "step" else 1),
         backend_factory=lambda: backend,
     )
     context = make_run_context(tmp_path)
