@@ -1,108 +1,165 @@
-"""B1-R2B linked-result and R2 consumer-boundary checks.
-
-These tests are intentionally local/fake-only: they exercise the durable
-producer and C1 reader without importing ``tpen`` or starting a scheduler.
-"""
+"""B1-R2B linked-result and controller consumer-boundary checks."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from tpen_executor._codec import digest
-from tpen_executor.contracts import AttemptId
-from tpen_executor.recovery import RecoveryGrantV1, admit_recovery
+from tpen_executor.allocations import ConfiguredAllocation, ControllerGenerationV1
+from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId, InvocationId
+from tpen_executor.lifecycle.attached import AttachedAllocation
+from tpen_executor.lifecycle.controller import GroupControllerFactsV1, run_group_controller
+import tpen_executor.lifecycle.controller as controller_module
+from tpen_executor.recovery import RecoveryAdmissionInputV1, RecoveryGrantV1, admit_recovery
 from tpen_executor.results import SuccessorAdmissionRecord
 from tpen_executor.storage import AdmissionFork, DirectoryStore, read_successor_admission
 
 from test_b1a_b_publication import _fixture
 from test_b1r2a_recovery_admission import _facts
+from test_review_b1b2_controller import _real_fresh
+from test_review_b1b2_t2_r1 import RecordingExecutor, _binding
 
 
 MUTANTS = (
     {"id": "omit-r2-checkpoint-link", "target": "executor/src/tpen_executor/results.py", "old": '"checkpoint_path": self.recovery_admission.checkpoint_path', "new": '"checkpoint_path": "crossed"', "killer": "test_r2_link_round_trip_preserves_typed_lineage"},
     {"id": "accept-crossed-r2-attempt", "target": "executor/src/tpen_executor/results.py", "old": "self.recovery_admission.predecessor_attempt_id != self.predecessor_attempt_id", "new": "False", "killer": "test_crossed_r2_link_is_rejected"},
-    {"id": "skip-r2-controller-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "verdict = None if admitted_item.recovery_input is not None else admission_port.admit(admitted_item)", "new": "verdict = admission_port.admit(admitted_item)", "killer": "test_r2_input_does_not_use_legacy_selector"},
-    {"id": "launch-before-r2-publication", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "published = store.publish_reconciliation(group, attempt, tuple(frozen_inputs), **publication_kwargs)", "new": "published = checked", "killer": "test_r2_launch_requires_published_admission"},
+    {"id": "skip-r2-controller-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "verdict = None if admitted_item.recovery_input is not None else admission_port.admit(admitted_item)", "new": "verdict = admission_port.admit(admitted_item)", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
+    {"id": "launch-before-r2-publication", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "durable_publication = store.read_reconciliation(group, attempt)", "new": "durable_publication = published", "killer": "test_r2_launch_requires_durable_publication"},
+    {"id": "r2-park-submit-bypass", "target": "executor/src/tpen_executor/recovery.py", "old": "return _park(member, member.recovery_admission.reason)", "new": 'return MemberReconciliationV2(member.task_id, "admit_successor", "recovery-admitted", member.attempt_id)', "killer": "test_r2_park_refuses_before_submit"},
+    {"id": "fabricate-interrupted-outcome", "target": "executor/src/tpen_executor/storage.py", "old": "if item.outcome_receipt is None:", "new": "if False:", "killer": "test_interrupted_r2_outcome_stays_observed_absence"},
+    {"id": "cross-c2-2-load-path", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "admission_record.checkpoint_path,", "new": '"crossed",', "killer": "test_c22_load_path_is_exact_admitted_checkpoint"},
 )
 
 
-def _real_admission(store, fence, *, successor: AttemptId, backend_job_id: str):
-    """Produce an R2 decision from facts bound to the real fixture store."""
+class RecordingAdmission:
+    def __init__(self):
+        self.calls = []
 
-    evidence = _facts(
-        Path(store.root),
-        mode="operator_authorized_unplanned_end",
-    )
-    checkpoint = evidence.checkpoint
-    bound_path = Path(store.root) / "groups" / fence.group_digest / fence.task_id / fence.attempt_id.value / "core" / "checkpoints" / "step"
-    # The test only needs the typed output; the fixture's predecessor is the
-    # persisted fence, so replace the synthetic current/predecessor identities.
-    from dataclasses import replace
+    def admit(self, member):
+        self.calls.append(member.task_id)
+        return member.core_verdict
+
+
+class BoundaryExecutor(RecordingExecutor):
+    def __init__(self, order):
+        super().__init__()
+        self.order = order
+        self.checkpoint_paths = []
+
+    def submit(self, fence, invocation):
+        self.order.append("submit")
+        return super().submit(fence, invocation)
+
+    def submit_admitted_successor(self, fence, invocation, checkpoint_path):
+        self.order.append("submit")
+        self.checkpoint_paths.append(checkpoint_path)
+        return RecordingExecutor.submit(self, fence, invocation)
+
+
+def _real_evidence(store, current, predecessor, *, backend_job_id: str):
+    evidence = _facts(Path(store.root), mode="operator_authorized_unplanned_end")
     from tpen_executor.recovery import RecoveryCheckpointFactsV1, RecoverySchedulerEndV1
 
+    checkpoint = evidence.checkpoint
+    bound_path = Path(predecessor.output_dir) / "core" / "checkpoints" / "step"
     checkpoint = RecoveryCheckpointFactsV1(
         str(bound_path), checkpoint.content_id, checkpoint.next_iteration,
         checkpoint.completed_updates, checkpoint.program_digest,
         checkpoint.science_digest, checkpoint.h_digest,
     )
-    evidence = replace(
+    return replace(
         evidence,
-        task_id=fence.task_id,
-        group_digest=fence.group_digest,
-        attempt_id=AttemptId("current-r2"),
-        predecessor_attempt_id=fence.attempt_id,
-        allocation_id=fence.allocation_id,
+        task_id=current.task_id,
+        group_digest=current.group_digest,
+        attempt_id=current.attempt_id,
+        predecessor_attempt_id=predecessor.attempt_id,
+        allocation_id=current.allocation_id,
         backend_job_id=backend_job_id,
         grant=RecoveryGrantV1(
             evidence.grant.grant_id, evidence.grant.expires_at_utc,
-            fence.group_digest, fence.task_id, evidence.grant.program_digest,
+            current.group_digest, current.task_id, evidence.grant.program_digest,
             evidence.grant.science_digest, evidence.grant.h_digest,
             evidence.grant.successor_limit,
         ),
         checkpoint=checkpoint,
         scheduler_end=RecoverySchedulerEndV1(
-            fence.task_id, fence.group_digest, AttemptId("current-r2"),
-            evidence.scheduler_end.scheduler, fence.allocation_id,
+            current.task_id, current.group_digest, current.attempt_id,
+            evidence.scheduler_end.scheduler, current.allocation_id,
             backend_job_id, evidence.scheduler_end.terminal_state,
             evidence.scheduler_end.terminal_at_utc, evidence.scheduler_end.writer_end_identity,
             evidence.scheduler_end.writer_end_at_utc,
         ),
     )
+
+
+def _real_admission(store, fence, *, successor: AttemptId, backend_job_id: str, current_attempt: AttemptId | None = None):
+    """Produce an R2 decision from facts bound to the real fixture store."""
+
+    current = replace(fence, attempt_id=current_attempt) if current_attempt is not None else fence
+    evidence = _real_evidence(store, current, fence, backend_job_id=backend_job_id)
     return admit_recovery(
         evidence, successor, now_utc="2026-11-24T00:02:00Z",
         trusted_store_root=store.root,
     )
 
 
-def test_r2_link_round_trip_preserves_typed_lineage(tmp_path: Path) -> None:
-    """Real R2 output survives the supported producer and actual C1 reader."""
-
-    store, group, _lease, _inputs, bindings, successors, fences = _fixture(
-        tmp_path, ("successor",), remote=False
+def _r2_setup(tmp_path: Path, *, outcome: bool = True):
+    store, group, lease, inputs, bindings, successors, fences = _fixture(
+        tmp_path, ("successor",), remote=False,
     )
+    predecessor = AttachedAllocation(
+        ConfiguredAllocation(lease.allocation_id, lease.backend_job_id, {}), store, lease,
+    ).begin(group, "successor", "utc-predecessor", "local", invocation_id=InvocationId("r2-predecessor"))
+    Path(predecessor.output_dir, "core", "checkpoints").mkdir(parents=True, exist_ok=True)
+    current = fences["successor"]
+    request, acceptance, successor_binding = successors["successor"]
+    evidence = _real_evidence(
+        store, current, predecessor, backend_job_id=current.backend_job_id.value,
+    )
+    recovery_input = RecoveryAdmissionInputV1(
+        evidence, successor_binding.attempt_id, "2026-11-24T00:02:00Z",
+    )
+    if not outcome:
+        Path(current.output_dir, "outcome.json").unlink()
+        Path(current.output_dir, "core-outcome.json").unlink()
+    item = replace(
+        inputs[0],
+        outcome_receipt=inputs[0].outcome_receipt if outcome else None,
+        core_verdict=None,
+        recovery_input=recovery_input,
+        recovery_admission=None,
+    )
+    allocation = ConfiguredAllocation(AllocationId("current-allocation"), BackendJobId("current-job"), {})
+    facts = GroupControllerFactsV1(
+        group, allocation, "a" * 64, "r2-controller", "2026-11-24T00:03:00Z",
+        (item,), {"successor": (request, acceptance, successor_binding)},
+    )
+    return store, group, allocation, facts, _binding(group, allocation.backend_job_id), evidence, successor_binding, current
+
+
+def test_r2_link_round_trip_preserves_typed_lineage(tmp_path: Path) -> None:
+    store, group, lease, _inputs, bindings, successors, fences = _fixture(tmp_path, ("successor",), remote=False)
     predecessor = fences["successor"]
     request, acceptance, successor_binding = successors["successor"]
     admission = _real_admission(
         store, predecessor, successor=successor_binding.attempt_id,
         backend_job_id=successor_binding.allocation_attempt.backend_job_id.value,
+        current_attempt=AttemptId("current-r2"),
     )
     assert admission.status == "admitted"
     record = store.record_successor_admission(
         predecessor, request, acceptance,
-        predecessor_binding=bindings["successor"],
-        successor_binding=successor_binding,
+        predecessor_binding=bindings["successor"], successor_binding=successor_binding,
         recovery_admission=admission,
     )
-    encoded = record.encode()
-    decoded = SuccessorAdmissionRecord.decode(encoded)
+    decoded = SuccessorAdmissionRecord.decode(record.encode())
     assert decoded.predecessor_attempt_id == admission.predecessor_attempt_id
     assert decoded.checkpoint_path == admission.checkpoint_path
-    assert decoded.predecessor["checkpoint_path"] == admission.checkpoint_path
-    # C1 consumes the same durable record; it never parses checkpoint_path.
     successor = store.begin_admitted_successor(
-        group, "successor", _lease_to_allocation(successor_binding),
+        group, "successor", ConfiguredAllocation(successor_binding.allocation_attempt.allocation_id, successor_binding.allocation_attempt.backend_job_id, {}),
         "2026-11-24T00:03:00Z", "local", allocation_attempt=successor_binding.allocation_attempt,
         admission=record,
     )
@@ -114,31 +171,16 @@ def test_r2_link_round_trip_preserves_typed_lineage(tmp_path: Path) -> None:
     assert result["record"]["predecessor"]["checkpoint_path"] == admission.checkpoint_path
 
 
-def _lease_to_allocation(binding):
-    from tpen_executor.allocations import ConfiguredAllocation
-
-    return ConfiguredAllocation(
-        binding.allocation_attempt.allocation_id,
-        binding.allocation_attempt.backend_job_id,
-        {},
-    )
-
-
 def test_crossed_r2_link_is_rejected(tmp_path: Path) -> None:
-    store, _group, _lease, _inputs, bindings, successors, fences = _fixture(
-        tmp_path, ("successor",), remote=False
-    )
+    store, _group, _lease, _inputs, bindings, successors, fences = _fixture(tmp_path, ("successor",), remote=False)
     predecessor = fences["successor"]
     request, acceptance, successor_binding = successors["successor"]
     admission = _real_admission(
         store, predecessor, successor=successor_binding.attempt_id,
         backend_job_id=successor_binding.allocation_attempt.backend_job_id.value,
+        current_attempt=AttemptId("current-r2"),
     )
-    crossed = type(admission)(
-        admission.status, admission.reason, admission.evidence_digest,
-        AttemptId("other-predecessor"), admission.checkpoint_path,
-        admission.successor_attempt_id, admission.grant_id,
-    )
+    crossed = replace(admission, predecessor_attempt_id=AttemptId("other-predecessor"))
     with pytest.raises(ValueError, match="crosses successor identity"):
         SuccessorAdmissionRecord.from_recovery_admission(
             crossed, predecessor_task_id="successor", predecessor_content_id="a" * 64,
@@ -149,36 +191,27 @@ def test_crossed_r2_link_is_rejected(tmp_path: Path) -> None:
 
 
 def test_r2_duplicate_replay_is_idempotent_and_fork_parks(tmp_path: Path) -> None:
-    from dataclasses import replace
-
-    store, _group, _lease, _inputs, bindings, successors, fences = _fixture(
-        tmp_path, ("successor",), remote=False
-    )
+    store, _group, _lease, _inputs, bindings, successors, fences = _fixture(tmp_path, ("successor",), remote=False)
     predecessor = fences["successor"]
     request, acceptance, successor_binding = successors["successor"]
     admission = _real_admission(
         store, predecessor, successor=successor_binding.attempt_id,
         backend_job_id=successor_binding.allocation_attempt.backend_job_id.value,
+        current_attempt=AttemptId("current-r2"),
     )
     first = store.record_successor_admission(
-        predecessor, request, acceptance,
-        predecessor_binding=bindings["successor"], successor_binding=successor_binding,
-        recovery_admission=admission,
+        predecessor, request, acceptance, predecessor_binding=bindings["successor"],
+        successor_binding=successor_binding, recovery_admission=admission,
     )
     assert store.record_successor_admission(
-        predecessor, request, acceptance,
-        predecessor_binding=bindings["successor"], successor_binding=successor_binding,
-        recovery_admission=admission,
+        predecessor, request, acceptance, predecessor_binding=bindings["successor"],
+        successor_binding=successor_binding, recovery_admission=admission,
     ) == first
     other_attempt = AttemptId("other-successor")
     other_request = dict(request)
     other_request["successor"] = {"task_id": "successor", "attempt_id": other_attempt.value}
     other_binding = replace(successor_binding, attempt_id=other_attempt)
-    other_admission = type(admission)(
-        admission.status, admission.reason, admission.evidence_digest,
-        admission.predecessor_attempt_id, admission.checkpoint_path,
-        other_attempt, admission.grant_id,
-    )
+    other_admission = replace(admission, successor_attempt_id=other_attempt)
     with pytest.raises(AdmissionFork):
         store.record_successor_admission(
             predecessor, other_request, acceptance,
@@ -187,15 +220,132 @@ def test_r2_duplicate_replay_is_idempotent_and_fork_parks(tmp_path: Path) -> Non
         )
 
 
-def test_r2_input_does_not_use_legacy_selector() -> None:
-    source = Path(__file__).parents[1].joinpath("src/tpen_executor/lifecycle/controller.py").read_text()
-    assert "admitted_item.recovery_input is not None" in source
+def test_r2_input_uses_admit_recovery_not_legacy_selector(tmp_path: Path, monkeypatch) -> None:
+    store, group, allocation, facts, binding, _evidence, _successor, _current = _r2_setup(tmp_path)
+    port = RecordingAdmission()
+    executor = BoundaryExecutor([])
+    admissions = []
+    original_admit = controller_module.admit_recovery
+
+    def admit(*args, **kwargs):
+        result = original_admit(*args, **kwargs)
+        admissions.append((result, kwargs["trusted_store_root"]))
+        return result
+
+    monkeypatch.setattr(controller_module, "admit_recovery", admit)
+    result = run_group_controller(binding, allocation.backend_job_id, facts, store, port, executor)
+    assert result.member_outcomes == (("successor", "collected"),)
+    assert admissions and all(result.status == "admitted" and root == store.root for result, root in admissions)
+    assert port.calls == []
+    legacy_group, legacy_alloc, legacy_facts, legacy_binding, legacy_store = _real_fresh(tmp_path / "legacy")
+    legacy_port = RecordingAdmission()
+    legacy_executor = BoundaryExecutor([])
+    run_group_controller(legacy_binding, legacy_alloc.backend_job_id, legacy_facts, legacy_store, legacy_port, legacy_executor)
+    assert legacy_port.calls and legacy_port.calls == ["real-task"] * len(legacy_port.calls)
 
 
-def test_r2_launch_requires_published_admission() -> None:
-    source = Path(__file__).parents[1].joinpath("src/tpen_executor/lifecycle/controller.py").read_text()
-    assert "publish_reconciliation" in source
-    assert source.index("publish_reconciliation") < source.index("executor.submit")
+@pytest.mark.parametrize("publication_mode", ["raise", "park"])
+def test_r2_launch_requires_durable_publication(tmp_path: Path, monkeypatch, publication_mode: str) -> None:
+    store, group, allocation, facts, binding, _evidence, _successor, _current = _r2_setup(tmp_path)
+    order = []
+    original = DirectoryStore.publish_reconciliation
+
+    def publish(self, *args, **kwargs):
+        order.append("publish")
+        if publication_mode == "raise":
+            raise RuntimeError("publication unavailable")
+        result = original(self, *args, **kwargs)
+        return replace(result, members=tuple(replace(member, action="park", reason_code="publication-parked") for member in result.members))
+
+    monkeypatch.setattr(DirectoryStore, "publish_reconciliation", publish)
+    executor = BoundaryExecutor(order)
+    result = run_group_controller(binding, allocation.backend_job_id, facts, store, RecordingAdmission(), executor)
+    assert order == ["publish"]
+    assert executor.calls == []
+    assert all(member.action == "park" for member in result.reconciliation.members)
+
+
+def test_r2_success_publishes_before_submit(tmp_path: Path, monkeypatch) -> None:
+    store, group, allocation, facts, binding, _evidence, _successor, _current = _r2_setup(tmp_path)
+    order = []
+    original = DirectoryStore.publish_reconciliation
+
+    def publish(self, *args, **kwargs):
+        order.append("publish")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DirectoryStore, "publish_reconciliation", publish)
+    executor = BoundaryExecutor(order)
+    result = run_group_controller(binding, allocation.backend_job_id, facts, store, RecordingAdmission(), executor)
+    assert result.member_outcomes == (("successor", "collected"),)
+    assert order == ["publish", "submit"]
+
+
+def test_r2_park_refuses_before_submit(tmp_path: Path) -> None:
+    store, group, allocation, facts, binding, evidence, _successor, _current = _r2_setup(tmp_path)
+    unavailable = replace(evidence, checkpoint=replace(evidence.checkpoint, committed=False))
+    item = replace(facts.member_inputs[0], recovery_input=replace(facts.member_inputs[0].recovery_input, evidence=unavailable))
+    facts = replace(facts, member_inputs=(item,))
+    executor = BoundaryExecutor([])
+    result = run_group_controller(binding, allocation.backend_job_id, facts, store, RecordingAdmission(), executor)
+    member = result.reconciliation.members[0]
+    assert executor.calls == []
+    assert member.action == "park"
+    assert member.reason_code == "checkpoint-unavailable"
+
+
+def test_interrupted_r2_outcome_stays_observed_absence(tmp_path: Path) -> None:
+    store, group, allocation, facts, binding, _evidence, _successor, current = _r2_setup(tmp_path, outcome=False)
+    executor = BoundaryExecutor([])
+    result = run_group_controller(binding, allocation.backend_job_id, facts, store, RecordingAdmission(), executor)
+    assert result.member_outcomes == (("successor", "collected"),)
+    assert not Path(current.output_dir, "outcome.json").exists()
+    assert not Path(current.output_dir, "core-outcome.json").exists()
+
+
+def test_duplicate_controller_replay_is_idempotent(tmp_path: Path) -> None:
+    store, group, allocation, facts, binding, _evidence, _successor, _current = _r2_setup(tmp_path)
+    first_executor = BoundaryExecutor([])
+    first = run_group_controller(binding, allocation.backend_job_id, facts, store, RecordingAdmission(), first_executor)
+    second_executor = BoundaryExecutor([])
+    second = run_group_controller(binding, allocation.backend_job_id, facts, store, RecordingAdmission(), second_executor)
+    assert first.member_outcomes == (("successor", "collected"),)
+    assert second_executor.calls == []
+    assert len(list(Path(store.root).rglob("successor-admission.json"))) == 1
+    assert second.member_outcomes == (("successor", "parked"),)
+
+
+def test_crossed_controller_generation_parks_before_submit(tmp_path: Path, monkeypatch) -> None:
+    store, group, allocation, facts, binding, _evidence, _successor, _current = _r2_setup(tmp_path)
+    original = DirectoryStore.publish_reconciliation
+
+    def publish_then_supersede(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        current = self.require_current_controller(group, facts.controller_generation, facts.claimant_nonce)
+        newer = ControllerGenerationV1(
+            group.group_id, facts.controller_generation + 1, allocation.allocation_id,
+            allocation.backend_job_id, facts.registration_receipt_digest, "crossed-controller",
+            current.record_digest,
+        )
+        self.acquire_controller_generation(group, newer)
+        return result
+
+    monkeypatch.setattr(DirectoryStore, "publish_reconciliation", publish_then_supersede)
+    executor = BoundaryExecutor([])
+    result = run_group_controller(binding, allocation.backend_job_id, facts, store, RecordingAdmission(), executor)
+    assert executor.calls == []
+    assert result.member_outcomes == (("successor", "parked"),)
+    assert result.member_reasons[0][1].startswith("member-transition:ControllerGenerationRejected")
+
+
+def test_c22_load_path_is_exact_admitted_checkpoint(tmp_path: Path) -> None:
+    store, group, allocation, facts, binding, evidence, _successor, _current = _r2_setup(tmp_path)
+    executor = BoundaryExecutor([])
+    result = run_group_controller(binding, allocation.backend_job_id, facts, store, RecordingAdmission(), executor)
+    assert result.member_outcomes == (("successor", "collected"),)
+    record_path = next(Path(store.root).rglob("successor-admission.json"))
+    record = SuccessorAdmissionRecord.decode(record_path.read_bytes())
+    assert executor.checkpoint_paths == [record.checkpoint_path]
 
 
 def test_mutant_sources_compile_and_killers_are_declared() -> None:

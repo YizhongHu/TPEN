@@ -60,7 +60,7 @@ Schema id: `tpen-executor/recovery-checkpoint-facts-v1`.
 | `next_iteration` | non-negative integer, retained independently |
 | `completed_updates` | non-negative integer, retained independently |
 | `program_digest` | lower-case SHA-256 program identity |
-| `science_digest` | opaque non-empty HI-issued science-lineage token, carried unchanged from the configured program |
+| `science_digest` | HI-issued science-lineage token, validated as a lowercase 64-hex SHA-256 (`TaskSpec.science_digest` via `sha256_text`, `contracts.py:166`) and carried unchanged from the configured program |
 | `h_digest` | lower-case SHA-256 H identity |
 | `committed` | boolean; true only for an independently validated committed checkpoint |
 
@@ -82,7 +82,7 @@ Schema id: `tpen-executor/recovery-grant-v1`.
 | `group_digest` | lower-case SHA-256 group identity |
 | `task_id` | non-empty frozen task identity |
 | `program_digest` | lower-case SHA-256 program identity |
-| `science_digest` | opaque non-empty HI-issued science-lineage token; the finite grant carries the same value for equality comparison |
+| `science_digest` | HI-issued science-lineage token, validated as a lowercase 64-hex SHA-256 (`TaskSpec.science_digest` via `sha256_text`, `contracts.py:166`); the finite grant carries the same value for equality comparison |
 | `h_digest` | lower-case SHA-256 H identity |
 | `successor_limit` | positive finite non-negative integer bound |
 

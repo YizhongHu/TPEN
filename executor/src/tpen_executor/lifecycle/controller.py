@@ -71,6 +71,14 @@ class AllocationLocalExecutor(Protocol):
     def submit(self, fence: AttemptFence, invocation: MemberInvocationV2) -> tuple[MemberLaunchResult, Any]:
         """Submit exactly once and return an acknowledgement plus opaque handle."""
 
+    def submit_admitted_successor(
+        self,
+        fence: AttemptFence,
+        invocation: MemberInvocationV2,
+        checkpoint_path: str,
+    ) -> tuple[MemberLaunchResult, Any]:
+        """Submit an admitted successor with its exact C2.2 load path."""
+
     def collect(self, handle: Any, timeout: float) -> Any:
         """Collect one submitted handle with a finite poll timeout."""
 
@@ -337,6 +345,7 @@ def run_group_controller(
             member = pending.pop(0)
             current_owned = None
             try:
+                admission_record = None
                 if member.action == "start_fresh":
                     invocation_id = InvocationId(uuid4().hex)
                     fence = store.begin_attempt_current_controller(
@@ -349,15 +358,15 @@ def run_group_controller(
                         fence.attempt_id, invocation_id,
                     )
                 else:
-                    record = next((item.admission for item in durable_publication.members if item.evidence.task_id == member.task_id), None)
-                    if not isinstance(record, SuccessorAdmissionRecord) or record.successor_binding is None:
+                    admission_record = next((item.admission for item in durable_publication.members if item.evidence.task_id == member.task_id), None)
+                    if not isinstance(admission_record, SuccessorAdmissionRecord) or admission_record.successor_binding is None:
                         raise LaunchIntentRejected("successor admission unavailable")
                     fence = store.begin_admitted_successor_current_controller(
                         group, member.task_id, allocation, facts.observed_at_utc, "local",
-                        allocation_attempt=record.successor_binding.allocation_attempt, admission=record,
+                        allocation_attempt=admission_record.successor_binding.allocation_attempt, admission=admission_record,
                         controller_record=controller,
                     )
-                    invocation = record.successor_binding
+                    invocation = admission_record.successor_binding
                 try:
                     existing = store.read_launch_intent(fence)
                 except LaunchIntentAbsent:
@@ -371,7 +380,12 @@ def run_group_controller(
                 store.create_launch_intent(fence, controller, invocation)
                 store.require_current_controller(group, controller.generation, controller.claimant_nonce)
                 try:
-                    launched, handle = executor.submit(fence, invocation)
+                    if admission_record is not None and hasattr(executor, "submit_admitted_successor"):
+                        launched, handle = executor.submit_admitted_successor(
+                            fence, invocation, admission_record.checkpoint_path,
+                        )
+                    else:
+                        launched, handle = executor.submit(fence, invocation)
                 except Exception as error:
                     try:
                         store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "executor-failed")

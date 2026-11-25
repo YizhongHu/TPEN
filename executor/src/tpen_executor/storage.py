@@ -1037,9 +1037,14 @@ class DirectoryStore:
                         durable = self._validate_fence(fence, task_dir)
                         self._validate_invocation(durable, binding)
                         outcome_path = os.path.join(start.output_dir, "outcome.json")
-                        _require_regular(outcome_path, "outcome receipt")
+                        if item.outcome_receipt is None:
+                            if recovery_admissions.get(task.task_id) is None:
+                                raise FenceRejected("missing-settled-outcome")
+                        else:
+                            _require_regular(outcome_path, "outcome receipt")
                         if (Path(os.path.join(start.output_dir, "start.json")).read_bytes() != start.encode()
-                                or Path(outcome_path).read_bytes() != item.outcome_receipt.encode()):
+                                or (item.outcome_receipt is not None
+                                    and Path(outcome_path).read_bytes() != item.outcome_receipt.encode())):
                             raise FenceRejected("crossed-durable-receipt")
                     fences[task.task_id] = fence
                 # A concurrent first start must not race a fresh_pending
