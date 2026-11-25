@@ -178,11 +178,19 @@ admit_selected_row() {
   require_value SELECTED_ROW
   [[ "$SELECTED_ROW" == /* ]] || die "SELECTED_ROW must be absolute"
   SELECTED_ROW_SOURCE="$SELECTED_ROW"
+  if [[ "$DRY_EXEC" == 1 ]]; then
+    # Dry-exec deliberately skips bootstrap and compute; preserve its
+    # historical no-run-root-write behavior while still admitting one row.
+    ADMITTED_ROW="$SELECTED_ROW"
+    printf 'POLARIS_ADMISSION selected_row=%s source=%s\n' \
+      "$SELECTED_ROW" "$SELECTED_ROW_SOURCE"
+    return 0
+  fi
   mkdir -p -- "$RESULTS_ROOT/plan"
-  assert_contained_path "$RESULTS_ROOT/plan/admitted-${MODE}-row.json" \
-    "$RESULTS_ROOT" ADMITTED_ROW
-  [[ ! -e "$ADMITTED_ROW" && ! -L "$ADMITTED_ROW" ]] ||
-    die "admitted selected-row snapshot already exists: $ADMITTED_ROW"
+  if ! ADMITTED_ROW="$(mktemp -p "$RESULTS_ROOT/plan" ".admitted-${MODE}-row.XXXXXX")"; then
+    die "could not reserve an admitted selected-row snapshot"
+  fi
+  assert_contained_path "$ADMITTED_ROW" "$RESULTS_ROOT" ADMITTED_ROW
   "$PYBIN" - "$SELECTED_ROW" "$ADMITTED_ROW" <<'PY'
 import os
 import sys
@@ -191,7 +199,7 @@ from pathlib import Path
 source, target = (Path(value) for value in sys.argv[1:])
 payload = source.read_bytes()
 target.parent.mkdir(parents=True, exist_ok=True)
-fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+fd = os.open(target, os.O_WRONLY | os.O_TRUNC, 0o600)
 try:
     with os.fdopen(fd, "wb") as handle:
         handle.write(payload)
