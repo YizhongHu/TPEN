@@ -442,8 +442,9 @@ class FullHorizonCompletionRecord:
         normalized_links: list[Mapping[str, str]] = []
         seen_predecessors: set[str] = set()
         seen_successors: set[str] = set()
+        visited_nodes: set[str] = set()
         previous_successor: str | None = None
-        for link in links:
+        for index, link in enumerate(links):
             if not isinstance(link, Mapping) or set(link) != {"predecessor_attempt_id", "successor_attempt_id", "request_digest"}:
                 raise TypeError("attempt_chain links have an invalid shape")
             predecessor = text(link["predecessor_attempt_id"], "attempt_chain.predecessor_attempt_id")
@@ -454,6 +455,11 @@ class FullHorizonCompletionRecord:
                 raise ValueError("attempt_chain cannot contain a self-link")
             if previous_successor is not None and predecessor != previous_successor:
                 raise ValueError("attempt_chain is not continuous")
+            if index == 0:
+                visited_nodes.add(predecessor)
+            if successor in visited_nodes:
+                raise ValueError("attempt_chain contains a cycle")
+            visited_nodes.add(successor)
             if predecessor in seen_predecessors or successor in seen_successors:
                 raise ValueError("attempt_chain contains a duplicate identity")
             seen_predecessors.add(predecessor)
@@ -518,7 +524,10 @@ class FullHorizonCompletionRecord:
 
     @classmethod
     def decode(cls, data: bytes | str | dict[str, Any]) -> "FullHorizonCompletionRecord":
-        return cls.from_mapping(decode_json(data))
+        record = cls.from_mapping(decode_json(data))
+        if isinstance(data, bytes) and data != record.encode():
+            raise ValueError("full-horizon completion record is not canonical")
+        return record
 
 
 @frozen_record
