@@ -546,6 +546,31 @@ def run_group_controller(
             published, reconcile_group(group, tuple(final_inputs)),
             parked_this_run, collected_members,
         )
+        for item in final_inputs:
+            member_final = next(member for member in final.members if member.task_id == item.task_id)
+            if member_final.action != "preserve_completed":
+                continue
+            if item.core_verdict is None or item.core_verdict.outcome != "completed":
+                continue
+            attempt_id = collected_fences[item.task_id]
+            record = _collected_attempt_record(manifest.attempts, item.task_id, attempt_id)
+            if record is None:
+                raise ValueError("full-horizon final attempt is absent from durable manifest")
+            completion_fence = AttemptFence(
+                store.root,
+                group.identity,
+                item.task_id,
+                record.start_receipt.allocation_id.value,
+                record.attempt_id,
+                record.output_dir,
+            )
+            task = next(task for task in group.members if task.task_id == item.task_id)
+            store.record_full_horizon_completion(
+                completion_fence,
+                task,
+                item.core_verdict,
+                task.target_horizon,
+            )
     except Exception as error:
         final = _merge_final_reconciliation(
             published, None, parked_this_run, collected_members,
