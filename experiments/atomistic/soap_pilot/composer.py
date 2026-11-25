@@ -85,6 +85,18 @@ def _resolve(value: Any, document: Mapping[str, Any]) -> Any:
     return _INTERPOLATION.sub(lambda m: str(_lookup(document, m.group(1))), value)
 
 
+def _resolve_document(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve nested references to a fixed point without rereading YAML."""
+
+    current: dict[str, Any] = deepcopy(dict(document))
+    for _ in range(12):
+        resolved = _resolve(current, current)
+        if resolved == current:
+            return resolved
+        current = resolved
+    raise ValueError("rendered config interpolation did not converge")
+
+
 def _set(mapping: dict[str, Any], path: str, value: Any) -> None:
     target = mapping
     parts = path.split(".")
@@ -161,7 +173,7 @@ def _materialize_train(profile: PilotProfile, *, results_root: str, run_id: str,
     _set(config, "checkpoint_steps", list(profile.checkpoint_steps))
     _set(config, "callbacks", _callbacks(config.get("callbacks", []), profile.family, profile.diagnostics_profile))
     _set(config, "stage1_overlay", {"path": str(_OVERLAY_BASE), "sha256": sha256_file(_OVERLAY_BASE), "profile": profile.diagnostics_profile})
-    config = _resolve(config, config)
+    config = _resolve_document(config)
     if any("${" in repr(value) or value == "???" for value in config.values()):
         raise ValueError("rendered train config retains unresolved values")
     return config, "train"
@@ -177,7 +189,7 @@ def _materialize_eval(*, results_root: str, run_id: str, checkpoint_dir: str, ch
     _set(config, "runtime.dtype", "float64")
     _set(config, "load.path", checkpoint_dir)
     _set(config, "trajectory_identity.checkpoint_file", checkpoint_file)
-    config = _resolve(config, config)
+    config = _resolve_document(config)
     return config, "eval"
 
 
