@@ -116,6 +116,9 @@ def _callbacks(base: list[Mapping[str, Any]], family: str, profile: str) -> list
         callbacks.append(_callback("tpen.callback.OptimizerState", every_n_steps=1))
     callbacks = [item for item in callbacks if item.get("_target_") != "tpen.callback.InitialCheckpoint"]
     callbacks.insert(0, _callback("tpen.callback.InitialCheckpoint", output_dir="${run.dir}/checkpoints"))
+    callbacks.append(_callback("tpen.callback.ResourceUsage", allocator_probe={"_target_": "tpen.accelerator.TorchAllocatorPeakProbe", "device": "${runtime.device}"}))
+    callbacks.append(_callback("tpen.callback.TrainPhaseTiming", every_n_steps=1, accelerator_synchronize=False))
+    callbacks.append(_callback("tpen.callback.TrainStepTiming", every_n_steps=1, rolling_window=20, accelerator_synchronize=False))
     for item in callbacks:
         if item.get("_target_") in {"tpen.callback.TrainPhaseTiming", "tpen.callback.TrainStepTiming"}:
             # R2/20, R1, and target keep synchronization disabled; the R2/100
