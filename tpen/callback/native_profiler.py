@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from tpen.artifacts import RunContext
-from tpen.events import Ended, Event as TypedEvent, Occurrence, Started, Subscription, started, ended
+from tpen.events import Ended, Event as TypedEvent, Occurrence, Operation, Started, Subscription, started, ended
 from tpen.observability_artifacts import (
     ObservabilityBundleWriter,
     ObservabilityManifest,
@@ -35,6 +35,30 @@ from .cadence import SubscriptionGroup
 if TYPE_CHECKING:
     from tpen.sampling.events import SamplerBurnIn, SamplerProduction
     from tpen.training.events import CollectSamples, TrainingIteration
+
+
+@dataclass(frozen=True)
+class _EnabledEventTypes:
+    """Runtime-resolved event classes owned by an enabled profiler."""
+
+    training_iteration: type[Operation]
+    collect_samples: type[Operation]
+    sampler_burn_in: type[Operation]
+    sampler_production: type[Operation]
+
+
+def _load_enabled_event_types() -> _EnabledEventTypes:
+    """Load the fixed event classes only on the enabled path."""
+
+    from tpen.sampling.events import SamplerBurnIn, SamplerProduction
+    from tpen.training.events import CollectSamples, TrainingIteration
+
+    return _EnabledEventTypes(
+        training_iteration=TrainingIteration,
+        collect_samples=CollectSamples,
+        sampler_burn_in=SamplerBurnIn,
+        sampler_production=SamplerProduction,
+    )
 
 
 @dataclass(frozen=True)
@@ -238,20 +262,18 @@ class NativeProfiler(Callback):
         self._active_session: _NativeSession | None = None
         self._unsafe = False
         self._observed = False
-        super().__init__(typed_groups=self._typed_groups() if self.enabled else ())
+        self._event_types = _load_enabled_event_types() if self.enabled else None
+        super().__init__(typed_groups=self._typed_groups(self._event_types) if self._event_types else ())
 
     @staticmethod
-    def _typed_groups() -> tuple[SubscriptionGroup, ...]:
+    def _typed_groups(event_types: _EnabledEventTypes) -> tuple[SubscriptionGroup, ...]:
         """Build the fixed event plan only for an enabled profiler."""
 
-        from tpen.sampling.events import SamplerBurnIn, SamplerProduction
-        from tpen.training.events import CollectSamples, TrainingIteration
-
         return (SubscriptionGroup(selectors=(
-            started(TrainingIteration), ended(TrainingIteration),
-            started(CollectSamples), ended(CollectSamples),
-            started(SamplerBurnIn), ended(SamplerBurnIn),
-            started(SamplerProduction), ended(SamplerProduction),
+            started(event_types.training_iteration), ended(event_types.training_iteration),
+            started(event_types.collect_samples), ended(event_types.collect_samples),
+            started(event_types.sampler_burn_in), ended(event_types.sampler_burn_in),
+            started(event_types.sampler_production), ended(event_types.sampler_production),
         )),)
 
     @staticmethod
@@ -327,11 +349,14 @@ class NativeProfiler(Callback):
         session = self._active_session
         if session is None:
             return
+        event_types = self._event_types
+        if event_types is None:
+            return
         event = occurrence.event
-        if isinstance(event, Started) and isinstance(event.operation, TrainingIteration):
+        if isinstance(event, Started) and isinstance(event.operation, event_types.training_iteration):
             step = event.operation.step
             session._steps.append(step)
-            session._typed_counts[TrainingIteration] = session._typed_counts.get(TrainingIteration, 0) + 1
+            session._typed_counts[event_types.training_iteration] = session._typed_counts.get(event_types.training_iteration, 0) + 1
             phase = self.window.phase(step)
             if phase == "warmup" or phase == "active":
                 if not session.started:
@@ -349,7 +374,7 @@ class NativeProfiler(Callback):
             else:
                 session.missed_window = True
             return
-        if isinstance(event, Ended) and isinstance(event.operation, TrainingIteration):
+        if isinstance(event, Ended) and isinstance(event.operation, event_types.training_iteration):
             if session.started and not session.stopped:
                 session.checkpoint()
                 if self.window.phase(event.operation.step) == "active" and event.operation.step == self.window.end_step:
@@ -359,7 +384,9 @@ class NativeProfiler(Callback):
             if session._range_contexts:
                 session._range_contexts.pop().__exit__(None, None, None)
             return
-        if isinstance(event, (Started, Ended)) and isinstance(event.operation, (CollectSamples, SamplerBurnIn, SamplerProduction)):
+        if isinstance(event, (Started, Ended)) and isinstance(event.operation, (
+            event_types.collect_samples, event_types.sampler_burn_in, event_types.sampler_production
+        )):
             op_type = type(event.operation)
             if isinstance(event, Started):
                 session._typed_counts[op_type] = session._typed_counts.get(op_type, 0) + 1
