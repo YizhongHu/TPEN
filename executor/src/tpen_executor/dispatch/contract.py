@@ -169,8 +169,8 @@ def _fence_placement_overlay(
     return values
 
 
-def _require_configured_physical_slot(allocation: Any) -> Any:
-    """Return the sole resolved physical slot required by configured runs."""
+def _require_configured_physical_slot(allocation: Any, selected_slot: Any = None) -> Any:
+    """Return a validated configured-run slot, preserving the legacy gate."""
 
     try:
         slots = physical_slots_from_allocation(allocation)
@@ -178,12 +178,24 @@ def _require_configured_physical_slot(allocation: Any) -> Any:
         raise
     except (BindingError, TypeError, ValueError) as error:
         raise PlacementRefusal("configured-physical-slot-required", str(error)) from error
-    if len(slots) != 1:
-        raise PlacementRefusal(
-            "configured-physical-slot-required",
-            "configured programs require exactly one resolved physical slot (slot ID, host, and CPUs)",
+    if selected_slot is None:
+        if len(slots) != 1:
+            raise PlacementRefusal(
+                "configured-physical-slot-required",
+                "configured programs require exactly one resolved physical slot (slot ID, host, and CPUs)",
+            )
+        slot = slots[0]
+    else:
+        matching = tuple(
+            candidate for candidate in slots
+            if candidate.slot_id == getattr(selected_slot, "slot_id", None)
         )
-    slot = slots[0]
+        if len(matching) != 1 or matching[0] != selected_slot:
+            raise PlacementRefusal(
+                "configured-physical-slot-foreign",
+                "selected configured-run slot is not an exact entitlement of this allocation",
+            )
+        slot = matching[0]
     if not slot.slot_id or not slot.node or not slot.cpus:
         raise PlacementRefusal(
             "configured-physical-slot-required",
@@ -278,6 +290,7 @@ def _with_child_placement(
     check_controller_affinity: bool = True,
     slot_resolver: Any = None,
     strict_host: bool = False,
+    selected_slot: Any = None,
 ) -> Any:
     """Overlay the one concrete slot and fenced identities for the child.
 
@@ -336,7 +349,7 @@ def _with_child_placement(
     devices = values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "")
     resolve_slots = slot_resolver or physical_slots_from_allocation
     if getattr(configured, "program", None) is not None:
-        slot = _require_configured_physical_slot(allocation)
+        slot = _require_configured_physical_slot(allocation, selected_slot)
         slot_facts = _physical_slot_overlay(slot)
         slot_id = slot.slot_id
         host = slot_facts["TPEN_PLACEMENT_DECLARED_HOST"]

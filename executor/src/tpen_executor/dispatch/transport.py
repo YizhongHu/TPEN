@@ -504,6 +504,7 @@ class LeafRequest:
         configured: Any,
         environment: PreparedPythonEnvironment,
         timeout: int | float | None = None,
+        selected_slot: Any = None,
     ) -> "LeafRequest":
         """Build the request for one begun attempt on the controller.
 
@@ -543,7 +544,7 @@ class LeafRequest:
         config = configured.config
         overrides = tuple(configured.overrides)
         if program is not None:
-            slot = _require_configured_physical_slot(allocation)
+            slot = _require_configured_physical_slot(allocation, selected_slot)
             attempt_delta = configured.attempt_delta(
                 fence.output_dir,
                 root=fence.root,

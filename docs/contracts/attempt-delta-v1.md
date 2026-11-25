@@ -34,10 +34,10 @@ The JSON object has exactly these fields:
 The executor derives `attempt_core_dir` from the fence's
 `<store>/groups/<group>/<task>/<attempt>` leaf. Before any child is created,
 all local, Parsl, and serialized carriers compare the delta's directory and
-identities to that fence. A configured launch is admitted only when allocation
-resolution supplies exactly one physical slot with a slot ID, host, and CPUs;
-otherwise it is refused before child creation. A crossed output, program, or
-fence is refused.
+identities to that fence. A configured launch is admitted only when each row
+carries one validated physical slot with a slot ID, host, and CPUs from its
+allocation; otherwise it is refused before child creation. A crossed output,
+program, or fence is refused.
 
 ## Canonical bytes and digest
 
