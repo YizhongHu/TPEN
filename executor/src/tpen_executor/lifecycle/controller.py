@@ -292,7 +292,7 @@ def run_group_controller(
     from .attached import AttachedAllocation
     from ..dispatch.completion import complete_leaf_result
     from ..dispatch.transport import LeafResultRejected, validate_leaf_result
-    from .local_executor import CollectionWaitTimeout, LeafCompletionContext
+    from .local_executor import CollectionWaitTimeout, LeafCompletionContext, LeafSubmissionError
 
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -399,8 +399,11 @@ def run_group_controller(
                 store.create_launch_intent(fence, controller, invocation)
                 store.require_current_controller(group, controller.generation, controller.claimant_nonce)
                 try:
-                    if admission_record is not None and hasattr(executor, "submit_admitted_successor"):
-                        launched, handle = executor.submit_admitted_successor(
+                    if admission_record is not None:
+                        submit_admitted = getattr(executor, "submit_admitted_successor", None)
+                        if not callable(submit_admitted):
+                            raise LeafSubmissionError("executor cannot honor admitted successor checkpoint")
+                        launched, handle = submit_admitted(
                             fence, invocation, admission_record.checkpoint_path,
                         )
                     else:
