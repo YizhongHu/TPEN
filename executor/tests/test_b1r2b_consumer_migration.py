@@ -117,7 +117,7 @@ def _r2_setup(tmp_path: Path, *, outcome: bool = True):
     current = fences["successor"]
     request, acceptance, successor_binding = successors["successor"]
     evidence = _real_evidence(
-        store, current, predecessor, backend_job_id=current.backend_job_id.value,
+        store, current, predecessor, backend_job_id=lease.backend_job_id.value,
     )
     recovery_input = RecoveryAdmissionInputV1(
         evidence, successor_binding.attempt_id, "2026-11-24T00:02:00Z",
@@ -180,7 +180,7 @@ def test_crossed_r2_link_is_rejected(tmp_path: Path) -> None:
         backend_job_id=successor_binding.allocation_attempt.backend_job_id.value,
         current_attempt=AttemptId("current-r2"),
     )
-    crossed = replace(admission, predecessor_attempt_id=AttemptId("other-predecessor"))
+    crossed = replace(admission, successor_attempt_id=AttemptId("other-successor"))
     with pytest.raises(ValueError, match="crosses successor identity"):
         SuccessorAdmissionRecord.from_recovery_admission(
             crossed, predecessor_task_id="successor", predecessor_content_id="a" * 64,
