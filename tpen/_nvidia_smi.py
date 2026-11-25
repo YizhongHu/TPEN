@@ -1272,6 +1272,31 @@ class NvidiaSmiDeviceProbe:
             time.monotonic_ns if monotonic_ns is None else monotonic_ns
         )
 
+    def __getstate__(self) -> Any:
+        """Refuse serialization of live subprocess probes and clocks."""
+
+        raise TypeError(
+            "NvidiaSmiDeviceProbe is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
+
+    def __reduce__(self) -> Any:
+        """Refuse pickling of live subprocess probes and clocks."""
+
+        raise TypeError(
+            "NvidiaSmiDeviceProbe is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        """Refuse pickling of live subprocess probes and clocks."""
+
+        del protocol
+        raise TypeError(
+            "NvidiaSmiDeviceProbe is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
+
     @property
     def identity(self) -> AcceleratorIdentity | None:
         """Selected physical accelerator identity bound to this probe."""

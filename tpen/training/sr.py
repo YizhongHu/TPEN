@@ -838,6 +838,8 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             raise ValueError(
                 "SR checkpoint layout/convention fingerprint does not match the live model"
             )
+        if state.get("policy") != self.policy.fingerprint():
+            raise ValueError("SR checkpoint policy does not match the live method")
         recorded_energy_policy = state.get("nonfinite_local_energy_policy")
         if recorded_energy_policy != self.nonfinite_local_energy_policy:
             raise ValueError(

@@ -270,7 +270,7 @@ def test_method_state_round_trips_through_the_trainer_checkpoint_state() -> None
     assert state["update_method"]["completed_updates"] == 2
 
     # A fresh trainer over the same model restores the counter.
-    resumed_method = _sr_method(model)
+    resumed_method = _sr_method(model, solve_space="parameter")
     resumed = VMCTrainer(max_steps=2, update_method=resumed_method)
     resumed.resolve_update_state(model=model, optimizer=resumed_method.optimizer)
     resumed.load_state_dict(state)
@@ -281,7 +281,7 @@ def test_method_state_round_trips_through_the_trainer_checkpoint_state() -> None
     # resumed against state describing a different geometry.
     torch.manual_seed(99)
     other_model = torch.nn.Linear(4, 3, dtype=torch.float64)
-    other_method = _sr_method(other_model)
+    other_method = _sr_method(other_model, solve_space="parameter")
     other = VMCTrainer(max_steps=1, update_method=other_method)
     other.resolve_update_state(model=other_model, optimizer=other_method.optimizer)
     with pytest.raises(ValueError, match="fingerprint does not match"):
