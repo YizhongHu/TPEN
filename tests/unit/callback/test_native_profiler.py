@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import os
+import json
 import pickle
 import subprocess
 import sys
@@ -176,9 +177,10 @@ def test_disabled_fresh_process_does_not_load_torch_profiler() -> None:
         "assert 'torch.profiler' not in sys.modules"
     )
     result = subprocess.run(
-        [sys.executable, "-c", code], check=True, capture_output=True, text=True,
+        [sys.executable, "-c", code], capture_output=True, text=True,
         cwd=os.getcwd(), env={**os.environ, "PYTHONPATH": os.getcwd()},
     )
+    assert result.returncode == 0, result.stderr
     assert result.stderr == ""
 
 
@@ -205,8 +207,9 @@ def test_window_counts_and_overshoot_are_recorded(tmp_path) -> None:
             callback.handle_occurrence(Occurrence(Started(TrainingIteration(step)), 1), context)
             callback.handle_occurrence(Occurrence(Ended(TrainingIteration(step)), 1), context)
     status = next(context.run_dir.rglob("profile-status.json")).read_text()
-    assert '"durable_steps":[2,3,4]' in status
-    assert "overshoot_steps=1" in status
+    payload = json.loads(status)
+    assert payload["durable_steps"] == [2, 3, 4]
+    assert "overshoot_steps=1" in payload["activity_diagnostics"]
 
 
 def test_open_partial_native_bundle_is_read_only_reconcilable(tmp_path) -> None:
@@ -223,7 +226,7 @@ def test_open_partial_native_bundle_is_read_only_reconcilable(tmp_path) -> None:
     inspected = inspect_run_observability(context.run_dir, relative_dir="native-profiling")
     reconciled = reconcile_run_observability(context.run_dir, relative_dir="native-profiling")
     assert inspected.status == "present"
-    assert reconciled.reconciliation_state == "open_interrupted"
+    assert reconciled.invocations[0].reconciliation_state == "open_interrupted"
 
 
 @pytest.mark.parametrize("failure", ["start", "step", "stop", "export"])
