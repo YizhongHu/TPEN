@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
 from collections.abc import Mapping
+from datetime import datetime, timezone
 import fcntl
 import json
 import os
@@ -336,6 +337,19 @@ def _require_regular(path: str, name: str, error_type: type[Exception] = FenceRe
     info = _existing(path, name, error_type)
     if not stat.S_ISREG(info.st_mode):
         raise error_type(f"{name} is not a regular file")
+
+
+def _canonical_completed_at(value: str) -> str:
+    """Render a durable UTC outcome timestamp in the completion wire form."""
+    if type(value) is not str:
+        raise FenceRejected("final outcome timestamp is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise FenceRejected("final outcome timestamp is invalid") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise FenceRejected("final outcome timestamp must be UTC")
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 @contextmanager
@@ -1679,7 +1693,7 @@ class DirectoryStore:
                 completed_updates,
                 target_iterations,
                 {"path": reference_path, "content_id": content_id},
-                outcome.finished_at_utc,
+                _canonical_completed_at(outcome.finished_at_utc),
                 digest(verdict.to_dict()),
                 links,
             )

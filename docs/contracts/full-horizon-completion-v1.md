@@ -68,7 +68,7 @@ Required top-level fields are exactly:
 | `completed_updates` | integer | `final_attempt.core_outcome.evidence.checkpoint.completed_updates`. |
 | `target_iterations` | integer | Full task horizon in iteration units; it equals `TaskSpec.target_horizon` when the task declares `target_horizon_units == "iterations"`. |
 | `final_checkpoint` | object | Exactly `path` and `content_id`; both strings. |
-| `completed_at` | string | Durable UTC timestamp, copied from the final outcome receipt. |
+| `completed_at` | string | Canonical UTC rendering of the final outcome receipt timestamp, formatted `YYYY-MM-DDTHH:MM:SS.ffffffZ`. |
 | `core_acceptance_digest` | string | `digest(verdict.to_dict())` for the typed final admission-port verdict. |
 | `attempt_chain` | array | Ordered successor-admission-v3 identity links. |
 
@@ -91,7 +91,7 @@ The canonical encoding is UTF-8 JSON with sorted keys, compact separators, and
 no duplicate keys. Example:
 
 ```json
-{"attempt_chain":[],"completed_at":"2026-11-25T14:00:00Z","completed_updates":100,"core_acceptance_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","final_attempt_id":"attempt-S","final_checkpoint":{"content_id":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","path":"/store/groups/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/task-7/attempt-S/core/checkpoints/final"},"group_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","schema":"tpen-executor/full-horizon-completion-v1","science_digest":"abababababababababababababababababababababababababababababababab","target_iterations":100,"task_id":"task-7"}
+{"attempt_chain":[],"completed_at":"2026-11-25T14:00:00.000000Z","completed_updates":100,"core_acceptance_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","final_attempt_id":"attempt-S","final_checkpoint":{"content_id":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","path":"/store/groups/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/task-7/attempt-S/core/checkpoints/final"},"group_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","schema":"tpen-executor/full-horizon-completion-v1","science_digest":"abababababababababababababababababababababababababababababababab","target_iterations":100,"task_id":"task-7"}
 ```
 
 ## Producer guards
@@ -129,9 +129,13 @@ either opaque value into this field.
 `executor/src/tpen_executor/contracts.py:137-180`; the writer's durable
 snapshot is the final-path source of truth.
 
-`completed_at` is copied verbatim from the durable final `OutcomeReceipt`'s
-`finished_at_utc`. The writer MUST NOT call the clock to populate it, so replay
-produces identical bytes.
+`completed_at` is derived only from the durable final `OutcomeReceipt`'s
+`finished_at_utc`; the writer MUST NOT call the clock. It parses an explicit
+timezone-bearing timestamp, requires a zero UTC offset, converts it to UTC, and
+renders the canonical form `%Y-%m-%dT%H:%M:%S.%fZ` (six microsecond digits,
+including `.000000` when the input has no fractional seconds). A `Z` or
+`+00:00` input is accepted; a naive or non-UTC offset is refused. The same
+durable input therefore produces identical bytes on replay.
 
 The timestamp field is defined by `OutcomeReceipt` at
 `executor/src/tpen_executor/results.py:151-199`; the final path reads the
@@ -161,7 +165,7 @@ or final attempt, missing/untyped/unknown/failed core evidence, a non-completed
 typed verdict, under-target progress, missing/crossed TaskSpec or science
 digest, non-iteration target units, disagreement between successor request
 copies or request digests, crossed successor group/lineage, missing or mismatched checkpoint
-path/content identity, missing/non-UTC durable timestamp, disconnected/crossed
+path/content identity, missing/naive/non-UTC durable timestamp, disconnected/crossed
 successor chain, checkpoint counter disagreement, cyclic chain, noncanonical
 completion bytes, missing/crossed/unreadable start provenance, a non-fresh
 chain root, an admitted attempt without its matching ledger link, and
