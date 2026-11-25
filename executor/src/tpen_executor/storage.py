@@ -1542,6 +1542,8 @@ class DirectoryStore:
             reference_path = checkpoint_ref.get("checkpoint_dir")
             if checkpoint_path != reference_path:
                 raise FenceRejected("final checkpoint path crosses core evidence")
+            if any(checkpoint.get(name) != checkpoint_ref.get(name) for name in ("completed_updates", "next_iteration")):
+                raise FenceRejected("final checkpoint counters cross core evidence")
             if "content_id" in checkpoint and checkpoint.get("content_id") != checkpoint_ref.get("content_id"):
                 raise FenceRejected("final checkpoint content identity crosses core evidence")
             content_id = sha256_text(checkpoint_ref.get("content_id"), "final_checkpoint.content_id")
@@ -1559,7 +1561,20 @@ class DirectoryStore:
                 if admission.successor_request is None:
                     raise FenceRejected("successor-admission-v3 request is absent")
                 request = self._successor_request_shape(dict(admission.successor_request))
+                if digest(request) != admission.request_digest:
+                    raise FenceRejected("successor admission request digest disagrees")
+                binding = admission.successor_binding
+                if binding is None:
+                    raise FenceRejected("successor admission binding is absent")
+                if binding.group_digest != fence.group_digest:
+                    raise FenceRejected("successor admission crosses final group")
+                if binding.task_id != stored_task.task_id:
+                    raise FenceRejected("successor admission crosses final task")
+                if binding.lineage_id != stored_task.lineage_id:
+                    raise FenceRejected("successor admission crosses final lineage")
                 request_target = request["target_iterations"]
+                if request_target != stored_task.target_horizon:
+                    raise FenceRejected("successor target_iterations disagrees with TaskSpec horizon")
                 if admitted_target_iterations is None:
                     admitted_target_iterations = request_target
                 elif request_target != admitted_target_iterations:
@@ -2243,10 +2258,21 @@ class DirectoryStore:
                 if attempt_id == _SUCCESSOR_ADMISSIONS:
                     continue
                 if attempt_id == _TASK_SPEC_FILENAME:
-                    _require_regular(os.path.join(task_dir, attempt_id), "task spec", ValueError)
+                    try:
+                        _require_regular(os.path.join(task_dir, attempt_id), "task spec", ValueError)
+                    except (OSError, TypeError, ValueError):
+                        # Optional completion context is unavailable to the
+                        # operational manifest; the completion writer remains
+                        # fail-closed when it reads this artifact directly.
+                        pass
                     continue
                 if attempt_id == _FULL_HORIZON_FILENAME:
-                    _require_regular(os.path.join(task_dir, attempt_id), "full-horizon completion record", ValueError)
+                    try:
+                        _require_regular(os.path.join(task_dir, attempt_id), "full-horizon completion record", ValueError)
+                    except (OSError, TypeError, ValueError):
+                        # A malformed optional completion artifact must not
+                        # alter operational reconciliation for the group.
+                        pass
                     continue
                 output_dir = _lexical(os.path.join(task_dir, attempt_id))
                 _require_directory(output_dir, "attempt directory", ValueError)
