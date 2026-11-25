@@ -14,6 +14,7 @@ import pytest
 
 from tests.helpers.run_context import make_run_context
 from tpen.callback import (
+    ChromeTraceExport,
     NativeProfiler,
     TorchOperatorSummary,
     TrainingIterationWindow,
@@ -59,6 +60,11 @@ class _FakeBackend:
                 return False
 
         return _Range()
+
+    def export_chrome_trace(self, path: str) -> None:
+        self.calls.append("export_chrome_trace")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"traceEvents": []}, handle)
 
 
 class _FailingBackend(_FakeBackend):
@@ -148,6 +154,53 @@ def test_fake_backend_is_started_stepped_and_stopped(tmp_path) -> None:
 def test_summary_is_bounded() -> None:
     backend = _FakeBackend()
     assert len(TorchOperatorSummary(max_rows=3).rows(backend)) == 3
+
+
+def test_chrome_trace_export_is_fixed_and_published_to_both_refs(tmp_path) -> None:
+    backend = _FakeBackend()
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        trace={},
+        backend_factory=lambda: backend,
+    )
+    context = make_run_context(tmp_path)
+    with callback.run_scope(context):
+        callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
+        callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
+
+    trace_path = next(context.run_dir.rglob("chrome-trace.json"))
+    assert trace_path.read_text(encoding="utf-8") == '{"traceEvents": []}'
+    status = json.loads(next(context.run_dir.rglob("profile-status.json")).read_text())
+    manifest = json.loads(next(context.run_dir.rglob("manifest.json")).read_text())
+    status_ref = next(ref for ref in status["artifacts"] if ref["kind"] == "trace")
+    manifest_ref = next(ref for ref in manifest["artifacts"] if ref["kind"] == "trace")
+    assert status_ref == manifest_ref
+    assert status_ref["path"] == (
+        "profiles/native-profiler/step-0-0/chrome-trace.json"
+    )
+    assert status["export_status"] == "complete"
+
+
+def test_chrome_trace_missing_backend_capability_is_partial_and_preserves_primary(tmp_path) -> None:
+    class _NoTraceBackend(_FakeBackend):
+        export_chrome_trace = None  # type: ignore[assignment]
+
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        trace=ChromeTraceExport(),
+        backend_factory=_NoTraceBackend,
+    )
+    context = make_run_context(tmp_path)
+    with callback.run_scope(context):
+        callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
+        callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
+    status = json.loads(next(context.run_dir.rglob("profile-status.json")).read_text())
+    assert status["export_status"] == "failed"
+    assert status["data_completeness"] == "partial"
+    assert status["artifacts"] is None
+    assert any(item.startswith("trace_export_failed") for item in status["activity_diagnostics"])
 
 
 def test_live_callback_and_session_refuse_serialization() -> None:

@@ -2856,6 +2856,7 @@ class ObservabilityBundleWriter:
         self._writer_truncation_reasons: dict[str, list[str]] = {}
         self._pending_bytes: dict[str, int] = {}
         self._written_artifacts: dict[str, Path] = {}
+        self._artifact_kinds: dict[str, str | None] = {}
 
     def __getstate__(self) -> Any:
         """Refuse serialization of live observability bundle writers."""
@@ -2957,6 +2958,108 @@ class ObservabilityBundleWriter:
         _check_no_symlinks_under(self._artifact_manager.run_dir, rel_parts)
         _check_no_symlinks_under(bundle_dir, normalized.split("/"))
         return candidate
+
+    def reserve_external_artifact(self, rel_path: str, *, kind: str) -> Path:
+        """Reserve an existing-backend artifact destination without writing it.
+
+        The reservation is intentionally read-only. It validates containment,
+        rejects every existing symlink component, refuses collisions with the
+        bundle's code-owned filenames, and refuses an existing target before a
+        caller can create a directory or file.
+
+        Parameters
+        ----------
+        rel_path : str
+            Safe bundle-relative destination for the external artifact.
+        kind : str
+            Existing artifact kind recorded when the file is registered.
+
+        Returns
+        -------
+        pathlib.Path
+            The validated physical destination.
+
+        Raises
+        ------
+        ObservabilityPathError
+            If the destination is unsafe, reserved, symlinked, or occupied.
+        """
+
+        self._require_not_finalized("reserve an external artifact")
+        normalized = validate_relative_path(
+            rel_path, "external_artifact_path", forbid_manifest_self=True
+        )
+        # External writers must never be allowed to overwrite one of the
+        # writer-owned records, even when the relative path is nested.
+        if Path(normalized).name.lower() in {
+            MANIFEST_FILENAME.lower(),
+            LIFECYCLE_MARKER_FILENAME.lower(),
+            PROFILE_STATUS_FILENAME.lower(),
+            LEGACY_PROFILE_STATUS_FILENAME.lower(),
+            PROFILE_SUMMARY_FILENAME.lower(),
+        }:
+            raise ObservabilityPathError(
+                f"external artifact path {normalized!r} collides with a reserved bundle filename"
+            )
+        if normalized in self._written_artifacts or normalized in self._artifact_kinds:
+            raise ObservabilityPathError(
+                f"external artifact path {normalized!r} is already reserved"
+            )
+        # _safe_artifact_path performs the routed-path and no-symlink checks;
+        # resolve again here so this public reservation explicitly proves the
+        # physical candidate remains inside the resolved bundle directory.
+        target = self._safe_artifact_path(normalized)
+        resolved_bundle = self.bundle_dir.resolve(strict=False)
+        resolved_target = target.resolve(strict=False)
+        try:
+            resolved_target.relative_to(resolved_bundle)
+        except ValueError as exc:
+            raise ObservabilityPathError(
+                f"external artifact {target!s} resolves outside bundle {resolved_bundle!s}"
+            ) from exc
+        if target.exists() or target.is_symlink():
+            raise ObservabilityPathError(
+                f"refusing existing external artifact target {target!s}"
+            )
+        # Construct once to validate the existing wire-level kind without
+        # creating a partial reference.
+        ObservabilityArtifactRef(path=normalized, kind=kind)
+        self._artifact_kinds[normalized] = kind
+        return target
+
+    def register_external_artifact(
+        self, rel_path: str, *, kind: str
+    ) -> ObservabilityArtifactRef:
+        """Register a reserved regular file with exact bytes and SHA-256.
+
+        Registration repeats the containment and symlink checks after the
+        external backend returns, closing the validation-to-write race at the
+        audited writer boundary.
+        """
+
+        self._require_not_finalized("register an external artifact")
+        normalized = validate_relative_path(
+            rel_path, "external_artifact_path", forbid_manifest_self=True
+        )
+        reserved_kind = self._artifact_kinds.get(normalized)
+        if reserved_kind != kind:
+            raise ObservabilityArtifactError(
+                f"external artifact {normalized!r} was not reserved with kind {kind!r}"
+            )
+        target = self._safe_artifact_path(normalized)
+        if not target.exists() or not target.is_file() or target.is_symlink():
+            raise ObservabilityArtifactError(
+                f"external artifact {normalized!r} is missing or not a regular file"
+            )
+        raw_bytes = target.read_bytes()
+        ref = ObservabilityArtifactRef(
+            path=normalized,
+            bytes=len(raw_bytes),
+            sha256=hashlib.sha256(raw_bytes).hexdigest(),
+            kind=kind,
+        )
+        self._written_artifacts[normalized] = target
+        return ref
 
     def _atomic_write_bytes(self, target: Path, payload: bytes) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -3465,6 +3568,9 @@ class ObservabilityBundleWriter:
             ordered_paths = sorted(all_paths)
 
         refs: list[ObservabilityArtifactRef] = []
+        supplied_kinds = {
+            ref.path: ref.kind for ref in manifest.artifacts if ref.kind is not None
+        }
         for rel_path in ordered_paths:
             target = self._safe_artifact_path(rel_path)
             if not target.exists() or not target.is_file():
@@ -3475,7 +3581,10 @@ class ObservabilityBundleWriter:
             digest = hashlib.sha256(raw_bytes).hexdigest()
             refs.append(
                 ObservabilityArtifactRef(
-                    path=rel_path, bytes=len(raw_bytes), sha256=digest
+                    path=rel_path,
+                    bytes=len(raw_bytes),
+                    sha256=digest,
+                    kind=self._artifact_kinds.get(rel_path, supplied_kinds.get(rel_path)),
                 )
             )
 

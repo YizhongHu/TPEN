@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from pathlib import Path
 from types import TracebackType
 from typing import Protocol, TYPE_CHECKING, TypeAlias
 
@@ -19,6 +20,7 @@ from tpen.artifacts import ArtifactManager, RunContext
 from tpen.events import Ended, Event as TypedEvent, Occurrence, Operation, Started
 from tpen.observability_artifacts import (
     ObservabilityBundleWriter,
+    ObservabilityArtifactRef,
     ObservabilityManifest,
     ObservabilityProfileStatus,
     ObservabilityProfileSummary,
@@ -47,6 +49,7 @@ class _ProfilerBackend(Protocol):
     def stop(self) -> None: ...
     def key_averages(self) -> Sequence[_OperatorRow]: ...
     def record_function(self, label: str) -> AbstractContextManager[object]: ...
+    def export_chrome_trace(self, path: str) -> None: ...
 
 
 _BackendFactory: TypeAlias = Callable[[], _ProfilerBackend]
@@ -59,6 +62,7 @@ class _RawTorchProfiler(Protocol):
     def step(self) -> None: ...
     def stop(self) -> None: ...
     def key_averages(self) -> Sequence[_OperatorRow]: ...
+    def export_chrome_trace(self, path: str) -> None: ...
 
 
 class _TorchProfilerBackend:
@@ -86,6 +90,9 @@ class _TorchProfilerBackend:
 
     def record_function(self, label: str) -> AbstractContextManager[object]:
         return self._record_function(label)
+
+    def export_chrome_trace(self, path: str) -> None:
+        self._raw.export_chrome_trace(path)
 
 
 @dataclass(frozen=True)
@@ -179,6 +186,17 @@ class TorchOperatorSummary:
         return self.collect(backend)[0]
 
 
+@dataclass(frozen=True)
+class ChromeTraceExport:
+    """Opt-in code-owned Chrome trace export with no path knobs."""
+
+    def __post_init__(self) -> None:
+        """Reject accidental fields when constructed through a mapping."""
+
+        if self.__dict__:
+            raise TypeError("ChromeTraceExport does not accept configuration fields")
+
+
 class _DisabledScope(AbstractContextManager[None]):
     """No-op scope for the disabled path."""
 
@@ -231,6 +249,8 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
         self._activation_ns = 0
         self._closed = False
         self._activation_failed = False
+        self.trace_path: Path | None = None
+        self.trace_ref: ObservabilityArtifactRef | None = None
 
     def __getstate__(self) -> object:
         raise TypeError("NativeProfiler live state cannot be serialized")
@@ -279,6 +299,10 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
         if self.writer is not None:
             return
         self.writer = self.callback._new_writer(self.context)
+        if self.callback.trace is not None:
+            self.trace_path = self.writer.reserve_external_artifact(
+                self.callback._trace_relative_path(), kind="trace"
+            )
         self.writer.write_open_manifest(self.callback._open_manifest(self.context))
 
     def _start(self) -> None:
@@ -288,8 +312,8 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
             return
         self.activation_attempted = True
         self._activation_ns = time.monotonic_ns()
-        self._open_writer()
         try:
+            self._open_writer()
             self.backend = self._make_backend()
             started_before = time.monotonic_ns()
             self.backend.start()
@@ -298,7 +322,11 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
             self.started = True
         except BaseException as exc:
             self._activation_failed = True
-            self._diagnostic("backend_start_failed", exc)
+            self._diagnostic(
+                "trace_reservation_failed" if self.trace_path is None and self.callback.trace is not None
+                else "backend_start_failed",
+                exc,
+            )
 
     def checkpoint(self) -> None:
         """Keep cooperative lifecycle checkpoints separate from backend steps."""
@@ -373,6 +401,27 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
         self.callback._finish(self)
         return False
 
+    def _export_trace(self) -> None:
+        """Synchronously export and register the optional native trace."""
+
+        if self.callback.trace is None or self.backend is None or not self.started:
+            return
+        writer = self.writer
+        trace_path = self.trace_path
+        if writer is None or trace_path is None:
+            self._diagnostic("trace_export_failed:reservation_unavailable")
+            return
+        try:
+            # This direct typed call is intentional: missing backend capability
+            # is an explicit diagnostic failure, never a silent success.
+            self.backend.export_chrome_trace(str(trace_path))
+            self.trace_ref = writer.register_external_artifact(
+                self.callback._trace_relative_path(), kind="trace"
+            )
+        except BaseException as exc:
+            self.trace_ref = None
+            self._diagnostic("trace_export_failed", exc)
+
 
 class NativeProfiler(Callback):
     """Opt-in managed native profiler with fixed typed ranges."""
@@ -383,6 +432,7 @@ class NativeProfiler(Callback):
         enabled: bool = False,
         window: TrainingIterationWindow | Mapping[str, object] | None = None,
         summary: TorchOperatorSummary | Mapping[str, object] | None = None,
+        trace: ChromeTraceExport | Mapping[str, object] | None = None,
         sink: RunArtifactSink | Mapping[str, object] | None = None,
         observer_id: str = "native-profiler",
         backend_factory: _BackendFactory | None = None,
@@ -395,6 +445,7 @@ class NativeProfiler(Callback):
         if self.enabled and self.window is None:
             raise ValueError("enabled NativeProfiler requires an explicit window")
         self.summary = self._coerce_summary(summary)
+        self.trace = self._coerce_trace(trace)
         self.sink = RunArtifactSink(relative_dir="native-profiling") if sink is None else self._coerce_sink(sink)
         self.observer_id = observer_id
         self.backend_factory = backend_factory
@@ -437,12 +488,33 @@ class NativeProfiler(Callback):
         raise TypeError("summary must be TorchOperatorSummary or a mapping")
 
     @staticmethod
+    def _coerce_trace(value: ChromeTraceExport | Mapping[str, object] | None) -> ChromeTraceExport | None:
+        if value is None:
+            return None
+        if isinstance(value, ChromeTraceExport):
+            return value
+        if isinstance(value, Mapping) and not value:
+            # Empty mappings preserve Hydra construction compatibility while
+            # keeping the exporter entirely code-owned and zero-knob.
+            return ChromeTraceExport()
+        raise TypeError("trace must be ChromeTraceExport, an empty mapping, or None")
+
+    @staticmethod
     def _coerce_sink(value: RunArtifactSink | Mapping[str, object]) -> RunArtifactSink:
         if type(value) is RunArtifactSink:
             return value
         if isinstance(value, Mapping):
             return RunArtifactSink(**dict(value))
         raise TypeError("sink must be exactly RunArtifactSink or a mapping")
+
+    def _trace_relative_path(self) -> str:
+        """Return the fixed bundle-relative Chrome trace destination."""
+
+        window = self.window
+        if window is None:
+            raise ValueError("enabled NativeProfiler requires an explicit window")
+        window_id = f"step-{window.start_step}-{window.end_step}"
+        return f"profiles/{self.observer_id}/{window_id}/chrome-trace.json"
 
     def __getstate__(self) -> object:
         raise TypeError("NativeProfiler is invocation-local and cannot be serialized")
@@ -483,6 +555,8 @@ class NativeProfiler(Callback):
             f"profiles/{self.observer_id}/{window_id}/profile-status.json",
             f"profiles/{self.observer_id}/{window_id}/summary.json",
         )
+        if self.trace is not None:
+            rels += (self._trace_relative_path(),)
         for relative in rels:
             target = bundle / relative
             claims.append(ResourceOwnershipClaim(
@@ -595,6 +669,7 @@ class NativeProfiler(Callback):
                 except BaseException as exc:
                     summary_succeeded = False
                     session._diagnostic("summary_failed", exc)
+            session._export_trace()
             if application_error is not None:
                 session._diagnostic(f"application_error={type(application_error).__name__}")
             if session._overshoot_steps:
@@ -610,10 +685,12 @@ class NativeProfiler(Callback):
                 lifecycle_state = "closed"
                 completeness = "complete" if session.window_completed else "partial"
             export_failed = any(
-                item.startswith(("backend_", "persistence_", "summary_failed"))
+                item.startswith(("backend_", "persistence_", "summary_failed", "trace_"))
                 for item in session._diagnostics
             )
             if summary_succeeded is False:
+                completeness = "partial"
+            if session.trace_ref is None and self.trace is not None and session.started:
                 completeness = "partial"
             diagnostics = tuple(session._diagnostics)
             requested = ("CPU",)
@@ -637,7 +714,11 @@ class NativeProfiler(Callback):
                 lifecycle_state=lifecycle_state,
                 data_completeness=completeness,
                 guarantee_class="diagnostic",
-                exporter="TorchOperatorSummary",
+                exporter=(
+                    "TorchOperatorSummary+ChromeTraceExport"
+                    if self.trace is not None
+                    else "TorchOperatorSummary"
+                ),
                 export_status=(
                     "failed"
                     if export_failed
@@ -649,6 +730,7 @@ class NativeProfiler(Callback):
                 backend_event_bounds={"status": "unavailable", "reason_code": "cooperative_boundary"},
                 stop_overshoot_bounds_seconds=None, activity_diagnostics=diagnostics,
                 durable_steps=tuple(session._steps), export_mode="summary",
+                artifacts=(session.trace_ref,) if session.trace_ref is not None else None,
                 truncation_reasons=("max_rows_exceeded",) if summary_truncated else None,
             ))
             writer.finalize_manifest(ObservabilityManifest(

@@ -977,6 +977,59 @@ def test_sample_byte_cap_preserves_prior_records_and_status_budget_is_independen
         tiny_writer.write_status(ObservabilityStatus.from_mapping(_appendix_a_status()))
 
 
+@pytest.mark.parametrize(
+    "reserved_name",
+    ["manifest.json", "lifecycle-marker.json", "profile-status.json", "status.json", "summary.json"],
+)
+def test_external_artifact_reservation_is_read_only_and_refuses_reserved_names(
+    reserved_name: str, tmp_path: Path
+) -> None:
+    manager = _make_manager(tmp_path)
+    writer = ObservabilityBundleWriter(manager, INVOCATION_ID)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("untouched", encoding="utf-8")
+
+    with pytest.raises(ObservabilityPathError, match="reserved bundle filename"):
+        writer.reserve_external_artifact(f"profiles/native/{reserved_name}", kind="trace")
+    assert sentinel.read_text(encoding="utf-8") == "untouched"
+    assert not manager.run_dir.exists()
+
+
+def test_external_artifact_reservation_refuses_symlink_before_mutation(tmp_path: Path) -> None:
+    manager = _make_manager(tmp_path)
+    manager.run_dir.mkdir(parents=True)
+    bundle = manager.run_dir / "observability" / INVOCATION_ID
+    bundle.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("untouched", encoding="utf-8")
+    (bundle / "profiles").symlink_to(outside, target_is_directory=True)
+    writer = ObservabilityBundleWriter(manager, INVOCATION_ID)
+
+    with pytest.raises(ObservabilityPathError, match="symlink"):
+        writer.reserve_external_artifact(
+            "profiles/native-profiler/step-0-0/chrome-trace.json", kind="trace"
+        )
+    assert sentinel.read_text(encoding="utf-8") == "untouched"
+    assert not (outside / "native-profiler").exists()
+
+
+def test_external_artifact_registration_preserves_trace_kind_and_integrity(tmp_path: Path) -> None:
+    manager = _make_manager(tmp_path)
+    writer = ObservabilityBundleWriter(manager, INVOCATION_ID)
+    rel_path = "profiles/native-profiler/step-0-0/chrome-trace.json"
+    target = writer.reserve_external_artifact(rel_path, kind="trace")
+    target.parent.mkdir(parents=True)
+    target.write_text('{"traceEvents": []}', encoding="utf-8")
+    ref = writer.register_external_artifact(rel_path, kind="trace")
+    assert ref.kind == "trace"
+    assert ref.bytes == target.stat().st_size
+    assert ref.sha256 == hashlib.sha256(target.read_bytes()).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # 5. Open / interrupted / torn-tail vs interior corrupt records (strictly read-only)
 # ---------------------------------------------------------------------------
