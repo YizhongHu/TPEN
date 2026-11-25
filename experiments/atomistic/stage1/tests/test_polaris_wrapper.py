@@ -15,6 +15,7 @@ from pathlib import Path
 from experiments.atomistic.stage1.protocol import (
     CHECKPOINT_EVIDENCE_SCHEMA,
     HE_H2_EVAL_CHECKPOINTS,
+    derive_smoke_request,
     manifest_hash,
 )
 
@@ -690,6 +691,55 @@ def _make_exact_fixture(tmp_path: Path) -> tuple[Path, str]:
     return checkout, sha
 
 
+def _make_real_main_fixture(tmp_path: Path) -> tuple[Path, str, Path]:
+    """Create an exact checkout whose public runner callback is the only stub."""
+
+    checkout = tmp_path / "real-main-checkout"
+    shutil.copytree(REPO_ROOT / "experiments", checkout / "experiments")
+    shutil.copytree(REPO_ROOT / "tpen", checkout / "tpen")
+    for name in ("pyproject.toml", "uv.lock", ".python-version"):
+        shutil.copy2(REPO_ROOT / name, checkout / name)
+    (checkout / "sitecustomize.py").write_text(
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "\n"
+        "if sys.argv and sys.argv[0].endswith('train.py'):\n"
+        "    import tpen.run as _run\n"
+        "\n"
+        "    def _recording_run(cfg, **kwargs):\n"
+        "        payload = {\n"
+        "            'root': str(cfg.run.root),\n"
+        "            'run_id': str(cfg.run.run_id),\n"
+        "            'max_steps': int(cfg.trainer.max_steps),\n"
+        "            'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),\n"
+        "            'command': kwargs.get('command'),\n"
+        "            'callbacks': [\n"
+        "                {'type': type(callback).__name__,\n"
+        "                 'target_iteration': getattr(callback, 'target_iteration', None),\n"
+        "                 'target_iterations': getattr(callback, 'target_iterations', None)}\n"
+        "                for callback in kwargs.get('runtime_callbacks', ())\n"
+        "            ],\n"
+        "        }\n"
+        "        with Path(os.environ['RUN_CALLBACK_RECORD']).open('a', encoding='utf-8') as handle:\n"
+        "            handle.write(json.dumps(payload, sort_keys=True) + '\\n')\n"
+        "        return 0\n"
+        "\n"
+        "    _run.run_from_config = _recording_run\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init", str(checkout)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(checkout), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(checkout), "config", "user.name", "test"], check=True)
+    subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(checkout), "commit", "-m", "real-main fixture"], check=True,
+                   capture_output=True)
+    sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+    callback_record = tmp_path / "run-callback.jsonl"
+    return checkout, sha, callback_record
+
+
 def _production_stubs(tmp_path: Path) -> dict[str, str]:
     """Stub only uv, nvidia-smi, the driver, and network Git subcommands."""
 
@@ -878,3 +928,125 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
     assert set(Path(env["TASKSET_RECORD"]).read_text().splitlines()) == {
         "0,1,2,3,4,5,6,7,8,9",
     }
+
+
+def test_production_argv_reaches_real_train_main_for_unbounded_and_smoke_rows(
+    tmp_path: Path,
+) -> None:
+    """Generated row argv reaches train.main with only final execution stubbed."""
+
+    checkout, source_sha, callback_record = _make_real_main_fixture(tmp_path)
+    env = _production_env(tmp_path, checkout, source_sha)
+    env["RUN_CALLBACK_RECORD"] = str(callback_record)
+    env["PYTHONPATH"] = str(checkout)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    results_root = Path(env["RESULTS_ROOT"])
+    results_root.mkdir(parents=True, exist_ok=True)
+    plan_path = results_root / "plan" / "phase1.json"
+    env.update({
+        "MODE": "plan", "PLAN_PHASE": "1", "SYSTEM": "he",
+        "PLAN_OUTPUT": str(plan_path), "LINEAGE_SEEDS": "1:2:3",
+    })
+    planned = _run("plan", env)
+    assert planned.returncode == 0, planned.stderr
+    train_row = next(
+        row for row in json.loads(plan_path.read_text(encoding="utf-8"))["rows"]
+        if row["kind"] == "train" and row["lineage"] == 1
+    )
+    selected = results_root / "plan" / "selected.json"
+    selected.write_text(json.dumps(train_row), encoding="utf-8")
+    env.update({"MODE": "train", "SELECTED_ROW": str(selected)})
+    unbounded = _run("train", env)
+    assert unbounded.returncode == 0, unbounded.stderr
+
+    isolated_root = Path(env["TPEN_POLARIS_TEST_RESULTS_PREFIX"]) / "isolated-smoke"
+    bounded_row = derive_smoke_request(train_row, results_root=str(isolated_root), stop_at=50_000)
+    bounded_selected = isolated_root / "plan" / "selected.json"
+    bounded_selected.parent.mkdir(parents=True)
+    bounded_selected.write_text(json.dumps(bounded_row), encoding="utf-8")
+    env["RESULTS_ROOT"] = str(isolated_root)
+    env["SELECTED_ROW"] = str(bounded_selected)
+    bounded = _run("train", env)
+    assert bounded.returncode == 0, bounded.stderr
+
+    records = [json.loads(line) for line in callback_record.read_text().splitlines()]
+    assert len(records) == 2
+    assert records[0] == {
+        "callbacks": [], "command": "stage1 train", "cuda_visible_devices": "1",
+        "max_steps": train_row["updates"],
+        "root": train_row["results_root"], "run_id": train_row["run_id"],
+    }
+    assert records[1] == {
+        "callbacks": [{"type": "PlannedYield", "target_iteration": 50_000,
+                       "target_iterations": bounded_row["updates"]}],
+        "command": "stage1 train", "cuda_visible_devices": "1",
+        "max_steps": bounded_row["updates"],
+        "root": bounded_row["results_root"], "run_id": bounded_row["run_id"],
+    }
+    logs = list(results_root.glob("logs/*.log")) + list(isolated_root.glob("logs/*.log"))
+    assert len(logs) == 2
+    assert all("POLARIS_COMMAND" in log.read_text(encoding="utf-8") for log in logs)
+    assert all("train.py" in log.read_text(encoding="utf-8") for log in logs)
+
+
+def test_production_refuses_selected_row_replacement_during_bootstrap(tmp_path: Path) -> None:
+    """Bootstrap must not redirect a planner-admitted row before the driver boundary."""
+
+    checkout, source_sha, callback_record = _make_real_main_fixture(tmp_path)
+    env = _production_env(tmp_path, checkout, source_sha)
+    env["RUN_CALLBACK_RECORD"] = str(callback_record)
+    env["PYTHONPATH"] = str(checkout)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    results_root = Path(env["RESULTS_ROOT"])
+    results_root.mkdir(parents=True, exist_ok=True)
+    plan_path = results_root / "plan" / "phase1.json"
+    env.update({
+        "MODE": "plan", "PLAN_PHASE": "1", "SYSTEM": "he",
+        "PLAN_OUTPUT": str(plan_path), "LINEAGE_SEEDS": "1:2:3",
+    })
+    planned = _run("plan", env)
+    assert planned.returncode == 0, planned.stderr
+    admitted = next(
+        row for row in json.loads(plan_path.read_text(encoding="utf-8"))["rows"]
+        if row["kind"] == "train" and row["lineage"] == 1
+    )
+    selected = results_root / "plan" / "selected.json"
+    selected.write_text(json.dumps(admitted), encoding="utf-8")
+    redirected = {
+        **admitted,
+        "results_root": str(Path(env["TPEN_POLARIS_TEST_RESULTS_PREFIX"]) / "redirected"),
+    }
+    uv_path = Path(env["UV_STUB"])
+    uv_path.write_text(
+        uv_path.read_text(encoding="utf-8").replace(
+            "  sync) mkdir -p",
+            f"  sync) printf '%s' {shlex.quote(json.dumps(redirected))} > \"$SELECTED_ROW\"; mkdir -p",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    env.update({"MODE": "train", "SELECTED_ROW": str(selected)})
+    result = _run("train", env)
+    records = (
+        [json.loads(line) for line in callback_record.read_text().splitlines()]
+        if callback_record.exists() else []
+    )
+    assert (
+        (result.returncode != 0 and not records)
+        or (
+            result.returncode == 0
+            and len(records) == 1
+            and records[0]["root"] == admitted["results_root"]
+        )
+    ), (
+        f"redirected callback record={records!r}; stderr={result.stderr}"
+    )
+
+
+def test_polaris_mutant_old_needles_are_present_once() -> None:
+    """Keep the committed mutant registry mechanically aligned with its source."""
+
+    mutants = json.loads((HERE / "polaris-mutants.json").read_text(encoding="utf-8"))
+    source = WRAPPER.read_text(encoding="utf-8")
+    for mutant in mutants:
+        assert source.count(mutant["old"]) == 1, mutant["id"]
