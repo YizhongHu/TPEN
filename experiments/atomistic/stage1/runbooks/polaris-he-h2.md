@@ -150,7 +150,7 @@ mkdir -p "$RESULTS_ROOT"/{inputs,logs,plan,launch}
 cp experiments/atomistic/stage1/polaris/pbs_stage1.sh "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 chmod 750 "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 sha256sum "$RESULTS_ROOT/inputs/pbs_stage1.sh" > "$RESULTS_ROOT/inputs/pbs_stage1.sh.sha256"
-python - "$RESULTS_ROOT/plan/phase1-manifest.json" "$RESULTS_ROOT/plan/selected-train.json" <<'PY'
+"$PYBIN" - "$RESULTS_ROOT/plan/phase1-manifest.json" "$RESULTS_ROOT/plan/selected-train.json" <<'PY'
 import json, sys
 from pathlib import Path
 source, target = map(Path, sys.argv[1:])
@@ -196,7 +196,7 @@ approved eval row in the same way.  This is a subset consumer only; it does not
 replace the full roster/grid reconciliation.
 
 ```bash
-python - "$RESULTS_ROOT/plan/phase2-manifest.json" "$RESULTS_ROOT/plan/selected-eval.json" <<'PY'
+"$PYBIN" - "$RESULTS_ROOT/plan/phase2-manifest.json" "$RESULTS_ROOT/plan/selected-eval.json" <<'PY'
 import json, sys
 from pathlib import Path
 source, target = map(Path, sys.argv[1:])
