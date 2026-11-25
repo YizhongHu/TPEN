@@ -485,7 +485,7 @@ def _checkpoint_under_attempt_core(
     path_parts = Path(path).parts
     expected = root_parts + ("groups", group_digest, task_id, attempt_id.value, "core")
     suffix = path_parts[len(expected):]
-    return tuple(path_parts[:len(expected)]) == expected and bool(suffix) and "groups" not in suffix
+    return tuple(path_parts[:len(expected)]) == expected and bool(suffix)
 
 
 def _checkpoint_predecessor_core(path: str, trusted_store_root: str, group_digest: str, task_id: str, attempt_id: AttemptId) -> bool:

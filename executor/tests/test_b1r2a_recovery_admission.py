@@ -171,6 +171,7 @@ def test_unknown_scheduler_end_parks(tmp_path: Path) -> None:
         ("nested-current", ("parked", "checkpoint-is-current-attempt")),
         ("nested-foreign", ("parked", "checkpoint-lineage-mismatch")),
         ("different-store", ("parked", "checkpoint-lineage-mismatch")),
+        ("nested-predecessor", ("admitted", "recovery-evidence-valid")),
         ("bound-groups", ("admitted", "recovery-evidence-valid")),
     ],
 )
@@ -186,6 +187,8 @@ def test_checkpoint_path_must_be_predecessor_core(tmp_path: Path, path_kind: str
         path = trusted_root / "groups" / "foreign-group" / "foreign-task" / "foreign-attempt" / "core" / "checkpoints" / "groups" / GROUP / "task" / "predecessor" / "core" / "step_000004"
     elif path_kind == "different-store":
         path = tmp_path / "other-store" / "groups" / GROUP / "task" / "predecessor" / "core" / "checkpoints" / "step_000004"
+    elif path_kind == "nested-predecessor":
+        path = trusted_root / "groups" / GROUP / "task" / "predecessor" / "core" / "checkpoints" / "groups" / "step_000004"
     else:
         trusted_root = tmp_path / "groups"
         path = trusted_root / "groups" / GROUP / "task" / "predecessor" / "core" / "checkpoints" / "step_000004"
