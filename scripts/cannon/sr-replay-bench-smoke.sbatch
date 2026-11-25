@@ -77,6 +77,7 @@ module_path = f"{checkout}/scripts/cannon/sr_replay_benchmark.py"
 spec = importlib.util.spec_from_file_location("sr_replay_benchmark_smoke", module_path)
 module = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
+sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 
 cell = {
