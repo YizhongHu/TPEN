@@ -632,7 +632,7 @@ def test_real_serialized_leaf_runs_science_then_inspection_on_the_worker(tmp_pat
     monkeypatch.delenv(WORKER_MARK, raising=False)
     request, (group, _allocation, lifecycle, configured, fence) = _request(tmp_path)
     # Fresh output: the controller's begin wrote only its start receipt.
-    assert sorted(os.listdir(fence.output_dir)) == ["start.json"]
+    assert sorted(os.listdir(fence.output_dir)) == ["start-provenance.json", "start.json"]
 
     leaf_pid, encoded = _serialized_leaf(request)
     result = validate_leaf_result(request, LeafResult.decode(encoded))
@@ -732,7 +732,7 @@ def test_leaf_admits_its_slot_against_the_store_quarantine(tmp_path: Path, monke
         assert "durable quarantine marker" in result.launch_error["message"]
     # No child was spawned and the fenced output is still fresh.
     assert spawned == [] and _events(tmp_path) == []
-    assert sorted(os.listdir(fence.output_dir)) == ["start.json"]
+    assert sorted(os.listdir(fence.output_dir)) == ["start-provenance.json", "start.json"]
 
     # A wrong overlay, or a sampled launch without one, is never a request.
     for overlay, message in (

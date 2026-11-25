@@ -41,6 +41,19 @@ checkpoint and grant lineage are not substitutes.
 Absence of `full-horizon-completion.json` means the task is not complete. There
 is no parked completion record.
 
+Each attempt leaf also contains the executor-internal, write-once
+`start-provenance.json` record at
+`<store>/groups/<group>/<task>/<attempt>/start-provenance.json`. HI does not
+read this file. Its schema is `tpen-executor/start-provenance-v1` and its
+common fields are `kind`, `task_id`, `attempt_id`, and `group_digest`. A fresh
+attempt has `kind: "fresh"`; an admitted successor has `kind: "admitted"` plus
+`predecessor_attempt_id` and the canonical successor-admission `request_digest`.
+The executor writes it atomically under the task lock when the corresponding
+begin operation succeeds. The completion writer requires the root attempt to
+be fresh and every later attempt to be admitted with a matching durable v3
+ledger link; missing, crossed, unreadable, or mismatched provenance refuses
+publication.
+
 ## Closed record shape
 
 Required top-level fields are exactly:
@@ -129,9 +142,10 @@ returns the existing record. Different facts produce a typed fork/refusal and
 never overwrite the file.
 
 This is an upgrade/no-backfill boundary: a pre-PR completed attempt without a
-durable task-spec snapshot or the required successor ledger is not backfilled
-into a completion record. A later fresh start may create the snapshot for its
-own attempt; absence of trusted final-path facts remains absence of completion.
+durable task-spec snapshot, start provenance, or required successor ledger is
+not backfilled into a completion record. A later fresh start may create these
+facts for its own attempt; absence of trusted final-path facts remains absence
+of completion.
 
 Write-once serialization is process-level: the writer holds the task's POSIX
 `lockf` advisory lock while reading, comparing, and publishing. Threads in one
@@ -149,6 +163,8 @@ digest, non-iteration target units, disagreement between successor request
 copies or request digests, crossed successor group/lineage, missing or mismatched checkpoint
 path/content identity, missing/non-UTC durable timestamp, disconnected/crossed
 successor chain, checkpoint counter disagreement, cyclic chain, noncanonical
-completion bytes, and conflicting bytes at the task-level path. A missing file
-is simply not complete; it is not a park result.
+completion bytes, missing/crossed/unreadable start provenance, a non-fresh
+chain root, an admitted attempt without its matching ledger link, and
+conflicting bytes at the task-level path. A missing file is simply not
+complete; it is not a park result.
 

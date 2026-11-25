@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
@@ -139,6 +140,48 @@ MUTANTS = (
         "new": "False",
         "killer": "test_full_horizon_decode_rejects_disconnected_chain",
     },
+    {
+        "id": "full-horizon-refuses-omitted-admission-history",
+        "target": "executor/src/tpen_executor/storage.py",
+        "old": 'not records and index == 0 and provenance.kind == "admitted"',
+        "new": "False",
+        "killer": "test_start_provenance_history_refusals",
+    },
+    {
+        "id": "full-horizon-refuses-omitted-earliest-admission",
+        "target": "executor/src/tpen_executor/storage.py",
+        "old": 'records and index == 0 and provenance.kind == "admitted" and provenance.predecessor_attempt_id.value not in successor_attempt_ids',
+        "new": "False",
+        "killer": "test_start_provenance_history_refusals",
+    },
+    {
+        "id": "full-horizon-requires-fresh-chain-root",
+        "target": "executor/src/tpen_executor/storage.py",
+        "old": 'records and index == 0 and provenance.kind != "fresh" and provenance.predecessor_attempt_id.value in successor_attempt_ids',
+        "new": "False",
+        "killer": "test_start_provenance_history_refusals",
+    },
+    {
+        "id": "full-horizon-requires-start-provenance-link",
+        "target": "executor/src/tpen_executor/storage.py",
+        "old": 'provenance.kind != "admitted" or provenance.predecessor_attempt_id != chain_attempt_ids[index - 1] or provenance.request_digest != admission.request_digest',
+        "new": "False",
+        "killer": "test_provenance_admission_link_is_checked",
+    },
+    {
+        "id": "full-horizon-requires-regular-start-provenance",
+        "target": "executor/src/tpen_executor/storage.py",
+        "old": '_require_regular(provenance_path, "start provenance")',
+        "new": "False",
+        "killer": "test_symlinked_start_provenance_is_rejected",
+    },
+    {
+        "id": "full-horizon-requires-start-provenance-identity",
+        "target": "executor/src/tpen_executor/storage.py",
+        "old": 'provenance.task_id != chain_start.task_id\n                    or provenance.attempt_id != chain_start.attempt_id\n                    or provenance.group_digest != chain_start.group_digest',
+        "new": "False",
+        "killer": "test_crossed_start_provenance_is_rejected",
+    },
 )
 
 MUTANT_GUARDS = {
@@ -158,6 +201,12 @@ MUTANT_GUARDS = {
     "full-horizon-record-rejects-cycles": "single visited-node path",
     "full-horizon-record-requires-canonical-bytes": "canonical completion bytes",
     "full-horizon-record-rejects-disconnected-chain": "continuous completion chain",
+    "full-horizon-refuses-omitted-admission-history": "all admission history is present",
+    "full-horizon-refuses-omitted-earliest-admission": "earliest admission is present",
+    "full-horizon-requires-fresh-chain-root": "fresh chain root",
+    "full-horizon-requires-start-provenance-link": "provenance admission link",
+    "full-horizon-requires-regular-start-provenance": "regular start provenance file",
+    "full-horizon-requires-start-provenance-identity": "start provenance identity binding",
 }
 
 
@@ -190,6 +239,13 @@ INTENDED_ASSERTION_TRACES = {
     "test_full_horizon_decode_rejects_cycle": ("single visited-node path",),
     "test_full_horizon_decode_rejects_noncanonical_bytes": ("canonical completion bytes",),
     "test_full_horizon_decode_rejects_disconnected_chain": ("continuous completion chain",),
+    "test_start_provenance_history_refusals": (
+        "all admission history is present", "earliest admission is present", "fresh chain root",
+    ),
+    "test_provenance_admission_link_is_checked": ("fresh root and complete durable history", "provenance admission link"),
+    "test_missing_start_provenance_is_rejected": ("durable start provenance file",),
+    "test_symlinked_start_provenance_is_rejected": ("regular start provenance file",),
+    "test_crossed_start_provenance_is_rejected": ("durable start provenance file", "start provenance identity binding"),
 }
 
 
@@ -315,6 +371,74 @@ def test_symlinked_core_outcome_is_rejected(tmp_path: Path) -> None:
     symlink_core.symlink_to(valid_core)
     with pytest.raises(FenceRejected, match="core outcome record"):
         _publish(symlink_store, symlink_group, symlink_fence, symlink_verdict, symlink_task)
+
+
+def test_start_provenance_history_refusals(tmp_path: Path) -> None:
+    all_history_root = tmp_path / "all-history"
+    all_history_root.mkdir()
+    store, group, _predecessor, _middle, final, verdict, task = _chain_fixture(all_history_root)
+    shutil.rmtree(Path(final.output_dir).parent / "successor-admissions")
+    with pytest.raises(FenceRejected, match="chain history is missing"):
+        _publish(store, group, final, verdict, task)
+
+    earliest_root = tmp_path / "earliest-ledger"
+    earliest_root.mkdir()
+    store, group, predecessor, middle, final, verdict, task = _chain_fixture(earliest_root)
+    shutil.rmtree(Path(middle.output_dir).parent / "successor-admissions" / predecessor.attempt_id.value)
+    with pytest.raises(FenceRejected, match="lacks its ledger link"):
+        _publish(store, group, final, verdict, task)
+
+    root_root = tmp_path / "root-kind"
+    root_root.mkdir()
+    store, group, _predecessor, middle, final, verdict, task = _chain_fixture(root_root)
+    provenance_path = Path(_predecessor.output_dir) / "start-provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance.update({
+        "kind": "admitted",
+        "predecessor_attempt_id": middle.attempt_id.value,
+        "request_digest": "a" * 64,
+    })
+    provenance_path.write_bytes(canonical_bytes(provenance))
+    with pytest.raises(FenceRejected, match="root provenance is not fresh"):
+        _publish(store, group, final, verdict, task)
+
+
+def test_provenance_admission_link_is_checked(tmp_path: Path) -> None:
+    store, group, _predecessor, middle, final, verdict, task = _chain_fixture(tmp_path)
+    provenance_path = Path(middle.output_dir) / "start-provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["request_digest"] = "0" * 64
+    provenance_path.write_bytes(canonical_bytes(provenance))
+    with pytest.raises(FenceRejected, match="does not match successor admission"):
+        _publish(store, group, final, verdict, task)
+
+
+def test_missing_start_provenance_is_rejected(tmp_path: Path) -> None:
+    store, group, fence, verdict, task = _single_fixture(tmp_path)
+    (Path(fence.output_dir) / "start-provenance.json").unlink()
+    with pytest.raises(FenceRejected, match="start provenance is missing"):
+        _publish(store, group, fence, verdict, task)
+
+
+def test_symlinked_start_provenance_is_rejected(tmp_path: Path) -> None:
+    store, group, fence, verdict, task = _single_fixture(tmp_path)
+    provenance_path = Path(fence.output_dir) / "start-provenance.json"
+    valid_provenance = tmp_path / "valid-start-provenance.json"
+    valid_provenance.write_bytes(provenance_path.read_bytes())
+    provenance_path.unlink()
+    provenance_path.symlink_to(valid_provenance)
+    with pytest.raises(FenceRejected, match="start provenance"):
+        _publish(store, group, fence, verdict, task)
+
+
+def test_crossed_start_provenance_is_rejected(tmp_path: Path) -> None:
+    store, group, fence, verdict, task = _single_fixture(tmp_path)
+    provenance_path = Path(fence.output_dir) / "start-provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["task_id"] = "foreign-task"
+    provenance_path.write_bytes(canonical_bytes(provenance))
+    with pytest.raises(FenceRejected, match="start provenance crosses attempt fence"):
+        _publish(store, group, fence, verdict, task)
 
 
 def test_non_iteration_horizon_is_rejected(tmp_path: Path) -> None:
