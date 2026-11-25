@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from tpen_executor._codec import digest
+from tpen_executor._codec import canonical_bytes, digest
 from tpen_executor.allocations import ConfiguredAllocation, ControllerGenerationV1
 from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId, InvocationId
 from tpen_executor.lifecycle.attached import AttachedAllocation
@@ -117,6 +117,12 @@ def _r2_setup(tmp_path: Path, *, outcome: bool = True):
     ).begin(group, "successor", "utc-predecessor", "local", invocation_id=InvocationId("r2-predecessor"))
     Path(predecessor.output_dir, "core", "checkpoints").mkdir(parents=True, exist_ok=True)
     current = fences["successor"]
+    # The extra predecessor start advances the task's current-attempt pointer.
+    # Restore the live failed-attempt pointer before the controller validates
+    # its fence; the predecessor remains addressable by its own attempt ID.
+    (Path(current.output_dir).parent / "current-attempt.json").write_bytes(
+        canonical_bytes({"schema": "tpen-executor/current-attempt-v1", "attempt_id": current.attempt_id.value})
+    )
     request, acceptance, successor_binding = successors["successor"]
     evidence = _real_evidence(
         store, current, predecessor, backend_job_id=lease.backend_job_id.value,
@@ -183,7 +189,7 @@ def test_crossed_r2_successor_link_is_rejected(tmp_path: Path) -> None:
         current_attempt=AttemptId("current-r2"),
     )
     crossed = replace(admission, successor_attempt_id=AttemptId("other-successor"))
-    with pytest.raises(ValueError, match="crosses successor identity"):
+    with pytest.raises(ValueError, match="successor binding crosses admission identity"):
         SuccessorAdmissionRecord.from_recovery_admission(
             crossed, predecessor_task_id="successor", predecessor_content_id="a" * 64,
             successor_task_id="successor", request_digest=digest(request),
