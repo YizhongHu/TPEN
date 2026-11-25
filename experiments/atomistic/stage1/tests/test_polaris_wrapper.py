@@ -989,6 +989,60 @@ def test_production_argv_reaches_real_train_main_for_unbounded_and_smoke_rows(
     assert all("train.py" in log.read_text(encoding="utf-8") for log in logs)
 
 
+def test_production_rejects_symlinked_plan_before_bootstrap(tmp_path: Path) -> None:
+    """Plan-parent containment must precede snapshot reservation and bootstrap."""
+
+    checkout, source_sha = _make_exact_fixture(tmp_path)
+    env = _production_env(tmp_path, checkout, source_sha)
+    results_root = Path(env["RESULTS_ROOT"])
+    results_root.mkdir(parents=True, exist_ok=True)
+    phase1 = results_root / "plan" / "phase1.json"
+    env.update({
+        "MODE": "plan", "PLAN_PHASE": "1", "SYSTEM": "he",
+        "PLAN_OUTPUT": str(phase1), "LINEAGE_SEEDS": "1:2:3",
+    })
+    planned = _run("plan", env)
+    assert planned.returncode == 0, planned.stderr
+    row = next(row for row in json.loads(phase1.read_text())["rows"] if row["kind"] == "train")
+    selected = results_root / "selected.json"
+    selected.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    outside = tmp_path / "outside-plan"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"preserve-me\0")
+    before_outside = sorted(
+        (path.relative_to(outside).as_posix(), path.read_bytes() if path.is_file() else None)
+        for path in outside.rglob("*")
+    )
+    plan_dir = results_root / "plan"
+    phase1.unlink()
+    plan_dir.rmdir()
+    plan_dir.symlink_to(outside, target_is_directory=True)
+    before_uv = Path(env["UV_RECORD"]).read_bytes()
+    before_driver = Path(env["DRIVER_RECORD"]).read_bytes() if Path(env["DRIVER_RECORD"]).exists() else None
+    before_rows = sorted(path.name for path in (results_root / "logs").glob("row-*"))
+
+    env.update({"MODE": "train", "SELECTED_ROW": str(selected)})
+    refused = _run("train", env)
+    assert refused.returncode == 2
+    assert "RESULTS_PLAN is outside" in refused.stderr
+    assert Path(env["UV_RECORD"]).read_bytes() == before_uv
+    after_driver = Path(env["DRIVER_RECORD"])
+    assert (after_driver.read_bytes() if after_driver.exists() else None) == before_driver
+    assert sorted(path.name for path in (results_root / "logs").glob("row-*")) == before_rows
+    assert sorted(
+        (path.relative_to(outside).as_posix(), path.read_bytes() if path.is_file() else None)
+        for path in outside.rglob("*")
+    ) == before_outside
+
+    plan_dir.unlink()
+    plan_dir.mkdir()
+    admitted = _run("train", env)
+    assert admitted.returncode == 0, admitted.stderr
+    assert Path(env["DRIVER_RECORD"]).read_text(encoding="utf-8").strip()
+
+
 def test_production_refuses_selected_row_replacement_during_bootstrap(tmp_path: Path) -> None:
     """Bootstrap must not redirect a planner-admitted row before the driver boundary."""
 

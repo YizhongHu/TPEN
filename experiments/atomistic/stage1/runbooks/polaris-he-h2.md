@@ -178,7 +178,11 @@ only to the approved selected row and run root.
 ```bash
 SMOKE_RESULTS_ROOT="$RESULTS_ROOT/ramp-up-r1"
 SMOKE_SELECTED_ROW="$SMOKE_RESULTS_ROOT/plan/selected-train.json"
-mkdir -p "$SMOKE_RESULTS_ROOT"/plan
+mkdir -p "$SMOKE_RESULTS_ROOT"/plan "$SMOKE_RESULTS_ROOT"/logs
+test -d "$SMOKE_RESULTS_ROOT/plan" -a -d "$SMOKE_RESULTS_ROOT/logs" || {
+  echo "bounded PBS output directories are not ready" >&2
+  exit 2
+}
 "$PYBIN" - "$RESULTS_ROOT/plan/selected-train.json" "$SMOKE_SELECTED_ROW" "$SMOKE_RESULTS_ROOT" <<'PY'
 import json
 import sys
@@ -192,6 +196,8 @@ request = derive_smoke_request(row, results_root=str(results_root), stop_at=50_0
 target.write_text(json.dumps(request, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 PY
 sha256sum "$SMOKE_SELECTED_ROW" > "$SMOKE_SELECTED_ROW.sha256"
+APPROVAL_ID="${MANAGER_RELAYED_APPROVAL_ID:-}"
+: "${APPROVAL_ID:?APPROVAL_ID must be set from the explicit manager-relayed value}"
 qsub -A HetRxnEnergy -q debug-scaling \
   -l select=1:system=polaris:ngpus=4:ncpus=64,walltime=00:55:00,filesystems=home:eagle,place=scatter \
   -o "$SMOKE_RESULTS_ROOT/logs/train-ramp.pbs.out" -e "$SMOKE_RESULTS_ROOT/logs/train-ramp.pbs.err" \

@@ -186,8 +186,9 @@ admit_selected_row() {
       "$SELECTED_ROW_SOURCE" "$ADMITTED_ROW"
     return 0
   fi
-  mkdir -p -- "$RESULTS_ROOT/plan"
-  if ! ADMITTED_ROW="$(mktemp -p "$RESULTS_ROOT/plan" ".admitted-${MODE}-row.XXXXXX")"; then
+  assert_contained_path "$RESULTS_ROOT/plan" "$RESULTS_ROOT" RESULTS_PLAN
+  mkdir -p -- "$RESULTS_PLAN"
+  if ! ADMITTED_ROW="$(mktemp -p "$RESULTS_PLAN" ".admitted-${MODE}-row.XXXXXX")"; then
     die "could not reserve an admitted selected-row snapshot"
   fi
   assert_contained_path "$ADMITTED_ROW" "$RESULTS_ROOT" ADMITTED_ROW
