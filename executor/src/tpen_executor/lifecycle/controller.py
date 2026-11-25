@@ -200,6 +200,12 @@ def _apply_recovery_admission(item: MemberRecoveryInputV2, store: DirectoryStore
     )
 
 
+def _is_recovery_member(item: MemberRecoveryInputV2) -> bool:
+    """Return whether a member carries raw or already-evaluated R2 facts."""
+
+    return item.recovery_input is not None or item.recovery_admission is not None
+
+
 def run_group_controller(
     binding: Any,
     observed_job_id: BackendJobId,
@@ -251,7 +257,7 @@ def run_group_controller(
                 admitted_item = _apply_recovery_admission(item, store)
                 # R2 facts are the complete recovery decision.  The legacy
                 # core selector remains available only to legacy callers.
-                verdict = None if item.recovery_input is not None else admission_port.admit(admitted_item)
+                verdict = None if _is_recovery_member(item) else admission_port.admit(admitted_item)
                 if verdict is not None and not isinstance(verdict, CoreAdmissionVerdictV2):
                     verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "malformed-core-admission")
             except Exception:

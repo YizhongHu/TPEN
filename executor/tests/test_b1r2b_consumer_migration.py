@@ -37,7 +37,8 @@ MUTANTS = (
     {"id": "skip-r2-evidence-digest", "target": "executor/src/tpen_executor/results.py", "old": "digest(self.recovery_evidence.to_dict()) != self.recovery_admission.evidence_digest", "new": "False", "killer": "test_reader_rejects_tampered_recovery_evidence_digest"},
     {"id": "accept-crossed-r2-predecessor", "target": "executor/src/tpen_executor/results.py", "old": "self.recovery_admission.predecessor_attempt_id != self.predecessor_attempt_id", "new": "False", "killer": "test_tampered_v3_predecessor_link_is_rejected"},
     {"id": "accept-crossed-r2-successor", "target": "executor/src/tpen_executor/results.py", "old": "self.successor_binding.attempt_id != self.successor_attempt_id", "new": "False", "killer": "test_crossed_r2_successor_link_is_rejected"},
-    {"id": "skip-r2-controller-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "verdict = None if item.recovery_input is not None else admission_port.admit(admitted_item)", "new": "verdict = admission_port.admit(admitted_item)", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
+    {"id": "skip-r2-controller-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "verdict = None if _is_recovery_member(item) else admission_port.admit(admitted_item)", "new": "verdict = admission_port.admit(admitted_item)", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
+    {"id": "pre-evaluated-r2-uses-admit-recovery", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "return item.recovery_input is not None or item.recovery_admission is not None", "new": "return item.recovery_input is not None", "killer": "test_r2_final_reconciliation_clears_pre_evaluated_admission"},
     {"id": "launch-before-r2-publication", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if published.encode() != checked.encode():", "new": "if False:", "killer": "test_r2_launch_requires_durable_publication"},
     {"id": "r2-park-submit-bypass", "target": "executor/src/tpen_executor/recovery.py", "old": "return _park(member, member.recovery_admission.reason)", "new": 'return MemberReconciliationV2(member.task_id, "admit_successor", "recovery-admitted", member.attempt_id)', "killer": "test_r2_park_refuses_before_submit"},
     {"id": "fabricate-interrupted-outcome", "target": "executor/src/tpen_executor/storage.py", "old": "if item.outcome_receipt is None:", "new": "if False:", "killer": "test_interrupted_r2_outcome_stays_observed_absence"},
@@ -624,10 +625,12 @@ def test_r2_final_reconciliation_does_not_use_legacy_selector(tmp_path: Path, mo
     assert result.exit_code == 0, diagnostic
 
 
-def test_r2_final_reconciliation_clears_pre_evaluated_admission(tmp_path: Path) -> None:
+@pytest.mark.parametrize("pre_evaluated", [False, True], ids=["raw", "pre-evaluated"])
+def test_r2_final_reconciliation_clears_pre_evaluated_admission(tmp_path: Path, pre_evaluated: bool) -> None:
     store, group, allocation, facts, binding, _evidence, _successor, _current = _r2_setup(tmp_path)
-    pre_evaluated = controller_module._apply_recovery_admission(facts.member_inputs[0], store)
-    facts = replace(facts, member_inputs=(pre_evaluated,))
+    original_item = facts.member_inputs[0]
+    member_input = controller_module._apply_recovery_admission(original_item, store) if pre_evaluated else original_item
+    facts = replace(facts, member_inputs=(member_input,))
     port = RecordingAdmission()
     result = run_group_controller(
         binding,
@@ -641,8 +644,8 @@ def test_r2_final_reconciliation_clears_pre_evaluated_admission(tmp_path: Path) 
     assert result.reconciliation.members[0].action == "preserve_completed", diagnostic
     assert result.exit_code == 0, diagnostic
     assert port.calls == ["successor"], diagnostic
-    final_member = port.members[-1]
-    assert final_member.attempt_id != pre_evaluated.attempt_id, diagnostic
+    assert port.members[0].attempt_id != original_item.attempt_id, diagnostic
+    final_member = port.members[0]
     assert final_member.recovery_input is None, diagnostic
     assert final_member.recovery_admission is None, diagnostic
     assert final_member.recovery_evidence is None, diagnostic
