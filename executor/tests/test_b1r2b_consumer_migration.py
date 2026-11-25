@@ -45,7 +45,7 @@ MUTANTS = (
     {"id": "r2-current-fence-required", "target": "executor/src/tpen_executor/storage.py", "old": "current_attempt_id = current_fence.attempt_id.value", "new": "current_attempt_id = admission.predecessor_attempt_id.value", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
     {"id": "preserve-typed-park-reason", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "elif member.action == \"park\":", "new": "elif False:", "killer": "test_controller_propagates_typed_park_reason"},
     {"id": "retain-r2-input-on-park", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "        recovery_input=None,\n        recovery_admission=admission,\n        recovery_evidence=request.evidence,", "new": "        recovery_admission=admission,\n        recovery_evidence=request.evidence,", "killer": "test_controller_propagates_typed_park_reason"},
-    {"id": "skip-r2-final-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "clear_recovery = item.recovery_input is not None", "new": "clear_recovery = False", "killer": "test_r2_final_reconciliation_does_not_use_legacy_selector"},
+    {"id": "skip-r2-final-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "                recovery_input=None,\n                recovery_admission=None,\n                recovery_evidence=None,", "new": "                recovery_input=None if item.recovery_input is not None else rebuilt.recovery_input,\n                recovery_admission=None if item.recovery_input is not None else rebuilt.recovery_admission,\n                recovery_evidence=None if item.recovery_input is not None else rebuilt.recovery_evidence,", "killer": "test_r2_final_reconciliation_clears_pre_evaluated_admission"},
     {"id": "require-r2-fence-for-legacy", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if admission_record.recovery_admission is not None:\n                        member_input", "new": "if True:\n                        member_input", "killer": "test_successor_uses_admitted_start_only"},
     {"id": "local-r2-ignores-admitted-load", "target": "executor/src/tpen_executor/lifecycle/local_executor.py", "old": "return self._submit(fence, invocation, admitted_checkpoint_path=checkpoint_path)", "new": "return self._submit(fence, invocation)", "killer": "test_local_r2_adapter_binds_admitted_checkpoint"},
     {"id": "controller-r2-plain-submit-fallback", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if admission_record is not None and admission_record.recovery_admission is not None:\n                        submit_admitted = getattr(executor, \"submit_admitted_successor\", None)", "new": "if admission_record is not None and False:\n                        submit_admitted = getattr(executor, \"submit_admitted_successor\", None)", "killer": "test_r2_adapter_without_admitted_boundary_refuses"},
@@ -622,6 +622,30 @@ def test_r2_final_reconciliation_does_not_use_legacy_selector(tmp_path: Path, mo
     assert port.members[-1].recovery_admission is None, diagnostic
     assert result.reconciliation.members[0].action == "preserve_completed", diagnostic
     assert result.exit_code == 0, diagnostic
+
+
+def test_r2_final_reconciliation_clears_pre_evaluated_admission(tmp_path: Path) -> None:
+    store, group, allocation, facts, binding, _evidence, _successor, _current = _r2_setup(tmp_path)
+    pre_evaluated = controller_module._apply_recovery_admission(facts.member_inputs[0], store)
+    facts = replace(facts, member_inputs=(pre_evaluated,))
+    port = RecordingAdmission()
+    result = run_group_controller(
+        binding,
+        allocation.backend_job_id,
+        facts,
+        store,
+        port,
+        BoundaryExecutor([]),
+    )
+    diagnostic = _controller_diagnostic(store, group, result)
+    assert result.reconciliation.members[0].action == "preserve_completed", diagnostic
+    assert result.exit_code == 0, diagnostic
+    assert port.calls == ["successor"], diagnostic
+    final_member = port.members[-1]
+    assert final_member.attempt_id != pre_evaluated.attempt_id, diagnostic
+    assert final_member.recovery_input is None, diagnostic
+    assert final_member.recovery_admission is None, diagnostic
+    assert final_member.recovery_evidence is None, diagnostic
 
 
 @pytest.mark.parametrize(

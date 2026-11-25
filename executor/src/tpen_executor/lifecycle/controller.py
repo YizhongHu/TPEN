@@ -519,16 +519,15 @@ def run_group_controller(
             if record is None:
                 raise ValueError("collected attempt is absent from durable manifest")
             rebuilt = _apply_recovery_admission(item, store)
-            clear_recovery = item.recovery_input is not None
             rebuilt = replace(
                 rebuilt,
                 attempt_id=record.attempt_id,
                 start_receipt=record.start_receipt,
                 outcome_receipt=record.outcome_receipt,
                 core_evidence=None if record.core_outcome is None else record.core_outcome.evidence,
-                recovery_input=None if clear_recovery else rebuilt.recovery_input,
-                recovery_admission=None if clear_recovery else rebuilt.recovery_admission,
-                recovery_evidence=None if clear_recovery else rebuilt.recovery_evidence,
+                recovery_input=None,
+                recovery_admission=None,
+                recovery_evidence=None,
             )
             try:
                 verdict = admission_port.admit(rebuilt)
