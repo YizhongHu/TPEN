@@ -19,7 +19,7 @@ from .allocations import AllocationAttemptV2, ConfiguredAllocation, ControllerGe
 from .contracts import AllocationId, AttemptId, BackendJobId, GroupId, InvocationId, ReadyGroup, ReadyGroupV2, TaskSpec
 from .results import (
     AcceptedSegment, CoreOutcomeRecord, FullHorizonCompletionRecord, ManifestAttempt, OutcomeReceipt, PLACEMENT_RECEIPT_TYPES, RemoteTeardownReceipt, RunManifest,
-    SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3, StartReceipt,
+    SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3, StartProvenanceV1, StartReceipt,
     SuccessorAdmissionRecord, MemberPublicationV2, ReconciliationPublicationV2, decode_placement_receipt,
 )
 from .runners import CoreRunEvidence, EvidenceUnavailable
@@ -194,6 +194,7 @@ _SUCCESSOR_ADMISSIONS = "successor-admissions"
 _SUCCESSOR_ADMISSION_FILENAME = "successor-admission.json"
 _SUCCESSOR_ADMISSION_TEMP_PREFIX = ".tmp-admission-"
 _TASK_SPEC_FILENAME = "task-spec.json"
+_START_PROVENANCE_FILENAME = "start-provenance.json"
 _FULL_HORIZON_FILENAME = "full-horizon-completion.json"
 _SUCCESSOR_ADMISSION_SCHEMA = "tpen.execution/successor-admission-request-v1"
 _REMOTE_TEARDOWN_FILENAME = "remote-teardown.json"
@@ -776,6 +777,8 @@ class DirectoryStore:
                 task = next(member for member in group.members if member.task_id == task_id)
                 binding = MemberInvocationV2(allocation_attempt, group.identity, task_id, task.lineage_id, attempt, invocation_id)
                 _write_new(os.path.join(output_dir, "invocation.json"), binding.encode())
+            provenance = StartProvenanceV1("fresh", task_id, attempt, group.identity)
+            _write_new(os.path.join(output_dir, _START_PROVENANCE_FILENAME), provenance.encode())
             pointer = os.path.join(task_dir, "current-attempt.json")
             _write_pointer(pointer, attempt.value)
             return AttemptFence(self.root, group.identity, task_id, allocation.allocation_id.value, attempt, output_dir)
@@ -832,6 +835,7 @@ class DirectoryStore:
             matches = [record for record in records if record.predecessor_attempt_id == admission.predecessor_attempt_id]
             if len(matches) != 1 or matches[0].encode() != admission.encode():
                 raise AdmissionFork("admission record is missing or differs")
+            validated_admission = matches[0]
             predecessor_dir = _lexical(os.path.join(task_dir, admission.predecessor_attempt_id.value))
             predecessor_start_path = os.path.join(predecessor_dir, "start.json")
             _require_regular(predecessor_start_path, "predecessor start receipt")
@@ -864,13 +868,21 @@ class DirectoryStore:
             binding = successor
             start_bytes = start.encode()
             invocation_bytes = binding.encode()
+            provenance_bytes = StartProvenanceV1(
+                "admitted", task_id, successor.attempt_id, group.identity,
+                validated_admission.predecessor_attempt_id, validated_admission.request_digest,
+            ).encode()
             if os.path.lexists(output_dir):
                 _require_directory(output_dir, "admitted successor attempt")
                 if current not in {successor.attempt_id.value, current_attempt_id}:
                     raise FenceRejected("admitted successor attempt is not current")
                 if current == current_attempt_id:
                     self._validate_fence(current_fence or predecessor_fence, task_dir)
-                for name, expected in (("start.json", start_bytes), ("invocation.json", invocation_bytes)):
+                for name, expected in (
+                    ("start.json", start_bytes),
+                    ("invocation.json", invocation_bytes),
+                    (_START_PROVENANCE_FILENAME, provenance_bytes),
+                ):
                     path = os.path.join(output_dir, name)
                     if os.path.lexists(path):
                         _require_regular(path, name)
@@ -893,9 +905,22 @@ class DirectoryStore:
             _mkdir_new(output_dir)
             _write_new(os.path.join(output_dir, "start.json"), start_bytes)
             _write_new(os.path.join(output_dir, "invocation.json"), invocation_bytes)
+            _write_new(os.path.join(output_dir, _START_PROVENANCE_FILENAME), provenance_bytes)
             _write_pointer(pointer, successor.attempt_id.value)
             return AttemptFence(self.root, group.identity, task_id, allocation.allocation_id.value,
                                 successor.attempt_id, output_dir)
+
+    @staticmethod
+    def _read_start_provenance(path: str) -> StartProvenanceV1:
+        """Read one canonical executor-internal start provenance record."""
+        encoded = Path(path).read_bytes()
+        try:
+            provenance = StartProvenanceV1.decode(encoded)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise FenceRejected("start provenance is unreadable") from error
+        if encoded != provenance.encode():
+            raise FenceRejected("start provenance is not canonical")
+        return provenance
 
     @staticmethod
     def _validate_invocation(start: StartReceipt, binding: MemberInvocationV2) -> None:
@@ -1602,6 +1627,50 @@ class DirectoryStore:
             if len(reversed_links) != len(records):
                 raise FenceRejected("successor chain is disconnected")
             links = tuple(reversed(reversed_links))
+            chain_attempt_ids = [
+                AttemptId(links[0]["predecessor_attempt_id"]) if links else start.attempt_id,
+                *(AttemptId(link["successor_attempt_id"]) for link in links),
+            ]
+            successor_attempt_ids = {link["successor_attempt_id"] for link in links}
+            for index, attempt_id in enumerate(chain_attempt_ids):
+                attempt_dir = _lexical(os.path.join(task_dir, attempt_id.value))
+                start_path = os.path.join(attempt_dir, "start.json")
+                _require_regular(start_path, "chain start receipt")
+                try:
+                    start_bytes = Path(start_path).read_bytes()
+                    chain_start = StartReceipt.decode(start_bytes)
+                except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise FenceRejected("chain start receipt is unreadable") from error
+                if start_bytes != chain_start.encode():
+                    raise FenceRejected("chain start receipt is not canonical")
+                if (
+                    chain_start.task_id != stored_task.task_id
+                    or chain_start.attempt_id != attempt_id
+                    or chain_start.group_digest != fence.group_digest
+                    or chain_start.output_dir != attempt_dir
+                ):
+                    raise FenceRejected("chain start receipt crosses final fence")
+                provenance_path = os.path.join(attempt_dir, _START_PROVENANCE_FILENAME)
+                if not os.path.lexists(provenance_path):
+                    raise FenceRejected("start provenance is missing")
+                _require_regular(provenance_path, "start provenance")
+                provenance = self._read_start_provenance(provenance_path)
+                if (
+                    provenance.task_id != chain_start.task_id
+                    or provenance.attempt_id != chain_start.attempt_id
+                    or provenance.group_digest != chain_start.group_digest
+                ):
+                    raise FenceRejected("start provenance crosses attempt fence")
+                if not records and index == 0 and provenance.kind == "admitted":
+                    raise FenceRejected("successor chain history is missing")
+                if records and index == 0 and provenance.kind == "admitted" and provenance.predecessor_attempt_id.value not in successor_attempt_ids:
+                    raise FenceRejected("successor chain root provenance lacks its ledger link")
+                if records and index == 0 and provenance.kind != "fresh" and provenance.predecessor_attempt_id.value in successor_attempt_ids:
+                    raise FenceRejected("successor chain root provenance is not fresh")
+                if index > 0:
+                    admission = by_successor[attempt_id]
+                    if provenance.kind != "admitted" or provenance.predecessor_attempt_id != chain_attempt_ids[index - 1] or provenance.request_digest != admission.request_digest:
+                        raise FenceRejected("start provenance does not match successor admission")
             record = FullHorizonCompletionRecord(
                 fence.group_digest,
                 stored_task.task_id,

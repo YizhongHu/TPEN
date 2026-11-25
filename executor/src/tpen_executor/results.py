@@ -150,6 +150,85 @@ class StartReceipt:
 
 
 @frozen_record
+class StartProvenanceV1:
+    """Executor-internal proof of how an attempt was started."""
+
+    schema: ClassVar[str] = "tpen-executor/start-provenance-v1"
+    kind: str
+    task_id: str
+    attempt_id: AttemptId
+    group_digest: str
+    predecessor_attempt_id: AttemptId | None = None
+    request_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"fresh", "admitted"}:
+            raise ValueError("start provenance kind is invalid")
+        object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
+        _identity(self.attempt_id, AttemptId, "attempt_id")
+        object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
+        if self.kind == "fresh":
+            if self.predecessor_attempt_id is not None or self.request_digest is not None:
+                raise ValueError("fresh start provenance cannot carry admission fields")
+            return
+        _identity(self.predecessor_attempt_id, AttemptId, "predecessor_attempt_id")
+        if self.predecessor_attempt_id == self.attempt_id:
+            raise ValueError("start provenance predecessor cannot equal attempt")
+        object.__setattr__(self, "request_digest", sha256_text(self.request_digest, "request_digest"))
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "schema": self.schema,
+            "kind": self.kind,
+            "task_id": self.task_id,
+            "attempt_id": self.attempt_id.value,
+            "group_digest": self.group_digest,
+        }
+        if self.kind == "admitted":
+            result["predecessor_attempt_id"] = self.predecessor_attempt_id.value
+            result["request_digest"] = self.request_digest
+        return result
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "StartProvenanceV1":
+        if not isinstance(data, Mapping):
+            raise TypeError("StartProvenanceV1 must be a mapping")
+        kind = data.get("kind")
+        if kind == "fresh":
+            fields(data, {"schema", "kind", "task_id", "attempt_id", "group_digest"}, cls.schema, cls.__name__)
+        elif kind == "admitted":
+            fields(
+                data,
+                {"schema", "kind", "task_id", "attempt_id", "group_digest", "predecessor_attempt_id", "request_digest"},
+                cls.schema,
+                cls.__name__,
+            )
+        else:
+            raise ValueError("start provenance kind is invalid")
+        if any(type(data[key]) is not str for key in ("kind", "task_id", "attempt_id", "group_digest")):
+            raise TypeError("StartProvenanceV1 has an invalid field type")
+        if kind == "fresh":
+            return cls(kind, data["task_id"], AttemptId(data["attempt_id"]), data["group_digest"])
+        if type(data["predecessor_attempt_id"]) is not str or type(data["request_digest"]) is not str:
+            raise TypeError("StartProvenanceV1 admission fields have an invalid type")
+        return cls(
+            kind,
+            data["task_id"],
+            AttemptId(data["attempt_id"]),
+            data["group_digest"],
+            AttemptId(data["predecessor_attempt_id"]),
+            data["request_digest"],
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "StartProvenanceV1":
+        return cls.from_mapping(decode_json(data))
+
+
+@frozen_record
 class OutcomeReceipt:
     """Durable observation of an attempt's operational outcome.
 
@@ -1838,7 +1917,7 @@ __all__ = [
     "AcceptedSegment", "AllocationObservation", "CoreOutcomeRecord", "ManifestAttempt", "OutcomeReceipt", "RemoteTeardownReceipt", "OUTCOME_STATUSES",
     "PLACEMENT_NOT_SAMPLED_MESSAGE", "PLACEMENT_RECEIPT_TYPES", "PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE",
     "PLACEMENT_UNQUALIFIED_MESSAGE", "PLACEMENT_V3_WARNINGS", "RunManifest", "SciencePlacementReceipt",
-    "SciencePlacementReceiptV2", "SciencePlacementReceiptV3", "StartReceipt", "SuccessorAdmission", "SuccessorAdmissionRecord", "decode_placement_receipt",
+    "SciencePlacementReceiptV2", "SciencePlacementReceiptV3", "StartReceipt", "StartProvenanceV1", "SuccessorAdmission", "SuccessorAdmissionRecord", "decode_placement_receipt",
     "placement_unqualified_message", "MemberPublicationV2", "ReconciliationPublicationV2",
 ]
 
