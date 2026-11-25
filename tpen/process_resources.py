@@ -72,6 +72,31 @@ class ProcessResourceBaseline:
     involuntary_context_switches: ResourceReading
     peak_rss_mb: ResourceReading
 
+    def __getstate__(self) -> Any:
+        """Refuse serialization of invocation-local RUSAGE baselines."""
+
+        raise TypeError(
+            "ProcessResourceBaseline is invocation-local RUSAGE state and "
+            "cannot be serialized or checkpointed"
+        )
+
+    def __reduce__(self) -> Any:
+        """Refuse pickling of invocation-local RUSAGE baselines."""
+
+        raise TypeError(
+            "ProcessResourceBaseline is invocation-local RUSAGE state and "
+            "cannot be serialized or checkpointed"
+        )
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        """Refuse pickling of invocation-local RUSAGE baselines."""
+
+        del protocol
+        raise TypeError(
+            "ProcessResourceBaseline is invocation-local RUSAGE state and "
+            "cannot be serialized or checkpointed"
+        )
+
 
 @dataclass(frozen=True)
 class ProcessResourceResult:
@@ -118,6 +143,31 @@ class ProcessRUsageProbe:
         if scope is not ResourceScope.PROCESS:
             raise ValueError("ProcessRUsageProbe supports only ResourceScope.PROCESS")
         self.scope = scope
+
+    def __getstate__(self) -> Any:
+        """Refuse serialization of live OS resource probes."""
+
+        raise TypeError(
+            "ProcessRUsageProbe is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
+
+    def __reduce__(self) -> Any:
+        """Refuse pickling of live OS resource probes."""
+
+        raise TypeError(
+            "ProcessRUsageProbe is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        """Refuse pickling of live OS resource probes."""
+
+        del protocol
+        raise TypeError(
+            "ProcessRUsageProbe is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
 
     def read(self) -> ProcessResourceBaseline:
         """Read the current process usage as a baseline-shaped record."""
@@ -873,6 +923,31 @@ class LinuxProcessMemoryProbe:
         )
         self._host_id = _require_optional_nonempty_str(
             host_id, "LinuxProcessMemoryProbe.host_id"
+        )
+
+    def __getstate__(self) -> Any:
+        """Refuse serialization of live procfs probes and bound generations."""
+
+        raise TypeError(
+            "LinuxProcessMemoryProbe is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
+
+    def __reduce__(self) -> Any:
+        """Refuse pickling of live procfs probes and bound generations."""
+
+        raise TypeError(
+            "LinuxProcessMemoryProbe is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        """Refuse pickling of live procfs probes and bound generations."""
+
+        del protocol
+        raise TypeError(
+            "LinuxProcessMemoryProbe is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
         )
 
     @property

@@ -946,6 +946,31 @@ class LinuxProcessTreeProbe:
     filesystem I/O and never calls ``os.getpid()`` when ``pid=None``.
     """
 
+    def __getstate__(self) -> Any:
+        """Refuse serialization of live procfs tree probes and bound PIDs."""
+
+        raise TypeError(
+            "LinuxProcessTreeProbe is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
+
+    def __reduce__(self) -> Any:
+        """Refuse pickling of live procfs tree probes and bound PIDs."""
+
+        raise TypeError(
+            "LinuxProcessTreeProbe is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        """Refuse pickling of live procfs tree probes and bound PIDs."""
+
+        del protocol
+        raise TypeError(
+            "LinuxProcessTreeProbe is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
+
     def __init__(
         self,
         *,
@@ -2896,6 +2921,31 @@ class LinuxCgroupV2Probe:
     Never guesses cgroup paths from scheduler job IDs, never writes or resets
     ``memory.peak``, and refuses cgroup v1 pretending to be v2.
     """
+
+    def __getstate__(self) -> Any:
+        """Refuse serialization of live cgroup v2 probes and bound PIDs."""
+
+        raise TypeError(
+            "LinuxCgroupV2Probe is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
+
+    def __reduce__(self) -> Any:
+        """Refuse pickling of live cgroup v2 probes and bound PIDs."""
+
+        raise TypeError(
+            "LinuxCgroupV2Probe is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        """Refuse pickling of live cgroup v2 probes and bound PIDs."""
+
+        del protocol
+        raise TypeError(
+            "LinuxCgroupV2Probe is invocation-local observability state and "
+            "cannot be serialized or checkpointed"
+        )
 
     def __init__(
         self,
