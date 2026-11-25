@@ -1150,6 +1150,7 @@ def evaluate_hamiltonian_tangent_step(
             logabs_chunks.append(chunk_output.logabs.detach().reshape(-1))
             sign_chunks.append(chunk_output.sign.detach().reshape(-1))
             total_chunks.append(chunk_result.total.detach())
+            term_value: torch.Tensor | None = None
             if return_terms:
                 for term_name, term_value in chunk_result.terms.items():
                     term_chunks.setdefault(term_name, []).append(term_value.detach())
@@ -1162,6 +1163,7 @@ def evaluate_hamiltonian_tangent_step(
             eloc_flat,
             per_sample_scores,
             per_sample_derivatives,
+            term_value,
             chunk,
         )
 
