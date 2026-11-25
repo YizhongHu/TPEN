@@ -81,6 +81,11 @@ class _FailingBackend(_FakeBackend):
         super().stop()
 
 
+class _SummaryFailingBackend(_FakeBackend):
+    def key_averages(self) -> list[object]:
+        raise RuntimeError("summary failed")
+
+
 class _RangeExitFailureBackend(_FakeBackend):
     def record_function(self, label: str):
         self.calls.append(f"start:{label}")
@@ -233,6 +238,10 @@ def test_first_observed_warmup_step_after_window_start_is_not_started(tmp_path) 
     payload = json.loads(next(context.run_dir.rglob("profile-status.json")).read_text())
     assert payload["lifecycle_state"] == "not_started"
     assert "window_start_not_observed" in payload["activity_diagnostics"]
+    inspected = inspect_run_observability(context.run_dir, relative_dir="native-profiling")
+    assert inspected.profile_statuses[0].lifecycle_state == "not_started"
+    reconciled = reconcile_run_observability(context.run_dir, relative_dir="native-profiling")
+    assert reconciled.profile_windows[0].lifecycle_state == "not_started"
 
 
 def test_request_stop_before_window_prevents_activation(tmp_path) -> None:
@@ -367,20 +376,53 @@ def test_real_torch_profiler_adapter_emits_fixed_ranges_and_stops_at_window_end(
 
     callback = NativeProfiler(
         enabled=True,
-        window=TrainingIterationWindow(0, 0, 1),
+        window=TrainingIterationWindow(0, 1, 1),
         summary=TorchOperatorSummary(max_rows=256),
     )
     context = make_run_context(tmp_path)
     with callback.run_scope(context):
         callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
-        _ = torch.ones(4) + 1
+        with torch.profiler.record_function("warmup_only"):
+            _ = torch.ones(4) + 1
         callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
+        callback.handle_occurrence(Occurrence(Started(TrainingIteration(1)), 1), context)
+        with torch.profiler.record_function("active_only"):
+            _ = torch.ones(4) + 2
+        callback.handle_occurrence(Occurrence(Ended(TrainingIteration(1)), 1), context)
+        callback.handle_occurrence(Occurrence(Started(TrainingIteration(2)), 1), context)
+        with torch.profiler.record_function("post_window_only"):
+            _ = torch.ones(4) + 3
+        callback.handle_occurrence(Occurrence(Ended(TrainingIteration(2)), 1), context)
         callback.handle_occurrence(Occurrence(Started(CollectSamples(0)), 1), context)
         callback.handle_occurrence(Occurrence(Ended(CollectSamples(0)), 1), context)
     payload = json.loads(next(context.run_dir.rglob("summary.json")).read_text())
     names = {row["name"] for row in payload["rows"]}
-    assert "TrainingIteration" in names
+    assert "active_only" in names
+    assert "warmup_only" not in names
+    assert "post_window_only" not in names
     assert payload["truncated"] is False
+
+
+def test_summary_failure_is_failed_partial_through_inspection_and_reconciliation(tmp_path) -> None:
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        backend_factory=_SummaryFailingBackend,
+    )
+    context = make_run_context(tmp_path)
+    with callback.run_scope(context):
+        callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
+        callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
+    status = json.loads(next(context.run_dir.rglob("profile-status.json")).read_text())
+    manifest = json.loads(next(context.run_dir.rglob("manifest.json")).read_text())
+    assert status["export_status"] == "failed"
+    assert status["data_completeness"] == "partial"
+    assert manifest["data_completeness"] == "partial"
+    inspected = inspect_run_observability(context.run_dir, relative_dir="native-profiling")
+    assert inspected.profile_statuses[0].export_status == "failed"
+    reconciled = reconcile_run_observability(context.run_dir, relative_dir="native-profiling")
+    assert reconciled.reconciliation_state == "failed"
+    assert reconciled.profile_windows[0].export_status == "failed"
 
 
 def test_failed_end_dispatch_preserves_application_primary(tmp_path) -> None:
@@ -453,6 +495,7 @@ def test_summary_truncation_and_failed_window_finalization_are_honest(tmp_path) 
     failed_manifest = json.loads(next(failed_context.run_dir.rglob("manifest.json")).read_text())
     assert failed_status["lifecycle_state"] == "unsafe"
     assert failed_status["data_completeness"] == "partial"
+    assert "stop_overshoot_bounds_seconds" not in failed_status
     assert failed_manifest["lifecycle_state"] == "unsafe"
 
 
