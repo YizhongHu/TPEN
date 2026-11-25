@@ -186,6 +186,14 @@ def validate_row(row: Mapping[str, Any], *, expected_kind: str | None = None) ->
     if (not isinstance(rendered.get("sha256"), str) or len(rendered["sha256"]) != 64
             or any(c not in "0123456789abcdef" for c in rendered["sha256"])):
         raise RowContractError("rendered_config.sha256 must be 64 hex characters")
+    # P0 sentence: “The extension branch reads, hashes and parses the SAME
+    # rendered bytes (no hash-then-load window).”  A row with a stale digest is
+    # not admissible even when its digest has the right shape.
+    rendered_path = Path(rendered["path"])
+    if not rendered_path.is_file():
+        raise RowContractError("rendered_config.path must name an existing regular file")
+    if sha256_file(rendered_path) != rendered["sha256"]:
+        raise RowContractError("rendered_config.sha256 does not match the named bytes")
     if ext.get("diagnostics_profile") not in {"diagnostics-v1", "diagnostics-v2"}:
         raise RowContractError("invalid diagnostics_profile")
     if row.get("config_identity_rule") != "stage1-config-v1":
