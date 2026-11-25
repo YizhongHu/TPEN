@@ -9,10 +9,11 @@ constructs this value after placement and passes it as one closed argument:
 
 The delta is not a recovery decision. It carries only the already-prepared
 load and the physical destination for this attempt. Every attempt has a new
-leaf and core directory. Recovery admission (B1-R2A/B) establishes the input
-precondition that a `train_resume` path names a predecessor attempt's core.
-The executor does not select or establish that lineage; it only requires the
-path to be outside the current attempt leaf.
+leaf and core directory. Recovery admission (B1-R2A/B) establishes and
+records the input precondition that a `train_resume` path names a predecessor
+attempt's core for the same group and task. The executor does not select a
+checkpoint from arbitrary paths; it validates this typed predecessor lineage
+and requires the path to be outside the current attempt leaf.
 
 ## Closed shape
 
@@ -28,7 +29,7 @@ The JSON object has exactly these fields:
 | `attempt_core_dir` | non-empty string; absolute, normalized path ending in `/<attempt>/core` |
 | `load` | object with exactly `mode` and `path` |
 | `load.mode` | string, exactly `fresh` or `train_resume`; absent mode is invalid |
-| `load.path` | `null` iff mode is `fresh`; otherwise a non-empty absolute, normalized checkpoint path outside the current attempt leaf. The predecessor-core relationship is an input precondition from recovery admission, not an executor predicate. |
+| `load.path` | `null` iff mode is `fresh`; otherwise a non-empty absolute, normalized checkpoint path inside the typed predecessor attempt's core for the same group and task, and outside the current attempt leaf. Recovery admission owns and records this relationship; the executor validates it before launch. |
 | `group_digest`, `task_id`, `attempt_id` | non-empty strings, each one path component; they must match the placement fence |
 
 The executor derives `attempt_core_dir` from the fence's
