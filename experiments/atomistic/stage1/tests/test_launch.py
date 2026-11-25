@@ -143,15 +143,25 @@ def test_render_fails_for_unapproved_partition_or_results_root() -> None:
                results_root="/tmp/stage1", scratch_base="/tmp/stage1")
 
 
-def test_gpu_render_defaults_to_measured_shape_and_cuda_binding() -> None:
+@pytest.mark.parametrize("resource_kwargs", [{}, {"cpus_per_task": None, "mem": None}])
+def test_gpu_render_defaults_to_measured_shape_and_cuda_binding(
+    resource_kwargs: dict[str, object],
+) -> None:
     gpu_row = {**ROW, "device": "cuda"}
     script = render(row=gpu_row, driver="driver.py", python="/usr/bin/python3",
                     head_sha="c" * 40, results_root=ROW["results_root"],
-                    partition="seas_gpu", time="12:00:00")
-    assert "#SBATCH --nodes=1" in script
-    assert "#SBATCH --ntasks=1" in script
-    assert "#SBATCH --cpus-per-task=1" in script
-    assert "#SBATCH --mem=4G" in script
+                    partition="seas_gpu", time="12:00:00", **resource_kwargs)
+    resource_block = script.split("#SBATCH --nodes=1\n", 1)[1].split(
+        "set -euo pipefail", 1)[0]
+    assert resource_block == (
+        "#SBATCH --ntasks=1\n"
+        "#SBATCH --cpus-per-task=1\n"
+        "#SBATCH --mem=4G\n"
+        "#SBATCH --time=12:00:00\n"
+        "#SBATCH --gres=gpu:1\n"
+        "#SBATCH --constraint=a100\n"
+        "#SBATCH --no-requeue\n"
+    )
 
     script = render(
         row=gpu_row, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,

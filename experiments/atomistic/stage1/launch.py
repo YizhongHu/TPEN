@@ -108,8 +108,10 @@ def _validate_gpu_resources(*, cpus_per_task: int | None, mem: str | None,
     """Validate GPU resources, applying the measured Stage-1 defaults.
 
     The default one CPU and 4 GiB request is based on the 2026-11-25 Cannon
-    ``jobstats`` sweep: the flagged jobs used one effective CPU and at most
-    1.2 GiB host memory.  Callers may still provide a larger measured shape.
+    ``jobstats`` sweeps: the flagged evaluation jobs used one effective CPU
+    and at most 1.2 GiB host memory, while nine representative Stage 1
+    training jobs reached 1.5 GiB.  Callers may still provide a larger
+    measured shape.
     """
 
     if cpus_per_task is None:
@@ -218,8 +220,8 @@ def _resolve_driver_path(driver: str, checkout_root: str) -> str:
 
 def render(*, row: Mapping[str, Any], checkout_root: str, python: str,
            partition: str = "test",
-           scratch_base: str = "/scratch", cpus_per_task: int | None = 1,
-           mem: str | None = "4G", time: str | None = None,
+           scratch_base: str = "/scratch", cpus_per_task: int | None = None,
+           mem: str | None = None, time: str | None = None,
            # Compatibility-only parameters for callers pinned to LR-1.  They
            # are checked against the row and never become application inputs.
            driver: str | None = None, head_sha: str | None = None,
