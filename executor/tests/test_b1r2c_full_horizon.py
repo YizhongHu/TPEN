@@ -234,7 +234,7 @@ def test_symlinked_core_outcome_is_rejected(tmp_path: Path) -> None:
     # path: the symlink target is a valid record from this same attempt, so a
     # mutant that removes only the regular-file guard reads otherwise-consistent
     # evidence and reaches the intended DID NOT RAISE assertion.
-    symlink_store, symlink_group, symlink_fence, symlink_verdict, symlink_task = _single_fixture(tmp_path / "symlink")
+    symlink_store, symlink_group, symlink_fence, symlink_verdict, symlink_task = _single_fixture(tmp_path)
     symlink_core = Path(symlink_fence.output_dir) / "core-outcome.json"
     valid_core = tmp_path / "valid-core-outcome.json"
     valid_core.write_bytes(symlink_core.read_bytes())
