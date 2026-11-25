@@ -28,10 +28,13 @@ from test_review_b1b2_controller import _real_fresh
 from test_review_b1b2_t2_r1 import RecordingExecutor, _binding
 from test_b1e1_local_executor import _environment as _local_environment, _failure_result, _group as _local_group, _invocation as _local_invocation
 from test_c22_output_binding import _allocation_with_cpu, _configured
+from test_core_evidence_v3 import _typed_evidence
 
 
 MUTANTS = (
     {"id": "omit-r2-checkpoint-link", "target": "executor/src/tpen_executor/results.py", "old": '"checkpoint_path": self.recovery_admission.checkpoint_path', "new": '"checkpoint_path": "crossed"', "killer": "test_r2_link_round_trip_preserves_typed_lineage"},
+    {"id": "skip-r2-evidence-content-binding", "target": "executor/src/tpen_executor/results.py", "old": "self.recovery_evidence.checkpoint.content_id != self.predecessor_content_id", "new": "False", "killer": "test_reader_rejects_content_crossed_with_admitted_evidence"},
+    {"id": "skip-r2-evidence-digest", "target": "executor/src/tpen_executor/results.py", "old": "digest(self.recovery_evidence.to_dict()) != self.recovery_admission.evidence_digest", "new": "False", "killer": "test_reader_rejects_tampered_recovery_evidence_digest"},
     {"id": "accept-crossed-r2-predecessor", "target": "executor/src/tpen_executor/results.py", "old": "self.recovery_admission.predecessor_attempt_id != self.predecessor_attempt_id", "new": "False", "killer": "test_tampered_v3_predecessor_link_is_rejected"},
     {"id": "accept-crossed-r2-successor", "target": "executor/src/tpen_executor/results.py", "old": "self.successor_binding.attempt_id != self.successor_attempt_id", "new": "False", "killer": "test_crossed_r2_successor_link_is_rejected"},
     {"id": "skip-r2-controller-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "verdict = None if item.recovery_input is not None else admission_port.admit(admitted_item)", "new": "verdict = admission_port.admit(admitted_item)", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
@@ -41,7 +44,7 @@ MUTANTS = (
     {"id": "cross-c2-2-load-path", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "launched, handle = submit_admitted(\n                            fence, invocation, admission_record.checkpoint_path,\n                        )", "new": "launched, handle = submit_admitted(\n                            fence, invocation, \"crossed\",\n                        )", "killer": "test_c22_load_path_is_exact_admitted_checkpoint"},
     {"id": "r2-current-fence-required", "target": "executor/src/tpen_executor/storage.py", "old": "current_attempt_id = current_fence.attempt_id.value", "new": "current_attempt_id = admission.predecessor_attempt_id.value", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
     {"id": "preserve-typed-park-reason", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "elif member.action == \"park\":", "new": "elif False:", "killer": "test_controller_propagates_typed_park_reason"},
-    {"id": "retain-r2-input-on-park", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "return replace(item, recovery_input=None, recovery_admission=admission)", "new": "return replace(item, recovery_admission=admission)", "killer": "test_controller_propagates_typed_park_reason"},
+    {"id": "retain-r2-input-on-park", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "        recovery_input=None,\n        recovery_admission=admission,\n        recovery_evidence=request.evidence,", "new": "        recovery_admission=admission,\n        recovery_evidence=request.evidence,", "killer": "test_controller_propagates_typed_park_reason"},
     {"id": "skip-r2-final-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if item.recovery_input is not None:", "new": "if False:", "killer": "test_r2_final_reconciliation_does_not_use_legacy_selector"},
     {"id": "require-r2-fence-for-legacy", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if admission_record.recovery_admission is not None:\n                        member_input", "new": "if True:\n                        member_input", "killer": "test_successor_uses_admitted_start_only"},
     {"id": "local-r2-ignores-admitted-load", "target": "executor/src/tpen_executor/lifecycle/local_executor.py", "old": "return self._submit(fence, invocation, admitted_checkpoint_path=checkpoint_path)", "new": "return self._submit(fence, invocation)", "killer": "test_local_r2_adapter_binds_admitted_checkpoint"},
@@ -74,14 +77,14 @@ class BoundaryExecutor(RecordingExecutor):
         return RecordingExecutor.submit(self, fence, invocation)
 
 
-def _real_evidence(store, current, predecessor, *, backend_job_id: str):
+def _real_evidence(store, current, predecessor, *, backend_job_id: str, content_id: str | None = None):
     evidence = _facts(Path(store.root), mode="operator_authorized_unplanned_end")
     from tpen_executor.recovery import RecoveryCheckpointFactsV1, RecoverySchedulerEndV1
 
     checkpoint = evidence.checkpoint
     bound_path = Path(predecessor.output_dir) / "core" / "checkpoints" / "step_000002"
     checkpoint = RecoveryCheckpointFactsV1(
-        str(bound_path), checkpoint.content_id, checkpoint.next_iteration,
+        str(bound_path), checkpoint.content_id if content_id is None else content_id, checkpoint.next_iteration,
         checkpoint.completed_updates, checkpoint.program_digest,
         checkpoint.science_digest, checkpoint.h_digest,
     )
@@ -114,8 +117,25 @@ def _real_admission(store, fence, *, successor: AttemptId, backend_job_id: str, 
     """Produce an R2 decision from facts bound to the real fixture store."""
 
     current = replace(fence, attempt_id=current_attempt) if current_attempt is not None else fence
-    evidence = _real_evidence(store, current, fence, backend_job_id=backend_job_id)
+    request = store.build_successor_admission_request(fence, successor, "a" * 64, 10)
+    evidence = _real_evidence(
+        store, current, fence, backend_job_id=backend_job_id,
+        content_id=request["core_evidence"]["checkpoint_ref"]["content_id"],
+    )
     return admit_recovery(
+        evidence, successor, now_utc="2026-11-24T00:02:00Z",
+        trusted_store_root=store.root,
+    )
+
+
+def _admitted_facts(store, fence, *, successor: AttemptId, backend_job_id: str, current_attempt: AttemptId | None = None):
+    current = replace(fence, attempt_id=current_attempt) if current_attempt is not None else fence
+    request = store.build_successor_admission_request(fence, successor, "a" * 64, 10)
+    evidence = _real_evidence(
+        store, current, fence, backend_job_id=backend_job_id,
+        content_id=request["core_evidence"]["checkpoint_ref"]["content_id"],
+    )
+    return evidence, admit_recovery(
         evidence, successor, now_utc="2026-11-24T00:02:00Z",
         trusted_store_root=store.root,
     )
@@ -134,6 +154,7 @@ def _r2_setup(tmp_path: Path, *, outcome: bool = True):
     store.finish_attempt(current, "failed", "utc-current-end")
     evidence = _real_evidence(
         store, current, predecessor, backend_job_id=lease.backend_job_id.value,
+        content_id=request["core_evidence"]["checkpoint_ref"]["content_id"],
     )
     recovery_input = RecoveryAdmissionInputV1(
         evidence, successor_binding.attempt_id, "2026-11-24T00:02:00Z",
@@ -189,7 +210,7 @@ def test_r2_link_round_trip_preserves_typed_lineage(tmp_path: Path) -> None:
     store, group, lease, _inputs, bindings, successors, fences = _fixture(tmp_path, ("successor",), remote=False)
     predecessor = fences["successor"]
     request, acceptance, successor_binding = successors["successor"]
-    admission = _real_admission(
+    evidence, admission = _admitted_facts(
         store, predecessor, successor=successor_binding.attempt_id,
         backend_job_id=successor_binding.allocation_attempt.backend_job_id.value,
         current_attempt=AttemptId("current-r2"),
@@ -198,13 +219,16 @@ def test_r2_link_round_trip_preserves_typed_lineage(tmp_path: Path) -> None:
     record = store.record_successor_admission(
         predecessor, request, acceptance,
         predecessor_binding=bindings["successor"], successor_binding=successor_binding,
-        recovery_admission=admission,
+        recovery_admission=admission, recovery_evidence=evidence,
     )
     wire = json.loads(record.encode())
     assert wire["predecessor"]["checkpoint_path"] == admission.checkpoint_path
+    assert wire["predecessor"]["content_id"] == evidence.checkpoint.content_id
+    assert wire["recovery_evidence"]["checkpoint"]["content_id"] == evidence.checkpoint.content_id
     decoded = SuccessorAdmissionRecord.decode(record.encode())
     assert decoded.predecessor_attempt_id == admission.predecessor_attempt_id
     assert decoded.checkpoint_path == admission.checkpoint_path
+    assert decoded.recovery_evidence == evidence
     successor = store.begin_admitted_successor(
         group, "successor", ConfiguredAllocation(successor_binding.allocation_attempt.allocation_id, successor_binding.allocation_attempt.backend_job_id, {}),
         "2026-11-24T00:03:00Z", "local", allocation_attempt=successor_binding.allocation_attempt,
@@ -280,11 +304,102 @@ def test_crossed_r2_request_is_refused_before_ledger(tmp_path: Path) -> None:
         group, allocation_attempt, (item,), bindings={"successor": current_binding},
         successors={"successor": (crossed, acceptance, proposed)},
         recovery_admissions={"successor": item.recovery_admission},
+        recovery_evidence={"successor": item.recovery_evidence},
     )
     assert result.members[0].action == "park", f"result={result!r}; crossed={crossed!r}"
     assert result.members[0].reason_code == "invalid-durable-evidence", f"result={result!r}; store={store.root}"
     assert not list(Path(store.root).rglob("successor-admission.json")), f"result={result!r}; store={store.root}"
     assert store.read_reconciliation(group, allocation_attempt) is None, f"result={result!r}; store={store.root}"
+
+
+def test_r2_publication_refuses_crossed_checkpoint_content_before_ledger(tmp_path: Path) -> None:
+    store, group, allocation, facts, _binding, _evidence, _successor, _current = _r2_setup(tmp_path)
+    item = controller_module._apply_recovery_admission(facts.member_inputs[0], store)
+    request, acceptance, proposed = facts.successor_requests["successor"]
+    crossed = json.loads(json.dumps(request))
+    crossed["core_evidence"]["checkpoint_ref"]["content_id"] = "b" * 64
+    with pytest.raises(FenceRejected, match="crosses admitted checkpoint facts") as error:
+        DirectoryStore._validate_recovery_request_binding(
+            crossed, item.recovery_admission, "successor", item.recovery_evidence,
+        )
+    assert "crosses admitted checkpoint facts" in str(error.value), f"error={error.value!r}; crossed={crossed!r}"
+    current_binding = MemberInvocationV2.decode(Path(item.start_receipt.output_dir, "invocation.json").read_bytes())
+    allocation_attempt = AllocationAttemptV2(
+        group.group_id, AllocationAttemptId("r23-content-publication"), allocation.allocation_id,
+        allocation.backend_job_id, "1", facts.observed_at_utc,
+    )
+    result = store.publish_reconciliation(
+        group, allocation_attempt, (item,), bindings={"successor": current_binding},
+        successors={"successor": (crossed, acceptance, proposed)},
+        recovery_admissions={"successor": item.recovery_admission},
+        recovery_evidence={"successor": item.recovery_evidence},
+    )
+    diagnostic = f"result={result!r}; crossed={crossed!r}; store={store.root}"
+    assert result.members[0].action == "park", diagnostic
+    assert result.members[0].reason_code == "invalid-durable-evidence", diagnostic
+    assert not list(Path(store.root).rglob("successor-admission.json")), diagnostic
+
+
+def test_reader_rejects_content_crossed_with_admitted_evidence(tmp_path: Path) -> None:
+    store, group, _allocation, facts, _binding, _evidence, _successor, current = _r2_setup(tmp_path)
+    item = controller_module._apply_recovery_admission(facts.member_inputs[0], store)
+    request, acceptance, successor_binding = facts.successor_requests["successor"]
+    record = store.record_successor_admission(
+        current, request, acceptance, successor_binding=successor_binding,
+        recovery_admission=item.recovery_admission, recovery_evidence=item.recovery_evidence,
+    )
+    successor = store.begin_admitted_successor(
+        group, "successor",
+        ConfiguredAllocation(successor_binding.allocation_attempt.allocation_id, successor_binding.allocation_attempt.backend_job_id, {}),
+        "2026-11-24T00:03:00Z", "local", allocation_attempt=successor_binding.allocation_attempt,
+        admission=record, current_fence=current,
+    )
+    ledger = Path(store.root) / "groups" / group.identity / "successor" / "successor-admissions" / record.predecessor_attempt_id.value / "successor-admission.json"
+    wire = json.loads(ledger.read_bytes())
+    wire["predecessor"]["content_id"] = "b" * 64
+    wire["successor_request"]["core_evidence"]["checkpoint_ref"]["content_id"] = "b" * 64
+    wire["request_digest"] = digest(wire["successor_request"])
+    ledger.write_bytes(canonical_bytes(wire))
+    with pytest.raises(AdmissionUnreadable, match="successor admission ledger is unreadable") as error:
+        read_successor_admission(
+            successor.output_dir, task_id="successor", attempt_id=record.successor_attempt_id.value,
+            group_digest=group.identity, science_input_digest=request["science_input_digest"],
+            target_iterations=request["target_iterations"],
+        )
+    cause = error.value.__cause__
+    diagnostic = f"error={error.value!r}; cause={cause!r}; wire={wire!r}; store={store.root}"
+    assert isinstance(cause, ValueError), diagnostic
+    assert "recovery evidence checkpoint content crosses admission" in str(cause), diagnostic
+
+
+def test_reader_rejects_tampered_recovery_evidence_digest(tmp_path: Path) -> None:
+    store, group, _allocation, facts, _binding, _evidence, _successor, current = _r2_setup(tmp_path)
+    item = controller_module._apply_recovery_admission(facts.member_inputs[0], store)
+    request, acceptance, successor_binding = facts.successor_requests["successor"]
+    record = store.record_successor_admission(
+        current, request, acceptance, successor_binding=successor_binding,
+        recovery_admission=item.recovery_admission, recovery_evidence=item.recovery_evidence,
+    )
+    successor = store.begin_admitted_successor(
+        group, "successor",
+        ConfiguredAllocation(successor_binding.allocation_attempt.allocation_id, successor_binding.allocation_attempt.backend_job_id, {}),
+        "2026-11-24T00:03:00Z", "local", allocation_attempt=successor_binding.allocation_attempt,
+        admission=record, current_fence=current,
+    )
+    ledger = Path(store.root) / "groups" / group.identity / "successor" / "successor-admissions" / record.predecessor_attempt_id.value / "successor-admission.json"
+    wire = json.loads(ledger.read_bytes())
+    wire["recovery_evidence"]["checkpoint"]["content_id"] = "b" * 64
+    ledger.write_bytes(canonical_bytes(wire))
+    with pytest.raises(AdmissionUnreadable, match="successor admission ledger is unreadable") as error:
+        read_successor_admission(
+            successor.output_dir, task_id="successor", attempt_id=record.successor_attempt_id.value,
+            group_digest=group.identity, science_input_digest=request["science_input_digest"],
+            target_iterations=request["target_iterations"],
+        )
+    cause = error.value.__cause__
+    diagnostic = f"error={error.value!r}; cause={cause!r}; wire={wire!r}; store={store.root}"
+    assert isinstance(cause, ValueError), diagnostic
+    assert "recovery evidence digest crosses admission" in str(cause), diagnostic
 
 
 def test_reader_rejects_crossed_embedded_request_with_recomputed_digest(tmp_path: Path) -> None:
@@ -294,6 +409,7 @@ def test_reader_rejects_crossed_embedded_request_with_recomputed_digest(tmp_path
     record = store.record_successor_admission(
         current, request, acceptance,
         successor_binding=successor_binding, recovery_admission=item.recovery_admission,
+        recovery_evidence=item.recovery_evidence,
     )
     successor = store.begin_admitted_successor(
         group, "successor",
@@ -331,7 +447,7 @@ def test_crossed_r2_successor_link_is_rejected(tmp_path: Path) -> None:
     store, _group, _lease, _inputs, bindings, successors, fences = _fixture(tmp_path, ("successor",), remote=False)
     predecessor = fences["successor"]
     request, acceptance, successor_binding = successors["successor"]
-    admission = _real_admission(
+    evidence, admission = _admitted_facts(
         store, predecessor, successor=successor_binding.attempt_id,
         backend_job_id=successor_binding.allocation_attempt.backend_job_id.value,
         current_attempt=AttemptId("current-r2"),
@@ -345,7 +461,7 @@ def test_crossed_r2_successor_link_is_rejected(tmp_path: Path) -> None:
             crossed, predecessor_task_id="successor", predecessor_content_id=crossed_content_id,
             successor_task_id="successor", request_digest=digest(crossed_request),
             core_acceptance_digest=acceptance, successor_binding=successor_binding,
-            successor_request=crossed_request,
+            successor_request=crossed_request, recovery_evidence=evidence,
         )
     assert "successor binding crosses admission identity" in str(error.value), f"error={error.value!r}; request={crossed_request!r}"
 
@@ -354,7 +470,7 @@ def test_tampered_v3_predecessor_link_is_rejected(tmp_path: Path) -> None:
     store, _group, _lease, _inputs, bindings, successors, fences = _fixture(tmp_path, ("successor",), remote=False)
     predecessor = fences["successor"]
     request, acceptance, successor_binding = successors["successor"]
-    admission = _real_admission(
+    evidence, admission = _admitted_facts(
         store, predecessor, successor=successor_binding.attempt_id,
         backend_job_id=successor_binding.allocation_attempt.backend_job_id.value,
         current_attempt=AttemptId("current-r2"),
@@ -362,7 +478,7 @@ def test_tampered_v3_predecessor_link_is_rejected(tmp_path: Path) -> None:
     record = store.record_successor_admission(
         predecessor, request, acceptance,
         predecessor_binding=bindings["successor"], successor_binding=successor_binding,
-        recovery_admission=admission,
+        recovery_admission=admission, recovery_evidence=evidence,
     )
     wire = json.loads(record.encode())
     wire["predecessor"]["attempt_id"] = "tampered-predecessor"
@@ -378,7 +494,7 @@ def test_r2_duplicate_replay_is_idempotent_and_fork_parks(tmp_path: Path) -> Non
     store, _group, _lease, _inputs, bindings, successors, fences = _fixture(tmp_path, ("successor",), remote=False)
     predecessor = fences["successor"]
     request, acceptance, successor_binding = successors["successor"]
-    admission = _real_admission(
+    evidence, admission = _admitted_facts(
         store, predecessor, successor=successor_binding.attempt_id,
         backend_job_id=successor_binding.allocation_attempt.backend_job_id.value,
         current_attempt=AttemptId("current-r2"),
@@ -386,10 +502,12 @@ def test_r2_duplicate_replay_is_idempotent_and_fork_parks(tmp_path: Path) -> Non
     first = store.record_successor_admission(
         predecessor, request, acceptance, predecessor_binding=bindings["successor"],
         successor_binding=successor_binding, recovery_admission=admission,
+        recovery_evidence=evidence,
     )
     assert store.record_successor_admission(
         predecessor, request, acceptance, predecessor_binding=bindings["successor"],
         successor_binding=successor_binding, recovery_admission=admission,
+        recovery_evidence=evidence,
     ) == first
     other_attempt = AttemptId("other-successor")
     other_request = dict(request)
@@ -401,6 +519,7 @@ def test_r2_duplicate_replay_is_idempotent_and_fork_parks(tmp_path: Path) -> Non
             predecessor, other_request, acceptance,
             predecessor_binding=bindings["successor"], successor_binding=other_binding,
             recovery_admission=other_admission,
+            recovery_evidence=evidence,
         )
 
 

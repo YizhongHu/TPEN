@@ -24,6 +24,7 @@ The decoded JSON value MUST be an object with exactly these fields:
 | `successor_binding` | object | Canonical `MemberInvocationV2` binding for the launched leaf. |
 | `recovery_admission` | object | Canonical `RecoveryAdmissionV1` decision that produced this link. It MUST be admitted. |
 | `successor_request` | object or `null` | The canonical executor-facing successor request used for this admission. R2 v3 publications MUST carry the object so a reader does not need a fabricated core outcome. |
+| `recovery_evidence` | object | Canonical `RecoveryEvidenceV1` independently admitted by R2. Its digest MUST equal `recovery_admission.evidence_digest`; it supplies the selected checkpoint content identity. |
 
 The object is canonical JSON: a writer serializes the closed mapping with
 sorted keys and no additional fields. A reader MUST reject missing, extra, or
@@ -123,6 +124,20 @@ The nested request's `predecessor` and `successor` identity fields are strings;
 "tpen-config-identity-v1"` and lowercase 64-hex `sha256`. The request is
 frozen into the record and its canonical digest MUST equal `request_digest`.
 
+### `recovery_evidence`
+
+`recovery_evidence` is the closed `tpen-executor/recovery-evidence-v1` JSON
+object supplied to `admit_recovery`. It is retained in v3 so a consumer can
+verify the admitted facts without trusting a content identity copied from the
+request. A reader MUST recompute the existing canonical `digest` of this
+object and require equality with `recovery_admission.evidence_digest`.
+The evidence checkpoint's `content_id` is the outer `predecessor.content_id`;
+its `checkpoint.checkpoint_path` is the outer `predecessor.checkpoint_path` and
+`recovery_admission.checkpoint_path`. The embedded request's
+`core_evidence.checkpoint_ref.content_id` and `checkpoint_dir` MUST equal those
+same evidence-derived values. Any mismatch is unreadable, even when the outer
+and embedded request copies agree with one another.
+
 For an R2 record, the writer MUST bind this embedded request to the independent
 `recovery_admission` before writing the ledger: both request task ids equal the
 record task, the request predecessor and successor `attempt_id` values equal
@@ -154,12 +169,16 @@ it MUST reject a record when:
    or its reason is not `recovery-evidence-valid`.
 6. The ledger task, predecessor start receipt, group, or launched output leaf
    disagrees with the record's identities.
-7. The embedded request has extra/missing fields, its canonical request digest
+7. `recovery_evidence` is absent, its canonical digest differs from
+   `recovery_admission.evidence_digest`, its checkpoint content or path differs
+   from the outer/admitted facts, or its typed predecessor facts cross the
+   admission.
+8. The embedded request has extra/missing fields, its canonical request digest
    does not match `request_digest`, its predecessor/successor identities do not
    equal the outer/admitted identities, or its checkpoint content does not
-   equal the outer typed predecessor content identity or its checkpoint path
-   does not equal the admitted checkpoint path.
-8. The caller science/iteration intent does not match `successor_request`.
+   equal the evidence-derived outer typed predecessor content identity or its
+   checkpoint path does not equal the admitted checkpoint path.
+9. The caller science/iteration intent does not match `successor_request`.
 
 The linked result is not a core outcome. If the predecessor was hard-killed and
 no core outcome exists, the reader uses the embedded admitted request and

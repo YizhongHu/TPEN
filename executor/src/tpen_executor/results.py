@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import field
 from typing import Any, ClassVar
 
-from ._codec import _freeze, canonical_bytes, decode_json, fields, sequence, sha256_text, text, thaw
+from ._codec import _freeze, canonical_bytes, decode_json, digest, fields, sequence, sha256_text, text, thaw
 from .contracts import AllocationId, AttemptId, BackendJobId
 from .gpu_telemetry import SAMPLER_METHOD, DeviceDecision, derive_device_decision, validate_sampler_wire
 from ._records import frozen_record
@@ -416,6 +416,7 @@ class SuccessorAdmissionRecord:
     successor_binding: Any = None
     recovery_admission: Any = None
     successor_request: Mapping[str, Any] | None = None
+    recovery_evidence: Any = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "predecessor_task_id", text(self.predecessor_task_id, "predecessor_task_id"))
@@ -443,6 +444,18 @@ class SuccessorAdmissionRecord:
             if (self.recovery_admission.predecessor_attempt_id != self.predecessor_attempt_id
                     or self.recovery_admission.successor_attempt_id != self.successor_attempt_id):
                 raise ValueError("recovery admission crosses successor identity")
+            from .recovery import RecoveryEvidenceV1
+
+            if not isinstance(self.recovery_evidence, RecoveryEvidenceV1):
+                raise TypeError("recovery_evidence must be RecoveryEvidenceV1")
+            if digest(self.recovery_evidence.to_dict()) != self.recovery_admission.evidence_digest:
+                raise ValueError("recovery evidence digest crosses admission")
+            if self.recovery_evidence.predecessor_attempt_id != self.recovery_admission.predecessor_attempt_id:
+                raise ValueError("recovery evidence predecessor crosses admission")
+            if self.recovery_evidence.checkpoint_path != self.recovery_admission.checkpoint_path:
+                raise ValueError("recovery evidence checkpoint path crosses admission")
+            if self.recovery_evidence.checkpoint.content_id != self.predecessor_content_id:
+                raise ValueError("recovery evidence checkpoint content crosses admission")
         if self.successor_request is not None:
             if not isinstance(self.successor_request, Mapping):
                 raise TypeError("successor_request must be a mapping")
@@ -522,6 +535,7 @@ class SuccessorAdmissionRecord:
         if self.recovery_admission is not None:
             result["recovery_admission"] = self.recovery_admission.to_dict()
             result["successor_request"] = None if self.successor_request is None else thaw(self.successor_request)
+            result["recovery_evidence"] = self.recovery_evidence.to_dict()
         return result
 
     def encode(self) -> bytes:
@@ -535,16 +549,19 @@ class SuccessorAdmissionRecord:
         binding = None
         recovery_admission = None
         successor_request = None
+        recovery_evidence = None
         if isinstance(data, Mapping) and data.get("schema") == cls.schema_v2:
             fields(data, keys | {"successor_binding"}, cls.schema_v2, cls.__name__)
             binding = MemberInvocationV2.from_mapping(data["successor_binding"])
         elif isinstance(data, Mapping) and data.get("schema") == cls.schema_v3:
-            fields(data, keys | {"successor_binding", "recovery_admission", "successor_request"}, cls.schema_v3, cls.__name__)
+            fields(data, keys | {"successor_binding", "recovery_admission", "successor_request", "recovery_evidence"}, cls.schema_v3, cls.__name__)
             binding = MemberInvocationV2.from_mapping(data["successor_binding"])
             from .recovery import RecoveryAdmissionV1
+            from .recovery import RecoveryEvidenceV1
 
             recovery_admission = RecoveryAdmissionV1.from_mapping(data["recovery_admission"])
             successor_request = data["successor_request"]
+            recovery_evidence = RecoveryEvidenceV1.from_mapping(data["recovery_evidence"])
         else:
             fields(data, keys, cls.schema, cls.__name__)
         predecessor_keys = {"task_id", "attempt_id", "content_id"}
@@ -574,6 +591,7 @@ class SuccessorAdmissionRecord:
             binding,
             recovery_admission,
             successor_request,
+            recovery_evidence,
         )
 
     @classmethod
@@ -588,6 +606,7 @@ class SuccessorAdmissionRecord:
         core_acceptance_digest: str,
         successor_binding: Any,
         successor_request: Mapping[str, Any] | None = None,
+        recovery_evidence: Any = None,
     ) -> "SuccessorAdmissionRecord":
         """Build the v3 link directly from the admitted R2 decision."""
 
@@ -600,7 +619,7 @@ class SuccessorAdmissionRecord:
         return cls(
             predecessor_task_id, admission.predecessor_attempt_id, predecessor_content_id,
             successor_task_id, admission.successor_attempt_id, request_digest,
-            core_acceptance_digest, successor_binding, admission, successor_request,
+            core_acceptance_digest, successor_binding, admission, successor_request, recovery_evidence,
         )
 
     @classmethod

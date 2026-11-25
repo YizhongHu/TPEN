@@ -859,6 +859,7 @@ class MemberRecoveryInputV2:
     receipt_digest: str | None = None
     recovery_input: RecoveryAdmissionInputV1 | None = None
     recovery_admission: RecoveryAdmissionV1 | None = None
+    recovery_evidence: RecoveryEvidenceV1 | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
@@ -875,12 +876,26 @@ class MemberRecoveryInputV2:
             raise TypeError("recovery_input must be RecoveryAdmissionInputV1 or None")
         if self.recovery_admission is not None and not isinstance(self.recovery_admission, RecoveryAdmissionV1):
             raise TypeError("recovery_admission must be RecoveryAdmissionV1 or None")
+        if self.recovery_evidence is not None and not isinstance(self.recovery_evidence, RecoveryEvidenceV1):
+            raise TypeError("recovery_evidence must be RecoveryEvidenceV1 or None")
         if self.recovery_input is not None:
             evidence = self.recovery_input.evidence
             if evidence.task_id != self.task_id or evidence.group_digest != (self.start_receipt.group_digest if self.start_receipt is not None else evidence.group_digest):
                 raise ValueError("recovery input crosses member identity")
             if self.attempt_id is not None and evidence.attempt_id != self.attempt_id:
                 raise ValueError("recovery input crosses attempt identity")
+        if self.recovery_evidence is not None:
+            evidence = self.recovery_evidence
+            if evidence.task_id != self.task_id or evidence.group_digest != (self.start_receipt.group_digest if self.start_receipt is not None else evidence.group_digest):
+                raise ValueError("recovery evidence crosses member identity")
+            if self.attempt_id is not None and evidence.attempt_id != self.attempt_id:
+                raise ValueError("recovery evidence crosses attempt identity")
+            if self.recovery_admission is not None:
+                if digest(evidence.to_dict()) != self.recovery_admission.evidence_digest:
+                    raise ValueError("recovery evidence digest crosses admission")
+                if (evidence.predecessor_attempt_id != self.recovery_admission.predecessor_attempt_id
+                        or evidence.checkpoint_path != self.recovery_admission.checkpoint_path):
+                    raise ValueError("recovery evidence crosses admission facts")
         if self.recovery_admission is not None and self.recovery_input is not None:
             if (self.recovery_admission.predecessor_attempt_id != self.recovery_input.evidence.predecessor_attempt_id
                     or self.recovery_admission.successor_attempt_id != self.recovery_input.successor_attempt_id):
@@ -920,6 +935,8 @@ class MemberRecoveryInputV2:
             result["recovery_input"] = self.recovery_input.to_dict()
         if self.recovery_admission is not None:
             result["recovery_admission"] = self.recovery_admission.to_dict()
+        if self.recovery_evidence is not None:
+            result["recovery_evidence"] = self.recovery_evidence.to_dict()
         return result
 
     def encode(self) -> bytes:
@@ -928,7 +945,7 @@ class MemberRecoveryInputV2:
     @classmethod
     def from_mapping(cls, data: Any) -> "MemberRecoveryInputV2":
         base_fields = {"schema", "task_id", "lineage_id", "attempt_id", "start_receipt", "outcome_receipt", "core_verdict", "receipt_digest"}
-        optional_fields = {key for key in ("recovery_input", "recovery_admission") if key in data}
+        optional_fields = {key for key in ("recovery_input", "recovery_admission", "recovery_evidence") if key in data}
         fields(data, base_fields | optional_fields, cls.schema, cls.__name__)
         if type(data["task_id"]) is not str or type(data["lineage_id"]) is not str:
             raise TypeError("MemberRecoveryInputV2 identity fields must be strings")
@@ -942,6 +959,7 @@ class MemberRecoveryInputV2:
             data["receipt_digest"],
             None if data.get("recovery_input") is None else RecoveryAdmissionInputV1.from_mapping(data["recovery_input"]),
             None if data.get("recovery_admission") is None else RecoveryAdmissionV1.from_mapping(data["recovery_admission"]),
+            None if data.get("recovery_evidence") is None else RecoveryEvidenceV1.from_mapping(data["recovery_evidence"]),
         )
 
     @classmethod

@@ -192,7 +192,12 @@ def _apply_recovery_admission(item: MemberRecoveryInputV2, store: DirectoryStore
     # attaching it so MemberRecoveryInputV2 does not reject the typed park as a
     # crossed recovery input; the controller still uses the original input to
     # select the R2 path and never calls the legacy admission port.
-    return replace(item, recovery_input=None, recovery_admission=admission)
+    return replace(
+        item,
+        recovery_input=None,
+        recovery_admission=admission,
+        recovery_evidence=request.evidence,
+    )
 
 
 def run_group_controller(
@@ -265,6 +270,7 @@ def run_group_controller(
                 bindings[item.task_id] = MemberInvocationV2.decode(invocation_path.read_bytes())
         successor_requests = {}
         recovery_admissions = {}
+        recovery_evidence = {}
         for task_id, (request, acceptance, proposed) in facts.successor_requests.items():
             if next(member.action for member in checked.members if member.task_id == task_id) != "admit_successor":
                 continue
@@ -276,9 +282,13 @@ def run_group_controller(
             member_input = next(item for item in frozen_inputs if item.task_id == task_id)
             if member_input.recovery_admission is not None:
                 recovery_admissions[task_id] = member_input.recovery_admission
+                if member_input.recovery_evidence is not None:
+                    recovery_evidence[task_id] = member_input.recovery_evidence
         publication_kwargs = {"bindings": bindings, "successors": successor_requests}
         if recovery_admissions:
             publication_kwargs["recovery_admissions"] = recovery_admissions
+        if recovery_evidence:
+            publication_kwargs["recovery_evidence"] = recovery_evidence
         published = store.publish_reconciliation(group, attempt, tuple(frozen_inputs), **publication_kwargs)
         if published.encode() != checked.encode():
             return _park(group, "reconciliation-publication-conflict")
