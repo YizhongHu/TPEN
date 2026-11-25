@@ -8,10 +8,11 @@ uses that one complete wrapper with an explicit mode.
 
 ## Scope and approval boundary
 
-The route is one direct Polaris allocation: three independent 50,000-update
-training lineages run concurrently on one four-GPU Polaris node, followed by
-strict model-only evaluation rows and collection on Eagle.  It does not use
-Balsam, debug-job chaining, or a first-class PBS path in `launch.py`.
+The route is one direct Polaris allocation for one already-approved training
+lineage, followed by any explicitly selected evaluation row and collection on
+Eagle.  The wrapper consumes a frozen row object and calls
+`launch.command_for_row`; it does not reconstruct a recipe from `qsub -v`, fan
+out to successor lineages, or use a first-class PBS path in `launch.py`.
 
 - `debug` and `debug-scaling` are free queues for bounded smoke, guard, plan,
   evaluation, and collection work.  The PBS queue name is `debug-scaling`,
@@ -24,6 +25,12 @@ Balsam, debug-job chaining, or a first-class PBS path in `launch.py`.
 - Never `qdel`, `qhold`, or `qrls`.  A guard, identity, checkpoint, wall-cap,
   or OOM failure is a terminal invalid measurement for that row; resubmission
   requires a new approval boundary.
+- `APPROVAL_ID` is a required operational input for every train/eval/dry-exec
+  control.  It identifies the manager-relayed queue/allocation approval; it is
+  never part of the science row.  No proxy hostname, port, or environment
+  recipe is copied from an older receipt.  If network access is needed, stop
+  at the current official ALCF documentation gate and record the verified
+  host note before proceeding.
 
 Before any Polaris action, read the `cluster-access` skill and the current TO
 chain: Clusters `cluster-access-read-first`, `00-orientation`,
@@ -113,8 +120,8 @@ The PBS wrapper replaces only the Slurm execution shell around that contract:
 - `pbs_stage1.sh:123-185` verifies the pre-staged detached checkout, provisions
   the job-local cu128 environment from the external cache, and cleans only a
   unique owned temporary child;
-- `pbs_stage1.sh:203-269` runs three train rows in parallel or eval rows
-  sequentially, with `CUDA_VISIBLE_DEVICES` and `taskset` CPU ranges.
+- `pbs_stage1.sh:203-269` records PBS/facility inputs and runs one selected
+  row with its lineage's `CUDA_VISIBLE_DEVICES` and `taskset` CPU range.
 
 The wrapper never silently routes a Polaris job through the Cannon Slurm
 template and never edits `launch.py`.
@@ -130,94 +137,146 @@ submission, and monitoring only.  `qstat -xf <jobid>` is the authoritative
 terminal scheduler observation.  Preserve qsub stdout/stderr, qstat output,
 wrapper logs, row status files, rendered command receipts, and every failure.
 
-### 1. Phase-1 plan on free `debug`
+### 1. Select one frozen row on the login side
 
-Create the output directory before submitting.  The wrapper records the PBS
-job ID and queue, checks all four GPU identities and MIG modes, and runs the
-plan through `python -m` from the exact detached checkout.
+Planning and full roster/grid reconciliation remain S0-B/S1-RC-owned.  After
+those owners publish the approved manifest, materialize exactly one row object
+without adding or changing fields.  The same row shape is used for an
+unbounded route and for a bounded qualification; only the latter adds the
+already-approved `execution.stop_at` datum in its separate request file.
 
 ```bash
 mkdir -p "$RESULTS_ROOT"/{inputs,logs,plan,launch}
 cp experiments/atomistic/stage1/polaris/pbs_stage1.sh "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 chmod 750 "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 sha256sum "$RESULTS_ROOT/inputs/pbs_stage1.sh" > "$RESULTS_ROOT/inputs/pbs_stage1.sh.sha256"
-qsub -A HetRxnEnergy -q debug \
+"$PYBIN" - "$RESULTS_ROOT/plan/phase1-manifest.json" "$RESULTS_ROOT/plan/selected-train.json" <<'PY'
+import json, sys
+from pathlib import Path
+source, target = map(Path, sys.argv[1:])
+rows = [row for row in json.loads(source.read_text())['rows'] if row['kind'] == 'train']
+if len(rows) != 3:
+    raise SystemExit(f"expected the published three-row train population, got {len(rows)}")
+target.write_text(json.dumps(rows[0], sort_keys=True, indent=2) + "\n")
+PY
+```
+
+The selected file is immutable evidence: record its SHA-256, source/config/
+overlay identities, lineage, results root, and the manager-relayed
+`APPROVAL_ID`.  Do not pass a phase manifest to the wrapper's train/eval
+consumer.
+
+### 2. Bounded ramp-up control on free `debug-scaling`
+
+Run the bounded ramp-up through the same wrapper and selected-lineage route
+before requesting any capacity approval.  `derive_smoke_request` changes only
+the isolated output root and the retained `execution.stop_at`; it does not
+invent a second recipe, seed, walker budget, or checkpoint schedule.  The
+example below uses the retained 50,000-update boundary and must be adapted
+only to the approved selected row and run root.
+
+```bash
+SMOKE_RESULTS_ROOT="$RESULTS_ROOT/ramp-up-r1"
+SMOKE_SELECTED_ROW="$SMOKE_RESULTS_ROOT/plan/selected-train.json"
+mkdir -p "$SMOKE_RESULTS_ROOT"/plan "$SMOKE_RESULTS_ROOT"/logs
+test -d "$SMOKE_RESULTS_ROOT/plan" -a -d "$SMOKE_RESULTS_ROOT/logs" || {
+  echo "bounded PBS output directories are not ready" >&2
+  exit 2
+}
+"$PYBIN" - "$RESULTS_ROOT/plan/selected-train.json" "$SMOKE_SELECTED_ROW" "$SMOKE_RESULTS_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from experiments.atomistic.stage1.protocol import derive_smoke_request
+
+source, target, results_root = map(Path, sys.argv[1:])
+row = json.loads(source.read_text(encoding="utf-8"))
+request = derive_smoke_request(row, results_root=str(results_root), stop_at=50_000)
+target.write_text(json.dumps(request, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+PY
+sha256sum "$SMOKE_SELECTED_ROW" > "$SMOKE_SELECTED_ROW.sha256"
+APPROVAL_ID="${MANAGER_RELAYED_APPROVAL_ID:-}"
+: "${APPROVAL_ID:?APPROVAL_ID must be set from the explicit manager-relayed value}"
+qsub -A HetRxnEnergy -q debug-scaling \
   -l select=1:system=polaris:ngpus=4:ncpus=64,walltime=00:55:00,filesystems=home:eagle,place=scatter \
-  -o "$RESULTS_ROOT/logs/plan.pbs.out" -e "$RESULTS_ROOT/logs/plan.pbs.err" \
-  -v MODE=plan,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",PLAN_PHASE=1,SYSTEM="$SYSTEM",PLAN_OUTPUT="$RESULTS_ROOT/plan/phase1-manifest.json",LINEAGE_SEEDS=1:2:3 \
+  -o "$SMOKE_RESULTS_ROOT/logs/train-ramp.pbs.out" -e "$SMOKE_RESULTS_ROOT/logs/train-ramp.pbs.err" \
+  -v MODE=train,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$SMOKE_RESULTS_ROOT",EXPECTED_QUEUE=debug-scaling,PYBIN="$PYBIN",SELECTED_ROW="$SMOKE_SELECTED_ROW",APPROVAL_ID="$APPROVAL_ID" \
   "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 ```
 
-Require `qstat -xf` to show the delivered queue `debug`, `Exit_status=0`,
-and `run_count=1` before reading the phase-1 manifest.  The plan must contain
-one smoke row and three train rows for the selected system, with lineages
-`0,1,2`, walkers `4096`, updates `100000`, terminal checkpoint `100000`,
-`device=cuda`, and the exact `SOURCE_SHA`.
+The bounded control is compute-skipped only when explicitly run in
+`DRY_EXEC=1`; a submitted ramp-up must retain the PBS stdout/stderr, qstat
+terminal record, wrapper receipts, row log/status, and the selected-row hash.
+It is a ladder rung, not a science result or capacity approval.
 
-### 2. Three train rows in one `capacity` allocation
+### 3. Capacity-approval gate
 
-This is the first nonfree action and needs a fresh approval naming the exact
-source SHA, Eagle root, queue, one-node/four-GPU shape, and wall cap.  Before
-the qsub, verify the `capacity` queue and account live, and verify the `-o`/`-e`
-directory exists.
+Before requesting any `capacity` approval, the operator must have all three
+non-empty, retained artifacts from the planned and passed ramp-up ladder and
+the smoke/science comparison.  These are evidence gates, not proxy values for
+the later science run:
 
 ```bash
+RAMP_UP_PLAN_RECEIPT="$RESULTS_ROOT/plan/ramp-up-planned.receipt"
+RAMP_UP_PASS_RECEIPT="$RESULTS_ROOT/plan/ramp-up-passed.receipt"
+SMOKE_SCIENCE_ARTIFACT_DIFF="$RESULTS_ROOT/plan/smoke-science-artifact-diff.txt"
+test -s "$RAMP_UP_PLAN_RECEIPT" || { echo "missing planned ramp-up receipt" >&2; exit 2; }
+test -s "$RAMP_UP_PASS_RECEIPT" || { echo "missing passed ramp-up receipt" >&2; exit 2; }
+test -s "$SMOKE_SCIENCE_ARTIFACT_DIFF" || { echo "missing smoke/science artifact diff" >&2; exit 2; }
+```
+
+Do not request or submit the paid run until those checks pass and a fresh
+manager-relayed approval names the exact source SHA, selected row, Eagle root,
+queue, node/GPU shape, and wall cap.  Paid runs remain an operator decision.
+
+### 4. One selected-lineage train control
+
+This is the first nonfree action and needs fresh approval naming the exact
+source SHA, selected row, Eagle root, queue, one-node/four-GPU shape, and wall
+cap.  Before qsub, verify the queue/account live and the `-o`/`-e` directory.
+The command below is complete and carries only facility inputs plus the frozen
+row path; the recipe is reconstructed nowhere in PBS.
+
+```bash
+APPROVAL_ID=<manager-relayed-approval-id>
 qsub -A HetRxnEnergy -q capacity \
   -l select=1:system=polaris:ngpus=4:ncpus=64,walltime=11:00:00,filesystems=home:eagle,place=scatter \
   -o "$RESULTS_ROOT/logs/train.pbs.out" -e "$RESULTS_ROOT/logs/train.pbs.err" \
-  -v MODE=train,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=capacity,PYBIN="$PYBIN",PLAN_MANIFEST="$RESULTS_ROOT/plan/phase1-manifest.json" \
+  -v MODE=train,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=capacity,PYBIN="$PYBIN",SELECTED_ROW="$RESULTS_ROOT/plan/selected-train.json",APPROVAL_ID="$APPROVAL_ID" \
   "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 ```
 
 The wrapper derives the affinity-constrained layout from `taskset -pc $$` and
-`lscpu -p=CPU,CORE,NODE`: it keeps one logical CPU per physical core, orders by
-NUMA node and core, and splits the usable cores into three equal lineage slices.
-Train/eval export `OMP_NUM_THREADS` and `MKL_NUM_THREADS` from each slice's
-derived physical-core count and reuse the exact derived CPU list with `taskset`.
-The allocation-dependent `POLARIS_LAYOUT` lines record the CPU lists and counts;
-the three rows start concurrently and GPU 3 is left unused.  Each row writes a
-separate log and `.status` receipt under `RESULTS_ROOT/logs/`; the wrapper also
-captures the exact argv returned by `launch.command_for_row`.
+`lscpu -p=CPU,CORE,NODE`, then runs only the selected lineage on its matching
+GPU/CPU slice.  The unbounded train row and a bounded request use this exact
+same train -> S1-R restart -> public gateway route; they differ only in the
+row's `execution.stop_at` and isolated output root.
 
-### 3. Phase-2 checkpoint binding on free `debug`
+### 5. One selected eval row on free `debug`
 
-After training, build `plan/checkpoint-evidence.json` from the three named run
-directories only.  Require `status.json` to say `completed`, require the
-complete `checkpoints/step_100000` directory, and record each `model.pt`
-SHA-256.  Do not search the Eagle tree recursively.  Then submit:
-
-This phase-2 selection follows the S0-B evaluation-cadence decision; the
-full roster B and evaluation cadence remain specified there.
+After the checkpoint owner publishes an eval manifest, materialize one
+approved eval row in the same way.  This is a subset consumer only; it does not
+replace the full roster/grid reconciliation.
 
 ```bash
-qsub -A HetRxnEnergy -q debug \
-  -l select=1:system=polaris:ngpus=4:ncpus=64,walltime=00:55:00,filesystems=home:eagle,place=scatter \
-  -o "$RESULTS_ROOT/logs/phase2.pbs.out" -e "$RESULTS_ROOT/logs/phase2.pbs.err" \
-  -v MODE=plan,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",PLAN_PHASE=2,PLAN_OUTPUT="$RESULTS_ROOT/plan/phase2-manifest.json",PHASE1_MANIFEST="$RESULTS_ROOT/plan/phase1-manifest.json",CHECKPOINT_BINDINGS="$RESULTS_ROOT/plan/checkpoint-evidence.json",CHECKPOINTS=100000,LINEAGE_SEEDS=1:2:3 \
-  "$RESULTS_ROOT/inputs/pbs_stage1.sh"
-```
-
-Require the phase-2 manifest to contain 12 eval rows (four streams for each
-lineage), each strictly bound to the phase-1 manifest, checkpoint digest,
-absolute `model.pt`, and `device=cuda`.
-
-### 4. Evaluation on free `debug`
-
-The wrapper runs the 12 eval rows sequentially on GPU 0, one fresh strict
-`model_only` restore per row.  The debug one-hour limit is suitable for this
-bounded evaluation shape. It continues through all selected eval rows,
-records every row status, and returns an aggregate nonzero exit if any lineage
-fails.
-
-```bash
+"$PYBIN" - "$RESULTS_ROOT/plan/phase2-manifest.json" "$RESULTS_ROOT/plan/selected-eval.json" <<'PY'
+import json, sys
+from pathlib import Path
+source, target = map(Path, sys.argv[1:])
+rows = [row for row in json.loads(source.read_text())['rows'] if row['kind'] == 'eval']
+if not rows:
+    raise SystemExit("no admitted eval row")
+target.write_text(json.dumps(rows[0], sort_keys=True, indent=2) + "\n")
+PY
 qsub -A HetRxnEnergy -q debug \
   -l select=1:system=polaris:ngpus=4:ncpus=64,walltime=00:55:00,filesystems=home:eagle,place=scatter \
   -o "$RESULTS_ROOT/logs/eval.pbs.out" -e "$RESULTS_ROOT/logs/eval.pbs.err" \
-  -v MODE=eval,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",PLAN_MANIFEST="$RESULTS_ROOT/plan/phase2-manifest.json" \
+  -v MODE=eval,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",SELECTED_ROW="$RESULTS_ROOT/plan/selected-eval.json",APPROVAL_ID="$APPROVAL_ID" \
   "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 ```
 
-### 5. Collection on free `debug`
+### 6. Collection on free `debug`
 
 Collection is a CPU-only command inside the same exact-SHA job-local
 environment.  It writes only the named collection output beneath Eagle.

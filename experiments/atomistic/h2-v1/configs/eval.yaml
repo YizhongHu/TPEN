@@ -27,7 +27,7 @@ system:
   nuclei:
     positions: [[-0.7, 0.0, 0.0], [0.7, 0.0, 0.0]]
     charges: [1.0, 1.0]
-  reference_energy: -1.17447
+  reference_energy: -1.1744757142204434
 
 # Sole typed nuclear-geometry authority (A5): one declarative `atoms` source
 # consumed by the wavefunction's post-readout ElectronNucleusCusp factor and

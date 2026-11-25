@@ -530,6 +530,8 @@ def _callback_ownership_claims(
     cfg: DictConfig,
     run_dir: Path,
     metadata: RunMetadata,
+    artifact_manager: ArtifactManager | None = None,
+    invocation_id: str | None = None,
 ) -> list[ResourceOwnershipClaim]:
     """Collect optional ``ResourceOwnershipClaim`` declarations from a callback."""
 
@@ -547,7 +549,13 @@ def _callback_ownership_claims(
     if not params:
         raw = provider()
     else:
-        available = {"cfg": cfg, "run_dir": run_dir, "metadata": metadata}
+        available = {
+            "cfg": cfg,
+            "run_dir": run_dir,
+            "metadata": metadata,
+            "artifact_manager": artifact_manager,
+            "invocation_id": invocation_id,
+        }
         named_compatible = all(
             param.name in available or param.default is not inspect.Parameter.empty
             for param in params
@@ -841,6 +849,7 @@ class _ManagedRunSession:
             include_hardware=False,
         )
 
+        invocation_id = str(uuid4())
         all_claims: list[ResourceOwnershipClaim] = []
         claims_by_callback: dict[int, list[ResourceOwnershipClaim]] = {}
         for callback in managed_callbacks:
@@ -849,6 +858,8 @@ class _ManagedRunSession:
                 cfg=resolved_cfg,
                 run_dir=artifact_manager.run_dir,
                 metadata=metadata,
+                artifact_manager=artifact_manager,
+                invocation_id=invocation_id,
             )
             ru_claim = _resource_usage_instance_claim(callback, resolved_cfg)
             if ru_claim is not None:
@@ -869,7 +880,6 @@ class _ManagedRunSession:
 
         # Acquire leases atomically BEFORE mutating sinks or calling make_dirs()
         # so even a concurrent conflict leaves zero directories or mutated sinks.
-        invocation_id = str(uuid4())
         _MANAGED_LIFECYCLE_REGISTRY.acquire(invocation_id, managed_callbacks, all_claims)
         self._invocation_id = invocation_id
         self._managed_callbacks = managed_callbacks

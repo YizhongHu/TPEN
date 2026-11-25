@@ -2494,6 +2494,12 @@ class LinearMethodUpdate(VMCUpdateMethod[HamiltonianTangentUpdateInput]):
     def load_method_state_dict(self, state: Mapping[str, Any]) -> None:
         """Restore ``lm-state-1`` fail-closed, rejecting any identity or policy drift."""
 
+        self.validate_method_state_dict(state)
+        self.completed_updates = state["completed_updates"]
+
+    def validate_method_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Validate ``lm-state-1`` without mutating live method state."""
+
         if not isinstance(state, Mapping):
             raise TypeError("LinearMethodUpdate state must be a mapping")
         version = state.get("version")
@@ -2541,7 +2547,6 @@ class LinearMethodUpdate(VMCUpdateMethod[HamiltonianTangentUpdateInput]):
             step_scale=self.policy.step_scale,
             model_parameters=self.model_parameters,
         )
-        self.completed_updates = completed
 
     def update(self, update_input: HamiltonianTangentUpdateInput) -> VMCUpdateResult:
         """Assemble dense LM matrices, solve the stabilized eigenproblem, and step SGD."""

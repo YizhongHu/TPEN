@@ -14,8 +14,9 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from experiments.atomistic.stage1.protocol import (
-    HOOKE_SYSTEMS, QHO_Q21, SYSTEMS, STAGE1_PROTOCOL,
-    OVERLAY_PROFILE_V1, OVERLAY_PROFILES,
+    HE_H2_EVAL_CHECKPOINTS, HOOKE_A37, HOOKE_SYSTEMS,
+    MANIFEST_SCHEMA, OVERLAY_PROFILE_V1, OVERLAY_PROFILES,
+    QHO_Q21, SYSTEMS, STAGE1_PROTOCOL,
     bind_evaluation_manifest, build_manifest, config_identities, manifest_hash,
     overlay_sha256, resolve_overlay_path,
 )
@@ -26,9 +27,9 @@ def main() -> int:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--source-sha", required=True)
+    parser.add_argument("--source-sha")
     parser.add_argument("--config-sha256", help="legacy digest input; two-phase modes recompute it")
-    parser.add_argument("--results-root", required=True)
+    parser.add_argument("--results-root")
     parser.add_argument("--checkpoint-bindings", type=Path,
                         help="phase-2 evidence envelope, or one-shot digest map")
     parser.add_argument("--phase", type=int, choices=(1, 2), default=2)
@@ -41,28 +42,58 @@ def main() -> int:
     parser.add_argument("--phase1-manifest", type=Path,
                         help="phase-1 manifest to bind during phase 2")
     parser.add_argument("--checkpoints", type=int, nargs="+")
-    parser.add_argument("--lineage-seeds", type=int, nargs="+", required=True)
+    parser.add_argument("--lineage-seeds", type=int, nargs="+")
     parser.add_argument("--science-profile")
     parser.add_argument("--evaluation-selection")
     args = parser.parse_args()
-    if args.checkpoints is None:
-        if (args.phase == 2 and args.science_profile == "hooke-hv2-v1"
-                and tuple(args.systems or ()) == ("qho2e",)):
-            args.checkpoints = list(QHO_Q21)
-        elif args.phase != 1 or STAGE1_PROTOCOL.retention_cadence is None:
+    systems = tuple(args.systems) if args.systems else None
+    if args.phase == 2 and args.phase1_manifest is not None:
+        phase1_probe = json.loads(args.phase1_manifest.read_text(encoding="utf-8"))
+        phase1_probe_rows = phase1_probe.get("rows", [])
+        if isinstance(phase1_probe_rows, list):
+            systems = tuple(dict.fromkeys(
+                str(row["system"])
+                for row in phase1_probe_rows
+                if isinstance(row, dict) and row.get("kind") == "train"
+            )) or systems
+    selected_for_profile = set(systems or SYSTEMS)
+    if args.phase == 2 and args.science_profile is None \
+            and selected_for_profile.issubset(HOOKE_SYSTEMS):
+        args.science_profile = "hooke-hv2-v1"
+    if args.phase == 1:
+        if (args.source_sha is None or args.results_root is None
+                or args.lineage_seeds is None):
+            parser.error("phase 1 requires --source-sha, --results-root and --lineage-seeds")
+        if systems is None or (
+            selected_for_profile & HOOKE_SYSTEMS
+            and not selected_for_profile.issubset(HOOKE_SYSTEMS)
+        ):
             parser.error(
-                "--checkpoints is required for phase 2 or protocols without retention_cadence"
+                "phase 1 refuses selections containing Hooke systems without the "
+                "Hooke science profile; choose Hooke-only systems or a non-Hooke selection"
             )
-        else:
+        if args.checkpoints is None:
+            if STAGE1_PROTOCOL.retention_cadence is None:
+                parser.error("--checkpoints is required for protocols without retention_cadence")
             args.checkpoints = list(range(
                 0, STAGE1_PROTOCOL.lineage_updates + 1,
                 STAGE1_PROTOCOL.retention_cadence,
             ))
-    systems = tuple(args.systems) if args.systems else None
-    selected_for_profile = set(systems or SYSTEMS)
-    if (args.phase == 1 and selected_for_profile & HOOKE_SYSTEMS
-            and args.science_profile != "hooke-hv2-v1"):
-        parser.error("Hooke production phase 1 requires --science-profile hooke-hv2-v1")
+        if args.science_profile is None and selected_for_profile.issubset(HOOKE_SYSTEMS):
+            args.science_profile = "hooke-hv2-v1"
+    elif args.checkpoints is None:
+        if args.science_profile == "hooke-hv2-v1" and selected_for_profile == {"qho2e"}:
+            args.checkpoints = list(QHO_Q21)
+        elif args.science_profile == "hooke-hv2-v1":
+            args.checkpoints = list(HOOKE_A37)
+        elif selected_for_profile.issubset({"he", "h2"}):
+            args.checkpoints = list(HE_H2_EVAL_CHECKPOINTS)
+        else:
+            parser.error("--checkpoints is required for phase 2")
+    if args.phase == 2 and args.phase1_manifest is None and (
+        args.source_sha is None or args.results_root is None or args.lineage_seeds is None
+    ):
+        parser.error("one-shot phase 2 requires --source-sha, --results-root and --lineage-seeds")
     if args.overlay_sha256 is not None and args.overlay is None:
         raise ValueError("--overlay-sha256 requires --overlay")
     effective_overlay_profile = args.overlay_profile or OVERLAY_PROFILE_V1
@@ -84,7 +115,8 @@ def main() -> int:
                               overlay_sha256=effective_overlay_sha,
                               overlay_profile=effective_overlay_profile,
                               science_profile=args.science_profile,
-                              evaluation_selection=args.evaluation_selection)
+                              evaluation_selection=args.evaluation_selection,
+                              include_smoke=False, auto_overlay=args.overlay is None)
     else:
         if args.phase1_manifest is not None:
             phase1_doc = json.loads(args.phase1_manifest.read_text(encoding="utf-8"))
@@ -158,12 +190,13 @@ def main() -> int:
                                   overlay_sha256=effective_overlay_sha,
                                   overlay_profile=effective_overlay_profile,
                                   science_profile=args.science_profile,
-                                  evaluation_selection=args.evaluation_selection)
+                                  evaluation_selection=args.evaluation_selection,
+                                  include_smoke=False, auto_overlay=args.overlay is None)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     identity_rules = {row.get("config_identity_rule") for row in rows}
     if len(identity_rules) != 1:
         raise ValueError("manifest rows must use one config identity rule")
-    args.output.write_text(json.dumps({"schema": "stage1/v3", "phase": args.phase,
+    args.output.write_text(json.dumps({"schema": MANIFEST_SCHEMA, "phase": args.phase,
                                        "config_identity_rule": next(iter(identity_rules)),
                                        "manifest_hash": manifest_hash(rows),
                                        "rows": rows}, indent=2) + "\n", encoding="utf-8")

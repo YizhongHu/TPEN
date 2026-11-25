@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
 import os
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, ClassVar, Protocol
 
-from ._codec import canonical_bytes, decode_json, fields, sequence, sha256_text, text
+from ._codec import canonical_bytes, decode_json, digest, fields, sequence, sha256_text, text
 from .contracts import AttemptId, GroupId, ReadyGroupV2
 from .environments import PreparedPythonEnvironment
 from ._records import frozen_record
@@ -26,6 +27,592 @@ REFUSAL_CODES = frozenset(
     }
 )
 PROFILE_REFUSAL_CODES = REFUSAL_CODES
+
+
+# B1-R2A is deliberately an executor-owned policy boundary.  These records
+# carry operational facts and authorization only; they are not a replacement
+# for the core-owned planned-yield selector below.
+RECOVERY_EVIDENCE_SCHEMA_V1 = "tpen-executor/recovery-evidence-v1"
+RECOVERY_ADMISSION_SCHEMA_V1 = "tpen-executor/recovery-admission-v1"
+RECOVERY_MODES = frozenset({"planned_yield", "operator_authorized_unplanned_end"})
+RECOVERY_ADMISSION_STATUSES = frozenset({"admitted", "parked"})
+RECOVERY_TERMINAL_STATES = frozenset({"completed", "failed", "timeout", "cancelled", "killed", "node_lost"})
+RECOVERY_PARK_REASONS = frozenset(
+    {
+        "unknown-scheduler-end",
+        "scheduler-identity-mismatch",
+        "writers-not-ended",
+        "checkpoint-unavailable",
+        "checkpoint-corrupt-or-ambiguous",
+        "checkpoint-lineage-mismatch",
+        "checkpoint-is-current-attempt",
+        "program-lineage-mismatch",
+        "science-lineage-mismatch",
+        "h-lineage-mismatch",
+        "grant-missing",
+        "grant-expired",
+        "budget-exhausted",
+        "no-progress-exhausted",
+        "ambiguous-external-submit",
+        "invalid-recovery-evidence",
+    }
+)
+
+
+def _recovery_text(value: Any, name: str) -> str:
+    """Validate one non-empty recovery fact string."""
+
+    return text(value, name)
+
+
+def _recovery_digest(value: Any, name: str) -> str:
+    """Validate one lowercase SHA-256 recovery identity."""
+
+    return sha256_text(value, name)
+
+
+def _recovery_science_lineage(value: Any, name: str) -> str:
+    """Validate an opaque caller-supplied HI science lineage token."""
+
+    return _recovery_text(value, name)
+
+
+def _recovery_counter(value: Any, name: str) -> int:
+    """Validate one non-negative progress counter."""
+
+    if type(value) is not int or value < 0:
+        raise TypeError(f"{name} must be a nonnegative integer")
+    return value
+
+
+def _recovery_time(value: Any, name: str) -> str:
+    """Validate one timezone-aware UTC timestamp in canonical text form."""
+
+    value = _recovery_text(value, name)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{name} must include a timezone")
+    return value
+
+
+def _recovery_time_not_after(left: str, right: str, name: str) -> bool:
+    """Compare two validated recovery timestamps without trusting text order."""
+
+    left_value = datetime.fromisoformat(left.replace("Z", "+00:00"))
+    right_value = datetime.fromisoformat(right.replace("Z", "+00:00"))
+    if left_value > right_value:
+        raise ValueError(f"{name} must not be after its containing end")
+    return True
+
+
+def _recovery_absolute_path(value: Any, name: str) -> str:
+    """Validate one absolute, normalized lexical path supplied by a caller."""
+
+    value = _recovery_text(value, name)
+    normalized = os.path.normpath(value)
+    if not os.path.isabs(value) or value != normalized or ".." in Path(value).parts:
+        raise ValueError(f"{name} must be an absolute normalized path")
+    return value
+
+
+@frozen_record
+class RecoverySchedulerEndV1:
+    """Exact scheduler identity and writer-end proof for one predecessor."""
+
+    schema: ClassVar[str] = "tpen-executor/recovery-scheduler-end-v1"
+    task_id: str
+    group_digest: str
+    attempt_id: AttemptId
+    scheduler: str
+    allocation_id: str
+    backend_job_id: str
+    terminal_state: str
+    terminal_at_utc: str
+    writer_end_identity: str
+    writer_end_at_utc: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "task_id", _recovery_text(self.task_id, "task_id"))
+        object.__setattr__(self, "group_digest", _recovery_digest(self.group_digest, "group_digest"))
+        if not isinstance(self.attempt_id, AttemptId):
+            raise TypeError("attempt_id must be AttemptId")
+        object.__setattr__(self, "scheduler", _recovery_text(self.scheduler, "scheduler"))
+        object.__setattr__(self, "allocation_id", _recovery_text(self.allocation_id, "allocation_id"))
+        object.__setattr__(self, "backend_job_id", _recovery_text(self.backend_job_id, "backend_job_id"))
+        object.__setattr__(self, "terminal_state", _recovery_text(self.terminal_state, "terminal_state"))
+        object.__setattr__(self, "terminal_at_utc", _recovery_time(self.terminal_at_utc, "terminal_at_utc"))
+        object.__setattr__(self, "writer_end_identity", _recovery_text(self.writer_end_identity, "writer_end_identity"))
+        object.__setattr__(self, "writer_end_at_utc", _recovery_time(self.writer_end_at_utc, "writer_end_at_utc"))
+        _recovery_time_not_after(self.terminal_at_utc, self.writer_end_at_utc, "terminal_at_utc")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "task_id": self.task_id,
+            "group_digest": self.group_digest,
+            "attempt_id": self.attempt_id.to_dict(),
+            "scheduler": self.scheduler,
+            "allocation_id": self.allocation_id,
+            "backend_job_id": self.backend_job_id,
+            "terminal_state": self.terminal_state,
+            "terminal_at_utc": self.terminal_at_utc,
+            "writer_end_identity": self.writer_end_identity,
+            "writer_end_at_utc": self.writer_end_at_utc,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "RecoverySchedulerEndV1":
+        fields(
+            data,
+            {"schema", "task_id", "group_digest", "attempt_id", "scheduler", "allocation_id", "backend_job_id", "terminal_state", "terminal_at_utc", "writer_end_identity", "writer_end_at_utc"},
+            cls.schema,
+            cls.__name__,
+        )
+        return cls(
+            data["task_id"], data["group_digest"], AttemptId.from_mapping(data["attempt_id"]),
+            data["scheduler"], data["allocation_id"], data["backend_job_id"], data["terminal_state"],
+            data["terminal_at_utc"], data["writer_end_identity"], data["writer_end_at_utc"],
+        )
+
+
+@frozen_record
+class RecoveryCheckpointFactsV1:
+    """Independently read and validated concrete checkpoint facts."""
+
+    schema: ClassVar[str] = "tpen-executor/recovery-checkpoint-facts-v1"
+    checkpoint_path: str
+    content_id: str
+    next_iteration: int
+    completed_updates: int
+    program_digest: str
+    science_digest: str
+    h_digest: str
+    committed: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "checkpoint_path", _recovery_absolute_path(self.checkpoint_path, "checkpoint_path"))
+        object.__setattr__(self, "content_id", _recovery_digest(self.content_id, "content_id"))
+        object.__setattr__(self, "next_iteration", _recovery_counter(self.next_iteration, "next_iteration"))
+        object.__setattr__(self, "completed_updates", _recovery_counter(self.completed_updates, "completed_updates"))
+        object.__setattr__(self, "program_digest", _recovery_digest(self.program_digest, "program_digest"))
+        object.__setattr__(self, "science_digest", _recovery_science_lineage(self.science_digest, "science_digest"))
+        object.__setattr__(self, "h_digest", _recovery_digest(self.h_digest, "h_digest"))
+        if type(self.committed) is not bool:
+            raise TypeError("committed must be a boolean")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "checkpoint_path": self.checkpoint_path,
+            "content_id": self.content_id,
+            "next_iteration": self.next_iteration,
+            "completed_updates": self.completed_updates,
+            "program_digest": self.program_digest,
+            "science_digest": self.science_digest,
+            "h_digest": self.h_digest,
+            "committed": self.committed,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "RecoveryCheckpointFactsV1":
+        fields(
+            data,
+            {"schema", "checkpoint_path", "content_id", "next_iteration", "completed_updates", "program_digest", "science_digest", "h_digest", "committed"},
+            cls.schema,
+            cls.__name__,
+        )
+        return cls(
+            data["checkpoint_path"], data["content_id"], data["next_iteration"], data["completed_updates"],
+            data["program_digest"], data["science_digest"], data["h_digest"], data["committed"],
+        )
+
+
+@frozen_record
+class RecoveryGrantV1:
+    """Finite frozen campaign authorization for executor recovery."""
+
+    schema: ClassVar[str] = "tpen-executor/recovery-grant-v1"
+    grant_id: str
+    expires_at_utc: str
+    group_digest: str
+    task_id: str
+    program_digest: str
+    science_digest: str
+    h_digest: str
+    successor_limit: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "grant_id", _recovery_text(self.grant_id, "grant_id"))
+        object.__setattr__(self, "expires_at_utc", _recovery_time(self.expires_at_utc, "expires_at_utc"))
+        object.__setattr__(self, "group_digest", _recovery_digest(self.group_digest, "group_digest"))
+        object.__setattr__(self, "task_id", _recovery_text(self.task_id, "task_id"))
+        object.__setattr__(self, "program_digest", _recovery_digest(self.program_digest, "program_digest"))
+        object.__setattr__(self, "science_digest", _recovery_science_lineage(self.science_digest, "science_digest"))
+        object.__setattr__(self, "h_digest", _recovery_digest(self.h_digest, "h_digest"))
+        object.__setattr__(self, "successor_limit", _recovery_counter(self.successor_limit, "successor_limit"))
+        if self.successor_limit == 0:
+            raise ValueError("successor_limit must be finite and positive")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "grant_id": self.grant_id,
+            "expires_at_utc": self.expires_at_utc,
+            "group_digest": self.group_digest,
+            "task_id": self.task_id,
+            "program_digest": self.program_digest,
+            "science_digest": self.science_digest,
+            "h_digest": self.h_digest,
+            "successor_limit": self.successor_limit,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "RecoveryGrantV1":
+        fields(
+            data,
+            {"schema", "grant_id", "expires_at_utc", "group_digest", "task_id", "program_digest", "science_digest", "h_digest", "successor_limit"},
+            cls.schema,
+            cls.__name__,
+        )
+        return cls(
+            data["grant_id"], data["expires_at_utc"], data["group_digest"], data["task_id"],
+            data["program_digest"], data["science_digest"], data["h_digest"], data["successor_limit"],
+        )
+
+
+@frozen_record
+class RecoveryEvidenceV1:
+    """Versioned executor facts used by the general recovery predicate."""
+
+    schema: ClassVar[str] = RECOVERY_EVIDENCE_SCHEMA_V1
+    mode: str
+    task_id: str
+    group_digest: str
+    attempt_id: AttemptId
+    predecessor_attempt_id: AttemptId
+    allocation_id: str
+    backend_job_id: str
+    expected_scheduler: str
+    checkpoint: RecoveryCheckpointFactsV1
+    scheduler_end: RecoverySchedulerEndV1
+    grant: RecoveryGrantV1 | None
+    budget_remaining: int
+    no_progress_threshold: int
+    no_progress_count: int = 0
+    prior_content_id: str | None = None
+    prior_completed_updates: int = 0
+    prior_next_iteration: int = 0
+    external_submit_state: str = "not_submitted"
+
+    def __post_init__(self) -> None:
+        if self.mode not in RECOVERY_MODES:
+            raise ValueError("unknown recovery mode")
+        object.__setattr__(self, "task_id", _recovery_text(self.task_id, "task_id"))
+        object.__setattr__(self, "group_digest", _recovery_digest(self.group_digest, "group_digest"))
+        if not isinstance(self.attempt_id, AttemptId) or not isinstance(self.predecessor_attempt_id, AttemptId):
+            raise TypeError("attempt identities must be AttemptId")
+        if self.attempt_id == self.predecessor_attempt_id:
+            raise ValueError("predecessor attempt must differ from current attempt")
+        object.__setattr__(self, "allocation_id", _recovery_text(self.allocation_id, "allocation_id"))
+        object.__setattr__(self, "backend_job_id", _recovery_text(self.backend_job_id, "backend_job_id"))
+        object.__setattr__(self, "expected_scheduler", _recovery_text(self.expected_scheduler, "expected_scheduler"))
+        if not isinstance(self.checkpoint, RecoveryCheckpointFactsV1):
+            raise TypeError("checkpoint must be RecoveryCheckpointFactsV1")
+        if not isinstance(self.scheduler_end, RecoverySchedulerEndV1):
+            raise TypeError("scheduler_end must be RecoverySchedulerEndV1")
+        if self.grant is not None and not isinstance(self.grant, RecoveryGrantV1):
+            raise TypeError("grant must be RecoveryGrantV1 or None")
+        object.__setattr__(self, "budget_remaining", _recovery_counter(self.budget_remaining, "budget_remaining"))
+        object.__setattr__(self, "no_progress_threshold", _recovery_counter(self.no_progress_threshold, "no_progress_threshold"))
+        object.__setattr__(self, "no_progress_count", _recovery_counter(self.no_progress_count, "no_progress_count"))
+        object.__setattr__(self, "prior_completed_updates", _recovery_counter(self.prior_completed_updates, "prior_completed_updates"))
+        object.__setattr__(self, "prior_next_iteration", _recovery_counter(self.prior_next_iteration, "prior_next_iteration"))
+        if self.no_progress_threshold == 0:
+            raise ValueError("no_progress_threshold must be positive")
+        if self.prior_content_id is not None:
+            object.__setattr__(self, "prior_content_id", _recovery_digest(self.prior_content_id, "prior_content_id"))
+        if self.external_submit_state not in {"not_submitted", "acknowledged", "ambiguous"}:
+            raise ValueError("unknown external_submit_state")
+
+    @property
+    def checkpoint_path(self) -> str:
+        """Expose the typed predecessor checkpoint path for HI consumers."""
+
+        return self.checkpoint.checkpoint_path
+
+    @property
+    def real_committed_progress(self) -> bool:
+        """Return whether this facts record proves a new committed update."""
+
+        return (
+            self.checkpoint.committed
+            and self.checkpoint.completed_updates > self.prior_completed_updates
+            and self.checkpoint.content_id != self.prior_content_id
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "mode": self.mode,
+            "task_id": self.task_id,
+            "group_digest": self.group_digest,
+            "attempt_id": self.attempt_id.to_dict(),
+            "predecessor_attempt_id": self.predecessor_attempt_id.to_dict(),
+            "allocation_id": self.allocation_id,
+            "backend_job_id": self.backend_job_id,
+            "expected_scheduler": self.expected_scheduler,
+            "checkpoint": self.checkpoint.to_dict(),
+            "scheduler_end": self.scheduler_end.to_dict(),
+            "grant": None if self.grant is None else self.grant.to_dict(),
+            "budget_remaining": self.budget_remaining,
+            "no_progress_threshold": self.no_progress_threshold,
+            "no_progress_count": self.no_progress_count,
+            "prior_content_id": self.prior_content_id,
+            "prior_completed_updates": self.prior_completed_updates,
+            "prior_next_iteration": self.prior_next_iteration,
+            "external_submit_state": self.external_submit_state,
+        }
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "RecoveryEvidenceV1":
+        fields(
+            data,
+            {"schema", "mode", "task_id", "group_digest", "attempt_id", "predecessor_attempt_id", "allocation_id", "backend_job_id", "expected_scheduler", "checkpoint", "scheduler_end", "grant", "budget_remaining", "no_progress_threshold", "no_progress_count", "prior_content_id", "prior_completed_updates", "prior_next_iteration", "external_submit_state"},
+            cls.schema,
+            cls.__name__,
+        )
+        return cls(
+            data["mode"], data["task_id"], data["group_digest"], AttemptId.from_mapping(data["attempt_id"]),
+            AttemptId.from_mapping(data["predecessor_attempt_id"]), data["allocation_id"], data["backend_job_id"], data["expected_scheduler"],
+            RecoveryCheckpointFactsV1.from_mapping(data["checkpoint"]),
+            RecoverySchedulerEndV1.from_mapping(data["scheduler_end"]),
+            None if data["grant"] is None else RecoveryGrantV1.from_mapping(data["grant"]),
+            data["budget_remaining"], data["no_progress_threshold"], data["no_progress_count"], data["prior_content_id"],
+            data["prior_completed_updates"], data["prior_next_iteration"], data["external_submit_state"],
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | Mapping[str, Any]) -> "RecoveryEvidenceV1":
+        return cls.from_mapping(decode_json(data))
+
+
+@frozen_record
+class RecoveryAdmissionV1:
+    """Typed executor authorization result linked to one predecessor."""
+
+    schema: ClassVar[str] = RECOVERY_ADMISSION_SCHEMA_V1
+    status: str
+    reason: str
+    evidence_digest: str
+    predecessor_attempt_id: AttemptId
+    checkpoint_path: str
+    successor_attempt_id: AttemptId | None
+    grant_id: str | None
+
+    def __post_init__(self) -> None:
+        if self.status not in RECOVERY_ADMISSION_STATUSES:
+            raise ValueError("unknown recovery admission status")
+        object.__setattr__(self, "reason", _recovery_text(self.reason, "reason"))
+        if self.status == "parked" and self.reason not in RECOVERY_PARK_REASONS:
+            raise ValueError("unknown recovery park reason")
+        if self.status == "admitted" and self.reason != "recovery-evidence-valid":
+            raise ValueError("admitted recovery has an invalid reason")
+        object.__setattr__(self, "evidence_digest", _recovery_digest(self.evidence_digest, "evidence_digest"))
+        if not isinstance(self.predecessor_attempt_id, AttemptId):
+            raise TypeError("predecessor_attempt_id must be AttemptId")
+        path = _recovery_text(self.checkpoint_path, "checkpoint_path")
+        if not os.path.isabs(path) or path != os.path.normpath(path) or ".." in Path(path).parts:
+            raise ValueError("checkpoint_path must be absolute and normalized")
+        object.__setattr__(self, "checkpoint_path", path)
+        if self.successor_attempt_id is not None and not isinstance(self.successor_attempt_id, AttemptId):
+            raise TypeError("successor_attempt_id must be AttemptId or None")
+        if self.grant_id is not None:
+            object.__setattr__(self, "grant_id", _recovery_text(self.grant_id, "grant_id"))
+        if self.status == "admitted" and (self.successor_attempt_id is None or self.grant_id is None):
+            raise ValueError("admitted recovery requires successor and grant identities")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "status": self.status,
+            "reason": self.reason,
+            "evidence_digest": self.evidence_digest,
+            "predecessor_attempt_id": self.predecessor_attempt_id.to_dict(),
+            "checkpoint_path": self.checkpoint_path,
+            "successor_attempt_id": None if self.successor_attempt_id is None else self.successor_attempt_id.to_dict(),
+            "grant_id": self.grant_id,
+        }
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "RecoveryAdmissionV1":
+        fields(
+            data,
+            {"schema", "status", "reason", "evidence_digest", "predecessor_attempt_id", "checkpoint_path", "successor_attempt_id", "grant_id"},
+            cls.schema,
+            cls.__name__,
+        )
+        return cls(
+            data["status"], data["reason"], data["evidence_digest"], AttemptId.from_mapping(data["predecessor_attempt_id"]),
+            data["checkpoint_path"],
+            None if data["successor_attempt_id"] is None else AttemptId.from_mapping(data["successor_attempt_id"]),
+            data["grant_id"],
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | Mapping[str, Any]) -> "RecoveryAdmissionV1":
+        return cls.from_mapping(decode_json(data))
+
+
+@frozen_record
+class RecoveryAdmissionInputV1:
+    """Real facts and decision identity supplied to the R2 consumer path.
+
+    The trusted store root is intentionally absent: the controller obtains it
+    from its live ``DirectoryStore``/fence and passes it directly to
+    :func:`admit_recovery`.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/recovery-admission-input-v1"
+    evidence: RecoveryEvidenceV1
+    successor_attempt_id: AttemptId
+    now_utc: str
+    existing_successors: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.evidence, RecoveryEvidenceV1):
+            raise TypeError("evidence must be RecoveryEvidenceV1")
+        if not isinstance(self.successor_attempt_id, AttemptId):
+            raise TypeError("successor_attempt_id must be AttemptId")
+        object.__setattr__(self, "now_utc", _recovery_time(self.now_utc, "now_utc"))
+        object.__setattr__(self, "existing_successors", _recovery_counter(self.existing_successors, "existing_successors"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "evidence": self.evidence.to_dict(),
+            "successor_attempt_id": self.successor_attempt_id.to_dict(),
+            "now_utc": self.now_utc,
+            "existing_successors": self.existing_successors,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "RecoveryAdmissionInputV1":
+        fields(data, {"schema", "evidence", "successor_attempt_id", "now_utc", "existing_successors"}, cls.schema, cls.__name__)
+        return cls(
+            RecoveryEvidenceV1.from_mapping(data["evidence"]),
+            AttemptId.from_mapping(data["successor_attempt_id"]),
+            data["now_utc"], data["existing_successors"],
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | Mapping[str, Any]) -> "RecoveryAdmissionInputV1":
+        return cls.from_mapping(decode_json(data))
+
+
+def _checkpoint_under_attempt_core(
+    path: str,
+    trusted_store_root: str,
+    group_digest: str,
+    task_id: str,
+    attempt_id: AttemptId,
+) -> bool:
+    """Require a path below one exact fence-bound attempt core."""
+
+    root_parts = Path(trusted_store_root).parts
+    path_parts = Path(path).parts
+    expected = root_parts + ("groups", group_digest, task_id, attempt_id.value, "core")
+    suffix = path_parts[len(expected):]
+    return tuple(path_parts[:len(expected)]) == expected and bool(suffix)
+
+
+def _checkpoint_predecessor_core(path: str, trusted_store_root: str, group_digest: str, task_id: str, attempt_id: AttemptId) -> bool:
+    """Require a checkpoint strictly below the exact predecessor core."""
+
+    return _checkpoint_under_attempt_core(path, trusted_store_root, group_digest, task_id, attempt_id)
+
+
+def _checkpoint_current_leaf(path: str, trusted_store_root: str, group_digest: str, task_id: str, attempt_id: AttemptId) -> bool:
+    """Recognize a checkpoint below the current attempt leaf independently."""
+
+    root_parts = Path(trusted_store_root).parts
+    path_parts = Path(path).parts
+    expected = root_parts + ("groups", group_digest, task_id, attempt_id.value, "core")
+    return tuple(path_parts[:len(expected)]) == expected and len(path_parts) > len(expected)
+
+
+def admit_recovery(
+    evidence: RecoveryEvidenceV1,
+    successor_attempt_id: AttemptId,
+    *,
+    now_utc: str,
+    trusted_store_root: str,
+    existing_successors: int = 0,
+) -> RecoveryAdmissionV1:
+    """Apply the closed executor admission predicate for either recovery mode."""
+
+    if not isinstance(evidence, RecoveryEvidenceV1):
+        raise TypeError("evidence must be RecoveryEvidenceV1")
+    if not isinstance(successor_attempt_id, AttemptId):
+        raise TypeError("successor_attempt_id must be AttemptId")
+    now_utc = _recovery_time(now_utc, "now_utc")
+    trusted_store_root = _recovery_absolute_path(trusted_store_root, "trusted_store_root")
+    existing_successors = _recovery_counter(existing_successors, "existing_successors")
+    evidence_digest = digest(evidence.to_dict())
+
+    def parked(reason: str) -> RecoveryAdmissionV1:
+        return RecoveryAdmissionV1(
+            "parked", reason, evidence_digest, evidence.predecessor_attempt_id,
+            evidence.checkpoint_path, None, None if evidence.grant is None else evidence.grant.grant_id,
+        )
+
+    if evidence.external_submit_state == "ambiguous":
+        return parked("ambiguous-external-submit")
+    if (
+        evidence.scheduler_end.task_id != evidence.task_id
+        or evidence.scheduler_end.group_digest != evidence.group_digest
+        or evidence.scheduler_end.attempt_id != evidence.attempt_id
+        or evidence.scheduler_end.allocation_id != evidence.allocation_id
+        or evidence.scheduler_end.backend_job_id != evidence.backend_job_id
+        or evidence.scheduler_end.scheduler != evidence.expected_scheduler
+    ):
+        return parked("scheduler-identity-mismatch")
+    if evidence.grant is None:
+        return parked("grant-missing")
+    if datetime.fromisoformat(evidence.grant.expires_at_utc.replace("Z", "+00:00")) <= datetime.fromisoformat(now_utc.replace("Z", "+00:00")):
+        return parked("grant-expired")
+    if evidence.budget_remaining == 0 or existing_successors >= evidence.grant.successor_limit:
+        return parked("budget-exhausted")
+    if not evidence.checkpoint.committed:
+        return parked("checkpoint-unavailable")
+    if _checkpoint_current_leaf(evidence.checkpoint_path, trusted_store_root, evidence.group_digest, evidence.task_id, evidence.attempt_id):
+        return parked("checkpoint-is-current-attempt")
+    if not _checkpoint_predecessor_core(evidence.checkpoint_path, trusted_store_root, evidence.group_digest, evidence.task_id, evidence.predecessor_attempt_id):
+        return parked("checkpoint-lineage-mismatch")
+    if evidence.grant.group_digest != evidence.group_digest or evidence.grant.task_id != evidence.task_id:
+        return parked("checkpoint-lineage-mismatch")
+    if evidence.checkpoint.program_digest != evidence.grant.program_digest:
+        return parked("program-lineage-mismatch")
+    if evidence.checkpoint.science_digest != evidence.grant.science_digest:
+        return parked("science-lineage-mismatch")
+    if evidence.checkpoint.h_digest != evidence.grant.h_digest:
+        return parked("h-lineage-mismatch")
+    if evidence.no_progress_count >= evidence.no_progress_threshold and not evidence.real_committed_progress:
+        return parked("no-progress-exhausted")
+    if evidence.scheduler_end.terminal_state not in RECOVERY_TERMINAL_STATES:
+        return parked("unknown-scheduler-end")
+    return RecoveryAdmissionV1(
+        "admitted", "recovery-evidence-valid", evidence_digest, evidence.predecessor_attempt_id,
+        evidence.checkpoint_path, successor_attempt_id, evidence.grant.grant_id,
+    )
 
 
 class ProfileUnavailable(RuntimeError):
@@ -270,6 +857,10 @@ class MemberRecoveryInputV2:
     outcome_receipt: OutcomeReceipt | None = None
     core_verdict: CoreAdmissionVerdictV2 | None = None
     receipt_digest: str | None = None
+    recovery_input: RecoveryAdmissionInputV1 | None = None
+    recovery_admission: RecoveryAdmissionV1 | None = None
+    recovery_evidence: RecoveryEvidenceV1 | None = None
+    core_evidence: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
@@ -282,6 +873,36 @@ class MemberRecoveryInputV2:
             raise TypeError("outcome_receipt must be OutcomeReceipt or None")
         if self.core_verdict is not None and not isinstance(self.core_verdict, CoreAdmissionVerdictV2):
             raise TypeError("core_verdict must be CoreAdmissionVerdictV2 or None")
+        if self.recovery_input is not None and not isinstance(self.recovery_input, RecoveryAdmissionInputV1):
+            raise TypeError("recovery_input must be RecoveryAdmissionInputV1 or None")
+        if self.recovery_admission is not None and not isinstance(self.recovery_admission, RecoveryAdmissionV1):
+            raise TypeError("recovery_admission must be RecoveryAdmissionV1 or None")
+        if self.recovery_evidence is not None and not isinstance(self.recovery_evidence, RecoveryEvidenceV1):
+            raise TypeError("recovery_evidence must be RecoveryEvidenceV1 or None")
+        if self.core_evidence is not None and not isinstance(self.core_evidence, Mapping):
+            raise TypeError("core_evidence must be a mapping or None")
+        if self.recovery_input is not None:
+            evidence = self.recovery_input.evidence
+            if evidence.task_id != self.task_id or evidence.group_digest != (self.start_receipt.group_digest if self.start_receipt is not None else evidence.group_digest):
+                raise ValueError("recovery input crosses member identity")
+            if self.attempt_id is not None and evidence.attempt_id != self.attempt_id:
+                raise ValueError("recovery input crosses attempt identity")
+        if self.recovery_evidence is not None:
+            evidence = self.recovery_evidence
+            if evidence.task_id != self.task_id or evidence.group_digest != (self.start_receipt.group_digest if self.start_receipt is not None else evidence.group_digest):
+                raise ValueError("recovery evidence crosses member identity")
+            if self.attempt_id is not None and evidence.attempt_id != self.attempt_id:
+                raise ValueError("recovery evidence crosses attempt identity")
+            if self.recovery_admission is not None:
+                if digest(evidence.to_dict()) != self.recovery_admission.evidence_digest:
+                    raise ValueError("recovery evidence digest crosses admission")
+                if (evidence.predecessor_attempt_id != self.recovery_admission.predecessor_attempt_id
+                        or evidence.checkpoint_path != self.recovery_admission.checkpoint_path):
+                    raise ValueError("recovery evidence crosses admission facts")
+        if self.recovery_admission is not None and self.recovery_input is not None:
+            if (self.recovery_admission.predecessor_attempt_id != self.recovery_input.evidence.predecessor_attempt_id
+                    or self.recovery_admission.successor_attempt_id != self.recovery_input.successor_attempt_id):
+                raise ValueError("recovery admission crosses recovery input")
         identities = [
             value for value in (
                 None if self.attempt_id is None else self.attempt_id,
@@ -303,7 +924,7 @@ class MemberRecoveryInputV2:
             object.__setattr__(self, "receipt_digest", sha256_text(self.receipt_digest, "receipt_digest"))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema": self.schema,
             "task_id": self.task_id,
             "lineage_id": self.lineage_id,
@@ -313,18 +934,24 @@ class MemberRecoveryInputV2:
             "core_verdict": None if self.core_verdict is None else self.core_verdict.to_dict(),
             "receipt_digest": self.receipt_digest,
         }
+        if self.recovery_input is not None:
+            result["recovery_input"] = self.recovery_input.to_dict()
+        if self.recovery_admission is not None:
+            result["recovery_admission"] = self.recovery_admission.to_dict()
+        if self.recovery_evidence is not None:
+            result["recovery_evidence"] = self.recovery_evidence.to_dict()
+        if self.core_evidence is not None:
+            result["core_evidence"] = dict(self.core_evidence)
+        return result
 
     def encode(self) -> bytes:
         return canonical_bytes(self.to_dict())
 
     @classmethod
     def from_mapping(cls, data: Any) -> "MemberRecoveryInputV2":
-        fields(
-            data,
-            {"schema", "task_id", "lineage_id", "attempt_id", "start_receipt", "outcome_receipt", "core_verdict", "receipt_digest"},
-            cls.schema,
-            cls.__name__,
-        )
+        base_fields = {"schema", "task_id", "lineage_id", "attempt_id", "start_receipt", "outcome_receipt", "core_verdict", "receipt_digest"}
+        optional_fields = {key for key in ("recovery_input", "recovery_admission", "recovery_evidence", "core_evidence") if key in data}
+        fields(data, base_fields | optional_fields, cls.schema, cls.__name__)
         if type(data["task_id"]) is not str or type(data["lineage_id"]) is not str:
             raise TypeError("MemberRecoveryInputV2 identity fields must be strings")
         return cls(
@@ -335,6 +962,10 @@ class MemberRecoveryInputV2:
             None if data["outcome_receipt"] is None else OutcomeReceipt.from_mapping(data["outcome_receipt"]),
             None if data["core_verdict"] is None else CoreAdmissionVerdictV2.from_mapping(data["core_verdict"]),
             data["receipt_digest"],
+            None if data.get("recovery_input") is None else RecoveryAdmissionInputV1.from_mapping(data["recovery_input"]),
+            None if data.get("recovery_admission") is None else RecoveryAdmissionV1.from_mapping(data["recovery_admission"]),
+            None if data.get("recovery_evidence") is None else RecoveryEvidenceV1.from_mapping(data["recovery_evidence"]),
+            None if data.get("core_evidence") is None else data["core_evidence"],
         )
 
     @classmethod
@@ -580,6 +1211,16 @@ def _member_reconciliation(
         member.outcome_receipt is not None and member.outcome_receipt.group_digest != group_digest
     ):
         return _park(member, "crossed-group-receipt")
+    # R2 admission is the sole recovery decision for members carrying real
+    # scheduler/checkpoint/grant facts.  It deliberately does not require a
+    # fabricated core outcome receipt after a hard kill; absence remains
+    # absence while the executor-owned decision is still typed and fenced.
+    if member.recovery_admission is not None:
+        if member.recovery_admission.status != "admitted":
+            return _park(member, member.recovery_admission.reason)
+        if member.recovery_admission.successor_attempt_id is None:
+            return _park(member, "invalid-recovery-evidence")
+        return MemberReconciliationV2(member.task_id, "admit_successor", "recovery-admitted", member.attempt_id)
     if member.outcome_receipt is None:
         return _park(member, "missing-settled-outcome")
     if member.outcome_receipt.status in NON_SETTLED_OPERATIONAL_OUTCOMES:
@@ -684,7 +1325,7 @@ reconcile = reconcile_group
 __all__ = [
     "CORE_ADMISSION_VERDICTS", "CORE_CHECKPOINT_VERDICTS", "CORE_QUIESCENCE_VERDICTS", "CORE_RECOVERY_OUTCOMES",
     "CoreProfileReference",
-    "CoreAdmissionPort", "CoreAdmissionUnavailable", "CoreAdmissionVerdictV2", "CORE_ADMISSION_WIRE_SCHEMA", "GroupReconciliationV2", "MappingCoreAdmissionPort", "MemberReconciliationV2", "MemberRecoveryInputV2",
+    "CoreAdmissionPort", "CoreAdmissionUnavailable", "CoreAdmissionVerdictV2", "CORE_ADMISSION_WIRE_SCHEMA", "GroupReconciliationV2", "MappingCoreAdmissionPort", "MemberReconciliationV2", "MemberRecoveryInputV2", "RecoveryAdmissionInputV1", "RecoveryAdmissionV1",
     "PROFILE_REFUSAL_CODES",
     "ProfileCheck",
     "ProfileUnavailable",

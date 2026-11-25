@@ -16,6 +16,8 @@ from experiments.toolkit.trajectory_records import (
 from experiments.atomistic.stage1.protocol import (
     CONFIG_IDENTITY_RULE,
     LEGACY_CONFIG_IDENTITY_RULE,
+    LEGACY_MANIFEST_SCHEMA,
+    MANIFEST_SCHEMA,
     _validate_config_identity_for_row,
     HOOKE_SCIENCE_PROFILE,
     HOOKE_SYSTEMS,
@@ -98,8 +100,10 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
     does not carry it.
     """
     document = _load(manifest)
-    if document.get("schema") != "stage1/v3":
-        raise CollectionError("unsupported manifest schema; expected stage1/v3")
+    if document.get("schema") not in {LEGACY_MANIFEST_SCHEMA, MANIFEST_SCHEMA}:
+        raise CollectionError(
+            "unsupported manifest schema; expected stage1/v3 or stage1/v4"
+        )
     rows = document.get("rows")
     if not isinstance(rows, list):
         raise CollectionError("manifest rows must be a list")

@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 from omegaconf import OmegaConf
 
-from experiments.atomistic.stage1 import restart
+from experiments.atomistic.stage1 import restart, train as stage1_train
 from experiments.atomistic.stage1.launch import row_overrides
 from experiments.atomistic.stage1.protocol import (
     HOOKE_SCIENCE_PROFILE,
@@ -23,11 +23,13 @@ from experiments.atomistic.stage1.protocol import (
     Protocol,
     build_manifest,
     config_identities,
+    derive_smoke_request,
     overlay_sha256,
     overlay_path_for_system,
 )
 from experiments.atomistic.stage1.train import build_train_config
 from experiments.toolkit.run_paths import resolve_run_dir
+from tpen.inspection import inspect_run
 from tpen.run import run_from_config
 
 
@@ -85,6 +87,14 @@ def _evidence(run_dir: Path, checkpoint_dir: Path, *, step: int = 0) -> object:
     )
 
 
+def test_train_cli_rejects_removed_restart_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LR-3 keeps no second CLI path for selecting a restart."""
+
+    monkeypatch.setattr(sys, "argv", ["stage1-train", "--binding", "ignored", "--restart"])
+    with pytest.raises(SystemExit):
+        stage1_train.main()
+
+
 def test_missing_resume_refuses_before_runner_call(tmp_path: Path, monkeypatch) -> None:
     cfg = _cfg(tmp_path)
     row = _row(tmp_path)
@@ -132,6 +142,115 @@ def test_row_update_horizon_mismatch_refuses_before_runner_call(
             inspector=lambda _path: pytest.fail("inspection must not run"),
         )
     assert error.value.cause is restart.RestartCause.HORIZON_MISMATCH
+    assert calls == []
+
+
+def test_fresh_train_stop_uses_runtime_planned_yield_without_changing_cfg(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A qualification stop is an operational callback, not a config edit."""
+
+    cfg = _cfg(tmp_path)
+    row = _row(tmp_path)
+    row["checkpoint_steps"] = [0, 1_000, 100_000]
+    row["execution"] = {"stop_at": 1_000}
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+    captured: dict[str, object] = {}
+
+    def fake_run(run_cfg, **kwargs):
+        captured["cfg"] = OmegaConf.to_container(run_cfg, resolve=True)
+        captured.update(kwargs)
+        return 2
+
+    assert restart.execute_train(
+        cfg=cfg, row=row, config_path="train.yaml", run=fake_run,
+    ) == 2
+    callbacks = captured["runtime_callbacks"]
+    assert isinstance(callbacks, tuple)
+    callback = callbacks[0]
+    assert type(callback).__name__ == "PlannedYield"
+    assert callback.target_iteration == 1_000
+    assert callback.target_iterations == 100_000
+    resolved = captured["cfg"]
+    assert isinstance(resolved, dict)
+    assert resolved["trainer"]["max_steps"] == 100_000
+
+
+def test_fresh_recorder_overlay_reaches_runner_before_continuation_guard(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A fresh recorder-enabled row is not mistaken for a continuation."""
+
+    row = _real_restart_row(tmp_path / "fresh", run_id="fresh-recorder")
+    config_path = CONFIG_ROOT / "he" / "train.yaml"
+    cfg = build_train_config(
+        row,
+        config_path=config_path,
+        overrides=row_overrides(row),
+        overlay=str(OVERLAY),
+        overlay_sha256=overlay_sha256(OVERLAY),
+    )
+    calls: list[object] = []
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+
+    def fake_run(*_args: object, **_kwargs: object) -> int:
+        calls.append(True)
+        return 0
+
+    assert restart.execute_train(
+        cfg=cfg, row=row, config_path=config_path, run=fake_run,
+    ) == 0
+    assert calls == [True]
+
+
+def test_reached_prefix_stop_refuses_before_runner_call(tmp_path: Path) -> None:
+    """A published prefix cannot be asked to stop at its already-reached boundary."""
+
+    cfg = _cfg(tmp_path)
+    row = _row(tmp_path)
+    row["checkpoint_steps"] = [0, 1_000, 100_000]
+    row["execution"] = {"stop_at": 1_000}
+    run_dir = Path(tmp_path) / "stage1_he" / "atomistic" / "run-0"
+    checkpoint = run_dir / "checkpoints" / "step_001000"
+    checkpoint.mkdir(parents=True)
+    evidence = _evidence(run_dir, checkpoint, step=1_000)
+
+    with pytest.raises(restart.RestartRefusal, match="stale or already reached"):
+        restart.execute_restart(
+            cfg=cfg,
+            row=row,
+            config_path="train.yaml",
+            inspector=lambda _path: evidence,
+            run=lambda *_a, **_k: pytest.fail("stale prefix launched"),
+        )
+
+
+def test_existing_recorder_overlay_refuses_before_inspection_or_runner(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A recorder-enabled continuation remains blocked at the Stage-1 boundary."""
+
+    row = _real_restart_row(tmp_path / "continuation", run_id="recorder-continuation")
+    config_path = CONFIG_ROOT / "he" / "train.yaml"
+    cfg = build_train_config(
+        row,
+        config_path=config_path,
+        overrides=row_overrides(row),
+        overlay=str(OVERLAY),
+        overlay_sha256=overlay_sha256(OVERLAY),
+    )
+    resolve_run_dir(row).mkdir(parents=True)
+    calls: list[object] = []
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+
+    with pytest.raises(restart.RestartRefusal, match="7eaf9e0c.*diagnostics-v1"):
+        restart.execute_train(
+            cfg=cfg,
+            row=row,
+            config_path=config_path,
+            inspector=lambda _path: pytest.fail("recorder refusal must precede inspection"),
+            run=lambda *_a, **_k: calls.append(True) or 0,
+        )
     assert calls == []
 
 
@@ -316,13 +435,15 @@ def test_full_horizon_checkpoint_is_incompatible_resume(tmp_path: Path, monkeypa
     assert error.value.cause is restart.RestartCause.INVALID_RESUME
 
 
-def _real_restart_row(tmp_path: Path, *, run_id: str) -> dict[str, object]:
-    """Build a two-update He row retaining the committed diagnostics overlay."""
+def _real_restart_row(
+    tmp_path: Path, *, run_id: str, lineage_updates: int = 2,
+) -> dict[str, object]:
+    """Build a bounded He row retaining the committed diagnostics overlay."""
 
     protocol = Protocol(
         smoke_updates=1,
         smoke_walkers=2,
-        lineage_updates=2,
+        lineage_updates=lineage_updates,
         lineage_walkers=2,
         lineages=3,
         eval_streams=4,
@@ -334,7 +455,7 @@ def _real_restart_row(tmp_path: Path, *, run_id: str) -> dict[str, object]:
         protocol=protocol,
         source_sha="a" * 40,
         config_sha256=config_identities(config_root=CONFIG_ROOT, systems=("he",)),
-        checkpoints=[0, 1, 2],
+        checkpoints=list(range(lineage_updates + 1)),
         lineage_seeds=[11, 12, 13],
         checkpoint_sha256={},
         results_root=str(tmp_path),
@@ -560,16 +681,22 @@ def test_nested_state_equal_handles_checkpoint_like_payload() -> None:
 
 
 def _real_restart_child() -> None:
-    """Run one fresh, resumed, or uninterrupted phase in a new interpreter."""
+    """Run one derived-prefix, resumed, or uninterrupted phase in a new interpreter."""
 
     payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     row = json.loads(Path(payload["row_path"]).read_text(encoding="utf-8"))
     recorder_free_row = {**row, "overlay": None, "overlay_sha256": None}
     config_path = Path(str(payload["config_path"]))
+    phase = str(payload["phase"])
+    effective_row = (
+        recorder_free_row
+        if phase == "fresh"
+        else {key: value for key, value in recorder_free_row.items() if key != "execution"}
+    )
     cfg = build_train_config(
-        recorder_free_row,
+        effective_row,
         config_path=config_path,
-        overrides=row_overrides(recorder_free_row),
+        overrides=row_overrides(effective_row),
         overlay=str(OVERLAY),
         overlay_sha256=overlay_sha256(OVERLAY),
     )
@@ -580,49 +707,53 @@ def _real_restart_child() -> None:
         callback for callback in cfg.callbacks
         if callback.get("_target_") != "tpen.callback.RawTrainingBatchRecorder"
     ]
-    phase = str(payload["phase"])
     if phase == "fresh":
-        from tpen.callback.planned_yield import PlannedYield
-
-        code = run_from_config(
-            cfg,
-            config_path=str(config_path),
-            command="stage1 real restart fresh",
-            runtime_callbacks=(PlannedYield(1, int(row["updates"])),),
-            raise_exceptions=True,
-        )
-        result: dict[str, object] = {"outcome": "planned_yield", "exit_code": code}
-    elif phase == "resumed":
-        resumed = restart.execute_restart(
+        code = restart.execute_train(
             cfg=cfg,
-            row=recorder_free_row,
+            row=effective_row,
+            config_path=config_path,
+            command="stage1 real restart fresh",
+            run=run_from_config,
+        )
+        evidence = inspect_run(resolve_run_dir(effective_row))
+    elif phase in {"resumed", "horizon-mismatch"}:
+        code = restart.execute_train(
+            cfg=cfg,
+            row=effective_row,
             config_path=config_path,
             command="stage1 real restart resumed",
+            run=run_from_config,
         )
-        result = {"outcome": resumed.outcome, "exit_code": resumed.exit_code}
-        Path(str(payload["diagnostics_path"])).write_text(
-            json.dumps(
-                {
-                    "result": result,
-                    "run_dir": str(resumed.selection.run_dir),
-                    "checkpoint_dir": str(resumed.selection.checkpoint_dir),
-                    "runner_load": dict(resumed.runner_load),
-                },
-                sort_keys=True,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+        evidence = inspect_run(resolve_run_dir(effective_row))
     elif phase == "reference":
-        code = run_from_config(
-            cfg,
-            config_path=str(config_path),
+        code = restart.execute_train(
+            cfg=cfg,
+            row=effective_row,
+            config_path=config_path,
             command="stage1 real restart reference",
-            raise_exceptions=True,
+            run=run_from_config,
         )
-        result = {"outcome": "completed", "exit_code": code}
+        evidence = inspect_run(resolve_run_dir(effective_row))
     else:
         raise ValueError(f"unknown phase: {phase}")
+    run_dir = resolve_run_dir(effective_row)
+    outcome_doc = json.loads((run_dir / "run-outcome.json").read_text(encoding="utf-8"))
+    result: dict[str, object] = {
+        "outcome": evidence.outcome,
+        "exit_code": code,
+        "inspection": evidence.to_dict(),
+        "target_iterations": outcome_doc["target_iterations"],
+        "error": outcome_doc.get("error"),
+        "exception_type": outcome_doc.get("exception_type"),
+    }
+    if phase == "resumed":
+        result["runner_load"] = {
+            "mode": "train_resume",
+            "path": str(evidence.checkpoint["checkpoint_dir"]),
+        }
+    Path(str(payload["diagnostics_path"])).write_text(
+        json.dumps(result, sort_keys=True) + "\n", encoding="utf-8",
+    )
     print(json.dumps(result, sort_keys=True))
 
 
@@ -654,9 +785,9 @@ def _run_real_restart_child(payload: dict[str, object]) -> dict[str, object]:
     )
     stdout_path.write_text(completed.stdout, encoding="utf-8")
     stderr_path.write_text(completed.stderr, encoding="utf-8")
-    if phase == "resumed" and diagnostics_path.is_file():
+    if diagnostics_path.is_file():
         diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
-        run_dir = Path(str(diagnostics["run_dir"]))
+        run_dir = Path(str(diagnostics["inspection"]["run_dir"]))
         evidence_root = os.environ.get("VERIFY_EVIDENCE_DIR")
         if evidence_root is None and os.environ.get("RUN_ROOT"):
             evidence_root = str(Path(os.environ["RUN_ROOT"]) / "evidence")
@@ -690,7 +821,10 @@ def test_real_fresh_process_restore_parity_with_checkpoint_zero_and_overlay(
     """
 
     config_path = CONFIG_ROOT / "he" / "train.yaml"
-    resumed_row = _real_restart_row(tmp_path / "resumed", run_id="train-lineage-0")
+    source_row = _real_restart_row(tmp_path / "science", run_id="train-lineage-0")
+    resumed_row = derive_smoke_request(
+        source_row, results_root=str(tmp_path / "resumed"), stop_at=1,
+    )
     resumed_row_path = tmp_path / "resumed-row.json"
     resumed_row_path.parent.mkdir(parents=True, exist_ok=True)
     resumed_row_path.write_text(json.dumps(resumed_row, sort_keys=True) + "\n", encoding="utf-8")
@@ -698,15 +832,36 @@ def test_real_fresh_process_restore_parity_with_checkpoint_zero_and_overlay(
         "phase": "fresh", "row_path": str(resumed_row_path), "config_path": str(config_path),
     }
     fresh_result = _run_real_restart_child(fresh_payload)
-    assert fresh_result == {"outcome": "planned_yield", "exit_code": 2}
+    assert fresh_result["outcome"] == "planned_yield"
+    assert fresh_result["exit_code"] == 2
+    assert fresh_result["target_iterations"] == resumed_row["updates"]
+    fresh_inspection = fresh_result["inspection"]
+    assert fresh_inspection["outcome"] == "planned_yield"
+    assert fresh_inspection["checkpoint"]["next_iteration"] == 1
+    assert fresh_inspection["checkpoint"]["completed_updates"] == 1
+    fresh_ref = fresh_inspection["checkpoint_ref"]
+    assert fresh_ref["profile"] == "train_resume"
+    assert fresh_ref["next_iteration"] == 1
+    assert fresh_ref["completed_updates"] == 1
+    assert isinstance(fresh_ref["content_id"], str)
+
+    catalog = resolve_run_dir(resumed_row) / "checkpoints" / "publications.jsonl"
+    catalog_bytes = catalog.read_bytes()
+    catalog.unlink()
+    missing_publication = inspect_run(resolve_run_dir(resumed_row))
+    assert missing_publication.verdict == "refused"
+    assert missing_publication.refusal is not None
+    # The core evidence contract maps a missing publication to this refusal.
+    assert missing_publication.refusal["code"] == "unpublished-checkpoint-ref"
+    catalog.write_bytes(catalog_bytes)
 
     resumed_result = _run_real_restart_child({**fresh_payload, "phase": "resumed"})
-    if resumed_result != {"outcome": "completed", "exit_code": 0}:
+    if resumed_result["outcome"] != "completed" or resumed_result["exit_code"] != 0:
         resumed_stderr = resumed_row_path.with_name("resumed-row.resumed.stderr")
         resumed_stdout = resumed_row_path.with_name("resumed-row.resumed.stdout")
         resumed_diagnostics = resumed_row_path.with_name("resumed-row.resumed.diagnostics.json")
         diagnostics = json.loads(resumed_diagnostics.read_text(encoding="utf-8"))
-        run_dir = Path(str(diagnostics["run_dir"]))
+        run_dir = Path(str(diagnostics["inspection"]["run_dir"]))
         def read_artifact(name: str) -> str:
             path = run_dir / name
             return path.read_text(encoding="utf-8") if path.is_file() else "<missing>"
@@ -714,8 +869,8 @@ def test_real_fresh_process_restore_parity_with_checkpoint_zero_and_overlay(
         pytest.fail(
             "resumed child did not complete:\n"
             f"result={resumed_result!r}\n"
-            f"runner_load={diagnostics['runner_load']!r}\n"
-            f"checkpoint_dir={diagnostics['checkpoint_dir']}\n"
+            f"runner_load={diagnostics.get('runner_load')!r}\n"
+            f"checkpoint={diagnostics['inspection'].get('checkpoint')!r}\n"
             f"run-outcome.json={read_artifact('run-outcome.json')}\n"
             f"status.json={read_artifact('status.json')}\n"
             f"stdout_path={resumed_stdout}\n{resumed_stdout.read_text(encoding='utf-8')}\n"
@@ -729,7 +884,8 @@ def test_real_fresh_process_restore_parity_with_checkpoint_zero_and_overlay(
     reference_result = _run_real_restart_child({
         "phase": "reference", "row_path": str(reference_row_path), "config_path": str(config_path),
     })
-    assert reference_result == {"outcome": "completed", "exit_code": 0}
+    assert reference_result["outcome"] == "completed"
+    assert reference_result["exit_code"] == 0
 
     resumed_dir = resolve_run_dir(resumed_row)
     reference_dir = resolve_run_dir(reference_row)
@@ -767,3 +923,56 @@ def test_real_fresh_process_restore_parity_with_checkpoint_zero_and_overlay(
     reference_trainer = json.loads((reference_checkpoint / "trainer.json").read_text(encoding="utf-8"))
     assert resumed_trainer == reference_trainer
     assert {"next_iteration", "completed_updates"} <= set(resumed_trainer)
+
+    # Keep the H=2 green route above as the ordinary prefix/continuation
+    # control.  This isolated arm reuses a separately published H=2 prefix,
+    # then rebuilds both row and config for H=3 before asking a fresh process
+    # to continue it.  Core's trainer_config compatibility refusal must stop
+    # the restore before any update or checkpoint publication.
+    h_sensitive_source = _real_restart_row(
+        tmp_path / "h-sensitive-source", run_id="h-sensitive-prefix", lineage_updates=2,
+    )
+    h_sensitive_row = derive_smoke_request(
+        h_sensitive_source, results_root=str(tmp_path / "h-sensitive"), stop_at=1,
+    )
+    h_sensitive_row_path = tmp_path / "h-sensitive-row.json"
+    h_sensitive_row_path.write_text(
+        json.dumps(h_sensitive_row, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    h_sensitive_fresh = _run_real_restart_child({
+        "phase": "fresh",
+        "row_path": str(h_sensitive_row_path),
+        "config_path": str(config_path),
+    })
+    assert h_sensitive_fresh["outcome"] == "planned_yield"
+    assert h_sensitive_fresh["exit_code"] == 2
+
+    h3_row = _real_restart_row(
+        tmp_path / "h-sensitive", run_id="h-sensitive-prefix", lineage_updates=3,
+    )
+    h3_row_path = tmp_path / "h3-row.json"
+    h3_row_path.write_text(json.dumps(h3_row, sort_keys=True) + "\n", encoding="utf-8")
+    prefix_dir = resolve_run_dir(h_sensitive_row)
+    prefix_checkpoint = prefix_dir / "checkpoints" / "step_000001"
+    catalog = prefix_dir / "checkpoints" / "publications.jsonl"
+    before_catalog = catalog.read_bytes()
+    before_payloads = {
+        name: (prefix_checkpoint / name).read_bytes()
+        for name in ("model.pt", "optimizer.pt", "sampler.pt", "rng.pt", "trainer.json")
+    }
+
+    h3_result = _run_real_restart_child({
+        "phase": "horizon-mismatch",
+        "row_path": str(h3_row_path),
+        "config_path": str(config_path),
+    })
+    assert h3_result["outcome"] == "failed"
+    assert h3_result["exit_code"] == 1
+    assert h3_result["exception_type"] == "ValueError"
+    assert "trainer_config mismatch" in h3_result["error"]
+    assert catalog.read_bytes() == before_catalog
+    assert not (prefix_dir / "checkpoints" / "step_000002").exists()
+    assert {
+        name: (prefix_checkpoint / name).read_bytes()
+        for name in before_payloads
+    } == before_payloads

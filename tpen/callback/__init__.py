@@ -226,6 +226,14 @@ def __getattr__(name: str) -> object:
         from .timing import SamplingScopeTiming
 
         return SamplingScopeTiming
+    if name in {"NativeProfiler", "TorchOperatorSummary", "TrainingIterationWindow"}:
+        from .native_profiler import (
+            NativeProfiler,
+            TorchOperatorSummary,
+            TrainingIterationWindow,
+        )
+
+        return locals()[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -254,6 +262,9 @@ __all__ = [
     "ManagedCallback",
     "ManagedLifecycleError",
     "Metadata",
+    "NativeProfiler",
+    "TorchOperatorSummary",
+    "TrainingIterationWindow",
     "ModuleNorms",
     "NvidiaDeviceSource",
     "OptimizerState",

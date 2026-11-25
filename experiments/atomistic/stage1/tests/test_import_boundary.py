@@ -11,6 +11,7 @@ HERE = Path(__file__).parents[1]
 _PUBLIC_IMPORTS = {
     "tpen.inspection": {"RunEvidence", "inspect_run"},
     "tpen.run": {"run_from_config", "load_config"},
+    "tpen.callback": {"PlannedYield"},
 }
 
 

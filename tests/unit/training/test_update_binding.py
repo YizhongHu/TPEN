@@ -162,7 +162,13 @@ class _CountingLegacyUpdate(LegacyAutogradUpdate):
     def method_state_dict(self):
         return {"updates_applied": int(self.updates_applied)}
 
+    def validate_method_state_dict(self, state):
+        if set(state) != {"updates_applied"}:
+            raise ValueError("invalid counting legacy method state")
+        int(state["updates_applied"])
+
     def load_method_state_dict(self, state):
+        self.validate_method_state_dict(state)
         self.restored_from = int(state["updates_applied"])
         self.updates_applied = int(state["updates_applied"])
 
