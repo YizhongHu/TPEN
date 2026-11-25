@@ -339,9 +339,10 @@ def test_crossed_r2_successor_link_is_rejected(tmp_path: Path) -> None:
     crossed = replace(admission, successor_attempt_id=AttemptId("other-successor"))
     crossed_request = json.loads(json.dumps(request))
     crossed_request["successor"]["attempt_id"] = crossed.successor_attempt_id.value
+    crossed_content_id = crossed_request["core_evidence"]["checkpoint_ref"]["content_id"]
     with pytest.raises(ValueError, match="successor binding crosses admission identity") as error:
         SuccessorAdmissionRecord.from_recovery_admission(
-            crossed, predecessor_task_id="successor", predecessor_content_id="a" * 64,
+            crossed, predecessor_task_id="successor", predecessor_content_id=crossed_content_id,
             successor_task_id="successor", request_digest=digest(crossed_request),
             core_acceptance_digest=acceptance, successor_binding=successor_binding,
             successor_request=crossed_request,
