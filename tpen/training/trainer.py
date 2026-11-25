@@ -777,12 +777,10 @@ class VMCTrainer:
             # ``rebind`` is pure: it validates the checkpoint layout against
             # the live model and returns a new binding.  Prevalidation must
             # discard that candidate; adoption belongs to the commit path.
-            rebuilt_binding = self._resolved_update_state.model_parameters.rebind(
+            self._resolved_update_state.model_parameters.rebind(
                 tuple(self._resolved_model.parameters()),
                 layout=restored_layout,
             )
-            if not rebuilt_binding.compare(self._resolved_update_state.model_parameters)[0]:
-                raise ValueError("checkpoint parameter layout does not match live model")
 
         if "update_method" in state:
             if self._resolved_update_method is None:
