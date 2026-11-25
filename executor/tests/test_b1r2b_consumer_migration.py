@@ -391,6 +391,10 @@ def test_reader_rejects_content_crossed_with_admitted_evidence(tmp_path: Path) -
     wire["predecessor"]["content_id"] = "b" * 64
     wire["successor_request"]["core_evidence"]["checkpoint_ref"]["content_id"] = "b" * 64
     wire["request_digest"] = digest(wire["successor_request"])
+    with pytest.raises(ValueError, match="recovery evidence checkpoint content crosses admission") as constructor_error:
+        SuccessorAdmissionRecord.from_mapping(wire)
+    constructor_diagnostic = f"error={constructor_error.value!r}; wire={wire!r}; store={store.root}"
+    assert "recovery evidence checkpoint content crosses admission" in str(constructor_error.value), constructor_diagnostic
     ledger.write_bytes(canonical_bytes(wire))
     with pytest.raises(AdmissionUnreadable, match="successor admission ledger is unreadable") as error:
         read_successor_admission(
@@ -421,6 +425,10 @@ def test_reader_rejects_tampered_recovery_evidence_digest(tmp_path: Path) -> Non
     ledger = Path(store.root) / "groups" / group.identity / "successor" / "successor-admissions" / record.predecessor_attempt_id.value / "successor-admission.json"
     wire = json.loads(ledger.read_bytes())
     wire["recovery_evidence"]["budget_remaining"] += 1
+    with pytest.raises(ValueError, match="recovery evidence digest crosses admission") as constructor_error:
+        SuccessorAdmissionRecord.from_mapping(wire)
+    constructor_diagnostic = f"error={constructor_error.value!r}; wire={wire!r}; store={store.root}"
+    assert "recovery evidence digest crosses admission" in str(constructor_error.value), constructor_diagnostic
     ledger.write_bytes(canonical_bytes(wire))
     with pytest.raises(AdmissionUnreadable, match="successor admission ledger is unreadable") as error:
         read_successor_admission(
