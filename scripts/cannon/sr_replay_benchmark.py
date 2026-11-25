@@ -223,23 +223,25 @@ def _reset_memory(device: torch.device) -> None:
 
 
 def _memory_snapshot(device: torch.device) -> dict[str, int | None]:
-    process_peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    process_lifetime_peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     if sys.platform == "darwin":
-        process_peak *= 1
+        process_lifetime_peak *= 1
     else:
-        process_peak *= 1024
+        process_lifetime_peak *= 1024
     if device.type != "cuda":
         return {
             "max_memory_allocated_bytes": None,
             "max_memory_reserved_bytes": None,
             "device_capacity_bytes": None,
-            "process_peak_bytes": process_peak,
+            # ru_maxrss is cumulative for the process lifetime, not a per-arm peak.
+            "process_lifetime_peak_bytes": process_lifetime_peak,
         }
     return {
         "max_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
         "max_memory_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
         "device_capacity_bytes": int(torch.cuda.get_device_properties(device).total_memory),
-        "process_peak_bytes": process_peak,
+        # ru_maxrss is cumulative for the process lifetime, not a per-arm peak.
+        "process_lifetime_peak_bytes": process_lifetime_peak,
     }
 
 
@@ -251,7 +253,9 @@ def _timed(device: torch.device, fn: Any) -> tuple[float, float | None, bool, An
         started = time.perf_counter()
         value = fn()
         elapsed = time.perf_counter() - started
-        return elapsed, None, True, value, _memory_snapshot(device)
+        memory = _memory_snapshot(device)
+        memory.pop("process_lifetime_peak_bytes")
+        return elapsed, None, True, value, memory
     # Slice 1 plan: "Synchronize CUDA immediately before starting and immediately after completing each timed body; use CUDA events (and record a synchronized host cross-check)."
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -268,7 +272,9 @@ def _timed(device: torch.device, fn: Any) -> tuple[float, float | None, bool, An
         raise HarnessInvalid(
             f"unsynchronized timing: CUDA event={event_elapsed:.6g}s host={host_elapsed:.6g}s"
         )
-    return event_elapsed, event_elapsed, True, value, _memory_snapshot(device)
+    memory = _memory_snapshot(device)
+    memory.pop("process_lifetime_peak_bytes")
+    return event_elapsed, event_elapsed, True, value, memory
 
 
 def _dense_trial(case: Case, *, include_reference: bool, retain_design: bool = False) -> Trial:
@@ -398,7 +404,23 @@ def _replay_trial(case: Case, *, panel_size: int, retain_centering_mean: bool = 
         direction += rows.transpose(0, 1) @ y.index_select(0, indices) / float(n) ** 0.5
     direction_norm = float(torch.linalg.vector_norm(direction).item())
     trust = case.policy.trust_scale(direction_norm=direction_norm)
-    displacement = -case.policy.learning_rate * trust * direction
+    optimizer = torch.optim.SGD(case.model.parameters(), lr=case.policy.learning_rate)
+    model_parameters = ModelParameterBinding(
+        parameters=tuple(case.model.parameters()),
+        layout=case.model.parameter_binding.layout,
+    )
+    method = StochasticReconfigurationUpdate(
+        optimizer,
+        model_parameters=model_parameters,
+        policy=case.policy,
+    )
+    # Review finding 1: apply replay through the same SR parameter-write path
+    # as the dense arm, then compare the resulting parameter state transition.
+    before = torch.nn.utils.parameters_to_vector(tuple(case.model.parameters())).detach().clone()
+    method._apply(direction * trust)
+    after = torch.nn.utils.parameters_to_vector(tuple(case.model.parameters())).detach().clone()
+    displacement = after - before
+    direction = -((after - before) / (case.policy.learning_rate * trust))
     return Trial(
         seconds=0.0,
         event_seconds=None,
@@ -703,6 +725,7 @@ def _run_cell(
             else:
                 replay_times.append(seconds)
                 replay_memory.append(memory)
+    process_lifetime_peak_bytes = _memory_snapshot(device)["process_lifetime_peak_bytes"]
     dense_stats = _json_tensor_stats(dense_times)
     replay_stats = _json_tensor_stats(replay_times)
     ratio = replay_stats["mean_seconds"] / dense_stats["mean_seconds"]
@@ -711,6 +734,9 @@ def _run_cell(
         "channel_width": width,
         "P": p,
         "panel_size": panel_size,
+        # ru_maxrss is cumulative for the process lifetime; record it once per
+        # cell rather than presenting it as a per-arm peak.
+        "process_lifetime_peak_bytes": process_lifetime_peak_bytes,
         "dense": {**dense_stats, "memory": dense_memory},
         "replay": {**replay_stats, "memory": replay_memory},
         "slowdown_replay_over_dense": ratio,
