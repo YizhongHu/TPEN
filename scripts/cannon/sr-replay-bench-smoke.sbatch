@@ -1,7 +1,6 @@
 #!/bin/bash
 # One complete CPU smoke control for Slice 1.  The caller supplies only the
 # unique evidence root, staged source tar, and immutable shared environment.
-#SBATCH --job-name=opt4f35-benchsmoke-op-e05d7c25
 #SBATCH --partition=test
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
