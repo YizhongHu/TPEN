@@ -239,7 +239,7 @@ def test_first_observed_warmup_step_after_window_start_is_not_started(tmp_path) 
     assert payload["lifecycle_state"] == "not_started"
     assert "window_start_not_observed" in payload["activity_diagnostics"]
     inspected = inspect_run_observability(context.run_dir, relative_dir="native-profiling")
-    assert inspected.profile_statuses[0].lifecycle_state == "not_started"
+    assert inspected.invocations[0].profile_statuses[0].lifecycle_state == "not_started"
     reconciled = reconcile_run_observability(context.run_dir, relative_dir="native-profiling")
     assert reconciled.profile_windows[0].lifecycle_state == "not_started"
 

@@ -267,8 +267,8 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
             activities=[ProfilerActivity.CPU],
             record_shapes=False,
             schedule=schedule(
-                wait=0,
-                warmup=window.warmup_steps,
+                wait=1 if window.warmup_steps else 0,
+                warmup=max(0, window.warmup_steps - 1),
                 active=window.active_steps,
                 repeat=1,
             ),
