@@ -28,13 +28,15 @@ MUTANTS = (
     {"id": "omit-r2-checkpoint-link", "target": "executor/src/tpen_executor/results.py", "old": '"checkpoint_path": self.recovery_admission.checkpoint_path', "new": '"checkpoint_path": "crossed"', "killer": "test_r2_link_round_trip_preserves_typed_lineage"},
     {"id": "accept-crossed-r2-predecessor", "target": "executor/src/tpen_executor/results.py", "old": "self.recovery_admission.predecessor_attempt_id != self.predecessor_attempt_id", "new": "False", "killer": "test_tampered_v3_predecessor_link_is_rejected"},
     {"id": "accept-crossed-r2-successor", "target": "executor/src/tpen_executor/results.py", "old": "self.successor_binding.attempt_id != self.successor_attempt_id", "new": "False", "killer": "test_crossed_r2_successor_link_is_rejected"},
-    {"id": "skip-r2-controller-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "verdict = None if admitted_item.recovery_input is not None else admission_port.admit(admitted_item)", "new": "verdict = admission_port.admit(admitted_item)", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
+    {"id": "skip-r2-controller-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "verdict = None if item.recovery_input is not None else admission_port.admit(admitted_item)", "new": "verdict = admission_port.admit(admitted_item)", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
     {"id": "launch-before-r2-publication", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if published.encode() != checked.encode():", "new": "if False:", "killer": "test_r2_launch_requires_durable_publication"},
     {"id": "r2-park-submit-bypass", "target": "executor/src/tpen_executor/recovery.py", "old": "return _park(member, member.recovery_admission.reason)", "new": 'return MemberReconciliationV2(member.task_id, "admit_successor", "recovery-admitted", member.attempt_id)', "killer": "test_r2_park_refuses_before_submit"},
     {"id": "fabricate-interrupted-outcome", "target": "executor/src/tpen_executor/storage.py", "old": "if item.outcome_receipt is None:", "new": "if False:", "killer": "test_interrupted_r2_outcome_stays_observed_absence"},
     {"id": "cross-c2-2-load-path", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "admission_record.checkpoint_path,", "new": '"crossed",', "killer": "test_c22_load_path_is_exact_admitted_checkpoint"},
     {"id": "r2-current-fence-required", "target": "executor/src/tpen_executor/storage.py", "old": "current_attempt_id = current_fence.attempt_id.value", "new": "current_attempt_id = admission.predecessor_attempt_id.value", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
     {"id": "preserve-typed-park-reason", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "elif member.action == \"park\":", "new": "elif False:", "killer": "test_controller_propagates_typed_park_reason"},
+    {"id": "retain-r2-input-on-park", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "return replace(item, recovery_input=None, recovery_admission=admission)", "new": "return replace(item, recovery_admission=admission)", "killer": "test_controller_propagates_typed_park_reason"},
+    {"id": "skip-r2-final-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "verdict = None if item.recovery_input is not None else admission_port.admit(rebuilt)", "new": "verdict = admission_port.admit(rebuilt)", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
 )
 
 
@@ -294,7 +296,15 @@ def test_r2_input_uses_admit_recovery_not_legacy_selector(tmp_path: Path, monkey
     assert result.member_outcomes == (("successor", "collected"),), diagnostic
     assert admissions and all(result.status == "admitted" and root == store.root for result, root in admissions), diagnostic
     assert port.calls == [], diagnostic
-    legacy_group, legacy_alloc, legacy_facts, legacy_binding, legacy_store = _real_fresh(tmp_path / "legacy")
+    legacy_store, legacy_group, legacy_lease, legacy_inputs, _legacy_bindings, legacy_successors, _legacy_fences = _fixture(
+        tmp_path / "legacy", ("successor",), remote=False,
+    )
+    legacy_alloc = ConfiguredAllocation(legacy_lease.allocation_id, legacy_lease.backend_job_id, {})
+    legacy_facts = GroupControllerFactsV1(
+        legacy_group, legacy_alloc, "a" * 64, "legacy-controller", "2026-11-24T00:03:00Z",
+        legacy_inputs, legacy_successors,
+    )
+    legacy_binding = _binding(legacy_group, legacy_lease.backend_job_id)
     legacy_port = RecordingAdmission()
     legacy_executor = BoundaryExecutor([])
     run_group_controller(legacy_binding, legacy_alloc.backend_job_id, legacy_facts, legacy_store, legacy_port, legacy_executor)

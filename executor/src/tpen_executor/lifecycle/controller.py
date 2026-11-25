@@ -188,7 +188,11 @@ def _apply_recovery_admission(item: MemberRecoveryInputV2, store: DirectoryStore
         trusted_store_root=store.root,
         existing_successors=request.existing_successors,
     )
-    return replace(item, recovery_admission=admission)
+    # A parked R2 result has no successor identity.  Clear the raw input before
+    # attaching it so MemberRecoveryInputV2 does not reject the typed park as a
+    # crossed recovery input; the controller still uses the original input to
+    # select the R2 path and never calls the legacy admission port.
+    return replace(item, recovery_input=None, recovery_admission=admission)
 
 
 def run_group_controller(
@@ -242,7 +246,7 @@ def run_group_controller(
                 admitted_item = _apply_recovery_admission(item, store)
                 # R2 facts are the complete recovery decision.  The legacy
                 # core selector remains available only to legacy callers.
-                verdict = None if admitted_item.recovery_input is not None else admission_port.admit(admitted_item)
+                verdict = None if item.recovery_input is not None else admission_port.admit(admitted_item)
                 if verdict is not None and not isinstance(verdict, CoreAdmissionVerdictV2):
                     verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "malformed-core-admission")
             except Exception:
@@ -501,7 +505,7 @@ def run_group_controller(
                                   outcome_receipt=record.outcome_receipt)
             try:
                 rebuilt = _apply_recovery_admission(rebuilt, store)
-                verdict = None if rebuilt.recovery_input is not None else admission_port.admit(rebuilt)
+                verdict = None if item.recovery_input is not None else admission_port.admit(rebuilt)
                 if verdict is not None and not isinstance(verdict, CoreAdmissionVerdictV2):
                     verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "malformed-core-admission")
             except Exception:
