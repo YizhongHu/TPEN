@@ -427,12 +427,27 @@ def _replay_trial(case: Case, *, panel_size: int, retain_centering_mean: bool = 
     )
 
 
-def _assert_parity(dense: Trial, replay: Trial) -> None:
+def _assert_parity(
+    dense: Trial,
+    replay: Trial,
+    *,
+    gram_bound: dict[str, Any] | None = None,
+) -> None:
     # Slice 1 plan: "Before timing, it must match the current dense sample-space direction/displacement ... (float64: direction/displacement rtol=atol=1e-9; Gram/trace/lambda rtol=atol=1e-11; discrete route/skip fields exact)."
+    # parity-criterion-decision-20261125: "New Gram parity criterion for slice 1 (supersedes Gram rtol=atol=1e-11 in option-a-slice-plan-20261125): GATING elementwise float64 bound |Gd-Gr|_ij <= 4*P*eps*S_ij with S_ij = sum_k |x_ik||x_jk| over the centered/normalized dense design (zero violations required)."
+    if dense.gram is None or replay.gram is None or dense.design_cpu is None:
+        raise HarnessInvalid("parity requires dense and replay Gram matrices plus the dense design")
+    if gram_bound is None:
+        gram_bound = _bound_check(dense.gram, replay.gram, dense.design_cpu)
     try:
         torch.testing.assert_close(replay.direction, dense.direction, rtol=1.0e-9, atol=1.0e-9)
         torch.testing.assert_close(replay.displacement, dense.displacement, rtol=1.0e-9, atol=1.0e-9)
-        torch.testing.assert_close(replay.gram, dense.gram, rtol=1.0e-11, atol=1.0e-11)
+        if not gram_bound["pass"]:
+            raise AssertionError(
+                "Gram bound mismatch: "
+                f"max ratio={gram_bound['max_ratio']:.17g}, "
+                f"violations={gram_bound['violating_entries']}"
+            )
         if abs(float(replay.trace) - float(dense.trace)) > 1.0e-11 * max(abs(float(dense.trace)), 1.0):
             raise AssertionError("trace mismatch")
         if abs(float(replay.damping) - float(dense.damping)) > 1.0e-11 * max(abs(float(dense.damping)), 1.0):
@@ -527,7 +542,7 @@ def _bound_check(
     replay_gram: torch.Tensor,
     design_cpu: torch.Tensor,
 ) -> dict[str, Any]:
-    """Check the non-gating first-order summation bound for every entry."""
+    """Check the first-order float64 summation bound for every entry."""
 
     dense_cpu = dense_gram.detach().to("cpu", dtype=torch.float64)
     replay_cpu = replay_gram.detach().to("cpu", dtype=torch.float64)
@@ -542,7 +557,7 @@ def _bound_check(
     ratio[positive] = difference[positive] / denominator[positive]
     ratio[~positive] = torch.where(difference[~positive] == 0.0, torch.zeros_like(difference[~positive]), torch.full_like(difference[~positive], math.inf))
     return {
-        "bound": "4 * P * eps * S_ij",
+        "bound": "4*P*eps*S_ij",
         "pass": bool(torch.all(difference <= denominator).item()),
         "max_ratio": float(torch.max(ratio).item()),
         "violating_entries": int(torch.count_nonzero(difference > denominator).item()),
@@ -624,12 +639,13 @@ def _run_cell(
     case = _make_case(cfg, width=width, n_walkers=n_walkers, device=device, seed=seed)
     p = case.model.parameter_binding.layout.total_numel
     _restore(case)
-    dense_parity = _dense_trial(case, include_reference=True, retain_design=diagnostic)
+    dense_parity = _dense_trial(case, include_reference=True, retain_design=True)
     _restore(case)
     replay_parity = _replay_trial(case, panel_size=panel_size, retain_centering_mean=diagnostic)
+    gram_bound = _bound_check(dense_parity.gram, replay_parity.gram, dense_parity.design_cpu)
     parity_error: str | None = None
     try:
-        _assert_parity(dense_parity, replay_parity)
+        _assert_parity(dense_parity, replay_parity, gram_bound=gram_bound)
     except HarnessInvalid as exc:
         parity_error = str(exc)
     diagnostic_report = _diagnostic_report(case, dense_parity, replay_parity, seed=seed) if diagnostic else None
@@ -641,7 +657,21 @@ def _run_cell(
             "channel_width": width,
             "P": p,
             "panel_size": panel_size,
-            "parity": {"status": "FAIL", "error": parity_error, "gram_trace_lambda_rtol": 1.0e-11, "gram_trace_lambda_atol": 1.0e-11},
+            "parity": {
+                "status": "FAIL",
+                "error": parity_error,
+                "gram_bound": {
+                    "max_ratio": gram_bound["max_ratio"],
+                    "violations": gram_bound["violating_entries"],
+                    "bound": "4*P*eps*S_ij",
+                },
+                "direction_rtol": 1.0e-9,
+                "direction_atol": 1.0e-9,
+                "displacement_rtol": 1.0e-9,
+                "displacement_atol": 1.0e-9,
+                "trace_rtol": 1.0e-11,
+                "lambda_rtol": 1.0e-11,
+            },
             "diagnostic": diagnostic_report,
             "timing": {"status": "UNMEASURED_PARITY_FAILURE"},
         }
@@ -686,10 +716,17 @@ def _run_cell(
         "slowdown_replay_over_dense": ratio,
         "parity": {
             "status": "PASS",
+            "gram_bound": {
+                "max_ratio": gram_bound["max_ratio"],
+                "violations": gram_bound["violating_entries"],
+                "bound": "4*P*eps*S_ij",
+            },
             "direction_rtol": 1.0e-9,
             "direction_atol": 1.0e-9,
-            "gram_trace_lambda_rtol": 1.0e-11,
-            "gram_trace_lambda_atol": 1.0e-11,
+            "displacement_rtol": 1.0e-9,
+            "displacement_atol": 1.0e-9,
+            "trace_rtol": 1.0e-11,
+            "lambda_rtol": 1.0e-11,
             "discrete_fields": "exact",
         },
         "structure": {
