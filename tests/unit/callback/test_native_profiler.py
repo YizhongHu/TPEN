@@ -241,7 +241,7 @@ def test_first_observed_warmup_step_after_window_start_is_not_started(tmp_path) 
     inspected = inspect_run_observability(context.run_dir, relative_dir="native-profiling")
     assert inspected.invocations[0].profile_statuses[0].lifecycle_state == "not_started"
     reconciled = reconcile_run_observability(context.run_dir, relative_dir="native-profiling")
-    assert reconciled.profile_windows[0].lifecycle_state == "not_started"
+    assert reconciled.invocations[0].summary.profile_windows[0].lifecycle_state == "not_started"
 
 
 def test_request_stop_before_window_prevents_activation(tmp_path) -> None:
@@ -419,10 +419,12 @@ def test_summary_failure_is_failed_partial_through_inspection_and_reconciliation
     assert status["data_completeness"] == "partial"
     assert manifest["data_completeness"] == "partial"
     inspected = inspect_run_observability(context.run_dir, relative_dir="native-profiling")
-    assert inspected.profile_statuses[0].export_status == "failed"
+    assert inspected.invocations[0].profile_statuses[0].export_status == "failed"
     reconciled = reconcile_run_observability(context.run_dir, relative_dir="native-profiling")
-    assert reconciled.reconciliation_state == "failed"
-    assert reconciled.profile_windows[0].export_status == "failed"
+    bundle = reconciled.invocations[0]
+    assert bundle.reconciliation_state == "failed"
+    assert bundle.data_completeness == "partial"
+    assert bundle.summary.profile_windows[0].export_status == "failed"
 
 
 def test_failed_end_dispatch_preserves_application_primary(tmp_path) -> None:
