@@ -6,9 +6,9 @@
 # owned by experiments.atomistic.stage1.launch.command_for_row.
 #
 # The submission driver supplies MODE=train|eval, SOURCE_SHA, CHECKOUT_ROOT,
-# UV_CACHE_DIR, RESULTS_ROOT, PLAN_MANIFEST, and EXPECTED_QUEUE.  The checked-in header is a
-# debug/evaluation shape; the training runbook supplies the capacity queue and
-# wall cap explicitly at qsub time.
+# UV_CACHE_DIR, RESULTS_ROOT, SELECTED_ROW, APPROVAL_ID, and EXPECTED_QUEUE.
+# The checked-in header is a debug/evaluation shape; the training runbook
+# supplies the capacity queue and wall cap explicitly at qsub time.
 #PBS -A HetRxnEnergy
 #PBS -q debug
 #PBS -l select=1:system=polaris
@@ -24,7 +24,8 @@ MODE="${MODE:-${1:-}}"
 SOURCE_SHA="${SOURCE_SHA:-}"
 CHECKOUT_ROOT="${CHECKOUT_ROOT:-}"
 RESULTS_ROOT="${RESULTS_ROOT:-}"
-PLAN_MANIFEST="${PLAN_MANIFEST:-}"
+SELECTED_ROW="${SELECTED_ROW:-}"
+APPROVAL_ID="${APPROVAL_ID:-}"
 EXPECTED_QUEUE="${EXPECTED_QUEUE:-}"
 PBS_JOBID="${PBS_JOBID:-}"
 PBS_QUEUE="${PBS_QUEUE:-}"
@@ -104,7 +105,8 @@ validate_mode_paths() {
     guard)
       ;;
     dry-exec|train|eval)
-      require_value PLAN_MANIFEST
+      require_value SELECTED_ROW
+      [[ "$SELECTED_ROW" == /* ]] || die "SELECTED_ROW must be absolute"
       ;;
     plan)
       require_value PLAN_OUTPUT
@@ -128,42 +130,52 @@ validate_mode_paths() {
   esac
 }
 
-validate_selected_rows() {
-  local manifest="$1" kind="$2"
-  "$PYBIN" - "$manifest" "$kind" "$SOURCE_SHA" "$RESULTS_ROOT" <<'PY'
+validate_selected_row() {
+  local selected_row="$1" kind="$2"
+  "$PYBIN" - "$selected_row" "$kind" "$SOURCE_SHA" "$RESULTS_ROOT" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-manifest, kind, source_sha, results_root = sys.argv[1:]
-manifest_path = Path(manifest)
+selected_row, kind, source_sha, results_root = sys.argv[1:]
+selected_path = Path(selected_row)
 root = Path(results_root)
-document = json.loads(manifest_path.read_text(encoding="utf-8"))
-rows = [row for row in document.get("rows", []) if row.get("kind") == kind]
-if kind == "train" and [int(row["lineage"]) for row in sorted(rows, key=lambda row: int(row["lineage"]))] != [0, 1, 2]:
-    raise SystemExit("expected train lineages 0,1,2")
-if kind == "eval" and len(rows) != 132:
-    raise SystemExit(f"expected 132 eval rows, got {len(rows)}")
-for row in rows:
-    row_root = Path(str(row.get("results_root", "")))
-    if row.get("source_sha") != source_sha:
-        raise SystemExit("row source_sha does not match wrapper SOURCE_SHA")
-    # Replace launch.render's GPU-row admission before any guard or driver.
-    if row.get("device") != "cuda":
-        raise SystemExit(f"row {row.get('row_id', '<unknown>')} must have device=cuda")
-    if any(part == ".." for part in row_root.parts):
-        raise SystemExit(f"row results_root contains '..': {row_root}")
-    try:
-        row_root.resolve().relative_to(root.resolve())
-    except ValueError as exc:
-        raise SystemExit(f"row results_root is outside wrapper RESULTS_ROOT: {row_root}") from exc
+try:
+    row = json.loads(selected_path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"selected row is not readable JSON: {exc}") from exc
+if not isinstance(row, dict) or "rows" in row:
+    raise SystemExit("SELECTED_ROW must contain one frozen row object, not a manifest")
+if row.get("kind") != kind:
+    raise SystemExit(f"selected row kind={row.get('kind')} does not match MODE={kind}")
+row_root = Path(str(row.get("results_root", "")))
+if row.get("source_sha") != source_sha:
+    raise SystemExit("row source_sha does not match wrapper SOURCE_SHA")
+# Replace launch.render's GPU-row admission before any guard or driver.
+if row.get("device") != "cuda":
+    raise SystemExit(f"row {row.get('row_id', '<unknown>')} must have device=cuda")
+if any(part == ".." for part in row_root.parts):
+    raise SystemExit(f"row results_root contains '..': {row_root}")
+try:
+    row_root.resolve().relative_to(root.resolve())
+except ValueError as exc:
+    raise SystemExit(f"row results_root is outside wrapper RESULTS_ROOT: {row_root}") from exc
+if kind == "train" and not isinstance(row.get("lineage"), int):
+    raise SystemExit("selected train row must carry a lineage")
 PY
 }
 
-validate_selected_rows_or_die() {
+validate_selected_row_or_die() {
   local error
-  if ! error="$(validate_selected_rows "$1" "$2" 2>&1)"; then
+  if ! error="$(validate_selected_row "$1" "$2" 2>&1)"; then
     die "$error"
+  fi
+}
+
+require_approval_or_die() {
+  require_value APPROVAL_ID
+  if [[ "$APPROVAL_ID" =~ [^A-Za-z0-9._:/-] ]]; then
+    die "APPROVAL_ID contains shell-unsafe characters"
   fi
 }
 
@@ -197,6 +209,12 @@ write_job_receipt() {
     printf 'SOURCE_SHA=%s\n' "$SOURCE_SHA"
     printf 'MODE=%s\n' "$MODE"
     printf 'RESULTS_ROOT=%s\n' "$RESULTS_ROOT"
+    if [[ -n "$SELECTED_ROW" ]]; then
+      printf 'SELECTED_ROW=%s\n' "$SELECTED_ROW"
+    fi
+    if [[ -n "$APPROVAL_ID" ]]; then
+      printf 'APPROVAL_ID=%s\n' "$APPROVAL_ID"
+    fi
     printf 'CHECKOUT_ROOT=%s\n' "$CHECKOUT_ROOT"
     printf 'UV_CACHE_DIR=%s\n' "$UV_CACHE_DIR"
     printf 'BASE_PYTHON=%s\n' "$PYBIN"
@@ -449,52 +467,6 @@ PY
   printf 'POLARIS_ENV uv='; "$PYBIN" -m uv --version
 }
 
-extract_rows() {
-  local manifest="$1" kind="$2" output_dir="$3"
-  require_value SOURCE_SHA
-  [[ -f "$manifest" ]] || die "manifest missing: $manifest"
-  mkdir -p -- "$output_dir"
-  "$PYTHON_BIN" - "$manifest" "$output_dir" "$kind" "$SOURCE_SHA" "$RESULTS_ROOT" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-manifest, output_dir, kind, source_sha, results_root = map(Path, sys.argv[1:])
-kind = str(kind)
-source_sha = str(source_sha)
-results_root = str(results_root)
-document = json.loads(manifest.read_text(encoding="utf-8"))
-rows = [row for row in document.get("rows", []) if row.get("kind") == kind]
-if kind == "train":
-    rows.sort(key=lambda row: int(row["lineage"]))
-    if [int(row["lineage"]) for row in rows] != [0, 1, 2]:
-        raise SystemExit("expected train lineages 0,1,2")
-else:
-    rows.sort(key=lambda row: (int(row["lineage"]), int(row["stream"])))
-    if len(rows) != 132:
-        raise SystemExit(f"expected 132 eval rows, got {len(rows)}")
-root = Path(results_root)
-for row in rows:
-    if row.get("source_sha") != source_sha:
-        raise SystemExit("row source_sha does not match wrapper SOURCE_SHA")
-    row_root = str(row.get("results_root", ""))
-    row_root_path = Path(row_root)
-    if any(part == ".." for part in row_root_path.parts):
-        raise SystemExit("row results_root contains '..'")
-    try:
-        row_root_path.resolve().relative_to(root.resolve())
-    except ValueError as exc:
-        raise SystemExit("row results_root is outside wrapper RESULTS_ROOT") from exc
-    if row.get("device") != "cuda":
-        raise SystemExit(f"row {row.get('row_id', '<unknown>')} must have device=cuda")
-    row_id = str(row["row_id"])
-    (output_dir / f"{row_id}.json").write_text(
-        json.dumps(row, sort_keys=True, indent=2) + "\n", encoding="utf-8",
-    )
-    print(output_dir / f"{row_id}.json")
-PY
-}
-
 run_command_for_row() {
   local row="$1" gpu="$2" cpu_set="$3" core_count="$4" log="$5" status="$6"
   local rc=0 row_id
@@ -527,63 +499,31 @@ PY
 }
 
 run_mode() {
-  local row_dir="$BOOT_ROOT/rows/$MODE"
-  local row_list row gpu cpu_set core_count log status lineage destination_root
+  local row="$SELECTED_ROW" row_id gpu lineage cpu_set core_count log status destination_root
   local rc=0
-  row_list="$BOOT_ROOT/$MODE-row-list.txt"
-  extract_rows "$PLAN_MANIFEST" "$MODE" "$row_dir" > "$row_list"
+  row_id="$($PYTHON_BIN -c 'import json,sys; print(json.load(open(sys.argv[1]))["row_id"])' "$row")"
   if [[ "$MODE" == train ]]; then
-    local -a pids=() rows=()
-    mapfile -t rows < "$row_list"
-    local index=0
-    for row in "${rows[@]}"; do
-      case "$index" in
-        0|1|2)
-          lineage="$index"
-          gpu="$lineage"
-          cpu_set="${LINEAGE_CPU_SETS[$lineage]}"
-          core_count="${LINEAGE_CORE_COUNTS[$lineage]}"
-          ;;
-        *) die "unexpected train row index=$index" ;;
-      esac
-      log="$RESULTS_ROOT/logs/row-$(basename "$row" .json)-${PBS_JOBID}.log"
-      status="$RESULTS_ROOT/logs/row-$(basename "$row" .json)-${PBS_JOBID}.status"
-      if [[ "$DRY_EXEC" == 1 ]]; then
-        log="$BOOT_ROOT/$(basename "$row" .json).log"
-        status="$BOOT_ROOT/$(basename "$row" .json).status"
-        destination_root="$BOOT_ROOT"
-      else
-        destination_root="$RESULTS_ROOT"
-      fi
-      assert_contained_path "$log" "$destination_root" log
-      assert_contained_path "$status" "$destination_root" status
-      run_command_for_row "$row" "$gpu" "$cpu_set" "$core_count" "$log" "$status" &
-      pids+=("$!")
-      index=$((index + 1))
-    done
-    for pid in "${pids[@]}"; do
-      wait "$pid" || rc=1
-    done
+    lineage="$($PYTHON_BIN -c 'import json,sys; print(json.load(open(sys.argv[1]))["lineage"])' "$row")"
+    [[ "$lineage" =~ ^[0-2]$ ]] || die "selected train lineage must be 0, 1, or 2"
+    gpu="$lineage"
   else
-    while IFS= read -r row; do
-      gpu=0
-      lineage=0
-      cpu_set="${LINEAGE_CPU_SETS[$lineage]}"
-      core_count="${LINEAGE_CORE_COUNTS[$lineage]}"
-      log="$RESULTS_ROOT/logs/row-$(basename "$row" .json)-${PBS_JOBID}.log"
-      status="$RESULTS_ROOT/logs/row-$(basename "$row" .json)-${PBS_JOBID}.status"
-      if [[ "$DRY_EXEC" == 1 ]]; then
-        log="$BOOT_ROOT/$(basename "$row" .json).log"
-        status="$BOOT_ROOT/$(basename "$row" .json).status"
-        destination_root="$BOOT_ROOT"
-      else
-        destination_root="$RESULTS_ROOT"
-      fi
-      assert_contained_path "$log" "$destination_root" log
-      assert_contained_path "$status" "$destination_root" status
-      run_command_for_row "$row" "$gpu" "$cpu_set" "$core_count" "$log" "$status" || rc=1
-    done < "$row_list"
+    lineage=0
+    gpu=0
   fi
+  cpu_set="${LINEAGE_CPU_SETS[$lineage]}"
+  core_count="${LINEAGE_CORE_COUNTS[$lineage]}"
+  log="$RESULTS_ROOT/logs/row-${row_id}-${PBS_JOBID}.log"
+  status="$RESULTS_ROOT/logs/row-${row_id}-${PBS_JOBID}.status"
+  if [[ "$DRY_EXEC" == 1 ]]; then
+    log="$BOOT_ROOT/${row_id}.log"
+    status="$BOOT_ROOT/${row_id}.status"
+    destination_root="$BOOT_ROOT"
+  else
+    destination_root="$RESULTS_ROOT"
+  fi
+  assert_contained_path "$log" "$destination_root" log
+  assert_contained_path "$status" "$destination_root" status
+  run_command_for_row "$row" "$gpu" "$cpu_set" "$core_count" "$log" "$status" || rc=$?
   return "$rc"
 }
 
@@ -645,12 +585,13 @@ main() {
       MODE=train
       EXPECTED_QUEUE="${EXPECTED_QUEUE:-debug}"
       require_value RESULTS_ROOT
-      require_value PLAN_MANIFEST
+      require_value SOURCE_SHA
       assert_results_root
       assert_pbs_context
       validate_mode_paths
+      validate_selected_row_or_die "$SELECTED_ROW" train
+      require_approval_or_die
       prepare_job
-      validate_selected_rows_or_die "$PLAN_MANIFEST" train
       guard_runtime
       cd "$CHECKOUT"
       run_mode
@@ -686,19 +627,19 @@ main() {
       [[ "$MODE" == train ]] && EXPECTED_QUEUE="${EXPECTED_QUEUE:-capacity}"
       [[ "$MODE" == eval ]] && EXPECTED_QUEUE="${EXPECTED_QUEUE:-debug}"
       require_value RESULTS_ROOT
-      require_value PLAN_MANIFEST
       require_value SOURCE_SHA
       assert_results_root
       assert_pbs_context
       validate_mode_paths
+      validate_selected_row_or_die "$SELECTED_ROW" "$MODE"
+      require_approval_or_die
       prepare_job
-      validate_selected_rows_or_die "$PLAN_MANIFEST" "$MODE"
       write_job_receipt
       guard_runtime
       cd "$CHECKOUT"
       run_mode
       ;;
-    *) die "usage: MODE=train|eval|guard|dry-exec" ;;
+    *) die "usage: MODE=train|eval|guard|dry-exec|plan|collect" ;;
   esac
 }
 

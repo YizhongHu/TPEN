@@ -123,6 +123,7 @@ def _env(tmp_path: Path, *, stubs: dict[str, str] | None = None,
         "PBS_JOBID": "dry-7860235",
         "PBS_QUEUE": "debug",
         "EXPECTED_QUEUE": "debug",
+        "APPROVAL_ID": "test-approval",
         "DRY_EXEC": "1",
         "PYBIN": sys.executable,
         "CHECKOUT_ROOT": str(REPO_ROOT),
@@ -134,6 +135,20 @@ def _env(tmp_path: Path, *, stubs: dict[str, str] | None = None,
     Path(env["UV_CACHE_DIR"]).mkdir()
     env.update(stubs if stubs is not None else _stub_bin(tmp_path))
     env.update(overrides)
+    # The consumer now receives one frozen row object.  Keep older fixture
+    # callers readable by materializing their first row into a test-owned file.
+    manifest = env.pop("PLAN_MANIFEST", None)
+    if manifest is not None:
+        document = json.loads(Path(manifest).read_text(encoding="utf-8"))
+        rows = document.get("rows", [])
+        row = rows[0] if rows else {
+            "kind": "train", "lineage": 0, "row_id": "test-row-0",
+            "source_sha": env["SOURCE_SHA"], "results_root": env["RESULTS_ROOT"],
+            "device": "cuda",
+        }
+        selected = Path(manifest).with_name("selected-row.json")
+        selected.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        env["SELECTED_ROW"] = str(selected)
     env.pop("MODE", None)
     return env
 
@@ -324,18 +339,11 @@ def test_guard_rejects_symlinked_results_root_before_any_write(tmp_path: Path) -
     assert sorted(path.relative_to(outside) for path in outside.rglob("*")) == before_outside
 
 
-def test_dry_exec_runs_three_train_control_rows(tmp_path: Path) -> None:
-    rows = [
-        {
-            "kind": "train",
-            "lineage": lineage,
-            "row_id": f"he-train-{lineage}",
-            "source_sha": SOURCE_SHA,
-            "results_root": EAGLE_ROOT,
-            "device": "cuda",
-        }
-        for lineage in range(3)
-    ]
+def test_dry_exec_runs_one_selected_train_control_row(tmp_path: Path) -> None:
+    rows = [{
+        "kind": "train", "lineage": 1, "row_id": "he-train-1",
+        "source_sha": SOURCE_SHA, "results_root": EAGLE_ROOT, "device": "cuda",
+    }]
     manifest = tmp_path / "phase1.json"
     manifest.write_text(json.dumps({"rows": rows}) + "\n", encoding="utf-8")
     env = _env(
@@ -348,8 +356,36 @@ def test_dry_exec_runs_three_train_control_rows(tmp_path: Path) -> None:
     result = _run("dry-exec", env)
     assert result.returncode == 0, result.stderr
     assert "DRY_EXEC bootstrap=SKIPPED" in result.stdout
-    assert result.stdout.count("DRY_EXEC compute=SKIPPED row=he-train-") == 3
+    assert result.stdout.count("DRY_EXEC compute=SKIPPED row=he-train-1") == 1
     assert "DRY_EXEC complete=PASS" in result.stdout
+
+
+def test_selected_row_rejects_manifest_before_driver(tmp_path: Path) -> None:
+    row = {
+        "kind": "train", "lineage": 0, "row_id": "he-train-0",
+        "source_sha": SOURCE_SHA, "results_root": EAGLE_ROOT, "device": "cuda",
+    }
+    selected = tmp_path / "selected-row.json"
+    selected.write_text(json.dumps({"rows": [row]}) + "\n", encoding="utf-8")
+    result = _run("dry-exec", _env(tmp_path, SELECTED_ROW=str(selected)))
+    assert result.returncode == 2
+    assert "one frozen row object, not a manifest" in result.stderr
+
+
+def test_missing_approval_refuses_before_driver_effect(tmp_path: Path) -> None:
+    row = {
+        "kind": "train", "lineage": 0, "row_id": "he-train-0",
+        "source_sha": SOURCE_SHA, "results_root": EAGLE_ROOT, "device": "cuda",
+    }
+    selected = tmp_path / "selected-row.json"
+    selected.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    result = _run(
+        "dry-exec",
+        _env(tmp_path, SELECTED_ROW=str(selected), APPROVAL_ID=""),
+    )
+    assert result.returncode == 2
+    assert "APPROVAL_ID is required" in result.stderr
+    assert "DRY_EXEC compute=SKIPPED" not in result.stdout
 
 
 def test_dry_exec_rejects_existing_boot_root_without_touching_it(tmp_path: Path) -> None:
@@ -611,7 +647,13 @@ def test_production_rejects_promisor_checkout_before_uv(tmp_path: Path) -> None:
         check=True,
     )
     env = _production_env(tmp_path, checkout, source_sha)
-    env.update({"MODE": "train", "PLAN_MANIFEST": str(tmp_path / "manifest.json")})
+    selected = tmp_path / "selected-row.json"
+    selected.write_text(json.dumps({
+        "kind": "train", "lineage": 0, "row_id": "test-row-0",
+        "source_sha": source_sha, "results_root": env["RESULTS_ROOT"],
+        "device": "cuda",
+    }), encoding="utf-8")
+    env.update({"MODE": "train", "SELECTED_ROW": str(selected)})
     result = _run("train", env)
     assert result.returncode == 2
     assert "promisor remote" in result.stderr
@@ -713,7 +755,8 @@ def _production_env(tmp_path: Path, checkout: Path, source_sha: str) -> dict[str
         "RESULTS_ROOT": str(results_prefix / f"t1-{tmp_path.name}"),
         "TPEN_POLARIS_TEST_RESULTS_PREFIX": str(results_prefix),
         "PBS_JOBID": "", "PBS_ENVIRONMENT": "", "PBS_QUEUE": "debug",
-        "EXPECTED_QUEUE": "debug", "DRY_EXEC": "0", "UV_CACHE_DIR": str(tmp_path / "uv-cache"),
+        "EXPECTED_QUEUE": "debug", "APPROVAL_ID": "test-approval", "DRY_EXEC": "0",
+        "UV_CACHE_DIR": str(tmp_path / "uv-cache"),
         "BOOT_PARENT": str(tmp_path / "boot-parent"),
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
     })
@@ -745,7 +788,10 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
     phase1 = json.loads(plan_path.read_text(encoding="utf-8"))
     assert [row["device"] for row in phase1["rows"] if row["kind"] == "train"] == ["cuda"] * 3
 
-    env.update({"MODE": "train", "PLAN_MANIFEST": str(plan_path), "DRIVER": env["DRIVER"]})
+    selected_train = results_root / "plan" / "selected-train.json"
+    train_row = next(row for row in phase1["rows"] if row["kind"] == "train")
+    selected_train.write_text(json.dumps(train_row), encoding="utf-8")
+    env.update({"MODE": "train", "SELECTED_ROW": str(selected_train), "DRIVER": env["DRIVER"]})
     trained = _run("train", env)
     assert trained.returncode == 0, trained.stderr
     uv_controls = Path(env["UV_RECORD"]).read_text(encoding="utf-8").splitlines()
@@ -764,24 +810,24 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
     )
 
     invalid_manifest = results_root / "plan" / "cpu-row.json"
-    invalid_doc = json.loads(plan_path.read_text(encoding="utf-8"))
-    invalid_doc["rows"][1]["device"] = "cpu"
+    invalid_doc = dict(train_row)
+    invalid_doc["device"] = "cpu"
     invalid_manifest.write_text(json.dumps(invalid_doc), encoding="utf-8")
     before_invalid = Path(env["DRIVER_RECORD"]).read_bytes()
-    env.update({"PLAN_MANIFEST": str(invalid_manifest)})
+    env.update({"SELECTED_ROW": str(invalid_manifest)})
     invalid = _run("train", env)
     assert invalid.returncode == 2
     assert "must have device=cuda" in invalid.stderr
     assert Path(env["DRIVER_RECORD"]).read_bytes() == before_invalid
-    invalid_doc["rows"][1].pop("device")
+    invalid_doc.pop("device")
     invalid_manifest.write_text(json.dumps(invalid_doc), encoding="utf-8")
     invalid_missing = _run("train", env)
     assert invalid_missing.returncode == 2
     assert "must have device=cuda" in invalid_missing.stderr
     assert Path(env["DRIVER_RECORD"]).read_bytes() == before_invalid
-    env["PLAN_MANIFEST"] = str(plan_path)
+    env["SELECTED_ROW"] = str(selected_train)
 
-    env["FAIL_DRIVER"] = "1"
+    env["FAIL_DRIVER"] = "all"
     failing = _run("train", env)
     assert failing.returncode != 0
     env.pop("FAIL_DRIVER")
@@ -811,15 +857,16 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
         "--checkpoints", *[str(checkpoint) for checkpoint in HE_H2_EVAL_CHECKPOINTS],
         "--lineage-seeds", "1", "2", "3",
     ], cwd=checkout, check=True)
-    env.update({"MODE": "eval", "PLAN_MANIFEST": str(phase2_path)})
+    selected_eval = results_root / "plan" / "selected-eval.json"
+    eval_row = next(row for row in json.loads(phase2_path.read_text())["rows"] if row["kind"] == "eval")
+    selected_eval.write_text(json.dumps(eval_row), encoding="utf-8")
+    env.update({"MODE": "eval", "SELECTED_ROW": str(selected_eval)})
     evaluated = _run("eval", env)
     assert evaluated.returncode == 0, evaluated.stderr
     env["FAIL_DRIVER"] = "all"
     evaluated_fail = _run("eval", env)
     assert evaluated_fail.returncode != 0
-    assert len(list(results_root.glob("logs/*.status"))) >= 132
+    assert len(list(results_root.glob("logs/*.status"))) >= 3
     assert set(Path(env["TASKSET_RECORD"]).read_text().splitlines()) == {
         "0,1,2,3,4,5,6,7,8,9",
-        "10,11,12,13,14,15,16,17,18,19",
-        "20,21,22,23,24,25,26,27,28,29",
     }
