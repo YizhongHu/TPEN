@@ -337,13 +337,16 @@ def test_crossed_r2_successor_link_is_rejected(tmp_path: Path) -> None:
         current_attempt=AttemptId("current-r2"),
     )
     crossed = replace(admission, successor_attempt_id=AttemptId("other-successor"))
-    with pytest.raises(ValueError, match="successor binding crosses admission identity"):
+    crossed_request = json.loads(json.dumps(request))
+    crossed_request["successor"]["attempt_id"] = crossed.successor_attempt_id.value
+    with pytest.raises(ValueError, match="successor binding crosses admission identity") as error:
         SuccessorAdmissionRecord.from_recovery_admission(
             crossed, predecessor_task_id="successor", predecessor_content_id="a" * 64,
-            successor_task_id="successor", request_digest=digest(request),
+            successor_task_id="successor", request_digest=digest(crossed_request),
             core_acceptance_digest=acceptance, successor_binding=successor_binding,
-            successor_request=request,
+            successor_request=crossed_request,
         )
+    assert "successor binding crosses admission identity" in str(error.value), f"error={error.value!r}; request={crossed_request!r}"
 
 
 def test_tampered_v3_predecessor_link_is_rejected(tmp_path: Path) -> None:
@@ -363,8 +366,11 @@ def test_tampered_v3_predecessor_link_is_rejected(tmp_path: Path) -> None:
     wire = json.loads(record.encode())
     wire["predecessor"]["attempt_id"] = "tampered-predecessor"
     wire["predecessor"]["checkpoint_path"] = admission.checkpoint_path
-    with pytest.raises(ValueError, match="recovery admission crosses successor identity"):
+    wire["successor_request"]["predecessor"]["attempt_id"] = "tampered-predecessor"
+    wire["request_digest"] = digest(wire["successor_request"])
+    with pytest.raises(ValueError, match="recovery admission crosses successor identity") as error:
         SuccessorAdmissionRecord.from_mapping(wire)
+    assert "recovery admission crosses successor identity" in str(error.value), f"error={error.value!r}; wire={wire!r}"
 
 
 def test_r2_duplicate_replay_is_idempotent_and_fork_parks(tmp_path: Path) -> None:
