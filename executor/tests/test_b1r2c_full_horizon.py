@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from tpen_executor._codec import canonical_bytes, digest
+from tpen_executor._codec import canonical_bytes, digest, thaw
 from tpen_executor.allocations import AllocationAttemptV2, MemberInvocationV2
 from tpen_executor.contracts import AllocationAttemptId, ExecutionPlanV2, GroupId, InvocationId, AttemptId, ReadyGroup, ReadyGroupV2
 from tpen_executor.lifecycle.controller import _publish_full_horizon_side_effect
@@ -508,7 +508,7 @@ def test_crossed_successor_group_is_rejected(tmp_path: Path, monkeypatch: pytest
     records = store._admission_records_for_task(str(task_dir), task.task_id)
     crossed_binding = replace(records[0].successor_binding, group_digest=digest("foreign-group"))
     crossed = replace(records[0], successor_binding=crossed_binding)
-    monkeypatch.setattr(store, "_admission_records_for_task", lambda *_args: (crossed, records[1]))
+    monkeypatch.setattr(DirectoryStore, "_admission_records_for_task", lambda _self, *_args: (crossed, records[1]))
     with pytest.raises(FenceRejected, match="crosses final group"):
         _publish(store, group, final, verdict, task)
 
@@ -517,13 +517,13 @@ def test_crossed_successor_task_is_rejected(tmp_path: Path, monkeypatch: pytest.
     store, group, _predecessor, _middle, final, verdict, task = _chain_fixture(tmp_path)
     task_dir = Path(final.output_dir).parent
     records = store._admission_records_for_task(str(task_dir), task.task_id)
-    request = json.loads(json.dumps(records[0].successor_request))
+    request = thaw(records[0].successor_request)
     request["predecessor"]["task_id"] = "foreign-task"
     crossed = replace(
         records[0], predecessor_task_id="foreign-task", successor_request=request,
         request_digest=digest(request),
     )
-    monkeypatch.setattr(store, "_admission_records_for_task", lambda *_args: (crossed, records[1]))
+    monkeypatch.setattr(DirectoryStore, "_admission_records_for_task", lambda _self, *_args: (crossed, records[1]))
     with pytest.raises(FenceRejected, match="crosses task identity"):
         _publish(store, group, final, verdict, task)
 

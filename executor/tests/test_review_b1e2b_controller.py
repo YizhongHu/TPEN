@@ -355,7 +355,7 @@ def test_nonregular_completion_artifact_does_not_park_collected_group(
 
     def manifest_with_invalid_optional_completion(self, current_group):
         task_dir = Path(self.root) / "groups" / current_group.identity / "one"
-        (task_dir / "full-horizon-completion.json").mkdir()
+        (task_dir / "full-horizon-completion.json").mkdir(exist_ok=True)
         return original_manifest(self, current_group)
 
     monkeypatch.setattr(DirectoryStore, "manifest", manifest_with_invalid_optional_completion)
