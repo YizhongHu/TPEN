@@ -37,6 +37,7 @@ MUTANTS = (
     {"id": "preserve-typed-park-reason", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "elif member.action == \"park\":", "new": "elif False:", "killer": "test_controller_propagates_typed_park_reason"},
     {"id": "retain-r2-input-on-park", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "return replace(item, recovery_input=None, recovery_admission=admission)", "new": "return replace(item, recovery_admission=admission)", "killer": "test_controller_propagates_typed_park_reason"},
     {"id": "skip-r2-final-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "verdict = None if item.recovery_input is not None else admission_port.admit(rebuilt)", "new": "verdict = admission_port.admit(rebuilt)", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
+    {"id": "require-r2-fence-for-legacy", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if admission_record.recovery_admission is not None:", "new": "if True:", "killer": "test_successor_uses_admitted_start_only"},
 )
 
 
@@ -310,7 +311,7 @@ def test_r2_input_uses_admit_recovery_not_legacy_selector(tmp_path: Path, monkey
     legacy_port = RecordingAdmission()
     legacy_executor = BoundaryExecutor([])
     run_group_controller(legacy_binding, legacy_alloc.backend_job_id, legacy_facts, legacy_store, legacy_port, legacy_executor)
-    assert legacy_port.calls and legacy_port.calls == ["real-task"] * len(legacy_port.calls)
+    assert legacy_port.calls and legacy_port.calls == ["successor"] * len(legacy_port.calls)
 
 
 @pytest.mark.parametrize("publication_mode", ["raise", "park"])

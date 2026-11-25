@@ -367,17 +367,19 @@ def run_group_controller(
                     admission_record = next((item.admission for item in durable_publication.members if item.evidence.task_id == member.task_id), None)
                     if not isinstance(admission_record, SuccessorAdmissionRecord) or admission_record.successor_binding is None:
                         raise LaunchIntentRejected("successor admission unavailable")
-                    member_input = next(item for item in frozen_inputs if item.task_id == member.task_id)
-                    if member_input.attempt_id is None or member_input.start_receipt is None:
-                        raise LaunchIntentRejected("recovery current fence unavailable")
-                    current_fence = AttemptFence(
-                        store.root,
-                        group.identity,
-                        member.task_id,
-                        member_input.start_receipt.allocation_id.value,
-                        member_input.attempt_id,
-                        member_input.start_receipt.output_dir,
-                    )
+                    current_fence = None
+                    if admission_record.recovery_admission is not None:
+                        member_input = next(item for item in frozen_inputs if item.task_id == member.task_id)
+                        if member_input.attempt_id is None or member_input.start_receipt is None:
+                            raise LaunchIntentRejected("recovery current fence unavailable")
+                        current_fence = AttemptFence(
+                            store.root,
+                            group.identity,
+                            member.task_id,
+                            member_input.start_receipt.allocation_id.value,
+                            member_input.attempt_id,
+                            member_input.start_receipt.output_dir,
+                        )
                     fence = store.begin_admitted_successor_current_controller(
                         group, member.task_id, allocation, facts.observed_at_utc, "local",
                         allocation_attempt=admission_record.successor_binding.allocation_attempt, admission=admission_record,
