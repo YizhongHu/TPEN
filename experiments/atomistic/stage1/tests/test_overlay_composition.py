@@ -149,7 +149,7 @@ def _v1_golden_plan(plan_key: str) -> tuple[
     )
     train_row = next(row for row in phase1 if row["kind"] == "train")
     train_cfg = stage1_train.build_train_config(train_row)
-    return plan, phase1, eval_rows, train_cfg
+    return golden, phase1, eval_rows, train_cfg
 
 
 @pytest.mark.parametrize("plan_key", ("he-h2", "hooke-qho2e"))
@@ -165,13 +165,14 @@ def test_v1_matches_origin_dev_golden_bytes(plan_key: str) -> None:
     callback insertion to the v1 branch must make this test fail.
     """
 
-    golden, phase1, eval_rows, train_cfg = _v1_golden_plan(plan_key)
+    golden_file, phase1, eval_rows, train_cfg = _v1_golden_plan(plan_key)
+    golden = golden_file["plans"][plan_key]
     phase1_bytes = _canonical_json(phase1)
     combined_bytes = _canonical_json(phase1 + eval_rows)
     callback_bytes = _canonical_json(
         OmegaConf.to_container(train_cfg.callbacks, resolve=True)
     )
-    assert golden["origin_dev"] == "fba6e82ab1091846fbe5ea7c36707ebfafd3c66a"
+    assert golden_file["origin_dev"] == "fba6e82ab1091846fbe5ea7c36707ebfafd3c66a"
     assert golden["overlay"] == next(
         row["overlay"] for row in phase1 if row["kind"] == "train"
     )
