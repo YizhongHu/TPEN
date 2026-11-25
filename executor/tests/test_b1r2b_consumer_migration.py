@@ -28,7 +28,7 @@ from test_review_b1b2_controller import _real_fresh
 from test_review_b1b2_t2_r1 import RecordingExecutor, _binding
 from test_b1e1_local_executor import _environment as _local_environment, _failure_result, _group as _local_group, _invocation as _local_invocation
 from test_c22_output_binding import _allocation_with_cpu, _configured
-from test_core_evidence_v3 import _typed_evidence
+from test_core_evidence_v3 import _typed_evidence_payload
 
 
 MUTANTS = (
@@ -45,7 +45,7 @@ MUTANTS = (
     {"id": "r2-current-fence-required", "target": "executor/src/tpen_executor/storage.py", "old": "current_attempt_id = current_fence.attempt_id.value", "new": "current_attempt_id = admission.predecessor_attempt_id.value", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
     {"id": "preserve-typed-park-reason", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "elif member.action == \"park\":", "new": "elif False:", "killer": "test_controller_propagates_typed_park_reason"},
     {"id": "retain-r2-input-on-park", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "        recovery_input=None,\n        recovery_admission=admission,\n        recovery_evidence=request.evidence,", "new": "        recovery_admission=admission,\n        recovery_evidence=request.evidence,", "killer": "test_controller_propagates_typed_park_reason"},
-    {"id": "skip-r2-final-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if item.recovery_input is not None:", "new": "if False:", "killer": "test_r2_final_reconciliation_does_not_use_legacy_selector"},
+    {"id": "skip-r2-final-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "clear_recovery = item.recovery_input is not None", "new": "clear_recovery = False", "killer": "test_r2_final_reconciliation_does_not_use_legacy_selector"},
     {"id": "require-r2-fence-for-legacy", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if admission_record.recovery_admission is not None:\n                        member_input", "new": "if True:\n                        member_input", "killer": "test_successor_uses_admitted_start_only"},
     {"id": "local-r2-ignores-admitted-load", "target": "executor/src/tpen_executor/lifecycle/local_executor.py", "old": "return self._submit(fence, invocation, admitted_checkpoint_path=checkpoint_path)", "new": "return self._submit(fence, invocation)", "killer": "test_local_r2_adapter_binds_admitted_checkpoint"},
     {"id": "controller-r2-plain-submit-fallback", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if admission_record is not None and admission_record.recovery_admission is not None:\n                        submit_admitted = getattr(executor, \"submit_admitted_successor\", None)", "new": "if admission_record is not None and False:\n                        submit_admitted = getattr(executor, \"submit_admitted_successor\", None)", "killer": "test_r2_adapter_without_admitted_boundary_refuses"},
@@ -88,8 +88,8 @@ class BoundaryExecutor(RecordingExecutor):
 
     def _decorate_context(self, fence, context):
         if self.evidence_mode == "v3":
-            evidence = _typed_evidence(Path(fence.output_dir) / "core", self.evidence_outcome)
-            context = replace(context, result=replace(context.result, evidence=evidence.to_dict()))
+            evidence = _typed_evidence_payload(Path(fence.output_dir) / "core", self.evidence_outcome)
+            context = replace(context, result=replace(context.result, evidence=evidence))
         elif self.evidence_mode == "missing":
             context = replace(
                 context,
