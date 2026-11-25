@@ -196,15 +196,19 @@ def test_linear_method_validation_is_non_mutating_and_loader_reuses_it() -> None
         model_parameters=ModelParameterBinding(parameters=(parameter,)),
         conventions=ScoreConventions(solve_dtype=torch.float64),
     )
+    method.completed_updates = 7
     invalid = copy.deepcopy(method.method_state_dict())
+    invalid["completed_updates"] = 11
     invalid["policy"] = {"drift": True}
     before = method.method_state_dict()
     with pytest.raises(ValueError, match="checkpoint policy"):
         method.validate_method_state_dict(invalid)
     assert method.method_state_dict() == before
+    assert method.completed_updates == 7
     with pytest.raises(ValueError, match="checkpoint policy"):
         method.load_method_state_dict(invalid)
     assert method.method_state_dict() == before
+    assert method.completed_updates == 7
 
 
 def test_linear_method_train_resume_refusal_is_prevalidated_and_matching_restores(
@@ -281,15 +285,20 @@ def test_linear_method_train_resume_refusal_is_prevalidated_and_matching_restore
 @pytest.mark.parametrize("kind", ["sr", "spring"])
 def test_json_method_validation_is_non_mutating_and_loader_reuses_it(kind: str) -> None:
     model, method, _, _ = _build_checkpoint_run(kind, max_steps=1, seed=0, nonfinite_local_energy_policy="fail")
+    method.completed_updates = 7
     state = dict(method.method_state_dict())
     invalid = copy.deepcopy(state)
+    invalid["completed_updates"] = 11
     invalid["policy"] = {"drift": True}
     before = method.method_state_dict()
     with pytest.raises(ValueError):
         method.validate_method_state_dict(invalid)
     assert method.method_state_dict() == before
+    assert method.completed_updates == 7
     with pytest.raises(ValueError):
         method.load_method_state_dict(invalid)
+    assert method.method_state_dict() == before
+    assert method.completed_updates == 7
 
 
 @pytest.mark.parametrize("factory", [
@@ -299,14 +308,19 @@ def test_json_method_validation_is_non_mutating_and_loader_reuses_it(kind: str) 
 def test_other_stateful_method_validation_is_non_mutating_and_loader_reuses_it(factory) -> None:
     parameter = torch.nn.Parameter(torch.ones(2, dtype=torch.float64))
     method = factory(parameter)
+    method.completed_updates = 7
     invalid = copy.deepcopy(method.method_state_dict())
+    invalid["completed_updates"] = 11
     invalid["policy"] = {"drift": True}
     before = method.method_state_dict()
     with pytest.raises(ValueError):
         method.validate_method_state_dict(invalid)
     assert method.method_state_dict() == before
+    assert method.completed_updates == 7
     with pytest.raises(ValueError):
         method.load_method_state_dict(invalid)
+    assert method.method_state_dict() == before
+    assert method.completed_updates == 7
 
 
 def test_base_method_validator_and_loader_agree_on_empty_and_nonempty_state() -> None:
