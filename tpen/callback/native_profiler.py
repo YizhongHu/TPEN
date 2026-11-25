@@ -296,7 +296,7 @@ class NativeProfiler(Callback):
             claims.append(self.sink.ownership_claim(artifact_manager, invocation_id, self.observer_id))
         return claims
 
-    def run_scope(self, context: RunContext) -> AbstractContextManager[RunResource | None]:
+    def run_scope(self, context: Any) -> AbstractContextManager[RunResource | None]:
         if not self.enabled:
             return _DisabledScope()
         if self._unsafe or self._active_session is not None:
