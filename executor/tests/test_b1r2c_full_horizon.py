@@ -43,6 +43,13 @@ MUTANTS = (
         "killer": "test_symlinked_core_outcome_is_rejected",
     },
     {
+        "id": "full-horizon-normalizes-completed-at",
+        "target": "executor/src/tpen_executor/storage.py",
+        "old": "_canonical_completed_at(outcome.finished_at_utc)",
+        "new": "outcome.finished_at_utc",
+        "killer": "test_completed_at_normalizes_utc_offset",
+    },
+    {
         "id": "full-horizon-requires-target-progress",
         "target": "executor/src/tpen_executor/results.py",
         "old": "self.completed_updates < self.target_iterations",
@@ -187,6 +194,7 @@ MUTANTS = (
 MUTANT_GUARDS = {
     "full-horizon-requires-typed-completed-verdict": "typed completed verdict",
     "full-horizon-requires-core-evidence": "durable core outcome",
+    "full-horizon-normalizes-completed-at": "canonical completed_at UTC rendering",
     "full-horizon-requires-target-progress": "completed_updates >= target_iterations",
     "full-horizon-requires-checkpoint-path-agreement": "checkpoint/checkpoint_ref path equality",
     "full-horizon-requires-science-lineage": "successor science equals TaskSpec science",
@@ -231,6 +239,12 @@ INTENDED_ASSERTION_TRACES = {
     "test_symlinked_core_outcome_is_rejected": (
         "typed completed verdict", "durable core outcome", "symlink core-outcome regular-file guard",
     ),
+    "test_completed_at_normalizes_utc_offset": (
+        "typed completed verdict", "durable core outcome", "canonical completed_at UTC rendering",
+    ),
+    "test_completed_at_rejects_non_utc_or_naive": (
+        "typed completed verdict", "durable core outcome", "canonical completed_at UTC validation",
+    ),
     "test_successor_request_digest_is_checked": ("typed completed verdict", "durable core outcome", "request digest recomputation"),
     "test_successor_target_horizon_is_checked": ("typed completed verdict", "durable core outcome", "fixed total horizon"),
     "test_checkpoint_counters_are_checked": ("typed completed verdict", "durable core outcome", "checkpoint counter agreement"),
@@ -266,14 +280,20 @@ def _evidence(core_dir: Path, *, outcome: str = "completed", completed_updates: 
     return CoreRunEvidence.from_mapping(payload)
 
 
-def _single_fixture(tmp_path: Path, *, completed_updates: int = 1, crossed: bool = False):
+def _single_fixture(
+    tmp_path: Path,
+    *,
+    completed_updates: int = 1,
+    crossed: bool = False,
+    finished_at_utc: str = "2026-11-25T14:01:00+00:00",
+):
     store, base_group, allocation = setup_store(tmp_path)
     task = replace(base_group.members[0], target_horizon_units="iterations")
     group = ReadyGroup(base_group.group_id, (task,), base_group.execution_plan_digest)
     fence = store.begin_attempt(group, "a", allocation, "2026-11-25T14:00:00Z")
     core_dir = Path(fence.output_dir) / "core"
     core_dir.mkdir()
-    store.finish_attempt(fence, "completed", "2026-11-25T14:01:00Z")
+    store.finish_attempt(fence, "completed", finished_at_utc)
     store.record_core_outcome(fence, _evidence(core_dir, completed_updates=completed_updates, crossed=crossed))
     return store, group, fence, _verdict(), task
 
@@ -332,6 +352,29 @@ def test_replay_conflict_is_a_fork(tmp_path: Path) -> None:
     outcome_path.write_bytes(canonical_bytes(outcome))
     with pytest.raises(FullHorizonFork, match="conflicts"):
         _publish(store, group, fence, verdict, task)
+
+
+def test_completed_at_normalizes_utc_offset(tmp_path: Path) -> None:
+    store, group, fence, verdict, task = _single_fixture(
+        tmp_path, finished_at_utc="2026-11-25T14:01:00.123456+00:00",
+    )
+    # If normalization is removed, the strict record validator refuses the
+    # raw +00:00 text; convert that mutant-only refusal into this assertion's
+    # intended failure rather than a wrong-exception kill.
+    try:
+        record = _publish(store, group, fence, verdict, task)
+    except (FenceRejected, ValueError):
+        record = None
+    assert record is not None
+    assert record.completed_at == "2026-11-25T14:01:00.123456Z"
+
+
+@pytest.mark.parametrize("finished_at_utc", ("2026-11-25T14:01:00+05:00", "2026-11-25T14:01:00"))
+def test_completed_at_rejects_non_utc_or_naive(tmp_path: Path, finished_at_utc: str) -> None:
+    store, group, fence, verdict, task = _single_fixture(tmp_path, finished_at_utc=finished_at_utc)
+    with pytest.raises(FenceRejected, match="final outcome timestamp must be UTC"):
+        _publish(store, group, fence, verdict, task)
+    assert not (Path(store.root) / "groups" / group.identity / task.task_id / "full-horizon-completion.json").exists()
 
 
 def test_completion_refusal_is_side_effect_only() -> None:
@@ -598,7 +641,7 @@ def _chain_fixture(tmp_path: Path, *, science_input: str | None = None, request_
     predecessor = store.begin_attempt(group, "a", allocation, "2026-11-25T14:00:00Z", allocation_attempt=lease1, invocation_id=InvocationId("invocation-predecessor"))
     predecessor_core = Path(predecessor.output_dir) / "core"
     predecessor_core.mkdir()
-    store.finish_attempt(predecessor, "failed", "2026-11-25T14:01:00Z")
+    store.finish_attempt(predecessor, "failed", "2026-11-25T14:01:00+00:00")
     predecessor_evidence = _evidence(predecessor_core, outcome="planned_yield")
     store.record_core_outcome(predecessor, predecessor_evidence)
 
@@ -626,7 +669,7 @@ def _chain_fixture(tmp_path: Path, *, science_input: str | None = None, request_
     )
     middle_core = Path(middle.output_dir) / "core"
     middle_core.mkdir()
-    store.finish_attempt(middle, "failed", "2026-11-25T14:03:00Z")
+    store.finish_attempt(middle, "failed", "2026-11-25T14:03:00+00:00")
     middle_evidence = _evidence(middle_core, outcome="planned_yield")
     store.record_core_outcome(middle, middle_evidence)
 
@@ -654,7 +697,7 @@ def _chain_fixture(tmp_path: Path, *, science_input: str | None = None, request_
     )
     final_core = Path(final.output_dir) / "core"
     final_core.mkdir()
-    store.finish_attempt(final, "completed", "2026-11-25T14:05:00Z")
+    store.finish_attempt(final, "completed", "2026-11-25T14:05:00+00:00")
     store.record_core_outcome(final, _evidence(final_core))
     return store, group, predecessor, middle, final, _verdict(), task
 
