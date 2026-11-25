@@ -435,13 +435,15 @@ def test_full_horizon_checkpoint_is_incompatible_resume(tmp_path: Path, monkeypa
     assert error.value.cause is restart.RestartCause.INVALID_RESUME
 
 
-def _real_restart_row(tmp_path: Path, *, run_id: str) -> dict[str, object]:
-    """Build a two-update He row retaining the committed diagnostics overlay."""
+def _real_restart_row(
+    tmp_path: Path, *, run_id: str, lineage_updates: int = 2,
+) -> dict[str, object]:
+    """Build a bounded He row retaining the committed diagnostics overlay."""
 
     protocol = Protocol(
         smoke_updates=1,
         smoke_walkers=2,
-        lineage_updates=2,
+        lineage_updates=lineage_updates,
         lineage_walkers=2,
         lineages=3,
         eval_streams=4,
@@ -453,7 +455,7 @@ def _real_restart_row(tmp_path: Path, *, run_id: str) -> dict[str, object]:
         protocol=protocol,
         source_sha="a" * 40,
         config_sha256=config_identities(config_root=CONFIG_ROOT, systems=("he",)),
-        checkpoints=[0, 1, 2],
+        checkpoints=list(range(lineage_updates + 1)),
         lineage_seeds=[11, 12, 13],
         checkpoint_sha256={},
         results_root=str(tmp_path),
@@ -714,7 +716,7 @@ def _real_restart_child() -> None:
             run=run_from_config,
         )
         evidence = inspect_run(resolve_run_dir(effective_row))
-    elif phase == "resumed":
+    elif phase in {"resumed", "horizon-mismatch"}:
         code = restart.execute_train(
             cfg=cfg,
             row=effective_row,
@@ -741,6 +743,8 @@ def _real_restart_child() -> None:
         "exit_code": code,
         "inspection": evidence.to_dict(),
         "target_iterations": outcome_doc["target_iterations"],
+        "error": outcome_doc.get("error"),
+        "exception_type": outcome_doc.get("exception_type"),
     }
     if phase == "resumed":
         result["runner_load"] = {
@@ -919,3 +923,56 @@ def test_real_fresh_process_restore_parity_with_checkpoint_zero_and_overlay(
     reference_trainer = json.loads((reference_checkpoint / "trainer.json").read_text(encoding="utf-8"))
     assert resumed_trainer == reference_trainer
     assert {"next_iteration", "completed_updates"} <= set(resumed_trainer)
+
+    # Keep the H=2 green route above as the ordinary prefix/continuation
+    # control.  This isolated arm reuses a separately published H=2 prefix,
+    # then rebuilds both row and config for H=3 before asking a fresh process
+    # to continue it.  Core's trainer_config compatibility refusal must stop
+    # the restore before any update or checkpoint publication.
+    h_sensitive_source = _real_restart_row(
+        tmp_path / "h-sensitive", run_id="h-sensitive-prefix", lineage_updates=2,
+    )
+    h_sensitive_row = derive_smoke_request(
+        h_sensitive_source, results_root=str(tmp_path / "h-sensitive"), stop_at=1,
+    )
+    h_sensitive_row_path = tmp_path / "h-sensitive-row.json"
+    h_sensitive_row_path.write_text(
+        json.dumps(h_sensitive_row, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    h_sensitive_fresh = _run_real_restart_child({
+        "phase": "fresh",
+        "row_path": str(h_sensitive_row_path),
+        "config_path": str(config_path),
+    })
+    assert h_sensitive_fresh["outcome"] == "planned_yield"
+    assert h_sensitive_fresh["exit_code"] == 2
+
+    h3_row = _real_restart_row(
+        tmp_path / "h-sensitive", run_id="h-sensitive-prefix", lineage_updates=3,
+    )
+    h3_row_path = tmp_path / "h3-row.json"
+    h3_row_path.write_text(json.dumps(h3_row, sort_keys=True) + "\n", encoding="utf-8")
+    prefix_dir = resolve_run_dir(h_sensitive_row)
+    prefix_checkpoint = prefix_dir / "checkpoints" / "step_000001"
+    catalog = prefix_dir / "checkpoints" / "publications.jsonl"
+    before_catalog = catalog.read_bytes()
+    before_payloads = {
+        name: (prefix_checkpoint / name).read_bytes()
+        for name in ("model.pt", "optimizer.pt", "sampler.pt", "rng.pt", "trainer.json")
+    }
+
+    h3_result = _run_real_restart_child({
+        "phase": "horizon-mismatch",
+        "row_path": str(h3_row_path),
+        "config_path": str(config_path),
+    })
+    assert h3_result["outcome"] == "failed"
+    assert h3_result["exit_code"] == 1
+    assert h3_result["exception_type"] == "ValueError"
+    assert "trainer_config mismatch" in h3_result["error"]
+    assert catalog.read_bytes() == before_catalog
+    assert not (prefix_dir / "checkpoints" / "step_000002").exists()
+    assert {
+        name: (prefix_checkpoint / name).read_bytes()
+        for name in before_payloads
+    } == before_payloads
