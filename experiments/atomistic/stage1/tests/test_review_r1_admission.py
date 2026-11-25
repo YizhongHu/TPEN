@@ -1,4 +1,4 @@
-"""Focused T2 admission tests imported from the recorder-order review."""
+"""T2 review probes for recorder payload and phase-2 profile admission."""
 
 from __future__ import annotations
 
@@ -81,6 +81,13 @@ def test_v2_resolved_validation_rejects_recorder_payload_mutation(
         protocol_module.validate_resolved_train_config(cfg, row)
 
 
+def test_v2_resolved_validation_accepts_unchanged_recorder_payload() -> None:
+    """The mutation detectors have a green control on the unmodified config."""
+
+    row, cfg = _v2_train_row()
+    protocol_module.validate_resolved_train_config(cfg, row)
+
+
 @pytest.mark.parametrize("system", protocol_module.SYSTEMS)
 def test_v2_canonical_single_checkpoint_passes(system: str) -> None:
     """Every canonical Stage-1 base composes one recorder before its publisher."""
@@ -105,7 +112,7 @@ def test_v2_canonical_single_checkpoint_passes(system: str) -> None:
     assert recorders == [checkpoints[0] - 1]
 
 
-def test_v2_composition_refuses_multiple_checkpoint_publishers() -> None:
+def test_v2_composition_handles_two_base_checkpoints() -> None:
     """The v2 one-writer contract rejects unsupported publisher multiplicity."""
 
     system = "he"
