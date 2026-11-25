@@ -46,7 +46,7 @@ export PATH="$WORK_ROOT/overlay/bin:$PATH"
 echo "job=$SLURM_JOB_ID partition=$SLURM_JOB_PARTITION host=$(hostname)"
 echo "python=$(command -v python)"
 python -c 'import sys, torch; print("python_version=" + sys.version.split()[0]); print("torch_version=" + torch.__version__); print("cuda_available=" + str(torch.cuda.is_available()))'
-export TPEN_SOURCE_SHA=1724c9d034653fceb04b1e033f650624883f9ad0
+: "${TPEN_SOURCE_SHA:?TPEN_SOURCE_SHA must be the exact staged source head}"
 python scripts/cannon/sr_replay_benchmark.py \
   --device cpu \
   --smoke \
