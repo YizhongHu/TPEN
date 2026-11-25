@@ -866,7 +866,15 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
     env["FAIL_DRIVER"] = "all"
     evaluated_fail = _run("eval", env)
     assert evaluated_fail.returncode != 0
-    assert len(list(results_root.glob("logs/*.status"))) == 2
+    statuses = sorted(results_root.glob("logs/*.status"))
+    assert len(statuses) == 2
+    status_rows = set()
+    for status in statuses:
+        fields = dict(field.split("=", 1) for field in status.read_text().splitlines())
+        status_rows.add(fields["row_id"])
+        assert status.name.startswith(f"row-{fields['row_id']}-")
+    assert status_rows == {train_row["row_id"], eval_row["row_id"]}
+    assert len(status_rows) == len(statuses)
     assert set(Path(env["TASKSET_RECORD"]).read_text().splitlines()) == {
         "0,1,2,3,4,5,6,7,8,9",
     }
