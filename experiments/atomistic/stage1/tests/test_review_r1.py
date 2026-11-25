@@ -73,25 +73,15 @@ def test_production_planner_controls_preserve_expected_profile_boundary(
 def test_mixed_or_omitted_planner_does_not_emit_unprofiled_hooke_rows(
     tmp_path: Path, systems: tuple[str, ...] | None,
 ) -> None:
-    """Every Hooke train row must retain the profile and independent seed fields."""
+    """Mixed/default Hooke planning refuses before writing a partial manifest."""
 
     returncode, rows, stderr = _run_phase1_plan(tmp_path, *(systems or ()))
-    if returncode:
-        # A deliberate fail-closed planner refusal is a valid mixed-population
-        # safety outcome; it must not emit a partial manifest.
-        assert systems is None or systems == ("hooke1", "he")
-        assert stderr.strip()
-        return
-    assert rows is not None
-    hooke_rows = [
-        row for row in rows
-        if row["kind"] == "train" and row["system"] in {"hooke1", "hooke2", "qho2e"}
-    ]
-    assert hooke_rows
-    assert all(row.get("science_profile") == "hooke-hv2-v1" for row in hooke_rows)
-    assert all(isinstance(row.get("lineage_seed"), int) for row in hooke_rows)
-    assert all(isinstance(row.get("sampler_seed"), int) for row in hooke_rows)
-    assert all(row.get("training_seed_rule") == "stage1-training-seeds-v1" for row in hooke_rows)
+    output = tmp_path / ("-".join(systems) if systems else "all") / "manifest.json"
+    assert returncode != 0
+    assert rows is None
+    assert "refuses" in stderr
+    assert "Hooke science profile" in stderr
+    assert not output.exists()
 
 
 def _cfg(tmp_path: Path) -> object:
@@ -219,6 +209,23 @@ def test_derived_smoke_composition_preserves_science_recipe(
     assert derived["checkpoint_steps"] == source["checkpoint_steps"]
     assert derived.get("overlay") == source.get("overlay")
     assert derived.get("seed") == source.get("seed")
+    later = derive_smoke_request(source, results_root=str(isolated_root), stop_at=2_000)
+    later_cfg = build_train_config(
+        later,
+        config_path=config_root / system / "train.yaml",
+        overrides=row_overrides(later),
+    )
+    later_doc = _normalise_roots(
+        OmegaConf.to_container(later_cfg, resolve=True),
+        (str(isolated_root),),
+    )
+    assert later_doc == source_doc
+    for identity_key in (
+        "config_sha256", "system_id", "overlay", "overlay_sha256", "science_profile",
+        "seed", "lineage_seed", "sampler_seed", "updates", "walkers", "checkpoint_steps",
+    ):
+        assert later.get(identity_key) == source.get(identity_key)
+    assert later["execution"] == {"stop_at": 2_000}
     if hooke:
         assert derived["science_profile"] == HOOKE_SCIENCE_PROFILE
         assert derived["lineage_seed"] == source["lineage_seed"]

@@ -61,6 +61,14 @@ def main() -> int:
         if (args.source_sha is None or args.results_root is None
                 or args.lineage_seeds is None):
             parser.error("phase 1 requires --source-sha, --results-root and --lineage-seeds")
+        if systems is None or (
+            selected_for_profile & HOOKE_SYSTEMS
+            and not selected_for_profile.issubset(HOOKE_SYSTEMS)
+        ):
+            parser.error(
+                "phase 1 refuses selections containing Hooke systems without the "
+                "Hooke science profile; choose Hooke-only systems or a non-Hooke selection"
+            )
         if args.checkpoints is None:
             if STAGE1_PROTOCOL.retention_cadence is None:
                 parser.error("--checkpoints is required for protocols without retention_cadence")

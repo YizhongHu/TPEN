@@ -384,9 +384,14 @@ def execute_restart(
     if callbacks:
         kwargs["runtime_callbacks"] = callbacks
     exit_code = int(runner(cfg, **kwargs))
+    outcome = {
+        0: "completed",
+        1: "failed",
+        2: "planned_yield",
+    }.get(exit_code, "failed")
     return RestartResult(
         selection=selection,
-        outcome="completed" if exit_code == 0 else "failed",
+        outcome=outcome,
         exit_code=exit_code,
         runner_load=runner_load,
     )
