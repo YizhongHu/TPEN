@@ -988,6 +988,8 @@ class DirectoryStore:
                     recovery_admission = recovery_admissions.get(member.task_id) or getattr(
                         by_task[member.task_id], "recovery_admission", None
                     )
+                    if recovery_admission is not None:
+                        self._validate_recovery_request_binding(request, recovery_admission, member.task_id)
                     predecessor_content_id = request["core_evidence"]["checkpoint_ref"]["content_id"]
                     if recovery_admission is None:
                         admission = SuccessorAdmissionRecord(
@@ -1457,6 +1459,31 @@ class DirectoryStore:
         if not isinstance(request["core_evidence"], Mapping):
             raise TypeError("core_evidence must be a mapping")
         return request
+
+    @staticmethod
+    def _validate_recovery_request_binding(
+        request: Mapping[str, Any], admission: Any, task_id: str,
+    ) -> None:
+        """Bind an embedded R2 request to its independently admitted facts."""
+
+        from .recovery import RecoveryAdmissionV1
+
+        if not isinstance(admission, RecoveryAdmissionV1) or admission.status != "admitted":
+            raise FenceRejected("recovery admission is not admitted")
+        predecessor = request["predecessor"]
+        successor = request["successor"]
+        checkpoint_ref = request["core_evidence"].get("checkpoint_ref")
+        if not isinstance(checkpoint_ref, Mapping):
+            raise FenceRejected("recovery request lacks checkpoint identity")
+        if (
+            predecessor["task_id"] != task_id
+            or predecessor["attempt_id"] != admission.predecessor_attempt_id.value
+            or successor["task_id"] != task_id
+            or successor["attempt_id"] != admission.successor_attempt_id.value
+            or checkpoint_ref.get("content_id") != admission.checkpoint.content_id
+            or checkpoint_ref.get("checkpoint_dir") != admission.checkpoint_path
+        ):
+            raise FenceRejected("recovery request crosses admitted facts")
 
     def _continuation_predecessor_locked(
         self, fence: AttemptFence, task_dir: str, *, current: bool = True,
@@ -2220,8 +2247,13 @@ def read_successor_admission(
             # CoreOutcomeRecord for C1 to read the admitted link.
             if record.recovery_admission is not None and record.successor_request is not None:
                 request = thaw(record.successor_request)
+                request = store._successor_request_shape(request)
                 if digest(request) != record.request_digest:
                     raise AdmissionIntentMismatch("successor admission intent does not match request digest")
+                try:
+                    store._validate_recovery_request_binding(request, record.recovery_admission, task_id)
+                except FenceRejected as error:
+                    raise AdmissionIdentityMismatch("successor admission request crosses admitted facts") from error
                 if (request.get("science_input_digest") != science_input_digest
                         or request.get("target_iterations") != target_iterations):
                     raise AdmissionIntentMismatch("successor admission intent does not match caller intent")

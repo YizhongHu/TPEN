@@ -446,6 +446,40 @@ class SuccessorAdmissionRecord:
         if self.successor_request is not None:
             if not isinstance(self.successor_request, Mapping):
                 raise TypeError("successor_request must be a mapping")
+            request = self.successor_request
+            expected_request = {
+                "schema", "predecessor", "successor", "science_input_digest",
+                "target_iterations", "core_evidence",
+            }
+            if set(request) != expected_request:
+                raise ValueError("successor_request has an invalid closed shape")
+            predecessor = request["predecessor"]
+            successor = request["successor"]
+            if (
+                not isinstance(predecessor, Mapping)
+                or set(predecessor) != {"task_id", "attempt_id", "core_outcome_digest", "resolved_config_identity"}
+                or not isinstance(successor, Mapping)
+                or set(successor) != {"task_id", "attempt_id"}
+            ):
+                raise ValueError("successor_request identity shape is invalid")
+            if (
+                predecessor["task_id"] != self.predecessor_task_id
+                or predecessor["attempt_id"] != self.predecessor_attempt_id.value
+                or successor["task_id"] != self.successor_task_id
+                or successor["attempt_id"] != self.successor_attempt_id.value
+            ):
+                raise ValueError("successor_request crosses admission identity")
+            evidence = request["core_evidence"]
+            checkpoint_ref = evidence.get("checkpoint_ref") if isinstance(evidence, Mapping) else None
+            if not isinstance(checkpoint_ref, Mapping):
+                raise ValueError("successor_request lacks checkpoint identity")
+            if checkpoint_ref.get("content_id") != self.predecessor_content_id:
+                raise ValueError("successor_request checkpoint content crosses admission identity")
+            if (
+                self.recovery_admission is not None
+                and checkpoint_ref.get("checkpoint_dir") != self.recovery_admission.checkpoint_path
+            ):
+                raise ValueError("successor_request checkpoint path crosses recovery admission")
             object.__setattr__(self, "successor_request", _freeze(self.successor_request))
 
     @property

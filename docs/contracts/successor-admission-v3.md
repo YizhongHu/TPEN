@@ -123,6 +123,16 @@ The nested request's `predecessor` and `successor` identity fields are strings;
 "tpen-config-identity-v1"` and lowercase 64-hex `sha256`. The request is
 frozen into the record and its canonical digest MUST equal `request_digest`.
 
+For an R2 record, the writer MUST bind this embedded request to the independent
+`recovery_admission` before writing the ledger: both request task ids equal the
+record task, the request predecessor and successor `attempt_id` values equal
+the admission's typed `value` fields, and
+`core_evidence.checkpoint_ref.content_id` and `checkpoint_dir` equal the
+admission's selected `content_id` and `checkpoint_path`. The reader MUST
+validate the same closed shape and equalities after recomputing
+`request_digest`; a request that is individually well-formed but crossed with
+the outer admission is unreadable.
+
 ## Crossed-link rejection
 
 A decoder or store reader MUST fail closed on any crossed link. In particular,
@@ -140,8 +150,11 @@ it MUST reject a record when:
    or its reason is not `recovery-evidence-valid`.
 6. The ledger task, predecessor start receipt, group, or launched output leaf
    disagrees with the record's identities.
-7. The canonical request digest or caller science/iteration intent does not
-   match `successor_request`.
+7. The embedded request has extra/missing fields, its canonical request digest
+   does not match `request_digest`, its predecessor/successor identities do not
+   equal the outer/admitted identities, or its checkpoint content/path does
+   not equal the admitted checkpoint facts.
+8. The caller science/iteration intent does not match `successor_request`.
 
 The linked result is not a core outcome. If the predecessor was hard-killed and
 no core outcome exists, the reader uses the embedded admitted request and

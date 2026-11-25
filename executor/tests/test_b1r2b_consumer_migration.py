@@ -5,24 +5,29 @@ from __future__ import annotations
 import ast
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from tpen_executor._codec import canonical_bytes, digest
-from tpen_executor.allocations import ConfiguredAllocation, ControllerGenerationV1
-from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId, InvocationId
+from tpen_executor.allocations import AllocationAttemptV2, ConfiguredAllocation, ControllerGenerationV1, MemberInvocationV2
+from tpen_executor.contracts import AllocationAttemptId, AllocationId, AttemptId, BackendJobId, InvocationId
+from tpen_executor.dispatch.transport import LeafRequest
 from tpen_executor.lifecycle.attached import AttachedAllocation
 from tpen_executor.lifecycle.controller import GroupControllerFactsV1, run_group_controller
 import tpen_executor.lifecycle.controller as controller_module
-from tpen_executor.recovery import RecoveryAdmissionInputV1, RecoveryGrantV1, admit_recovery
-from tpen_executor.results import SuccessorAdmissionRecord
-from tpen_executor.storage import AdmissionFork, DirectoryStore, read_successor_admission
+from tpen_executor.recovery import CoreAdmissionVerdictV2, RecoveryAdmissionInputV1, RecoveryGrantV1, admit_recovery
+from tpen_executor.results import OutcomeReceipt, StartReceipt, SuccessorAdmissionRecord
+from tpen_executor.lifecycle.local_executor import LeafSubmissionError, LocalLeafExecutor
+from tpen_executor.storage import AdmissionFork, AdmissionUnreadable, DirectoryStore, FenceRejected, read_successor_admission
 
 from test_b1a_b_publication import _fixture
 from test_b1r2a_recovery_admission import _facts
 from test_review_b1b2_controller import _real_fresh
 from test_review_b1b2_t2_r1 import RecordingExecutor, _binding
+from test_b1e1_local_executor import _environment as _local_environment, _failure_result, _group as _local_group, _invocation as _local_invocation
+from test_c22_output_binding import _allocation_with_cpu, _configured
 
 
 MUTANTS = (
@@ -37,8 +42,11 @@ MUTANTS = (
     {"id": "r2-current-fence-required", "target": "executor/src/tpen_executor/storage.py", "old": "current_attempt_id = current_fence.attempt_id.value", "new": "current_attempt_id = admission.predecessor_attempt_id.value", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
     {"id": "preserve-typed-park-reason", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "elif member.action == \"park\":", "new": "elif False:", "killer": "test_controller_propagates_typed_park_reason"},
     {"id": "retain-r2-input-on-park", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "return replace(item, recovery_input=None, recovery_admission=admission)", "new": "return replace(item, recovery_admission=admission)", "killer": "test_controller_propagates_typed_park_reason"},
-    {"id": "skip-r2-final-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "verdict = None if item.recovery_input is not None else admission_port.admit(rebuilt)", "new": "verdict = admission_port.admit(rebuilt)", "killer": "test_r2_final_reconciliation_does_not_use_legacy_selector"},
+    {"id": "skip-r2-final-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if item.recovery_input is not None:", "new": "if False:", "killer": "test_r2_final_reconciliation_does_not_use_legacy_selector"},
     {"id": "require-r2-fence-for-legacy", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if admission_record.recovery_admission is not None:", "new": "if True:", "killer": "test_successor_uses_admitted_start_only"},
+    {"id": "local-r2-ignores-admitted-load", "target": "executor/src/tpen_executor/lifecycle/local_executor.py", "old": "return self._submit(fence, invocation, admitted_checkpoint_path=checkpoint_path)", "new": "return self._submit(fence, invocation)", "killer": "test_local_r2_adapter_binds_admitted_checkpoint"},
+    {"id": "controller-r2-plain-submit-fallback", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if admission_record is not None:\n                        submit_admitted = getattr(executor, \"submit_admitted_successor\", None)", "new": "if admission_record is not None and False:\n                        submit_admitted = getattr(executor, \"submit_admitted_successor\", None)", "killer": "test_r2_adapter_without_admitted_boundary_refuses"},
+    {"id": "publish-crossed-r2-request", "target": "executor/src/tpen_executor/storage.py", "old": "self._validate_recovery_request_binding(request, recovery_admission, member.task_id)", "new": "pass", "killer": "test_crossed_r2_request_is_refused_before_ledger"},
 )
 
 
@@ -72,7 +80,7 @@ def _real_evidence(store, current, predecessor, *, backend_job_id: str):
     from tpen_executor.recovery import RecoveryCheckpointFactsV1, RecoverySchedulerEndV1
 
     checkpoint = evidence.checkpoint
-    bound_path = Path(predecessor.output_dir) / "core" / "checkpoints" / "step"
+    bound_path = Path(predecessor.output_dir) / "core" / "checkpoints" / "step_000002"
     checkpoint = RecoveryCheckpointFactsV1(
         str(bound_path), checkpoint.content_id, checkpoint.next_iteration,
         checkpoint.completed_updates, checkpoint.program_digest,
@@ -118,18 +126,13 @@ def _r2_setup(tmp_path: Path, *, outcome: bool = True):
     store, group, lease, inputs, bindings, successors, fences = _fixture(
         tmp_path, ("successor",), remote=False,
     )
-    predecessor = AttachedAllocation(
-        ConfiguredAllocation(lease.allocation_id, lease.backend_job_id, {}), store, lease,
-    ).begin(group, "successor", "utc-predecessor", "local", invocation_id=InvocationId("r2-predecessor"))
-    Path(predecessor.output_dir, "core", "checkpoints").mkdir(parents=True, exist_ok=True)
-    current = fences["successor"]
-    # The extra predecessor start advances the task's current-attempt pointer.
-    # Restore the live failed-attempt pointer before the controller validates
-    # its fence; the predecessor remains addressable by its own attempt ID.
-    (Path(current.output_dir).parent / "current-attempt.json").write_bytes(
-        canonical_bytes({"schema": "tpen-executor/current-attempt-v1", "attempt_id": current.attempt_id.value})
-    )
+    predecessor = fences["successor"]
     request, acceptance, successor_binding = successors["successor"]
+    current = AttachedAllocation(
+        ConfiguredAllocation(lease.allocation_id, lease.backend_job_id, {}), store, lease,
+    ).begin(group, "successor", "utc-current", "local", invocation_id=InvocationId("r2-current"))
+    Path(current.output_dir, "core").mkdir(parents=True, exist_ok=True)
+    store.finish_attempt(current, "failed", "utc-current-end")
     evidence = _real_evidence(
         store, current, predecessor, backend_job_id=lease.backend_job_id.value,
     )
@@ -138,10 +141,13 @@ def _r2_setup(tmp_path: Path, *, outcome: bool = True):
     )
     if not outcome:
         Path(current.output_dir, "outcome.json").unlink()
-        Path(current.output_dir, "core-outcome.json").unlink()
+    current_start = StartReceipt.decode(Path(current.output_dir, "start.json").read_bytes())
+    current_outcome = OutcomeReceipt.decode(Path(current.output_dir, "outcome.json").read_bytes()) if outcome else None
     item = replace(
         inputs[0],
-        outcome_receipt=inputs[0].outcome_receipt if outcome else None,
+        attempt_id=current.attempt_id,
+        start_receipt=current_start,
+        outcome_receipt=current_outcome,
         core_verdict=None,
         recovery_input=recovery_input,
         recovery_admission=None,
@@ -211,6 +217,97 @@ def test_r2_link_round_trip_preserves_typed_lineage(tmp_path: Path) -> None:
     )
     assert result["record"]["predecessor"]["attempt_id"] == admission.predecessor_attempt_id.value
     assert result["record"]["predecessor"]["checkpoint_path"] == admission.checkpoint_path
+
+
+def test_local_r2_adapter_binds_admitted_checkpoint(tmp_path: Path) -> None:
+    group = _local_group(("member",))
+    allocation = _allocation_with_cpu(min(os.sched_getaffinity(0)))
+    seen: list = []
+
+    def runner(payload: bytes) -> bytes:
+        request = LeafRequest.decode(payload)
+        seen.append(request)
+        return _failure_result(request).encode()
+
+    executor = LocalLeafExecutor(group, allocation, lambda _program: _configured(tmp_path, task_id="member"), _local_environment, leaf_runner=runner)
+    try:
+        fence, invocation = _local_invocation(group, allocation, "member", tmp_path / "store")
+        wrong = str(Path(fence.output_dir) / "core" / "checkpoint")
+        with pytest.raises(LeafSubmissionError, match="own attempt leaf"):
+            executor.submit_admitted_successor(fence, invocation, wrong)
+        assert seen == [], f"runner_calls={seen!r}; wrong_path={wrong!r}"
+        admitted_path = str(tmp_path / "predecessor" / "core" / "checkpoint")
+        acknowledgement, handle = executor.submit_admitted_successor(fence, invocation, admitted_path)
+        executor.collect(handle)
+        assert acknowledgement.acknowledged, f"ack={acknowledgement!r}; requests={seen!r}"
+        assert len(seen) == 1, f"requests={seen!r}"
+        request = seen[0]
+        assert request.attempt_delta is not None, f"request={request!r}"
+        assert request.attempt_delta.load.mode == "train_resume", f"request={request!r}"
+        assert request.attempt_delta.load.path == admitted_path, f"request={request!r}; expected={admitted_path!r}"
+    finally:
+        executor.close()
+
+
+def test_r2_adapter_without_admitted_boundary_refuses(tmp_path: Path) -> None:
+    store, group, allocation, facts, binding, _evidence, _successor, _current = _r2_setup(tmp_path)
+
+    class LegacyOnlyExecutor(RecordingExecutor):
+        pass
+
+    executor = LegacyOnlyExecutor()
+    result = run_group_controller(binding, allocation.backend_job_id, facts, store, RecordingAdmission(), executor)
+    diagnostic = _controller_diagnostic(store, group, result)
+    assert executor.calls == [], diagnostic
+    assert result.member_outcomes == (("successor", "parked"),), diagnostic
+    assert result.member_reasons[0][1].startswith("member-transition:executor-launch:LeafSubmissionError"), diagnostic
+
+
+def test_crossed_r2_request_is_refused_before_ledger(tmp_path: Path) -> None:
+    store, group, allocation, facts, _binding, _evidence, successor_binding, _current = _r2_setup(tmp_path)
+    item = controller_module._apply_recovery_admission(facts.member_inputs[0], store)
+    request, acceptance, proposed = facts.successor_requests["successor"]
+    crossed = json.loads(json.dumps(request))
+    crossed["predecessor"]["attempt_id"] = "crossed-predecessor"
+    with pytest.raises(FenceRejected, match="crosses admitted facts") as error:
+        DirectoryStore._validate_recovery_request_binding(crossed, item.recovery_admission, "successor")
+    assert "crosses admitted facts" in str(error.value), f"error={error.value!r}; crossed={crossed!r}"
+    current_binding = MemberInvocationV2.decode(Path(item.start_receipt.output_dir, "invocation.json").read_bytes())
+    allocation_attempt = AllocationAttemptV2(
+        group.group_id, AllocationAttemptId("r16-publication"), allocation.allocation_id,
+        allocation.backend_job_id, "1", facts.observed_at_utc,
+    )
+    result = store.publish_reconciliation(
+        group, allocation_attempt, (item,), bindings={"successor": current_binding},
+        successors={"successor": (crossed, acceptance, proposed)},
+        recovery_admissions={"successor": item.recovery_admission},
+    )
+    assert result.members[0].action == "park", f"result={result!r}; crossed={crossed!r}"
+    assert result.members[0].reason_code == "invalid-durable-evidence", f"result={result!r}; store={store.root}"
+    assert not list(Path(store.root).rglob("successor-admission.json")), f"result={result!r}; store={store.root}"
+    assert store.read_reconciliation(group, allocation_attempt) is None, f"result={result!r}; store={store.root}"
+
+
+def test_reader_rejects_crossed_embedded_request_with_recomputed_digest(tmp_path: Path) -> None:
+    store, group, _allocation, facts, _binding, _evidence, _successor, current = _r2_setup(tmp_path)
+    item = controller_module._apply_recovery_admission(facts.member_inputs[0], store)
+    request, acceptance, successor_binding = facts.successor_requests["successor"]
+    record = store.record_successor_admission(
+        current, request, acceptance,
+        successor_binding=successor_binding, recovery_admission=item.recovery_admission,
+    )
+    ledger = Path(store.root) / "groups" / group.identity / "successor" / "successor-admissions" / record.predecessor_attempt_id.value / "successor-admission.json"
+    wire = json.loads(ledger.read_bytes())
+    wire["successor_request"]["predecessor"]["attempt_id"] = "crossed-predecessor"
+    wire["request_digest"] = digest(wire["successor_request"])
+    ledger.write_bytes(canonical_bytes(wire))
+    with pytest.raises(AdmissionUnreadable, match="successor admission") as error:
+        read_successor_admission(
+            current.output_dir, task_id="successor", attempt_id=record.successor_attempt_id.value,
+            group_digest=group.identity, science_input_digest=request["science_input_digest"],
+            target_iterations=request["target_iterations"],
+        )
+    assert "successor admission" in str(error.value), f"error={error.value!r}; wire={wire!r}"
 
 
 def test_crossed_r2_successor_link_is_rejected(tmp_path: Path) -> None:
@@ -334,8 +431,26 @@ def test_r2_final_reconciliation_does_not_use_legacy_selector(tmp_path: Path, mo
     diagnostic = _controller_diagnostic(store, group, result)
     assert len(reconciliations) == 2, diagnostic
     final_input = reconciliations[-1][0]
-    assert final_input[0] is None and final_input[1] is not None, diagnostic
+    assert final_input[0] is None and final_input[1] is None, diagnostic
     assert port.calls == [], diagnostic
+    assert result.reconciliation.members[0].action == "preserve_completed", diagnostic
+    assert result.exit_code == 0, diagnostic
+
+
+@pytest.mark.parametrize("outcome,expected_action", [("terminal", "preserve_terminal"), ("unknown", "park")])
+def test_r2_final_reconciliation_uses_successor_outcome(tmp_path: Path, outcome: str, expected_action: str) -> None:
+    store, group, _allocation, facts, _binding, _evidence, _successor, _current = _r2_setup(tmp_path)
+    admitted = controller_module._apply_recovery_admission(facts.member_inputs[0], store)
+    successor = replace(
+        admitted,
+        recovery_input=None,
+        recovery_admission=None,
+        core_verdict=CoreAdmissionVerdictV2(outcome, "unknown", "unknown", "unknown", None, "successor-owned"),
+    )
+    result = controller_module.reconcile_group(group, (successor,))
+    diagnostic = f"outcome={outcome!r}; result={result!r}; successor={successor!r}; store={store.root}"
+    assert result.members[0].action == expected_action, diagnostic
+    assert result.members[0].action != "admit_successor", diagnostic
 
 
 @pytest.mark.parametrize("publication_mode", ["raise", "park"])
