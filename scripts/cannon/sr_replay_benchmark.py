@@ -22,7 +22,7 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
-from tpen.data.batch import ElectronBatch, ParameterScoreForwardPacket, ScoreUpdateInput
+from tpen.data.batch import ElectronBatch, ParameterScoreForwardPacket
 from tpen.nn.forward import MaterializedParameterScoreRequest
 from tpen.training.qgt import (
     QGTOperator,
@@ -36,6 +36,7 @@ from tpen.training.score_geometry import (
     flatten_parameter_score_blocks,
 )
 from tpen.training.sr import SRPolicy, SRTelemetry, StochasticReconfigurationUpdate
+from tpen.training.update import ScoreUpdateInput
 
 
 ROOT = Path(__file__).resolve().parents[2]
