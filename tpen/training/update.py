@@ -1544,6 +1544,13 @@ class VMCUpdateMethod(Generic[InputT], ABC):
     def load_method_state_dict(self, state: Mapping[str, Any]) -> None:
         """Restore persistent method state, empty by default."""
 
+        self.validate_method_state_dict(state)
+        if state:
+            raise ValueError("stateless VMCUpdateMethod cannot load non-empty method state")
+
+    def validate_method_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Validate persistent method state without mutating live state."""
+
         if not isinstance(state, Mapping):
             raise TypeError("VMCUpdateMethod method state must be a mapping")
         if state:

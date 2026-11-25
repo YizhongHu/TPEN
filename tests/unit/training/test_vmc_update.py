@@ -618,10 +618,20 @@ def test_public_save_restore_rebuilds_direct_binding_after_model_restore(tmp_pat
     )["parameter_layout"]
 
 
-def test_restore_rejects_incompatible_parameter_layout(tmp_path) -> None:
+@pytest.mark.parametrize("kind", ["legacy", "sr"])
+def test_restore_rejects_incompatible_parameter_layout(tmp_path, kind: str) -> None:
     """A recorded layout mismatch fails rather than silently resuming."""
 
-    checkpoint = _resume_checkpoint(tmp_path)
+    if kind == "legacy":
+        checkpoint = _resume_checkpoint(tmp_path)
+    else:
+        from tests.unit.training.test_method_state_restore_prevalidation import (
+            _assert_snapshot_unchanged,
+            _checkpoint as _state_checkpoint,
+            _snapshot,
+        )
+
+        checkpoint = _state_checkpoint(tmp_path, "sr")
     trainer_path = checkpoint / "trainer.json"
     trainer_state = json.loads(trainer_path.read_text())
     trainer_state["parameter_layout"]["slots"][0]["dtype"] = "torch.float32"
@@ -631,14 +641,57 @@ def test_restore_rejects_incompatible_parameter_layout(tmp_path) -> None:
     manifest["hashes"]["trainer_sha256"] = file_sha256(trainer_path)
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    model = torch.nn.Linear(1, 1).double()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
-    update = LegacyAutogradUpdate(
-        optimizer,
-        model_parameters=ModelParameterBinding.from_parameters(tuple(model.parameters())),
-    )
+    if kind == "legacy":
+        model = torch.nn.Linear(1, 1).double()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+        update = LegacyAutogradUpdate(
+            optimizer,
+            model_parameters=ModelParameterBinding.from_parameters(tuple(model.parameters())),
+        )
+    else:
+        from tests.unit.training.test_nonfinite_score_row_policy import (
+            _build_checkpoint_run,
+            _checkpoint_context as _state_checkpoint_context,
+        )
+
+        model, update, trainer, sampler = _build_checkpoint_run(
+            "sr", max_steps=2, seed=0, nonfinite_local_energy_policy="fail"
+        )
+        optimizer = update.optimizer
+        trainer.resolve_update_state(model=model, optimizer=optimizer)
+        for parameter in model.parameters():
+            parameter.data.fill_(7.0)
+        optimizer.state[next(iter(model.parameters()))]["sentinel"] = torch.tensor(
+            -23.0, dtype=torch.float64
+        )
+        binding = update.model_parameters
+        before = _snapshot(model, optimizer)
+        before_method_state = copy.deepcopy(update.method_state_dict())
+        before_trainer_state = copy.deepcopy(trainer.state_dict())
+        with pytest.raises(ValueError, match="parameter layout"):
+            restore_checkpoint(
+                load={"mode": "train_resume", "path": str(checkpoint)},
+                model=model,
+                context=_state_checkpoint_context(tmp_path),
+                optimizer=optimizer,
+                trainer=trainer,
+                sampler=sampler,
+            )
+        _assert_snapshot_unchanged(before, model, optimizer)
+        assert update.model_parameters is binding
+        assert update.method_state_dict() == before_method_state
+        assert trainer.state_dict() == before_trainer_state
+        return
     trainer = VMCTrainer(max_steps=2, update_method=update)
     trainer.resolve_update_state(model=model, optimizer=optimizer)
+    for parameter in model.parameters():
+        parameter.data.fill_(7.0)
+    optimizer.state[next(iter(model.parameters()))]["sentinel"] = torch.tensor(
+        -23.0, dtype=torch.float64
+    )
+    binding = update.model_parameters
+    before_method_state = copy.deepcopy(update.method_state_dict())
+    before_trainer_state = copy.deepcopy(trainer.state_dict())
     sampler = MetropolisSampler(
         n_walkers=2,
         burn_in=0,
@@ -661,6 +714,9 @@ def test_restore_rejects_incompatible_parameter_layout(tmp_path) -> None:
 
     assert trainer.state_dict()["next_iteration"] == 0
     assert trainer.state_dict()["completed_updates"] == 0
+    assert update.model_parameters is binding
+    assert update.method_state_dict() == before_method_state
+    assert trainer.state_dict() == before_trainer_state
 
 
 def test_live_update_inputs_cannot_be_serialized() -> None:

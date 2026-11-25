@@ -694,6 +694,7 @@ class NativeKFACUpdate(VMCUpdateMethod[StructuredCurvatureUpdateInput]):
     def load_method_state_dict(self, state: Mapping[str, Any]) -> None:
         """Restore compact KFAC metadata, rejecting any version/policy/layout drift."""
 
+        self.validate_method_state_dict(state)
         completed_updates, curvature_step, parsed_sig = self._parse_method_state(state)
 
         self.completed_updates = completed_updates
@@ -705,6 +706,11 @@ class NativeKFACUpdate(VMCUpdateMethod[StructuredCurvatureUpdateInput]):
         self._kronecker_eigs = None
         self._dense_ema = None
         self._dense_eigs = None
+
+    def validate_method_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Validate compact KFAC metadata without mutating live state."""
+
+        self._parse_method_state(state)
 
     def method_tensor_state_dict(self) -> dict[str, Any] | None:
         """Return detached CPU curvature tensors for binary ``method_state.pt``."""

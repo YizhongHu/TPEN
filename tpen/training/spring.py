@@ -342,6 +342,19 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
     def load_method_state_dict(self, state: Mapping[str, Any]) -> None:
         """Restore state, rejecting version, identity, policy, and history-shape drift."""
 
+        self.validate_method_state_dict(state)
+        recorded_dtype = _parse_history_dtype(state.get("history_dtype"))
+        recorded_history = state["history"]
+        self.history = torch.tensor(
+            [float(value) for value in recorded_history],
+            dtype=recorded_dtype,
+            device=self._history_device(),
+        )
+        self.completed_updates = state["completed_updates"]
+
+    def validate_method_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Validate state without mutating the live update method."""
+
         if not isinstance(state, Mapping):
             raise TypeError("SPRINGUpdate state must be a mapping")
         version = state.get("version")
@@ -395,12 +408,6 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             for value in recorded_history
         ):
             raise ValueError("SPRING state history must contain only finite numeric values")
-        self.history = torch.tensor(
-            [float(value) for value in recorded_history],
-            dtype=recorded_dtype,
-            device=self._history_device(),
-        )
-        self.completed_updates = completed
 
     def update(self, update_input: ScoreUpdateInput) -> VMCUpdateResult:
         """Apply one SPRING step without a second score gather or solve."""
