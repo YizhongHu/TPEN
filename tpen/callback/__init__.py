@@ -226,9 +226,8 @@ def __getattr__(name: str) -> object:
         from .timing import SamplingScopeTiming
 
         return SamplingScopeTiming
-    if name in {"ChromeTraceExport", "NativeProfiler", "TorchOperatorSummary", "TrainingIterationWindow"}:
+    if name in {"NativeProfiler", "TorchOperatorSummary", "TrainingIterationWindow"}:
         from .native_profiler import (
-            ChromeTraceExport,
             NativeProfiler,
             TorchOperatorSummary,
             TrainingIterationWindow,
@@ -265,7 +264,6 @@ __all__ = [
     "Metadata",
     "NativeProfiler",
     "TorchOperatorSummary",
-    "ChromeTraceExport",
     "TrainingIterationWindow",
     "ModuleNorms",
     "NvidiaDeviceSource",

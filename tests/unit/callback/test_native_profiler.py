@@ -13,7 +13,6 @@ import pytest
 
 from tests.helpers.run_context import make_run_context
 from tpen.callback import (
-    ChromeTraceExport,
     NativeProfiler,
     TorchOperatorSummary,
     TrainingIterationWindow,
@@ -81,9 +80,21 @@ class _FailingBackend(_FakeBackend):
             raise RuntimeError("stop failed")
         super().stop()
 
-    def export_chrome_trace(self, _path: str) -> None:
-        if self.failure == "export":
-            raise RuntimeError("export failed")
+
+class _RangeExitFailureBackend(_FakeBackend):
+    def record_function(self, label: str):
+        self.calls.append(f"start:{label}")
+        parent = self
+
+        class _Range:
+            def __enter__(_self):
+                return _self
+
+            def __exit__(_self, *_args):
+                parent.calls.append(f"end:{label}")
+                raise RuntimeError("range exit failed")
+
+        return _Range()
 
 
 def test_window_uses_durable_numeric_selection() -> None:
@@ -125,18 +136,20 @@ def test_fake_backend_is_started_stepped_and_stopped(tmp_path) -> None:
     with session:
         session._start()  # type: ignore[attr-defined]
         session.checkpoint()  # type: ignore[attr-defined]
-    assert backend.calls == ["start", "step", "stop"]
+    assert backend.calls == ["start", "stop"]
 
 
-def test_summary_and_trace_are_bounded_and_contained() -> None:
+def test_summary_is_bounded() -> None:
     backend = _FakeBackend()
     assert len(TorchOperatorSummary(max_rows=3).rows(backend)) == 3
-    with pytest.raises(ValueError):
-        ChromeTraceExport("../escape.json")
 
 
 def test_live_callback_and_session_refuse_serialization() -> None:
-    callback = NativeProfiler(enabled=True, backend_factory=_FakeBackend)
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        backend_factory=_FakeBackend,
+    )
     for operation in (pickle.dumps, copy.deepcopy):
         with pytest.raises(TypeError):
             operation(callback)
@@ -144,7 +157,11 @@ def test_live_callback_and_session_refuse_serialization() -> None:
 
 def test_typed_ranges_nest_in_fixed_order_and_skip_absent_sampler(tmp_path) -> None:
     backend = _FakeBackend()
-    callback = NativeProfiler(enabled=True, backend_factory=lambda: backend)
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        backend_factory=lambda: backend,
+    )
     context = make_run_context(tmp_path)
     session = callback.run_scope(context)
     with session:
@@ -165,8 +182,9 @@ def test_typed_ranges_nest_in_fixed_order_and_skip_absent_sampler(tmp_path) -> N
 
 
 def test_two_enabled_callbacks_conflict_before_scope_mutation() -> None:
-    first = NativeProfiler(enabled=True)
-    second = NativeProfiler(enabled=True)
+    window = TrainingIterationWindow(0, 0, 1)
+    first = NativeProfiler(enabled=True, window=window)
+    second = NativeProfiler(enabled=True, window=window)
     assert claims_conflict(first.ownership_claims()[0], second.ownership_claims()[0])
 
 
@@ -254,7 +272,11 @@ def test_final_active_iteration_stops_backend_before_next_callback_event(tmp_pat
 
 def test_out_of_order_ended_occurrence_does_not_pop_unrelated_range(tmp_path) -> None:
     backend = _FakeBackend()
-    callback = NativeProfiler(enabled=True, backend_factory=lambda: backend)
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        backend_factory=lambda: backend,
+    )
     context = make_run_context(tmp_path)
     with callback.run_scope(context):
         callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
@@ -292,7 +314,7 @@ def test_window_counts_and_overshoot_are_recorded(tmp_path) -> None:
             callback.handle_occurrence(Occurrence(Ended(TrainingIteration(step)), 1), context)
     status = next(context.run_dir.rglob("profile-status.json")).read_text()
     payload = json.loads(status)
-    assert payload["durable_steps"] == [2, 3, 4]
+    assert payload["durable_steps"] == [2, 3]
     assert "overshoot_steps=1" in payload["activity_diagnostics"]
 
 
@@ -313,26 +335,136 @@ def test_open_partial_native_bundle_is_read_only_reconcilable(tmp_path) -> None:
     assert reconciled.invocations[0].reconciliation_state == "open_interrupted"
 
 
-@pytest.mark.parametrize("failure", ["start", "step", "stop", "export"])
+@pytest.mark.parametrize("failure", ["start", "step", "stop"])
 def test_backend_failures_clear_session_and_preserve_primary(failure: str, tmp_path) -> None:
     backend = _FailingBackend(failure)
     callback = NativeProfiler(
         enabled=True,
         window=TrainingIterationWindow(0, 0, 1),
-        chrome_trace=ChromeTraceExport() if failure == "export" else None,
         backend_factory=lambda: backend,
     )
     context = make_run_context(tmp_path)
     primary = RuntimeError("application failed")
-    expected = "application failed" if failure in {"stop", "export"} else f"{failure} failed"
+    expected = "application failed"
     with pytest.raises(RuntimeError, match=expected):
         with callback.run_scope(context) as session:
             session._start()  # type: ignore[attr-defined]
             if failure == "step":
-                session.checkpoint()  # type: ignore[attr-defined]
+                callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
+                callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
             elif failure == "start":
                 raise primary
             else:
                 raise primary
     assert callback._active_session is None  # type: ignore[attr-defined]
+
+
+def test_real_torch_profiler_adapter_emits_fixed_ranges_and_stops_at_window_end(tmp_path) -> None:
+    """The CPU adapter must use module-level record_function on Cannon's torch."""
+
+    import torch
+
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        summary=TorchOperatorSummary(max_rows=256),
+    )
+    context = make_run_context(tmp_path)
+    with callback.run_scope(context):
+        callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
+        _ = torch.ones(4) + 1
+        callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
+        callback.handle_occurrence(Occurrence(Started(CollectSamples(0)), 1), context)
+        callback.handle_occurrence(Occurrence(Ended(CollectSamples(0)), 1), context)
+    payload = json.loads(next(context.run_dir.rglob("summary.json")).read_text())
+    names = {row["name"] for row in payload["rows"]}
+    assert "TrainingIteration" in names
+    assert payload["truncated"] is False
+
+
+def test_failed_end_dispatch_preserves_application_primary(tmp_path) -> None:
+    backend = _RangeExitFailureBackend()
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        backend_factory=lambda: backend,
+    )
+    context = make_run_context(tmp_path)
+    session = callback.run_scope(context)
+    with pytest.raises(RuntimeError, match="primary"):
+        with session as live:
+            callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
+            callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
+            raise RuntimeError("primary")
+    assert "range_exit_failed:RuntimeError:range exit failed" in live._diagnostics  # type: ignore[attr-defined]
+
+
+def test_matched_out_of_order_range_is_unwound_once_on_exit(tmp_path) -> None:
+    backend = _FakeBackend()
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        backend_factory=lambda: backend,
+    )
+    context = make_run_context(tmp_path)
+    with callback.run_scope(context):
+        callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
+        callback.handle_occurrence(Occurrence(Started(CollectSamples(0)), 1), context)
+        callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
+        assert "end:CollectSamples" not in backend.calls
+    assert backend.calls.count("end:CollectSamples") == 1
+    assert backend.calls.count("end:TrainingIteration") == 1
+
+
+def test_summary_truncation_and_failed_window_finalization_are_honest(tmp_path) -> None:
+    backend = _FakeBackend()
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        summary=TorchOperatorSummary(max_rows=3),
+        backend_factory=lambda: backend,
+    )
+    context = make_run_context(tmp_path)
+    with callback.run_scope(context):
+        callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
+        callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
+    summary = json.loads(next(context.run_dir.rglob("summary.json")).read_text())
+    status = json.loads(next(context.run_dir.rglob("profile-status.json")).read_text())
+    manifest = json.loads(next(context.run_dir.rglob("manifest.json")).read_text())
+    assert summary["total_rows"] == 20
+    assert summary["truncated"] is True
+    assert status["lifecycle_state"] == "closed"
+    assert status["data_completeness"] == "complete"
+    assert manifest["lifecycle_state"] == "closed"
+
+    failed = _FailingBackend("stop")
+    failed_callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        backend_factory=lambda: failed,
+    )
+    failed_context = make_run_context(tmp_path / "failed")
+    with failed_callback.run_scope(failed_context):
+        failed_callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), failed_context)
+        failed_callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), failed_context)
+    failed_status = json.loads(next(failed_context.run_dir.rglob("profile-status.json")).read_text())
+    failed_manifest = json.loads(next(failed_context.run_dir.rglob("manifest.json")).read_text())
+    assert failed_status["lifecycle_state"] == "unsafe"
+    assert failed_status["data_completeness"] == "partial"
+    assert failed_manifest["lifecycle_state"] == "unsafe"
+
+
+def test_enabled_profiler_requires_explicit_window_and_exact_sink() -> None:
+    with pytest.raises(ValueError, match="explicit window"):
+        NativeProfiler(enabled=True)
+
+    class _SinkSubclass(RunArtifactSink):
+        pass
+
+    with pytest.raises(TypeError, match="exactly RunArtifactSink"):
+        NativeProfiler(
+            enabled=True,
+            window=TrainingIterationWindow(0, 0, 1),
+            sink=_SinkSubclass(),
+        )
 
