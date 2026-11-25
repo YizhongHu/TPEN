@@ -19,7 +19,7 @@ from ..allocations import AllocationAttemptV2, ConfiguredAllocation, ControllerG
 from ..contracts import AllocationAttemptId, BackendJobId, GroupId, InvocationId, ReadyGroupV2
 from ..recovery import CoreAdmissionPort, CoreAdmissionVerdictV2, GroupReconciliationV2, MemberRecoveryInputV2, admit_recovery, reconcile_group
 from ..results import SuccessorAdmissionRecord
-from ..storage import AttemptFence, ControllerGenerationRejected, DirectoryStore, FenceRejected, LaunchIntentAbsent, LaunchIntentRejected
+from ..storage import AttemptFence, ControllerGenerationRejected, DirectoryStore, FenceRejected, FullHorizonFork, LaunchIntentAbsent, LaunchIntentRejected
 
 
 @frozen_record
@@ -82,6 +82,15 @@ class AllocationLocalExecutor(Protocol):
     def collect(self, handle: Any, timeout: float) -> Any:
         """Collect one submitted handle with a finite poll timeout."""
 
+
+def _publish_full_horizon_side_effect(store: DirectoryStore, fence: AttemptFence, task: Any,
+                                      verdict: CoreAdmissionVerdictV2, target_iterations: int) -> bool:
+    """Attempt optional completion publication without changing reconciliation."""
+    try:
+        store.record_full_horizon_completion(fence, task, verdict, target_iterations)
+    except (FenceRejected, FullHorizonFork, TypeError, ValueError, OSError):
+        return False
+    return True
 
 @frozen_record
 class GroupControllerOutcome:
@@ -565,11 +574,8 @@ def run_group_controller(
                 record.output_dir,
             )
             task = next(task for task in group.members if task.task_id == item.task_id)
-            store.record_full_horizon_completion(
-                completion_fence,
-                task,
-                item.core_verdict,
-                task.target_horizon,
+            _publish_full_horizon_side_effect(
+                store, completion_fence, task, item.core_verdict, task.target_horizon,
             )
     except Exception as error:
         final = _merge_final_reconciliation(

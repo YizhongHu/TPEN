@@ -1500,7 +1500,9 @@ class DirectoryStore:
             raise FenceRejected("full-horizon completion requires a typed completed core verdict")
         if type(target_iterations) is not int or target_iterations < 0:
             raise TypeError("target_iterations must be a nonnegative integer")
-        if task.target_horizon_units == "iterations" and task.target_horizon != target_iterations:
+        if task.target_horizon_units != "iterations":
+            raise FenceRejected("full-horizon completion requires iteration horizon")
+        if task.target_horizon != target_iterations:
             raise FenceRejected("target_iterations disagrees with TaskSpec horizon")
         task_dir = self._task_dir_for_fence(fence)
         lock_path = os.path.join(task_dir, _TASK_LOCK)
@@ -1548,6 +1550,7 @@ class DirectoryStore:
                 raise FenceRejected("final completion count is invalid")
             records = list(self._admission_records_for_task(task_dir, task.task_id))
             by_successor: dict[AttemptId, SuccessorAdmissionRecord] = {}
+            admitted_target_iterations: int | None = None
             for admission in records:
                 if admission.to_dict().get("schema") != SuccessorAdmissionRecord.schema_v3:
                     raise FenceRejected("full-horizon chain requires successor-admission-v3")
@@ -1556,8 +1559,11 @@ class DirectoryStore:
                 if admission.successor_request is None:
                     raise FenceRejected("successor-admission-v3 request is absent")
                 request = self._successor_request_shape(dict(admission.successor_request))
-                if request["target_iterations"] != target_iterations:
-                    raise FenceRejected("successor target_iterations disagrees with stage horizon")
+                request_target = request["target_iterations"]
+                if admitted_target_iterations is None:
+                    admitted_target_iterations = request_target
+                elif request_target != admitted_target_iterations:
+                    raise FenceRejected("successor target_iterations disagree with one another")
                 if request["science_input_digest"] != stored_task.science_digest:
                     raise FenceRejected("successor science lineage disagrees with TaskSpec")
                 if admission.successor_attempt_id in by_successor:

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from tpen_executor._codec import digest
 from tpen_executor.allocations import AllocationAttemptV2, MemberInvocationV2
-from tpen_executor.contracts import AllocationAttemptId, GroupId, InvocationId, AttemptId
+from tpen_executor.contracts import AllocationAttemptId, ExecutionPlanV2, GroupId, InvocationId, AttemptId, ReadyGroup, ReadyGroupV2
+from tpen_executor.lifecycle.controller import _publish_full_horizon_side_effect
 from tpen_executor.recovery import (
     RecoveryAdmissionV1,
     RecoveryCheckpointFactsV1,
@@ -17,7 +19,6 @@ from tpen_executor.recovery import (
     RecoverySchedulerEndV1,
     CoreAdmissionVerdictV2,
 )
-from tpen_executor.results import SuccessorAdmissionRecord
 from tpen_executor.storage import DirectoryStore, FenceRejected, FullHorizonFork
 
 from test_core_evidence_v3 import _typed_evidence_payload
@@ -67,7 +68,32 @@ MUTANTS = (
         "new": "False",
         "killer": "test_replay_conflict_is_a_fork",
     },
+    {
+        "id": "full-horizon-refusal-is-side-effect-only",
+        "target": "executor/src/tpen_executor/lifecycle/controller.py",
+        "old": "return False",
+        "new": "False",
+        "killer": "test_completion_refusal_is_side_effect_only",
+    },
+    {
+        "id": "full-horizon-requires-iteration-units",
+        "target": "executor/src/tpen_executor/storage.py",
+        "old": 'task.target_horizon_units != "iterations"',
+        "new": "False",
+        "killer": "test_non_iteration_horizon_is_rejected",
+    },
 )
+
+MUTANT_GUARDS = {
+    "full-horizon-requires-typed-completed-verdict": "typed completed verdict",
+    "full-horizon-requires-core-evidence": "durable core outcome",
+    "full-horizon-requires-target-progress": "completed_updates >= target_iterations",
+    "full-horizon-requires-checkpoint-path-agreement": "checkpoint/checkpoint_ref path equality",
+    "full-horizon-requires-science-lineage": "successor science equals TaskSpec science",
+    "full-horizon-refuses-conflicting-replay": "write-once conflict refusal",
+    "full-horizon-refusal-is-side-effect-only": "controller swallows per-task refusal",
+    "full-horizon-requires-iteration-units": "TaskSpec iteration units",
+}
 
 
 INTENDED_ASSERTION_TRACES = {
@@ -86,6 +112,8 @@ INTENDED_ASSERTION_TRACES = {
     "test_replay_conflict_is_a_fork": (
         "typed completed verdict", "durable core outcome", "target progress", "checkpoint_ref", "write-once identity",
     ),
+    "test_completion_refusal_is_side_effect_only": ("per-task completion publication", "refusal is swallowed"),
+    "test_non_iteration_horizon_is_rejected": ("typed completed verdict", "durable core outcome", "non-iteration units"),
 }
 
 
@@ -107,13 +135,19 @@ def _evidence(core_dir: Path, *, outcome: str = "completed", completed_updates: 
 
 
 def _single_fixture(tmp_path: Path, *, completed_updates: int = 1, crossed: bool = False):
-    store, group, allocation = setup_store(tmp_path)
+    store, base_group, allocation = setup_store(tmp_path)
+    task = replace(base_group.members[0], target_horizon_units="iterations")
+    group = ReadyGroup(base_group.group_id, (task,), base_group.execution_plan_digest)
     fence = store.begin_attempt(group, "a", allocation, "2026-11-25T14:00:00Z")
     core_dir = Path(fence.output_dir) / "core"
     core_dir.mkdir()
     store.finish_attempt(fence, "completed", "2026-11-25T14:01:00Z")
     store.record_core_outcome(fence, _evidence(core_dir, completed_updates=completed_updates, crossed=crossed))
-    return store, group, fence, _verdict(), group.members[0]
+    return store, group, fence, _verdict(), task
+
+
+def _non_iteration_fixture(tmp_path: Path):
+    return setup_store(tmp_path)
 
 
 def _publish(store, group, fence, verdict, task):
@@ -168,17 +202,39 @@ def test_replay_conflict_is_a_fork(tmp_path: Path) -> None:
         _publish(store, group, fence, verdict, task)
 
 
+def test_completion_refusal_is_side_effect_only() -> None:
+    class RefusingStore:
+        def record_full_horizon_completion(self, *args):
+            raise FenceRejected("controlled refusal")
+
+    assert _publish_full_horizon_side_effect(RefusingStore(), None, None, None, 1) is False
+
+
 def test_rc0_only_or_unknown_verdict_is_rejected(tmp_path: Path) -> None:
     store, group, fence, _verdict_value, task = _single_fixture(tmp_path)
     with pytest.raises(FenceRejected, match="typed completed core verdict"):
         _publish(store, group, fence, CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "rc0-only"), task)
 
-    no_core_store, no_core_group, no_core_fence = setup_store(tmp_path / "missing")
-    no_core_fence = no_core_store.begin_attempt(no_core_group, "a", no_core_fence, "2026-11-25T14:00:00Z")
+    (tmp_path / "missing").mkdir()
+    no_core_store, base_group, allocation = setup_store(tmp_path / "missing" / "store")
+    no_core_task = replace(base_group.members[0], target_horizon_units="iterations")
+    no_core_group = ReadyGroup(base_group.group_id, (no_core_task,), base_group.execution_plan_digest)
+    no_core_fence = no_core_store.begin_attempt(no_core_group, "a", allocation, "2026-11-25T14:00:00Z")
     Path(no_core_fence.output_dir, "core").mkdir()
     no_core_store.finish_attempt(no_core_fence, "completed", "2026-11-25T14:01:00Z")
     with pytest.raises(FenceRejected, match="core outcome record"):
         _publish(no_core_store, no_core_group, no_core_fence, _verdict(), no_core_group.members[0])
+
+
+def test_non_iteration_horizon_is_rejected(tmp_path: Path) -> None:
+    store, group, allocation = _non_iteration_fixture(tmp_path)
+    fence = store.begin_attempt(group, "a", allocation, "2026-11-25T14:00:00Z")
+    core_dir = Path(fence.output_dir) / "core"
+    core_dir.mkdir()
+    store.finish_attempt(fence, "completed", "2026-11-25T14:01:00Z")
+    store.record_core_outcome(fence, _evidence(core_dir))
+    with pytest.raises(FenceRejected, match="requires iteration horizon"):
+        _publish(store, group, fence, _verdict(), group.members[0])
 
 
 def test_under_target_progress_is_rejected(tmp_path: Path) -> None:
@@ -194,30 +250,28 @@ def test_checkpoint_path_crossing_is_rejected(tmp_path: Path) -> None:
 
 
 def test_successor_science_lineage_is_checked(tmp_path: Path) -> None:
-    """The chain helper is covered by the durable-chain test below."""
-    store, group, fence, verdict, task = _single_fixture(tmp_path)
-    path = Path(fence.output_dir).parent / "task-spec.json"
-    path.write_bytes(task.encode())
-    assert _publish(store, group, fence, verdict, task).science_digest == task.science_digest
+    store, group, _predecessor, final, verdict, task = _chain_fixture(tmp_path, science_input="b" * 64)
+    with pytest.raises(FenceRejected, match="science lineage"):
+        _publish(store, group, final, verdict, task)
 
 
-def test_p_to_c_to_s_chain_is_read_from_durable_v3_ledger(tmp_path: Path) -> None:
-    store, group, allocation = setup_store(tmp_path)
-    task = group.members[0]
-    predecessor = store.begin_attempt(group, "a", allocation, "2026-11-25T14:00:00Z")
+def _chain_fixture(tmp_path: Path, *, science_input: str | None = None, request_target: int = 10):
+    base_store, base_group, allocation = setup_store(tmp_path)
+    task = replace(base_group.members[0], target_horizon_units="iterations")
+    plan_ref = {"members": ["a"], "plan": "b1r2c"}
+    plan = ExecutionPlanV2(plan_ref, digest(plan_ref), ("a",), "native-recovery/v2", "preserve-or-park/v1")
+    group = ReadyGroupV2(GroupId("group-r2c"), (task,), plan)
+    store = base_store
+    lease1 = AllocationAttemptV2(group.group_id, AllocationAttemptId("lease-1"), allocation.allocation_id, allocation.backend_job_id, "controller", "2026-11-25T14:00:00Z")
+    predecessor = store.begin_attempt(group, "a", allocation, "2026-11-25T14:00:00Z", allocation_attempt=lease1, invocation_id=InvocationId("invocation-predecessor"))
     predecessor_core = Path(predecessor.output_dir) / "core"
     predecessor_core.mkdir()
     store.finish_attempt(predecessor, "failed", "2026-11-25T14:01:00Z")
     predecessor_evidence = _evidence(predecessor_core, outcome="planned_yield")
     store.record_core_outcome(predecessor, predecessor_evidence)
 
-    final = store.begin_attempt(group, "a", allocation, "2026-11-25T14:02:00Z")
-    final_core = Path(final.output_dir) / "core"
-    final_core.mkdir()
-    store.finish_attempt(final, "completed", "2026-11-25T14:03:00Z")
-    store.record_core_outcome(final, _evidence(final_core))
-
-    request = store.build_successor_admission_request(predecessor, final.attempt_id, task.science_digest, 1)
+    successor_id = AttemptId("attempt-successor")
+    request = store.build_successor_admission_request(predecessor, successor_id, science_input or task.science_digest, request_target)
     predecessor_ref = predecessor_evidence.checkpoint_ref
     assert predecessor_ref is not None
     checkpoint = RecoveryCheckpointFactsV1(
@@ -229,35 +283,41 @@ def test_p_to_c_to_s_chain_is_read_from_durable_v3_ledger(tmp_path: Path) -> Non
         allocation.backend_job_id.value, "failed", "2026-11-25T14:01:00Z", "writer", "2026-11-25T14:01:00Z",
     )
     recovery_evidence = RecoveryEvidenceV1(
-        "planned_yield", task.task_id, group.identity, final.attempt_id, predecessor.attempt_id,
+        "planned_yield", task.task_id, group.identity, AttemptId("attempt-current"), predecessor.attempt_id,
         allocation.allocation_id.value, allocation.backend_job_id.value, "slurm", checkpoint, scheduler_end,
         None, 1, 10,
     )
     recovery_admission = RecoveryAdmissionV1(
         "admitted", "recovery-evidence-valid", digest(recovery_evidence.to_dict()), predecessor.attempt_id,
-        predecessor_ref["checkpoint_dir"], final.attempt_id, "grant-1",
+        predecessor_ref["checkpoint_dir"], successor_id, "grant-1",
     )
-    binding = MemberInvocationV2(
-        AllocationAttemptV2(GroupId("group"), AllocationAttemptId("allocation-attempt"), allocation.allocation_id,
-                            allocation.backend_job_id, "controller", "2026-11-25T14:00:00Z"),
-        group.identity, task.task_id, task.lineage_id, final.attempt_id, InvocationId("invocation-final"),
+    predecessor_binding = MemberInvocationV2.decode(Path(predecessor.output_dir, "invocation.json").read_bytes())
+    lease2 = AllocationAttemptV2(group.group_id, AllocationAttemptId("lease-2"), allocation.allocation_id, allocation.backend_job_id, "controller", "2026-11-25T14:02:00Z")
+    successor_binding = MemberInvocationV2(
+        lease2, group.identity, task.task_id, task.lineage_id, successor_id, InvocationId("invocation-successor"),
     )
-    admission = SuccessorAdmissionRecord.from_recovery_admission(
-        recovery_admission,
-        predecessor_task_id=task.task_id,
-        predecessor_content_id=predecessor_ref["content_id"],
-        successor_task_id=task.task_id,
-        request_digest=digest(request),
-        core_acceptance_digest="e" * 64,
-        successor_binding=binding,
-        successor_request=request,
+    admission = store.record_successor_admission(
+        predecessor, request, "e" * 64,
+        predecessor_binding=predecessor_binding,
+        successor_binding=successor_binding,
+        recovery_admission=recovery_admission,
         recovery_evidence=recovery_evidence,
     )
-    ledger = Path(predecessor.output_dir).parent / "successor-admissions" / predecessor.attempt_id.value
-    ledger.mkdir(parents=True)
-    (ledger / "successor-admission.json").write_bytes(admission.encode())
+    final = store.begin_admitted_successor(
+        group, "a", allocation, "2026-11-25T14:02:00Z", "local",
+        allocation_attempt=lease2, admission=admission, current_fence=predecessor,
+    )
+    final_core = Path(final.output_dir) / "core"
+    final_core.mkdir()
+    store.finish_attempt(final, "completed", "2026-11-25T14:03:00Z")
+    store.record_core_outcome(final, _evidence(final_core))
+    return store, group, predecessor, final, _verdict(), task
 
-    record = _publish(store, group, final, _verdict(), task)
+
+def test_p_to_c_to_s_chain_is_read_from_durable_v3_ledger(tmp_path: Path) -> None:
+    store, group, predecessor, final, verdict, task = _chain_fixture(tmp_path)
+
+    record = _publish(store, group, final, verdict, task)
     assert record.final_attempt_id == final.attempt_id
     assert record.attempt_chain[0]["predecessor_attempt_id"] == predecessor.attempt_id.value
     assert record.attempt_chain[0]["successor_attempt_id"] == final.attempt_id.value
@@ -267,6 +327,7 @@ def test_mutant_rows_are_unique_and_compile_as_expression_replacements() -> None
     olds = [row["old"] for row in MUTANTS]
     assert len(olds) == len(set(olds))
     assert all(set(row) == {"id", "target", "old", "new", "killer"} for row in MUTANTS)
+    assert {row["id"] for row in MUTANTS} == set(MUTANT_GUARDS)
     assert all(row["killer"] in INTENDED_ASSERTION_TRACES for row in MUTANTS)
     for row in MUTANTS:
         compile("def _mutant_guard():\n    return " + row["new"], "<mutant>", "exec")

@@ -53,7 +53,7 @@ Required top-level fields are exactly:
 | `science_digest` | string | Verbatim final-task `TaskSpec.science_digest`, lowercase 64-hex. HI compares it with the row id. |
 | `final_attempt_id` | string | Canonical attempt identity of the final durable leaf. |
 | `completed_updates` | integer | `final_attempt.core_outcome.evidence.checkpoint.completed_updates`. |
-| `target_iterations` | integer | Admitted stage horizon; all successor request copies must agree. |
+| `target_iterations` | integer | Full task horizon in iteration units; it equals `TaskSpec.target_horizon` when the task declares `target_horizon_units == "iterations"`. |
 | `final_checkpoint` | object | Exactly `path` and `content_id`; both strings. |
 | `completed_at` | string | Durable UTC timestamp, copied from the final outcome receipt. |
 | `core_acceptance_digest` | string | `digest(verdict.to_dict())` for the typed final admission-port verdict. |
@@ -100,10 +100,14 @@ final_checkpoint.content_id = checkpoint_ref["content_id"]
 If a typed checkpoint source also carries a content id, it must equal the
 reference content id.
 
-`target_iterations` equals the admitted stage horizon. Every successor
-admission request copy must equal it; when `TaskSpec.target_horizon_units` is
-the same iteration coordinate, `TaskSpec.target_horizon` must equal it exactly.
-The writer performs no silent unit conversion.
+`target_iterations` is the full task horizon in iteration units. The writer
+requires `TaskSpec.target_horizon_units == "iterations"` and exact equality
+with `TaskSpec.target_horizon`; non-iteration units are an explicit typed
+refusal. A successor request's `target_iterations` is the admitted
+per-segment/remaining target supplied to that successor admission, not this
+record's full-horizon field. All request copies in one durable chain must agree
+with one another, but they need not equal the full task horizon. The writer
+performs no silent unit conversion.
 
 `science_digest` is read verbatim from the durable final-task `TaskSpec` and
 must equal any science lineage carried by the admitted successor chain. The
@@ -132,7 +136,8 @@ Readers and writers fail closed on malformed/noncanonical JSON, missing or extra
 fields, wrong schema/types, invalid identities or digests, a crossed task/group
 or final attempt, missing/untyped/unknown/failed core evidence, a non-completed
 typed verdict, under-target progress, missing/crossed TaskSpec or science
-digest, target/stage/request disagreement, missing or mismatched checkpoint
+digest, non-iteration target units, disagreement between successor request
+copies, missing or mismatched checkpoint
 path/content identity, missing/non-UTC durable timestamp, disconnected/crossed
 successor chain, and conflicting bytes at the task-level path. A missing file
 is simply not complete; it is not a park result.
