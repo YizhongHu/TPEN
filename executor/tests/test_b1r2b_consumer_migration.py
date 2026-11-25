@@ -49,32 +49,64 @@ MUTANTS = (
     {"id": "require-r2-fence-for-legacy", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if admission_record.recovery_admission is not None:\n                        member_input", "new": "if True:\n                        member_input", "killer": "test_successor_uses_admitted_start_only"},
     {"id": "local-r2-ignores-admitted-load", "target": "executor/src/tpen_executor/lifecycle/local_executor.py", "old": "return self._submit(fence, invocation, admitted_checkpoint_path=checkpoint_path)", "new": "return self._submit(fence, invocation)", "killer": "test_local_r2_adapter_binds_admitted_checkpoint"},
     {"id": "controller-r2-plain-submit-fallback", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if admission_record is not None and admission_record.recovery_admission is not None:\n                        submit_admitted = getattr(executor, \"submit_admitted_successor\", None)", "new": "if admission_record is not None and False:\n                        submit_admitted = getattr(executor, \"submit_admitted_successor\", None)", "killer": "test_r2_adapter_without_admitted_boundary_refuses"},
+    {"id": "skip-r2-final-core-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "verdict = admission_port.admit(rebuilt)", "new": "verdict = None", "killer": "test_r2_final_reconciliation_does_not_use_legacy_selector"},
 )
 
 
 class RecordingAdmission:
     def __init__(self):
         self.calls = []
+        self.members = []
 
     def admit(self, member):
         self.calls.append(member.task_id)
-        return member.core_verdict
+        self.members.append(member)
+        if member.core_verdict is not None:
+            return member.core_verdict
+        evidence = member.core_evidence
+        if evidence is None or evidence.get("schema") != "tpen.run-evidence/v3":
+            return None
+        if evidence.get("outcome") == "completed" and member.outcome_receipt is not None and member.outcome_receipt.status == "completed":
+            return CoreAdmissionVerdictV2("completed", "unknown", "unknown", "unknown", None, "core-evidence-completed")
+        if evidence.get("outcome") == "failed":
+            return CoreAdmissionVerdictV2("terminal", "unknown", "unknown", "unknown", None, "core-evidence-failed")
+        return CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "core-evidence-not-completed")
 
 
 class BoundaryExecutor(RecordingExecutor):
-    def __init__(self, order):
+    def __init__(self, order, *, evidence_mode="v3", evidence_outcome="completed"):
         super().__init__()
         self.order = order
         self.checkpoint_paths = []
+        self.evidence_mode = evidence_mode
+        self.evidence_outcome = evidence_outcome
 
     def submit(self, fence, invocation):
         self.order.append("submit")
-        return super().submit(fence, invocation)
+        launched, context = super().submit(fence, invocation)
+        return launched, self._decorate_context(fence, context)
+
+    def _decorate_context(self, fence, context):
+        if self.evidence_mode == "v3":
+            evidence = _typed_evidence(Path(fence.output_dir) / "core", self.evidence_outcome)
+            context = replace(context, result=replace(context.result, evidence=evidence.to_dict()))
+        elif self.evidence_mode == "missing":
+            context = replace(
+                context,
+                result=replace(
+                    context.result,
+                    evidence=None,
+                    inspection="unavailable",
+                    inspection_error={"type": "EvidenceUnavailable", "message": "controlled missing evidence"},
+                ),
+            )
+        return context
 
     def submit_admitted_successor(self, fence, invocation, checkpoint_path):
         self.order.append("submit")
         self.checkpoint_paths.append(checkpoint_path)
-        return RecordingExecutor.submit(self, fence, invocation)
+        launched, context = RecordingExecutor.submit(self, fence, invocation)
+        return launched, self._decorate_context(fence, context)
 
 
 def _real_evidence(store, current, predecessor, *, backend_job_id: str, content_id: str | None = None):
@@ -540,7 +572,9 @@ def test_r2_input_uses_admit_recovery_not_legacy_selector(tmp_path: Path, monkey
     diagnostic = _controller_diagnostic(store, group, result)
     assert result.member_outcomes == (("successor", "collected"),), diagnostic
     assert admissions and all(result.status == "admitted" and root == store.root for result, root in admissions), diagnostic
-    assert port.calls == [], diagnostic
+    assert port.calls == ["successor"], diagnostic
+    assert port.members[-1].attempt_id != facts.member_inputs[0].attempt_id, diagnostic
+    assert port.members[-1].recovery_admission is None, diagnostic
     legacy_root = tmp_path / "legacy"
     legacy_root.mkdir()
     legacy_store, legacy_group, legacy_lease, legacy_inputs, _legacy_bindings, legacy_successors, _legacy_fences = _fixture(
@@ -575,25 +609,35 @@ def test_r2_final_reconciliation_does_not_use_legacy_selector(tmp_path: Path, mo
     assert len(reconciliations) == 2, diagnostic
     final_input = reconciliations[-1][0]
     assert final_input[0] is None and final_input[1] is None, diagnostic
-    assert port.calls == [], diagnostic
+    assert port.calls == ["successor"], diagnostic
+    assert port.members[-1].attempt_id != facts.member_inputs[0].attempt_id, diagnostic
+    assert port.members[-1].recovery_admission is None, diagnostic
     assert result.reconciliation.members[0].action == "preserve_completed", diagnostic
     assert result.exit_code == 0, diagnostic
 
 
-@pytest.mark.parametrize("outcome,expected_action", [("terminal", "preserve_terminal"), ("unknown", "park")])
-def test_r2_final_reconciliation_uses_successor_outcome(tmp_path: Path, outcome: str, expected_action: str) -> None:
-    store, group, _allocation, facts, _binding, _evidence, _successor, _current = _r2_setup(tmp_path)
-    admitted = controller_module._apply_recovery_admission(facts.member_inputs[0], store)
-    successor = replace(
-        admitted,
-        recovery_input=None,
-        recovery_admission=None,
-        core_verdict=CoreAdmissionVerdictV2(outcome, "unknown", "unknown", "unknown", None, "successor-owned"),
+@pytest.mark.parametrize(
+    "evidence_mode,evidence_outcome,expected_action",
+    [("v3", "failed", "preserve_terminal"), ("v3", "refused", "park"), ("missing", None, "park"), ("v2", None, "park")],
+)
+def test_r2_final_reconciliation_classifies_successor_core_evidence(
+    tmp_path: Path, evidence_mode: str, evidence_outcome: str | None, expected_action: str,
+) -> None:
+    store, group, allocation, facts, binding, _evidence, _successor, _current = _r2_setup(tmp_path)
+    port = RecordingAdmission()
+    result = run_group_controller(
+        binding,
+        allocation.backend_job_id,
+        facts,
+        store,
+        port,
+        BoundaryExecutor([], evidence_mode=evidence_mode, evidence_outcome=evidence_outcome),
     )
-    result = controller_module.reconcile_group(group, (successor,))
-    diagnostic = f"outcome={outcome!r}; result={result!r}; successor={successor!r}; store={store.root}"
-    assert result.members[0].action == expected_action, diagnostic
-    assert result.members[0].action != "admit_successor", diagnostic
+    diagnostic = _controller_diagnostic(store, group, result)
+    assert result.reconciliation.members[0].action == expected_action, diagnostic
+    assert result.reconciliation.members[0].action != "admit_successor", diagnostic
+    assert port.calls == ["successor"], diagnostic
+    assert port.members[-1].recovery_admission is None, diagnostic
 
 
 @pytest.mark.parametrize("publication_mode", ["raise", "park"])

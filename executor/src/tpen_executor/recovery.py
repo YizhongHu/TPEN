@@ -860,6 +860,7 @@ class MemberRecoveryInputV2:
     recovery_input: RecoveryAdmissionInputV1 | None = None
     recovery_admission: RecoveryAdmissionV1 | None = None
     recovery_evidence: RecoveryEvidenceV1 | None = None
+    core_evidence: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
@@ -878,6 +879,8 @@ class MemberRecoveryInputV2:
             raise TypeError("recovery_admission must be RecoveryAdmissionV1 or None")
         if self.recovery_evidence is not None and not isinstance(self.recovery_evidence, RecoveryEvidenceV1):
             raise TypeError("recovery_evidence must be RecoveryEvidenceV1 or None")
+        if self.core_evidence is not None and not isinstance(self.core_evidence, Mapping):
+            raise TypeError("core_evidence must be a mapping or None")
         if self.recovery_input is not None:
             evidence = self.recovery_input.evidence
             if evidence.task_id != self.task_id or evidence.group_digest != (self.start_receipt.group_digest if self.start_receipt is not None else evidence.group_digest):
@@ -937,6 +940,8 @@ class MemberRecoveryInputV2:
             result["recovery_admission"] = self.recovery_admission.to_dict()
         if self.recovery_evidence is not None:
             result["recovery_evidence"] = self.recovery_evidence.to_dict()
+        if self.core_evidence is not None:
+            result["core_evidence"] = dict(self.core_evidence)
         return result
 
     def encode(self) -> bytes:
@@ -945,7 +950,7 @@ class MemberRecoveryInputV2:
     @classmethod
     def from_mapping(cls, data: Any) -> "MemberRecoveryInputV2":
         base_fields = {"schema", "task_id", "lineage_id", "attempt_id", "start_receipt", "outcome_receipt", "core_verdict", "receipt_digest"}
-        optional_fields = {key for key in ("recovery_input", "recovery_admission", "recovery_evidence") if key in data}
+        optional_fields = {key for key in ("recovery_input", "recovery_admission", "recovery_evidence", "core_evidence") if key in data}
         fields(data, base_fields | optional_fields, cls.schema, cls.__name__)
         if type(data["task_id"]) is not str or type(data["lineage_id"]) is not str:
             raise TypeError("MemberRecoveryInputV2 identity fields must be strings")
@@ -960,6 +965,7 @@ class MemberRecoveryInputV2:
             None if data.get("recovery_input") is None else RecoveryAdmissionInputV1.from_mapping(data["recovery_input"]),
             None if data.get("recovery_admission") is None else RecoveryAdmissionV1.from_mapping(data["recovery_admission"]),
             None if data.get("recovery_evidence") is None else RecoveryEvidenceV1.from_mapping(data["recovery_evidence"]),
+            None if data.get("core_evidence") is None else data["core_evidence"],
         )
 
     @classmethod
