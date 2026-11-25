@@ -348,22 +348,26 @@ systems:
               position_bohr: [0.7, 0.0, 0.0]
         - term: electron_electron
         - term: nucleus_nucleus
-    reference_energy_hartree: -1.17447
+    # This component is documented separately so tests can recompute it from
+    # the declared nuclei rather than trusting a second R literal.
+    nuclear_repulsion_hartree: 0.7142857142857143
+    reference_energy_hartree: -1.1744757142204434
     reference_source: >-
-      Kolos and Wolniewicz (1965), the standard Born-Oppenheimer reference,
-      quoted as the exact column of the PauliNet results table (Hermann et al.,
-      arXiv:1909.08423, Table 1). Read 2026-08-13.
+      K. Pachucki, "Born-Oppenheimer potential for H2", arXiv:1007.0322,
+      https://ar5iv.labs.arxiv.org/html/1007.0322, Table IV, row r/au = 1.40:
+      -1.174 475 714 220 4434(5) Ha (uncertainty 5e-16 Ha). Equation (2)
+      defines the total Born-Oppenheimer energy including the +1/R
+      nucleus-nucleus term. Corroborated by J. S. Sims and S. A. Hagstrom,
+      J. Chem. Phys. 124, 094101 (2006),
+      https://www.nist.gov/document/sims-h2pdf, which reports
+      -1.174 475 714 220(1) Ha at R = 1.4 bohr.
     confidence: transcribed
     notes: >-
-      Geometry is load-bearing here and does not match the baseline default. The
-      value above is the R = 1.4 bohr reference, whereas FermiNet's built-in
-      diatomic table uses 0.737164 angstrom = 1.393 bohr, a different geometry.
-      Runs against this entry must pin the bond length explicitly rather than
-      accepting that default. The energy difference between the two geometries
-      is second order at the minimum and small (order 0.01 mHa), but it is a
-      systematic offset, not noise, and it is silent if unstated. Only five
-      digits were transcribed; the Kolos-Wolniewicz value is quoted to more
-      precision in the primary source, which has not been read here.
+      The coordinate convention is nuclei at [-0.7, 0, 0] and [0.7, 0, 0]
+      bohr, so R = 1.4 bohr. The reference is the total BO energy, not the
+      electronic energy with nuclear repulsion removed. This is distinct from
+      FermiNet's built-in 0.737164 angstrom (approximately 1.393 bohr)
+      geometry; comparisons must use the declared positions and term list.
 
   - id: n2_molecule
     description: >-
