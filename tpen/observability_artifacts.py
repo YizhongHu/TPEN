@@ -3079,15 +3079,35 @@ class ObservabilityBundleWriter:
                 f"external artifact {normalized!r} was not reserved"
             )
         target = self._safe_artifact_path(normalized)
-        resolved_run = self._artifact_manager.run_dir.resolve(strict=False)
+        run_dir = self._artifact_manager.run_dir
+        resolved_run = run_dir.resolve(strict=False)
         resolved_bundle = self.bundle_dir.resolve(strict=False)
-        current = self._artifact_manager.run_dir
-        all_parts = (
-            *self.sink.relative_dir.split("/"),
-            self.invocation_id,
-            *Path(normalized).parent.parts,
+        # The manager may not have created its run tree yet.  Start at the
+        # manager-owned root so every newly-created component is checked.
+        anchor = (
+            self._artifact_manager.destination.physical_root
+            if self._artifact_manager.destination is not None
+            else self._artifact_manager.root
         )
-        for part in all_parts:
+        anchor = Path(anchor)
+        resolved_anchor = anchor.resolve(strict=False)
+        try:
+            resolved_run.relative_to(resolved_anchor)
+        except ValueError as exc:
+            raise ObservabilityPathError(
+                f"external artifact run {run_dir!s} resolves outside root "
+                f"{anchor!s}"
+            ) from exc
+        try:
+            run_parts = run_dir.relative_to(anchor).parts
+        except ValueError as exc:
+            raise ObservabilityPathError(
+                f"external artifact run {run_dir!s} is outside root {anchor!s}"
+            ) from exc
+
+        def create_checked(
+            current: Path, part: str, *, containment: Path
+        ) -> Path:
             current = current / part
             if current.is_symlink():
                 raise ObservabilityPathError(
@@ -3104,12 +3124,38 @@ class ObservabilityBundleWriter:
                 )
             resolved_current = current.resolve(strict=False)
             try:
-                resolved_current.relative_to(resolved_run)
+                resolved_current.relative_to(containment)
             except ValueError as exc:
                 raise ObservabilityPathError(
-                    f"external artifact parent {current!s} resolves outside run "
-                    f"{resolved_run!s}"
+                    f"external artifact parent {current!s} resolves outside "
+                    f"{containment!s}"
                 ) from exc
+
+            return current
+
+        if anchor.is_symlink():
+            raise ObservabilityPathError(
+                f"refusing symlinked external artifact root {anchor!s}"
+            )
+        if anchor.exists() and not anchor.is_dir():
+            raise ObservabilityPathError(
+                f"external artifact root {anchor!s} is not a directory"
+            )
+        if not anchor.exists():
+            anchor.mkdir()
+        if anchor.is_symlink():
+            raise ObservabilityPathError(
+                f"refusing symlinked external artifact root {anchor!s}"
+            )
+        current = anchor
+        for part in run_parts:
+            current = create_checked(current, part, containment=resolved_anchor)
+        for part in (
+            *self.sink.relative_dir.split("/"),
+            self.invocation_id,
+            *Path(normalized).parent.parts,
+        ):
+            current = create_checked(current, part, containment=resolved_run)
         try:
             current.resolve(strict=False).relative_to(resolved_bundle)
         except ValueError as exc:
