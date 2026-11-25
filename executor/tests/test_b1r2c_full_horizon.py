@@ -20,7 +20,7 @@ from tpen_executor.recovery import (
     RecoverySchedulerEndV1,
     CoreAdmissionVerdictV2,
 )
-from tpen_executor.results import FullHorizonCompletionRecord
+from tpen_executor.results import FullHorizonCompletionRecord, StartProvenanceV1
 from tpen_executor.storage import DirectoryStore, FenceRejected, FullHorizonFork, read_successor_admission
 
 from test_core_evidence_v3 import _typed_evidence_payload
@@ -514,7 +514,7 @@ def test_successor_science_lineage_is_checked(tmp_path: Path) -> None:
 
 
 def test_successor_request_digest_is_checked(tmp_path: Path) -> None:
-    store, group, predecessor, _middle, final, verdict, task = _chain_fixture(tmp_path)
+    store, group, predecessor, middle, final, verdict, task = _chain_fixture(tmp_path)
     ledger_path = (
         Path(predecessor.output_dir).parent / "successor-admissions" / predecessor.attempt_id.value
         / "successor-admission.json"
@@ -522,6 +522,9 @@ def test_successor_request_digest_is_checked(tmp_path: Path) -> None:
     payload = json.loads(ledger_path.read_text(encoding="utf-8"))
     payload["request_digest"] = "f" * 64
     ledger_path.write_bytes(canonical_bytes(payload))
+    provenance_path = Path(middle.output_dir) / "start-provenance.json"
+    provenance = StartProvenanceV1.decode(provenance_path.read_bytes())
+    provenance_path.write_bytes(replace(provenance, request_digest=payload["request_digest"]).encode())
     with pytest.raises(FenceRejected, match="request digest"):
         _publish(store, group, final, verdict, task)
     assert not ledger_path.parent.parent.parent.joinpath("full-horizon-completion.json").exists()
@@ -557,15 +560,19 @@ def test_crossed_successor_group_is_rejected(tmp_path: Path, monkeypatch: pytest
 
 
 def test_crossed_successor_task_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    store, group, _predecessor, _middle, final, verdict, task = _chain_fixture(tmp_path)
+    store, group, _predecessor, middle, final, verdict, task = _chain_fixture(tmp_path)
     task_dir = Path(final.output_dir).parent
     records = store._admission_records_for_task(str(task_dir), task.task_id)
     request = thaw(records[0].successor_request)
     request["predecessor"]["task_id"] = "foreign-task"
+    request_digest = digest(request)
     crossed = replace(
         records[0], predecessor_task_id="foreign-task", successor_request=request,
-        request_digest=digest(request),
+        request_digest=request_digest,
     )
+    provenance_path = Path(middle.output_dir) / "start-provenance.json"
+    provenance = StartProvenanceV1.decode(provenance_path.read_bytes())
+    provenance_path.write_bytes(replace(provenance, request_digest=request_digest).encode())
     monkeypatch.setattr(DirectoryStore, "_admission_records_for_task", lambda _self, *_args: (crossed, records[1]))
     with pytest.raises(FenceRejected, match="crosses task identity"):
         _publish(store, group, final, verdict, task)
