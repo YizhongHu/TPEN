@@ -143,6 +143,12 @@ _MANIFEST_SPEC.loader.exec_module(scan_manifest)
 architecture_stage_family = importlib.import_module(
     "experiments.atomistic.he-importance.architecture_stage_family"
 )
+attempt_delta = importlib.import_module(
+    "experiments.atomistic.he-importance.attempt_delta"
+)
+full_horizon_completion = importlib.import_module(
+    "experiments.atomistic.he-importance.full_horizon_completion"
+)
 
 
 def _require_executable_stage(stage: str) -> None:
@@ -1553,6 +1559,14 @@ def execute(
     """
 
     launch.refuse_hi_continuation(restore_request)
+    raw_delta = getattr(args, "attempt_delta", None)
+    delta = (
+        attempt_delta.parse_attempt_delta(raw_delta)
+        if raw_delta is not None
+        else None
+    )
+    if delta is not None and (getattr(args, "manifest", None) is None or getattr(args, "row", None) is None):
+        raise StageQSelectionError("--attempt-delta requires --manifest and --row")
     manifest_path = getattr(args, "manifest", None)
     row_id = getattr(args, "row", None)
     if (manifest_path is None) != (row_id is None):
@@ -1639,6 +1653,12 @@ def execute(
         )
     selection = replace(selection, cell=cell)
     packet, resolved = _resolve_selected_config(selection)
+    if delta is not None:
+        # The executor owns the physical leaf.  Keep the authenticated cell
+        # identity intact and apply only the closed operational route overlay.
+        resolved = train_config.resolve_train_config(
+            packet, overrides={"run.dir": str(delta.attempt_core_dir)}
+        )
     recorded_resolved = OmegaConf.to_container(resolved, resolve=True)
     report = {
         "selection": selection.receipt(),
@@ -1652,13 +1672,35 @@ def execute(
         },
         "resolved_config": recorded_resolved,
     }
+    c_report = report
+    if delta is not None:
+        # C is cell-owned science identity; per-attempt operational facts stay
+        # in the report captured under the executor-owned physical leaf.
+        c_report = {key: report[key] for key in ("selection", "walkers", "roster_vs_design", "train_packet")}
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
     if args.dry_run:
         return 0
 
     output_path = Path(packet.cell.output_path)
     _refuse_occupied_output_path(output_path)
-    _write_cell_selection_receipt(output_root, packet.cell.content_hash, report)
+    receipt_path = _selection_receipt_path(output_root, packet.cell.content_hash)
+    if delta is not None and delta.load_mode == "train_resume":
+        _validate_cell_selection_receipt(output_root, packet.cell.content_hash, c_report)
+    elif delta is None:
+        _write_cell_selection_receipt(output_root, packet.cell.content_hash, report)
+    elif receipt_path.exists():
+        _validate_cell_selection_receipt(output_root, packet.cell.content_hash, c_report)
+    else:
+        _write_cell_selection_receipt(output_root, packet.cell.content_hash, c_report)
+    if delta is not None:
+        _write_json(output_path / "attempt_report.json", {"attempt_delta": {
+            "attempt_core_dir": str(delta.attempt_core_dir),
+            "attempt_id": delta.attempt_id,
+            "group_digest": delta.group_digest,
+            "load": {"mode": delta.load_mode, "path": None if delta.load_path is None else str(delta.load_path)},
+            "schema": attempt_delta.SCHEMA,
+            "task_id": delta.task_id,
+        }, "resolved_config": recorded_resolved})
 
     def _guarded_runner(
         config: Any,
@@ -1687,6 +1729,7 @@ def execute(
             _execution_facts(),
             runner=_guarded_runner,
             runtime_callbacks=runtime_callbacks,
+            overrides=None if delta is None else {"run.dir": str(delta.attempt_core_dir)},
         )
     else:
         exit_code = launch.launch_train(
@@ -1694,12 +1737,14 @@ def execute(
             _execution_facts(),
             runner=_guarded_runner,
             runtime_callbacks=runtime_callbacks,
+            overrides=None if delta is None else {"run.dir": str(delta.attempt_core_dir)},
         )
     if exit_code == 0:
         resolved_snapshot = output_path / "resolved_config.yaml"
         if not resolved_snapshot.is_file():
             raise RuntimeError(f"runner returned success without {resolved_snapshot}")
-        (output_path / "COMPLETE").write_text("completed\n", encoding="utf-8")
+        if delta is None:
+            (output_path / "COMPLETE").write_text("completed\n", encoding="utf-8")
     return exit_code
 
 
@@ -1717,6 +1762,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--literal-configuration", type=json.loads)
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--row")
+    parser.add_argument("--attempt-delta")
     return parser
 
 
