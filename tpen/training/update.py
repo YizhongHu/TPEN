@@ -1553,6 +1553,8 @@ class VMCUpdateMethod(Generic[InputT], ABC):
 
         if not isinstance(state, Mapping):
             raise TypeError("VMCUpdateMethod method state must be a mapping")
+        if state:
+            raise ValueError("stateless VMCUpdateMethod cannot load non-empty method state")
 
     def method_tensor_state_dict(self) -> Mapping[str, Any] | None:
         """Return optional binary tensor state persisted to ``method_state.pt``.

@@ -768,7 +768,21 @@ class VMCTrainer:
         live model, optimizer, trainer, and update-method state untouched.
         """
 
-        self._parse_trainer_state_prefix(state)
+        _, _, restored_layout = self._parse_trainer_state_prefix(state)
+        if restored_layout is not None:
+            if self._resolved_model is None or self._resolved_update_state is None:
+                raise ValueError(
+                    "parameter layout restore requires resolved model and update state"
+                )
+            # ``rebind`` is pure: it validates the checkpoint layout against
+            # the live model and returns a new binding.  Prevalidation must
+            # discard that candidate; adoption belongs to the commit path.
+            rebuilt_binding = self._resolved_update_state.model_parameters.rebind(
+                tuple(self._resolved_model.parameters()),
+                layout=restored_layout,
+            )
+            if not rebuilt_binding.compare(self._resolved_update_state.model_parameters)[0]:
+                raise ValueError("checkpoint parameter layout does not match live model")
 
         if "update_method" in state:
             if self._resolved_update_method is None:
@@ -781,8 +795,6 @@ class VMCTrainer:
             if not isinstance(method_state, Mapping):
                 raise TypeError("VMCUpdateMethod method state must be a mapping")
             method.validate_method_state_dict(method_state)
-            if not method.method_state_dict() and method_state:
-                raise ValueError("stateless VMCUpdateMethod cannot load non-empty method state")
             validator = getattr(method, "validate_method_tensor_state_dict", None)
             if callable(validator):
                 validator(method_tensor_state, method_state=method_state)

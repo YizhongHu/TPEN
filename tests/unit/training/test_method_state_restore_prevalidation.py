@@ -15,7 +15,8 @@ from tpen.training.kfac import KFACPolicy, NativeKFACUpdate
 from tpen.training.score_geometry import ScoreConventions
 from tpen.training.spring import SPRINGPolicy, SPRINGUpdate
 from tpen.training.sr import SRPolicy, StochasticReconfigurationUpdate
-from tpen.training.update import ModelParameterBinding
+from tpen.training.trainer import VMCTrainer
+from tpen.training.update import ModelParameterBinding, VMCUpdateMethod, VMCUpdateResult, VMCUpdateState
 from tests.unit.training.test_nonfinite_score_row_policy import _build_checkpoint_run, _checkpoint_context, _rewrite_trainer_json_and_digest
 from tests.unit.training.test_vmc_trainer_tpen_smoke import _StubContext
 
@@ -178,3 +179,44 @@ def test_other_stateful_method_validation_is_non_mutating_and_loader_reuses_it(f
     assert method.method_state_dict() == before
     with pytest.raises(ValueError):
         method.load_method_state_dict(invalid)
+
+
+def test_base_method_validator_and_loader_agree_on_empty_and_nonempty_state() -> None:
+    method = object.__new__(VMCUpdateMethod)
+
+    method.validate_method_state_dict({})
+    method.load_method_state_dict({})
+    with pytest.raises(ValueError, match="stateless"):
+        method.validate_method_state_dict({"counter": 1})
+    with pytest.raises(ValueError, match="stateless"):
+        method.load_method_state_dict({"counter": 1})
+
+
+class _StatefulDefaultValidator(VMCUpdateMethod[Any]):
+    def update(self, update_input: Any) -> VMCUpdateResult:
+        raise AssertionError("not reached")
+
+    def method_state_dict(self):
+        return {"counter": 1}
+
+    def update_state(self):
+        return VMCUpdateState(optimizer=self.optimizer, model_parameters=self.model_parameters)
+
+    def __init__(self, optimizer, model_parameters):
+        super().__init__()
+        self.optimizer = optimizer
+        self.model_parameters = model_parameters
+
+
+def test_stateful_subclass_without_validator_fails_closed_in_prevalidation() -> None:
+    model = torch.nn.Linear(1, 1).double()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    method = _StatefulDefaultValidator(
+        optimizer, ModelParameterBinding(parameters=tuple(model.parameters()))
+    )
+    trainer = VMCTrainer(max_steps=1, update_method=method)
+    trainer.resolve_update_state(model=model, optimizer=optimizer)
+    with pytest.raises(ValueError, match="stateless"):
+        trainer.validate_checkpoint_state(
+            {"next_iteration": 0, "completed_updates": 0, "update_method": {"counter": 1}}
+        )
