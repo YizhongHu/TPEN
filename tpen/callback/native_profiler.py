@@ -129,7 +129,7 @@ class _DisabledScope(AbstractContextManager[None]):
 class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
     """Invocation-local backend and range state."""
 
-    def __init__(self, callback: "NativeProfiler", context: Any) -> None:
+    def __init__(self, callback: "NativeProfiler", context: RunContext) -> None:
         self.callback = callback
         self.context = context
         self.backend: Any = None
@@ -139,7 +139,8 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
         self.stop_requested = False
         self.missed_window = False
         self._range_stack: list[tuple[type[Any], int]] = []
-        self._counts: dict[str, int] = {}
+        self._range_contexts: list[Any] = []
+        self._typed_counts: dict[type[Any], int] = {}
         self._steps: list[int] = []
         self._primary_error: BaseException | None = None
 
@@ -296,7 +297,7 @@ class NativeProfiler(Callback):
             claims.append(self.sink.ownership_claim(artifact_manager, invocation_id, self.observer_id))
         return claims
 
-    def run_scope(self, context: Any) -> AbstractContextManager[RunResource | None]:
+    def run_scope(self, context: RunContext) -> AbstractContextManager[RunResource | None]:
         if not self.enabled:
             return _DisabledScope()
         if self._unsafe or self._active_session is not None:
@@ -319,12 +320,17 @@ class NativeProfiler(Callback):
         if isinstance(event, Started) and isinstance(event.operation, TrainingIteration):
             step = event.operation.step
             session._steps.append(step)
-            session._counts["TrainingIteration"] = session._counts.get("TrainingIteration", 0) + 1
+            session._typed_counts[TrainingIteration] = session._typed_counts.get(TrainingIteration, 0) + 1
             phase = self.window.phase(step)
             if phase == "warmup" or phase == "active":
                 if not session.started:
                     session._start()
                 session._range_stack.append((type(event.operation), occurrence.count))
+                recorder = getattr(session.backend, "record_function", None)
+                if callable(recorder):
+                    range_context = recorder(type(event.operation).__name__)
+                    range_context.__enter__()
+                    session._range_contexts.append(range_context)
             elif phase == "after":
                 session.request_stop()
             else:
@@ -337,14 +343,24 @@ class NativeProfiler(Callback):
                     session.request_stop()
             if session._range_stack:
                 session._range_stack.pop()
+            if session._range_contexts:
+                session._range_contexts.pop().__exit__(None, None, None)
             return
         if isinstance(event, (Started, Ended)) and isinstance(event.operation, (CollectSamples, SamplerBurnIn, SamplerProduction)):
-            label = type(event.operation).__name__
-            session._counts[label] = session._counts.get(label, 0) + (1 if isinstance(event, Started) else 0)
+            op_type = type(event.operation)
+            if isinstance(event, Started):
+                session._typed_counts[op_type] = session._typed_counts.get(op_type, 0) + 1
             if isinstance(event, Started) and session.started:
                 session._range_stack.append((type(event.operation), occurrence.count))
+                recorder = getattr(session.backend, "record_function", None)
+                if callable(recorder):
+                    range_context = recorder(op_type.__name__)
+                    range_context.__enter__()
+                    session._range_contexts.append(range_context)
             elif isinstance(event, Ended) and session._range_stack:
                 session._range_stack.pop()
+                if session._range_contexts:
+                    session._range_contexts.pop().__exit__(None, None, None)
 
     def _persist(self, session: _NativeSession) -> None:
         # Persistence is best effort, but uses the existing bounded profile schema.
@@ -364,8 +380,9 @@ class NativeProfiler(Callback):
         writer.write_open_manifest(ObservabilityManifest(lifecycle_state="open", data_completeness="unknown", **manifest_base))
         writer.write_profile_summary(ObservabilityProfileSummary(session.context.invocation_id, self.observer_id, window_id,
             "TorchOperatorSummary", self.summary.max_rows, len(rows), tuple(rows)))
+        counts = {op.__name__: count for op, count in session._typed_counts.items()}
         writer.write_profile_status(ObservabilityProfileStatus(session.context.invocation_id, self.observer_id, window_id,
-            "operation", ("CPU",), ("CPU",) if session.started else (), session._counts, "process-monotonic", now,
+            "operation", ("CPU",), ("CPU",) if session.started else (), counts, "process-monotonic", now,
             status, completeness, "diagnostic", "TorchOperatorSummary", "complete" if session.stopped else "partial",
             durable_steps=tuple(session._steps), max_rows=self.summary.max_rows, export_mode="chrome_trace" if self.chrome_trace else "summary"))
         writer.finalize_manifest(ObservabilityManifest(lifecycle_state="closed" if session.stopped else "unsafe",
