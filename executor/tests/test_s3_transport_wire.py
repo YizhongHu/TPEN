@@ -631,7 +631,7 @@ def test_real_serialized_leaf_runs_science_then_inspection_on_the_worker(tmp_pat
 
     monkeypatch.delenv(WORKER_MARK, raising=False)
     request, (group, _allocation, lifecycle, configured, fence) = _request(tmp_path)
-    # Fresh output: the controller's begin wrote only its start receipt.
+    # Fresh output: the controller's begin wrote its start receipt and provenance.
     assert sorted(os.listdir(fence.output_dir)) == ["start-provenance.json", "start.json"]
 
     leaf_pid, encoded = _serialized_leaf(request)
