@@ -17,7 +17,7 @@ from uuid import uuid4
 from .._records import frozen_record
 from ..allocations import AllocationAttemptV2, ConfiguredAllocation, ControllerGenerationV1, MemberInvocationV2
 from ..contracts import AllocationAttemptId, BackendJobId, GroupId, InvocationId, ReadyGroupV2
-from ..recovery import CoreAdmissionPort, CoreAdmissionVerdictV2, GroupReconciliationV2, MemberRecoveryInputV2, reconcile_group
+from ..recovery import CoreAdmissionPort, CoreAdmissionVerdictV2, GroupReconciliationV2, MemberRecoveryInputV2, admit_recovery, reconcile_group
 from ..results import SuccessorAdmissionRecord
 from ..storage import AttemptFence, ControllerGenerationRejected, DirectoryStore, FenceRejected, LaunchIntentAbsent, LaunchIntentRejected
 
@@ -70,6 +70,14 @@ class AllocationLocalExecutor(Protocol):
 
     def submit(self, fence: AttemptFence, invocation: MemberInvocationV2) -> tuple[MemberLaunchResult, Any]:
         """Submit exactly once and return an acknowledgement plus opaque handle."""
+
+    def submit_admitted_successor(
+        self,
+        fence: AttemptFence,
+        invocation: MemberInvocationV2,
+        checkpoint_path: str,
+    ) -> tuple[MemberLaunchResult, Any]:
+        """Submit an admitted successor with its exact C2.2 load path."""
 
     def collect(self, handle: Any, timeout: float) -> Any:
         """Collect one submitted handle with a finite poll timeout."""
@@ -167,6 +175,37 @@ def _require_current_controller(store: DirectoryStore, group: ReadyGroupV2, cont
     store.require_current_controller(group, generation=controller.generation, nonce=controller.claimant_nonce)
 
 
+def _apply_recovery_admission(item: MemberRecoveryInputV2, store: DirectoryStore) -> MemberRecoveryInputV2:
+    """Evaluate real R2 facts against the live store root before reconcile."""
+
+    request = item.recovery_input
+    if request is None:
+        return item
+    admission = admit_recovery(
+        request.evidence,
+        request.successor_attempt_id,
+        now_utc=request.now_utc,
+        trusted_store_root=store.root,
+        existing_successors=request.existing_successors,
+    )
+    # A parked R2 result has no successor identity.  Clear the raw input before
+    # attaching it so MemberRecoveryInputV2 does not reject the typed park as a
+    # crossed recovery input; the controller still uses the original input to
+    # select the R2 path and never calls the legacy admission port.
+    return replace(
+        item,
+        recovery_input=None,
+        recovery_admission=admission,
+        recovery_evidence=request.evidence,
+    )
+
+
+def _is_recovery_member(item: MemberRecoveryInputV2) -> bool:
+    """Return whether a member carries raw or already-evaluated R2 facts."""
+
+    return item.recovery_input is not None or item.recovery_admission is not None
+
+
 def run_group_controller(
     binding: Any,
     observed_job_id: BackendJobId,
@@ -215,12 +254,16 @@ def run_group_controller(
         frozen_inputs = []
         for item in facts.member_inputs:
             try:
-                verdict = admission_port.admit(item)
+                admitted_item = _apply_recovery_admission(item, store)
+                # R2 facts are the complete recovery decision.  The legacy
+                # core selector remains available only to legacy callers.
+                verdict = None if _is_recovery_member(item) else admission_port.admit(admitted_item)
                 if verdict is not None and not isinstance(verdict, CoreAdmissionVerdictV2):
                     verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "malformed-core-admission")
             except Exception:
+                admitted_item = replace(item, recovery_admission=None)
                 verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "core-admission-unavailable")
-            frozen_inputs.append(replace(item, core_verdict=verdict))
+            frozen_inputs.append(replace(admitted_item, core_verdict=verdict))
         checked = reconcile_group(group, tuple(frozen_inputs))
     except Exception:
         return _park(group, "admission-port-failed")
@@ -232,6 +275,8 @@ def run_group_controller(
                 invocation_path = Path(item.start_receipt.output_dir) / "invocation.json"
                 bindings[item.task_id] = MemberInvocationV2.decode(invocation_path.read_bytes())
         successor_requests = {}
+        recovery_admissions = {}
+        recovery_evidence = {}
         for task_id, (request, acceptance, proposed) in facts.successor_requests.items():
             if next(member.action for member in checked.members if member.task_id == task_id) != "admit_successor":
                 continue
@@ -240,10 +285,17 @@ def run_group_controller(
                 next(task.lineage_id for task in group.members if task.task_id == task_id),
                 proposed.attempt_id, InvocationId(uuid4().hex),
             ))
-        published = store.publish_reconciliation(
-            group, attempt, tuple(frozen_inputs), bindings=bindings,
-            successors=successor_requests,
-        )
+            member_input = next(item for item in frozen_inputs if item.task_id == task_id)
+            if member_input.recovery_admission is not None:
+                recovery_admissions[task_id] = member_input.recovery_admission
+                if member_input.recovery_evidence is not None:
+                    recovery_evidence[task_id] = member_input.recovery_evidence
+        publication_kwargs = {"bindings": bindings, "successors": successor_requests}
+        if recovery_admissions:
+            publication_kwargs["recovery_admissions"] = recovery_admissions
+        if recovery_evidence:
+            publication_kwargs["recovery_evidence"] = recovery_evidence
+        published = store.publish_reconciliation(group, attempt, tuple(frozen_inputs), **publication_kwargs)
         if published.encode() != checked.encode():
             return _park(group, "reconciliation-publication-conflict")
         durable_publication = store.read_reconciliation(group, attempt)
@@ -256,7 +308,7 @@ def run_group_controller(
     from .attached import AttachedAllocation
     from ..dispatch.completion import complete_leaf_result
     from ..dispatch.transport import LeafResultRejected, validate_leaf_result
-    from .local_executor import CollectionWaitTimeout, LeafCompletionContext
+    from .local_executor import CollectionWaitTimeout, LeafCompletionContext, LeafSubmissionError
 
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -300,6 +352,8 @@ def run_group_controller(
             outcomes.append((member.task_id, member.action))
         elif member.action in {"start_fresh", "admit_successor"}:
             pending.append(member)
+        elif member.action == "park":
+            _park_member(member.task_id, member.reason_code)
         else:
             _park_member(member.task_id, "reconcile-action")
 
@@ -313,6 +367,7 @@ def run_group_controller(
             member = pending.pop(0)
             current_owned = None
             try:
+                admission_record = None
                 if member.action == "start_fresh":
                     invocation_id = InvocationId(uuid4().hex)
                     fence = store.begin_attempt_current_controller(
@@ -325,15 +380,28 @@ def run_group_controller(
                         fence.attempt_id, invocation_id,
                     )
                 else:
-                    record = next((item.admission for item in durable_publication.members if item.evidence.task_id == member.task_id), None)
-                    if not isinstance(record, SuccessorAdmissionRecord) or record.successor_binding is None:
+                    admission_record = next((item.admission for item in durable_publication.members if item.evidence.task_id == member.task_id), None)
+                    if not isinstance(admission_record, SuccessorAdmissionRecord) or admission_record.successor_binding is None:
                         raise LaunchIntentRejected("successor admission unavailable")
+                    current_fence = None
+                    if admission_record.recovery_admission is not None:
+                        member_input = next(item for item in frozen_inputs if item.task_id == member.task_id)
+                        if member_input.attempt_id is None or member_input.start_receipt is None:
+                            raise LaunchIntentRejected("recovery current fence unavailable")
+                        current_fence = AttemptFence(
+                            store.root,
+                            group.identity,
+                            member.task_id,
+                            member_input.start_receipt.allocation_id.value,
+                            member_input.attempt_id,
+                            member_input.start_receipt.output_dir,
+                        )
                     fence = store.begin_admitted_successor_current_controller(
                         group, member.task_id, allocation, facts.observed_at_utc, "local",
-                        allocation_attempt=record.successor_binding.allocation_attempt, admission=record,
-                        controller_record=controller,
+                        allocation_attempt=admission_record.successor_binding.allocation_attempt, admission=admission_record,
+                        current_fence=current_fence, controller_record=controller,
                     )
-                    invocation = record.successor_binding
+                    invocation = admission_record.successor_binding
                 try:
                     existing = store.read_launch_intent(fence)
                 except LaunchIntentAbsent:
@@ -347,7 +415,19 @@ def run_group_controller(
                 store.create_launch_intent(fence, controller, invocation)
                 store.require_current_controller(group, controller.generation, controller.claimant_nonce)
                 try:
-                    launched, handle = executor.submit(fence, invocation)
+                    if admission_record is not None and admission_record.recovery_admission is not None:
+                        submit_admitted = getattr(executor, "submit_admitted_successor", None)
+                        if not callable(submit_admitted):
+                            raise LeafSubmissionError("executor cannot honor admitted successor checkpoint")
+                        launched, handle = submit_admitted(
+                            fence, invocation, admission_record.checkpoint_path,
+                        )
+                    elif admission_record is not None and hasattr(executor, "submit_admitted_successor"):
+                        launched, handle = executor.submit_admitted_successor(
+                            fence, invocation, admission_record.checkpoint_path,
+                        )
+                    else:
+                        launched, handle = executor.submit(fence, invocation)
                 except Exception as error:
                     try:
                         store.record_controller_outcome(fence, controller, invocation, "unacknowledged", "executor-failed")
@@ -444,10 +524,17 @@ def run_group_controller(
             record = _collected_attempt_record(manifest.attempts, item.task_id, attempt_id)
             if record is None:
                 raise ValueError("collected attempt is absent from durable manifest")
-            rebuilt = item
-            if record is not None:
-                rebuilt = replace(item, attempt_id=record.attempt_id, start_receipt=record.start_receipt,
-                                  outcome_receipt=record.outcome_receipt)
+            rebuilt = _apply_recovery_admission(item, store)
+            rebuilt = replace(
+                rebuilt,
+                attempt_id=record.attempt_id,
+                start_receipt=record.start_receipt,
+                outcome_receipt=record.outcome_receipt,
+                core_evidence=None if record.core_outcome is None else record.core_outcome.evidence,
+                recovery_input=None,
+                recovery_admission=None,
+                recovery_evidence=None,
+            )
             try:
                 verdict = admission_port.admit(rebuilt)
                 if verdict is not None and not isinstance(verdict, CoreAdmissionVerdictV2):

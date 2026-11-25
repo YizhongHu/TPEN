@@ -14,17 +14,16 @@ planned yield and an operator-authorized unplanned end.
 
 All records are immutable, closed mappings. Nested identity records use their
 own typed identity schemas. Program, group, H, content, and evidence identities
-are lower-case SHA-256 strings. `science_digest` is different: it is an opaque,
-non-empty value issued by HI and carried unchanged by the configured program,
-for example `manifest_sha256:<manifest-sha256>:row:<row-id>`. The executor
-does not derive or hash this value; admission compares the caller-supplied
-checkpoint and grant values for equality only.
+are lower-case SHA-256 strings. `science_digest` is an HI-issued, non-empty
+science-lineage token carried in both the checkpoint facts and finite grant.
+Recovery record validation checks that it is non-empty only; admission parks
+with `science-lineage-mismatch` unless the checkpoint and grant values are
+equal. The executor does not compare this token with the configured task's
+`TaskSpec.science_digest`, and does not derive or hash it.
 
-The HI caller obtains the configured-program inputs from
-`executor/src/tpen_executor/configured_program.py` (`manifest_sha256` and
-`row`) and constructs this token before creating the checkpoint facts and
-finite grant. The same token is carried into both records; the executor only
-validates that it is non-empty and compares the two values for equality.
+HI should issue a per-row lowercase 64-hex token, using the same value it puts
+in `TaskSpec.science_digest`; this is a convention, not an enforced rule.
+The HI caller carries that token into the checkpoint facts and finite grant.
 
 ### `RecoverySchedulerEndV1`
 
@@ -60,7 +59,7 @@ Schema id: `tpen-executor/recovery-checkpoint-facts-v1`.
 | `next_iteration` | non-negative integer, retained independently |
 | `completed_updates` | non-negative integer, retained independently |
 | `program_digest` | lower-case SHA-256 program identity |
-| `science_digest` | opaque non-empty HI-issued science-lineage token, carried unchanged from the configured program |
+| `science_digest` | HI-issued, non-empty science-lineage token carried in the checkpoint facts; record validation checks non-empty only, and admission requires equality with the finite grant |
 | `h_digest` | lower-case SHA-256 H identity |
 | `committed` | boolean; true only for an independently validated committed checkpoint |
 
@@ -82,7 +81,7 @@ Schema id: `tpen-executor/recovery-grant-v1`.
 | `group_digest` | lower-case SHA-256 group identity |
 | `task_id` | non-empty frozen task identity |
 | `program_digest` | lower-case SHA-256 program identity |
-| `science_digest` | opaque non-empty HI-issued science-lineage token; the finite grant carries the same value for equality comparison |
+| `science_digest` | HI-issued, non-empty science-lineage token carried in the finite grant; record validation checks non-empty only, and admission requires equality with the checkpoint facts |
 | `h_digest` | lower-case SHA-256 H identity |
 | `successor_limit` | positive finite non-negative integer bound |
 
@@ -128,8 +127,11 @@ Schema id: `tpen-executor/recovery-admission-v1`.
 | `grant_id` | non-empty grant id when present; `null` only without a grant |
 
 The admission record exposes `predecessor_attempt_id` and `checkpoint_path` as
-typed fields. Linked-result exposure of those fields is pending B1-R2B
-(4464489c); consumers do not parse path strings to recover lineage.
+typed fields. B1-R2B publishes these same fields through the versioned linked
+result `tpen-executor/successor-admission-v3`; consumers read the typed fields
+and do not parse path strings to recover lineage. The v3 record also carries
+the admitted R2 decision and the canonical successor request so C1 can read an
+unplanned-end admission without fabricating a core outcome.
 
 ## Admission predicate
 
@@ -146,9 +148,11 @@ root and enforces all of the following before returning `admitted`:
    from the checkpoint path. The current attempt leaf is excluded
    independently. A path in an unrelated group/task, nested store layout, or
    different store parks.
-4. Program and H digests match the finite grant. The HI-issued opaque
-   `science_digest` carried by the configured program matches the checkpoint
-   and finite grant by equality; the executor does not derive this value.
+4. Program and H digests match the finite grant. Recovery record validation
+   checks `science_digest` is non-empty only; admission parks with
+   `science-lineage-mismatch` unless the checkpoint and finite grant values are
+   equal. The executor does not compare this token with the configured task's
+   `TaskSpec.science_digest`, and does not derive or hash it.
 5. A grant exists, is unexpired, and has remaining successor capacity; budget
    remaining must be positive. No grant means default-OFF.
 6. A repeated identical progress observation parks when

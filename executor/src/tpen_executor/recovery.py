@@ -472,6 +472,52 @@ class RecoveryAdmissionV1:
         return cls.from_mapping(decode_json(data))
 
 
+@frozen_record
+class RecoveryAdmissionInputV1:
+    """Real facts and decision identity supplied to the R2 consumer path.
+
+    The trusted store root is intentionally absent: the controller obtains it
+    from its live ``DirectoryStore``/fence and passes it directly to
+    :func:`admit_recovery`.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/recovery-admission-input-v1"
+    evidence: RecoveryEvidenceV1
+    successor_attempt_id: AttemptId
+    now_utc: str
+    existing_successors: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.evidence, RecoveryEvidenceV1):
+            raise TypeError("evidence must be RecoveryEvidenceV1")
+        if not isinstance(self.successor_attempt_id, AttemptId):
+            raise TypeError("successor_attempt_id must be AttemptId")
+        object.__setattr__(self, "now_utc", _recovery_time(self.now_utc, "now_utc"))
+        object.__setattr__(self, "existing_successors", _recovery_counter(self.existing_successors, "existing_successors"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "evidence": self.evidence.to_dict(),
+            "successor_attempt_id": self.successor_attempt_id.to_dict(),
+            "now_utc": self.now_utc,
+            "existing_successors": self.existing_successors,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "RecoveryAdmissionInputV1":
+        fields(data, {"schema", "evidence", "successor_attempt_id", "now_utc", "existing_successors"}, cls.schema, cls.__name__)
+        return cls(
+            RecoveryEvidenceV1.from_mapping(data["evidence"]),
+            AttemptId.from_mapping(data["successor_attempt_id"]),
+            data["now_utc"], data["existing_successors"],
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | Mapping[str, Any]) -> "RecoveryAdmissionInputV1":
+        return cls.from_mapping(decode_json(data))
+
+
 def _checkpoint_under_attempt_core(
     path: str,
     trusted_store_root: str,
@@ -811,6 +857,10 @@ class MemberRecoveryInputV2:
     outcome_receipt: OutcomeReceipt | None = None
     core_verdict: CoreAdmissionVerdictV2 | None = None
     receipt_digest: str | None = None
+    recovery_input: RecoveryAdmissionInputV1 | None = None
+    recovery_admission: RecoveryAdmissionV1 | None = None
+    recovery_evidence: RecoveryEvidenceV1 | None = None
+    core_evidence: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
@@ -823,6 +873,36 @@ class MemberRecoveryInputV2:
             raise TypeError("outcome_receipt must be OutcomeReceipt or None")
         if self.core_verdict is not None and not isinstance(self.core_verdict, CoreAdmissionVerdictV2):
             raise TypeError("core_verdict must be CoreAdmissionVerdictV2 or None")
+        if self.recovery_input is not None and not isinstance(self.recovery_input, RecoveryAdmissionInputV1):
+            raise TypeError("recovery_input must be RecoveryAdmissionInputV1 or None")
+        if self.recovery_admission is not None and not isinstance(self.recovery_admission, RecoveryAdmissionV1):
+            raise TypeError("recovery_admission must be RecoveryAdmissionV1 or None")
+        if self.recovery_evidence is not None and not isinstance(self.recovery_evidence, RecoveryEvidenceV1):
+            raise TypeError("recovery_evidence must be RecoveryEvidenceV1 or None")
+        if self.core_evidence is not None and not isinstance(self.core_evidence, Mapping):
+            raise TypeError("core_evidence must be a mapping or None")
+        if self.recovery_input is not None:
+            evidence = self.recovery_input.evidence
+            if evidence.task_id != self.task_id or evidence.group_digest != (self.start_receipt.group_digest if self.start_receipt is not None else evidence.group_digest):
+                raise ValueError("recovery input crosses member identity")
+            if self.attempt_id is not None and evidence.attempt_id != self.attempt_id:
+                raise ValueError("recovery input crosses attempt identity")
+        if self.recovery_evidence is not None:
+            evidence = self.recovery_evidence
+            if evidence.task_id != self.task_id or evidence.group_digest != (self.start_receipt.group_digest if self.start_receipt is not None else evidence.group_digest):
+                raise ValueError("recovery evidence crosses member identity")
+            if self.attempt_id is not None and evidence.attempt_id != self.attempt_id:
+                raise ValueError("recovery evidence crosses attempt identity")
+            if self.recovery_admission is not None:
+                if digest(evidence.to_dict()) != self.recovery_admission.evidence_digest:
+                    raise ValueError("recovery evidence digest crosses admission")
+                if (evidence.predecessor_attempt_id != self.recovery_admission.predecessor_attempt_id
+                        or evidence.checkpoint_path != self.recovery_admission.checkpoint_path):
+                    raise ValueError("recovery evidence crosses admission facts")
+        if self.recovery_admission is not None and self.recovery_input is not None:
+            if (self.recovery_admission.predecessor_attempt_id != self.recovery_input.evidence.predecessor_attempt_id
+                    or self.recovery_admission.successor_attempt_id != self.recovery_input.successor_attempt_id):
+                raise ValueError("recovery admission crosses recovery input")
         identities = [
             value for value in (
                 None if self.attempt_id is None else self.attempt_id,
@@ -844,7 +924,7 @@ class MemberRecoveryInputV2:
             object.__setattr__(self, "receipt_digest", sha256_text(self.receipt_digest, "receipt_digest"))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema": self.schema,
             "task_id": self.task_id,
             "lineage_id": self.lineage_id,
@@ -854,18 +934,24 @@ class MemberRecoveryInputV2:
             "core_verdict": None if self.core_verdict is None else self.core_verdict.to_dict(),
             "receipt_digest": self.receipt_digest,
         }
+        if self.recovery_input is not None:
+            result["recovery_input"] = self.recovery_input.to_dict()
+        if self.recovery_admission is not None:
+            result["recovery_admission"] = self.recovery_admission.to_dict()
+        if self.recovery_evidence is not None:
+            result["recovery_evidence"] = self.recovery_evidence.to_dict()
+        if self.core_evidence is not None:
+            result["core_evidence"] = dict(self.core_evidence)
+        return result
 
     def encode(self) -> bytes:
         return canonical_bytes(self.to_dict())
 
     @classmethod
     def from_mapping(cls, data: Any) -> "MemberRecoveryInputV2":
-        fields(
-            data,
-            {"schema", "task_id", "lineage_id", "attempt_id", "start_receipt", "outcome_receipt", "core_verdict", "receipt_digest"},
-            cls.schema,
-            cls.__name__,
-        )
+        base_fields = {"schema", "task_id", "lineage_id", "attempt_id", "start_receipt", "outcome_receipt", "core_verdict", "receipt_digest"}
+        optional_fields = {key for key in ("recovery_input", "recovery_admission", "recovery_evidence", "core_evidence") if key in data}
+        fields(data, base_fields | optional_fields, cls.schema, cls.__name__)
         if type(data["task_id"]) is not str or type(data["lineage_id"]) is not str:
             raise TypeError("MemberRecoveryInputV2 identity fields must be strings")
         return cls(
@@ -876,6 +962,10 @@ class MemberRecoveryInputV2:
             None if data["outcome_receipt"] is None else OutcomeReceipt.from_mapping(data["outcome_receipt"]),
             None if data["core_verdict"] is None else CoreAdmissionVerdictV2.from_mapping(data["core_verdict"]),
             data["receipt_digest"],
+            None if data.get("recovery_input") is None else RecoveryAdmissionInputV1.from_mapping(data["recovery_input"]),
+            None if data.get("recovery_admission") is None else RecoveryAdmissionV1.from_mapping(data["recovery_admission"]),
+            None if data.get("recovery_evidence") is None else RecoveryEvidenceV1.from_mapping(data["recovery_evidence"]),
+            None if data.get("core_evidence") is None else data["core_evidence"],
         )
 
     @classmethod
@@ -1121,6 +1211,16 @@ def _member_reconciliation(
         member.outcome_receipt is not None and member.outcome_receipt.group_digest != group_digest
     ):
         return _park(member, "crossed-group-receipt")
+    # R2 admission is the sole recovery decision for members carrying real
+    # scheduler/checkpoint/grant facts.  It deliberately does not require a
+    # fabricated core outcome receipt after a hard kill; absence remains
+    # absence while the executor-owned decision is still typed and fenced.
+    if member.recovery_admission is not None:
+        if member.recovery_admission.status != "admitted":
+            return _park(member, member.recovery_admission.reason)
+        if member.recovery_admission.successor_attempt_id is None:
+            return _park(member, "invalid-recovery-evidence")
+        return MemberReconciliationV2(member.task_id, "admit_successor", "recovery-admitted", member.attempt_id)
     if member.outcome_receipt is None:
         return _park(member, "missing-settled-outcome")
     if member.outcome_receipt.status in NON_SETTLED_OPERATIONAL_OUTCOMES:
@@ -1225,7 +1325,7 @@ reconcile = reconcile_group
 __all__ = [
     "CORE_ADMISSION_VERDICTS", "CORE_CHECKPOINT_VERDICTS", "CORE_QUIESCENCE_VERDICTS", "CORE_RECOVERY_OUTCOMES",
     "CoreProfileReference",
-    "CoreAdmissionPort", "CoreAdmissionUnavailable", "CoreAdmissionVerdictV2", "CORE_ADMISSION_WIRE_SCHEMA", "GroupReconciliationV2", "MappingCoreAdmissionPort", "MemberReconciliationV2", "MemberRecoveryInputV2",
+    "CoreAdmissionPort", "CoreAdmissionUnavailable", "CoreAdmissionVerdictV2", "CORE_ADMISSION_WIRE_SCHEMA", "GroupReconciliationV2", "MappingCoreAdmissionPort", "MemberReconciliationV2", "MemberRecoveryInputV2", "RecoveryAdmissionInputV1", "RecoveryAdmissionV1",
     "PROFILE_REFUSAL_CODES",
     "ProfileCheck",
     "ProfileUnavailable",

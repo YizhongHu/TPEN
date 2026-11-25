@@ -1103,6 +1103,8 @@ class DispatcherContract:
         fence: AttemptFence,
         request: Mapping[str, Any],
         core_acceptance_digest: str,
+        *,
+        recovery_admission: Any | None = None,
     ) -> SuccessorAdmissionRecord:
         """Persist a caller-confirmed core admission without launching work.
 
@@ -1116,6 +1118,7 @@ class DispatcherContract:
             raise TypeError("lifecycle must expose successor admission storage")
         return lifecycle.store.record_successor_admission(
             fence, request, core_acceptance_digest,
+            recovery_admission=recovery_admission,
         )
 
     def _begin_dispatch(

@@ -42,11 +42,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import threading
 from typing import Any
 
 from ..allocations import ConfiguredAllocation, MemberInvocationV2
+from ..configured_program import ConfiguredLoad
 from ..contracts import ProgramSpecRef, ReadyGroupV2, TaskSpec
 from ..dispatch.contract import _with_child_context_keys, _with_child_placement
 from ..dispatch.contract import ConfiguredProgramRouteRefused
@@ -330,8 +331,14 @@ class LocalLeafExecutor:
             value = PreparedPythonEnvironment(value.python, value.setup, {**value.env, **slot.env})
         return value
 
-    def submit(self, fence: AttemptFence, invocation: MemberInvocationV2) -> tuple[MemberLaunchResult, MemberLaunchHandle]:
-        """Accept exactly one leaf without waiting for its completion."""
+    def _submit(
+        self,
+        fence: AttemptFence,
+        invocation: MemberInvocationV2,
+        *,
+        admitted_checkpoint_path: str | None = None,
+    ) -> tuple[MemberLaunchResult, MemberLaunchHandle]:
+        """Accept one leaf, optionally binding its configured resume path."""
 
         task = self._validate_invocation(fence, invocation)
         with self._lock:
@@ -341,6 +348,16 @@ class LocalLeafExecutor:
             self._active += 1
         try:
             configured = self._configured(task)
+            if admitted_checkpoint_path is not None:
+                if configured.program is None:
+                    raise LeafSubmissionError("admitted successor requires a configured program")
+                configured = replace(
+                    configured,
+                    program=replace(
+                        configured.program,
+                        load=ConfiguredLoad("train_resume", admitted_checkpoint_path),
+                    ),
+                )
             environment = self._base_environment(task, configured, slot)
             environment = _with_child_context_keys(environment, self._allocation)
             environment = _with_child_placement(environment, self._allocation, fence, self._group, task, configured)
@@ -358,6 +375,21 @@ class LocalLeafExecutor:
         with self._lock:
             self._handles[id(handle)] = handle
         return MemberLaunchResult(True, status="submitted", detail="local leaf accepted"), handle
+
+    def submit(self, fence: AttemptFence, invocation: MemberInvocationV2) -> tuple[MemberLaunchResult, MemberLaunchHandle]:
+        """Accept exactly one legacy/fresh leaf without waiting for completion."""
+
+        return self._submit(fence, invocation)
+
+    def submit_admitted_successor(
+        self,
+        fence: AttemptFence,
+        invocation: MemberInvocationV2,
+        checkpoint_path: str,
+    ) -> tuple[MemberLaunchResult, MemberLaunchHandle]:
+        """Accept an R2 successor only with its admitted train-resume path."""
+
+        return self._submit(fence, invocation, admitted_checkpoint_path=checkpoint_path)
 
     def _run_leaf(self, request: LeafRequest) -> LeafResult:
         """Run one canonical request and decode its canonical result."""
