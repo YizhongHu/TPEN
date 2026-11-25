@@ -155,9 +155,6 @@ def test_real_train_row_reaches_gateway_zero_preparation(
         "argv",
         [
             "stage1-train",
-            "--config", str(ROOT / system / "train.yaml"),
-            "--kind", "train",
-            *overrides,
             "--binding", _binding_token(row),
         ],
     )

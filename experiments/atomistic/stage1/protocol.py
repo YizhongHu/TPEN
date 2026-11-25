@@ -14,7 +14,7 @@ import binascii
 import copy
 import math
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -165,7 +165,17 @@ def overlay_sha256(overlay: str | Path) -> str:
     path = resolve_overlay_path(overlay)
     if not path.is_file():
         raise ProtocolError(f"overlay file does not exist: {path}")
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    return _sha256_file(path)
+
+
+def _sha256_file(path: Path) -> str:
+    """Hash one admitted file's exact bytes without loading it all at once."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def overlay_path_for_system(system: str) -> str:
@@ -883,6 +893,57 @@ def decode_binding(token: str) -> dict[str, Any]:
     return value
 
 
+def row_config_values(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the finite row-owned values applied by a Stage-1 gateway.
+
+    This is deliberately a structured mapping rather than a caller-supplied
+    OmegaConf dotlist.  The binding is the only application input; the
+    gateway owns this small row-to-config composition step.
+    """
+
+    kind = row.get("kind")
+    if kind not in KINDS:
+        raise ProtocolError("manifest row has an invalid kind")
+    values: dict[str, Any] = {
+        "runtime": {"seed": row["seed"]},
+        "run": {
+            "root": row["results_root"],
+            "run_id": row["run_id"],
+            "layout": "nested",
+        },
+        "experiment": {
+            "name": row["experiment_name"],
+            "sector": row["sector"],
+        },
+    }
+    if "device" in row:
+        values["runtime"]["device"] = row["device"]
+    if kind == "eval":
+        checkpoint_dir, checkpoint_file = _checkpoint_binding(row)
+        values.update({
+            "evaluation_sampler": {"n_walkers": row["walkers"]},
+            "evaluation_tasks": {
+                "mcmc_energy": {"generator": {"n_draws": row["draws"]}},
+            },
+            "load": {
+                "path": str(checkpoint_dir),
+                "mode": "model_only",
+                "strict": True,
+            },
+            "trajectory_identity": {"checkpoint_file": str(checkpoint_file)},
+        })
+    else:
+        values.update({
+            "sampler": {"n_walkers": row["walkers"]},
+            "trainer": {"max_steps": row["updates"]},
+        })
+        if "sampler_seed" in row:
+            values["sampler"]["seed"] = row["sampler_seed"]
+        if row.get("checkpoint_steps"):
+            values["checkpoint_steps"] = list(row["checkpoint_steps"])
+    return values
+
+
 def _is_overlay_owned_override(key: str) -> bool:
     """Identify override paths reserved by the declared train overlay."""
 
@@ -913,23 +974,39 @@ def _canonical_override_key(key: str, *, reject_noncanonical: bool) -> str:
     return canonical
 
 
-def validate_gateway_binding(*, binding: str, config: str, overrides: list[str], kind: str,
+def validate_gateway_binding(*, binding: str, config: str | None = None,
+                             overrides: list[str] | None = None, kind: str | None = None,
+                             expected_kinds: Collection[str] | None = None,
                              expected_checkpoint_sha256: str | None = None,
                              overlay: str | None = None,
                              overlay_sha256: str | None = None) -> dict[str, Any]:
-    """Validate that gateway arguments still match the rendered row binding."""
+    """Validate a complete row binding before loading or constructing core state.
+
+    ``config``/``kind``/``overrides`` remain optional only for the pinned
+    restart adapter that predates the one-row gateway.  Real train/eval mains
+    pass the binding alone, so no repeated application description is accepted
+    on the wire.
+    """
 
     row = decode_binding(binding)
-    if row.get("kind") != kind:
+    effective_kind = row.get("kind")
+    if effective_kind not in KINDS:
+        raise ProtocolError("manifest row has an invalid kind")
+    if expected_kinds is not None and effective_kind not in expected_kinds:
+        expected = ", ".join(sorted(expected_kinds))
+        raise ProtocolError(
+            f"gateway expected kind in {{{expected}}}, actual kind {effective_kind!r}"
+        )
+    if kind is not None and effective_kind != kind:
         raise ProtocolError("binding kind does not match gateway")
     row_config = row.get("config")
-    if not isinstance(config, str) or not isinstance(row_config, str):
+    if not isinstance(row_config, str):
         raise ProtocolError("gateway config is invalid")
     if row.get("config_identity_rule") not in {
         None, CONFIG_IDENTITY_RULE, LEGACY_CONFIG_IDENTITY_RULE,
     }:
         raise ProtocolError("binding config identity rule is unsupported")
-    if resolve_config_path(config) != resolve_config_path(row_config):
+    if config is not None and resolve_config_path(config) != resolve_config_path(row_config):
         raise ProtocolError("gateway config does not match binding")
     declared_overlay = row.get("overlay")
     declared_overlay_sha = row.get("overlay_sha256")
@@ -939,20 +1016,24 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
         if overlay is not None or overlay_sha256 is not None:
             raise ProtocolError("overlay was applied without being declared in the binding")
     else:
-        if kind != "train":
+        if effective_kind != "train":
             raise ProtocolError("overlay is supported only on train rows")
-        if overlay != declared_overlay or overlay_sha256 != declared_overlay_sha:
+        if ((overlay is not None and overlay != declared_overlay)
+                or (overlay_sha256 is not None and overlay_sha256 != declared_overlay_sha)):
             raise ProtocolError("gateway overlay does not match binding")
         _overlay_binding(
-            overlay=overlay,
-            expected_sha256=overlay_sha256,
+            overlay=declared_overlay,
+            expected_sha256=declared_overlay_sha,
             system=str(row.get("system")),
         )
-    if kind == "train" and _is_hooke_science_row(row) and declared_overlay is None:
+    if effective_kind == "train" and _is_hooke_science_row(row) and declared_overlay is None:
         raise ProtocolError("Hooke science train rows require the Hooke diagnostics overlay")
-    _validate_config_identity_for_row(row, resolve_config_path(config))
+    config_path = resolve_config_path(row_config)
+    _validate_config_identity_for_row(row, config_path)
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Stage-1 config path does not exist: {config_path}")
     _validate_run_identity(row)
-    if kind == "train" and _is_hooke_science_row(row):
+    if effective_kind == "train" and _is_hooke_science_row(row):
         _validate_hooke_science_train_row(row)
     expected = {
         f"runtime.seed={row['seed']}",
@@ -967,8 +1048,23 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
         if device not in {"cpu", "cuda"}:
             raise ProtocolError("binding device must be 'cpu' or 'cuda'")
         expected.add(f"runtime.device={device}")
-    if kind == "eval":
+    if effective_kind == "eval":
         checkpoint_dir, checkpoint_file = _checkpoint_binding(row)
+        expected_checkpoint_digest = _require_sha(
+            row.get("checkpoint_sha256"), length=64, field="checkpoint_sha256"
+        )
+        if expected_kinds is not None:
+            # The row-only gateways use this admission path.  The legacy
+            # restart adapter continues to validate its historical override
+            # contract here, while its restart lifecycle owns checkpoint I/O.
+            if not checkpoint_file.is_file():
+                raise ProtocolError(f"checkpoint file does not exist: {checkpoint_file}")
+            actual_checkpoint_digest = _sha256_file(checkpoint_file)
+            if actual_checkpoint_digest != expected_checkpoint_digest:
+                raise ProtocolError(
+                    "checkpoint file sha256 does not match row checkpoint_sha256: "
+                    f"actual={actual_checkpoint_digest}, expected={expected_checkpoint_digest}"
+                )
         expected.update({
             f"evaluation_sampler.n_walkers={row['walkers']}",
             f"evaluation_tasks.mcmc_energy.generator.n_draws={row['draws']}",
@@ -976,11 +1072,11 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
             "load.strict=true",
             f"trajectory_identity.checkpoint_file={checkpoint_file}",
         })
-        if expected_checkpoint_sha256 is None:
-            raise ProtocolError("eval requires strict restore and expected checkpoint")
-        _require_sha(expected_checkpoint_sha256, length=64,
-                     field="expected_checkpoint_sha256")
-        if expected_checkpoint_sha256 != row.get("checkpoint_sha256"):
+        if expected_checkpoint_sha256 is not None:
+            _require_sha(expected_checkpoint_sha256, length=64,
+                         field="expected_checkpoint_sha256")
+        if (expected_checkpoint_sha256 is not None
+                and expected_checkpoint_sha256 != expected_checkpoint_digest):
             raise ProtocolError("expected checkpoint sha256 does not match binding")
     else:
         expected.update({f"sampler.n_walkers={row['walkers']}",
@@ -990,6 +1086,8 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
         if row.get("checkpoint_steps"):
             steps = ",".join(str(step) for step in row["checkpoint_steps"])
             expected.add(f"checkpoint_steps=[{steps}]")
+    if overrides is None:
+        return row
     override_map: dict[str, str] = {}
     for override in overrides:
         key, separator, value = override.partition("=")

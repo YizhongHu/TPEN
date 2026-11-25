@@ -194,10 +194,7 @@ def test_public_he_overlay_path_binds_the_100k_horizon(
         sys,
         "argv",
         [
-            "stage1-train", "--config", str(row["config"]), "--kind", "train",
-            *row_overrides(row), "--binding", _binding_token(row),
-            "--overlay", str(row["overlay"]),
-            "--overlay-sha256", str(row["overlay_sha256"]),
+            "stage1-train", "--binding", _binding_token(row),
         ],
     )
     assert stage1_train.main() == 0
@@ -389,17 +386,9 @@ def test_stale_canonical_overlay_digest_is_rejected_at_every_binding_boundary() 
 def test_actual_train_gateway_refuses_overlay_owned_overrides(
     owned_override: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The public train gateway refuses unbound overlay-owned overrides."""
+    """The public train gateway exposes no repeated override channel."""
 
     row = _overlay_row()
-    overrides = row_overrides(row) + [owned_override]
-    split_calls: list[str] = []
-    original_split_key = protocol_module.split_key
-    monkeypatch.setattr(
-        protocol_module,
-        "split_key",
-        lambda key: split_calls.append(key) or original_split_key(key),
-    )
     monkeypatch.setattr(
         "tpen.run.load_config",
         lambda *_args, **_kwargs: pytest.fail("rejected gateway loaded a config"),
@@ -414,22 +403,13 @@ def test_actual_train_gateway_refuses_overlay_owned_overrides(
         "argv",
         [
             "stage1-train",
-            "--config",
-            str(CONFIG_ROOT / "he" / "train.yaml"),
-            "--kind",
-            "train",
-            *overrides,
             "--binding",
             _binding_token(row),
-            "--overlay",
-            str(row["overlay"]),
-            "--overlay-sha256",
-            str(row["overlay_sha256"]),
+            owned_override,
         ],
     )
-    with pytest.raises(ProtocolError):
+    with pytest.raises(SystemExit):
         stage1_train.main()
-    assert owned_override.partition("=")[0] in split_calls
 
 
 def test_actual_train_gateway_accepts_bound_overlay_without_owned_override(
@@ -451,17 +431,8 @@ def test_actual_train_gateway_accepts_bound_overlay_without_owned_override(
         "argv",
         [
             "stage1-train",
-            "--config",
-            str(CONFIG_ROOT / "he" / "train.yaml"),
-            "--kind",
-            "train",
-            *row_overrides(row),
             "--binding",
             _binding_token(row),
-            "--overlay",
-            str(row["overlay"]),
-            "--overlay-sha256",
-            str(row["overlay_sha256"]),
         ],
     )
     assert stage1_train.main() == 0
@@ -489,17 +460,8 @@ def test_overlay_gateway_zero_checkpoint_preserves_base_checkpoint_callback(
         "argv",
         [
             "stage1-train",
-            "--config",
-            str(CONFIG_ROOT / "he" / "train.yaml"),
-            "--kind",
-            "train",
-            *row_overrides(row),
             "--binding",
             _binding_token(row),
-            "--overlay",
-            str(row["overlay"]),
-            "--overlay-sha256",
-            str(row["overlay_sha256"]),
         ],
     )
     assert stage1_train.main() == 0
@@ -737,25 +699,20 @@ def test_real_overlay_train_eval_collect_chain(
         overlay=str(train_row["overlay"]),
         overlay_sha256=str(train_row["overlay_sha256"]),
     )
-    assert str(train_row["config"]) in command_for_row(
+    assert "--binding" in command_for_row(
         train_row, python="/usr/bin/python3", driver="experiments/atomistic/stage1/train.py",
     )
     rendered_command = command_for_row(
         train_row, python="/usr/bin/python3", driver="experiments/atomistic/stage1/train.py",
     )
-    assert f"--overlay {train_row['overlay']}" in rendered_command
-    assert f"--overlay-sha256 {train_row['overlay_sha256']}" in rendered_command
+    assert "--overlay" not in rendered_command
+    assert "--overlay-sha256" not in rendered_command
     monkeypatch.setattr(
         sys,
         "argv",
         [
             "stage1-train",
-            "--config", str(CONFIG_ROOT / "he" / "train.yaml"),
-            "--kind", "train",
-            *train_overrides,
             "--binding", _binding_token(train_row),
-            "--overlay", str(train_row["overlay"]),
-            "--overlay-sha256", str(train_row["overlay_sha256"]),
         ],
     )
     assert stage1_train.main() == 0

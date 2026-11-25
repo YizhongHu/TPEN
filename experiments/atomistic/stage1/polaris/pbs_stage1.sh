@@ -496,14 +496,14 @@ PY
 }
 
 run_command_for_row() {
-  local row="$1" driver="$2" gpu="$3" cpu_set="$4" core_count="$5" log="$6" status="$7"
+  local row="$1" gpu="$2" cpu_set="$3" core_count="$4" log="$5" status="$6"
   local rc=0 row_id
   row_id="$($PYTHON_BIN -c 'import json,sys; print(json.load(open(sys.argv[1]))["row_id"])' "$row")"
   if [[ "$DRY_EXEC" == 1 ]]; then
     printf 'DRY_EXEC compute=SKIPPED row=%s gpu=%s cpu=%s\n' "$row_id" "$gpu" "$cpu_set" | tee "$log"
   else
     export CUDA_VISIBLE_DEVICES="$gpu" OMP_NUM_THREADS="$core_count" MKL_NUM_THREADS="$core_count"
-    "$TASKSET_BIN" --cpu-list "$cpu_set" "$PYTHON_BIN" - "$row" "$driver" "$CHECKOUT" \
+    "$TASKSET_BIN" --cpu-list "$cpu_set" "$PYTHON_BIN" - "$row" "$CHECKOUT" \
       "$PYTHON_BIN" "$SOURCE_SHA" "$RESULTS_ROOT" > "$log" 2>&1 <<'PY' || rc=$?
 import json
 import os
@@ -514,9 +514,9 @@ from pathlib import Path
 
 from experiments.atomistic.stage1.launch import command_for_row
 
-row_path, driver, checkout, python, head_sha, results_root = sys.argv[1:]
+row_path, checkout, python, head_sha, results_root = sys.argv[1:]
 row = json.loads(Path(row_path).read_text(encoding="utf-8"))
-argv = shlex.split(command_for_row(row, python=python, driver=driver))
+argv = shlex.split(command_for_row(row, python=python, checkout_root=checkout))
 print("POLARIS_COMMAND " + shlex.join(argv), flush=True)
 completed = subprocess.run(argv, cwd=checkout, env=os.environ)
 raise SystemExit(completed.returncode)
@@ -557,8 +557,7 @@ run_mode() {
       fi
       assert_contained_path "$log" "$destination_root" log
       assert_contained_path "$status" "$destination_root" status
-      run_command_for_row "$row" "$CHECKOUT/experiments/atomistic/stage1/train.py" \
-        "$gpu" "$cpu_set" "$core_count" "$log" "$status" &
+      run_command_for_row "$row" "$gpu" "$cpu_set" "$core_count" "$log" "$status" &
       pids+=("$!")
       index=$((index + 1))
     done
@@ -582,8 +581,7 @@ run_mode() {
       fi
       assert_contained_path "$log" "$destination_root" log
       assert_contained_path "$status" "$destination_root" status
-      run_command_for_row "$row" "$CHECKOUT/experiments/atomistic/stage1/eval.py" \
-        "$gpu" "$cpu_set" "$core_count" "$log" "$status" || rc=1
+      run_command_for_row "$row" "$gpu" "$cpu_set" "$core_count" "$log" "$status" || rc=1
     done < "$row_list"
   fi
   return "$rc"

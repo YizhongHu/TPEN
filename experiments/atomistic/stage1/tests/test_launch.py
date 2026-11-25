@@ -138,7 +138,8 @@ def test_render_fails_for_unapproved_partition_or_results_root() -> None:
                results_root="/n/netscratch/kozinsky_lab/Lab/rhu/stage1",
                partition="not-a-partition", scratch_base="/tmp/stage1")
     with pytest.raises(ValueError, match="Netscratch"):
-        render(row=ROW, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
+        render(row={**ROW, "results_root": "/tmp/stage1"}, driver="driver.py",
+               python="/usr/bin/python3", head_sha="c" * 40,
                results_root="/tmp/stage1", scratch_base="/tmp/stage1")
 
 
@@ -157,7 +158,8 @@ def test_gpu_render_requires_explicit_shape_and_cuda_binding() -> None:
     assert "#SBATCH --cpus-per-task=8" in script
     assert "#SBATCH --mem=64G" in script
     assert "#SBATCH --time=08:00:00" in script
-    assert "runtime.device=cuda" in script
+    assert "--binding" in script
+    assert "runtime.device=cuda" not in script
     assert "expected exactly one management GPU" in script
 
 
@@ -438,30 +440,17 @@ def test_forced_template_metacharacter_fails_without_side_effect(tmp_path: Path)
 
 
 def test_gateway_rejects_omitted_or_altered_binding_before_run() -> None:
-    from experiments.atomistic.stage1.launch import _binding_token, row_overrides
+    from experiments.atomistic.stage1.launch import _binding_token
     token = _binding_token(ROW)
-    overrides = row_overrides(ROW)
-    validate_gateway_binding(binding=token, config=ROW["config"], overrides=overrides, kind="train")
+    assert validate_gateway_binding(binding=token) == ROW
+    # The application description is owned by the binding; a second CLI
+    # description is no longer part of the gateway contract.
     with pytest.raises(ProtocolError):
-        validate_gateway_binding(binding=token, config=ROW["config"], overrides=overrides[:-1], kind="train")
-    with pytest.raises(ProtocolError):
-        validate_gateway_binding(binding=token, config=ROW["config"], overrides=[*overrides[:-1], "trainer.max_steps=1"], kind="train")
-    with pytest.raises(ProtocolError):
-        validate_gateway_binding(binding=token, config="configs/he/other.yaml",
-                                 overrides=overrides, kind="train")
+        validate_gateway_binding(binding=token, config="configs/he/other.yaml")
     gpu_row = {**ROW, "device": "cuda"}
-    gpu_overrides = row_overrides(gpu_row)
     assert validate_gateway_binding(
-        binding=_binding_token(gpu_row), config=gpu_row["config"],
-        overrides=gpu_overrides, kind="train",
+        binding=_binding_token(gpu_row),
     ) == gpu_row
-    with pytest.raises(ProtocolError):
-        validate_gateway_binding(
-            binding=_binding_token(gpu_row), config=gpu_row["config"],
-            overrides=[override for override in gpu_overrides
-                       if not override.startswith("runtime.device=")],
-            kind="train",
-        )
     eval_row = {
         **ROW, "kind": "eval", "draws": 256,
         "checkpoint_dir": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010",
@@ -469,12 +458,9 @@ def test_gateway_rejects_omitted_or_altered_binding_before_run() -> None:
         "checkpoint_sha256": "d" * 64,
     }
     eval_token = _binding_token(eval_row)
-    eval_overrides = row_overrides(eval_row)
-    validate_gateway_binding(binding=eval_token, config=eval_row["config"], overrides=eval_overrides, kind="eval",
-                             expected_checkpoint_sha256="d" * 64)
+    assert validate_gateway_binding(binding=eval_token) == eval_row
     with pytest.raises(ProtocolError):
-        validate_gateway_binding(binding=eval_token, config=eval_row["config"], overrides=eval_overrides, kind="eval",
-                                 expected_checkpoint_sha256=None)
+        validate_gateway_binding(binding=_binding_token({**eval_row, "checkpoint_sha256": None}))
 
 
 def test_train_gateway_rejects_missing_config_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -489,10 +475,7 @@ def test_train_gateway_rejects_missing_config_path(monkeypatch: pytest.MonkeyPat
         "sys.argv",
         [
             "train.py",
-            "--config", row["config"],
-            *row_overrides(row),
             "--binding", _binding_token(row),
-            "--kind", "smoke",
         ],
     )
     with pytest.raises(FileNotFoundError, match="config path does not exist"):
@@ -678,12 +661,9 @@ def test_gateway_rejects_effective_run_dir_outside_results_root(
 
 
 def test_row_overrides_bind_nested_layout_even_when_config_inherits_flat() -> None:
-    row = {**ROW, "config": "configs/he/inherited-flat.yaml"}
-    overrides = row_overrides(row)
-    assert "run.layout=nested" in overrides
-    assert validate_gateway_binding(
-        binding=_binding_token(row), config=row["config"], overrides=overrides, kind="train",
-    ) == row
+    from experiments.atomistic.stage1.protocol import row_config_values
+
+    assert row_config_values(ROW)["run"]["layout"] == "nested"
 
 
 def test_gateway_rejects_relative_checkpoint_paths() -> None:
@@ -766,10 +746,13 @@ def test_command_binds_every_kind() -> None:
     }
     for row in ({**ROW, "kind": "smoke"}, ROW, eval_row):
         command = command_for_row(row, python="/usr/bin/python3", driver="driver.py")
-        assert f"runtime.seed={row['seed']}" in command
-        assert str(row["walkers"]) in command
+        assert "--binding" in command
+        assert "--config" not in command
+        assert "--kind" not in command
+        assert "runtime.seed=" not in command
     eval_command = command_for_row(eval_row, python="/usr/bin/python3", driver="eval.py")
-    assert "load.path=" in eval_command
-    assert "trajectory_identity.checkpoint_file=" in eval_command
-    assert "load.mode=model_only" in eval_command
+    assert "--expected-checkpoint-sha256" not in eval_command
+    assert "load.path=" not in eval_command
+    assert "trajectory_identity.checkpoint_file=" not in eval_command
+    assert "load.mode=model_only" not in eval_command
     assert "--expected-resolved-config-identity" not in eval_command

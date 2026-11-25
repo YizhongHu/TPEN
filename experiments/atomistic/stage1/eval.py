@@ -16,7 +16,11 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from tpen.run import run_from_config
-from experiments.atomistic.stage1.protocol import resolve_config_path, validate_gateway_binding
+from experiments.atomistic.stage1.protocol import (
+    resolve_config_path,
+    row_config_values,
+    validate_gateway_binding,
+)
 from experiments.toolkit.run_paths import resolve_run_dir
 
 
@@ -53,14 +57,11 @@ def build_eval_config(
 
     cfg = load_config(str(selected_config))
     _bind_output_identity(cfg, row)
-    if overrides is None:
-        from experiments.atomistic.stage1.launch import row_overrides
-
-        selected_overrides = row_overrides(row)
-    else:
-        selected_overrides = list(overrides)
-    if selected_overrides:
-        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(selected_overrides))
+    cfg = OmegaConf.merge(cfg, OmegaConf.create(row_config_values(row)))
+    # Kept solely for the pinned pre-LR-2 restart adapter; the real eval
+    # gateway has no repeated override channel.
+    if overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(overrides)))
     # Keep the row authoritative for artifact placement if a compatibility
     # caller supplied a contradictory run.root override.
     _bind_output_identity(cfg, row)
@@ -97,20 +98,11 @@ def main() -> int:
     """Run evaluation through the public gateway with model-only restore."""
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
-    parser.add_argument("overrides", nargs="*")
     parser.add_argument("--binding", required=True)
-    parser.add_argument("--kind", choices=("eval",), required=True)
-    parser.add_argument("--expected-checkpoint-sha256", required=True)
-    # The existing compatibility CLI keeps free-form OmegaConf overrides;
-    # allow rendered commands to place named gateway flags around that list.
-    args = parser.parse_intermixed_args()
-    config_path = resolve_config_path(args.config)
-    row = validate_gateway_binding(
-        binding=args.binding, config=str(config_path), overrides=args.overrides, kind=args.kind,
-        expected_checkpoint_sha256=args.expected_checkpoint_sha256,
-    )
-    cfg = build_eval_config(row, config_path=config_path, overrides=args.overrides)
+    args = parser.parse_args()
+    row = validate_gateway_binding(binding=args.binding, expected_kinds={"eval"})
+    cfg = build_eval_config(row)
+    config_path = resolve_config_path(str(row["config"]))
     _refuse_existing_eval_run(cfg)
     # The config/launcher supplies the strict model-only restore policy; this
     # driver does not import checkpoint internals or silently alter identity.
