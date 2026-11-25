@@ -182,8 +182,8 @@ admit_selected_row() {
     # Dry-exec deliberately skips bootstrap and compute; preserve its
     # historical no-run-root-write behavior while still admitting one row.
     ADMITTED_ROW="$SELECTED_ROW"
-    printf 'POLARIS_ADMISSION selected_row=%s source=%s\n' \
-      "$SELECTED_ROW" "$SELECTED_ROW_SOURCE"
+    printf 'POLARIS_ADMISSION source=%s admitted=%s\n' \
+      "$SELECTED_ROW_SOURCE" "$ADMITTED_ROW"
     return 0
   fi
   mkdir -p -- "$RESULTS_ROOT/plan"
@@ -212,6 +212,12 @@ except BaseException:
         pass
     raise
 PY
+  printf 'POLARIS_ADMISSION source=%s admitted=%s\n' \
+    "$SELECTED_ROW_SOURCE" "$ADMITTED_ROW"
+}
+
+select_admitted_row() {
+  require_value ADMITTED_ROW
   SELECTED_ROW="$ADMITTED_ROW"
   printf 'POLARIS_ADMISSION selected_row=%s source=%s\n' \
     "$SELECTED_ROW" "$SELECTED_ROW_SOURCE"
@@ -639,9 +645,10 @@ main() {
       assert_pbs_context
       validate_mode_paths
       admit_selected_row
-      validate_selected_row_or_die "$SELECTED_ROW" train
+      validate_selected_row_or_die "$ADMITTED_ROW" train
       require_approval_or_die
       prepare_job
+      select_admitted_row
       guard_runtime
       cd "$CHECKOUT"
       run_mode
@@ -682,9 +689,10 @@ main() {
       assert_pbs_context
       validate_mode_paths
       admit_selected_row
-      validate_selected_row_or_die "$SELECTED_ROW" "$MODE"
+      validate_selected_row_or_die "$ADMITTED_ROW" "$MODE"
       require_approval_or_die
       prepare_job
+      select_admitted_row
       write_job_receipt
       guard_runtime
       cd "$CHECKOUT"
