@@ -50,7 +50,9 @@ EXPECTED_REGISTRY = {
     "hooke2": ("hooke_pair_singlet_omega0.5", 2.0, "transcribed"),
     "qho2e": ("qho_pair_noninteracting_singlet_omega0.5", 1.5, "transcribed"),
     "he": ("he_atom", -2.903724377034119598, "transcribed"),
-    "h2": ("h2_molecule", -1.17447, "transcribed"),
+    # H2's analysis reference is owned by the canonical registry entry; do not
+    # duplicate a legacy rounded literal in this producer-chain test.
+    "h2": ("h2_molecule", None, "transcribed"),
 }
 
 
@@ -246,6 +248,8 @@ def test_real_train_eval_inspect_collect_chain_for_all_stage1_systems(
         system = next(system for system, expected in EXPECTED_REGISTRY.items()
                       if expected[0] == record["system_id"])
         expected_id, expected_reference, expected_confidence = EXPECTED_REGISTRY[system]
+        if expected_reference is None:
+            expected_reference = registry[expected_id]["reference_energy_hartree"]
         assert record["system_id"] == expected_id
         assert registry[expected_id]["reference_energy_hartree"] == expected_reference
         assert registry[expected_id]["confidence"] == expected_confidence

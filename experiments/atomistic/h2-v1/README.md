@@ -15,10 +15,11 @@ the Hamiltonian's `ElectronNucleusPotential`/`NucleusNucleusPotential` terms,
 and its default linear cusp law sums independently over both H nuclei. It
 intentionally has no Gaussian confinement.
 
-The reference is -1.17447 Ha (Kolos and Wolniewicz 1965), mirrored from the
-canonical `h2_molecule` record in `experiments/baselines/systems.yaml`. Train
-and eval must agree exactly on model wiring; eval restores with
-`strict: true`.
+The reference is -1.1744757142204434 Ha at R = 1.4 bohr, mirrored from the
+canonical `h2_molecule` record in `experiments/baselines/systems.yaml`. It is
+the total Born-Oppenheimer energy and includes the +1/R nuclear-repulsion
+term; the primary citation is Pachucki, arXiv:1007.0322, Table IV, row 1.40.
+Train and eval must agree exactly on model wiring; eval restores with `strict: true`.
 
 Evaluation records the variational MCMC energy, finite-sample standard error,
 and scalar reference comparison, together with sampled fermionic

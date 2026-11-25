@@ -323,6 +323,44 @@ def test_hydrogen_atom_entry_is_exact_and_distinct(entries: list[dict[str, Any]]
     ]["reference_energy_hartree"]
 
 
+def test_h2_reference_geometry_and_nuclear_repulsion_are_one_contract(
+    entries: list[dict[str, Any]],
+) -> None:
+    """The H2 registry entry pins R, the total-energy convention, and precision."""
+
+    h2 = next(entry for entry in entries if entry["id"] == "h2_molecule")
+    nuclei = _nuclei(h2)
+    assert [nucleus["position_bohr"] for nucleus in nuclei] == [
+        [-0.7, 0.0, 0.0],
+        [0.7, 0.0, 0.0],
+    ]
+    separation = math.sqrt(
+        sum(
+            (left - right) ** 2
+            for left, right in zip(
+                nuclei[0]["position_bohr"], nuclei[1]["position_bohr"]
+            )
+        )
+    )
+    assert math.isclose(separation, 1.4, rel_tol=0.0, abs_tol=1e-12)
+    terms = [term["term"] for term in h2["hamiltonian"]["terms"]]
+    assert "nucleus_nucleus" in terms
+    assert math.isclose(
+        1.0 / separation,
+        h2["nuclear_repulsion_hartree"],
+        rel_tol=0.0,
+        abs_tol=1e-15,
+    )
+    assert h2["reference_energy_hartree"] == -1.1744757142204434
+    assert len(str(abs(h2["reference_energy_hartree"])).split(".", 1)[1]) >= 10
+    source = h2["reference_source"]
+    assert "arXiv:1007.0322" in source
+    assert "Table IV" in source and "r/au = 1.40" in source
+    assert "uncertainty 5e-16 Ha" in source
+    assert "including the +1/R" in source
+    assert "Sims and S. A. Hagstrom" in source
+
+
 def test_loader_covers_every_reproduced_system() -> None:
     """Every system a baseline run has been emitted for is registered.
 
