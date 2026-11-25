@@ -38,6 +38,7 @@ from tpen.run import run_from_config
 ROOT = Path(__file__).parents[1]
 CONFIG_ROOT = ROOT / "configs"
 OVERLAY = CONFIG_ROOT / "overlays" / "diagnostics-v1.yaml"
+V1_GOLDEN = ROOT / "tests" / "fixtures" / "v1-overlay-golden-fba6e82.json"
 APPROVED_PROPOSAL_SHA256 = "8bbaf291e90ec6c90b5a8afbe664bded96dcb9743ad0c24cda1f66ddcb4634c1"
 COMMITTED_OVERLAY_SHA256 = "bf7a78f5b3721f0486053301a0ed8165de58366bdd6ea4748e05b1f742161096"
 
@@ -97,6 +98,126 @@ def _phase1(*, overlay: bool) -> list[dict[str, object]]:
     )
 
 
+def _canonical_json(value: object) -> bytes:
+    """Return the stable JSON bytes used by the committed v1 goldens."""
+
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _v1_golden_plan(plan_key: str) -> tuple[
+    dict[str, object], list[dict[str, object]], list[dict[str, object]], object,
+]:
+    """Build the fixed v1 plan used by the fba6e82ab golden fixture."""
+
+    golden = json.loads(V1_GOLDEN.read_text(encoding="utf-8"))
+    plan = golden["plans"][plan_key]
+    systems = tuple(plan["systems"])
+    overlay = ROOT / plan["overlay"]
+    phase1 = build_manifest(
+        protocol=_protocol(),
+        source_sha=golden["source_sha"],
+        config_sha256=config_identities(config_root=CONFIG_ROOT, systems=systems),
+        checkpoints=[0, 1],
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root=golden["results_root"],
+        systems=systems,
+        phase=1,
+        device="cpu",
+        overlay=str(overlay),
+        overlay_sha256=overlay_sha256(overlay),
+    )
+    evidence = {
+        "schema": protocol_module.CHECKPOINT_EVIDENCE_SCHEMA,
+        "phase1_manifest_hash": manifest_hash(phase1),
+        "phase1_train_row_hashes": {
+            f"{row['system']}:{row['lineage']}": manifest_hash([row])
+            for row in phase1 if row["kind"] == "train"
+        },
+        "checkpoints": {
+            f"{row['system']}:{row['lineage']}:1": "c" * 64
+            for row in phase1 if row["kind"] == "train"
+        },
+    }
+    eval_rows = bind_evaluation_manifest(
+        phase1_rows=phase1,
+        checkpoints=[1],
+        checkpoint_evidence=evidence,
+        expected_physical_system_id={system: "c" * 64 for system in systems},
+        protocol=_protocol(),
+        device="cpu",
+    )
+    train_row = next(row for row in phase1 if row["kind"] == "train")
+    train_cfg = stage1_train.build_train_config(train_row)
+    return golden, phase1, eval_rows, train_cfg
+
+
+@pytest.mark.parametrize("plan_key", ("he-h2", "hooke-qho2e"))
+def test_v1_matches_origin_dev_golden_bytes(plan_key: str) -> None:
+    """Compare full v1 bytes with goldens generated at fba6e82ab.
+
+    The fixture was generated from origin/dev fba6e82ab with ``uv run
+    python`` using this test's fixed protocol, source SHA, results root,
+    canonical JSON separators, and the same build_manifest plus
+    bind_evaluation_manifest calls below.  Hashes cover the complete resolved
+    callback JSON and complete phase-1/combined row JSON bytes, not selected
+    fields.  This is intentionally a bounded detector: applying the v2
+    callback insertion to the v1 branch must make this test fail.
+    """
+
+    golden_file, phase1, eval_rows, train_cfg = _v1_golden_plan(plan_key)
+    golden = golden_file["plans"][plan_key]
+    phase1_bytes = _canonical_json(phase1)
+    combined_bytes = _canonical_json(phase1 + eval_rows)
+    callback_bytes = _canonical_json(
+        OmegaConf.to_container(train_cfg.callbacks, resolve=True)
+    )
+    assert golden_file["origin_dev"] == "fba6e82ab1091846fbe5ea7c36707ebfafd3c66a"
+    assert golden["overlay"] == next(
+        row["overlay"] for row in phase1 if row["kind"] == "train"
+    )
+    assert golden["overlay_sha256"] == next(
+        row["overlay_sha256"] for row in phase1 if row["kind"] == "train"
+    )
+    assert golden["config_sha256"] == config_identities(
+        config_root=CONFIG_ROOT, systems=tuple(golden["systems"])
+    )
+    assert golden["phase1_row_ids"] == [row["row_id"] for row in phase1]
+    assert golden["phase1_rows_sha256"] == hashlib.sha256(phase1_bytes).hexdigest()
+    assert golden["phase1_rows_bytes_length"] == len(phase1_bytes)
+    assert golden["combined_rows_sha256"] == hashlib.sha256(combined_bytes).hexdigest()
+    assert golden["combined_rows_bytes_length"] == len(combined_bytes)
+    assert golden["phase1_manifest_hash"] == manifest_hash(phase1)
+    assert golden["combined_manifest_hash"] == manifest_hash(phase1 + eval_rows)
+    assert golden["callback_sha256"] == hashlib.sha256(callback_bytes).hexdigest()
+    assert golden["callback_bytes_length"] == len(callback_bytes)
+    assert all("overlay_profile" not in row for row in phase1)
+
+
+@pytest.mark.parametrize(
+    ("system", "plan_key"),
+    (("he", "he-h2"), ("hooke1", "hooke-qho2e")),
+)
+def test_v1_resolved_config_accepts_recorder_after_checkpoint(
+    system: str, plan_key: str,
+) -> None:
+    """V1 keeps its historical Recorder-after-Checkpoint callback order."""
+
+    _, phase1, _, cfg = _v1_golden_plan(plan_key)
+    row = next(row for row in phase1 if row["kind"] == "train" and row["system"] == system)
+    assert cfg.stage1_overlay.composition_order == protocol_module.OVERLAY_COMPOSITION_ORDER
+    assert "profile" not in cfg.stage1_overlay
+    targets = [entry["_target_"] for entry in cfg.callbacks]
+    checkpoint_indices = [i for i, target in enumerate(targets) if target == "tpen.callback.Checkpoint"]
+    recorder_indices = [
+        i for i, target in enumerate(targets)
+        if target == "tpen.callback.RawTrainingBatchRecorder"
+    ]
+    assert row["overlay"] == protocol_module.overlay_path_for_system(system)
+    assert checkpoint_indices and recorder_indices
+    assert min(recorder_indices) > max(checkpoint_indices)
+
+
 def test_repository_overlay_is_versioned_and_checkpoint_free() -> None:
     """The committed variant records its deliberate checkpoint deviation."""
 
@@ -129,6 +250,75 @@ def test_hooke_overlay_is_system_qualified_and_has_amplitude_risk() -> None:
     assert list(amplitude[0].thresholds) == [-3, -4, -5, -7, -10]
     assert amplitude[0].every_n_steps == 100
     assert amplitude[0].start_step == 0
+
+
+@pytest.mark.parametrize("system", protocol_module.SYSTEMS)
+def test_diagnostics_v2_places_recorder_before_checkpoint_and_initial_checkpoint(
+    system: str,
+) -> None:
+    """The opt-in v2 profile orders durable capture before publication."""
+
+    overlay = ROOT / protocol_module.overlay_path_for_system(
+        system, profile=protocol_module.OVERLAY_PROFILE_V2,
+    )
+    cfg = load_config(str(CONFIG_ROOT / system / "train.yaml"))
+    cfg.checkpoint_steps = [0, 1]
+    protocol_module.compose_train_overlay(
+        cfg,
+        overlay=str(overlay),
+        expected_sha256=overlay_sha256(overlay),
+        overlay_profile=protocol_module.OVERLAY_PROFILE_V2,
+    )
+    stage1_train.prepare_initial_checkpoint_config(cfg)
+    targets = [entry["_target_"] for entry in cfg.callbacks]
+    checkpoint_indices = [i for i, target in enumerate(targets) if target == "tpen.callback.Checkpoint"]
+    recorder_indices = [
+        i for i, target in enumerate(targets)
+        if target == "tpen.callback.RawTrainingBatchRecorder"
+    ]
+    assert checkpoint_indices
+    assert recorder_indices == [i - 1 for i in checkpoint_indices]
+    assert max(recorder_indices) < targets.index("tpen.callback.InitialCheckpoint")
+    assert cfg.stage1_overlay.profile == protocol_module.OVERLAY_PROFILE_V2
+    assert cfg.stage1_overlay.composition_order == protocol_module.OVERLAY_V2_COMPOSITION_ORDER
+
+
+def test_diagnostics_v2_manifest_is_explicit_and_v1_stays_default() -> None:
+    """v2 rows carry a visible profile while the v1 row shape is unchanged."""
+
+    v1 = _phase1(overlay=True)
+    assert all("overlay_profile" not in row for row in v1 if row["kind"] == "train")
+    v2_overlay = ROOT / protocol_module.overlay_path_for_system(
+        "he", profile=protocol_module.OVERLAY_PROFILE_V2,
+    )
+    v2 = build_manifest(
+        protocol=_protocol(),
+        source_sha="a" * 40,
+        config_sha256=config_identities(config_root=CONFIG_ROOT, systems=("he",)),
+        checkpoints=[0, 1],
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root="/n/netscratch/kozinsky_lab/Lab/rhu/stage1-overlay-v2-test",
+        systems=("he",),
+        phase=1,
+        device="cpu",
+        overlay=str(v2_overlay),
+        overlay_sha256=overlay_sha256(v2_overlay),
+        overlay_profile=protocol_module.OVERLAY_PROFILE_V2,
+    )
+    train_rows = [row for row in v2 if row["kind"] == "train"]
+    assert {row["overlay_profile"] for row in train_rows} == {protocol_module.OVERLAY_PROFILE_V2}
+    assert {row["overlay"] for row in train_rows} == {
+        protocol_module.OVERLAY_V2_RELATIVE_PATH,
+    }
+    assert overlay_sha256(v2_overlay) != overlay_sha256(OVERLAY)
+
+
+def test_unknown_diagnostics_v2_profile_is_rejected() -> None:
+    """A profile marker cannot silently select an unallowlisted composition."""
+
+    with pytest.raises(ProtocolError, match="unknown diagnostics overlay profile"):
+        protocol_module.overlay_path_for_system("he", profile="diagnostics-v99")
 
 
 def test_hooke_manifest_requires_its_overlay_and_rejects_he_overlay() -> None:

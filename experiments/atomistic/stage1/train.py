@@ -17,6 +17,7 @@ if _REPO_ROOT not in sys.path:
 
 from tpen.run import run_from_config
 from experiments.atomistic.stage1.protocol import (
+    OVERLAY_PROFILE_V1,
     compose_train_overlay,
     resolve_config_path,
     row_config_values,
@@ -70,6 +71,7 @@ def build_train_config(
             raise ValueError("train overlay is missing its sha256 binding")
         compose_train_overlay(
             cfg, overlay=str(selected_overlay), expected_sha256=str(selected_overlay_sha),
+            overlay_profile=str(row.get("overlay_profile", OVERLAY_PROFILE_V1)),
         )
 
     cfg = OmegaConf.merge(cfg, OmegaConf.create(row_config_values(row)))
