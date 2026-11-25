@@ -264,20 +264,28 @@ def _timed(device: torch.device, fn: Any) -> tuple[float, float | None, bool, An
     return event_elapsed, event_elapsed, True, value, _memory_snapshot(device)
 
 
-def _dense_trial(case: Case) -> Trial:
+def _dense_trial(case: Case, *, include_reference: bool) -> Trial:
     model = case.model
     request = MaterializedParameterScoreRequest(chunk_size=case.policy.score_chunk_size)
     packet = model.evaluate_materialized_parameter_score_request(request=request, batch=case.batch).detach()
-    rows = flatten_parameter_score_blocks(packet.parameter_scores, sample_shape=tuple(packet.output.logabs.shape))
-    geometry = build_score_geometry_from_rows(rows, layout=packet.parameter_scores.layout)
-    residual = build_energy_residual(case.local_energy, geometry=geometry)
-    operator = QGTOperator(geometry)
-    dense_direction, dense_diag = solve_sample_space(
-        operator,
-        residual,
-        damping=case.policy.damping,
-        rank_cutoff=case.policy.rank_cutoff,
-    )
+    reference_gram = None
+    reference_trace = None
+    reference_damping = None
+    if include_reference:
+        # The dense reference is parity-only; it must not be part of the timed current path.
+        rows = flatten_parameter_score_blocks(packet.parameter_scores, sample_shape=tuple(packet.output.logabs.shape))
+        geometry = build_score_geometry_from_rows(rows, layout=packet.parameter_scores.layout)
+        residual = build_energy_residual(case.local_energy, geometry=geometry)
+        operator = QGTOperator(geometry)
+        _, dense_diag = solve_sample_space(
+            operator,
+            residual,
+            damping=case.policy.damping,
+            rank_cutoff=case.policy.rank_cutoff,
+        )
+        reference_gram = operator.dense_sample_gram().detach()
+        reference_trace = float(operator.trace().item())
+        reference_damping = float(dense_diag.shift)
     optimizer = torch.optim.SGD(model.parameters(), lr=case.policy.learning_rate)
     method = StochasticReconfigurationUpdate(
         optimizer,
@@ -308,9 +316,9 @@ def _dense_trial(case: Case) -> Trial:
         host_crosscheck_ok=True,
         displacement=after - before,
         direction=direction,
-        gram=operator.dense_sample_gram().detach(),
-        trace=float(operator.trace().item()),
-        damping=float(telemetry.diagnostics.shift),
+        gram=reference_gram,
+        trace=reference_trace,
+        damping=reference_damping if include_reference else float(telemetry.diagnostics.shift),
         diagnostics={
             "applied": telemetry.applied,
             "reason": telemetry.reason,
@@ -435,7 +443,7 @@ def _run_cell(
     case = _make_case(cfg, width=width, n_walkers=n_walkers, device=device, seed=seed)
     p = case.model.parameter_binding.layout.total_numel
     _restore(case)
-    dense_parity = _dense_trial(case)
+    dense_parity = _dense_trial(case, include_reference=True)
     _restore(case)
     replay_parity = _replay_trial(case, panel_size=panel_size)
     _assert_parity(dense_parity, replay_parity)
@@ -447,13 +455,13 @@ def _run_cell(
     for _ in range(warmups):
         for arm in ("dense", "replay"):
             _restore(case)
-            trial_fn = (lambda: _dense_trial(case)) if arm == "dense" else (lambda: _replay_trial(case, panel_size=panel_size))
+            trial_fn = (lambda: _dense_trial(case, include_reference=False)) if arm == "dense" else (lambda: _replay_trial(case, panel_size=panel_size))
             _, _, _, _, _ = _timed(device, trial_fn)
     for pair in range(repetitions):
         order = ("dense", "replay") if pair % 2 == 0 else ("replay", "dense")
         for arm in order:
             _restore(case)
-            trial_fn = (lambda: _dense_trial(case)) if arm == "dense" else (lambda: _replay_trial(case, panel_size=panel_size))
+            trial_fn = (lambda: _dense_trial(case, include_reference=False)) if arm == "dense" else (lambda: _replay_trial(case, panel_size=panel_size))
             seconds, event_seconds, host_ok, trial, memory = _timed(device, trial_fn)
             if not host_ok:
                 raise HarnessInvalid("unsynchronized timing")
