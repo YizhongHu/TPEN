@@ -13,7 +13,7 @@ from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from tpen.artifacts import RunContext
 from tpen.events import Ended, Event as TypedEvent, Occurrence, Started, Subscription, started, ended
@@ -24,9 +24,6 @@ from tpen.observability_artifacts import (
     ObservabilityProfileSummary,
     RunArtifactSink,
 )
-from tpen.sampling.events import SamplerBurnIn, SamplerProduction
-from tpen.training.events import CollectSamples, TrainingIteration
-
 from .base import (
     Callback,
     ManagedLifecycleError,
@@ -34,6 +31,10 @@ from .base import (
     RunResource,
 )
 from .cadence import SubscriptionGroup
+
+if TYPE_CHECKING:
+    from tpen.sampling.events import SamplerBurnIn, SamplerProduction
+    from tpen.training.events import CollectSamples, TrainingIteration
 
 
 @dataclass(frozen=True)
@@ -237,12 +238,21 @@ class NativeProfiler(Callback):
         self._active_session: _NativeSession | None = None
         self._unsafe = False
         self._observed = False
-        super().__init__(typed_groups=(SubscriptionGroup(selectors=(
+        super().__init__(typed_groups=self._typed_groups() if self.enabled else ())
+
+    @staticmethod
+    def _typed_groups() -> tuple[SubscriptionGroup, ...]:
+        """Build the fixed event plan only for an enabled profiler."""
+
+        from tpen.sampling.events import SamplerBurnIn, SamplerProduction
+        from tpen.training.events import CollectSamples, TrainingIteration
+
+        return (SubscriptionGroup(selectors=(
             started(TrainingIteration), ended(TrainingIteration),
             started(CollectSamples), ended(CollectSamples),
             started(SamplerBurnIn), ended(SamplerBurnIn),
             started(SamplerProduction), ended(SamplerProduction),
-        )),))
+        )),)
 
     @staticmethod
     def _coerce_window(value: Any) -> TrainingIterationWindow:

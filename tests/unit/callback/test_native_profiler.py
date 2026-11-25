@@ -174,7 +174,7 @@ def test_disabled_fresh_process_does_not_load_torch_profiler() -> None:
     code = (
         "import sys; from tpen.callback import NativeProfiler; "
         "p=NativeProfiler(enabled=False); assert p.ownership_claims()==[]; "
-        "assert 'torch.profiler' not in sys.modules"
+        "assert 'torch' not in sys.modules"
     )
     result = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True,
