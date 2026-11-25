@@ -69,6 +69,8 @@ OVERLAY_COMPOSITION_ORDER = (
 OVERLAY_V2_COMPOSITION_ORDER = (
     "base-config -> recorder-before-checkpoint diagnostics-v2 overlay -> manifest overrides"
 )
+ROW_EXTENSION_VERSION = "stage1-rendered-config/v1"
+ROW_EXTENSION_PROFILES = frozenset(OVERLAY_PROFILES)
 CHECKPOINT_EVIDENCE_SCHEMA = "stage1-checkpoint-evidence/v1"
 MANIFEST_SCHEMA = "stage1/v4"
 LEGACY_MANIFEST_SCHEMA = "stage1/v3"
@@ -84,6 +86,27 @@ _TORCH_SEED_MODULUS = 2**63 - 1
 
 class ProtocolError(ValueError):
     """Raised when a Stage-1 protocol or manifest row is incomplete."""
+
+
+@dataclass(frozen=True)
+class MaterializedConfigAdmission:
+    """Identity retained from the one checked rendered-config read."""
+
+    rendered_path: Path
+    rendered_file_sha256: str
+    gateway_config_sha256: str
+
+
+def _is_int_coordinate(value: object) -> bool:
+    """Return whether ``value`` is an integer coordinate, excluding bool."""
+
+    return type(value) is int
+
+
+def _is_torch_seed(value: object) -> bool:
+    """Return whether ``value`` fits the existing signed Torch seed range."""
+
+    return _is_int_coordinate(value) and 0 <= value < _TORCH_SEED_MODULUS
 
 
 @dataclass(frozen=True)
@@ -190,6 +213,374 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _canonical_json_digest(value: Mapping[str, Any]) -> str:
+    """Hash a fully materialized plain mapping for gateway evidence."""
+
+    try:
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError("materialized config contains non-JSON values") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _plain_materialized_config(cfg: Any) -> dict[str, Any]:
+    """Resolve one parsed OmegaConf mapping without external substitutions."""
+
+    try:
+        plain = OmegaConf.to_container(cfg, resolve=False, throw_on_missing=True)
+    except Exception as exc:
+        raise ProtocolError("rendered config contains a missing mandatory value") from exc
+    if not isinstance(plain, Mapping):
+        raise ProtocolError("rendered config must contain a top-level mapping")
+
+    def reject_interpolation(value: Any) -> None:
+        if isinstance(value, str) and "${" in value:
+            raise ProtocolError("rendered config must not contain interpolations")
+        if isinstance(value, Mapping):
+            for nested in value.values():
+                reject_interpolation(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                reject_interpolation(nested)
+
+    reject_interpolation(plain)
+    try:
+        resolved = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
+    except Exception as exc:
+        raise ProtocolError("rendered config could not be resolved") from exc
+    if not isinstance(resolved, Mapping):
+        raise ProtocolError("rendered config must resolve to a top-level mapping")
+    # The digest call is also the finite, JSON-compatible value check.
+    _canonical_json_digest(resolved)
+    return dict(resolved)
+
+
+def _rendered_config_scope(row: Mapping[str, Any]) -> Path:
+    """Validate and return the canonical row-owned rendered input path."""
+
+    extension = row.get("row_extension")
+    if not isinstance(extension, Mapping):
+        raise ProtocolError("row_extension must be a mapping")
+    rendered = extension.get("rendered_config")
+    if not isinstance(rendered, Mapping):
+        raise ProtocolError("row_extension.rendered_config must be a mapping")
+    raw_path = rendered.get("path")
+    if not isinstance(raw_path, str) or not raw_path.startswith("/"):
+        raise ProtocolError("rendered_config.path must be an absolute path")
+    path = Path(raw_path)
+    if any(part in {".", ".."} for part in path.parts):
+        raise ProtocolError("rendered_config.path must not contain lexical traversal")
+    canonical = path.resolve()
+    if path != canonical or not canonical.is_file() or canonical.is_symlink():
+        raise ProtocolError("rendered_config.path must be a canonical regular file")
+    root = Path(str(row.get("results_root"))).resolve()
+    inputs = root / "inputs"
+    try:
+        canonical.relative_to(inputs)
+    except ValueError as exc:
+        raise ProtocolError("rendered_config.path must be beneath results_root/inputs") from exc
+    if canonical == inputs:
+        raise ProtocolError("rendered_config.path must name a file below results_root/inputs")
+    return canonical
+
+
+def _validate_extension_shape(row: Mapping[str, Any], *, expected_kind: str | None = None) -> None:
+    """Validate the closed wire shape for a new materialized row."""
+
+    extension = row.get("row_extension")
+    if not isinstance(extension, Mapping):
+        raise ProtocolError("row_extension must be a mapping")
+    if set(extension) != {"version", "rendered_config", "diagnostics_profile"}:
+        raise ProtocolError("row_extension contains unsupported or missing keys")
+    if extension.get("version") != ROW_EXTENSION_VERSION:
+        raise ProtocolError("row_extension.version is unsupported")
+    rendered = extension.get("rendered_config")
+    if not isinstance(rendered, Mapping) or set(rendered) != {"path", "sha256"}:
+        raise ProtocolError("row_extension.rendered_config has unsupported or missing keys")
+    _require_sha(rendered.get("sha256"), length=64, field="rendered_config.sha256")
+    profile = extension.get("diagnostics_profile")
+    if profile not in ROW_EXTENSION_PROFILES:
+        raise ProtocolError("row_extension.diagnostics_profile is unsupported")
+    kind = row.get("kind")
+    if kind not in {"train", "eval"} or (expected_kind is not None and kind != expected_kind):
+        raise ProtocolError("materialized rows support only train and eval kinds")
+
+    common = {
+        "row_id", "system", "system_id", "kind", "seed", "source_sha",
+        "config_sha256", "config_identity_rule", "config", "results_root",
+        "experiment_name", "sector", "run_id", "updates", "walkers", "device",
+        "row_extension",
+    }
+    additions = (
+        {"lineage", "sampler_seed", "checkpoint_steps", "overlay", "overlay_sha256"}
+        if kind == "train" else
+        {"lineage", "checkpoint", "stream", "draws", "expected_physical_system_id",
+         "checkpoint_dir", "checkpoint_file", "checkpoint_sha256", "depends_on",
+         "phase1_manifest_hash", "phase1_train_row_hash"}
+    )
+    allowed = common | additions | ({"execution"} if kind == "train" else set())
+    if kind == "train" and profile == OVERLAY_PROFILE_V2:
+        allowed.add("overlay_profile")
+    required = common | additions
+    if set(row) - allowed:
+        raise ProtocolError("materialized row contains unsupported top-level keys")
+    if not set(row).issuperset(required):
+        raise ProtocolError("materialized row is missing required top-level keys")
+    if kind == "train" and profile == OVERLAY_PROFILE_V2:
+        if row.get("overlay_profile") != OVERLAY_PROFILE_V2:
+            raise ProtocolError("diagnostics-v2 materialized train row needs overlay_profile")
+    elif "overlay_profile" in row:
+        raise ProtocolError("overlay_profile is only admitted for diagnostics-v2 train rows")
+    if "execution" in row and (
+        kind != "train" or not isinstance(row["execution"], Mapping)
+        or set(row["execution"]) != {"stop_at"}
+        or not _is_int_coordinate(row["execution"].get("stop_at"))
+    ):
+        raise ProtocolError("materialized execution must contain only integer stop_at")
+
+    if row.get("system") not in SYSTEMS or not isinstance(row.get("system_id"), str):
+        raise ProtocolError("materialized row has an invalid system identity")
+    if row.get("config_identity_rule") != CONFIG_IDENTITY_RULE:
+        raise ProtocolError("materialized rows require stage1-config-v1")
+    if not isinstance(row.get("config"), str):
+        raise ProtocolError("materialized row config is invalid")
+    expected_config = f"configs/{row['system']}/{kind}.yaml"
+    if row["config"] != expected_config:
+        raise ProtocolError("materialized row config is not the canonical system config")
+    _require_sha(row.get("source_sha"), length=40, field="source_sha")
+    _require_sha(row.get("config_sha256"), length=64, field="config_sha256")
+    for key in ("row_id", "experiment_name", "sector", "run_id", "depends_on"):
+        if key in row and not isinstance(row[key], str) or key in row and not row[key]:
+            raise ProtocolError(f"materialized row {key} is invalid")
+    for key in ("seed", "updates", "walkers", "lineage"):
+        if not _is_int_coordinate(row.get(key)) or row[key] < 0:
+            raise ProtocolError(f"materialized row {key} must be a non-negative integer")
+    if not _is_torch_seed(row["seed"]):
+        raise ProtocolError("materialized row seed is outside the Torch-compatible range")
+    if row["updates"] <= 0 or row["walkers"] <= 0:
+        raise ProtocolError("materialized row dimensions must be positive")
+    if row.get("device") not in {"cpu", "cuda"}:
+        raise ProtocolError("materialized row device must be cpu or cuda")
+    if kind == "train":
+        if row["lineage"] > 2 or not _is_torch_seed(row.get("sampler_seed")):
+            raise ProtocolError("materialized train lineage or sampler_seed is invalid")
+        steps = row.get("checkpoint_steps")
+        if (not isinstance(steps, list) or not steps or
+                any(not _is_int_coordinate(step) or step < 0 for step in steps)
+                or steps != sorted(set(steps)) or steps[0] != 0 or steps[-1] != row["updates"]):
+            raise ProtocolError("materialized train checkpoint_steps must be sorted, unique, 0..H")
+        if not isinstance(row.get("overlay"), str):
+            raise ProtocolError("materialized train overlay is missing")
+        _require_sha(row.get("overlay_sha256"), length=64, field="overlay_sha256")
+    else:
+        for key in ("checkpoint", "stream", "draws"):
+            if not _is_int_coordinate(row.get(key)) or row[key] < 0:
+                raise ProtocolError(f"materialized eval {key} must be a non-negative integer")
+        if not _is_torch_seed(row["seed"]):
+            raise ProtocolError("materialized eval seed is outside the Torch-compatible range")
+        if row["updates"] != row["checkpoint"] or row["draws"] <= 0:
+            raise ProtocolError("materialized eval checkpoint and dimensions are inconsistent")
+        _require_sha(row.get("expected_physical_system_id"), length=64,
+                     field="expected_physical_system_id")
+        _require_sha(row.get("phase1_manifest_hash"), length=64,
+                     field="phase1_manifest_hash")
+        _require_sha(row.get("phase1_train_row_hash"), length=64,
+                     field="phase1_train_row_hash")
+        _checkpoint_binding(row)
+    _validate_run_identity(row)
+    _rendered_config_scope(row)
+    profile = str(extension["diagnostics_profile"])
+    if kind == "train":
+        expected_overlay = overlay_path_for_system(str(row["system"]), profile=profile)
+        if row["overlay"] != expected_overlay:
+            raise ProtocolError("materialized train overlay does not match its profile/system")
+        if profile == OVERLAY_PROFILE_V1 and "overlay_profile" in row:
+            raise ProtocolError("diagnostics-v1 must not add overlay_profile")
+        _overlay_binding(
+            overlay=row["overlay"], expected_sha256=row["overlay_sha256"],
+            system=str(row["system"]), profile=profile,
+        )
+
+
+def _materialized_mapping(cfg: Any, row: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the concrete mapping consumed by a materialized gateway."""
+
+    _validate_extension_shape(row, expected_kind=str(row.get("kind")))
+    expected_root = str(resolve_run_dir(row))
+    run = cfg.get("run")
+    experiment = cfg.get("experiment")
+    runtime = cfg.get("runtime")
+    system = cfg.get("system")
+    if not all(isinstance(value, Mapping) for value in (run, experiment, runtime, system)):
+        raise ProtocolError("materialized config lacks required identity sections")
+    expected_identity = {
+        "root": row["results_root"], "run_id": row["run_id"], "layout": "nested",
+    }
+    if any(run.get(key) != value for key, value in expected_identity.items()):
+        raise ProtocolError("materialized run identity does not match row")
+    if run.get("dir") != expected_root:
+        raise ProtocolError("materialized run.dir does not match the row run directory")
+    if experiment.get("name") != row["experiment_name"] or experiment.get("sector") != row["sector"]:
+        raise ProtocolError("materialized experiment identity does not match row")
+    if runtime.get("seed") != row["seed"] or runtime.get("device") != row["device"]:
+        raise ProtocolError("materialized runtime identity does not match row")
+    if "dtype" not in runtime:
+        raise ProtocolError("materialized runtime dtype is missing")
+    if system.get("id") != row["system_id"]:
+        raise ProtocolError("materialized system identity does not match row")
+
+    def mapping(name: str) -> Mapping[str, Any]:
+        value = cfg.get(name)
+        if not isinstance(value, Mapping):
+            raise ProtocolError(f"materialized config section {name} is missing")
+        return value
+
+    runner = mapping("runner")
+    if row["kind"] == "train":
+        if "load" in cfg:
+            raise ProtocolError("materialized train does not admit a load section")
+        required_runner = {"_target_", "model", "sampler", "hamiltonian_terms", "optimizer", "trainer"}
+        if set(runner) != required_runner or runner.get("_target_") != "tpen.runner.Train":
+            raise ProtocolError("materialized train runner shape is unsupported")
+        if any(key in runner for key in ("_args_", "_partial_", "callbacks", "loggers", "load")):
+            raise ProtocolError("materialized train runner contains an unsupported route")
+        for name in ("model", "sampler", "hamiltonian_terms", "optimizer", "trainer"):
+            if runner.get(name) != cfg.get(name):
+                raise ProtocolError(f"materialized train runner.{name} disagrees with root config")
+        sampler = mapping("sampler")
+        trainer = mapping("trainer")
+        if sampler.get("n_walkers") != row["walkers"] or sampler.get("seed") != row["sampler_seed"]:
+            raise ProtocolError("materialized sampler bindings disagree with row")
+        if trainer.get("max_steps") != row["updates"]:
+            raise ProtocolError("materialized trainer horizon disagrees with row")
+        steps = list(row["checkpoint_steps"])
+        positive_steps = steps[1:]
+        if list(cfg.get("checkpoint_steps", ())) != positive_steps:
+            raise ProtocolError("materialized checkpoint_steps must exclude only zero")
+        callbacks = OmegaConf.to_container(cfg.get("callbacks"), resolve=True)
+        if not isinstance(callbacks, list):
+            raise ProtocolError("materialized train callbacks are missing")
+        checkpoints = [entry for entry in callbacks if isinstance(entry, Mapping)
+                       and entry.get("_target_") == "tpen.callback.Checkpoint"]
+        initial = [entry for entry in callbacks if isinstance(entry, Mapping)
+                   and entry.get("_target_") == "tpen.callback.InitialCheckpoint"]
+        if len(checkpoints) != 1 or len(initial) != 1 or callbacks.index(initial[0]) <= callbacks.index(checkpoints[0]):
+            raise ProtocolError("materialized train requires one Checkpoint then one InitialCheckpoint")
+        checkpoint = checkpoints[0]
+        if checkpoint.get("terminal") is not False or checkpoint.get("output_dir") != f"{expected_root}/checkpoints":
+            raise ProtocolError("materialized checkpoint publisher is not bound to the row")
+        schedule = checkpoint.get("schedule")
+        payload = checkpoint.get("payload")
+        if (not isinstance(schedule, Mapping) or schedule.get("_target_") != "tpen.checkpoint.ExplicitUpdates"
+                or list(schedule.get("updates", ())) != positive_steps
+                or not isinstance(payload, Mapping) or payload.get("_target_") != "tpen.checkpoint.TrainResume"):
+            raise ProtocolError("materialized checkpoint schedule/payload is unsupported")
+        if initial[0].get("output_dir") != f"{expected_root}/checkpoints":
+            raise ProtocolError("materialized initial checkpoint is not bound to the row")
+        if str(row["row_extension"]["diagnostics_profile"]) == OVERLAY_PROFILE_V2:
+            targets = [entry.get("_target_") if isinstance(entry, Mapping) else None for entry in callbacks]
+            recorder = [i for i, target in enumerate(targets) if target == "tpen.callback.RawTrainingBatchRecorder"]
+            checkpoint_index = callbacks.index(checkpoint)
+            if recorder != [checkpoint_index - 1]:
+                raise ProtocolError("diagnostics-v2 recorder must immediately precede Checkpoint")
+    else:
+        required_runner = {"_target_", "model", "load", "evaluator"}
+        if set(runner) != required_runner or runner.get("_target_") != "tpen.runner.Evaluate":
+            raise ProtocolError("materialized eval runner shape is unsupported")
+        load = mapping("load")
+        expected_load = {
+            "path": str(Path(row["checkpoint_dir"]).resolve()), "mode": "model_only",
+            "strict": True, "allow_protocol_mismatch": False,
+        }
+        if dict(load) != expected_load or runner.get("load") != load:
+            raise ProtocolError("materialized eval load binding disagrees with row")
+        if runner.get("model") != cfg.get("model") or runner.get("evaluator") != cfg.get("evaluator"):
+            raise ProtocolError("materialized eval runner disagrees with root config")
+        if cfg.get("trajectory_identity", {}).get("checkpoint_file") != row["checkpoint_file"]:
+            raise ProtocolError("materialized eval checkpoint identity disagrees with row")
+        sampler = mapping("evaluation_sampler")
+        if sampler.get("n_walkers") != row["walkers"] or sampler.get("seed") != row["seed"]:
+            raise ProtocolError("materialized evaluation sampler disagrees with row")
+        evaluator = mapping("evaluator")
+        if evaluator.get("_target_") != "tpen.evaluation.Evaluator" or evaluator.get("seed") != row["seed"]:
+            raise ProtocolError("materialized evaluator identity disagrees with row")
+        tasks = OmegaConf.to_container(evaluator.get("tasks"), resolve=True)
+        task = OmegaConf.to_container(
+            mapping("evaluation_tasks").get("mcmc_energy"), resolve=True,
+        )
+        if not isinstance(tasks, list) or len(tasks) != 1 or tasks[0] != task:
+            raise ProtocolError("materialized evaluator task list disagrees with root task")
+        if not isinstance(task, Mapping) or task.get("output_dir") != f"{expected_root}/mcmc_energy":
+            raise ProtocolError("materialized eval output is not bound to the row")
+        generator = task.get("generator")
+        if not isinstance(generator, Mapping) or generator.get("_target_") != "tpen.evaluation.generators.TrajectoryMCMCGenerator":
+            raise ProtocolError("materialized eval generator is unsupported")
+        if (generator.get("sampler") != sampler or generator.get("hamiltonian_terms") != cfg.get("hamiltonian_terms")
+                or generator.get("seed") != row["seed"] or generator.get("n_draws") != row["draws"]):
+            raise ProtocolError("materialized eval generator bindings disagree with row")
+    return _plain_materialized_config(cfg)
+
+
+def materialized_config_digest(cfg: Any) -> str:
+    """Return the canonical gateway digest for a concrete config mapping."""
+
+    plain = _plain_materialized_config(cfg)
+    return _canonical_json_digest(plain)
+
+
+def load_materialized_config(row: Mapping[str, Any], *, expected_kind: str) -> tuple[Any, MaterializedConfigAdmission]:
+    """Read, hash, parse and validate one rendered config exactly once."""
+
+    _validate_extension_shape(row, expected_kind=expected_kind)
+    config_path = resolve_config_path(str(row["config"]))
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Stage-1 config path does not exist: {config_path}")
+    _validate_config_identity_for_row(row, config_path)
+    path = _rendered_config_scope(row)
+    expected_file_digest = str(row["row_extension"]["rendered_config"]["sha256"])
+    try:
+        raw = path.read_bytes()
+        actual_digest = hashlib.sha256(raw).hexdigest()
+        if actual_digest != expected_file_digest:
+            raise ProtocolError("rendered config sha256 does not match row binding")
+        cfg = OmegaConf.create(raw.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise ProtocolError("rendered config must be UTF-8 YAML") from exc
+    except ProtocolError:
+        raise
+    except Exception as exc:
+        raise ProtocolError("rendered config could not be parsed") from exc
+    if cfg.get("defaults") not in (None, [], {}):
+        raise ProtocolError("materialized config must not contain non-empty defaults")
+    plain = _materialized_mapping(cfg, row)
+    admission = MaterializedConfigAdmission(
+        rendered_path=path,
+        rendered_file_sha256=actual_digest,
+        gateway_config_sha256=_canonical_json_digest(plain),
+    )
+    return cfg, admission
+
+
+def validate_materialized_admission(
+    cfg: Any, row: Mapping[str, Any], admission: MaterializedConfigAdmission,
+    *, check_file: bool = True,
+) -> None:
+    """Recheck the retained rendered identity immediately before core."""
+
+    _validate_extension_shape(row, expected_kind=str(row.get("kind")))
+    path = _rendered_config_scope(row)
+    if path != admission.rendered_path:
+        raise ProtocolError("materialized rendered path changed after admission")
+    if check_file and _sha256_file(path) != admission.rendered_file_sha256:
+        raise ProtocolError("materialized rendered bytes changed after admission")
+    _materialized_mapping(cfg, row)
+    if materialized_config_digest(cfg) != admission.gateway_config_sha256:
+        raise ProtocolError("materialized config mapping changed after admission")
 
 
 def overlay_path_for_system(system: str, *, profile: str = OVERLAY_PROFILE_V1) -> str:
@@ -1035,6 +1426,8 @@ def derive_smoke_request(
 
     if train_row.get("kind") != "train":
         raise ProtocolError("smoke qualification must be derived from a train row")
+    if "row_extension" in train_row:
+        raise ProtocolError("materialized rows cannot be derived by the native smoke adapter")
     source_root = _safe_results_root(train_row.get("results_root"))
     isolated_root = _safe_results_root(results_root)
     if Path(source_root).resolve() == Path(isolated_root).resolve():
@@ -1110,6 +1503,10 @@ def validate_gateway_binding(*, binding: str, config: str | None = None,
         )
     if kind is not None and effective_kind != kind:
         raise ProtocolError("binding kind does not match gateway")
+    if "row_extension" in row:
+        _validate_extension_shape(row, expected_kind=effective_kind)
+        if overrides:
+            raise ProtocolError("materialized rows do not admit restart overrides")
     row_config = row.get("config")
     if not isinstance(row_config, str):
         raise ProtocolError("gateway config is invalid")

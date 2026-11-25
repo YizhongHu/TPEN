@@ -129,6 +129,15 @@ from the same row. A CLI caller rendering from the repository root for a
 staged checkout passes `--checkout-root /path/to/staged/checkout`; it must not
 rely on the launch module's own location or the submission cwd.
 
+New materialized rows may opt into `row_extension` version
+`stage1-rendered-config/v1`. Their rendered config is an exact, canonical file
+under `results_root/inputs/`; the gateway hashes and parses the same bytes,
+checks the consumed train/eval runner mappings, and passes that mapping through
+the ordinary gateway. Materialized train rows are fresh-only (with an optional
+retained `execution.stop_at`), and unsupported resume/load or native smoke
+derivation requests refuse before core effects. Existing rows have no extension
+and retain their native byte shape and composition path.
+
 Qualification requests use the same train row and `configs/<system>/train.yaml`
 recipe as science. Their only application difference is the isolated output
 root plus `execution.stop_at`, which is translated to the public
