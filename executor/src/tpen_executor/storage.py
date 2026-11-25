@@ -995,10 +995,11 @@ class DirectoryStore:
                         by_task[member.task_id], "recovery_evidence", None
                     )
                     if recovery_admission is not None:
-                        # Defense in depth: the v3 record constructor repeats
-                        # these task/attempt/path bindings at results.py:465-482
-                        # before encoding; keep this earlier gate before any
-                        # admission record or ledger can be written.
+                        # Defense in depth for predecessor-attempt and
+                        # checkpoint-path bindings repeated by the v3 record
+                        # constructor at results.py:465-482. Successor-task
+                        # co-crossing is not duplicated there; retain this
+                        # early gate before any ledger write.
                         self._validate_recovery_request_binding(
                             request, recovery_admission, member.task_id, admitted_evidence,
                         )

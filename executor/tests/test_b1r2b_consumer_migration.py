@@ -420,7 +420,7 @@ def test_reader_rejects_tampered_recovery_evidence_digest(tmp_path: Path) -> Non
     )
     ledger = Path(store.root) / "groups" / group.identity / "successor" / "successor-admissions" / record.predecessor_attempt_id.value / "successor-admission.json"
     wire = json.loads(ledger.read_bytes())
-    wire["recovery_evidence"]["checkpoint"]["content_id"] = "b" * 64
+    wire["recovery_evidence"]["budget_remaining"] += 1
     ledger.write_bytes(canonical_bytes(wire))
     with pytest.raises(AdmissionUnreadable, match="successor admission ledger is unreadable") as error:
         read_successor_admission(
