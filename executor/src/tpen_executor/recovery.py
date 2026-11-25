@@ -108,6 +108,16 @@ def _recovery_time_not_after(left: str, right: str, name: str) -> bool:
     return True
 
 
+def _recovery_absolute_path(value: Any, name: str) -> str:
+    """Validate one absolute, normalized lexical path supplied by a caller."""
+
+    value = _recovery_text(value, name)
+    normalized = os.path.normpath(value)
+    if not os.path.isabs(value) or value != normalized or ".." in Path(value).parts:
+        raise ValueError(f"{name} must be an absolute normalized path")
+    return value
+
+
 @frozen_record
 class RecoverySchedulerEndV1:
     """Exact scheduler identity and writer-end proof for one predecessor."""
@@ -183,11 +193,7 @@ class RecoveryCheckpointFactsV1:
     committed: bool = True
 
     def __post_init__(self) -> None:
-        path = _recovery_text(self.checkpoint_path, "checkpoint_path")
-        normalized = os.path.normpath(path)
-        if not os.path.isabs(path) or path != normalized or ".." in Path(path).parts:
-            raise ValueError("checkpoint_path must be an absolute normalized path")
-        object.__setattr__(self, "checkpoint_path", path)
+        object.__setattr__(self, "checkpoint_path", _recovery_absolute_path(self.checkpoint_path, "checkpoint_path"))
         object.__setattr__(self, "content_id", _recovery_digest(self.content_id, "content_id"))
         object.__setattr__(self, "next_iteration", _recovery_counter(self.next_iteration, "next_iteration"))
         object.__setattr__(self, "completed_updates", _recovery_counter(self.completed_updates, "completed_updates"))
@@ -289,6 +295,7 @@ class RecoveryEvidenceV1:
     predecessor_attempt_id: AttemptId
     allocation_id: str
     backend_job_id: str
+    expected_scheduler: str
     checkpoint: RecoveryCheckpointFactsV1
     scheduler_end: RecoverySchedulerEndV1
     grant: RecoveryGrantV1 | None
@@ -311,6 +318,7 @@ class RecoveryEvidenceV1:
             raise ValueError("predecessor attempt must differ from current attempt")
         object.__setattr__(self, "allocation_id", _recovery_text(self.allocation_id, "allocation_id"))
         object.__setattr__(self, "backend_job_id", _recovery_text(self.backend_job_id, "backend_job_id"))
+        object.__setattr__(self, "expected_scheduler", _recovery_text(self.expected_scheduler, "expected_scheduler"))
         if not isinstance(self.checkpoint, RecoveryCheckpointFactsV1):
             raise TypeError("checkpoint must be RecoveryCheckpointFactsV1")
         if not isinstance(self.scheduler_end, RecoverySchedulerEndV1):
@@ -355,6 +363,7 @@ class RecoveryEvidenceV1:
             "predecessor_attempt_id": self.predecessor_attempt_id.to_dict(),
             "allocation_id": self.allocation_id,
             "backend_job_id": self.backend_job_id,
+            "expected_scheduler": self.expected_scheduler,
             "checkpoint": self.checkpoint.to_dict(),
             "scheduler_end": self.scheduler_end.to_dict(),
             "grant": None if self.grant is None else self.grant.to_dict(),
@@ -374,13 +383,13 @@ class RecoveryEvidenceV1:
     def from_mapping(cls, data: Any) -> "RecoveryEvidenceV1":
         fields(
             data,
-            {"schema", "mode", "task_id", "group_digest", "attempt_id", "predecessor_attempt_id", "allocation_id", "backend_job_id", "checkpoint", "scheduler_end", "grant", "budget_remaining", "no_progress_threshold", "no_progress_count", "prior_content_id", "prior_completed_updates", "prior_next_iteration", "external_submit_state"},
+            {"schema", "mode", "task_id", "group_digest", "attempt_id", "predecessor_attempt_id", "allocation_id", "backend_job_id", "expected_scheduler", "checkpoint", "scheduler_end", "grant", "budget_remaining", "no_progress_threshold", "no_progress_count", "prior_content_id", "prior_completed_updates", "prior_next_iteration", "external_submit_state"},
             cls.schema,
             cls.__name__,
         )
         return cls(
             data["mode"], data["task_id"], data["group_digest"], AttemptId.from_mapping(data["attempt_id"]),
-            AttemptId.from_mapping(data["predecessor_attempt_id"]), data["allocation_id"], data["backend_job_id"],
+            AttemptId.from_mapping(data["predecessor_attempt_id"]), data["allocation_id"], data["backend_job_id"], data["expected_scheduler"],
             RecoveryCheckpointFactsV1.from_mapping(data["checkpoint"]),
             RecoverySchedulerEndV1.from_mapping(data["scheduler_end"]),
             None if data["grant"] is None else RecoveryGrantV1.from_mapping(data["grant"]),
@@ -463,16 +472,35 @@ class RecoveryAdmissionV1:
         return cls.from_mapping(decode_json(data))
 
 
-def _checkpoint_predecessor_core(path: str, group_digest: str, task_id: str, attempt_id: AttemptId) -> bool:
-    """Require a resume path below the exact predecessor attempt core."""
+def _checkpoint_under_attempt_core(
+    path: str,
+    trusted_store_root: str,
+    group_digest: str,
+    task_id: str,
+    attempt_id: AttemptId,
+) -> bool:
+    """Require a path below one exact fence-bound attempt core."""
 
-    parts = Path(path).parts
-    try:
-        group_index = max(index for index, value in enumerate(parts) if value == "groups")
-    except ValueError:
-        return False
-    expected = ("groups", group_digest, task_id, attempt_id.value, "core")
-    return tuple(parts[group_index:group_index + len(expected)]) == expected and len(parts) > group_index + len(expected)
+    root_parts = Path(trusted_store_root).parts
+    path_parts = Path(path).parts
+    expected = root_parts + ("groups", group_digest, task_id, attempt_id.value, "core")
+    suffix = path_parts[len(expected):]
+    return tuple(path_parts[:len(expected)]) == expected and bool(suffix) and "groups" not in suffix
+
+
+def _checkpoint_predecessor_core(path: str, trusted_store_root: str, group_digest: str, task_id: str, attempt_id: AttemptId) -> bool:
+    """Require a checkpoint strictly below the exact predecessor core."""
+
+    return _checkpoint_under_attempt_core(path, trusted_store_root, group_digest, task_id, attempt_id)
+
+
+def _checkpoint_current_leaf(path: str, trusted_store_root: str, group_digest: str, task_id: str, attempt_id: AttemptId) -> bool:
+    """Recognize a checkpoint below the current attempt leaf independently."""
+
+    root_parts = Path(trusted_store_root).parts
+    path_parts = Path(path).parts
+    expected = root_parts + ("groups", group_digest, task_id, attempt_id.value, "core")
+    return tuple(path_parts[:len(expected)]) == expected and len(path_parts) > len(expected)
 
 
 def admit_recovery(
@@ -480,6 +508,7 @@ def admit_recovery(
     successor_attempt_id: AttemptId,
     *,
     now_utc: str,
+    trusted_store_root: str,
     existing_successors: int = 0,
 ) -> RecoveryAdmissionV1:
     """Apply the closed executor admission predicate for either recovery mode."""
@@ -489,6 +518,7 @@ def admit_recovery(
     if not isinstance(successor_attempt_id, AttemptId):
         raise TypeError("successor_attempt_id must be AttemptId")
     now_utc = _recovery_time(now_utc, "now_utc")
+    trusted_store_root = _recovery_absolute_path(trusted_store_root, "trusted_store_root")
     existing_successors = _recovery_counter(existing_successors, "existing_successors")
     evidence_digest = digest(evidence.to_dict())
 
@@ -506,6 +536,7 @@ def admit_recovery(
         or evidence.scheduler_end.attempt_id != evidence.attempt_id
         or evidence.scheduler_end.allocation_id != evidence.allocation_id
         or evidence.scheduler_end.backend_job_id != evidence.backend_job_id
+        or evidence.scheduler_end.scheduler != evidence.expected_scheduler
     ):
         return parked("scheduler-identity-mismatch")
     if evidence.grant is None:
@@ -516,9 +547,9 @@ def admit_recovery(
         return parked("budget-exhausted")
     if not evidence.checkpoint.committed:
         return parked("checkpoint-unavailable")
-    if not _checkpoint_predecessor_core(evidence.checkpoint_path, evidence.group_digest, evidence.task_id, evidence.predecessor_attempt_id):
-        if evidence.checkpoint_path.find(f"/{evidence.attempt_id.value}/core/") >= 0:
-            return parked("checkpoint-is-current-attempt")
+    if _checkpoint_current_leaf(evidence.checkpoint_path, trusted_store_root, evidence.group_digest, evidence.task_id, evidence.attempt_id):
+        return parked("checkpoint-is-current-attempt")
+    if not _checkpoint_predecessor_core(evidence.checkpoint_path, trusted_store_root, evidence.group_digest, evidence.task_id, evidence.predecessor_attempt_id):
         return parked("checkpoint-lineage-mismatch")
     if evidence.grant.group_digest != evidence.group_digest or evidence.grant.task_id != evidence.task_id:
         return parked("checkpoint-lineage-mismatch")

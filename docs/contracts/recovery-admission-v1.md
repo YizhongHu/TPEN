@@ -100,6 +100,7 @@ Schema id: `tpen-executor/recovery-evidence-v1`.
 | `predecessor_attempt_id` | typed predecessor `AttemptId`, different from `attempt_id` |
 | `allocation_id` | expected non-empty allocation identity |
 | `backend_job_id` | expected non-empty backend job identity |
+| `expected_scheduler` | non-empty expected launch backend/scheduler namespace; the observed scheduler end must match it |
 | `checkpoint` | typed `RecoveryCheckpointFactsV1` |
 | `scheduler_end` | typed `RecoverySchedulerEndV1` |
 | `grant` | typed `RecoveryGrantV1` or `null`; `null` is default-OFF |
@@ -126,21 +127,25 @@ Schema id: `tpen-executor/recovery-admission-v1`.
 | `successor_attempt_id` | typed successor `AttemptId`, required when admitted; otherwise `null` |
 | `grant_id` | non-empty grant id when present; `null` only without a grant |
 
-The admission record and the linked result both expose
-`predecessor_attempt_id` and `checkpoint_path` as typed fields. Consumers do
-not parse path strings to recover lineage.
+The admission record exposes `predecessor_attempt_id` and `checkpoint_path` as
+typed fields. Linked-result exposure of those fields is pending B1-R2B
+(4464489c); consumers do not parse path strings to recover lineage.
 
 ## Admission predicate
 
-`admit_recovery` enforces all of the following before returning `admitted`:
+`admit_recovery` requires the caller's trusted `trusted_store_root` fence/store
+root and enforces all of the following before returning `admitted`:
 
 1. The scheduler end binds to the exact task, group, current attempt,
    allocation, and backend job, has an accepted terminal state, and includes a
    writer-end identity and timestamp.
 2. The checkpoint is committed and independently validated.
-3. The checkpoint path is inside the `core` directory of the recorded
-   predecessor attempt for the same group and task. A path in an unrelated
-   group/task or in the current attempt's own leaf parks.
+3. The checkpoint path is strictly below the exact component path
+   `<trusted_store_root>/groups/<group>/<task>/<predecessor_attempt>/core`.
+   The root is supplied by the caller's trusted fence/store, never derived
+   from the checkpoint path. The current attempt leaf is excluded
+   independently. A path in an unrelated group/task, nested store layout, or
+   different store parks.
 4. Program and H digests match the finite grant. The HI-issued opaque
    `science_digest` carried by the configured program matches the checkpoint
    and finite grant by equality; the executor does not derive this value.
