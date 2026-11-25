@@ -261,7 +261,12 @@ def summarize(results: Iterable[CheckResult]) -> dict[str, Any]:
 
     results = list(results)
     counts = {verdict.value: sum(result.verdict is verdict for result in results) for verdict in Verdict}
-    overall = Verdict.PASS if results and all(result.passed for result in results) else next((result.verdict for result in results if result.verdict is not Verdict.PASS), Verdict.UNMEASURED)
+    if results and all(result.passed for result in results):
+        overall = Verdict.PASS
+    else:
+        # Product evidence is the strongest negative classification, followed
+        # by an invalid harness and then an unmeasured gate.
+        overall = next((verdict for verdict in (Verdict.PRODUCT_FAILURE, Verdict.HARNESS_INVALID, Verdict.UNMEASURED) if any(result.verdict is verdict for result in results)), Verdict.UNMEASURED)
     return {"overall": overall.value, "counts": counts, "checks": [result.__dict__ for result in results]}
 
 

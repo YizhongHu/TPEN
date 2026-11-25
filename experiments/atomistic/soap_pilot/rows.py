@@ -183,7 +183,8 @@ def validate_row(row: Mapping[str, Any], *, expected_kind: str | None = None) ->
     if not isinstance(rendered, Mapping) or set(rendered) != {"path", "sha256"}:
         raise RowContractError("rendered_config must contain exactly path and sha256")
     _path(rendered.get("path"), "rendered_config.path")
-    if not isinstance(rendered.get("sha256"), str) or len(rendered["sha256"]) != 64:
+    if (not isinstance(rendered.get("sha256"), str) or len(rendered["sha256"]) != 64
+            or any(c not in "0123456789abcdef" for c in rendered["sha256"])):
         raise RowContractError("rendered_config.sha256 must be 64 hex characters")
     if ext.get("diagnostics_profile") not in {"diagnostics-v1", "diagnostics-v2"}:
         raise RowContractError("invalid diagnostics_profile")
