@@ -71,6 +71,12 @@ def _recovery_digest(value: Any, name: str) -> str:
     return sha256_text(value, name)
 
 
+def _recovery_science_lineage(value: Any, name: str) -> str:
+    """Validate an opaque caller-supplied HI science lineage token."""
+
+    return _recovery_text(value, name)
+
+
 def _recovery_counter(value: Any, name: str) -> int:
     """Validate one non-negative progress counter."""
 
@@ -186,7 +192,7 @@ class RecoveryCheckpointFactsV1:
         object.__setattr__(self, "next_iteration", _recovery_counter(self.next_iteration, "next_iteration"))
         object.__setattr__(self, "completed_updates", _recovery_counter(self.completed_updates, "completed_updates"))
         object.__setattr__(self, "program_digest", _recovery_digest(self.program_digest, "program_digest"))
-        object.__setattr__(self, "science_digest", _recovery_digest(self.science_digest, "science_digest"))
+        object.__setattr__(self, "science_digest", _recovery_science_lineage(self.science_digest, "science_digest"))
         object.__setattr__(self, "h_digest", _recovery_digest(self.h_digest, "h_digest"))
         if type(self.committed) is not bool:
             raise TypeError("committed must be a boolean")
@@ -238,7 +244,7 @@ class RecoveryGrantV1:
         object.__setattr__(self, "group_digest", _recovery_digest(self.group_digest, "group_digest"))
         object.__setattr__(self, "task_id", _recovery_text(self.task_id, "task_id"))
         object.__setattr__(self, "program_digest", _recovery_digest(self.program_digest, "program_digest"))
-        object.__setattr__(self, "science_digest", _recovery_digest(self.science_digest, "science_digest"))
+        object.__setattr__(self, "science_digest", _recovery_science_lineage(self.science_digest, "science_digest"))
         object.__setattr__(self, "h_digest", _recovery_digest(self.h_digest, "h_digest"))
         object.__setattr__(self, "successor_limit", _recovery_counter(self.successor_limit, "successor_limit"))
         if self.successor_limit == 0:
