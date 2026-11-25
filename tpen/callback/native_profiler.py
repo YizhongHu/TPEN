@@ -8,6 +8,7 @@ serialization.
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
@@ -29,6 +30,8 @@ from tpen.observability_artifacts import (
 
 from .base import Callback, ManagedLifecycleError, ResourceOwnershipClaim, RunResource
 from .cadence import SubscriptionGroup
+
+_LOGGER = logging.getLogger("tpen.callback")
 
 if TYPE_CHECKING:
     from tpen.sampling.events import SamplerBurnIn, SamplerProduction
@@ -298,12 +301,18 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
     def _open_writer(self) -> None:
         if self.writer is not None:
             return
-        self.writer = self.callback._new_writer(self.context)
+        writer = self.callback._new_writer(self.context)
+        trace_path: Path | None = None
         if self.callback.trace is not None:
-            self.trace_path = self.writer.reserve_external_artifact(
+            # Keep the writer local until reservation succeeds. A rejected
+            # reservation therefore has no writer capable of later publishing
+            # summary, status, or manifest records into that bundle.
+            trace_path = writer.reserve_external_artifact(
                 self.callback._trace_relative_path(), kind="trace"
             )
-        self.writer.write_open_manifest(self.callback._open_manifest(self.context))
+        writer.write_open_manifest(self.callback._open_manifest(self.context))
+        self.writer = writer
+        self.trace_path = trace_path
 
     def _start(self) -> None:
         """Attempt activation once; partial-start failures remain diagnostic."""
@@ -322,11 +331,13 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
             self.started = True
         except BaseException as exc:
             self._activation_failed = True
-            self._diagnostic(
-                "trace_reservation_failed" if self.trace_path is None and self.callback.trace is not None
-                else "backend_start_failed",
-                exc,
+            diagnostic = (
+                "trace_reservation_failed"
+                if self.trace_path is None and self.callback.trace is not None
+                else "backend_start_failed"
             )
+            self._diagnostic(diagnostic, exc)
+            _LOGGER.warning("Native profiler activation failed (%s): %s", diagnostic, exc)
 
     def checkpoint(self) -> None:
         """Keep cooperative lifecycle checkpoints separate from backend steps."""
@@ -407,23 +418,26 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
         if self.callback.trace is None or self.backend is None or not self.started:
             return
         writer = self.writer
-        trace_path = self.trace_path
-        if writer is None or trace_path is None:
+        if writer is None or self.trace_path is None:
             self._diagnostic("trace_export_failed:reservation_unavailable")
             return
+        temp_path: Path | None = None
         try:
-            trace_path = writer.prepare_external_artifact(
+            temp_path = writer.create_external_artifact_temp(
                 self.callback._trace_relative_path()
             )
             # This direct typed call is intentional: missing backend capability
             # is an explicit diagnostic failure, never a silent success.
-            self.backend.export_chrome_trace(str(trace_path))
-            self.trace_ref = writer.register_external_artifact(
-                self.callback._trace_relative_path(), kind="trace"
+            self.backend.export_chrome_trace(str(temp_path))
+            self.trace_ref = writer.publish_external_artifact(
+                self.callback._trace_relative_path(), temp_path
             )
         except BaseException as exc:
             self.trace_ref = None
             self._diagnostic("trace_export_failed", exc)
+        finally:
+            if temp_path is not None:
+                writer.discard_external_artifact_temp(temp_path)
 
 
 class NativeProfiler(Callback):
@@ -748,4 +762,9 @@ class NativeProfiler(Callback):
             session._diagnostic("persistence_failed", exc)
 
 
-__all__ = ["NativeProfiler", "TorchOperatorSummary", "TrainingIterationWindow"]
+__all__ = [
+    "ChromeTraceExport",
+    "NativeProfiler",
+    "TorchOperatorSummary",
+    "TrainingIterationWindow",
+]

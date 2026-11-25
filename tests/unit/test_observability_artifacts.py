@@ -1034,6 +1034,7 @@ def test_external_artifact_parent_is_created_only_after_reservation(tmp_path: Pa
     manager = _make_manager(tmp_path)
     writer = ObservabilityBundleWriter(manager, INVOCATION_ID)
     rel_path = "profiles/native-profiler/step-0-0/chrome-trace.json"
+    writer.write_open_manifest(_open_manifest())
     target = writer.reserve_external_artifact(rel_path, kind="trace")
     assert not target.parent.exists()
 

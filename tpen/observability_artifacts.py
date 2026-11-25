@@ -3062,12 +3062,20 @@ class ObservabilityBundleWriter:
         return ref
 
     def prepare_external_artifact(self, rel_path: str) -> Path:
-        """Create a reserved artifact's parent directory after validation.
+        """Create only the reserved artifact's missing profile-directory tail.
 
-        Reservation remains read-only. This separate writer-owned operation is
-        the only place that creates the missing directory tail for an external
-        backend, and it rechecks every component after each ``mkdir`` so a
-        symlink race cannot redirect the backend outside the resolved bundle.
+        The run, sink, and invocation ancestors are established by activation;
+        their loss is an error rather than an invitation to recreate them. The
+        remaining ``profiles/<observer>/<window>`` tail is opened and created
+        relative to directory file descriptors with ``O_NOFOLLOW``. This pins
+        each checked parent while the tail is made and prevents a swapped
+        parent from redirecting ``mkdir`` outside the bundle.
+
+        The backend still receives a path string for its own write. A
+        path-based backend write can race with a later parent replacement, so
+        registration remains a required post-write containment, symlink, and
+        integrity audit; this method does not claim to eliminate that residual
+        limitation.
         """
 
         self._require_not_finalized("prepare an external artifact")
@@ -3080,91 +3088,140 @@ class ObservabilityBundleWriter:
             )
         target = self._safe_artifact_path(normalized)
         run_dir = self._artifact_manager.run_dir
-        resolved_run = run_dir.resolve(strict=False)
-        resolved_bundle = self.bundle_dir.resolve(strict=False)
-        # The manager may not have created its run tree yet.  Start at the
-        # manager-owned root so every newly-created component is checked.
-        anchor = (
-            self._artifact_manager.destination.physical_root
-            if self._artifact_manager.destination is not None
-            else self._artifact_manager.root
-        )
-        anchor = Path(anchor)
-        resolved_anchor = anchor.resolve(strict=False)
-        try:
-            resolved_run.relative_to(resolved_anchor)
-        except ValueError as exc:
+        established = (*self.sink.relative_dir.split("/"), self.invocation_id)
+        if not run_dir.exists() or not run_dir.is_dir():
             raise ObservabilityPathError(
-                f"external artifact run {run_dir!s} resolves outside root "
-                f"{anchor!s}"
-            ) from exc
-        try:
-            run_parts = run_dir.relative_to(anchor).parts
-        except ValueError as exc:
+                f"established observability run directory is missing: {run_dir!s}"
+            )
+        if not self.bundle_dir.exists() or not self.bundle_dir.is_dir():
             raise ObservabilityPathError(
-                f"external artifact run {run_dir!s} is outside root {anchor!s}"
-            ) from exc
+                f"established observability bundle directory is missing: {self.bundle_dir!s}"
+            )
+        _check_no_symlinks_under(run_dir, established)
 
-        def create_checked(
-            current: Path, part: str, *, containment: Path
-        ) -> Path:
-            current = current / part
-            if current.is_symlink():
-                raise ObservabilityPathError(
-                    f"refusing symlinked external artifact parent {current!s}"
-                )
-            if current.exists() and not current.is_dir():
-                raise ObservabilityPathError(
-                    f"external artifact parent {current!s} is not a directory"
-                )
-            current.mkdir(exist_ok=True)
-            if current.is_symlink():
-                raise ObservabilityPathError(
-                    f"refusing symlinked external artifact parent {current!s}"
-                )
-            resolved_current = current.resolve(strict=False)
+        directory_flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+        )
+
+        def open_at(parent_fd: int, name: str) -> int:
             try:
-                resolved_current.relative_to(containment)
-            except ValueError as exc:
+                return os.open(name, directory_flags, dir_fd=parent_fd)
+            except OSError as exc:
                 raise ObservabilityPathError(
-                    f"external artifact parent {current!s} resolves outside "
-                    f"{containment!s}"
+                    f"cannot open established external-artifact directory {name!r}: {exc}"
                 ) from exc
 
-            return current
-
-        if anchor.is_symlink():
-            raise ObservabilityPathError(
-                f"refusing symlinked external artifact root {anchor!s}"
-            )
-        if anchor.exists() and not anchor.is_dir():
-            raise ObservabilityPathError(
-                f"external artifact root {anchor!s} is not a directory"
-            )
-        if not anchor.exists():
-            anchor.mkdir()
-        if anchor.is_symlink():
-            raise ObservabilityPathError(
-                f"refusing symlinked external artifact root {anchor!s}"
-            )
-        current = anchor
-        for part in run_parts:
-            current = create_checked(current, part, containment=resolved_anchor)
-        for part in (
-            *self.sink.relative_dir.split("/"),
-            self.invocation_id,
-            *Path(normalized).parent.parts,
-        ):
-            current = create_checked(current, part, containment=resolved_run)
+        current_fd: int | None = None
         try:
-            current.resolve(strict=False).relative_to(resolved_bundle)
-        except ValueError as exc:
-            raise ObservabilityPathError(
-                f"external artifact parent {current!s} resolves outside bundle "
-                f"{resolved_bundle!s}"
-            ) from exc
+            try:
+                current_fd = os.open(run_dir, directory_flags)
+            except OSError as exc:
+                raise ObservabilityPathError(
+                    f"cannot open established observability run directory {run_dir!s}: {exc}"
+                ) from exc
+
+            # Existing ancestors are opened only through pinned descriptors.
+            for part in established:
+                next_fd = open_at(current_fd, part)
+                os.close(current_fd)
+                current_fd = next_fd
+
+            # Only the profile tail may be created. An existing child must be
+            # a real directory and cannot be reached through a symlink.
+            for part in Path(normalized).parent.parts:
+                try:
+                    next_fd = open_at(current_fd, part)
+                except ObservabilityPathError as exc:
+                    if not isinstance(exc.__cause__, FileNotFoundError):
+                        raise
+                    try:
+                        os.mkdir(part, mode=0o755, dir_fd=current_fd)
+                    except FileExistsError:
+                        pass
+                    next_fd = open_at(current_fd, part)
+                os.close(current_fd)
+                current_fd = next_fd
+        finally:
+            if current_fd is not None:
+                os.close(current_fd)
+
+        # Recheck the path after tail creation. If a test or external process
+        # swapped a path component, fail before handing it to the backend.
         _check_no_symlinks_under(self.bundle_dir, normalized.split("/"))
         return target
+
+    def create_external_artifact_temp(self, rel_path: str) -> Path:
+        """Create a writer-owned temporary file beside a reserved artifact.
+
+        The external backend writes this temporary path. The fixed destination
+        remains untouched until :meth:`publish_external_artifact` links the
+        completed file with no-clobber semantics.
+        """
+
+        target = self.prepare_external_artifact(rel_path)
+        try:
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+            )
+        except OSError as exc:
+            raise ObservabilityArtifactError(
+                f"cannot create external-artifact temporary file beside {target!s}: {exc}"
+            ) from exc
+        os.close(fd)
+        return Path(temp_name)
+
+    def discard_external_artifact_temp(self, temp_path: Path) -> None:
+        """Remove a writer-owned temporary external-artifact file if present."""
+
+        if not isinstance(temp_path, Path):
+            raise TypeError("temp_path must be a pathlib.Path")
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def publish_external_artifact(
+        self, rel_path: str, temp_path: Path
+    ) -> ObservabilityArtifactRef:
+        """Publish a completed temporary artifact without replacing a target.
+
+        ``os.link`` is deliberately used instead of ``os.replace``: a target
+        created after reservation causes publication to fail and is never
+        overwritten. The temporary link is removed after the publish attempt;
+        registration then computes the audited bytes and SHA-256 of the fixed
+        destination.
+        """
+
+        self._require_not_finalized("publish an external artifact")
+        if not isinstance(temp_path, Path):
+            raise TypeError("temp_path must be a pathlib.Path")
+        normalized = validate_relative_path(
+            rel_path, "external_artifact_path", forbid_manifest_self=True
+        )
+        if self._artifact_kinds.get(normalized) != "trace":
+            raise ObservabilityArtifactError(
+                f"external artifact {normalized!r} was not reserved as a trace"
+            )
+        if temp_path.is_symlink() or not temp_path.exists() or not temp_path.is_file():
+            raise ObservabilityArtifactError(
+                f"external artifact temporary file {temp_path!s} is not regular"
+            )
+        target = self._safe_artifact_path(normalized)
+        try:
+            os.link(temp_path, target, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise ObservabilityArtifactError(
+                f"external artifact target {target!s} appeared before publication"
+            ) from exc
+        except OSError as exc:
+            raise ObservabilityArtifactError(
+                f"cannot publish external artifact {normalized!r}: {exc}"
+            ) from exc
+        finally:
+            self.discard_external_artifact_temp(temp_path)
+        return self.register_external_artifact(normalized, kind="trace")
 
     def _atomic_write_bytes(self, target: Path, payload: bytes) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
