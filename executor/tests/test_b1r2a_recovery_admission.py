@@ -19,7 +19,7 @@ from tpen_executor.recovery import (
 
 GROUP = "a" * 64
 PROGRAM = "b" * 64
-SCIENCE = "c" * 64
+SCIENCE = "manifest_sha256:" + "c" * 64 + ":row:17"
 H = "d" * 64
 _DEFAULT_GRANT = object()
 
@@ -31,7 +31,7 @@ MUTANTS = (
     {"id": "terminal-state-bypass", "target": "executor/src/tpen_executor/recovery.py", "old": "evidence.scheduler_end.terminal_state not in RECOVERY_TERMINAL_STATES", "new": "False", "killer": "test_unknown_scheduler_end_parks"},
     {"id": "grant-bypass", "target": "executor/src/tpen_executor/recovery.py", "old": "if evidence.grant is None:", "new": "if False:", "killer": "test_missing_grant_defaults_off"},
     {"id": "expiry-bypass", "target": "executor/src/tpen_executor/recovery.py", "old": "datetime.fromisoformat(evidence.grant.expires_at_utc.replace(\"Z\", \"+00:00\")) <= datetime.fromisoformat(now_utc.replace(\"Z\", \"+00:00\"))", "new": "False", "killer": "test_expired_grant_parks"},
-    {"id": "predecessor-core-bypass", "target": "executor/src/tpen_executor/recovery.py", "old": "if not _checkpoint_predecessor_core(evidence.checkpoint_path, evidence.group_digest, evidence.task_id, evidence.predecessor_attempt_id):", "new": "if False:", "killer": "test_unrelated_checkpoint_path_parks"},
+    {"id": "predecessor-core-bypass", "target": "executor/src/tpen_executor/recovery.py", "old": "if not _checkpoint_predecessor_core(evidence.checkpoint_path, evidence.group_digest, evidence.task_id, evidence.predecessor_attempt_id):", "new": "if False:", "killer": "test_checkpoint_path_must_be_predecessor_core"},
     {"id": "counter-conflation", "target": "executor/src/tpen_executor/recovery.py", "old": "self.checkpoint.completed_updates > self.prior_completed_updates", "new": "self.checkpoint.next_iteration > self.prior_next_iteration", "killer": "test_next_iteration_without_completed_update_is_not_progress"},
     {"id": "repeat-progress-bypass", "target": "executor/src/tpen_executor/recovery.py", "old": "if evidence.no_progress_count >= evidence.no_progress_threshold and not evidence.real_committed_progress:", "new": "if False:", "killer": "test_repeated_identical_progress_parks"},
     {"id": "ambiguous-submit-retry", "target": "executor/src/tpen_executor/recovery.py", "old": "if evidence.external_submit_state == \"ambiguous\":", "new": "if False:", "killer": "test_ambiguous_external_submit_parks"},
