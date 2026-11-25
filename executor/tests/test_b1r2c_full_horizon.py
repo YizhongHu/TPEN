@@ -215,7 +215,7 @@ def test_rc0_only_or_unknown_verdict_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(FenceRejected, match="typed completed core verdict"):
         _publish(store, group, fence, CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "rc0-only"), task)
 
-    (tmp_path / "missing").mkdir()
+    (tmp_path / "missing" / "store").mkdir(parents=True)
     no_core_store, base_group, allocation = setup_store(tmp_path / "missing" / "store")
     no_core_task = replace(base_group.members[0], target_horizon_units="iterations")
     no_core_group = ReadyGroup(base_group.group_id, (no_core_task,), base_group.execution_plan_digest)
