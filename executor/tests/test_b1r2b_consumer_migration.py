@@ -20,7 +20,7 @@ import tpen_executor.lifecycle.controller as controller_module
 from tpen_executor.recovery import CoreAdmissionVerdictV2, RecoveryAdmissionInputV1, RecoveryGrantV1, admit_recovery
 from tpen_executor.results import OutcomeReceipt, StartReceipt, SuccessorAdmissionRecord
 from tpen_executor.lifecycle.local_executor import LeafSubmissionError, LocalLeafExecutor
-from tpen_executor.storage import AdmissionFork, DirectoryStore, FenceRejected, read_successor_admission
+from tpen_executor.storage import AdmissionFork, AdmissionUnreadable, DirectoryStore, FenceRejected, read_successor_admission
 
 from test_b1a_b_publication import _fixture
 from test_b1r2a_recovery_admission import _facts
@@ -302,17 +302,27 @@ def test_reader_rejects_crossed_embedded_request_with_recomputed_digest(tmp_path
         "2026-11-24T00:03:00Z", "local", allocation_attempt=successor_binding.allocation_attempt,
         admission=record, current_fence=current,
     )
-    ledger = Path(store.root) / "groups" / group.identity / "successor" / "successor-admissions" / record.predecessor_attempt_id.value / "successor-admission.json"
-    wire = json.loads(ledger.read_bytes())
-    wire["successor_request"]["predecessor"]["attempt_id"] = "crossed-predecessor"
-    wire["request_digest"] = digest(wire["successor_request"])
-    ledger.write_bytes(canonical_bytes(wire))
     clean = read_successor_admission(
         successor.output_dir, task_id="successor", attempt_id=record.successor_attempt_id.value,
         group_digest=group.identity, science_input_digest=request["science_input_digest"],
         target_iterations=request["target_iterations"],
     )
     assert clean["record"]["successor"]["attempt_id"] == record.successor_attempt_id.value, f"clean={clean!r}"
+    ledger = Path(store.root) / "groups" / group.identity / "successor" / "successor-admissions" / record.predecessor_attempt_id.value / "successor-admission.json"
+    wire = json.loads(ledger.read_bytes())
+    wire["successor_request"]["predecessor"]["attempt_id"] = "crossed-predecessor"
+    wire["request_digest"] = digest(wire["successor_request"])
+    ledger.write_bytes(canonical_bytes(wire))
+    with pytest.raises(AdmissionUnreadable, match="successor admission ledger is unreadable") as error:
+        read_successor_admission(
+            successor.output_dir, task_id="successor", attempt_id=record.successor_attempt_id.value,
+            group_digest=group.identity, science_input_digest=request["science_input_digest"],
+            target_iterations=request["target_iterations"],
+        )
+    cause = error.value.__cause__
+    diagnostic = f"error={error.value!r}; cause={cause!r}; wire={wire!r}; store={store.root}"
+    assert isinstance(cause, ValueError), diagnostic
+    assert "successor_request crosses admission identity" in str(cause), diagnostic
     with pytest.raises(ValueError, match="successor_request crosses admission identity") as error:
         SuccessorAdmissionRecord.from_mapping(wire)
     assert "successor_request crosses admission identity" in str(error.value), f"error={error.value!r}; wire={wire!r}"
