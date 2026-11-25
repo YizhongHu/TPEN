@@ -258,9 +258,21 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
             return self.callback.backend_factory()
         # Imports remain inside enabled activation. The adapter deliberately
         # binds module-level record_function, not an optional backend method.
-        from torch.profiler import ProfilerActivity, profile, record_function
+        from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
-        raw = profile(activities=[ProfilerActivity.CPU], record_shapes=False)
+        window = self.callback.window
+        if window is None:
+            raise ValueError("enabled NativeProfiler requires an explicit window")
+        raw = profile(
+            activities=[ProfilerActivity.CPU],
+            record_shapes=False,
+            schedule=schedule(
+                wait=0,
+                warmup=window.warmup_steps,
+                active=window.active_steps,
+                repeat=1,
+            ),
+        )
         return _TorchProfilerBackend(raw, record_function)
 
     def _open_writer(self) -> None:
@@ -546,12 +558,12 @@ class NativeProfiler(Callback):
             session._close_range(event.operation, occurrence.count)
             if session.started and not session.stopped and not session.stop_requested:
                 try:
+                    if session.backend is not None and event.operation.step <= window.end_step:
+                        session.backend.step()
                     if event.operation.step == window.end_step:
                         session.window_completed = True
                         session.request_stop()
                         session._stop()
-                    elif session.backend is not None:
-                        session.backend.step()
                 except BaseException as exc:
                     session._diagnostic("backend_step_failed", exc)
             return
@@ -575,10 +587,13 @@ class NativeProfiler(Callback):
             rows: tuple[Mapping[str, object], ...] = ()
             total_rows = 0
             summary_truncated = False
+            summary_succeeded = not session.started
             if session.backend is not None and session.started:
                 try:
                     rows, total_rows, summary_truncated = self.summary.collect(session.backend)
+                    summary_succeeded = True
                 except BaseException as exc:
+                    summary_succeeded = False
                     session._diagnostic("summary_failed", exc)
             if application_error is not None:
                 session._diagnostic(f"application_error={type(application_error).__name__}")
@@ -594,6 +609,12 @@ class NativeProfiler(Callback):
             else:
                 lifecycle_state = "closed"
                 completeness = "complete" if session.window_completed else "partial"
+            export_failed = any(
+                item.startswith(("backend_", "persistence_", "summary_failed"))
+                for item in session._diagnostics
+            )
+            if summary_succeeded is False:
+                completeness = "partial"
             diagnostics = tuple(session._diagnostics)
             requested = ("CPU",)
             accepted = requested if session.started else ()
@@ -619,14 +640,14 @@ class NativeProfiler(Callback):
                 exporter="TorchOperatorSummary",
                 export_status=(
                     "failed"
-                    if any(item.startswith(("backend_", "persistence_")) for item in diagnostics)
-                    else "complete"
+                    if export_failed
+                    else ("not_started" if not session.started else "complete")
                 ),
-                requested_start_ns=session._start_bracket_ns[0] if session._start_bracket_ns else None,
-                requested_end_ns=session._stop_bracket_ns[1] if session._stop_bracket_ns else None,
+                requested_start_ns=None,
+                requested_end_ns=None,
                 start_call_bracket_ns=session._start_bracket_ns, stop_call_bracket_ns=session._stop_bracket_ns,
                 backend_event_bounds={"status": "unavailable", "reason_code": "cooperative_boundary"},
-                stop_overshoot_bounds_seconds=(0.0, 0.0), activity_diagnostics=diagnostics,
+                stop_overshoot_bounds_seconds=None, activity_diagnostics=diagnostics,
                 durable_steps=tuple(session._steps), export_mode="summary",
                 truncation_reasons=("max_rows_exceeded",) if summary_truncated else None,
             ))
