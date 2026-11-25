@@ -930,7 +930,7 @@ def test_real_fresh_process_restore_parity_with_checkpoint_zero_and_overlay(
     # to continue it.  Core's trainer_config compatibility refusal must stop
     # the restore before any update or checkpoint publication.
     h_sensitive_source = _real_restart_row(
-        tmp_path / "h-sensitive", run_id="h-sensitive-prefix", lineage_updates=2,
+        tmp_path / "h-sensitive-source", run_id="h-sensitive-prefix", lineage_updates=2,
     )
     h_sensitive_row = derive_smoke_request(
         h_sensitive_source, results_root=str(tmp_path / "h-sensitive"), stop_at=1,
