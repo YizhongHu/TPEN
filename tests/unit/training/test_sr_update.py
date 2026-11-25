@@ -483,6 +483,87 @@ def test_state_envelope_round_trips_and_rejects_layout_drift() -> None:
         restored.load_method_state_dict({**state, "version": "sr-state-0"})
 
 
+def test_state_envelope_round_trips_with_squared_update_norm_bound() -> None:
+    """The sr-state-2 envelope preserves the policy's squared trust cap."""
+
+    parameter, _, _ = _problem(n_samples=8, n_parameters=4, seed=16)
+    policy = SRPolicy(
+        damping=DampingPolicy(absolute=0.0, relative=1.0e-2),
+        learning_rate=LEARNING_RATE,
+        squared_update_norm_bound=0.25,
+    )
+    method = _method(parameter, policy=policy)
+    state = method.method_state_dict()
+
+    restored = _method(torch.nn.Parameter(parameter.detach().clone()), policy=policy)
+    restored.load_method_state_dict(state)
+
+    assert state["version"] == "sr-state-2"
+    assert restored.policy.fingerprint() == policy.fingerprint()
+
+
+@pytest.mark.parametrize(
+    ("field", "changed_policy"),
+    [
+        (
+            "squared_update_norm_bound",
+            SRPolicy(
+                damping=DampingPolicy(absolute=0.0, relative=1.0e-2),
+                learning_rate=LEARNING_RATE,
+                squared_update_norm_bound=0.5,
+            ),
+        ),
+        (
+            "learning_rate",
+            SRPolicy(
+                damping=DampingPolicy(absolute=0.0, relative=1.0e-2),
+                learning_rate=LEARNING_RATE * 2.0,
+                squared_update_norm_bound=0.25,
+            ),
+        ),
+        (
+            "damping",
+            SRPolicy(
+                damping=DampingPolicy(absolute=0.0, relative=2.0e-2),
+                learning_rate=LEARNING_RATE,
+                squared_update_norm_bound=0.25,
+            ),
+        ),
+    ],
+)
+def test_state_envelope_rejects_policy_drift(field: str, changed_policy: SRPolicy) -> None:
+    """Every persisted policy component is part of the resume identity."""
+
+    parameter, _, _ = _problem(n_samples=8, n_parameters=4, seed=17)
+    saved_policy = SRPolicy(
+        damping=DampingPolicy(absolute=0.0, relative=1.0e-2),
+        learning_rate=LEARNING_RATE,
+        squared_update_norm_bound=0.25,
+    )
+    source = _method(parameter, policy=saved_policy)
+    state = source.method_state_dict()
+    restored = _method(torch.nn.Parameter(parameter.detach().clone()), policy=changed_policy)
+
+    with pytest.raises(ValueError, match="SR checkpoint policy does not match"):
+        restored.load_method_state_dict(state)
+
+
+def test_state_envelope_rejects_missing_policy_without_mutating_state() -> None:
+    """Legacy envelopes fail closed before touching the live update counter."""
+
+    parameter, _, _ = _problem(n_samples=8, n_parameters=4, seed=18)
+    method = _method(parameter)
+    method.completed_updates = 7
+    state = dict(method.method_state_dict())
+    state["completed_updates"] = 11
+    state.pop("policy")
+
+    with pytest.raises(ValueError, match="SR checkpoint policy does not match"):
+        method.load_method_state_dict(state)
+
+    assert method.completed_updates == 7
+
+
 def test_binding_drift_is_rejected_rather_than_updating_a_stale_reference() -> None:
     """Scores must reference the parameters this method actually owns."""
 
