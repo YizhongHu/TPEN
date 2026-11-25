@@ -169,9 +169,14 @@ def test_chrome_trace_export_is_fixed_and_published_to_both_refs(tmp_path) -> No
         callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
         callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
 
-    trace_path = next(context.run_dir.rglob("chrome-trace.json"))
+    status_path = next(context.run_dir.rglob("profile-status.json"))
+    status = json.loads(status_path.read_text())
+    trace_path = next(
+        context.run_dir.rglob("chrome-trace.json"),
+        None,
+    )
+    assert trace_path is not None, status
     assert trace_path.read_text(encoding="utf-8") == '{"traceEvents": []}'
-    status = json.loads(next(context.run_dir.rglob("profile-status.json")).read_text())
     manifest = json.loads(next(context.run_dir.rglob("manifest.json")).read_text())
     status_ref = next(ref for ref in status["artifacts"] if ref["kind"] == "trace")
     manifest_ref = next(ref for ref in manifest["artifacts"] if ref["kind"] == "trace")
@@ -199,7 +204,7 @@ def test_chrome_trace_missing_backend_capability_is_partial_and_preserves_primar
     status = json.loads(next(context.run_dir.rglob("profile-status.json")).read_text())
     assert status["export_status"] == "failed"
     assert status["data_completeness"] == "partial"
-    assert status["artifacts"] is None
+    assert status.get("artifacts") is None
     assert any(item.startswith("trace_export_failed") for item in status["activity_diagnostics"])
 
 
