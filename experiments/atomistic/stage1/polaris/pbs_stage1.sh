@@ -522,6 +522,7 @@ run_command_for_row() {
   if [[ "$DRY_EXEC" == 1 ]]; then
     printf 'DRY_EXEC compute=SKIPPED row=%s gpu=%s cpu=%s\n' "$row_id" "$gpu" "$cpu_set" | tee "$log"
   else
+    [[ "$DRY_EXEC" != 1 ]] || die "internal error: dry-exec reached driver"
     export CUDA_VISIBLE_DEVICES="$gpu" OMP_NUM_THREADS="$core_count" MKL_NUM_THREADS="$core_count"
     "$TASKSET_BIN" --cpu-list "$cpu_set" "$PYTHON_BIN" - "$row" "$CHECKOUT" \
       "$PYTHON_BIN" "$SOURCE_SHA" "$RESULTS_ROOT" > "$log" 2>&1 <<'PY' || rc=$?
