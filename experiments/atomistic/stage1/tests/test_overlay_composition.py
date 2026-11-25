@@ -137,7 +137,7 @@ def test_diagnostics_v2_places_recorder_before_checkpoint_and_initial_checkpoint
 ) -> None:
     """The opt-in v2 profile orders durable capture before publication."""
 
-    overlay = CONFIG_ROOT / protocol_module.overlay_path_for_system(
+    overlay = ROOT / protocol_module.overlay_path_for_system(
         system, profile=protocol_module.OVERLAY_PROFILE_V2,
     )
     cfg = load_config(str(CONFIG_ROOT / system / "train.yaml"))
@@ -167,7 +167,7 @@ def test_diagnostics_v2_manifest_is_explicit_and_v1_stays_default() -> None:
 
     v1 = _phase1(overlay=True)
     assert all("overlay_profile" not in row for row in v1 if row["kind"] == "train")
-    v2_overlay = CONFIG_ROOT / protocol_module.overlay_path_for_system(
+    v2_overlay = ROOT / protocol_module.overlay_path_for_system(
         "he", profile=protocol_module.OVERLAY_PROFILE_V2,
     )
     v2 = build_manifest(
