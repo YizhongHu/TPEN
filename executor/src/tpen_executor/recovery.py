@@ -132,7 +132,7 @@ class RecoverySchedulerEndV1:
         object.__setattr__(self, "writer_end_at_utc", _recovery_time(self.writer_end_at_utc, "writer_end_at_utc"))
         _recovery_time_not_after(self.terminal_at_utc, self.writer_end_at_utc, "terminal_at_utc")
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "schema": self.schema,
             "task_id": self.task_id,
