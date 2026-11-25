@@ -103,11 +103,9 @@ reference content id.
 `target_iterations` is the full task horizon in iteration units. The writer
 requires `TaskSpec.target_horizon_units == "iterations"` and exact equality
 with `TaskSpec.target_horizon`; non-iteration units are an explicit typed
-refusal. A successor request's `target_iterations` is the admitted
-per-segment/remaining target supplied to that successor admission, not this
-record's full-horizon field. All request copies in one durable chain must agree
-with one another, but they need not equal the full task horizon. The writer
-performs no silent unit conversion.
+refusal. Every admitted successor request also carries that same fixed total
+horizon, so every request copy must equal `TaskSpec.target_horizon` and agree
+with every other request. The writer performs no silent unit conversion.
 
 `science_digest` is read verbatim from the durable final-task `TaskSpec` and
 must equal any science lineage carried by the admitted successor chain. The
@@ -130,6 +128,17 @@ The first canonical bytes at the task-level path win. An identical replay
 returns the existing record. Different facts produce a typed fork/refusal and
 never overwrite the file.
 
+This is an upgrade/no-backfill boundary: a pre-PR completed attempt without a
+durable task-spec snapshot or the required successor ledger is not backfilled
+into a completion record. A later fresh start may create the snapshot for its
+own attempt; absence of trusted final-path facts remains absence of completion.
+
+Write-once serialization is process-level: the writer holds the task's POSIX
+`lockf` advisory lock while reading, comparing, and publishing. Threads in one
+process are not serialized by this protocol; they must treat a losing
+same-fact publication as a replay/fork outcome rather than as evidence of
+thread-level mutual exclusion.
+
 ## Rejections
 
 Readers and writers fail closed on malformed/noncanonical JSON, missing or extra
@@ -137,8 +146,9 @@ fields, wrong schema/types, invalid identities or digests, a crossed task/group
 or final attempt, missing/untyped/unknown/failed core evidence, a non-completed
 typed verdict, under-target progress, missing/crossed TaskSpec or science
 digest, non-iteration target units, disagreement between successor request
-copies, missing or mismatched checkpoint
+copies or request digests, crossed successor group/lineage, missing or mismatched checkpoint
 path/content identity, missing/non-UTC durable timestamp, disconnected/crossed
-successor chain, and conflicting bytes at the task-level path. A missing file
+successor chain, checkpoint counter disagreement, cyclic chain, noncanonical
+completion bytes, and conflicting bytes at the task-level path. A missing file
 is simply not complete; it is not a park result.
 
