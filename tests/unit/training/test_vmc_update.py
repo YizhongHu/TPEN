@@ -626,7 +626,9 @@ def test_restore_rejects_incompatible_parameter_layout(tmp_path, kind: str) -> N
         checkpoint = _resume_checkpoint(tmp_path)
     else:
         from tests.unit.training.test_method_state_restore_prevalidation import (
+            _assert_snapshot_unchanged,
             _checkpoint as _state_checkpoint,
+            _snapshot,
         )
 
         checkpoint = _state_checkpoint(tmp_path, "sr")
@@ -647,7 +649,10 @@ def test_restore_rejects_incompatible_parameter_layout(tmp_path, kind: str) -> N
             model_parameters=ModelParameterBinding.from_parameters(tuple(model.parameters())),
         )
     else:
-        from tests.unit.training.test_nonfinite_score_row_policy import _build_checkpoint_run
+        from tests.unit.training.test_nonfinite_score_row_policy import (
+            _build_checkpoint_run,
+            _checkpoint_context as _state_checkpoint_context,
+        )
 
         model, update, trainer, sampler = _build_checkpoint_run(
             "sr", max_steps=2, seed=0, nonfinite_local_energy_policy="fail"
@@ -660,17 +665,19 @@ def test_restore_rejects_incompatible_parameter_layout(tmp_path, kind: str) -> N
             -23.0, dtype=torch.float64
         )
         binding = update.model_parameters
+        before = _snapshot(model, optimizer)
         before_method_state = copy.deepcopy(update.method_state_dict())
         before_trainer_state = copy.deepcopy(trainer.state_dict())
         with pytest.raises(ValueError, match="parameter layout"):
             restore_checkpoint(
                 load={"mode": "train_resume", "path": str(checkpoint)},
                 model=model,
-                context=_checkpoint_context(tmp_path),
+                context=_state_checkpoint_context(tmp_path),
                 optimizer=optimizer,
                 trainer=trainer,
                 sampler=sampler,
             )
+        _assert_snapshot_unchanged(before, model, optimizer)
         assert update.model_parameters is binding
         assert update.method_state_dict() == before_method_state
         assert trainer.state_dict() == before_trainer_state
