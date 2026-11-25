@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import inspect
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 import torch
@@ -14,7 +16,10 @@ from tpen.evaluation.events import EvaluationTaskRun
 from tpen.events import Ended, Occurrence, Started
 from tpen.sampling import MetropolisSampler
 from tpen.sampling.events import SamplerBurnIn, SamplerProduction
-from tpen.sampling.trajectory import collect_observable_trajectory
+from tpen.sampling.trajectory import (
+    collect_observable_trajectory,
+    collect_observable_trajectory_with_diagnostics,
+)
 from tpen.training.events import TrainingIteration, TrainingIterationCompleted
 from tests.unit.callback.support import RecordingContext
 
@@ -315,6 +320,51 @@ def test_sampling_scope_timing_uses_occurrence_durations_not_zero_clock() -> Non
     }
 
 
+def test_sampling_scope_timing_excludes_failed_scope_duration() -> None:
+    callback = SamplingScopeTiming(clock=lambda: 0.0)
+    context = RecordingContext()
+    task = EvaluationTaskRun("failed-sibling", "failed-sibling", Path("/tmp/failed-sibling"))
+
+    def deliver(event, count, timestamp):
+        callback.handle_occurrence(
+            Occurrence(event, count, monotonic_time=timestamp), context
+        )
+
+    deliver(Started(task), 1, 0.0)
+    operation = SamplerProduction(n_steps=1)
+    deliver(Started(operation), 1, 1.0)
+    deliver(Ended(operation, succeeded=False), 1, 9.0)
+    deliver(Started(operation), 2, 10.0)
+    deliver(Ended(operation, succeeded=True), 2, 13.0)
+    deliver(Ended(task), 1, 14.0)
+
+    assert context.records[-1]["metrics"] == {"sampler_production_time_sec": 3.0}
+
+
+def test_sampling_scope_timing_eval_aggregation_preserves_parent_totals() -> None:
+    callback = SamplingScopeTiming(clock=lambda: 0.0)
+    context = RecordingContext()
+    task = EvaluationTaskRun("multi-draw", "multi-draw", Path("/tmp/multi-draw"))
+
+    def deliver(event, count, timestamp):
+        callback.handle_occurrence(
+            Occurrence(event, count, monotonic_time=timestamp), context
+        )
+
+    deliver(Started(task), 1, 0.0)
+    for count, start, end in ((1, 1.0, 2.5), (2, 4.0, 6.0)):
+        operation = SamplerProduction(n_steps=2)
+        deliver(Started(operation), count, start)
+        deliver(Ended(operation), count, end)
+    deliver(Ended(task), 1, 7.0)
+
+    assert context.records[-1]["metrics"] == {"sampler_production_time_sec": 3.5}
+    # The nested attribution is not a rewrite of the established parent
+    # generator/sampling totals; this callback emits only sampler_* keys.
+    assert "generator_time_sec" not in context.records[-1]["metrics"]
+    assert "sampling_time_sec" not in context.records[-1]["metrics"]
+
+
 def test_sampling_scope_timing_restores_training_parent_after_nested_evaluation() -> None:
     callback = SamplingScopeTiming(clock=lambda: 0.0)
     context = RecordingContext()
@@ -360,4 +410,20 @@ def test_emitter_keyword_is_required_on_sampler_and_trajectory_protocol() -> Non
     sampler = _sampler()
     with pytest.raises(TypeError):
         sampler.collect_samples(_LinearModel())  # type: ignore[call-arg]
+
+    for collector in (
+        collect_observable_trajectory,
+        collect_observable_trajectory_with_diagnostics,
+    ):
+        emitter = inspect.signature(collector).parameters["emitter"]
+        assert emitter.default is inspect.Parameter.empty
+        assert get_type_hints(collector)["sampler"] is SamplingCollector
+        with pytest.raises(TypeError):
+            collector(  # type: ignore[call-arg]
+                sampler,
+                _LinearModel(),
+                lambda walkers: walkers.positions[:, 0, 0],
+                observable_name="position",
+                n_draws=1,
+            )
 
