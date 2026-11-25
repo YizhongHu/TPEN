@@ -368,7 +368,19 @@ def test_nonregular_completion_artifact_does_not_park_collected_group(
     invalid_destination = Path(store.root) / "groups" / executor.group.identity / "one" / "full-horizon-completion.json"
     assert invalid_destination.is_dir()
     valid_destination = Path(store.root) / "groups" / executor.group.identity / "two" / "full-horizon-completion.json"
-    assert valid_destination.is_file()
+    # Option (b): this controller fixture deliberately exercises operational
+    # isolation. Its real lifecycle timestamp is ``+00:00`` while the v1
+    # completion record currently requires a ``Z``-suffixed UTC timestamp, so
+    # expose that side-effect refusal without making this F5 test a positive
+    # producer test. The positive producer path is covered by
+    # test_single_attempt_producer_and_stdlib_consumer_round_trip and
+    # test_p_to_c_to_s_chain_is_read_from_durable_v3_ledger.
+    task_two = next(member for member in group.members if member.task_id == "two")
+    with pytest.raises(ValueError, match="UTC timestamp ending in Z"):
+        store.record_full_horizon_completion(
+            executor.fences["two"], task_two, _core("completed"), task_two.target_horizon,
+        )
+    assert not valid_destination.exists()
 
 
 def test_failed_launched_ack_write_parks_but_collects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
