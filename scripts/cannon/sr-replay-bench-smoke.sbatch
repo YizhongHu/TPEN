@@ -3,6 +3,7 @@
 # unique evidence root, staged source archive, and immutable shared environment.
 # Staging contract: SOURCE_ARCHIVE is the exact basename written below
 # STAGE_ROOT (default: source.tar); the submitter must export the same value.
+# The archive must contain the checkout under a top-level tpen/ directory.
 #SBATCH --partition=test
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
