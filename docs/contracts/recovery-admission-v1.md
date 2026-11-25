@@ -14,16 +14,16 @@ planned yield and an operator-authorized unplanned end.
 
 All records are immutable, closed mappings. Nested identity records use their
 own typed identity schemas. Program, group, H, content, and evidence identities
-are lower-case SHA-256 strings. `science_digest` is an HI-issued lowercase
-64-hex token equal to the configured task's `science_digest`. The recovery
-records validate this field as non-empty only; admission enforces equality with
-the configured task's `science_digest` and between the checkpoint and grant.
-The executor does not derive or hash this value.
+are lower-case SHA-256 strings. `science_digest` is an HI-issued, non-empty
+science-lineage token carried in both the checkpoint facts and finite grant.
+Recovery record validation checks that it is non-empty only; admission parks
+with `science-lineage-mismatch` unless the checkpoint and grant values are
+equal. The executor does not compare this token with the configured task's
+`TaskSpec.science_digest`, and does not derive or hash it.
 
-The HI caller supplies the configured task's `science_digest` when creating
-the checkpoint facts and finite grant. The same token is carried into both
-records; recovery record validation only checks that it is non-empty, while
-admission enforces equality with the configured task and between the records.
+HI should issue a per-row lowercase 64-hex token, using the same value it puts
+in `TaskSpec.science_digest`; this is a convention, not an enforced rule.
+The HI caller carries that token into the checkpoint facts and finite grant.
 
 ### `RecoverySchedulerEndV1`
 
@@ -59,7 +59,7 @@ Schema id: `tpen-executor/recovery-checkpoint-facts-v1`.
 | `next_iteration` | non-negative integer, retained independently |
 | `completed_updates` | non-negative integer, retained independently |
 | `program_digest` | lower-case SHA-256 program identity |
-| `science_digest` | HI-issued lowercase 64-hex token equal to the configured task's `science_digest`; recovery record validation checks non-empty, while admission enforces equality |
+| `science_digest` | HI-issued, non-empty science-lineage token carried in the checkpoint facts; record validation checks non-empty only, and admission requires equality with the finite grant |
 | `h_digest` | lower-case SHA-256 H identity |
 | `committed` | boolean; true only for an independently validated committed checkpoint |
 
@@ -81,7 +81,7 @@ Schema id: `tpen-executor/recovery-grant-v1`.
 | `group_digest` | lower-case SHA-256 group identity |
 | `task_id` | non-empty frozen task identity |
 | `program_digest` | lower-case SHA-256 program identity |
-| `science_digest` | HI-issued lowercase 64-hex token equal to the configured task's `science_digest`; recovery record validation checks non-empty, while admission enforces equality |
+| `science_digest` | HI-issued, non-empty science-lineage token carried in the finite grant; record validation checks non-empty only, and admission requires equality with the checkpoint facts |
 | `h_digest` | lower-case SHA-256 H identity |
 | `successor_limit` | positive finite non-negative integer bound |
 
@@ -148,10 +148,11 @@ root and enforces all of the following before returning `admitted`:
    from the checkpoint path. The current attempt leaf is excluded
    independently. A path in an unrelated group/task, nested store layout, or
    different store parks.
-4. Program and H digests match the finite grant. The HI-issued lowercase
-   64-hex `science_digest` equals the configured task's `science_digest` and
-   matches the checkpoint and finite grant by equality; recovery record
-   validation only checks that it is non-empty.
+4. Program and H digests match the finite grant. Recovery record validation
+   checks `science_digest` is non-empty only; admission parks with
+   `science-lineage-mismatch` unless the checkpoint and finite grant values are
+   equal. The executor does not compare this token with the configured task's
+   `TaskSpec.science_digest`, and does not derive or hash it.
 5. A grant exists, is unexpired, and has remaining successor capacity; budget
    remaining must be positive. No grant means default-OFF.
 6. A repeated identical progress observation parks when
