@@ -1523,7 +1523,12 @@ def _jsonable(value: Any) -> Any:
 
 
 def _cell_science_report(report: Mapping[str, object]) -> dict[str, object]:
-    """Return C with operational run-path fields removed from the comparison."""
+    """Return delta-mode C with operational fields removed from comparison.
+
+    A non-delta run writes the legacy full report, so a delta successor cannot
+    silently cross that mode boundary: its normalized science view will not
+    equal the legacy bytes and validation refuses the mixed-mode record.
+    """
 
     result = dict(report)
     resolved = result.get("resolved_config")
@@ -1533,12 +1538,21 @@ def _cell_science_report(report: Mapping[str, object]) -> dict[str, object]:
         if isinstance(run, dict):
             for key in ("dir", "root", "run_id"):
                 run.pop(key, None)
+        runner_config = resolved_copy.get("runner")
+        if isinstance(runner_config, dict):
+            # runner.load is the closed operational allowance, not C science.
+            runner_config.pop("load", None)
         result["resolved_config"] = resolved_copy
     return result
 
 
 def _apply_attempt_delta_load(config: Any, delta: object | None) -> None:
-    """Apply the one closed train-resume load step after config resolution."""
+    """Apply the one closed train-resume load step after config resolution.
+
+    ``mutable_state_inventory`` governs the separate HI continuation refusal
+    path; this executor-issued allowance changes only the resolved runner
+    input and therefore does not alter the inventory comparison.
+    """
 
     if delta is None or getattr(delta, "load_mode") == "fresh":
         return
@@ -1705,16 +1719,25 @@ def execute(
         return 0
 
     output_path = delta.attempt_core_dir if delta is not None else Path(packet.cell.output_path)
+    if delta is None:
+        # Preserve pre-delta behavior: an occupied logical leaf refuses before
+        # C can be created or modified.
+        _refuse_occupied_output_path(output_path)
     receipt_path = _selection_receipt_path(output_root, packet.cell.content_hash)
     if delta is not None and delta.load_mode == "train_resume":
         _validate_cell_selection_receipt(output_root, packet.cell.content_hash, c_report)
-    elif delta is None:
-        _write_cell_selection_receipt(output_root, packet.cell.content_hash, report)
     elif receipt_path.exists() or receipt_path.is_symlink():
         _validate_cell_selection_receipt(output_root, packet.cell.content_hash, c_report)
-    else:
+    if delta is not None:
+        # Executor begin_attempt creates <attempt> but not its core child;
+        # the leaf owns this fresh physical core directory.  Claim it before
+        # creating first-attempt C so an occupied physical leaf cannot leave a
+        # misleading new logical receipt behind.
+        _refuse_occupied_output_path(output_path)
+    if delta is None:
+        _write_cell_selection_receipt(output_root, packet.cell.content_hash, report)
+    elif not receipt_path.exists() and not receipt_path.is_symlink():
         _write_cell_selection_receipt(output_root, packet.cell.content_hash, c_report)
-    _refuse_occupied_output_path(output_path)
     if delta is not None:
         _write_json(output_path / "attempt_report.json", {"attempt_delta": {
             "attempt_core_dir": str(delta.attempt_core_dir),
