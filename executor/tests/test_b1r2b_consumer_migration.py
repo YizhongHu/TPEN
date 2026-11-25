@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from pathlib import Path
 
 import pytest
@@ -25,7 +26,8 @@ from test_review_b1b2_t2_r1 import RecordingExecutor, _binding
 
 MUTANTS = (
     {"id": "omit-r2-checkpoint-link", "target": "executor/src/tpen_executor/results.py", "old": '"checkpoint_path": self.recovery_admission.checkpoint_path', "new": '"checkpoint_path": "crossed"', "killer": "test_r2_link_round_trip_preserves_typed_lineage"},
-    {"id": "accept-crossed-r2-attempt", "target": "executor/src/tpen_executor/results.py", "old": "self.recovery_admission.predecessor_attempt_id != self.predecessor_attempt_id", "new": "False", "killer": "test_crossed_r2_link_is_rejected"},
+    {"id": "accept-crossed-r2-predecessor", "target": "executor/src/tpen_executor/results.py", "old": "self.recovery_admission.predecessor_attempt_id != self.predecessor_attempt_id", "new": "False", "killer": "test_tampered_v3_predecessor_link_is_rejected"},
+    {"id": "accept-crossed-r2-successor", "target": "executor/src/tpen_executor/results.py", "old": "self.successor_binding.attempt_id != self.successor_attempt_id", "new": "False", "killer": "test_crossed_r2_successor_link_is_rejected"},
     {"id": "skip-r2-controller-admission", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "verdict = None if admitted_item.recovery_input is not None else admission_port.admit(admitted_item)", "new": "verdict = admission_port.admit(admitted_item)", "killer": "test_r2_input_uses_admit_recovery_not_legacy_selector"},
     {"id": "launch-before-r2-publication", "target": "executor/src/tpen_executor/lifecycle/controller.py", "old": "if published.encode() != checked.encode():", "new": "if False:", "killer": "test_r2_launch_requires_durable_publication"},
     {"id": "r2-park-submit-bypass", "target": "executor/src/tpen_executor/recovery.py", "old": "return _park(member, member.recovery_admission.reason)", "new": 'return MemberReconciliationV2(member.task_id, "admit_successor", "recovery-admitted", member.attempt_id)', "killer": "test_r2_park_refuses_before_submit"},
@@ -171,7 +173,7 @@ def test_r2_link_round_trip_preserves_typed_lineage(tmp_path: Path) -> None:
     assert result["record"]["predecessor"]["checkpoint_path"] == admission.checkpoint_path
 
 
-def test_crossed_r2_link_is_rejected(tmp_path: Path) -> None:
+def test_crossed_r2_successor_link_is_rejected(tmp_path: Path) -> None:
     store, _group, _lease, _inputs, bindings, successors, fences = _fixture(tmp_path, ("successor",), remote=False)
     predecessor = fences["successor"]
     request, acceptance, successor_binding = successors["successor"]
@@ -188,6 +190,26 @@ def test_crossed_r2_link_is_rejected(tmp_path: Path) -> None:
             core_acceptance_digest=acceptance, successor_binding=successor_binding,
             successor_request=request,
         )
+
+
+def test_tampered_v3_predecessor_link_is_rejected(tmp_path: Path) -> None:
+    store, _group, _lease, _inputs, bindings, successors, fences = _fixture(tmp_path, ("successor",), remote=False)
+    predecessor = fences["successor"]
+    request, acceptance, successor_binding = successors["successor"]
+    admission = _real_admission(
+        store, predecessor, successor=successor_binding.attempt_id,
+        backend_job_id=successor_binding.allocation_attempt.backend_job_id.value,
+        current_attempt=AttemptId("current-r2"),
+    )
+    record = store.record_successor_admission(
+        predecessor, request, acceptance,
+        predecessor_binding=bindings["successor"], successor_binding=successor_binding,
+        recovery_admission=admission,
+    )
+    wire = json.loads(record.encode())
+    wire["predecessor"]["attempt_id"] = "tampered-predecessor"
+    with pytest.raises(ValueError, match="crosses successor identity"):
+        SuccessorAdmissionRecord.from_mapping(wire)
 
 
 def test_r2_duplicate_replay_is_idempotent_and_fork_parks(tmp_path: Path) -> None:
