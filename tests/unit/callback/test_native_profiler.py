@@ -312,9 +312,13 @@ def test_real_cpu_profiler_trace_is_readable_and_reconciled(tmp_path) -> None:
     trace = json.loads(trace_path.read_text(encoding="utf-8"))
     assert isinstance(trace["traceEvents"], list)
     assert trace["traceEvents"]
-    inspected = inspect_run_observability(context.run_dir)
+    inspected = inspect_run_observability(
+        context.run_dir, relative_dir="native-profiling"
+    )
     assert inspected.status == "present"
-    reconciled = reconcile_run_observability(context.run_dir)
+    reconciled = reconcile_run_observability(
+        context.run_dir, relative_dir="native-profiling"
+    )
     assert reconciled.status == "present"
     assert reconciled.invocations
 
