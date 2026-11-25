@@ -195,6 +195,8 @@ def test_r2_link_round_trip_preserves_typed_lineage(tmp_path: Path) -> None:
         predecessor_binding=bindings["successor"], successor_binding=successor_binding,
         recovery_admission=admission,
     )
+    wire = json.loads(record.encode())
+    assert wire["predecessor"]["checkpoint_path"] == admission.checkpoint_path
     decoded = SuccessorAdmissionRecord.decode(record.encode())
     assert decoded.predecessor_attempt_id == admission.predecessor_attempt_id
     assert decoded.checkpoint_path == admission.checkpoint_path
@@ -246,7 +248,8 @@ def test_tampered_v3_predecessor_link_is_rejected(tmp_path: Path) -> None:
     )
     wire = json.loads(record.encode())
     wire["predecessor"]["attempt_id"] = "tampered-predecessor"
-    with pytest.raises(ValueError, match="crosses successor identity"):
+    wire["predecessor"]["checkpoint_path"] = admission.checkpoint_path
+    with pytest.raises(ValueError, match="recovery admission crosses successor identity"):
         SuccessorAdmissionRecord.from_mapping(wire)
 
 
@@ -326,7 +329,7 @@ def test_r2_launch_requires_durable_publication(tmp_path: Path, monkeypatch, pub
         if publication_mode == "raise":
             raise RuntimeError("publication unavailable")
         result = original(self, *args, **kwargs)
-        return replace(result, members=tuple(replace(member, action="park", reason_code="publication-parked") for member in result.members))
+        return replace(result, members=tuple(replace(member, reason_code="publication-parked") for member in result.members))
 
     monkeypatch.setattr(DirectoryStore, "publish_reconciliation", publish)
     executor = BoundaryExecutor(order)

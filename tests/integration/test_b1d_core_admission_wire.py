@@ -261,7 +261,7 @@ MUTANTS = (
     (
         "controller-ignores-port",
         "executor/src/tpen_executor/lifecycle/controller.py",
-        "verdict = admission_port.admit(item)",
+        "verdict = None if item.recovery_input is not None else admission_port.admit(admitted_item)",
         "verdict = item.core_verdict",
         "test_controller_unknown_mapping_overrides_prefilled_successor",
     ),
