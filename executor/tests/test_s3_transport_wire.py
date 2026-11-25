@@ -98,9 +98,9 @@ S3A_MUTANT_TABLE = (
         "suite": "executor", "assertion": "public inspection runs in the leaf after science, not in the controller after the leaf returns",
     },
     {
-        "id": "R5", "target": TRANSPORT,
-        "old": "        return (*TPENCommand(self.config, self.overrides).args, f\"run.root={output_dir}\"",
-        "new": "        return (\"-m\", \"tpen.run\", \"--config\", self.config, *self.overrides, f\"run.root={output_dir}\"",
+        "id": "R5", "target": "executor/src/tpen_executor/tasks.py",
+        "old": "            return TPENCommand(\n                self.config,\n                (*self.overrides, f\"run.root={output_dir}\", \"run.layout=flat\", \"run.run_id=core\"),\n            )\n",
+        "new": "            return type(\"MutatedLegacyCommand\", (), {\"args\": (\"-m\", \"tpen.run\", \"--config\", self.config, *self.overrides, f\"run.root={output_dir}\", \"run.layout=flat\", \"run.run_id=core\")})()\n",
         "killer": "test_real_serialized_leaf_runs_science_then_inspection_on_the_worker",
         "suite": "executor", "assertion": "the leaf launches science through RUN_SHIM, never python -m tpen.run",
     },
