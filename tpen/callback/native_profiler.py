@@ -582,6 +582,8 @@ class NativeProfiler(Callback):
                     session._diagnostic("summary_failed", exc)
             if application_error is not None:
                 session._diagnostic(f"application_error={type(application_error).__name__}")
+            if session._overshoot_steps:
+                session._diagnostic(f"overshoot_steps={session._overshoot_steps}")
             if summary_truncated:
                 session._diagnostic("summary_rows_truncated")
             window_id = f"step-{self.window.start_step}-{self.window.end_step}"
