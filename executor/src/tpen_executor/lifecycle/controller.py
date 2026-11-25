@@ -399,11 +399,15 @@ def run_group_controller(
                 store.create_launch_intent(fence, controller, invocation)
                 store.require_current_controller(group, controller.generation, controller.claimant_nonce)
                 try:
-                    if admission_record is not None:
+                    if admission_record is not None and admission_record.recovery_admission is not None:
                         submit_admitted = getattr(executor, "submit_admitted_successor", None)
                         if not callable(submit_admitted):
                             raise LeafSubmissionError("executor cannot honor admitted successor checkpoint")
                         launched, handle = submit_admitted(
+                            fence, invocation, admission_record.checkpoint_path,
+                        )
+                    elif admission_record is not None and hasattr(executor, "submit_admitted_successor"):
+                        launched, handle = executor.submit_admitted_successor(
                             fence, invocation, admission_record.checkpoint_path,
                         )
                     else:

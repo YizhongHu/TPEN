@@ -127,8 +127,12 @@ For an R2 record, the writer MUST bind this embedded request to the independent
 `recovery_admission` before writing the ledger: both request task ids equal the
 record task, the request predecessor and successor `attempt_id` values equal
 the admission's typed `value` fields, and
-`core_evidence.checkpoint_ref.content_id` and `checkpoint_dir` equal the
-admission's selected `content_id` and `checkpoint_path`. The reader MUST
+`core_evidence.checkpoint_ref.checkpoint_dir` equals the admission's selected
+`checkpoint_path`. R2A's admitted v1 decision intentionally carries the typed
+path but not a separate content-id field; the typed checkpoint content identity
+is `core_evidence.checkpoint_ref.content_id`, which is copied into the v3
+record's `predecessor.content_id` and checked for exact equality by the record
+constructor. The reader MUST
 validate the same closed shape and equalities after recomputing
 `request_digest`; a request that is individually well-formed but crossed with
 the outer admission is unreadable.
@@ -152,8 +156,9 @@ it MUST reject a record when:
    disagrees with the record's identities.
 7. The embedded request has extra/missing fields, its canonical request digest
    does not match `request_digest`, its predecessor/successor identities do not
-   equal the outer/admitted identities, or its checkpoint content/path does
-   not equal the admitted checkpoint facts.
+   equal the outer/admitted identities, or its checkpoint content does not
+   equal the outer typed predecessor content identity or its checkpoint path
+   does not equal the admitted checkpoint path.
 8. The caller science/iteration intent does not match `successor_request`.
 
 The linked result is not a core outcome. If the predecessor was hard-killed and

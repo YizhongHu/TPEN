@@ -1480,7 +1480,6 @@ class DirectoryStore:
             or predecessor["attempt_id"] != admission.predecessor_attempt_id.value
             or successor["task_id"] != task_id
             or successor["attempt_id"] != admission.successor_attempt_id.value
-            or checkpoint_ref.get("content_id") != admission.checkpoint.content_id
             or checkpoint_ref.get("checkpoint_dir") != admission.checkpoint_path
         ):
             raise FenceRejected("recovery request crosses admitted facts")
