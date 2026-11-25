@@ -507,12 +507,24 @@ def run_group_controller(
             rebuilt = _apply_recovery_admission(item, store)
             rebuilt = replace(rebuilt, attempt_id=record.attempt_id, start_receipt=record.start_receipt,
                               outcome_receipt=record.outcome_receipt)
-            try:
-                verdict = None if item.recovery_input is not None else admission_port.admit(rebuilt)
-                if verdict is not None and not isinstance(verdict, CoreAdmissionVerdictV2):
-                    verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "malformed-core-admission")
-            except Exception:
-                verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "core-admission-unavailable")
+            if item.recovery_input is not None:
+                rebuilt = replace(rebuilt, recovery_admission=None)
+                outcome = (
+                    "completed" if record.outcome_receipt is not None and record.outcome_receipt.status == "completed"
+                    else "unknown" if record.core_outcome is None else record.core_outcome.outcome
+                )
+                if outcome not in {"completed", "terminal", "unknown", "successor"}:
+                    outcome = "unknown"
+                verdict = CoreAdmissionVerdictV2(
+                    outcome, "unknown", "unknown", "unknown", None, "collected-core-outcome",
+                )
+            else:
+                try:
+                    verdict = admission_port.admit(rebuilt)
+                    if verdict is not None and not isinstance(verdict, CoreAdmissionVerdictV2):
+                        verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "malformed-core-admission")
+                except Exception:
+                    verdict = CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "core-admission-unavailable")
             final_inputs.append(replace(rebuilt, core_verdict=verdict))
         final = _merge_final_reconciliation(
             published, reconcile_group(group, tuple(final_inputs)),
