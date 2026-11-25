@@ -9,6 +9,7 @@ import pickle
 import subprocess
 import sys
 import warnings
+from pathlib import Path
 
 import pytest
 
@@ -109,6 +110,26 @@ class _RangeExitFailureBackend(_FakeBackend):
         return _Range()
 
 
+def _tree_state(root: Path) -> tuple[tuple[str, str, bytes | str], ...]:
+    """Capture regular-file bytes and symlink targets without following links."""
+
+    entries: list[tuple[str, str, bytes | str]] = []
+
+    def visit(path: Path) -> None:
+        for child in sorted(path.iterdir(), key=lambda item: item.name):
+            relative = str(child.relative_to(root))
+            if child.is_symlink():
+                entries.append((relative, "symlink", os.readlink(child)))
+            elif child.is_dir():
+                entries.append((relative, "directory", ""))
+                visit(child)
+            else:
+                entries.append((relative, "file", child.read_bytes()))
+
+    visit(root)
+    return tuple(entries)
+
+
 def test_window_uses_durable_numeric_selection() -> None:
     window = TrainingIterationWindow(start_step=4, warmup_steps=2, active_steps=3)
     assert [window.phase(i) for i in range(8)] == [
@@ -205,6 +226,97 @@ def test_chrome_trace_missing_backend_capability_is_partial_and_preserves_primar
     assert status["export_status"] == "failed"
     assert status["data_completeness"] == "partial"
     assert status.get("artifacts") is None
+
+
+def test_failed_trace_reservation_has_zero_writer_mutation(tmp_path) -> None:
+    context = make_run_context(tmp_path)
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        trace=ChromeTraceExport(),
+        backend_factory=_FakeBackend,
+    )
+    bundle = callback.sink.resolve_bundle_dir(
+        context.artifact_manager, context.invocation_id
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("untouched", encoding="utf-8")
+    bundle.mkdir(parents=True)
+    (bundle / "profiles").symlink_to(outside, target_is_directory=True)
+    before = _tree_state(context.run_dir)
+
+    with callback.run_scope(context):
+        callback.handle_occurrence(
+            Occurrence(Started(TrainingIteration(0)), 1), context
+        )
+
+    assert _tree_state(context.run_dir) == before
+    assert sentinel.read_text(encoding="utf-8") == "untouched"
+    assert not (outside / "native-profiler").exists()
+
+
+def test_trace_target_created_after_reservation_is_not_overwritten(tmp_path) -> None:
+    context = make_run_context(tmp_path)
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        trace=ChromeTraceExport(),
+        backend_factory=_FakeBackend,
+    )
+    target = (
+        callback.sink.resolve_bundle_dir(context.artifact_manager, context.invocation_id)
+        / callback._trace_relative_path()
+    )
+
+    class _CollidingBackend(_FakeBackend):
+        def stop(self) -> None:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("sentinel", encoding="utf-8")
+            super().stop()
+
+    callback.backend_factory = _CollidingBackend
+    with callback.run_scope(context):
+        callback.handle_occurrence(
+            Occurrence(Started(TrainingIteration(0)), 1), context
+        )
+        callback.handle_occurrence(
+            Occurrence(Ended(TrainingIteration(0)), 1), context
+        )
+
+    assert target.read_text(encoding="utf-8") == "sentinel"
+    status = json.loads(next(context.run_dir.rglob("profile-status.json")).read_text())
+    assert status["export_status"] == "failed"
+    assert status.get("artifacts") is None
+
+
+def test_real_cpu_profiler_trace_is_readable_and_reconciled(tmp_path) -> None:
+    torch = pytest.importorskip("torch")
+    context = make_run_context(tmp_path)
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        trace=ChromeTraceExport(),
+    )
+    with callback.run_scope(context):
+        callback.handle_occurrence(
+            Occurrence(Started(TrainingIteration(0)), 1), context
+        )
+        _ = torch.ones((8, 8)) + torch.ones((8, 8))
+        callback.handle_occurrence(
+            Occurrence(Ended(TrainingIteration(0)), 1), context
+        )
+
+    trace_path = next(context.run_dir.rglob("chrome-trace.json"))
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert isinstance(trace["traceEvents"], list)
+    assert trace["traceEvents"]
+    inspected = inspect_run_observability(context.run_dir)
+    assert inspected.status == "present"
+    reconciled = reconcile_run_observability(context.run_dir)
+    assert reconciled.status == "present"
+    assert reconciled.invocations
 
 
 def test_live_callback_and_session_refuse_serialization() -> None:
