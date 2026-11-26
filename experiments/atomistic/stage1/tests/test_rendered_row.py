@@ -332,6 +332,13 @@ def _rewrite_materialized_row(
     row["row_extension"]["rendered_config"]["sha256"] = _write_rendered(  # type: ignore[index]
         rendered_path, payload,
     )
+
+    _refreeze_row_id(row)
+
+
+def _refreeze_row_id(row: dict[str, object]) -> None:
+    """Recompute the production row identity after a deliberate test mutation."""
+
     row["row_id"] = protocol.manifest_hash([
         {key: value for key, value in row.items() if key != "row_id"}
     ])
@@ -348,9 +355,7 @@ def test_extended_row_id_is_content_addressed_with_a_refrozen_green_sibling(
         protocol.validate_gateway_binding(
             binding=_binding_token(row), expected_kinds={"train"},
         )
-    row["row_id"] = protocol.manifest_hash([
-        {key: value for key, value in row.items() if key != "row_id"}
-    ])
+    _refreeze_row_id(row)
     protocol.validate_gateway_binding(
         binding=_binding_token(row), expected_kinds={"train"},
     )
@@ -556,6 +561,7 @@ def test_rendered_input_scope_rejects_escape_paths(tmp_path: Path, path_kind: st
     else:
         replacement = rendered_path.parent / ".." / "outside.yaml"
     row["row_extension"]["rendered_config"]["path"] = str(replacement)  # type: ignore[index]
+    _refreeze_row_id(row)
     with pytest.raises(ProtocolError, match="canonical|beneath|traversal"):
         protocol.load_materialized_config(row, expected_kind="train")
 
@@ -607,6 +613,7 @@ def test_extended_stop_preserves_full_horizon_and_returns_planned_yield(
 
     row, rendered_path = _train_row(tmp_path)
     row["execution"] = {"stop_at": 1}
+    _refreeze_row_id(row)
     cfg, admission = protocol.load_materialized_config(row, expected_kind="train")
     observed: dict[str, object] = {}
 
@@ -666,6 +673,7 @@ def test_extended_v2_basis_provenance_and_recorder_order_are_strict(tmp_path: Pa
     row["row_extension"]["rendered_config"]["sha256"] = _write_rendered(  # type: ignore[index]
         rendered_path, payload,
     )
+    _refreeze_row_id(row)
     cfg, admission = protocol.load_materialized_config(row, expected_kind="train")
     protocol.validate_materialized_admission(cfg, row, admission)
     cfg.stage1_overlay.path = protocol.HOOKE_OVERLAY_RELATIVE_PATH
