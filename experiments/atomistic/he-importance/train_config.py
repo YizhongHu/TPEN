@@ -476,13 +476,13 @@ def _reject_bracket_override_path(path: object) -> None:
 def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple[str, Any], ...]:
     """Flatten mapping or Hydra dotlist overrides into explicit leaf updates."""
 
+    preserved_chunk_items: list[tuple[str, Any]] = []
     if isinstance(overrides, Mapping):
         try:
             raw = OmegaConf.to_container(OmegaConf.create(overrides), resolve=False)
         except Exception as exc:
             raise TrainConfigResolutionError("overrides must be a valid mapping") from exc
     elif isinstance(overrides, Sequence) and not isinstance(overrides, (str, bytes, bytearray)):
-        preserved_chunk_items: list[tuple[str, Any]] = []
         ordinary_overrides: list[str] = []
         for override in overrides:
             path, _, _ = str(override).partition("=")

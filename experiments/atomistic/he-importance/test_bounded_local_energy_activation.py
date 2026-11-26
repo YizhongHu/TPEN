@@ -6,7 +6,6 @@ import importlib
 import json
 from pathlib import Path
 import sys
-from types import SimpleNamespace
 
 from omegaconf import OmegaConf
 from hydra.utils import instantiate
@@ -197,35 +196,35 @@ def test_real_hydra_runner_constructs_and_executes_bounded_helper(
     constructed = instantiate(cpu_config.runner)
     assert constructed.trainer.local_energy_chunk_size == 3
 
-    torch = importlib.import_module("torch")
     trainer_mod = sys.modules[type(constructed.trainer).__module__]
-    helper_mod = importlib.import_module("tpen.physics.hamiltonian")
-    calls: list[int] = []
+    helper_mod = sys.modules[trainer_mod.evaluate_local_energy_in_chunks.__module__]
+    chunk_calls: list[int] = []
+    row_sizes: list[int] = []
+    local_calls: list[int] = []
+    real_chunked = trainer_mod.evaluate_local_energy_in_chunks
+    real_local = trainer_mod.local_energy
+    real_slice = helper_mod.slice_flat_batch
 
-    class FakeBatch:
-        batch_size = 8
+    def spy_chunked(*args: object, **kwargs: object) -> object:
+        chunk_calls.append(int(kwargs["chunk_size"]))
+        return real_chunked(*args, **kwargs)
 
-    class FakeEvaluator:
-        def make_context(self, wavefunction: object, batch: object) -> object:
-            del wavefunction
-            calls.append(batch.batch_size)
-            return batch
+    def spy_local(terms: object, model: object, batch: object, **kwargs: object) -> object:
+        local_calls.append(int(batch.batch_size))
+        return real_local(terms, model, batch, **kwargs)
 
-        def evaluate(self, terms: object, context: object, *, return_terms: bool) -> object:
-            del terms, return_terms
-            return torch.zeros(context.batch_size)
+    def spy_slice(batch: object, start: int, stop: int) -> object:
+        row_sizes.append(stop - start)
+        return real_slice(batch, start, stop)
 
-    monkeypatch.setattr(
-        helper_mod, "slice_flat_batch", lambda batch, start, stop: SimpleNamespace(
-            batch_size=stop - start
-        )
-    )
-    result = helper_mod.evaluate_local_energy_in_chunks(
-        {}, constructed.model, FakeBatch(), chunk_size=constructed.trainer.local_energy_chunk_size,
-        evaluator=FakeEvaluator(),
-    )
-    assert tuple(calls) == (3, 3, 2)
-    assert tuple(result.shape) == (8,)
+    monkeypatch.setattr(trainer_mod, "evaluate_local_energy_in_chunks", spy_chunked)
+    monkeypatch.setattr(trainer_mod, "local_energy", spy_local)
+    monkeypatch.setattr(helper_mod, "slice_flat_batch", spy_slice)
+    context_helper = importlib.import_module("tests.helpers.run_context")
+    constructed.run(context_helper.make_run_context(tmp_path / "context", device="cpu"))
+    assert chunk_calls == [3]
+    assert tuple(row_sizes) == (3, 3, 2)
+    assert local_calls == []
 
 
 def test_real_hydra_runner_legacy_helper_is_single_unchunked_batch(
@@ -236,34 +235,27 @@ def test_real_hydra_runner_legacy_helper_is_single_unchunked_batch(
     constructed = instantiate(legacy_config.runner)
     assert constructed.trainer.local_energy_chunk_size is None
 
-    torch = importlib.import_module("torch")
     trainer_mod = sys.modules[type(constructed.trainer).__module__]
-    helper_mod = importlib.import_module("tpen.physics.hamiltonian")
-    calls: list[int] = []
+    helper_mod = sys.modules[trainer_mod.evaluate_local_energy_in_chunks.__module__]
+    chunk_calls: list[int] = []
+    local_calls: list[int] = []
+    real_chunked = trainer_mod.evaluate_local_energy_in_chunks
+    real_local = trainer_mod.local_energy
 
-    class FakeBatch:
-        batch_size = 8
+    def spy_chunked(*args: object, **kwargs: object) -> object:
+        chunk_calls.append(int(kwargs["chunk_size"]))
+        return real_chunked(*args, **kwargs)
 
-    class FakeEvaluator:
-        def make_context(self, wavefunction: object, batch: object) -> object:
-            del wavefunction
-            calls.append(batch.batch_size)
-            return batch
+    def spy_local(terms: object, model: object, batch: object, **kwargs: object) -> object:
+        local_calls.append(int(batch.batch_size))
+        return real_local(terms, model, batch, **kwargs)
 
-        def evaluate(self, terms: object, context: object, *, return_terms: bool) -> object:
-            del terms, return_terms
-            return torch.zeros(context.batch_size)
-
-    monkeypatch.setattr(
-        helper_mod, "slice_flat_batch", lambda batch, start, stop: SimpleNamespace(
-            batch_size=stop - start
-        )
-    )
-    result = helper_mod.evaluate_local_energy_in_chunks(
-        {}, constructed.model, FakeBatch(), chunk_size=None, evaluator=FakeEvaluator()
-    )
-    assert calls == [8]
-    assert tuple(result.shape) == (8,)
+    monkeypatch.setattr(trainer_mod, "evaluate_local_energy_in_chunks", spy_chunked)
+    monkeypatch.setattr(trainer_mod, "local_energy", spy_local)
+    context_helper = importlib.import_module("tests.helpers.run_context")
+    constructed.run(context_helper.make_run_context(tmp_path / "context", device="cpu"))
+    assert chunk_calls == []
+    assert local_calls == [8]
 
 
 def test_dropped_bound_is_refused_before_production_runner(
