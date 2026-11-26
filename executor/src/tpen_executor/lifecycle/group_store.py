@@ -14,7 +14,12 @@ from .._codec import canonical_bytes, decode_json, fields, sha256_text, text
 from .._records import frozen_record
 from ..allocations import ControllerGenerationV1
 from ..contracts import ReadyGroupV2
-from ..storage import ControllerGenerationRejected, DirectoryStore, FenceRejected
+from ..storage import (
+    ControllerGenerationPublicationUncertain,
+    ControllerGenerationRejected,
+    DirectoryStore,
+    FenceRejected,
+)
 
 
 class GroupStoreError(ValueError):
@@ -26,7 +31,7 @@ class GroupStoreRefused(GroupStoreError):
 
 
 class GroupStoreAuthorityPublished(GroupStoreError):
-    """Controller authority advanced; outcome is uncertain and must be reconciled."""
+    """Controller authority may have published; outcome must be reconciled."""
 
 
 @frozen_record
@@ -130,6 +135,19 @@ def _binding(request: InitialGroupStoreRequest | ReentryGroupStoreRequest, *, an
                                  request.deployment_lineage, anchor)
 
 
+def _acquire_for_reentry(store: DirectoryStore, request: ReentryGroupStoreRequest) -> ControllerGenerationV1:
+    """Acquire authority while preserving clean refusals and publication uncertainty."""
+    try:
+        acquired = store.acquire_controller_generation(request.group, request.controller)
+        return acquired
+    except ControllerGenerationPublicationUncertain as error:
+        raise GroupStoreAuthorityPublished(str(error)) from error
+    except ControllerGenerationRejected as error:
+        raise GroupStoreRefused(str(error)) from error
+    except OSError as error:
+        raise GroupStoreAuthorityPublished(str(error)) from error
+
+
 def initial(request: InitialGroupStoreRequest, root: str | os.PathLike[str]) -> GroupStoreResult:
     """Create one store and publish its binding exactly once."""
     if not isinstance(request, InitialGroupStoreRequest):
@@ -158,7 +176,11 @@ def initial(request: InitialGroupStoreRequest, root: str | os.PathLike[str]) -> 
 
 
 def reentry(request: ReentryGroupStoreRequest, root: str | os.PathLike[str]) -> GroupStoreResult:
-    """Strictly reconstruct and reopen a store without replacing any record."""
+    """Strictly reconstruct and reopen a store without replacing any record.
+
+    Acquisition may have published controller authority before reporting an
+    I/O failure; such outcomes are reported as requiring reconciliation.
+    """
     if not isinstance(request, ReentryGroupStoreRequest):
         raise TypeError("reentry requires ReentryGroupStoreRequest")
     try:
@@ -182,7 +204,7 @@ def reentry(request: ReentryGroupStoreRequest, root: str | os.PathLike[str]) -> 
         # successor's allocation/controller incarnation is admitted by the
         # existing monotonic generation fence and is never compared bytewise
         # with the creation-time controller.
-        acquired = store.acquire_controller_generation(request.group, request.controller)
+        acquired = _acquire_for_reentry(store, request)
         try:
             store.require_current_controller(request.group, acquired.generation, acquired.claimant_nonce)
             try:

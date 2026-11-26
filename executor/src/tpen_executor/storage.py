@@ -48,6 +48,10 @@ class ControllerGenerationRejected(FenceRejected):
     """Raised when a controller generation is stale, crossed, or forked."""
 
 
+class ControllerGenerationPublicationUncertain(ControllerGenerationRejected):
+    """Raised when controller publication may have completed before an error."""
+
+
 class LaunchIntentRejected(FenceRejected):
     """Raised when a member launch intent cannot be created or read safely."""
 
@@ -598,7 +602,9 @@ class DirectoryStore:
             try:
                 _write_new(path, record.encode())
             except FileExistsError as error:
-                raise ControllerGenerationRejected("controller generation write is ambiguous") from error
+                raise ControllerGenerationPublicationUncertain(
+                    "controller generation write is ambiguous"
+                ) from error
             return record
 
     def require_current_controller(self, group: ReadyGroupV2 | GroupId, generation: int, nonce: str) -> ControllerGenerationV1:

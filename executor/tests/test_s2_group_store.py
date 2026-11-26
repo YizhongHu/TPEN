@@ -31,6 +31,7 @@ MUTANTS = [
     {"id": "pre-acquire-order", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "invocation_parent = os.path.join(store.root, \"invocations\")\n        _validate_invocation_parent(invocation_parent)", "new": "invocation_parent = os.path.join(store.root, \"invocations\")\n        None", "killer": "test_regular_invocation_parent_refuses_before_acquire"},
     {"id": "missing-controller-lock", "target": "executor/src/tpen_executor/storage.py", "old": "with _existing_lock(os.path.join(directory, _CONTROLLER_LOCK)):", "new": "with _task_lock(os.path.join(directory, _CONTROLLER_LOCK)):", "killer": "test_missing_controller_lock_refuses"},
     {"id": "single-component-path", "target": "executor/src/tpen_executor/storage.py", "old": "raise ValueError(\"relative_path must be one non-empty filename component\")", "new": "return", "killer": "test_seams_refuse_nested_and_symlinked_ancestors"},
+    {"id": "acquire-publication-uncertainty", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "except OSError as error:\n        raise GroupStoreAuthorityPublished(str(error)) from error", "new": "except OSError as error:\n        raise GroupStoreRefused(str(error)) from error", "killer": "test_acquire_post_link_fsync_failure_is_authority_published"},
 ]
 
 
@@ -68,6 +69,15 @@ def _tree(root):
             else:
                 entries.append((rel, "other"))
     return sorted(entries)
+
+
+def _controller_ledger(root):
+    matches = sorted(Path(root).rglob("generation-1.json"))
+    assert len(matches) == 1
+    ledger = matches[0].parent
+    assert (ledger / "generation-1.json").is_file()
+    assert (ledger / "controller.lock").is_file()
+    return ledger
 
 
 def test_initial_create_and_identical_reentry(tmp_path):
@@ -132,7 +142,8 @@ def test_regular_invocation_parent_refuses_before_acquire(tmp_path):
     before = _tree(tmp_path)
     with pytest.raises(GroupStoreRefused): reentry(_request(group, successor), root)
     assert _tree(tmp_path) == before
-    assert not (root / "groups" / group.identity / "generation-2.json").exists()
+    ledger = _controller_ledger(root)
+    assert not (ledger / "generation-2.json").exists()
 
 
 def test_post_acquire_failure_is_authority_published(tmp_path, monkeypatch):
@@ -144,13 +155,32 @@ def test_post_acquire_failure_is_authority_published(tmp_path, monkeypatch):
     with pytest.raises(GroupStoreAuthorityPublished) as error:
         reentry(_request(group, successor), root)
     assert not isinstance(error.value, GroupStoreRefused)
-    assert (root / "groups" / group.identity / "generation-2.json").is_file()
+    assert (_controller_ledger(root) / "generation-2.json").is_file()
+
+
+def test_acquire_post_link_fsync_failure_is_authority_published(tmp_path, monkeypatch):
+    group, controller = _fixture(); root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
+    successor = ControllerGenerationV1(group.group_id, 2, AllocationId("allocation-2"), BackendJobId("job-2"), "b" * 64, "nonce-2", controller.record_digest)
+    ledger = _controller_ledger(root)
+    import tpen_executor.storage as storage
+    original = storage._fsync_directory
+
+    def fault(path):
+        original(path)
+        if os.path.abspath(path) == os.path.abspath(str(ledger)) and (ledger / "generation-2.json").exists():
+            raise OSError("injected post-link fsync")
+
+    monkeypatch.setattr(storage, "_fsync_directory", fault)
+    with pytest.raises(GroupStoreAuthorityPublished):
+        reentry(_request(group, successor), root)
+    assert (ledger / "generation-2.json").read_bytes() == successor.encode()
 
 
 def test_missing_controller_lock_refuses(tmp_path):
     group, controller = _fixture(); root = tmp_path / "store"
     initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
-    lock = root / "groups" / group.identity / "controller.lock"; lock.unlink()
+    lock = _controller_ledger(root) / "controller.lock"; lock.unlink()
     before = _tree(tmp_path)
     with pytest.raises(GroupStoreRefused): reentry(_request(group, controller, execution_bundle_digest="d" * 64), root)
     assert _tree(tmp_path) == before
@@ -160,7 +190,7 @@ def test_missing_controller_lock_refuses(tmp_path):
 def test_missing_controller_lock_matching_bundle_refuses(tmp_path):
     group, controller = _fixture(); root = tmp_path / "store"
     initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
-    lock = root / "groups" / group.identity / "controller.lock"; lock.unlink()
+    lock = _controller_ledger(root) / "controller.lock"; lock.unlink()
     before = _tree(tmp_path)
     with pytest.raises(GroupStoreRefused): reentry(_request(group, controller), root)
     assert _tree(tmp_path) == before
@@ -279,7 +309,10 @@ def test_group_binding_mismatch_refuses(tmp_path):
     group, controller = _fixture(); root = tmp_path / "store"
     initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
     other, _ = _fixture()
-    other = ReadyGroupV2(group.group_id, other.members, other.execution_plan)
+    changed = TaskSpec("task", "lineage", other.members[0].program, "a" * 64, 2, "steps")
+    other = ReadyGroupV2(group.group_id, (changed,), other.execution_plan)
+    assert other.group_id == group.group_id
+    assert other.identity != group.identity
     from tpen_executor.storage import DirectoryStore
     # Keep the ledger/controller identity fixed so this detector reaches only
     # the canonical binding's group comparison.
@@ -289,6 +322,8 @@ def test_group_binding_mismatch_refuses(tmp_path):
     try:
         with pytest.raises(GroupStoreRefused): reentry(_request(other, controller), root)
         assert _tree(tmp_path) == before
+        monkeypatch.setattr(CanonicalGroupBinding, "__eq__", lambda self, other: True)
+        reentry(_request(other, controller), root)
     finally:
         monkeypatch.undo()
 
