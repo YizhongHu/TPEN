@@ -482,11 +482,26 @@ def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple
         except Exception as exc:
             raise TrainConfigResolutionError("overrides must be a valid mapping") from exc
     elif isinstance(overrides, Sequence) and not isinstance(overrides, (str, bytes, bytearray)):
+        preserved_chunk_items: list[tuple[str, Any]] = []
+        ordinary_overrides: list[str] = []
         for override in overrides:
             path, _, _ = str(override).partition("=")
             _reject_bracket_override_path(path)
+            if str.__eq__(path, "trainer.local_energy_chunk_size") is True:
+                try:
+                    single = OmegaConf.from_dotlist([str(override)])
+                    value = OmegaConf.select(single, path, default=_OVERRIDE_MISSING)
+                except Exception as exc:
+                    raise TrainConfigResolutionError(
+                        "overrides must be a valid Hydra dotlist"
+                    ) from exc
+                preserved_chunk_items.append((path, value))
+            else:
+                ordinary_overrides.append(str(override))
         try:
-            raw = OmegaConf.to_container(OmegaConf.from_dotlist(list(overrides)), resolve=False)
+            raw = OmegaConf.to_container(
+                OmegaConf.from_dotlist(ordinary_overrides), resolve=False
+            )
         except Exception as exc:
             raise TrainConfigResolutionError("overrides must be a valid Hydra dotlist") from exc
     else:
@@ -504,6 +519,7 @@ def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple
             items.append((path, value))
 
     visit(raw, "")
+    items.extend(preserved_chunk_items)
     return tuple(items)
 
 

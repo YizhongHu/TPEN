@@ -199,6 +199,7 @@ def test_real_hydra_runner_constructs_and_executes_bounded_helper(
 
     torch = importlib.import_module("torch")
     trainer_mod = sys.modules[type(constructed.trainer).__module__]
+    helper_mod = importlib.import_module("tpen.physics.hamiltonian")
     calls: list[int] = []
 
     class FakeBatch:
@@ -215,11 +216,11 @@ def test_real_hydra_runner_constructs_and_executes_bounded_helper(
             return torch.zeros(context.batch_size)
 
     monkeypatch.setattr(
-        trainer_mod, "slice_flat_batch", lambda batch, start, stop: SimpleNamespace(
+        helper_mod, "slice_flat_batch", lambda batch, start, stop: SimpleNamespace(
             batch_size=stop - start
         )
     )
-    result = trainer_mod.evaluate_local_energy_in_chunks(
+    result = helper_mod.evaluate_local_energy_in_chunks(
         {}, constructed.model, FakeBatch(), chunk_size=constructed.trainer.local_energy_chunk_size,
         evaluator=FakeEvaluator(),
     )
@@ -237,6 +238,7 @@ def test_real_hydra_runner_legacy_helper_is_single_unchunked_batch(
 
     torch = importlib.import_module("torch")
     trainer_mod = sys.modules[type(constructed.trainer).__module__]
+    helper_mod = importlib.import_module("tpen.physics.hamiltonian")
     calls: list[int] = []
 
     class FakeBatch:
@@ -253,11 +255,11 @@ def test_real_hydra_runner_legacy_helper_is_single_unchunked_batch(
             return torch.zeros(context.batch_size)
 
     monkeypatch.setattr(
-        trainer_mod, "slice_flat_batch", lambda batch, start, stop: SimpleNamespace(
+        helper_mod, "slice_flat_batch", lambda batch, start, stop: SimpleNamespace(
             batch_size=stop - start
         )
     )
-    result = trainer_mod.evaluate_local_energy_in_chunks(
+    result = helper_mod.evaluate_local_energy_in_chunks(
         {}, constructed.model, FakeBatch(), chunk_size=None, evaluator=FakeEvaluator()
     )
     assert calls == [8]
