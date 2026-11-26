@@ -280,9 +280,17 @@ class LocalLeafExecutor:
         self._lock = threading.Lock()
         self._active = 0
         self._free_slots = list(self._slots)
+        self._retired_slot_ids: set[str] = set()
         self._handles: dict[int, MemberLaunchHandle] = {}
         self._collected: set[int] = set()
         self._collecting: set[int] = set()
+
+    @property
+    def retired_slot_ids(self) -> tuple[str, ...]:
+        """Return the immutable snapshot of slots retired by terminal errors."""
+
+        with self._lock:
+            return tuple(sorted(self._retired_slot_ids))
 
     def _task(self, task_id: str) -> TaskSpec:
         """Return the one immutable task bound to ``task_id``."""
@@ -342,7 +350,7 @@ class LocalLeafExecutor:
 
         task = self._validate_invocation(fence, invocation)
         with self._lock:
-            if self._active >= self.capacity:
+            if self._active >= self.capacity or (self._slots and not self._free_slots):
                 raise CapacityExceededError("local leaf capacity is already admitted")
             slot = self._free_slots.pop() if self._free_slots else None
             self._active += 1
@@ -430,6 +438,7 @@ class LocalLeafExecutor:
                 raise HandleCollectionInProgressError("launch handle is already being collected")
             self._collecting.add(key)
         terminal = False
+        release_slot = False
         was_done = handle._future.done()
         try:
             try:
@@ -465,6 +474,7 @@ class LocalLeafExecutor:
             if not isinstance(result, LeafResult):
                 raise LeafResultRejected("leaf runner returned a non-LeafResult")
             result = validate_leaf_result(handle._request, result)
+            release_slot = True
             return LeafCompletionContext(result, handle._request, handle._configured, handle._environment)
         finally:
             with self._lock:
@@ -473,7 +483,10 @@ class LocalLeafExecutor:
                     self._collected.add(key)
                     self._active -= 1
                     if handle._slot is not None:
-                        self._free_slots.append(handle._slot)
+                        if release_slot:
+                            self._free_slots.append(handle._slot)
+                        else:
+                            self._retired_slot_ids.add(handle._slot.slot_id)
 
     def close(self, *, wait: bool = True) -> None:
         """Shut down the local submission pool after outstanding work settles."""

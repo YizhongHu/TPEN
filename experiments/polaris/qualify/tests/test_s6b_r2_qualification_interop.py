@@ -5,16 +5,8 @@ from __future__ import annotations
 import importlib
 import json
 from pathlib import Path
-import sys
 
 import pytest
-
-from tpen_executor.configured_program import AttemptDelta, ConfiguredLoad
-from tpen_executor._codec import canonical_bytes
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "executor" / "tests"))
-from test_b1r2c_full_horizon import _publish, _single_fixture  # noqa: E402
-
 
 completion = importlib.import_module(
     "experiments.atomistic.he-importance.full_horizon_completion"
@@ -22,29 +14,67 @@ completion = importlib.import_module(
 qualification = importlib.import_module("experiments.polaris.qualify.qualification")
 
 
-def _delta(core: Path, mode: str) -> AttemptDelta:
-    checkpoint = None if mode == "fresh" else str(core.parent.parent.parent / "previous" / "core" / "checkpoint")
-    return AttemptDelta(
-        str(core), ConfiguredLoad(mode, checkpoint), core.parent.parent.parent.name,
-        core.parent.parent.name, core.parent.name,
-    )
+def _canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+
+
+def _delta(core: Path, mode: str) -> dict[str, object]:
+    return {
+        "attempt_core_dir": str(core),
+        "attempt_id": core.parent.name,
+        "group_digest": core.parent.parent.parent.name,
+        "load": {
+            "mode": mode,
+            "path": None if mode == "fresh" else str(
+                core.parent.parent.parent / "previous" / "core" / "checkpoint"
+            ),
+        },
+        "schema": "tpen-executor/attempt-delta-v1",
+        "task_id": core.parent.parent.name,
+    }
+
+
+def _completion(core: Path, row_id: str) -> dict[str, object]:
+    return {
+        "attempt_chain": [],
+        "completed_at": "2026-11-25T14:00:00.000000Z",
+        "completed_updates": 1,
+        "core_acceptance_digest": "a" * 64,
+        "final_attempt_id": core.parent.name,
+        "final_checkpoint": {
+            "content_id": "f" * 64,
+            "path": str(core / "checkpoints" / "final"),
+        },
+        "group_digest": core.parent.parent.parent.name,
+        "schema": "tpen-executor/full-horizon-completion-v1",
+        "science_digest": row_id,
+        "target_iterations": 1,
+        "task_id": core.parent.parent.name,
+    }
 
 
 def _qualification_fixture(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     root = tmp_path / "root"
     root.mkdir()
-    store, group, fence, verdict, task = _single_fixture(root)
-    _publish(store, group, fence, verdict, task)
-    row_id = task.science_digest
+    row_id = "ab" * 32
+    core = root / "groups" / ("b" * 64) / "task-7" / "attempt-S" / "core"
+    core.mkdir(parents=True)
+    (core.parent.parent / "full-horizon-completion.json").write_bytes(
+        _canonical_bytes(_completion(core, row_id))
+    )
     campaign = root / "campaign"
     (campaign / "cells" / row_id).mkdir(parents=True)
-    (campaign / "cells" / row_id / "selection_receipt.json").write_bytes(canonical_bytes({"selection": {"selected": {"context": "O-raw"}}, "walkers": 1}))
-    delta = _delta(Path(fence.output_dir) / "core", "fresh")
-    report = {"row_id": row_id, "attempt_delta": json.loads(delta.canonical_bytes)}
-    (Path(fence.output_dir) / "core" / "attempt_report.json").write_bytes(canonical_bytes(report))
+    (campaign / "cells" / row_id / "selection_receipt.json").write_bytes(
+        _canonical_bytes({"selection": {"selected": {"context": "O-raw"}}, "walkers": 1})
+    )
+    (core / "attempt_report.json").write_bytes(
+        _canonical_bytes({"row_id": row_id, "attempt_delta": _delta(core, "fresh")})
+    )
     manifest = tmp_path / "manifest.json"
-    manifest.write_bytes(canonical_bytes({"runtime_kind": "polaris-gpu-qualification", "output_root": str(campaign), "cell": {"context": "O-raw", "walkers": 1, "updates": 1, "checkpoint_every": 1}}))
-    return campaign, manifest, Path(fence.output_dir) / "core", row_id
+    manifest.write_bytes(_canonical_bytes({"runtime_kind": "polaris-gpu-qualification", "output_root": str(campaign), "cell": {"context": "O-raw", "walkers": 1, "updates": 1, "checkpoint_every": 1}}))
+    return campaign, manifest, core, row_id
 
 
 def test_qualification_cell_complete_consumes_matching_real_full_h_record(tmp_path: Path) -> None:
@@ -61,9 +91,9 @@ def test_qualification_does_not_short_circuit_later_invalid_same_row_report(
     campaign, manifest, core, row = _qualification_fixture(tmp_path)
     invalid_core = core.parents[2] / "task-invalid" / "attempt-invalid" / "core"
     invalid_core.mkdir(parents=True)
-    (invalid_core.parent.parent / "full-horizon-completion.json").write_bytes(canonical_bytes({"schema": "malformed"}))
+    (invalid_core.parent.parent / "full-horizon-completion.json").write_bytes(_canonical_bytes({"schema": "malformed"}))
     invalid = invalid_core / "attempt_report.json"
-    invalid.write_bytes(canonical_bytes({"row_id": row, "attempt_delta": json.loads(_delta(invalid_core, "fresh").canonical_bytes)}))
+    invalid.write_bytes(_canonical_bytes({"row_id": row, "attempt_delta": _delta(invalid_core, "fresh")}))
     real_rglob = Path.rglob
 
     def ordered_rglob(root: Path, pattern: str):
@@ -80,13 +110,13 @@ def test_qualification_legacy_complete_survives_unrelated_delta_report(tmp_path:
     root = tmp_path / "campaign"
     row = "row-a"
     (root / "cells" / row).mkdir(parents=True)
-    (root / "cells" / row / "selection_receipt.json").write_bytes(canonical_bytes({"selection": {"selected": {"context": "O-raw"}}}))
+    (root / "cells" / row / "selection_receipt.json").write_bytes(_canonical_bytes({"selection": {"selected": {"context": "O-raw"}}}))
     (root / "Q" / row / "COMPLETE").parent.mkdir(parents=True)
     (root / "Q" / row / "COMPLETE").write_text("completed\n", encoding="utf-8")
     (root / "unrelated" / "attempt_report.json").parent.mkdir(parents=True)
-    (root / "unrelated" / "attempt_report.json").write_bytes(canonical_bytes({"row_id": "row-b"}))
+    (root / "unrelated" / "attempt_report.json").write_bytes(_canonical_bytes({"row_id": "row-b"}))
     manifest = tmp_path / "manifest.json"
-    manifest.write_bytes(canonical_bytes({"runtime_kind": "polaris-gpu-qualification", "output_root": str(root), "cell": {"context": "O-raw", "walkers": 1, "updates": 1, "checkpoint_every": 1}}))
+    manifest.write_bytes(_canonical_bytes({"runtime_kind": "polaris-gpu-qualification", "output_root": str(root), "cell": {"context": "O-raw", "walkers": 1, "updates": 1, "checkpoint_every": 1}}))
     evidence = tmp_path / "evidence"
     qualification.qualify(manifest, evidence)
     verdict = json.loads((evidence / "qualification.json").read_text(encoding="utf-8"))

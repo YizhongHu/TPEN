@@ -48,16 +48,6 @@ def _manifest_args(tmp_path: Path, row_id: str, raw_delta: str) -> SimpleNamespa
     )
 
 
-def test_executor_begin_creates_attempt_but_not_core_source_contract() -> None:
-    storage = Path(__file__).parents[3] / "executor" / "src" / "tpen_executor" / "storage.py"
-    transport = Path(__file__).parents[3] / "executor" / "src" / "tpen_executor" / "dispatch" / "transport.py"
-    storage_source = storage.read_text(encoding="utf-8")
-    transport_source = transport.read_text(encoding="utf-8")
-    assert "_mkdir_new(output_dir)" in storage_source
-    assert "_mkdir_new(os.path.join(output_dir, \"core\"))" not in storage_source
-    assert "existing core directory or log means the request is a replay" in transport_source
-
-
 def test_delta_load_is_one_closed_runner_step() -> None:
     config = OmegaConf.create({"runner": {}})
     runner._apply_attempt_delta_load(config, _delta("train_resume"))

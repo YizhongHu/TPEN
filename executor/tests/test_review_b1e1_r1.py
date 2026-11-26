@@ -137,14 +137,12 @@ def test_terminal_collection_error_returns_exact_slot_once(tmp_path: Path, failu
         _, first = executor.submit(*_invocation(group, allocation, "one", tmp_path))
         with pytest.raises(expected):
             executor.collect(first)
+        assert first.slot_id in executor.retired_slot_ids
         with pytest.raises(local.UnknownLaunchHandleError):
             executor.collect(first)
-        _, second = executor.submit(*_invocation(group, allocation, "two", tmp_path))
-        # A second collection of the first must not create extra capacity.
         with pytest.raises(local.CapacityExceededError):
-            executor.submit(*_invocation(group, allocation, "three", tmp_path))
-        executor.collect(second)
-        assert captured["one"].slot_id == captured["two"].slot_id == first.slot_id == second.slot_id
+            executor.submit(*_invocation(group, allocation, "two", tmp_path))
+        assert set(captured) == {"one"}
     finally:
         executor.close()
 

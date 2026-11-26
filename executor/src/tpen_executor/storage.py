@@ -48,6 +48,10 @@ class ControllerGenerationRejected(FenceRejected):
     """Raised when a controller generation is stale, crossed, or forked."""
 
 
+class ControllerGenerationPublicationUncertain(ControllerGenerationRejected):
+    """Raised when controller publication may have completed before an error."""
+
+
 class LaunchIntentRejected(FenceRejected):
     """Raised when a member launch intent cannot be created or read safely."""
 
@@ -339,6 +343,14 @@ def _require_regular(path: str, name: str, error_type: type[Exception] = FenceRe
         raise error_type(f"{name} is not a regular file")
 
 
+def _validate_single_component(relative_path: str) -> None:
+    """Reject absolute, empty, dot, or nested store-relative paths."""
+    if (type(relative_path) is not str or not relative_path or os.path.isabs(relative_path)
+            or os.sep in relative_path or (os.altsep and os.altsep in relative_path)
+            or relative_path in {".", ".."}):
+        raise ValueError("relative_path must be one non-empty filename component")
+
+
 def _canonical_completed_at(value: str) -> str:
     """Render a durable UTC outcome timestamp in the completion wire form."""
     try:
@@ -358,6 +370,27 @@ def _task_lock(path: str):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise FenceRejected("task lock is not a regular file")
+        fcntl.lockf(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.lockf(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _existing_lock(path: str):
+    """Hold an existing POSIX lock without repairing a missing lock file."""
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError as error:
+        raise ControllerGenerationRejected("controller lock is missing") from error
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ControllerGenerationRejected("controller lock is not a regular file")
         fcntl.lockf(fd, fcntl.LOCK_EX)
         try:
             yield
@@ -413,6 +446,37 @@ class DirectoryStore:
         if os.path.lexists(root):
             _require_directory(root, "store root")
         object.__setattr__(self, "root", root)
+
+    def write_once(self, relative_path: str, payload: bytes) -> str:
+        """Publish one root-level canonical payload without replacement.
+
+        ``relative_path`` is exactly one non-empty filename component; nested
+        paths are rejected so no pre-existing symlinked ancestor can redirect
+        publication outside the store.
+        """
+        _validate_single_component(relative_path)
+        destination = _lexical(os.path.join(self.root, relative_path))
+        if not _inside(self.root, destination):
+            raise FenceRejected("write path escapes store root")
+        _write_new(destination, payload)
+        return destination
+
+    def read_canonical(self, relative_path: str, decoder: Any) -> Any:
+        """Read one root-level regular, non-symlink receipt through a decoder.
+
+        ``relative_path`` is exactly one non-empty filename component, which
+        prevents traversal through a pre-existing symlinked ancestor.
+        """
+        _validate_single_component(relative_path)
+        path = _lexical(os.path.join(self.root, relative_path))
+        if not _inside(self.root, path):
+            raise FenceRejected("read path escapes store root")
+        _require_regular(path, "canonical receipt")
+        payload = Path(path).read_bytes()
+        record = decoder(payload)
+        if payload != record.encode():
+            raise FenceRejected("canonical receipt is not canonical")
+        return record
 
     def record_pre_start_receipt(self, group: ReadyGroupV2 | GroupId, backend_job_id: BackendJobId, observed_job_id: BackendJobId, reason: str) -> None:
         """Durably record one refusal keyed by group and backend observations."""
@@ -485,6 +549,14 @@ class DirectoryStore:
             previous = record
         return [record for _, record in records]
 
+    def controller_generations(self, group: ReadyGroupV2 | GroupId) -> list[ControllerGenerationV1]:
+        """Read the complete store-owned controller chain under its lock."""
+        directory = self._controller_dir(group)
+        group_id = group.group_id if isinstance(group, ReadyGroupV2) else group
+        _require_directory(directory, "controller ledger", ControllerGenerationRejected)
+        with _existing_lock(os.path.join(directory, _CONTROLLER_LOCK)):
+            return self._controller_records(directory, group_id)
+
     def _prepare_controller_dir(self, group: ReadyGroupV2) -> str:
         """Create and durably publish the controller ledger ancestry."""
         directory = self._controller_dir(group)
@@ -530,7 +602,9 @@ class DirectoryStore:
             try:
                 _write_new(path, record.encode())
             except FileExistsError as error:
-                raise ControllerGenerationRejected("controller generation write is ambiguous") from error
+                raise ControllerGenerationPublicationUncertain(
+                    "controller generation write is ambiguous"
+                ) from error
             return record
 
     def require_current_controller(self, group: ReadyGroupV2 | GroupId, generation: int, nonce: str) -> ControllerGenerationV1:

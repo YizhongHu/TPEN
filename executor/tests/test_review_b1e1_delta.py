@@ -98,11 +98,10 @@ def test_leaf_timeout_during_bounded_wait_consumes_handle(
             executor.collect(handle, timeout=1)
         assert first.value is leaf_error
         assert future.done()
-        _, next_handle = executor.submit(*_invocation(group, allocation, "two", tmp_path))
-        assert next_handle.slot_id == handle.slot_id
+        assert handle.slot_id in executor.retired_slot_ids
         with pytest.raises(local.UnknownLaunchHandleError):
             executor.collect(handle)
-        with pytest.raises(FutureTimeoutError):
-            executor.collect(next_handle, timeout=1)
+        with pytest.raises(local.CapacityExceededError):
+            executor.submit(*_invocation(group, allocation, "two", tmp_path))
     finally:
         executor.close()
