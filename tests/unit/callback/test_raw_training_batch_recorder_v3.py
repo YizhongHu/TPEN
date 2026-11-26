@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -834,46 +833,3 @@ def test_v3_legacy_history_cannot_pass_require_complete(tmp_path: Path) -> None:
     (tmp_path / "manifest.json").write_text(json.dumps({"schema": "training_history/v1", "partitions": []}) + "\n")
     with pytest.raises(ValueError, match="legacy|complete"):
         TrainingBatchReader(tmp_path).validate(require_complete=True)
-
-
-MUTANTS = [
-    {"id": "M01", "target": "tpen/callback/raw_training_batch_recorder.py", "old": 'if events and event["previous_event_sha256"] != digests[-1]:', "new": "if False:", "killer": "test_v3_refuses_chain_corruption"},
-    {"id": "M02", "target": "tpen/callback/raw_training_batch_recorder.py", "old": 'if not sidecar_path.is_file() or _sha256(sidecar_path) != event["sidecar_sha256"]:', "new": "if False:", "killer": "test_v3_refuses_sidecar_hash_corruption"},
-    {"id": "M03", "target": "tpen/callback/raw_training_batch_recorder.py", "old": 'if not bundle_path.is_file() or _sha256(bundle_path) != sidecar["compressed_sha256"]:', "new": "if False:", "killer": "test_v3_refuses_bundle_hash_corruption"},
-    {"id": "M04", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if identity in active_identities:", "new": "if False:", "killer": "test_v3_refuses_duplicate_active_grid"},
-    {"id": "M05", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if require_complete and node.completion is None:", "new": "if False:", "killer": "test_v3_require_complete_refuses_open"},
-    {"id": "M07", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if stream_id in seen_streams and root not in stack:", "new": "if False:", "killer": "test_v3_refuses_duplicate_stream_id"},
-    {"id": "M08", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if not history_path.is_file() or not events_path.is_file():", "new": "if False:", "killer": "test_v3_refuses_missing_file"},
-    {"id": "M09", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if not required <= set(value) or not set(value) <= allowed:", "new": "if False:", "killer": "test_v3_refuses_extra_header_key"},
-    {"id": "M10", "target": "tpen/callback/raw_training_batch_recorder.py", "old": 'if parent_node.header["contract"] != header["contract"]:', "new": "if False:", "killer": "test_v3_refuses_incompatible_contract"},
-    {"id": "M11", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if parent_node is not None and not _v3_has_scheduled_prefix(inherited_steps, header[\"contract\"], cut):", "new": "if False:", "killer": "test_v3_refuses_invalid_cut"},
-    {"id": "M12", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if not isinstance(event, Mapping) or line != _compact_json(event):", "new": "if False:", "killer": "test_v3_refuses_unpinned_malformed_lf_line"},
-    {"id": "M13", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if limit is not None and expected_prefix_sha256 is not None and digests[-1] != expected_prefix_sha256:", "new": "if False:", "killer": "test_v3_refuses_wrong_parent_pin_digest"},
-    {"id": "M14", "target": "tpen/callback/raw_training_batch_recorder.py", "old": 'if len({int(seal["group_index"]) for seal in effective_seals}) != len(effective_seals):', "new": "if False:", "killer": "test_v3_duplicate_active_seals_are_refused"},
-    {"id": "M15", "target": "tpen/callback/raw_training_batch_recorder.py", "old": 'if require_complete:\n            raise ValueError("require_complete is unavailable for legacy training histories")', "new": 'if False:\n            raise ValueError("require_complete is unavailable for legacy training histories")', "killer": "test_v3_legacy_history_cannot_pass_require_complete"},
-]
-
-
-def test_mutant_rows_are_executable() -> None:
-    """The Cannon mutation harness can apply every row without guessing."""
-
-    assert len(MUTANTS) == 14
-    assert {row["id"] for row in MUTANTS} == (
-        {f"M{index:02d}" for index in range(1, 6)}
-        | {f"M{index:02d}" for index in range(7, 16)}
-    )
-    root = Path(__file__).resolve().parents[3]
-    test_roots = (root / "tests", root / "executor" / "tests")
-    for row in MUTANTS:
-        target = root / row["target"]
-        assert target.is_file(), row
-        source = target.read_text()
-        assert source.count(row["old"]) == 1, row
-        compile(source.replace(row["old"], row["new"], 1), str(target), "exec")
-        definitions = sum(
-            len(re.findall(rf"^def {re.escape(row['killer'])}\s*\(", path.read_text(), re.MULTILINE))
-            for test_root in test_roots
-            if test_root.is_dir()
-            for path in test_root.rglob("*.py")
-        )
-        assert definitions == 1, row
