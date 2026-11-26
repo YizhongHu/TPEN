@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 from omegaconf import OmegaConf
@@ -76,12 +78,20 @@ def test_explicit_bound_cannot_conflict_with_trainer_override(tmp_path: Path) ->
 
 
 def test_duplicate_dotlist_override_is_fail_closed(tmp_path: Path) -> None:
-    with pytest.raises(train_config.TrainConfigResolutionError, match="duplicate"):
+    with pytest.raises(train_config.TrainConfigResolutionError, match="exact positive integer"):
         train_config.resolve_train_config(
             _cell(tmp_path),
             overrides=[
                 "trainer.local_energy_chunk_size=3",
                 "trainer.local_energy_chunk_size=0",
+            ],
+        )
+    with pytest.raises(train_config.TrainConfigResolutionError, match="duplicate"):
+        train_config.resolve_train_config(
+            _cell(tmp_path / "valid"),
+            overrides=[
+                "trainer.local_energy_chunk_size=3",
+                "trainer.local_energy_chunk_size=2",
             ],
         )
 
@@ -139,7 +149,7 @@ def test_real_stage_q_entrypoint_records_both_limbs_and_legacy_identity(
     assert bounded.trainer.local_energy_chunk_size == 3
     assert bounded.runner.trainer.local_energy_chunk_size == 3
     receipt = next((tmp_path / "bounded").glob("cells/*/selection_receipt.json"))
-    report = __import__("json").loads(receipt.read_text(encoding="utf-8"))
+    report = json.loads(receipt.read_text(encoding="utf-8"))
     assert report["local_energy_chunking"] == {
         "activation_path": "stage_q_cli", "effective_chunk_size": 3
     }
@@ -147,7 +157,7 @@ def test_real_stage_q_entrypoint_records_both_limbs_and_legacy_identity(
     legacy = _run_entrypoint_with_stubbed_runner(tmp_path / "legacy", monkeypatch, None)
     assert OmegaConf.select(legacy, "trainer.local_energy_chunk_size") is None
     legacy_receipt = next((tmp_path / "legacy").glob("cells/*/selection_receipt.json"))
-    legacy_report = __import__("json").loads(legacy_receipt.read_text(encoding="utf-8"))
+    legacy_report = json.loads(legacy_receipt.read_text(encoding="utf-8"))
     assert legacy_report["local_energy_chunking"] == {
         "activation_path": "legacy_default", "effective_chunk_size": None
     }
@@ -176,17 +186,78 @@ def test_family_stage_resolver_and_launch_adapter_forward_bound(
     assert calls[0]["local_energy_chunk_size"] == 3
 
 
-def test_real_hydra_runner_constructs_bound_trainer(tmp_path: Path) -> None:
-    cell = _cell(tmp_path)
-    config = train_config.resolve_train_config(cell, local_energy_chunk_size=3)
-    cpu_config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
+def test_real_hydra_runner_constructs_and_executes_bounded_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cpu_config = _run_entrypoint_with_stubbed_runner(tmp_path / "runner", monkeypatch, 3)
     cpu_config.runtime.device = "cpu"
-    cpu_config.trainer.max_steps = 1
-    cpu_config.sampler.burn_in = 0
-    cpu_config.sampler.n_steps = 1
-    cpu_config.sampler.n_walkers = 8
+    cpu_config.runner.trainer.max_steps = 1
+    cpu_config.runner.sampler.burn_in = 0
+    cpu_config.runner.sampler.n_steps = 1
     constructed = instantiate(cpu_config.runner)
     assert constructed.trainer.local_energy_chunk_size == 3
+
+    torch = importlib.import_module("torch")
+    trainer_mod = sys.modules[type(constructed.trainer).__module__]
+    calls: list[int] = []
+
+    class FakeBatch:
+        batch_size = 8
+
+    class FakeEvaluator:
+        def make_context(self, wavefunction: object, batch: object) -> object:
+            del wavefunction
+            calls.append(batch.batch_size)
+            return batch
+
+        def evaluate(self, terms: object, context: object, *, return_terms: bool) -> object:
+            del terms, return_terms
+            return torch.zeros(context.batch_size)
+
+    monkeypatch.setattr(
+        trainer_mod, "slice_flat_batch", lambda batch, start, stop: SimpleNamespace(
+            batch_size=stop - start
+        )
+    )
+    result = trainer_mod.evaluate_local_energy_in_chunks(
+        {}, constructed.model, FakeBatch(), chunk_size=constructed.trainer.local_energy_chunk_size,
+        evaluator=FakeEvaluator(),
+    )
+    assert tuple(calls) == (3, 3, 2)
+    assert tuple(result.shape) == (8,)
+
+
+def test_dropped_bound_is_refused_before_production_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_overrides = stage_coordinate.sampler_override_values
+    monkeypatch.setattr(
+        stage_coordinate,
+        "sampler_override_values",
+        lambda stage, coordinate: (8,)
+        if stage == "Q" and coordinate == "n_walkers"
+        else original_overrides(stage, coordinate),
+    )
+    facts = {
+        "global_rank": 0, "global_size": 1, "local_rank": 0, "local_size": 1,
+        "node_rank": 0, "node_size": 1, "host": "cpu-test", "pid": 1,
+        "device": "cpu", "job_id": "cpu-test", "device_identity": None,
+    }
+    runner_calls: list[object] = []
+    monkeypatch.setattr(run_stage_q, "_execution_facts", lambda: facts)
+
+    def late_resolve(packet: object, _facts: object, *, runner: object, **kwargs: object) -> int:
+        del _facts, kwargs
+        dropped = train_config.resolve_train_config(packet)
+        return runner(dropped, topology=facts)
+
+    monkeypatch.setattr(run_stage_q.launch, "launch_train", late_resolve)
+    monkeypatch.setattr(
+        run_stage_q.launch, "run_from_config", lambda *args, **kwargs: runner_calls.append(args) or 0
+    )
+    with pytest.raises(run_stage_q.StageQSelectionError, match="local_energy_chunk_size"):
+        run_stage_q.execute(_entrypoint_args(tmp_path, 3))
+    assert not runner_calls
 
 
 @pytest.mark.parametrize("argv", [["--local-energy-chunk-size", "0"], ["--local-energy-chunk-size", "-1"]])
