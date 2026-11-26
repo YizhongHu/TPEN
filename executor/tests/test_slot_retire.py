@@ -114,7 +114,10 @@ def test_confirmed_reap_recycles_slot(tmp_path: Path) -> None:
     try:
         first = executor.submit(*_invocation(group, allocation, "one", tmp_path))[1]
         executor.collect(first, timeout=2)
-        second = executor.submit(*_invocation(group, allocation, "two", tmp_path))[1]
+        try:
+            second = executor.submit(*_invocation(group, allocation, "two", tmp_path))[1]
+        except CapacityExceededError:
+            pytest.fail("validated confirmed-reap result must recycle its slot", pytrace=False)
         assert second.slot_id == first.slot_id == "slot-0"
         executor.collect(second, timeout=2)
         assert executor.retired_slot_ids == ()
@@ -138,10 +141,14 @@ def test_one_retired_slot_does_not_block_other_slot(tmp_path: Path) -> None:
         with pytest.raises(LeafResultRejected):
             executor.collect(first, timeout=2)
         second = executor.submit(*_invocation(group, allocation, "two", tmp_path))[1]
-        executor.collect(second, timeout=2)
         assert second.slot_id != first.slot_id
         with pytest.raises(CapacityExceededError):
             executor.submit(*_invocation(group, allocation, "three", tmp_path))
+        executor.collect(second, timeout=2)
+        third = executor.submit(*_invocation(group, allocation, "three", tmp_path))[1]
+        assert third.slot_id == second.slot_id
+        executor.collect(third, timeout=2)
+        assert executor.retired_slot_ids == (first.slot_id,)
     finally:
         executor.close()
 
