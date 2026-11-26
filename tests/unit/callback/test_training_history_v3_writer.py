@@ -6,6 +6,7 @@ import hashlib
 import json
 import time
 import tracemalloc
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -99,22 +100,55 @@ def _resume_stub(root: Path, *, contract: dict[str, object], cut: int, frontier:
 
 def test_resume_cadence_phase_and_inherited_full_seal_frontier(tmp_path: Path) -> None:
     contract = _contract() | {"every_n_steps": 50, "partition_size_steps": 1000}
-    writer = _resume_stub(tmp_path / "cadence", contract=contract, cut=473)
-    assert writer._expected_capture_count(0, 1000) == 10
+    parent = tmp_path / "cadence-parent"
+    parent_writer = TrainingHistoryV3Writer(parent, stream_id="34343434-3434-4434-8434-343434343434", run_id="resume-parent", contract=contract, provenance={"config_hash": "a" * 64})
+    for step in range(0, 473, 50):
+        parent_writer.append_capture(_record(step))
+    parent_writer.complete(next_iteration=473, completed_updates=473)
+    parent_root, parent_count, parent_prefix = _pin(parent)
+    checkpoint = _write_real_checkpoint(tmp_path / "checkpoint", step=473, run_id="resume-parent", run_dir=parent.parent)
+    checkpoint_data = {"path": str(checkpoint.resolve()), "manifest_sha256": hashlib.sha256((checkpoint / "manifest.json").read_bytes()).hexdigest(), "model_sha256": hashlib.sha256((checkpoint / "model.pt").read_bytes()).hexdigest(), "next_iteration": 473, "completed_updates": 473}
+    writer = TrainingHistoryV3Writer(tmp_path / "cadence", stream_id="35353535-3535-4535-8535-353535353535", run_id="cadence", contract=contract, origin="train_resume", parent={"root": str(parent_root.resolve()), "event_count": parent_count, "prefix_sha256": parent_prefix}, checkpoint=checkpoint_data, supersede_from_step=473, provenance={"config_hash": "b" * 64})
     for step in range(500, 1000, 50):
         writer.append_capture(_record(step))
     writer.seal_window(0)
     writer.complete(next_iteration=1000, completed_updates=10)
-    writer = _resume_stub(tmp_path / "cadence-short", contract=contract, cut=473)
+    TrainingBatchReader(writer.root).validate(require_complete=True)
+    np.testing.assert_array_equal(TrainingBatchReader(writer.root).read()["iteration_step"], np.repeat(np.arange(500, 1000, 50), 2))
+
+    parent = tmp_path / "cadence-short-parent"
+    parent_writer = TrainingHistoryV3Writer(parent, stream_id="36363636-3636-4636-8636-363636363636", run_id="resume-parent-short", contract=contract, provenance={"config_hash": "c" * 64})
+    for step in range(0, 473, 50):
+        parent_writer.append_capture(_record(step))
+    parent_writer.complete(next_iteration=473, completed_updates=473)
+    parent_root, parent_count, parent_prefix = _pin(parent)
+    checkpoint = _write_real_checkpoint(tmp_path / "checkpoint-short", step=473, run_id="resume-parent-short", run_dir=parent.parent)
+    checkpoint_data = {"path": str(checkpoint.resolve()), "manifest_sha256": hashlib.sha256((checkpoint / "manifest.json").read_bytes()).hexdigest(), "model_sha256": hashlib.sha256((checkpoint / "model.pt").read_bytes()).hexdigest(), "next_iteration": 473, "completed_updates": 473}
+    writer = TrainingHistoryV3Writer(tmp_path / "cadence-short", stream_id="37373737-3737-4737-8737-373737373737", run_id="cadence-short", contract=contract, origin="train_resume", parent={"root": str(parent_root.resolve()), "event_count": parent_count, "prefix_sha256": parent_prefix}, checkpoint=checkpoint_data, supersede_from_step=473, provenance={"config_hash": "d" * 64})
     for step in range(500, 725, 50):
         writer.append_capture(_record(step))
     writer.complete(next_iteration=725, completed_updates=5)
+    TrainingBatchReader(writer.root).validate(require_complete=True)
+    np.testing.assert_array_equal(TrainingBatchReader(writer.root).read()["iteration_step"], np.repeat(np.arange(500, 725, 50), 2))
 
-    small = _resume_stub(tmp_path / "inherited", contract=_contract(), cut=4, frontier=1)
+    parent = tmp_path / "inherited-parent"
+    parent_writer = TrainingHistoryV3Writer(parent, stream_id="38383838-3838-4838-8838-383838383838", run_id="resume-parent-inherited", contract=_contract(), provenance={"config_hash": "e" * 64})
+    for step in range(4):
+        parent_writer.append_capture(_record(step))
+    parent_writer.seal_window(0)
+    parent_writer.complete(next_iteration=4, completed_updates=4)
+    parent_root, parent_count, parent_prefix = _pin(parent)
+    checkpoint = _write_real_checkpoint(tmp_path / "checkpoint-inherited", step=4, run_id="resume-parent-inherited", run_dir=parent.parent)
+    checkpoint_data = {"path": str(checkpoint.resolve()), "manifest_sha256": hashlib.sha256((checkpoint / "manifest.json").read_bytes()).hexdigest(), "model_sha256": hashlib.sha256((checkpoint / "model.pt").read_bytes()).hexdigest(), "next_iteration": 4, "completed_updates": 4}
+    small = TrainingHistoryV3Writer(tmp_path / "inherited", stream_id="39393939-3939-4939-8939-393939393939", run_id="inherited", contract=_contract(), origin="train_resume", parent={"root": str(parent_root.resolve()), "event_count": parent_count, "prefix_sha256": parent_prefix}, checkpoint=checkpoint_data, supersede_from_step=4, inherited_seal_frontier=1, provenance={"config_hash": "f" * 64})
     small.complete(next_iteration=4, completed_updates=4)
-    continuing = _resume_stub(tmp_path / "continuing", contract=_contract(), cut=4, frontier=1)
+    TrainingBatchReader(small.root).validate(require_complete=True)
+    assert TrainingBatchReader(small.root).read()["iteration_step"].size == 0
+    continuing = TrainingHistoryV3Writer(tmp_path / "continuing", stream_id="40404040-4040-4040-8040-404040404040", run_id="continuing", contract=_contract(), origin="train_resume", parent={"root": str(parent_root.resolve()), "event_count": parent_count, "prefix_sha256": parent_prefix}, checkpoint=checkpoint_data, supersede_from_step=4, inherited_seal_frontier=1, provenance={"config_hash": "1" * 64})
     continuing.append_capture(_record(4))
     continuing.complete(next_iteration=5, completed_updates=5)
+    TrainingBatchReader(continuing.root).validate(require_complete=True)
+    np.testing.assert_array_equal(TrainingBatchReader(continuing.root).read()["iteration_step"], [4, 4])
 
     phased = _resume_stub(tmp_path / "phase", contract=_contract() | {"start_step": 1, "every_n_steps": 2}, cut=4)
     assert phased._expected_capture_count(0, 10) == 3
@@ -197,7 +231,21 @@ def test_root_creation_fsyncs_new_directory_entries(monkeypatch: pytest.MonkeyPa
     assert trace[:3] == [tmp_path.name, "missing", "history"]
 
 
-@pytest.mark.parametrize("mutation", ["finite", "completed_updates", "positions"])
+def test_root_creation_directory_fsync_failure_propagates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import tpen.callback.training_history_v3_writer as module
+    original = module._fsync_directory
+
+    def fail_parent(path: Path) -> None:
+        if path == tmp_path / "missing":
+            raise OSError("injected parent directory fsync failure")
+        original(path)
+
+    monkeypatch.setattr(module, "_fsync_directory", fail_parent)
+    with pytest.raises(OSError, match="parent directory fsync"):
+        _writer(tmp_path / "missing" / "history")
+
+
+@pytest.mark.parametrize("mutation", ["finite", "completed_updates", "positions", "walker_index"])
 def test_append_admission_rejects_mutated_record_without_log_write(tmp_path: Path, mutation: str) -> None:
     writer = _writer(tmp_path / mutation)
     record = _record(0)
@@ -206,6 +254,8 @@ def test_append_admission_rejects_mutated_record_without_log_write(tmp_path: Pat
         record.finite[0] = False
     elif mutation == "completed_updates":
         object.__setattr__(record, "completed_updates", 2)
+    elif mutation == "walker_index":
+        record.walker_index[:] = 0
     else:
         record.positions[0, 0, 0] = np.nan
     with pytest.raises(ValueError):
@@ -475,6 +525,26 @@ def test_memory_bound_and_no_fragment_reads(tmp_path: Path, monkeypatch: pytest.
     writer.append_capture(_record(0))
 
 
+def test_memory_bound_across_many_groups(tmp_path: Path) -> None:
+    contract = _contract() | {"partition_size_steps": 1}
+    writer = TrainingHistoryV3Writer(
+        tmp_path / "many-groups", stream_id="36363636-3636-4636-8636-363636363636",
+        run_id="many-groups", contract=contract, provenance={"config_hash": "6" * 64},
+    )
+    tracemalloc.start()
+    for step in range(60):
+        writer.append_capture(_record(step))
+        writer.seal_window(step)
+        if step == 9:
+            baseline = tracemalloc.get_traced_memory()[0]
+    writer.complete(next_iteration=60, completed_updates=60)
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert current - baseline < 1_000_000
+    assert peak - baseline < 2_000_000
+    assert not any(isinstance(value, (dict, set)) and "group" in name.lower() for name, value in vars(writer).items())
+
+
 def test_bounded_cost_measurement_prints_wall_time_and_bytes(tmp_path: Path) -> None:
     contract = _contract() | {"every_n_steps": 50, "partition_size_steps": 1000, "walker_count": 64, "n_electrons": 2}
     writer = TrainingHistoryV3Writer(tmp_path / "cost", stream_id="27272727-2727-4272-8272-272727272727", run_id="cost", contract=contract, provenance={"config_hash": "d" * 64})
@@ -484,5 +554,7 @@ def test_bounded_cost_measurement_prints_wall_time_and_bytes(tmp_path: Path) -> 
         record = TrainingBatchRecord(iteration_step=step, completed_updates=step, update_applied=True, walker_index=np.arange(64, dtype="<i8"), positions=np.zeros((64, 2, 3), dtype="<f8"), local_energy=np.ones(64), term_energies={"kinetic": np.ones(64)}, logabs=np.ones(64), sign=np.ones(64), finite=np.ones(64, dtype=np.bool_))
         writer.append_capture(record)
     elapsed = time.perf_counter() - started
-    print(f"writer_cost wall_time_sec={elapsed:.6f} bytes={sum(path.stat().st_size for path in writer.root.rglob('*') if path.is_file())}")
+    total_bytes = sum(path.stat().st_size for path in writer.root.rglob('*') if path.is_file())
+    print(f"writer_cost wall_time_sec={elapsed:.6f} bytes={total_bytes}")
+    warnings.warn(UserWarning(f"writer_cost wall_time_sec={elapsed:.6f} bytes={total_bytes}"))
 

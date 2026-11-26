@@ -475,6 +475,10 @@ class TrainingHistoryV3Writer:
             raise ValueError("resume capture precedes the supersede cut")
         if record.n_walkers != int(self.contract["walker_count"]):
             raise ValueError("capture walker count disagrees with the v3 contract")
+        if record.walker_index.dtype != np.dtype("<i8") or not np.array_equal(
+            record.walker_index, np.arange(record.n_walkers, dtype=record.walker_index.dtype)
+        ):
+            raise ValueError("capture walker_index must be 0..W-1")
         if record.term_names != tuple(self.contract["term_names"]):
             raise ValueError("capture term names disagree with the v3 contract")
         if record.positions.shape[1:] != (int(self.contract["n_electrons"]), int(self.contract["spatial_dim"])):
