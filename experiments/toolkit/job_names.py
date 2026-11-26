@@ -10,7 +10,7 @@ import re
 from typing import Any, Mapping, Optional
 
 
-MAX_JOB_NAME_LENGTH = 40
+MAX_JOB_NAME_LENGTH = 64
 _COMPONENT_RE = re.compile(r"[a-z0-9][a-z0-9_.-]*\Z")
 _SHA_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
 
@@ -86,8 +86,13 @@ def stage1_row_job_name(row: Mapping[str, Any]) -> str:
     if type(lineage) is not int or lineage < 0:
         raise ValueError("lineage must be a non-negative integer")
     variant = None
+    profile_variant = row.get("variant")
+    if profile_variant is not None:
+        _component(profile_variant, field="variant")
     if kind in {"train", "eval"}:
         variant = f"l{lineage}"
+    if profile_variant is not None:
+        variant = profile_variant if variant is None else f"{profile_variant}-{variant}"
     if kind == "eval":
         checkpoint = row.get("checkpoint", 0)
         stream = row.get("stream", 0)

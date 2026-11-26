@@ -17,6 +17,8 @@ if _REPO_ROOT not in sys.path:
 
 from tpen.run import run_from_config
 from experiments.atomistic.stage1.protocol import (
+    is_hooke2_act50_profile,
+    compose_model_profile,
     resolve_config_path,
     row_config_values,
     validate_gateway_binding,
@@ -56,6 +58,7 @@ def build_eval_config(
     from tpen.run import load_config
 
     cfg = load_config(str(selected_config))
+    compose_model_profile(cfg, str(row.get("science_profile")) if row.get("science_profile") else None)
     _bind_output_identity(cfg, row)
     cfg = OmegaConf.merge(cfg, OmegaConf.create(row_config_values(row)))
     # Kept solely for the pinned pre-LR-2 restart adapter; the real eval
@@ -94,6 +97,29 @@ def _refuse_existing_eval_run(cfg: DictConfig) -> None:
         )
 
 
+def _refuse_cross_variant_checkpoint(cfg: DictConfig, row: Mapping[str, object]) -> None:
+    """Refuse a checkpoint from another ACT50 model before creating eval output."""
+
+    profile = row.get("science_profile")
+    if not is_hooke2_act50_profile(profile):
+        return
+    checkpoint_dir = Path(str(row["checkpoint_dir"]))
+    manifest_path = checkpoint_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise EvalRunRefusal(
+            f"ACT50 checkpoint compatibility manifest is missing: {manifest_path}"
+        )
+    from tpen.checkpoint import checkpoint_hashes, read_manifest
+
+    manifest = read_manifest(manifest_path, mode="model_only")
+    expected = checkpoint_hashes(cfg).get("model_config")
+    actual = manifest.hashes.get("model_config")
+    if expected is None or actual is None or expected != actual:
+        raise EvalRunRefusal(
+            "ACT50 refuses a checkpoint from a different model profile before eval writes"
+        )
+
+
 def main() -> int:
     """Run evaluation through the public gateway with model-only restore."""
 
@@ -103,6 +129,7 @@ def main() -> int:
     row = validate_gateway_binding(binding=args.binding, expected_kinds={"eval"})
     cfg = build_eval_config(row)
     config_path = resolve_config_path(str(row["config"]))
+    _refuse_cross_variant_checkpoint(cfg, row)
     _refuse_existing_eval_run(cfg)
     # The config/launcher supplies the strict model-only restore policy; this
     # driver does not import checkpoint internals or silently alter identity.

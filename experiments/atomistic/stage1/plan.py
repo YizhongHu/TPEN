@@ -18,7 +18,8 @@ from experiments.atomistic.stage1.protocol import (
     MANIFEST_SCHEMA, OVERLAY_PROFILE_V1, OVERLAY_PROFILES,
     QHO_Q21, SYSTEMS, STAGE1_PROTOCOL,
     bind_evaluation_manifest, build_manifest, config_identities, manifest_hash,
-    overlay_sha256, resolve_overlay_path,
+    overlay_sha256, resolve_overlay_path, protocol_for_science_profile,
+    HOOKE2_ACT50_PROFILES,
 )
 
 
@@ -72,20 +73,26 @@ def main() -> int:
                 "phase 1 refuses selections containing Hooke systems without the "
                 "Hooke science profile; choose Hooke-only systems or a non-Hooke selection"
             )
+        effective_protocol = protocol_for_science_profile(STAGE1_PROTOCOL, args.science_profile)
         if args.checkpoints is None:
-            if STAGE1_PROTOCOL.retention_cadence is None:
+            if effective_protocol.retention_cadence is None:
                 parser.error("--checkpoints is required for protocols without retention_cadence")
             args.checkpoints = list(range(
-                0, STAGE1_PROTOCOL.lineage_updates + 1,
-                STAGE1_PROTOCOL.retention_cadence,
+                0, effective_protocol.lineage_updates + 1,
+                effective_protocol.retention_cadence,
             ))
         if args.science_profile is None and selected_for_profile.issubset(HOOKE_SYSTEMS):
             args.science_profile = "hooke-hv2-v1"
-    elif args.checkpoints is None:
+    else:
+        effective_protocol = protocol_for_science_profile(STAGE1_PROTOCOL, args.science_profile)
+    if args.phase == 2 and args.checkpoints is None:
         if args.science_profile == "hooke-hv2-v1" and selected_for_profile == {"qho2e"}:
             args.checkpoints = list(QHO_Q21)
         elif args.science_profile == "hooke-hv2-v1":
             args.checkpoints = list(HOOKE_A37)
+        elif args.science_profile in HOOKE2_ACT50_PROFILES:
+            from experiments.atomistic.stage1.protocol import HOOKE2_ACT50_A27
+            args.checkpoints = list(HOOKE2_ACT50_A27)
         elif selected_for_profile.issubset({"he", "h2"}):
             args.checkpoints = list(HE_H2_EVAL_CHECKPOINTS)
         else:
@@ -101,11 +108,16 @@ def main() -> int:
         None if args.overlay is None else args.overlay_sha256 or overlay_sha256(args.overlay)
     )
     config_root = Path(__file__).resolve().parent / "configs"
+    identity_profile = (
+        args.science_profile if args.science_profile in HOOKE2_ACT50_PROFILES else None
+    )
     config_sha256: str | dict[str, str]
     if args.phase == 1:
-        config_sha256 = config_identities(config_root=config_root, systems=systems)
+        config_sha256 = config_identities(
+            config_root=config_root, systems=systems, science_profile=identity_profile,
+        )
         _compare_legacy_config_sha256(args.config_sha256, config_sha256)
-        rows = build_manifest(protocol=STAGE1_PROTOCOL, source_sha=args.source_sha,
+        rows = build_manifest(protocol=effective_protocol, source_sha=args.source_sha,
                               config_sha256=config_sha256, checkpoints=args.checkpoints,
                               lineage_seeds=args.lineage_seeds, checkpoint_sha256={},
                               results_root=args.results_root, systems=systems, phase=1,
@@ -162,14 +174,23 @@ def main() -> int:
                     raise ValueError(
                         "explicit --overlay conflicts with the phase-1 manifest"
                     )
-            config_sha256 = config_identities(config_root=config_root, systems=phase1_systems)
+            phase1_science_profiles = {
+                row.get("science_profile") for row in phase1_train_rows
+                if row.get("science_profile") in HOOKE2_ACT50_PROFILES
+            }
+            phase1_science_profile = next(iter(phase1_science_profiles), args.science_profile)
+            config_sha256 = config_identities(
+                config_root=config_root, systems=phase1_systems,
+                science_profile=(phase1_science_profile
+                                 if phase1_science_profile in HOOKE2_ACT50_PROFILES else None),
+            )
             _compare_legacy_config_sha256(args.config_sha256, config_sha256)
             eval_rows = bind_evaluation_manifest(
                 phase1_rows=phase1_rows, checkpoints=args.checkpoints,
                 checkpoint_evidence=_read_bindings(args.checkpoint_bindings, structured=True),
                 source_sha=args.source_sha,
                 config_sha256=config_sha256,
-                protocol=STAGE1_PROTOCOL,
+                protocol=protocol_for_science_profile(STAGE1_PROTOCOL, phase1_science_profile),
                 phase1_manifest_hash=phase1_hash,
                 device=args.device,
             )
@@ -178,8 +199,11 @@ def main() -> int:
             if args.config_sha256 is not None:
                 config_sha256 = args.config_sha256
             else:
-                config_sha256 = config_identities(config_root=config_root, systems=systems)
-            rows = build_manifest(protocol=STAGE1_PROTOCOL, source_sha=args.source_sha,
+                config_sha256 = config_identities(
+                    config_root=config_root, systems=systems,
+                    science_profile=identity_profile,
+                )
+            rows = build_manifest(protocol=effective_protocol, source_sha=args.source_sha,
                                   config_sha256=config_sha256, checkpoints=args.checkpoints,
                                   lineage_seeds=args.lineage_seeds,
                                   checkpoint_sha256=_read_bindings(args.checkpoint_bindings),

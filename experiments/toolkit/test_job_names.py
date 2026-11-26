@@ -13,4 +13,4 @@ def test_build_job_name_uses_sha8_and_lane() -> None:
 
 def test_validate_job_name_enforces_length() -> None:
     with pytest.raises(ValueError, match="too long"):
-        validate_job_name("x" * 41)
+        validate_job_name("x" * 65)
