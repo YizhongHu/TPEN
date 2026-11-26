@@ -1,0 +1,18 @@
+{
+  "mutants": [
+    {
+      "id": "r2-writer-order-log-after-publish",
+      "target": "tpen/callback/training_history_v3_writer.py",
+      "old": "_fsync_directory(self.fragments)\n            self._append_event({",
+      "new": "self._append_event({",
+      "killer": "tests/unit/callback/test_training_history_v3_writer.py::test_writer_round_trip_and_exact_write_set"
+    },
+    {
+      "id": "r2-writer-monotone-guard",
+      "target": "tpen/callback/training_history_v3_writer.py",
+      "old": "if self._last_step is not None and step <= self._last_step:",
+      "new": "if False:",
+      "killer": "tests/unit/callback/test_training_history_v3_writer.py::test_writer_refuses_nonmonotone_capture"
+    }
+  ]
+}
