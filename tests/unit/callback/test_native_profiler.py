@@ -192,14 +192,16 @@ def test_real_torch_streaming_summary_matches_key_averages() -> None:
 
     raw = profile(activities=[ProfilerActivity.CPU], record_shapes=False)
     raw.start()
-    with torch.profiler.record_function("streaming_equivalence"):
-        value = torch.ones(8)
-        _ = value + 1
+    for index in range(70):
+        with torch.profiler.record_function(f"streaming_equivalence_{index}"):
+            value = torch.ones(8)
+            _ = value + 1
     raw.stop()
 
     backend = _TorchProfilerBackend(raw, torch.profiler.record_function)
     streaming = backend.streaming_rows()
     expected = list(raw.key_averages())
+    assert len(expected) > 64
     assert len(streaming) == len(expected)
     for actual, reference in zip(streaming[:64], expected[:64]):
         assert actual.key == str(reference.key)
@@ -212,7 +214,8 @@ def test_real_torch_streaming_summary_matches_key_averages() -> None:
     summary = TorchOperatorSummary(max_rows=64)
     rows, total_rows, truncated = summary.collect(backend)
     assert total_rows == len(expected)
-    assert truncated is (len(expected) > 64)
+    assert truncated is True
+    assert len(rows) == 64
     assert [row["name"] for row in rows] == [str(row.key) for row in expected[:64]]
 
 
@@ -280,8 +283,8 @@ def test_torch_streaming_backend_missing_kineto_results_fails_without_fallback(t
             del path
 
         @property
-        def kineto_results(self):
-            raise AttributeError("kineto_results contract is missing")
+        def profiler(self):
+            raise AttributeError("profiler contract is missing")
 
     raw = _RawWithoutKineto()
     backend = _TorchProfilerBackend(raw, lambda _label: nullcontext())

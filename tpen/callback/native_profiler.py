@@ -63,6 +63,12 @@ class _KeyAveragesBackend(_ProfilerBackend, Protocol):
 _BackendFactory: TypeAlias = Callable[[], _ProfilerBackend]
 
 
+class _InnerTorchProfiler(Protocol):
+    """Typed surface of Torch's inner autograd profiler."""
+
+    kineto_results: "_KinetoResults | None"
+
+
 class _RawTorchProfiler(Protocol):
     """Typed surface of the object returned by ``torch.profiler.profile``."""
 
@@ -71,14 +77,13 @@ class _RawTorchProfiler(Protocol):
     def stop(self) -> None: ...
     def export_chrome_trace(self, path: str) -> None: ...
 
-    kineto_results: "_KinetoResults | None"
+    profiler: "_InnerTorchProfiler | None"
 
 
 class _KinetoEvent(Protocol):
     """Typed CPU Kineto event surface used by the streaming collector."""
 
     def name(self) -> str: ...
-    def is_hidden_event(self) -> bool: ...
     def device_type(self) -> object: ...
     def start_ns(self) -> int: ...
     def end_ns(self) -> int: ...
@@ -174,7 +179,10 @@ class _TorchProfilerBackend:
         from torch.autograd import DeviceType
         from torch.autograd.profiler_util import _filter_name, _rewrite_name
 
-        results = self._raw.kineto_results
+        inner_profiler = self._raw.profiler
+        if inner_profiler is None:
+            raise RuntimeError("Torch profiler backend has no inner profiler")
+        results = inner_profiler.kineto_results
         if results is None:
             raise RuntimeError("Torch profiler backend has no kineto_results")
 
@@ -233,7 +241,10 @@ class _TorchProfilerBackend:
 
         for event in results.events():
             name = event.name()
-            if _filter_name(name) or event.is_hidden_event():
+            # Torch 2.11's KinetoEvent has no is_hidden_event binding; the
+            # upstream parser's fallback is false, while name filtering remains
+            # explicit and typed here.
+            if _filter_name(name):
                 continue
             if event.device_type() != DeviceType.CPU:
                 continue
