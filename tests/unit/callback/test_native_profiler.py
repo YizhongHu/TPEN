@@ -266,6 +266,9 @@ def test_error_during_window_extracts_summary_and_releases_backend(tmp_path) -> 
 
 
 def test_torch_streaming_backend_missing_kineto_results_fails_without_fallback(tmp_path) -> None:
+    class _InnerWithoutKineto:
+        kineto_results: object | None = None
+
     class _RawWithoutKineto:
         def start(self) -> None:
             pass
@@ -283,8 +286,8 @@ def test_torch_streaming_backend_missing_kineto_results_fails_without_fallback(t
             del path
 
         @property
-        def profiler(self):
-            raise AttributeError("profiler contract is missing")
+        def profiler(self) -> _InnerWithoutKineto:
+            return _InnerWithoutKineto()
 
     raw = _RawWithoutKineto()
     backend = _TorchProfilerBackend(raw, lambda _label: nullcontext())
@@ -300,7 +303,7 @@ def test_torch_streaming_backend_missing_kineto_results_fails_without_fallback(t
     status = json.loads(next(context.run_dir.rglob("profile-status.json")).read_text())
     assert status["export_status"] == "failed"
     assert status["data_completeness"] == "partial"
-    assert any(item.startswith("summary_failed:AttributeError") for item in status["activity_diagnostics"])
+    assert any(item.startswith("summary_failed:RuntimeError") for item in status["activity_diagnostics"])
 
 
 def test_chrome_trace_export_is_fixed_and_published_to_both_refs(tmp_path) -> None:
