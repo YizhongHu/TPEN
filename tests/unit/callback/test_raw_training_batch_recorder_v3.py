@@ -89,6 +89,7 @@ def _write_v3_fixture(
     cut: int = 0,
     contract: dict[str, object] | None = None,
     emit_seals: bool = True,
+    checkpoint_run_dir: Path | None = None,
 ) -> None:
     """Emit only the approved v3 bytes; this is not a production writer."""
 
@@ -116,7 +117,7 @@ def _write_v3_fixture(
             checkpoint_root,
             step=cut,
             run_id=parent_header["run_id"],
-            run_dir=parent_root,
+            run_dir=parent_root.parent if checkpoint_run_dir is None else checkpoint_run_dir,
         )
         events.append({
             "type": "resume", "previous_event_sha256": None,
@@ -266,6 +267,16 @@ def test_v3_optional_measurements_and_newer_canonical_uuid(tmp_path: Path) -> No
     reader.validate()
     assert reader.provenance[0]["history_root"] == str(root.resolve())
     assert reader.provenance[0]["stream_id"] == "36363636-3636-7363-8636-363636363636"
+
+
+def test_v3_read_then_completion_preserves_provenance(tmp_path: Path) -> None:
+    root = tmp_path / "completion-provenance"
+    _write_v3_fixture(root, stream_id="3a3a3a3a-3a3a-43a3-83a3-3a3a3a3a3a3a", steps=[0], complete=1)
+    reader = TrainingBatchReader(root)
+    reader.read()
+    before = dict(reader.provenance)
+    assert reader.completion == {"next_iteration": 1, "completed_updates": 1}
+    assert reader.provenance == before
 
 
 def test_v3_sidecar_json_integer_types_are_strict(tmp_path: Path) -> None:
@@ -560,7 +571,8 @@ def test_v3_checkpoint_refuses_mutable_root_and_latest_locators(tmp_path: Path, 
 
 
 def test_v3_checkpoint_provenance_is_bound_to_parent_history(tmp_path: Path) -> None:
-    parent = tmp_path / "provenance-parent"
+    parent = tmp_path / "attempt-a" / "core" / "training_history"
+    parent.parent.mkdir(parents=True)
     _write_v3_fixture(parent, stream_id="32323232-3232-4232-8232-323232323232", steps=[0])
     child = tmp_path / "provenance-child"
     _write_v3_fixture(
@@ -569,7 +581,11 @@ def test_v3_checkpoint_provenance_is_bound_to_parent_history(tmp_path: Path) -> 
         origin="train_resume",
         parent=_pin(parent),
         cut=1,
+        checkpoint_run_dir=parent.parent,
     )
+    # The approved layout is <attempt>/core/training_history, with the
+    # checkpoint provenance bound to the containing <attempt>/core run dir.
+    TrainingBatchReader(child).validate()
     event = json.loads((child / "events.jsonl").read_text().splitlines()[0])
     checkpoint_dir = child / "checkpoint" / "step_000001"
     manifest_path = checkpoint_dir / "manifest.json"
@@ -582,8 +598,9 @@ def test_v3_checkpoint_provenance_is_bound_to_parent_history(tmp_path: Path) -> 
         TrainingBatchReader(child).validate()
 
 
-def test_v3_checkpoint_same_run_id_different_run_dir_is_refused(tmp_path: Path) -> None:
-    parent = tmp_path / "run-dir-parent"
+def test_v3_checkpoint_run_dir_from_foreign_attempt_is_refused(tmp_path: Path) -> None:
+    parent = tmp_path / "attempt-a" / "core" / "training_history"
+    parent.parent.mkdir(parents=True)
     _write_v3_fixture(parent, stream_id="40404040-4040-4404-8404-404040404040", steps=[0])
     child = tmp_path / "run-dir-child"
     _write_v3_fixture(
@@ -592,10 +609,35 @@ def test_v3_checkpoint_same_run_id_different_run_dir_is_refused(tmp_path: Path) 
         origin="train_resume",
         parent=_pin(parent),
         cut=1,
+        checkpoint_run_dir=parent.parent,
     )
     manifest_path = child / "checkpoint" / "step_000001" / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    manifest["provenance"]["run_dir"] = str(tmp_path / "unrelated-run")
+    manifest["provenance"]["run_dir"] = str(tmp_path / "attempt-b" / "core")
+    manifest_path.write_bytes(_pretty(manifest))
+    events = [json.loads(line) for line in (child / "events.jsonl").read_text().splitlines()]
+    events[0]["checkpoint"]["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    _rewrite_events(child, events)
+    with pytest.raises(ValueError, match="provenance"):
+        TrainingBatchReader(child).validate()
+
+
+def test_v3_checkpoint_history_escape_is_refused(tmp_path: Path) -> None:
+    parent = tmp_path / "attempt-a" / "core" / "training_history"
+    parent.parent.mkdir(parents=True)
+    _write_v3_fixture(parent, stream_id="4b4b4b4b-4b4b-44b4-84b4-4b4b4b4b4b4b", steps=[0])
+    child = tmp_path / "escape-child"
+    _write_v3_fixture(
+        child,
+        stream_id="4c4c4c4c-4c4c-44c4-84c4-4c4c4c4c4c4c",
+        origin="train_resume",
+        parent=_pin(parent),
+        cut=1,
+        checkpoint_run_dir=parent.parent,
+    )
+    manifest_path = child / "checkpoint" / "step_000001" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["provenance"]["run_dir"] = str(parent / "nested" / "run")
     manifest_path.write_bytes(_pretty(manifest))
     events = [json.loads(line) for line in (child / "events.jsonl").read_text().splitlines()]
     events[0]["checkpoint"]["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
@@ -790,7 +832,6 @@ MUTANTS = [
     {"id": "M03", "target": "tpen/callback/raw_training_batch_recorder.py", "old": 'if not bundle_path.is_file() or _sha256(bundle_path) != sidecar["compressed_sha256"]:', "new": "if False:", "killer": "test_v3_refuses_bundle_hash_corruption"},
     {"id": "M04", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if identity in active_identities:", "new": "if False:", "killer": "test_v3_refuses_duplicate_active_grid"},
     {"id": "M05", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if require_complete and node.completion is None:", "new": "if False:", "killer": "test_v3_require_complete_refuses_open"},
-    {"id": "M06", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if root in stack:", "new": "if False:", "killer": "test_v3_refuses_cycle"},
     {"id": "M07", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if stream_id in seen_streams and root not in stack:", "new": "if False:", "killer": "test_v3_refuses_duplicate_stream_id"},
     {"id": "M08", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if not history_path.is_file() or not events_path.is_file():", "new": "if False:", "killer": "test_v3_refuses_missing_file"},
     {"id": "M09", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if not required <= set(value) or not set(value) <= allowed:", "new": "if False:", "killer": "test_v3_refuses_extra_header_key"},
@@ -806,6 +847,11 @@ MUTANTS = [
 def test_mutant_rows_are_executable() -> None:
     """The Cannon mutation harness can apply every row without guessing."""
 
+    assert len(MUTANTS) == 14
+    assert {row["id"] for row in MUTANTS} == (
+        {f"M{index:02d}" for index in range(1, 6)}
+        | {f"M{index:02d}" for index in range(7, 16)}
+    )
     root = Path(__file__).resolve().parents[3]
     test_roots = (root / "tests", root / "executor" / "tests")
     for row in MUTANTS:

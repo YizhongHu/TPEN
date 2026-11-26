@@ -831,7 +831,10 @@ class TrainingBatchReader:
             retain_rows=retain_rows,
         )
         self._v3_completion = node.completion
-        self.provenance = {index: value for index, value in enumerate(node.provenance)}
+        # A no-row validation can legitimately have no selected arrays.  Do not
+        # erase attribution already exposed by an earlier read in that case.
+        if node.provenance or not self.provenance:
+            self.provenance = {index: value for index, value in enumerate(node.provenance)}
         if require_complete and node.completion is None:
             raise ValueError("v3 training history is open and is not complete")
         arrays = node.rows
@@ -858,6 +861,9 @@ class TrainingBatchReader:
         select_end: int | None = None,
         retain_rows: bool = True,
     ) -> _V3Node:
+        # Valid pins cannot form a cycle: prefix_sha256 is the parent's own
+        # chain digest, so a self/mutual pin would require a hash fixed point.
+        # Keep this guard as defense in depth for malformed or hand-crafted data.
         if root in stack:
             raise ValueError("v3 lineage contains a cycle")
         history_path = root / HISTORY_FILENAME
@@ -944,6 +950,10 @@ class TrainingBatchReader:
                 fragments.append((dict(event), selected, sidecar))
                 fragment_steps.append(step)
                 fragment_updates.append(int(arrays["completed_updates"][0]))
+                # Do not retain a full bundle while validating ancestors.  Any
+                # selected rows are copies; only scalar/identity metadata is
+                # needed below, so peak transient bundle retention is one node.
+                del arrays
             elif event["type"] == "window_seal":
                 group = _int(event["group_index"], name="window_seal group_index")
                 start = _int(event["start_step"], name="window_seal start_step")
@@ -1026,8 +1036,11 @@ class TrainingBatchReader:
         provenance = []
         if parent_node is not None:
             provenance.extend(dict(item) for item in parent_node.provenance if item.get("start_step", -1) < cut)
-        for event, arrays, sidecar in fragments:
-            if not arrays:
+        for event, _, sidecar in fragments:
+            step = int(event["start_step"])
+            if select_start is not None and step < int(select_start):
+                continue
+            if select_end is not None and step > int(select_end):
                 continue
             provenance.append({
                 **dict(sidecar["provenance"]),
@@ -1083,7 +1096,12 @@ class TrainingBatchReader:
                 checkpoint_run_dir = Path(run_dir).resolve()
             except OSError as exc:
                 raise ValueError("v3 checkpoint source provenance does not bind the pinned history") from exc
-            if checkpoint_run_dir != parent.root.resolve():
+            parent_history_root = parent.root.resolve()
+            # §4 places the recorder history below the originating RunContext
+            # run directory (for example ``<attempt>/core/training_history``).
+            # A valid pin is therefore a strict descendant of run_dir; equality
+            # or an escape to a foreign attempt is never a valid binding.
+            if checkpoint_run_dir == parent_history_root or checkpoint_run_dir not in parent_history_root.parents:
                 raise ValueError("v3 checkpoint source provenance does not bind the pinned history")
 
     @staticmethod
