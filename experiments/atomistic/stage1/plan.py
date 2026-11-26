@@ -17,7 +17,8 @@ from experiments.atomistic.stage1.protocol import (
     HE_H2_EVAL_CHECKPOINTS, HOOKE_A37, HOOKE_SYSTEMS,
     MANIFEST_SCHEMA, OVERLAY_PROFILE_V1, OVERLAY_PROFILES,
     QHO_Q21, SYSTEMS, STAGE1_PROTOCOL,
-    bind_evaluation_manifest, build_manifest, config_identities, manifest_hash,
+    bind_evaluation_manifest, build_manifest, config_identities, derive_smoke_eval_roster,
+    manifest_hash,
     overlay_sha256, resolve_overlay_path, protocol_for_science_profile,
     HOOKE2_ACT50_PROFILES, HOOKE_SCIENCE_PROFILE,
 )
@@ -202,6 +203,10 @@ def main() -> int:
             if len(phase1_science_profiles) > 1:
                 raise ValueError("phase-1 rows must use one science profile")
             phase1_science_profile = next(iter(phase1_science_profiles), args.science_profile)
+            if any(row.get("evaluation_roster") is not None for row in phase1_rows):
+                args.checkpoints = list(derive_smoke_eval_roster(
+                    phase1_rows, science_roster=args.checkpoints,
+                ))
             config_sha256 = config_identities(
                 config_root=config_root, systems=phase1_systems,
                 science_profile=(phase1_science_profile

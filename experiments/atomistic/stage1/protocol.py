@@ -69,6 +69,7 @@ HE_H2_EVAL_CHECKPOINTS = (0, 1_000, 2_000, 4_000, 8_000, 16_000,
                           25_000, 40_000, 60_000, 80_000, 100_000)
 HE_H2_SYSTEMS = frozenset({"he", "h2"})
 HOOKE_SYSTEMS = frozenset({"hooke1", "hooke2", "qho2e"})
+SMOKE_EVAL_ROSTER_MARKER = "smoke-prefix-v1"
 OVERLAY_RELATIVE_PATH = "configs/overlays/diagnostics-v1.yaml"
 HOOKE_OVERLAY_RELATIVE_PATH = "configs/overlays/hooke-diagnostics-v1.yaml"
 OVERLAY_V2_RELATIVE_PATH = "configs/overlays/diagnostics-v2.yaml"
@@ -887,6 +888,67 @@ def _is_he_h2_production_phase(phase1_rows: list[Mapping[str, Any]]) -> bool:
     )
 
 
+def _smoke_eval_science_roster(
+    train_row: Mapping[str, Any], requested: Collection[int] | None = None,
+) -> tuple[int, ...]:
+    """Return the science checkpoint roster applicable to one train row."""
+
+    profile = train_row.get("science_profile")
+    if _is_hooke_science_row(train_row):
+        return hooke_profile_selection(str(profile), str(train_row["system"]))[2]
+    if _is_he_h2_production_train_row(train_row):
+        return HE_H2_EVAL_CHECKPOINTS
+    if requested is not None:
+        return tuple(requested)
+    return tuple(train_row.get("checkpoint_steps", ()))
+
+
+def smoke_eval_roster(
+    train_row: Mapping[str, Any], *, science_roster: Collection[int] | None = None,
+) -> tuple[int, ...]:
+    """Derive and validate one smoke row's retained evaluation roster.
+
+    The phase-1 train row owns the prefix boundary and its retained checkpoint
+    coordinates.  Profile-specific science rosters remain protocol-owned;
+    arbitrary fixture rows may provide their declared science roster.
+    """
+
+    if train_row.get("evaluation_roster") != SMOKE_EVAL_ROSTER_MARKER:
+        raise ProtocolError("row does not carry the smoke-prefix-v1 roster marker")
+    execution = train_row.get("execution")
+    if not isinstance(execution, Mapping) or set(execution) != {"stop_at"}:
+        raise ProtocolError("smoke-prefix-v1 row requires execution.stop_at")
+    stop_at = execution.get("stop_at")
+    steps = train_row.get("checkpoint_steps")
+    if (type(stop_at) is not int or not isinstance(steps, (list, tuple))
+            or any(type(step) is not int for step in steps)
+            or stop_at not in steps):
+        raise ProtocolError("smoke-prefix-v1 stop_at must name a retained checkpoint")
+    science = set(_smoke_eval_science_roster(train_row, science_roster))
+    derived = tuple(step for step in steps if step <= stop_at and step in science)
+    if not derived:
+        raise ProtocolError("smoke-prefix-v1 evaluation roster is empty")
+    return derived
+
+
+def derive_smoke_eval_roster(
+    phase1_rows: list[Mapping[str, Any]], *, science_roster: Collection[int],
+) -> tuple[int, ...]:
+    """Derive the union of smoke checkpoints for a phase-1 manifest."""
+
+    train_rows = [row for row in phase1_rows if row.get("kind") == "train"]
+    if not train_rows or any(
+        row.get("evaluation_roster") != SMOKE_EVAL_ROSTER_MARKER for row in train_rows
+    ):
+        raise ProtocolError("phase-1 rows are not a smoke-prefix-v1 manifest")
+    derived = set()
+    for row in train_rows:
+        derived.update(smoke_eval_roster(row, science_roster=science_roster))
+    if not derived:
+        raise ProtocolError("smoke-prefix-v1 evaluation roster is empty")
+    return tuple(sorted(derived))
+
+
 def validate_he_h2_eval_grid(
     rows: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
     *,
@@ -1212,6 +1274,9 @@ def derive_smoke_request(
 
     if train_row.get("kind") != "train":
         raise ProtocolError("smoke qualification must be derived from a train row")
+    existing_marker = train_row.get("evaluation_roster")
+    if existing_marker is not None and existing_marker != SMOKE_EVAL_ROSTER_MARKER:
+        raise ProtocolError("unsupported evaluation_roster marker")
     source_root = _safe_results_root(train_row.get("results_root"))
     isolated_root = _safe_results_root(results_root)
     if Path(source_root).resolve() == Path(isolated_root).resolve():
@@ -1228,6 +1293,10 @@ def derive_smoke_request(
     request = copy.deepcopy(dict(train_row))
     request["results_root"] = isolated_root
     request["execution"] = {"stop_at": stop_at}
+    request["evaluation_roster"] = SMOKE_EVAL_ROSTER_MARKER
+    # Validate the derived roster before returning a request that can be
+    # persisted as a phase-1 manifest.
+    smoke_eval_roster(request)
     _validate_run_identity(request)
     return request
 
@@ -2153,6 +2222,18 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
     if len({row.get("seed") for row in phase1_rows}) != len(phase1_rows):
         raise ProtocolError("phase-1 manifest contains duplicate seed")
     train_rows = [row for row in phase1_rows if row.get("kind") == "train"]
+    for row in phase1_rows:
+        marker = row.get("evaluation_roster")
+        if marker is not None and marker != SMOKE_EVAL_ROSTER_MARKER:
+            raise ProtocolError("unsupported evaluation_roster marker")
+    train_markers = {row.get("evaluation_roster") for row in train_rows}
+    smoke_manifest = SMOKE_EVAL_ROSTER_MARKER in train_markers
+    if smoke_manifest and train_markers != {SMOKE_EVAL_ROSTER_MARKER}:
+        raise ProtocolError("phase-1 rows mix smoke and science evaluation rosters")
+    if smoke_manifest and any(
+        row.get("evaluation_roster") != SMOKE_EVAL_ROSTER_MARKER for row in phase1_rows
+    ):
+        raise ProtocolError("smoke phase-1 rows must carry the smoke-prefix-v1 marker")
     for row in train_rows:
         _validate_act50_variant(row)
     systems = tuple(dict.fromkeys(str(row["system"]) for row in train_rows))
@@ -2172,7 +2253,7 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
             hooke_profile, "hooke2" if is_hooke2_act50_profile(hooke_profile)
             else ("qho2e" if set(systems) == {"qho2e"} else "hooke1")
         )[2]
-        if list(checkpoints) != list(expected_checkpoints):
+        if not smoke_manifest and list(checkpoints) != list(expected_checkpoints):
             selection = hooke_profile_selection(
                 hooke_profile, "hooke2" if is_hooke2_act50_profile(hooke_profile)
                 else ("qho2e" if set(systems) == {"qho2e"} else "hooke1")
@@ -2182,7 +2263,7 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
             )
     else:
         hooke_profile = None
-    if he_h2_selection and list(checkpoints) != list(HE_H2_EVAL_CHECKPOINTS):
+    if not smoke_manifest and he_h2_selection and list(checkpoints) != list(HE_H2_EVAL_CHECKPOINTS):
         raise ProtocolError("He/H2 production phase 2 requires the exact roster-B checkpoints")
     train_identity_keys = [f"{row.get('system')}:{row.get('lineage')}" for row in train_rows]
     if len(set(train_identity_keys)) != len(train_identity_keys):
@@ -2244,7 +2325,22 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         bindings[key] = _require_sha(
             raw_digest, length=64, field=f"checkpoint evidence checkpoints[{raw_key!r}]"
         )
-    if he_h2_selection:
+    smoke_checkpoints_by_train: dict[str, tuple[int, ...]] = {}
+    if smoke_manifest:
+        for train_row in train_rows:
+            smoke_checkpoints_by_train[str(train_row["row_id"])] = smoke_eval_roster(
+                train_row, science_roster=checkpoints,
+            )
+        expected_bindings = {
+            (str(row["system"]), int(row["lineage"]), checkpoint)
+            for row in train_rows
+            for checkpoint in smoke_checkpoints_by_train[str(row["row_id"])]
+        }
+        if set(bindings) != expected_bindings:
+            raise ProtocolError(
+                "smoke-prefix-v1 checkpoint evidence is incomplete or out of scope"
+            )
+    if not smoke_manifest and he_h2_selection:
         expected_bindings = {
             (system, lineage, checkpoint)
             for system in systems
@@ -2253,7 +2349,7 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         }
         if set(bindings) != expected_bindings:
             raise ProtocolError("He/H2 roster-B checkpoint evidence is incomplete or out of scope")
-    if hooke_science:
+    if not smoke_manifest and hooke_science:
         expected_bindings = {
             (system, lineage, checkpoint)
             for system in systems
@@ -2309,11 +2405,11 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
     for train_row in train_rows:
         system = str(train_row["system"])
         lineage = int(train_row["lineage"])
-        eval_checkpoints = (
+        eval_checkpoints = smoke_checkpoints_by_train.get(str(train_row["row_id"]), (
             hooke_profile_selection(str(hooke_profile), system)[2]
             if hooke_science and system in HOOKE_SYSTEMS
             else tuple(checkpoints)
-        )
+        ))
         for checkpoint in eval_checkpoints:
             key = (system, lineage, checkpoint)
             digest = bindings.get(key)
@@ -2353,6 +2449,8 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
                         "selection_id": HE_H2_EVAL_SELECTION_ID,
                     } if he_h2_selection else {}),
                 }
+                if smoke_manifest:
+                    row["evaluation_roster"] = SMOKE_EVAL_ROSTER_MARKER
                 if row["row_id"] in combined_row_ids or row["seed"] in combined_seeds:
                     raise ProtocolError("phase-1 and phase-2 rows are not jointly unique")
                 combined_row_ids.add(row["row_id"])
@@ -2363,9 +2461,9 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
     for row in rows:
         _validate_run_identity(row)
         _checkpoint_binding(row)
-    if hooke_science:
+    if not smoke_manifest and hooke_science:
         validate_hooke_eval_grid(rows, expected_systems=tuple(systems), expected_profile=hooke_profile)
-    if he_h2_selection:
+    if not smoke_manifest and he_h2_selection:
         validate_he_h2_eval_grid(
             rows,
             expected_systems=systems,
