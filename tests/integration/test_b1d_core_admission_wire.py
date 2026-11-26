@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from tpen.execution.core_admission import evaluate_core_admission
@@ -184,14 +185,31 @@ def _port_admit(payload):
         profile_name=payload["profile_name"],
         environment=PreparedPythonEnvironment(sys.executable),
     )
+    relative_paths = payload.get("relative_paths", False)
+    if relative_paths:
+        control = Path(payload["control_dir"])
+        science = Path(payload["science_dir"])
+        control.mkdir(parents=True, exist_ok=True)
+        science.mkdir(parents=True, exist_ok=True)
+        os.chdir(control)
+        stdout_path, stderr_path, child_cwd = "out.log", "err.log", science
+    else:
+        stdout_path, stderr_path, child_cwd = (
+            Path(payload["stdout_path"]),
+            Path(payload["stderr_path"]),
+            None,
+        )
     verdict = ScienceProcessCoreAdmissionPort().admit(
         request,
         member,
-        stdout_path=Path(payload["stdout_path"]),
-        stderr_path=Path(payload["stderr_path"]),
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        cwd=child_cwd,
     )
     return {
         "verdict": None if verdict is None else verdict.to_dict(),
+        "parent_stdout_exists": Path(stdout_path).exists(),
+        "parent_stderr_exists": Path(stderr_path).exists(),
         "tpen_modules": sorted(
             name for name in sys.modules if name == "tpen" or name.startswith("tpen.")
         ),
@@ -473,6 +491,37 @@ def test_real_process_port_missing_leaf_returns_none(tmp_path: Path) -> None:
     }
     result = executor_call(_EXECUTOR_CHILD, tmp_path, "port", payload)
     assert result["verdict"] is None
+    assert result["tpen_modules"] == []
+
+
+def test_real_process_port_relative_logs_cross_child_cwd(tmp_path: Path) -> None:
+    """Relative logs stay parent-relative while the sidecar follows the child cwd."""
+
+    context = admission_context(None)
+    control = tmp_path / "control"
+    science = tmp_path / "science"
+    result = executor_call(
+        _EXECUTOR_CHILD,
+        tmp_path,
+        "port",
+        {
+            "task_id": context.task_id,
+            "lineage_id": context.lineage_id,
+            "core_run_dir": None,
+            "science_input_digest": context.science_input_digest,
+            "successor_request": None,
+            "unresolved_config": dict(context.unresolved_config),
+            "profile_name": context.profile_name,
+            "relative_paths": True,
+            "control_dir": str(control),
+            "science_dir": str(science),
+        },
+    )
+    assert result["verdict"] is None
+    assert result["parent_stdout_exists"] is True
+    assert result["parent_stderr_exists"] is True
+    assert (control / "out.log").exists()
+    assert (control / "err.log").exists()
     assert result["tpen_modules"] == []
 
 

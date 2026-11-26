@@ -168,7 +168,12 @@ class ScienceProcessCoreAdmissionPort:
                 raise CoreAdmissionUnavailable("core admission request crosses science digest")
 
         stdout_path = Path(stdout_path)
-        result_path = stdout_path.with_name(f"{stdout_path.name}.result.json")
+        # Resolve only the sidecar against the parent's cwd.  The worker keeps
+        # the caller's stdout/stderr paths unchanged, while the science child
+        # may run under a different cwd.
+        result_path = Path(os.path.abspath(stdout_path)).with_name(
+            f"{stdout_path.name}.result.json"
+        )
         try:
             if result_path.exists() or result_path.is_symlink():
                 result_path.unlink()

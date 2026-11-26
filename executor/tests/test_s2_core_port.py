@@ -13,7 +13,7 @@ import pytest
 
 from tpen_executor._codec import digest
 from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId, ExecutionPlanV2, GroupId, ProgramSpecRef, ReadyGroupV2, TaskSpec
-from tpen_executor.environments import PreparedPythonEnvironment
+from tpen_executor.environments import PreparedPythonEnvironment, SourceScript
 from tpen_executor.lifecycle.core_port import CoreAdmissionProcessRequest, ScienceProcessCoreAdmissionPort
 from tpen_executor.recovery import CoreAdmissionUnavailable, MemberRecoveryInputV2
 from tpen_executor.results import OutcomeReceipt, StartReceipt
@@ -30,6 +30,7 @@ MUTANTS = [
     {"id": "nonzero", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if outcome.returncode != 0:', "new": 'if False:', "killer": "test_nonzero_exit_is_unavailable"},
     {"id": "launch-failure", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'except (OSError, TypeError, ValueError, RuntimeError) as exc:', "new": 'except TypeError as exc:', "killer": "test_launch_failure_is_unavailable"},
     {"id": "result-read-guard", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": "except (OSError, UnicodeError) as exc:", "new": "except UnicodeError as exc:", "killer": "test_missing_result_envelope_is_unavailable"},
+    {"id": "stdout-fallback", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'raise CoreAdmissionUnavailable("core admission process output could not be read") from exc', "new": 'payload = json.dumps({"nonce": nonce, "request_digest": request_digest, "result": decode_json(Path(stdout_path).read_bytes())}).encode()', "killer": "test_setup_early_exit_completed_payload_is_unavailable"},
     {"id": "malformed-json", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": "except (TypeError, ValueError) as exc:", "new": "except TypeError as exc:", "killer": "test_malformed_json_is_unavailable"},
     {"id": "nonce", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if decoded["nonce"] != nonce:', "new": "if False:", "killer": "test_wrong_nonce_envelope_is_unavailable"},
     {"id": "request-digest", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if decoded["request_digest"] != request_digest:', "new": "if False:", "killer": "test_wrong_request_digest_envelope_is_unavailable"},
@@ -234,6 +235,67 @@ def test_missing_result_envelope_is_unavailable(tmp_path: Path) -> None:
     port, out, err = _port(tmp_path, _RawEnvelopeWorker(None))
     with pytest.raises(CoreAdmissionUnavailable):
         port.admit(_request(member), member, stdout_path=out, stderr_path=err)
+
+
+def _setup_early_exit_environment(tmp_path: Path, payload: str) -> PreparedPythonEnvironment:
+    setup = tmp_path / "setup-early-exit.sh"
+    setup.write_text(f"printf '%s' '{payload}'\nexit 0\n", encoding="utf-8")
+    return PreparedPythonEnvironment(str(tmp_path / "missing-python"), SourceScript(str(setup)))
+
+
+def test_setup_early_exit_null_is_unavailable(tmp_path: Path) -> None:
+    member = _member()
+    output = "null"
+    request = CoreAdmissionProcessRequest(
+        member.task_id,
+        member.lineage_id,
+        None,
+        "a" * 64,
+        None,
+        {"study": "s2"},
+        "profile",
+        _setup_early_exit_environment(tmp_path, output),
+    )
+    stdout_path, stderr_path = tmp_path / "setup-null.out", tmp_path / "setup-null.err"
+    with pytest.raises(CoreAdmissionUnavailable):
+        ScienceProcessCoreAdmissionPort().admit(
+            request, member, stdout_path=stdout_path, stderr_path=stderr_path
+        )
+    assert stdout_path.read_text(encoding="utf-8") == output
+    assert stderr_path.read_text(encoding="utf-8") == ""
+
+
+def test_setup_early_exit_completed_payload_is_unavailable(tmp_path: Path) -> None:
+    member = _member()
+    output = json.dumps(
+        {
+            "schema": "tpen-core-admission-v1",
+            "outcome": "completed",
+            "admission": "unknown",
+            "checkpoint": "absent",
+            "quiescence": "unknown",
+            "profile": None,
+            "reason": "completed",
+        },
+        separators=(",", ":"),
+    )
+    request = CoreAdmissionProcessRequest(
+        member.task_id,
+        member.lineage_id,
+        None,
+        "a" * 64,
+        None,
+        {"study": "s2"},
+        "profile",
+        _setup_early_exit_environment(tmp_path, output),
+    )
+    stdout_path, stderr_path = tmp_path / "setup-completed.out", tmp_path / "setup-completed.err"
+    with pytest.raises(CoreAdmissionUnavailable):
+        ScienceProcessCoreAdmissionPort().admit(
+            request, member, stdout_path=stdout_path, stderr_path=stderr_path
+        )
+    assert stdout_path.read_text(encoding="utf-8") == output
+    assert stderr_path.read_text(encoding="utf-8") == ""
 
 
 def test_malformed_successor_shape_is_unavailable(tmp_path: Path) -> None:
