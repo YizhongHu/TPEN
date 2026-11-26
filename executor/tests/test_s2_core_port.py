@@ -18,9 +18,13 @@ from tpen_executor.workers import ProcessOutcome
 
 
 MUTANTS = [
-    {"id": "cross-task", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if predecessor.get("task_id") != request.task_id', "new": 'if False', "killer": "test_crossed_task_refused_before_spawn"},
+    {"id": "cross-task", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if request.task_id != member.task_id:', "new": 'if False:', "killer": "test_crossed_task_refused_before_spawn"},
+    {"id": "cross-lineage", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if request.lineage_id != member.lineage_id:', "new": 'if False:', "killer": "test_crossed_lineage_refused_before_spawn"},
     {"id": "cross-digest", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if request.successor_request.get("science_input_digest") != request.science_input_digest:', "new": 'if False:', "killer": "test_crossed_digest_refused_before_spawn"},
-    {"id": "timeout", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if outcome.timed_out or outcome.returncode != 0:', "new": 'if outcome.returncode != 0:', "killer": "test_timeout_is_unavailable"},
+    {"id": "timeout", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if outcome.timed_out:', "new": 'if False:', "killer": "test_timeout_is_unavailable"},
+    {"id": "nonzero", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if outcome.returncode != 0:', "new": 'if False:', "killer": "test_nonzero_exit_is_unavailable"},
+    {"id": "launch-failure", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'except OSError as exc:', "new": 'except RuntimeError as exc:', "killer": "test_launch_failure_is_unavailable"},
+    {"id": "malformed-json", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'decoded = json.loads(payload)', "new": 'decoded = {}', "killer": "test_malformed_json_is_unavailable"},
     {"id": "strict-decoder", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'return decoder.admit(member)', "new": 'return decoded', "killer": "test_extra_field_is_unavailable"},
 ]
 
@@ -37,6 +41,11 @@ class _Worker:
         Path(stdout_path).write_text(json.dumps(self.payload), encoding="utf-8")
         Path(stderr_path).write_text("", encoding="utf-8")
         return ProcessOutcome((sys.executable, "-c", ""), self.returncode, str(stdout_path), str(stderr_path), self.timed_out)
+
+
+class _LaunchFailure:
+    def run(self, *_args, **_kwargs):
+        raise OSError("launch failed")
 
 
 def _member() -> MemberRecoveryInputV2:
@@ -120,5 +129,40 @@ def test_crossed_lineage_refused_before_spawn(tmp_path: Path) -> None:
     assert worker.calls == 0
 
 
-def test_control_interpreter_has_no_tpen_import() -> None:
+def test_launch_failure_is_unavailable(tmp_path: Path) -> None:
+    member = _member()
+    port, out, err = _port(tmp_path, _LaunchFailure())  # type: ignore[arg-type]
+    with pytest.raises(CoreAdmissionUnavailable):
+        port.admit(_request(member), member, stdout_path=out, stderr_path=err)
+
+
+def test_malformed_json_is_unavailable(tmp_path: Path) -> None:
+    class _Malformed(_Worker):
+        def run(self, _environment, _args, *, stdout_path, stderr_path, **_kwargs):
+            Path(stdout_path).write_text("not-json", encoding="utf-8")
+            Path(stderr_path).write_text("", encoding="utf-8")
+            return ProcessOutcome((sys.executable,), 0, str(stdout_path), str(stderr_path), False)
+
+    member = _member()
+    port, out, err = _port(tmp_path, _Malformed(None))
+    with pytest.raises(CoreAdmissionUnavailable):
+        port.admit(_request(member), member, stdout_path=out, stderr_path=err)
+
+
+def test_control_interpreter_has_no_tpen_import(tmp_path: Path) -> None:
+    member = _member()
+    port = ScienceProcessCoreAdmissionPort()
+    assert port.admit(
+        _request(member), member, stdout_path=tmp_path / "out.json", stderr_path=tmp_path / "err.log"
+    ) is None
     assert not any(name == "tpen" or name.startswith("tpen.") for name in sys.modules)
+
+
+def test_mutant_rows_have_unique_source_anchors_and_killers() -> None:
+    root = Path(__file__).parents[2]
+    source = (root / "executor/src/tpen_executor/lifecycle/core_port.py").read_text()
+    test_source = Path(__file__).read_text()
+    for row in MUTANTS:
+        assert source.count(row["old"]) == 1, row["id"]
+        compile(source.replace(row["old"], row["new"], 1), str(root), "exec")
+        assert f"def {row['killer']}(" in test_source

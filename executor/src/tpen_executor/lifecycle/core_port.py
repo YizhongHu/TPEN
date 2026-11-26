@@ -130,8 +130,10 @@ class ScienceProcessCoreAdmissionPort:
             raise TypeError("request must be CoreAdmissionProcessRequest")
         if not isinstance(member, MemberRecoveryInputV2):
             raise TypeError("member must be MemberRecoveryInputV2")
-        if request.task_id != member.task_id or request.lineage_id != member.lineage_id:
-            raise CoreAdmissionUnavailable("core admission context crosses member identity")
+        if request.task_id != member.task_id:
+            raise CoreAdmissionUnavailable("core admission context crosses member task")
+        if request.lineage_id != member.lineage_id:
+            raise CoreAdmissionUnavailable("core admission context crosses member lineage")
         if request.successor_request is not None:
             predecessor = request.successor_request.get("predecessor")
             successor = request.successor_request.get("successor")
@@ -151,14 +153,19 @@ class ScienceProcessCoreAdmissionPort:
                 stderr_path=stderr_path,
                 timeout=timeout,
             )
-        except Exception as exc:
+        except OSError as exc:
             raise CoreAdmissionUnavailable("core admission process could not be launched") from exc
-        if outcome.timed_out or outcome.returncode != 0:
+        if outcome.timed_out:
+            raise CoreAdmissionUnavailable("core admission process timed out")
+        if outcome.returncode != 0:
             raise CoreAdmissionUnavailable("core admission process did not complete successfully")
         try:
             payload = Path(outcome.stdout_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise CoreAdmissionUnavailable("core admission process output could not be read") from exc
+        try:
             decoded = json.loads(payload)
-        except Exception as exc:
+        except (TypeError, ValueError) as exc:
             raise CoreAdmissionUnavailable("core admission process output is invalid") from exc
 
         decoder = MappingCoreAdmissionPort(lambda _member: decoded)

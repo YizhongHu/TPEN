@@ -80,6 +80,7 @@ from tpen_executor.recovery import (
     MemberRecoveryInputV2,
     reconcile_group,
 )
+from tpen_executor.lifecycle.core_port import CoreAdmissionProcessRequest, ScienceProcessCoreAdmissionPort
 from tpen_executor.results import OutcomeReceipt, StartReceipt
 from test_s3_transport_wire import _synthetic_result
 
@@ -167,6 +168,31 @@ def _reconcile(payload):
     }
 
 
+def _port_admit(payload):
+    """Run the real process port from an executor-only control interpreter."""
+
+    task_id = payload["task_id"]
+    group = _group((task_id,))
+    member = _member(group, task_id, status="completed")
+    request = CoreAdmissionProcessRequest(
+        task_id=task_id,
+        lineage_id=payload["lineage_id"],
+        core_run_dir=payload["core_run_dir"],
+        science_input_digest=payload["science_input_digest"],
+        successor_request=payload["successor_request"],
+        unresolved_config=payload["unresolved_config"],
+        profile_name=payload["profile_name"],
+        environment=PreparedPythonEnvironment(sys.executable),
+    )
+    verdict = ScienceProcessCoreAdmissionPort().admit(
+        request,
+        member,
+        stdout_path=Path(payload["stdout_path"]),
+        stderr_path=Path(payload["stderr_path"]),
+    )
+    return {"verdict": None if verdict is None else verdict.to_dict()}
+
+
 def _controller(payload):
     # Use the existing executor-side durable fixture; only the core mapping is
     # supplied over the wire from the parent process.
@@ -238,6 +264,8 @@ if action == "reconcile":
     _emit(_reconcile(payload))
 elif action == "controller":
     _controller(payload)
+elif action == "port":
+    _emit(_port_admit(payload))
 else:
     raise SystemExit(f"unknown child action: {action}")
 '''
@@ -394,6 +422,51 @@ def test_real_mapping_does_not_claim_quiescence(tmp_path: Path) -> None:
     )
     assert mapping is not None
     assert mapping["quiescence"] == "unknown"
+
+
+def test_real_process_port_producer_to_decoder_round_trip(tmp_path: Path) -> None:
+    """The prepared science interpreter produces a mapping accepted by the executor decoder."""
+
+    completed = tmp_path / "completed-port"
+    completed.mkdir()
+    completed_ref = checkpoint(completed)
+    write_run_start(completed)
+    (completed / "status.json").write_text('{"status":"completed"}\n', encoding="utf-8")
+    write_outcome(completed, "completed", completed_ref)
+    context = admission_context(completed)
+    payload = {
+        "task_id": context.task_id,
+        "lineage_id": context.lineage_id,
+        "core_run_dir": context.core_run_dir,
+        "science_input_digest": context.science_input_digest,
+        "successor_request": None,
+        "unresolved_config": dict(context.unresolved_config),
+        "profile_name": context.profile_name,
+        "stdout_path": str(tmp_path / "port-out.json"),
+        "stderr_path": str(tmp_path / "port-err.log"),
+    }
+    result = executor_call(_EXECUTOR_CHILD, tmp_path, "port", payload)
+    assert result["verdict"]["outcome"] == "completed"
+    assert result["verdict"]["admission"] == "unknown"
+
+
+def test_real_process_port_missing_leaf_returns_none(tmp_path: Path) -> None:
+    """The real port preserves core's genuine absent-leaf result."""
+
+    context = admission_context(None)
+    payload = {
+        "task_id": context.task_id,
+        "lineage_id": context.lineage_id,
+        "core_run_dir": None,
+        "science_input_digest": context.science_input_digest,
+        "successor_request": None,
+        "unresolved_config": dict(context.unresolved_config),
+        "profile_name": context.profile_name,
+        "stdout_path": str(tmp_path / "port-out.json"),
+        "stderr_path": str(tmp_path / "port-err.log"),
+    }
+    result = executor_call(_EXECUTOR_CHILD, tmp_path, "port", payload)
+    assert result["verdict"] is None
 
 
 def test_executor_rejects_core_quiescence_claim(tmp_path: Path) -> None:
