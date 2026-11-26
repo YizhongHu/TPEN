@@ -17,13 +17,20 @@ from typing import Any, Iterable, Mapping
 
 import yaml
 
-from .rows import RenderedConfig, canonical_hash, row_id, sha256_file, validate_row
+from experiments.atomistic.stage1.protocol import SYSTEM_SPECS, config_identity
+
+from .rows import RenderedConfig, manifest_hash, row_id, sha256_file, validate_row
 
 
 _ROOT = Path(__file__).resolve().parents[3]
 _TRAIN_BASE = _ROOT / "experiments" / "atomistic" / "stage1" / "configs" / "hooke2" / "train.yaml"
 _EVAL_BASE = _ROOT / "experiments" / "atomistic" / "stage1" / "configs" / "hooke2" / "eval.yaml"
 _OVERLAY_BASE = _ROOT / "experiments" / "atomistic" / "stage1" / "configs" / "overlays" / "hooke-diagnostics-v2.yaml"
+_STAGE1_CONFIG_ROOT = _ROOT / "experiments" / "atomistic" / "stage1" / "configs"
+_HOOKE2 = next(spec for spec in SYSTEM_SPECS if spec.name == "hooke2")
+_HOOKE2_CONFIG_SHA256 = config_identity(
+    config_root=_STAGE1_CONFIG_ROOT, systems=("hooke2",)
+)["sha256"]
 _INTERPOLATION = re.compile(r"\$\{([^{}]+)\}")
 
 
@@ -222,8 +229,8 @@ def _write_yaml(path: Path, config: Mapping[str, Any]) -> RenderedConfig:
 
 def _common_row(*, rendered: RenderedConfig, profile: PilotProfile, results_root: str, run_id: str, source_sha: str, config_path: str, device: str) -> dict[str, Any]:
     row = {
-        "system": "hooke_pair_singlet_omega0.5", "system_id": "hooke_pair_singlet_omega0.5", "kind": "train",
-        "seed": 2435329684536531677, "source_sha": source_sha, "config_sha256": sha256_file(config_path),
+        "system": _HOOKE2.name, "system_id": _HOOKE2.system_id, "kind": "train",
+        "seed": 2435329684536531677, "source_sha": source_sha, "config_sha256": _HOOKE2_CONFIG_SHA256,
         "config_identity_rule": "stage1-config-v1", "config": "configs/hooke2/train.yaml", "results_root": results_root,
         "experiment_name": "stage1_hooke2", "sector": "atomistic", "run_id": run_id, "updates": profile.updates,
         "walkers": profile.walkers, "device": device, "lineage": 0, "sampler_seed": 7066630035130326805,
@@ -253,18 +260,18 @@ def render_eval(*, output_dir: str | Path, results_root: str, source_sha: str, c
 
     config, _ = _materialize_eval(results_root=results_root, run_id=run_id, checkpoint_dir=checkpoint_dir, checkpoint_file="model.pt", source_sha=source_sha, device=device)
     rendered = _write_yaml(Path(output_dir) / "r2-soap-eval-100.yaml", config)
-    parent = parent_row or {"row_id": "parent", "system": "hooke_pair_singlet_omega0.5", "system_id": "hooke_pair_singlet_omega0.5", "seed": 2435329684536531677, "source_sha": source_sha, "config_sha256": sha256_file(_EVAL_BASE), "results_root": results_root, "experiment_name": "stage1_hooke2", "sector": "atomistic", "device": device, "lineage": 0}
+    parent = parent_row or {"row_id": "parent", "system": _HOOKE2.name, "system_id": _HOOKE2.system_id, "seed": 2435329684536531677, "source_sha": source_sha, "config_sha256": _HOOKE2_CONFIG_SHA256, "results_root": results_root, "experiment_name": "stage1_hooke2", "sector": "atomistic", "device": device, "lineage": 0}
     evaluation_sampler = config["evaluation_sampler"]
     task = config["evaluation_tasks"]["mcmc_energy"]
     generator = task["generator"]
     row = {
         "system": parent["system"], "system_id": parent["system_id"], "kind": "eval", "seed": 6348702091350892190,
-        "source_sha": source_sha, "config_sha256": sha256_file(_EVAL_BASE), "config_identity_rule": "stage1-config-v1",
+        "source_sha": source_sha, "config_sha256": _HOOKE2_CONFIG_SHA256, "config_identity_rule": "stage1-config-v1",
         "config": "configs/hooke2/eval.yaml", "results_root": results_root, "experiment_name": "stage1_hooke2", "sector": "atomistic",
         "run_id": run_id, "updates": int(parent.get("updates", 100)), "walkers": int(evaluation_sampler["n_walkers"]), "device": device, "row_extension": {"version": "stage1-rendered-config/v1", "rendered_config": {"path": rendered.path, "sha256": rendered.sha256}, "diagnostics_profile": "diagnostics-v2"},
         "lineage": parent.get("lineage", 0), "checkpoint": int(parent.get("updates", 100)), "stream": 0, "draws": int(generator["n_draws"]), "expected_physical_system_id": parent["system_id"],
         "checkpoint_dir": checkpoint_dir, "checkpoint_file": "model.pt", "checkpoint_sha256": checkpoint_sha256,
-        "depends_on": parent["row_id"], "phase1_manifest_hash": canonical_hash([parent]), "phase1_train_row_hash": canonical_hash(parent),
+        "depends_on": parent["row_id"], "phase1_manifest_hash": manifest_hash([dict(parent)]), "phase1_train_row_hash": manifest_hash([dict(parent)]),
     }
     row["row_id"] = row_id(row)
     validate_row(row, expected_kind="eval")

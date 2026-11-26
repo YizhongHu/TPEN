@@ -364,15 +364,36 @@ def check_step_zero(values: Mapping[str, Any] | None) -> CheckResult:
     shas = values.get("model_sha256")
     if not all(isinstance(x, Mapping) for x in (families, variance, gradients, shas)):
         return _invalid(name, "step-zero fields must be family mappings")
+    expected_families = {"adam", "soap", "minsr64", "minsr128"}
+    family_fields = {
+        "energy": families,
+        "energy_variance": variance,
+        "grad_norm": gradients,
+        "model_sha256": shas,
+    }
+    for field, family_values in family_fields.items():
+        keys = set(family_values)
+        if keys != expected_families:
+            missing = sorted(expected_families - keys)
+            extra = sorted(keys - expected_families)
+            if missing and not extra:
+                return _missing(name, f"step-zero {field} is missing families: {missing}")
+            return _invalid(name, f"step-zero {field} has malformed family set: missing={missing}; extra={extra}")
+    expected_constructions = {"autograd", "qgt"}
+    groups = values["construction"]
+    if not isinstance(groups, Mapping):
+        return _invalid(name, "construction groups must name two gradient values")
+    construction_keys = set(groups)
+    if construction_keys != expected_constructions:
+        return _invalid(name, f"construction key set must be exactly {sorted(expected_constructions)}")
+    if not all(isinstance(v, (list, tuple)) and len(v) == 2 for v in groups.values()):
+        return _invalid(name, "construction groups must name two gradient values")
     if not all(_finite(v) for v in [*families.values(), *variance.values(), *gradients.values()]):
         return _failure(name, "step-zero metric is non-finite")
     if len(set(families.values())) != 1 or len(set(variance.values())) != 1:
         return _failure(name, "step-zero energy or energy_variance is not exactly equal")
     if len(set(shas.values())) != 1:
         return _failure(name, "step-zero model SHA differs across families")
-    groups = values["construction"]
-    if not isinstance(groups, Mapping) or not all(isinstance(v, (list, tuple)) and len(v) == 2 for v in groups.values()):
-        return _invalid(name, "construction groups must name two gradient values")
     for label, pair in groups.items():
         a, b = pair
         if not (_finite(a) and _finite(b)):

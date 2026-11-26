@@ -286,7 +286,7 @@ def make_parent_join(*, campaign_id: str, invocation_id: str, row: Mapping[str, 
         campaign_id=campaign_id,
         invocation_id=invocation_id,
         manifest_hash=manifest_hash([dict(row)]),
-        train_row_hash=canonical_hash(dict(row)),
+        train_row_hash=manifest_hash([dict(row)]),
         source_sha=row["source_sha"],
         rendered_config_sha256=ext["rendered_config"]["sha256"],
         row_id=row["row_id"],
@@ -304,7 +304,7 @@ def make_eval_row(*, train_row: Mapping[str, Any], parent: ParentJoin, checkpoin
         raise RowContractError("checkpoint is not in the parent schedule")
     if parent.row_id != train_row.get("row_id"):
         raise RowContractError("parent row does not match train row")
-    if parent.manifest_hash != manifest_hash([dict(train_row)]) or parent.train_row_hash != canonical_hash(dict(train_row)):
+    if parent.manifest_hash != manifest_hash([dict(train_row)]) or parent.train_row_hash != manifest_hash([dict(train_row)]):
         raise RowContractError("parent hashes do not match the actual singleton row")
     if parent.source_sha != train_row.get("source_sha") or parent.rendered_config_sha256 != train_row["row_extension"]["rendered_config"]["sha256"]:
         raise RowContractError("parent provenance does not match the actual train row")

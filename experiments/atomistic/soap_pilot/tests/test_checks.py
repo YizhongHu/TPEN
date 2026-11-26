@@ -49,6 +49,32 @@ def test_step_zero_amendment_controls() -> None:
     assert result.passed
 
 
+def test_step_zero_requires_exact_families_and_constructions() -> None:
+    """The clean four-family fixture passes; each family deletion is unmeasured."""
+
+    clean = {
+        "energy": {family: 2.0 for family in ("adam", "soap", "minsr64", "minsr128")},
+        "energy_variance": {family: 0.1 for family in ("adam", "soap", "minsr64", "minsr128")},
+        "grad_norm": {family: 8.0 for family in ("adam", "soap", "minsr64", "minsr128")},
+        "model_sha256": {family: "a" for family in ("adam", "soap", "minsr64", "minsr128")},
+        "construction": {"autograd": (8.0, 8.0), "qgt": (8.0, 8.0)},
+    }
+    assert check_step_zero(clean).passed
+    for family in ("adam", "soap", "minsr64", "minsr128"):
+        missing = {key: dict(value) for key, value in clean.items() if key != "construction"}
+        for values in missing.values():
+            values.pop(family)
+        missing["construction"] = dict(clean["construction"])
+        assert check_step_zero(missing).verdict is Verdict.UNMEASURED
+
+    malformed = {key: dict(value) if isinstance(value, dict) else value for key, value in clean.items()}
+    malformed["energy"]["unexpected"] = 2.0
+    assert check_step_zero(malformed).verdict is Verdict.HARNESS_INVALID
+    malformed_construction = {key: dict(value) if isinstance(value, dict) else value for key, value in clean.items()}
+    malformed_construction["construction"] = {"autograd": (8.0, 8.0)}
+    assert check_step_zero(malformed_construction).verdict is Verdict.HARNESS_INVALID
+
+
 def test_disconnected_count_is_tensor_count() -> None:
     assert check_disconnected_optimizer_state({"n_no_optimizer_state": 16, "n_no_optimizer_state_elements": 492000}).passed
     assert check_disconnected_optimizer_state({"n_no_optimizer_state": 492000, "n_no_optimizer_state_elements": 16}).verdict is Verdict.PRODUCT_FAILURE
