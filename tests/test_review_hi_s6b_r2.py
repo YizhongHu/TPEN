@@ -133,7 +133,7 @@ def test_delta_reader_rejects_current_attempt_sibling_but_accepts_predecessor(tm
 
 def _qualification_fixture(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     root = tmp_path / "root"
-    store, group, fence, verdict, task = _single_fixture(root / "store")
+    store, group, fence, verdict, task = _single_fixture(root)
     _publish(store, group, fence, verdict, task)
     row_id = task.science_digest
     campaign = root / "campaign"
