@@ -332,6 +332,44 @@ def test_t2_completion_order_refills_a_quiescent_slot(tmp_path: Path) -> None:
 
 
 @PARSL_REQUIRED
+def test_t9_configured_multislot_forwards_distinct_member_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Configured argv keeps each slot's output, task, and attempt identity."""
+
+    package = _stub_package(tmp_path)
+    dispatcher = _dispatcher(tmp_path, package)
+    lifecycle = AttachedAllocation(_allocation(tmp_path, slots=_slots(2)), DirectoryStore(tmp_path / "store"))
+    group = _group("left", "right")
+    runs = _runs(tmp_path, "left", "right")
+    submitted: list[tuple[str, ...]] = []
+    original_submit = ParslDispatcher._submit_process
+
+    def capture_submit(self, materialized, environment, args, **kwargs):
+        submitted.append(tuple(args))
+        return original_submit(self, materialized, environment, args, **kwargs)
+
+    monkeypatch.setattr(ParslDispatcher, "_submit_process", capture_submit)
+    manifest = dispatcher.run(group, runs, lifecycle)
+
+    assert len(submitted) == 2
+    attempts = {attempt.task_id: attempt for attempt in manifest.attempts}
+    assert set(attempts) == {"left", "right"}
+    captured_by_task = {args[-4].split("=", 1)[-1]: args for args in submitted}
+    assert set(captured_by_task) == set(attempts)
+    for task_id, attempt in attempts.items():
+        assert attempt.start_receipt is not None
+        expected = runs[task_id].command_for_attempt(
+            attempt.start_receipt.output_dir,
+            root=str(lifecycle.store.root),
+            group_digest=group.identity,
+            task_id=task_id,
+            attempt_id=attempt.attempt_id.value,
+        ).args
+        assert captured_by_task[task_id] == expected
+
+
+@PARSL_REQUIRED
 def test_t3_future_completion_does_not_release_before_child_quiescence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """T3 keeps refill behind controller handling and bounds live slot use."""
 
