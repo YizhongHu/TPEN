@@ -1406,7 +1406,9 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
         if not isinstance(event, TrainingIterationCompleted):
             return
         scheduled = self._steps.should_run(event.iteration.step)
-        if not scheduled and self.format_version == 2:
+        if not scheduled:
+            if self.format_version == 3:
+                self._advance_v3_unscheduled(event.iteration.step, context, state)
             return
         if state.batch is None or state.local_energy is None or state.wavefunction_output is None:
             raise ValueError("raw training recorder requires batch, local energy, and wavefunction output")
@@ -1515,26 +1517,70 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
         )
         self._v3_counters = counters
 
+    def _ensure_v3_writer(
+        self,
+        context: RunContext,
+        state: TrainerState,
+        *,
+        walker_count: int,
+        n_electrons: int,
+        spatial_dim: int,
+        term_names: list[str],
+    ) -> None:
+        from .training_history_v3_writer import TrainingHistoryV3Writer
+
+        if self._v3_writer is not None:
+            return
+        contract = {
+            "coordinate": "iteration_step", "start_step": self._steps.cadence.start,
+            "every_n_steps": self._steps.cadence.every_n,
+            "partition_size_steps": self.partition_size_steps,
+            "walker_count": walker_count, "n_electrons": n_electrons,
+            "spatial_dim": spatial_dim, "term_names": term_names,
+            "capture_semantics": "pre_update_model_forward",
+        }
+        self._v3_writer = TrainingHistoryV3Writer(
+            self.path, run_id=context.metadata.run_id, contract=contract,
+            provenance=_context_provenance(context, state.sampler_stats),
+        )
+
+    def _advance_v3_unscheduled(self, step: int, context: RunContext, state: TrainerState) -> None:
+        """Advance v3 step counters and window seals without host tensor copies."""
+        if step != self._v3_counters[0]:
+            raise ValueError("v3 recorder iteration gap or duplicate")
+        if self._v3_writer is None:
+            if state.batch is None or state.local_energy is None or state.wavefunction_output is None:
+                raise ValueError("raw training recorder requires batch, local energy, and wavefunction output")
+            if state.local_energy_terms is None:
+                raise ValueError("raw training recorder requires trainer return_terms=True")
+            batch = state.batch
+            self._ensure_v3_writer(
+                context,
+                state,
+                walker_count=int(state.local_energy.reshape(-1).shape[0]),
+                n_electrons=int(batch.n_electrons),
+                spatial_dim=int(batch.spatial_dim),
+                term_names=sorted(state.local_energy_terms),
+            )
+        completed_updates = int(getattr(state.trainer, "completed_updates", 0))
+        self._v3_counters = (step + 1, completed_updates)
+        if self._v3_counters[0] % self.partition_size_steps == 0 and self._v3_writer is not None:
+            self._v3_writer.seal_window(step // self.partition_size_steps)
+
     def _capture_v3(self, record: TrainingBatchRecord, context: RunContext,
                     state: TrainerState, *, scheduled: bool) -> None:
         """Publish each selected batch before acknowledging its iteration."""
-        from .training_history_v3_writer import TrainingHistoryV3Writer
-
         if record.iteration_step != self._v3_counters[0]:
             raise ValueError("v3 recorder iteration gap or duplicate")
-        if self._v3_writer is None:
-            contract = {
-                "coordinate": "iteration_step", "start_step": self._steps.cadence.start,
-                "every_n_steps": self._steps.cadence.every_n,
-                "partition_size_steps": self.partition_size_steps,
-                "walker_count": record.n_walkers, "n_electrons": record.positions.shape[1],
-                "spatial_dim": record.positions.shape[2], "term_names": list(record.term_names),
-                "capture_semantics": "pre_update_model_forward",
-            }
-            self._v3_writer = TrainingHistoryV3Writer(
-                self.path, run_id=context.metadata.run_id, contract=contract,
-                provenance=_context_provenance(context, state.sampler_stats),
-            )
+        self._ensure_v3_writer(
+            context,
+            state,
+            walker_count=record.n_walkers,
+            n_electrons=record.positions.shape[1],
+            spatial_dim=record.positions.shape[2],
+            term_names=list(record.term_names),
+        )
+        assert self._v3_writer is not None
         if scheduled:
             self._v3_writer.append_capture(record, sampler_stats=_sampler_provenance(state.sampler_stats))
         self._v3_counters = (record.iteration_step + 1, record.completed_updates)

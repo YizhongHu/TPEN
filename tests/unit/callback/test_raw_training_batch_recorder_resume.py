@@ -102,3 +102,49 @@ def test_yield_seals_durable_partial_window(tmp_path: Path) -> None:
     reader = TrainingHistoryReader(root)
     reader.validate(require_complete=True)
     assert reader.completion == {"next_iteration": 3, "completed_updates": 3}
+
+
+def test_v3_unscheduled_step_skips_host_transfer(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    import numpy as np
+    from tpen.events import TrainingIterationCompleted
+    from tpen.training.events import TrainingIteration
+
+    class _NoCpuTensor:
+        def __init__(self, shape: tuple[int, ...]) -> None:
+            self.shape = shape
+
+        def reshape(self, *shape: int):
+            if shape == (-1,):
+                total = 1
+                for dim in self.shape:
+                    total *= dim
+                return _NoCpuTensor((total,))
+            return _NoCpuTensor(shape)
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            raise AssertionError("unscheduled v3 step must not copy tensor to host")
+
+    context = _run_context(tmp_path)
+    root = Path(context.metadata.run_dir) / "training_history"
+    recorder = RawTrainingBatchRecorder(root, format_version=3, every_n_steps=2, partition_size_steps=4)
+    recorder._capture_v3(_record(0), context, TrainerState(trainer=_trainer(1)), scheduled=True)
+
+    unscheduled_state = TrainerState(
+        trainer=_trainer(2),
+        batch=SimpleNamespace(positions=_NoCpuTensor((2, 2, 3)), n_electrons=2, spatial_dim=3),
+        local_energy=_NoCpuTensor((2,)),
+        local_energy_terms={"kinetic": _NoCpuTensor((2,))},
+        wavefunction_output=SimpleNamespace(logabs=_NoCpuTensor((2,)), sign=_NoCpuTensor((2,))),
+    )
+    recorder.handle_occurrence_impl(
+        Occurrence(TrainingIterationCompleted(TrainingIteration(step=1, total_steps=4)), 1),
+        context,
+        unscheduled_state,
+    )
+    assert recorder._v3_counters == (2, 2)
+    reader = TrainingHistoryReader(root)
+    assert np.array_equal(reader.read_all()["iteration_step"], np.array([0]))
