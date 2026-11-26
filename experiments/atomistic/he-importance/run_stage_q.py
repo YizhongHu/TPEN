@@ -1170,7 +1170,7 @@ def _require_truthful_cell(
             raise StageQSelectionError(
                 f"truthfulness guard refused local_energy_chunk_size at {field}: {error}"
             ) from error
-        if type(actual) is not type(expected_chunk_size) or actual != expected_chunk_size:
+        if actual != expected_chunk_size:
             raise StageQSelectionError(
                 "truthfulness guard refused local_energy_chunk_size: "
                 f"expected {expected_chunk_size!r}, top-level trainer={actual_top!r}, "

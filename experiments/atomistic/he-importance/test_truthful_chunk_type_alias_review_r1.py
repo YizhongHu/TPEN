@@ -149,6 +149,64 @@ def test_late_resolution_alias_refuses_before_production_runner(
     assert not runner_calls
 
 
+def test_late_resolution_non_chunk_type_alias_refuses_in_guarded_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-chunk type alias must reach and fail the resolved-config guard."""
+
+    original_overrides = stage_coordinate.sampler_override_values
+    monkeypatch.setattr(
+        stage_coordinate,
+        "sampler_override_values",
+        lambda stage, coordinate: (8,)
+        if stage == "Q" and coordinate == "n_walkers"
+        else original_overrides(stage, coordinate),
+    )
+    facts = {
+        "global_rank": 0,
+        "global_size": 1,
+        "local_rank": 0,
+        "local_size": 1,
+        "node_rank": 0,
+        "node_size": 1,
+        "host": "cpu-test",
+        "pid": 1,
+        "device": "cpu",
+        "job_id": "cpu-test",
+        "device_identity": None,
+    }
+    runner_calls: list[object] = []
+    monkeypatch.setattr(run_stage_q, "_execution_facts", lambda: facts)
+
+    def late_resolve(
+        packet: object,
+        _facts: object,
+        *,
+        runner: object,
+        **kwargs: object,
+    ) -> int:
+        del _facts, kwargs
+        resolved = train_config.resolve_train_config(packet, local_energy_chunk_size=1)
+        resolved.trainer.max_steps = float(resolved.trainer.max_steps)
+        resolved.runner.trainer.max_steps = float(resolved.runner.trainer.max_steps)
+        run_stage_q._require_truthful_cell(packet.cell, resolved, 1)
+        return runner(resolved, topology=facts)  # type: ignore[operator]
+
+    monkeypatch.setattr(run_stage_q.launch, "launch_train", late_resolve)
+    monkeypatch.setattr(
+        run_stage_q.launch,
+        "run_from_config",
+        lambda *args, **kwargs: runner_calls.append((args, kwargs)) or 0,
+    )
+
+    with pytest.raises(
+        run_stage_q.StageQSelectionError,
+        match=r"launch truthfulness guard refused field 'resolved_config\.",
+    ):
+        run_stage_q.execute(_entrypoint_args(tmp_path))
+    assert not runner_calls
+
+
 def test_legacy_none_remains_unbounded_and_not_an_alias(tmp_path: Path) -> None:
     config = train_config.resolve_train_config(_cell(tmp_path))
     assert OmegaConf.select(config, "trainer.local_energy_chunk_size") is None
