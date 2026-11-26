@@ -271,12 +271,22 @@ def test_v3_optional_measurements_and_newer_canonical_uuid(tmp_path: Path) -> No
 
 def test_v3_read_then_completion_preserves_provenance(tmp_path: Path) -> None:
     root = tmp_path / "completion-provenance"
-    _write_v3_fixture(root, stream_id="3a3a3a3a-3a3a-43a3-83a3-3a3a3a3a3a3a", steps=[0], complete=1)
+    _write_v3_fixture(root, stream_id="3a3a3a3a-3a3a-43a3-83a3-3a3a3a3a3a3a", steps=[0, 1], complete=2)
+    reader = TrainingBatchReader(root)
+    reader.read(start_step=1, end_step=1)
+    before = dict(reader.provenance)
+    assert reader.completion == {"next_iteration": 2, "completed_updates": 2}
+    assert reader.provenance == before
+
+
+def test_v3_empty_read_clears_provenance_after_prior_read(tmp_path: Path) -> None:
+    root = tmp_path / "empty-read-provenance"
+    _write_v3_fixture(root, stream_id="3b3b3b3b-3b3b-43b3-83b3-3b3b3b3b3b3b", steps=[0, 1], complete=2)
     reader = TrainingBatchReader(root)
     reader.read()
-    before = dict(reader.provenance)
-    assert reader.completion == {"next_iteration": 1, "completed_updates": 1}
-    assert reader.provenance == before
+    assert reader.provenance
+    assert reader.read(start_step=2) == {}
+    assert reader.provenance == {}
 
 
 def test_v3_sidecar_json_integer_types_are_strict(tmp_path: Path) -> None:

@@ -736,6 +736,7 @@ class TrainingBatchReader:
         self.root = Path(root)
         self.provenance: dict[int, Mapping[str, Any]] = {}
         self._v3_completion: dict[str, int] | None = None
+        self._has_read_view = False
 
     def read(self, *, start_step: int | None = None, end_step: int | None = None) -> dict[str, np.ndarray]:
         """Validate the complete selected graph, then return an inclusive step range."""
@@ -744,9 +745,13 @@ class TrainingBatchReader:
             raw = (self.root / HISTORY_FILENAME).read_bytes()
             header = _strict_json_loads(raw)
             if isinstance(header, Mapping) and header.get("schema") == V3_SCHEMA:
-                return self._read_v3(start_step=start_step, end_step=end_step)
+                result = self._read_v3(start_step=start_step, end_step=end_step, publish_provenance=True)
+                self._has_read_view = True
+                return result
         self._v3_completion = None
-        return self._read_legacy(start_step=start_step, end_step=end_step)
+        result = self._read_legacy(start_step=start_step, end_step=end_step, publish_provenance=True)
+        self._has_read_view = True
+        return result
 
     def validate(self, *, require_complete: bool = False) -> None:
         """Validate every committed object; optionally require a v3 completion event."""
@@ -755,28 +760,39 @@ class TrainingBatchReader:
             raw = (self.root / HISTORY_FILENAME).read_bytes()
             header = _strict_json_loads(raw)
             if isinstance(header, Mapping) and header.get("schema") == V3_SCHEMA:
-                self._read_v3(require_complete=require_complete, retain_rows=False)
+                self._read_v3(
+                    require_complete=require_complete,
+                    retain_rows=False,
+                    publish_provenance=not self._has_read_view,
+                )
                 return
         if require_complete:
             raise ValueError("require_complete is unavailable for legacy training histories")
-        self._read_legacy()
+        self._read_legacy(publish_provenance=not self._has_read_view)
 
     @property
     def completion(self) -> dict[str, int] | None:
         """Return v3 completion counters, or ``None`` for open/legacy histories."""
 
         if (self.root / HISTORY_FILENAME).is_file():
-            self._read_v3(retain_rows=False)
+            self._read_v3(retain_rows=False, publish_provenance=False)
             return dict(self._v3_completion) if self._v3_completion is not None else None
         return None
 
-    def _read_legacy(self, *, start_step: int | None = None, end_step: int | None = None) -> dict[str, np.ndarray]:
+    def _read_legacy(
+        self,
+        *,
+        start_step: int | None = None,
+        end_step: int | None = None,
+        publish_provenance: bool = True,
+    ) -> dict[str, np.ndarray]:
         manifest_path = self.root / MANIFEST_FILENAME
         manifest = json.loads(manifest_path.read_text())
         if manifest.get("schema") not in {LEGACY_SCHEMA, SCHEMA}:
             raise ValueError("training history manifest has the wrong schema")
         selected: list[dict[str, np.ndarray]] = []
-        self.provenance = {}
+        if publish_provenance:
+            self.provenance = {}
         identities: set[tuple[int, int]] = set()
         for partition_number, entry in enumerate(manifest.get("partitions", [])):
             parent_hash = entry.get("parent_manifest_sha256")
@@ -794,7 +810,7 @@ class TrainingBatchReader:
                 raise ValueError("training partition sidecar digest does not match its manifest entry (partition integrity failure)")
             sidecar = json.loads(sidecar_path.read_text())
             _validate_sidecar(self.root, sidecar, entry=entry)
-            if sidecar["schema"] == SCHEMA:
+            if publish_provenance and sidecar["schema"] == SCHEMA:
                 self.provenance[partition_number] = dict(sidecar["provenance"])
             arrays = dict(np.load(self.root / sidecar["compressed_filename"], allow_pickle=False))
             _validate_bundle(arrays, sidecar)
@@ -820,6 +836,7 @@ class TrainingBatchReader:
         end_step: int | None = None,
         require_complete: bool = False,
         retain_rows: bool = True,
+        publish_provenance: bool = True,
     ) -> dict[str, np.ndarray]:
         node = self._load_v3_node(
             self.root.resolve(),
@@ -831,9 +848,7 @@ class TrainingBatchReader:
             retain_rows=retain_rows,
         )
         self._v3_completion = node.completion
-        # A no-row validation can legitimately have no selected arrays.  Do not
-        # erase attribution already exposed by an earlier read in that case.
-        if node.provenance or not self.provenance:
+        if publish_provenance:
             self.provenance = {index: value for index, value in enumerate(node.provenance)}
         if require_complete and node.completion is None:
             raise ValueError("v3 training history is open and is not complete")
@@ -861,8 +876,8 @@ class TrainingBatchReader:
         select_end: int | None = None,
         retain_rows: bool = True,
     ) -> _V3Node:
-        # Valid pins cannot form a cycle: prefix_sha256 is the parent's own
-        # chain digest, so a self/mutual pin would require a hash fixed point.
+        # Constructing a hash-consistent cycle requires solving a computational
+        # fixed-point constraint: a self/mutual pin would require D=F(D).
         # Keep this guard as defense in depth for malformed or hand-crafted data.
         if root in stack:
             raise ValueError("v3 lineage contains a cycle")
