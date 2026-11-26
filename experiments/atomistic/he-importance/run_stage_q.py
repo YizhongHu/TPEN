@@ -1148,8 +1148,37 @@ def _require_family_common_truthfulness(cell: Any, resolved: Any) -> None:
             )
 
 
-def _require_truthful_cell(cell: Any, resolved: Any) -> None:
+def _require_truthful_cell(
+    cell: Any, resolved: Any, local_energy_chunk_size: int | None = None
+) -> None:
     """Refuse a cell whose declared context or Adam levels are not consumed."""
+
+    try:
+        expected_chunk_size = train_config.validate_local_energy_chunk_size(
+            local_energy_chunk_size
+        )
+    except train_config.TrainConfigResolutionError as error:
+        raise StageQSelectionError(str(error)) from error
+    trainer = getattr(resolved, "trainer", None)
+    runner_trainer = getattr(getattr(resolved, "runner", None), "trainer", None)
+    actual_top = getattr(trainer, "local_energy_chunk_size", None)
+    actual_consumed = getattr(runner_trainer, "local_energy_chunk_size", None)
+    for field, actual in (
+        ("trainer.local_energy_chunk_size", actual_top),
+        ("runner.trainer.local_energy_chunk_size", actual_consumed),
+    ):
+        try:
+            train_config.validate_local_energy_chunk_size(actual)
+        except train_config.TrainConfigResolutionError as error:
+            raise StageQSelectionError(
+                f"truthfulness guard refused local_energy_chunk_size at {field}: {error}"
+            ) from error
+        if actual != expected_chunk_size:
+            raise StageQSelectionError(
+                "truthfulness guard refused local_energy_chunk_size: "
+                f"expected {expected_chunk_size!r}, top-level trainer={actual_top!r}, "
+                f"runner.trainer={actual_consumed!r}"
+            )
 
     identity = cell.manifest["scientific_identity"]
     if architecture_stage_family.is_family_stage(str(cell.manifest["stage"])):
@@ -1355,7 +1384,9 @@ def _training_packet(cell: Any) -> Any:
     return packets.train[0]
 
 
-def _resolve_selected_config(selection: CellSelection) -> tuple[Any, Any]:
+def _resolve_selected_config(
+    selection: CellSelection, local_energy_chunk_size: int | None = None
+) -> tuple[Any, Any]:
     """Run the single selection-side resolve-and-check route.
 
     Parameters
@@ -1380,12 +1411,23 @@ def _resolve_selected_config(selection: CellSelection) -> tuple[Any, Any]:
 
     packet = _training_packet(selection.cell)
     if architecture_stage_family.is_family_stage(str(selection.cell.manifest["stage"])):
-        resolved = architecture_stage_family.descriptor_for(
+        resolver = architecture_stage_family.descriptor_for(
             str(selection.cell.manifest["stage"])
-        ).resolver(packet)
+        ).resolver
+        resolved = (
+            resolver(packet)
+            if local_energy_chunk_size is None
+            else resolver(packet, local_energy_chunk_size=local_energy_chunk_size)
+        )
     else:
-        resolved = train_config.resolve_train_config(packet)
-    _require_truthful_cell(selection.cell, resolved)
+        resolved = (
+            train_config.resolve_train_config(packet)
+            if local_energy_chunk_size is None
+            else train_config.resolve_train_config(
+                packet, local_energy_chunk_size=local_energy_chunk_size
+            )
+        )
+    _require_truthful_cell(selection.cell, resolved, local_energy_chunk_size)
     return packet, resolved
 
 
@@ -1611,6 +1653,12 @@ def execute(
     """
 
     launch.refuse_hi_continuation(restore_request)
+    try:
+        local_energy_chunk_size = train_config.validate_local_energy_chunk_size(
+            getattr(args, "local_energy_chunk_size", None)
+        )
+    except train_config.TrainConfigResolutionError as error:
+        raise StageQSelectionError(str(error)) from error
     raw_delta = getattr(args, "attempt_delta", None)
     delta = (
         attempt_delta.parse_attempt_delta(raw_delta)
@@ -1704,11 +1752,14 @@ def execute(
             f"stage {args.stage!r} declares n_walkers={declared_walkers!r}"
         )
     selection = replace(selection, cell=cell)
-    packet, resolved = _resolve_selected_config(selection)
+    packet, resolved = (
+        _resolve_selected_config(selection)
+        if local_energy_chunk_size is None
+        else _resolve_selected_config(selection, local_energy_chunk_size)
+    )
     if delta is not None:
         # The executor owns the physical leaf.  Keep the authenticated cell
         # identity intact and apply only the closed operational route overlay.
-        resolved = train_config.resolve_train_config(packet)
         _apply_attempt_delta_route(resolved, delta)
         _apply_attempt_delta_load(resolved, delta)
     recorded_resolved = OmegaConf.to_container(resolved, resolve=True)
@@ -1723,6 +1774,12 @@ def execute(
             "independent_sampler_packets": 0,
         },
         "resolved_config": recorded_resolved,
+        "local_energy_chunking": {
+            "activation_path": (
+                "stage_q_cli" if local_energy_chunk_size is not None else "legacy_default"
+            ),
+            "effective_chunk_size": local_energy_chunk_size,
+        },
     }
     c_report = _cell_science_report(report) if delta is not None else report
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
@@ -1768,13 +1825,17 @@ def execute(
         """Validate launch.py's late resolution before delegating to TPEN."""
 
         _apply_attempt_delta_route(config, delta)
-        _require_truthful_cell(selection.cell, config)
+        _require_truthful_cell(selection.cell, config, local_energy_chunk_size)
         _apply_attempt_delta_load(config, delta)
         launched_resolved = OmegaConf.to_container(config, resolve=True)
-        if launched_resolved != recorded_resolved:
+        difference = _first_config_difference(
+            recorded_resolved, launched_resolved, "resolved_config"
+        )
+        if difference is not None:
+            path, recorded_value, launched_value = difference
             raise StageQSelectionError(
-                "launch truthfulness guard refused field 'resolved_config': "
-                f"recorded value {recorded_resolved!r}, launched value {launched_resolved!r}"
+                f"launch truthfulness guard refused field '{path}': "
+                f"recorded value {recorded_value!r}, launched value {launched_value!r}"
             )
         runner_kwargs: dict[str, object] = {"topology": topology}
         if runtime_callbacks:
@@ -1783,21 +1844,17 @@ def execute(
 
     if architecture_stage_family.is_family_stage(args.stage):
         descriptor = architecture_stage_family.descriptor_for(args.stage)
-        exit_code = descriptor.launch_adapter(
-            packet,
-            _execution_facts(),
-            runner=_guarded_runner,
-            runtime_callbacks=runtime_callbacks,
-            overrides=None,
-        )
+        launch_kwargs = {"runner": _guarded_runner, "runtime_callbacks": runtime_callbacks}
+        if local_energy_chunk_size is not None:
+            launch_kwargs["local_energy_chunk_size"] = local_energy_chunk_size
+        launch_kwargs["overrides"] = None
+        exit_code = descriptor.launch_adapter(packet, _execution_facts(), **launch_kwargs)
     else:
-        exit_code = launch.launch_train(
-            packet,
-            _execution_facts(),
-            runner=_guarded_runner,
-            runtime_callbacks=runtime_callbacks,
-            overrides=None,
-        )
+        launch_kwargs = {"runner": _guarded_runner, "runtime_callbacks": runtime_callbacks}
+        if local_energy_chunk_size is not None:
+            launch_kwargs["local_energy_chunk_size"] = local_energy_chunk_size
+        launch_kwargs["overrides"] = None
+        exit_code = launch.launch_train(packet, _execution_facts(), **launch_kwargs)
     if exit_code == 0:
         resolved_snapshot = output_path / "resolved_config.yaml"
         if not resolved_snapshot.is_file():
@@ -1816,6 +1873,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beta2", type=float)
     parser.add_argument("--seed-label", type=int)
     parser.add_argument("--walkers", type=int)
+    parser.add_argument("--local-energy-chunk-size", type=int)
     parser.add_argument("--output-root", type=Path, default=Path(__file__).with_name("outputs"))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--literal-configuration", type=json.loads)

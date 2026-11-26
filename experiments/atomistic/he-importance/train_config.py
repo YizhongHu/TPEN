@@ -476,17 +476,32 @@ def _reject_bracket_override_path(path: object) -> None:
 def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple[str, Any], ...]:
     """Flatten mapping or Hydra dotlist overrides into explicit leaf updates."""
 
+    preserved_chunk_items: list[tuple[str, Any]] = []
     if isinstance(overrides, Mapping):
         try:
             raw = OmegaConf.to_container(OmegaConf.create(overrides), resolve=False)
         except Exception as exc:
             raise TrainConfigResolutionError("overrides must be a valid mapping") from exc
     elif isinstance(overrides, Sequence) and not isinstance(overrides, (str, bytes, bytearray)):
+        ordinary_overrides: list[str] = []
         for override in overrides:
             path, _, _ = str(override).partition("=")
             _reject_bracket_override_path(path)
+            if str.__eq__(path, "trainer.local_energy_chunk_size") is True:
+                try:
+                    single = OmegaConf.from_dotlist([str(override)])
+                    value = OmegaConf.select(single, path, default=_OVERRIDE_MISSING)
+                except Exception as exc:
+                    raise TrainConfigResolutionError(
+                        "overrides must be a valid Hydra dotlist"
+                    ) from exc
+                preserved_chunk_items.append((path, value))
+            else:
+                ordinary_overrides.append(str(override))
         try:
-            raw = OmegaConf.to_container(OmegaConf.from_dotlist(list(overrides)), resolve=False)
+            raw = OmegaConf.to_container(
+                OmegaConf.from_dotlist(ordinary_overrides), resolve=False
+            )
         except Exception as exc:
             raise TrainConfigResolutionError("overrides must be a valid Hydra dotlist") from exc
     else:
@@ -504,6 +519,7 @@ def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple
             items.append((path, value))
 
     visit(raw, "")
+    items.extend(preserved_chunk_items)
     return tuple(items)
 
 
@@ -591,7 +607,8 @@ def _ab_context_labels(manifest: Mapping[str, Any], axis: str) -> dict[str, str]
 
 
 def resolve_train_config(
-    source: Any, *, overrides: Mapping[str, Any] | Sequence[str] | None = None
+    source: Any, *, overrides: Mapping[str, Any] | Sequence[str] | None = None,
+    local_energy_chunk_size: int | None = None,
 ) -> DictConfig:
     """Resolve one materialized cell or training packet into a Hydra config.
 
@@ -621,6 +638,8 @@ def resolve_train_config(
         If the composed configuration fails the HI schema firewall.
     """
 
+    if local_energy_chunk_size is not None:
+        local_energy_chunk_size = validate_local_energy_chunk_size(local_energy_chunk_size)
     cell, source_hash = _cell_from_source(source)
     stage_api = _stage_api()
     # Own one frozen manifest before any resolver consumer can read it again.
@@ -681,8 +700,51 @@ def resolve_train_config(
     OmegaConf.update(cfg, "run.layout", "flat", merge=False, force_add=True)
     OmegaConf.update(cfg, "run.dir", str(output_path), merge=False)
     OmegaConf.update(cfg, "runtime.seed", model_seed, merge=False)
+    chunk_override_values: list[int | None] = []
     for path, value in override_items:
-        OmegaConf.update(cfg, path, value, merge=False)
+        if str.__eq__(path, "trainer.local_energy_chunk_size") is True:
+            validated = validate_local_energy_chunk_size(value)
+            if chunk_override_values and (
+                validated is None
+                or chunk_override_values[0] is None
+                or int.__ne__(validated, chunk_override_values[0]) is True
+            ):
+                raise TrainConfigResolutionError(
+                    "duplicate trainer.local_energy_chunk_size overrides conflict"
+                )
+            chunk_override_values.append(validated)
+    for path, value in override_items:
+        OmegaConf.update(
+            cfg, path, value, merge=False,
+            force_add=str.__eq__(path, "trainer.local_energy_chunk_size") is True,
+        )
+    override_chunk_size = OmegaConf.select(
+        cfg, "trainer.local_energy_chunk_size", default=_OVERRIDE_MISSING
+    )
+    if override_chunk_size is not _OVERRIDE_MISSING:
+        override_chunk_size = validate_local_energy_chunk_size(override_chunk_size)
+    if local_energy_chunk_size is not None and (
+        override_chunk_size is not _OVERRIDE_MISSING
+        and (
+            override_chunk_size is None
+            or int.__ne__(override_chunk_size, local_energy_chunk_size) is True
+        )
+    ):
+        raise TrainConfigResolutionError(
+            "local_energy_chunk_size conflicts with trainer.local_energy_chunk_size override"
+        )
+    effective_chunk_size = (
+        local_energy_chunk_size
+        if local_energy_chunk_size is not None
+        else (None if override_chunk_size is _OVERRIDE_MISSING else override_chunk_size)
+    )
+    # Apply this before interpolation resolution so runner.trainer receives
+    # the same bound through the committed ${trainer} limb.
+    if effective_chunk_size is not None:
+        OmegaConf.update(
+            cfg, "trainer.local_energy_chunk_size", effective_chunk_size,
+            merge=False, force_add=True,
+        )
     OmegaConf.update(cfg, "optimizer._target_", optimizer_entry.target, merge=False)
     # Every Adam coordinate is explicit in the resolved config; no torch
     # constructor default is allowed to stand in for a declared level.
@@ -763,6 +825,17 @@ def resolve_train_config(
     schema.validate_hi_train_config(cfg)
     return cfg
 
+def validate_local_energy_chunk_size(value: Any) -> int | None:
+    """Validate the explicit Stage-Q local-energy chunk bound."""
+
+    if value is None:
+        return None
+    if type(value) is not int or value <= 0:
+        raise TrainConfigResolutionError(
+            "local_energy_chunk_size must be None or an exact positive integer"
+        )
+    return value
+
 
 resolve_training_config = resolve_train_config
 
@@ -773,6 +846,7 @@ __all__ = [
     "OptimizerLevelResolutionError",
     "TrainConfigResolutionError",
     "UnavailableOptimizerError",
+    "validate_local_energy_chunk_size",
     "resolve_train_config",
     "resolve_training_config",
 ]
