@@ -181,13 +181,9 @@ class _TorchProfilerBackend:
         stats: dict[tuple[str, object, bool], _StreamingOperatorStats] = {}
         first_seen: dict[tuple[str, object, bool], int] = {}
         stacks: dict[tuple[int, object], list[_StreamingFrame]] = {}
-        seen = 0
+        event_order = 0
 
         def add(frame: _ClosedStreamingFrame) -> None:
-            nonlocal seen
-            if frame.key not in first_seen:
-                first_seen[frame.key] = seen
-                seen += 1
             current = stats.setdefault(
                 frame.key, _StreamingOperatorStats(frame.name)
             )
@@ -246,6 +242,9 @@ class _TorchProfilerBackend:
                 event.start_thread_id() != event.end_thread_id()
             )
             key = (name, -1, bool(event.is_user_annotation()))
+            if key not in first_seen:
+                first_seen[key] = event_order
+            event_order += 1
             frame = _StreamingFrame(
                 key=key,
                 name=name,
