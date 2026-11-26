@@ -80,7 +80,7 @@ class _RawEnvelopeWorker:
 
 
 def _envelope_template(result: str = "null") -> str:
-    return '{{"nonce":"{nonce}","request_digest":"{digest}","result":' + result + '}'
+    return '{"nonce":"{nonce}","request_digest":"{digest}","result":' + result + '}'
 
 
 def _member() -> MemberRecoveryInputV2:
