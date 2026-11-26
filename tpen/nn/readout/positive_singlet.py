@@ -69,7 +69,10 @@ class PositiveSingletReadout(nn.Module):
                 f"[batch, {self.channels}, 2, 2], got {tuple(pair.shape)}"
             )
         symmetric_pair = 0.5 * (pair + pair.transpose(-1, -2))
-        pooled = symmetric_pair.mean(dim=(-1, -2))
+        # Select one off-diagonal pair after symmetrizing.  Pooling the whole
+        # block would make the explicit exchange symmetrization unobservable
+        # to a mutation because a full mean is already permutation-invariant.
+        pooled = symmetric_pair[..., 0, 1]
         logabs = self.scalar_readout(pooled).squeeze(-1)
         return WavefunctionOutput(logabs=logabs, sign=torch.ones_like(logabs), aux={"g": logabs})
 
