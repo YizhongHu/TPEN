@@ -25,10 +25,11 @@ _CONFIGS = {
 _DTYPE = torch.float64
 
 
-def _model_and_batch(arm: str):
+def _model_and_batch(arm: str, *, include_spins: bool = False):
     torch.manual_seed(12345)
     cfg = OmegaConf.load(_CONFIGS[arm])
     OmegaConf.resolve(cfg)
+    cfg.model.embedding.include_spins = include_spins
     model = instantiate(cfg.model).to(dtype=_DTYPE)
     sampler = instantiate(cfg.sampler)
     return model, sampler, sampler.reset(n_walkers=1).make_batch()
@@ -62,6 +63,25 @@ def test_assembled_models_are_spatially_symmetric_at_fixed_spins(arm: str) -> No
     direct = model(batch).logabs
     torch.testing.assert_close(direct, model(spatial_only).logabs, rtol=0.0, atol=1.0e-12)
     torch.testing.assert_close(direct, model(simultaneous).logabs, rtol=0.0, atol=1.0e-12)
+
+
+def test_boundary_average_covers_spin_enabled_spatial_exchange() -> None:
+    """Exercise the model-boundary average when the trunk itself is asymmetric."""
+
+    model, _, sampler_batch = _model_and_batch("tail", include_spins=True)
+    batch = replace(sampler_batch, positions=_generic_positions())
+    spatial_only = replace(batch, positions=batch.positions[:, [1, 0]])
+
+    # The public assembled path is symmetric with spins held fixed (+,-).
+    direct = model(batch).logabs
+    torch.testing.assert_close(direct, model(spatial_only).logabs, rtol=0.0, atol=1.0e-12)
+
+    # The same fixture is a negative control for the verifier mutant: without
+    # TPENWaveFunction's boundary average, the spin-conditioned trunk is not
+    # spatially symmetric.  This private one-pass helper is the un-averaged g.
+    unaveraged = model._readout_output_once(batch).logabs
+    unaveraged_swapped = model._readout_output_once(spatial_only).logabs
+    assert torch.max(torch.abs(unaveraged - unaveraged_swapped)) > 1.0e-8
 
 
 @pytest.mark.parametrize("arm", ["tail", "comparator"])
