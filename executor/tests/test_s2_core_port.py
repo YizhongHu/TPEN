@@ -49,10 +49,11 @@ class _LaunchFailure:
 
 
 def _member() -> MemberRecoveryInputV2:
+    plan_ref = {"members": ["task"]}
     group = ReadyGroupV2(
         GroupId("s2-group"),
         (TaskSpec("task", "lineage", ProgramSpecRef({"task": "task"}, digest({"task": "task"})), "a" * 64, 1, "steps"),),
-        ExecutionPlanV2({"members": ["task"]}, "b" * 64, ("task",), "profile", "protocol"),
+        ExecutionPlanV2(plan_ref, digest(plan_ref), ("task",), "profile", "protocol"),
     )
     attempt = AttemptId("attempt")
     start = StartReceipt("task", attempt, AllocationId("allocation"), BackendJobId("job"), group.identity, "2026-11-20T00:00:00Z", "/tmp/s2-core")

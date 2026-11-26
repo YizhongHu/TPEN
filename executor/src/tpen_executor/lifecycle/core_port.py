@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from .._records import frozen_record
 from ..recovery import (
     CoreAdmissionUnavailable,
     MappingCoreAdmissionPort,
@@ -37,7 +37,7 @@ _REQUEST_FIELDS = frozenset(
 )
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class CoreAdmissionProcessRequest:
     """Closed inputs for one science-process admission call."""
 

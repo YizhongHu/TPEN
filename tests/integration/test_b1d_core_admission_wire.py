@@ -111,7 +111,7 @@ def _group(task_ids=("task",)):
     return ReadyGroupV2(GroupId("group-b1d-int"), members, plan)
 
 
-def _member(group, task_id="task", status="failed", root=Path(".")):
+def _member(group, task_id="task", status="failed", root=Path("."), lineage_id=None):
     attempt = AttemptId(f"attempt-{task_id}")
     start = StartReceipt(
         task_id,
@@ -132,7 +132,7 @@ def _member(group, task_id="task", status="failed", root=Path(".")):
     )
     return MemberRecoveryInputV2(
         task_id,
-        f"lineage-{task_id}",
+        f"lineage-{task_id}" if lineage_id is None else lineage_id,
         attempt,
         start,
         outcome,
@@ -173,7 +173,7 @@ def _port_admit(payload):
 
     task_id = payload["task_id"]
     group = _group((task_id,))
-    member = _member(group, task_id, status="completed")
+    member = _member(group, task_id, status="completed", lineage_id=payload["lineage_id"])
     request = CoreAdmissionProcessRequest(
         task_id=task_id,
         lineage_id=payload["lineage_id"],
