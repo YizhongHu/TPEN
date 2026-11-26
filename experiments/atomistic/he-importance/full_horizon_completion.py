@@ -118,8 +118,11 @@ def read_full_horizon_completion(
     if chain:
         if chain[-1]["successor_attempt_id"] != value["final_attempt_id"]:
             raise FullHorizonCompletionError("attempt_chain does not terminate at final_attempt_id")
-        if len({link["successor_attempt_id"] for link in chain}) != len(chain):
-            raise FullHorizonCompletionError("attempt_chain contains a repeated successor")
+        visited = {chain[0]["predecessor_attempt_id"]}
+        for link in chain:
+            if link["successor_attempt_id"] in visited:
+                raise FullHorizonCompletionError("attempt_chain contains a cycle")
+            visited.add(link["successor_attempt_id"])
         for previous, current in zip(chain, chain[1:]):
             if previous["successor_attempt_id"] != current["predecessor_attempt_id"]:
                 raise FullHorizonCompletionError("attempt_chain is disconnected")

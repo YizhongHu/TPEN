@@ -52,10 +52,10 @@ def _single_component(value: object, field: str) -> str:
 def _absolute_normalized(value: object, field: str) -> Path:
     if type(value) is not str or not value:
         raise AttemptDeltaError(f"{field} must be a non-empty absolute path")
-    path = Path(value)
-    if not path.is_absolute() or path != Path(_os_path_norm(value)):
+    normalized = _os_path_norm(value)
+    if value.startswith("//") or value != normalized or not value.startswith("/"):
         raise AttemptDeltaError(f"{field} must be absolute and normalized")
-    return path
+    return Path(value)
 
 
 def _os_path_norm(value: str) -> str:
@@ -105,7 +105,8 @@ def parse_attempt_delta(raw: str | bytes) -> AttemptDelta:
             raise AttemptDeltaError("fresh load.path must be null")
     else:
         load_path = _absolute_normalized(load_path, "load.path")
-        if load_path == core or core in load_path.parents:
+        attempt_root = core.parent
+        if load_path == attempt_root or attempt_root in load_path.parents:
             raise AttemptDeltaError("train_resume load.path must be outside the current attempt leaf")
     canonical = _canonical(value)
     raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else raw

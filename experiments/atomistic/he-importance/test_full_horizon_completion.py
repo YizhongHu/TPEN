@@ -62,3 +62,23 @@ def test_completion_reader_rejects_noncanonical_record(tmp_path: Path) -> None:
     path.write_text(json.dumps(_record()) + "\n", encoding="utf-8")
     with pytest.raises(completion.FullHorizonCompletionError, match="canonical"):
         completion.read_full_horizon_completion(core, group_digest="b" * 64, task_id="task-7", science_digest="ab" * 32, target_iterations=100)
+
+
+@pytest.mark.parametrize(
+    "chain",
+    [
+        [{"predecessor_attempt_id": "A", "successor_attempt_id": "A", "request_digest": "a" * 64}],
+        [
+            {"predecessor_attempt_id": "A", "successor_attempt_id": "B", "request_digest": "a" * 64},
+            {"predecessor_attempt_id": "B", "successor_attempt_id": "A", "request_digest": "b" * 64},
+        ],
+    ],
+)
+def test_completion_reader_rejects_attempt_chain_cycles(tmp_path: Path, chain: list[dict[str, str]]) -> None:
+    core = tmp_path / "groups" / ("b" * 64) / "task-7" / "attempt-S" / "core"
+    record = _record()
+    record["attempt_chain"] = chain
+    record["final_attempt_id"] = chain[-1]["successor_attempt_id"]
+    _write(core, record)
+    with pytest.raises(completion.FullHorizonCompletionError, match="cycle"):
+        completion.read_full_horizon_completion(core, group_digest="b" * 64, task_id="task-7", science_digest="ab" * 32, target_iterations=100)

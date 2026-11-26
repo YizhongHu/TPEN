@@ -49,3 +49,18 @@ def test_attempt_delta_accepts_resume_outside_current_leaf() -> None:
     value = _value()
     value["load"] = {"mode": "train_resume", "path": "/store/groups/g/t/previous/core/checkpoints/final"}
     assert delta.parse_attempt_delta(_raw(value)).load_mode == "train_resume"
+
+
+@pytest.mark.parametrize("path", ["/store/groups/g/t/a/core/", "/store/groups/g/t/a//core", "/store/groups/g/t/a/./core", "//store/groups/g/t/a/core"])
+def test_attempt_delta_rejects_non_normalized_absolute_paths(path: str) -> None:
+    value = _value()
+    value["attempt_core_dir"] = path
+    with pytest.raises(delta.AttemptDeltaError, match="absolute and normalized"):
+        delta.parse_attempt_delta(_raw(value))
+
+
+def test_attempt_delta_rejects_all_paths_in_current_attempt_root() -> None:
+    value = _value()
+    value["load"] = {"mode": "train_resume", "path": "/store/groups/g/t/a/checkpoint"}
+    with pytest.raises(delta.AttemptDeltaError, match="outside the current attempt leaf"):
+        delta.parse_attempt_delta(_raw(value))
