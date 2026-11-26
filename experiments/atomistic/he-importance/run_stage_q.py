@@ -1160,12 +1160,22 @@ def _require_truthful_cell(
     runner_trainer = getattr(getattr(resolved, "runner", None), "trainer", None)
     actual_top = getattr(trainer, "local_energy_chunk_size", None)
     actual_consumed = getattr(runner_trainer, "local_energy_chunk_size", None)
-    if actual_top != expected_chunk_size or actual_consumed != expected_chunk_size:
-        raise StageQSelectionError(
-            "truthfulness guard refused local_energy_chunk_size: "
-            f"expected {expected_chunk_size!r}, top-level trainer={actual_top!r}, "
-            f"runner.trainer={actual_consumed!r}"
-        )
+    for field, actual in (
+        ("trainer.local_energy_chunk_size", actual_top),
+        ("runner.trainer.local_energy_chunk_size", actual_consumed),
+    ):
+        try:
+            train_config.validate_local_energy_chunk_size(actual)
+        except train_config.TrainConfigResolutionError as error:
+            raise StageQSelectionError(
+                f"truthfulness guard refused local_energy_chunk_size at {field}: {error}"
+            ) from error
+        if type(actual) is not type(expected_chunk_size) or actual != expected_chunk_size:
+            raise StageQSelectionError(
+                "truthfulness guard refused local_energy_chunk_size: "
+                f"expected {expected_chunk_size!r}, top-level trainer={actual_top!r}, "
+                f"runner.trainer={actual_consumed!r}"
+            )
 
     identity = cell.manifest["scientific_identity"]
     if architecture_stage_family.is_family_stage(str(cell.manifest["stage"])):
@@ -1718,10 +1728,14 @@ def execute(
 
         _require_truthful_cell(selection.cell, config, local_energy_chunk_size)
         launched_resolved = OmegaConf.to_container(config, resolve=True)
-        if launched_resolved != recorded_resolved:
+        difference = _first_config_difference(
+            recorded_resolved, launched_resolved, "resolved_config"
+        )
+        if difference is not None:
+            path, recorded_value, launched_value = difference
             raise StageQSelectionError(
-                "launch truthfulness guard refused field 'resolved_config': "
-                f"recorded value {recorded_resolved!r}, launched value {launched_resolved!r}"
+                f"launch truthfulness guard refused field '{path}': "
+                f"recorded value {recorded_value!r}, launched value {launched_value!r}"
             )
         runner_kwargs: dict[str, object] = {"topology": topology}
         if runtime_callbacks:

@@ -17,6 +17,7 @@ optimizer_grid = importlib.import_module("experiments.atomistic.he-importance.op
 architecture_stage_family = importlib.import_module(
     "experiments.atomistic.he-importance.architecture_stage_family"
 )
+scan_manifest = importlib.import_module("experiments.atomistic.he-importance.scan_manifest")
 train_config = importlib.import_module("experiments.atomistic.he-importance.train_config")
 run_stage_q = importlib.import_module("experiments.atomistic.he-importance.run_stage_q")
 
@@ -183,6 +184,107 @@ def test_family_stage_resolver_and_launch_adapter_forward_bound(
     )
     assert descriptor.launch_adapter(cell, {}, local_energy_chunk_size=3) == 0
     assert calls[0]["local_energy_chunk_size"] == 3
+
+
+def test_family_stage_execute_records_bound_and_launch_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The enabled A/B route persists and consumes one bounded configuration."""
+
+    stage = architecture_stage_family.family_stage_codes()[0]
+    context = architecture_stage_family.render_family_inventory(stage)[0][
+        "configurations"
+    ][0]["scientific_identity"]["context"]
+    args = run_stage_q.build_parser().parse_args(
+        ["--stage", stage, "--context", stage, "--literal-configuration",
+         json.dumps(context["literal_configuration"]), "--seed-label", "810001", "--walkers", "8",
+         "--local-energy-chunk-size", "3", "--output-root", str(tmp_path)]
+    )
+    facts = {
+        "global_rank": 0, "global_size": 1, "local_rank": 0, "local_size": 1,
+        "node_rank": 0, "node_size": 1, "host": "cpu-test", "pid": 1,
+        "device": "cpu", "job_id": "cpu-test", "device_identity": None,
+    }
+    launched: list[object] = []
+
+    def fake_runner(config: object, *, topology: object, runtime_callbacks: object = ()) -> int:
+        del topology, runtime_callbacks
+        launched.append(config)
+        output = Path(config.run.dir)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "resolved_config.yaml").write_text(OmegaConf.to_yaml(config), encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(run_stage_q, "_execution_facts", lambda: facts)
+    monkeypatch.setattr(run_stage_q.launch, "run_from_config", fake_runner)
+    assert run_stage_q.execute(args) == 0
+    assert len(launched) == 1
+    config = launched[0]
+    assert config.trainer.local_energy_chunk_size == 3
+    assert config.runner.trainer.local_energy_chunk_size == 3
+    receipt = next(tmp_path.glob("**/selection_receipt.json"))
+    report = json.loads(receipt.read_text(encoding="utf-8"))
+    assert report["local_energy_chunking"] == {
+        "activation_path": "stage_q_cli", "effective_chunk_size": 3
+    }
+    saved = next(tmp_path.glob("**/resolved_config.yaml"))
+    saved_config = OmegaConf.load(saved)
+    assert saved_config.trainer.local_energy_chunk_size == 3
+    assert saved_config.runner.trainer.local_energy_chunk_size == 3
+
+
+def _o1_manifest_args(output_root: Path, *, dry_run: bool) -> object:
+    manifest = scan_manifest.load_manifest(scan_manifest.MANIFEST_PATH)
+    row = next(row for row in manifest["rows"] if row["status"] == "available")
+    argv = ["--manifest", str(scan_manifest.MANIFEST_PATH), "--row", row["row_id"],
+            "--local-energy-chunk-size", "3", "--output-root", str(output_root)]
+    if dry_run:
+        argv.append("--dry-run")
+    return run_stage_q.build_parser().parse_args(argv)
+
+
+def test_o1_manifest_dry_run_reports_bound_without_writing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert run_stage_q.execute(_o1_manifest_args(tmp_path, dry_run=True)) == 0
+    output = capsys.readouterr().out
+    assert "local_energy_chunking" in output
+    assert '"effective_chunk_size": 3' in output
+    assert not tuple(tmp_path.rglob("selection_receipt.json"))
+    assert not tuple(tmp_path.rglob("resolved_config.yaml"))
+
+
+def test_o1_manifest_execute_records_bound_and_launch_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    facts = {
+        "global_rank": 0, "global_size": 1, "local_rank": 0, "local_size": 1,
+        "node_rank": 0, "node_size": 1, "host": "cpu-test", "pid": 1,
+        "device": "cpu", "job_id": "cpu-test", "device_identity": None,
+    }
+    launched: list[object] = []
+
+    def fake_runner(config: object, *, topology: object, runtime_callbacks: object = ()) -> int:
+        del topology, runtime_callbacks
+        launched.append(config)
+        output = Path(config.run.dir)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "resolved_config.yaml").write_text(OmegaConf.to_yaml(config), encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(run_stage_q, "_execution_facts", lambda: facts)
+    monkeypatch.setattr(run_stage_q.launch, "run_from_config", fake_runner)
+    assert run_stage_q.execute(_o1_manifest_args(tmp_path, dry_run=False)) == 0
+    assert len(launched) == 1
+    config = launched[0]
+    assert config.trainer.local_energy_chunk_size == 3
+    assert config.runner.trainer.local_energy_chunk_size == 3
+    receipt = next(tmp_path.glob("**/selection_receipt.json"))
+    report = json.loads(receipt.read_text(encoding="utf-8"))
+    assert report["local_energy_chunking"]["effective_chunk_size"] == 3
+    saved = OmegaConf.load(next(tmp_path.glob("**/resolved_config.yaml")))
+    assert saved.trainer.local_energy_chunk_size == 3
+    assert saved.runner.trainer.local_energy_chunk_size == 3
 
 
 def test_real_hydra_runner_constructs_and_executes_bounded_helper(
