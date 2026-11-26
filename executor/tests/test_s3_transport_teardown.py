@@ -583,6 +583,14 @@ def test_dispatcher_cancel_waits_one_shared_deadline_across_remote_leaves(
 
     fake_parsl.hooks["run_leaf"] = _never_acknowledging_leaf
     _interrupt_once(monkeypatch)
+    wait_bounds: list[tuple[str, float]] = []
+    real_wait_for_teardown = _RemoteLeaf.wait_for_teardown
+
+    def recording_wait_for_teardown(handle: _RemoteLeaf, bound: float) -> bool:
+        wait_bounds.append((handle.request.task_id, bound))
+        return real_wait_for_teardown(handle, bound)
+
+    monkeypatch.setattr(_RemoteLeaf, "wait_for_teardown", recording_wait_for_teardown)
     dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path), transport=_transport(teardown_timeout=0.3))
     group = _group("s3c-cancel-m3", "first", "second")
     lifecycle = _two_slot_lifecycle(tmp_path)
@@ -590,9 +598,14 @@ def test_dispatcher_cancel_waits_one_shared_deadline_across_remote_leaves(
     with pytest.raises(KeyboardInterrupt, match="S3C cancellation"):
         dispatcher.run(group, _runs(tmp_path, "first", "second"), lifecycle, timeout=60)
     elapsed = time.monotonic() - started
-    # One shared 0.3s deadline for both live leaves costs ~0.3s total; a
-    # per-record bound (the mutant) costs ~0.3s per remote record, ~0.6s here.
-    assert elapsed < 0.5
+    # The first wait receives the full teardown budget and the second receives
+    # only the remainder of that same absolute deadline.  The M7 mutant gives
+    # each leaf a fresh 0.3s bound, so the second bound is not smaller.
+    assert [task_id for task_id, _bound in wait_bounds] == ["first", "second"]
+    assert 0 <= wait_bounds[1][1] < wait_bounds[0][1] <= 0.3
+    # Keep only a loose wall-clock sanity bound; the detector above is
+    # deterministic and does not depend on scheduler timing.
+    assert elapsed < 5
     manifest = lifecycle.store.manifest(group)
     assert {attempt.outcome_receipt.status for attempt in manifest.attempts} == {"remote-quiescence-unconfirmed"}
     assert manifest.segments == ()
