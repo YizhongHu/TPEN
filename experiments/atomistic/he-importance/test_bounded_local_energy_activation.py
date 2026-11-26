@@ -197,7 +197,7 @@ def test_family_stage_execute_records_bound_and_launch_config(
     ][0]["scientific_identity"]["context"]
     args = run_stage_q.build_parser().parse_args(
         ["--stage", stage, "--context", stage, "--literal-configuration",
-         json.dumps(context["literal_configuration"]), "--seed-label", "810001", "--walkers", "8",
+         json.dumps(context["literal_configuration"]), "--seed-label", "830001", "--walkers", "8",
          "--local-energy-chunk-size", "3", "--output-root", str(tmp_path)]
     )
     facts = {
