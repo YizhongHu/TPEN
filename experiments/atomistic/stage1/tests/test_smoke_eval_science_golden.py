@@ -10,6 +10,8 @@ import sys
 import tarfile
 from pathlib import Path
 
+import pytest
+
 from experiments.atomistic.stage1.protocol import (
     CHECKPOINT_EVIDENCE_SCHEMA,
     HOOKE2_ACT50_A27,
@@ -28,6 +30,20 @@ from experiments.atomistic.stage1.protocol import (
 ROOT = Path(__file__).parents[1]
 REPO_ROOT = ROOT.parents[2]
 CONFIG_ROOT = ROOT / "configs"
+_IMPORT_AFFECTING_ENV_VARS = frozenset(
+    {
+        "PYTHONPATH",
+        "PYTHONSAFEPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+        "PYTHONNOUSERSITE",
+        "PYTHONPLATLIBDIR",
+        "PYTHONCASEOK",
+        "PYTHONEXECUTABLE",
+        "__PYVENV_LAUNCHER__",
+    }
+)
 
 
 def _science_snapshot() -> bytes:
@@ -140,7 +156,7 @@ print(json.dumps(out, indent=2, sort_keys=True) + "\n", end="")
 '''
 
 
-def _base_snapshot(*, hostile_pythonpath: Path | None = None) -> bytes:
+def _base_snapshot() -> bytes:
     """Run the same serializer from an isolated exact-merge-base checkout."""
 
     base = subprocess.check_output(
@@ -159,11 +175,8 @@ def _base_snapshot(*, hostile_pythonpath: Path | None = None) -> bytes:
         env = {
             key: value
             for key, value in os.environ.items()
-            if not key.startswith("PYTHON")
+            if key not in _IMPORT_AFFECTING_ENV_VARS
         }
-        if hostile_pythonpath is not None:
-            env["PYTHONPATH"] = str(hostile_pythonpath)
-            env["PYTHONSAFEPATH"] = "1"
         return subprocess.check_output(
             [sys.executable, "-c", _BASE_SCRIPT, str(checkout.resolve())],
             cwd=checkout.resolve(), env=env, text=False,
@@ -183,8 +196,12 @@ def test_native_and_act50_science_rows_are_byte_identical_to_merge_base() -> Non
     assert _science_snapshot() == _base_snapshot()
 
 
-def test_merge_base_serializer_rejects_head_pythonpath_self_comparison() -> None:
-    """A hostile checkout path cannot redirect the exact-base serializer."""
+def test_merge_base_serializer_rejects_head_pythonpath_self_comparison(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hostile parent environment cannot redirect the exact-base serializer."""
 
-    assert _science_snapshot() == _base_snapshot(hostile_pythonpath=REPO_ROOT)
+    monkeypatch.setenv("PYTHONPATH", str(REPO_ROOT))
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    assert _science_snapshot() == _base_snapshot()
 
