@@ -192,7 +192,7 @@ def test_review_crossed_overlay_request_refused(tmp_path: Path) -> None:
 
 
 def test_review_same_lowercase_gpu_slot_succeeds_v2(tmp_path: Path) -> None:
-    gpu = "GPU-3b0c1234-1234-1234-1234-123456789abc"
+    gpu = "gpu-3b0c1234-1234-1234-1234-123456789abc"
     base = _allocation(1)
     group, allocation, _, configured, fence = _begin(
         tmp_path, task_id="member", facts=base.facts,
@@ -208,11 +208,16 @@ def test_review_same_lowercase_gpu_slot_succeeds_v2(tmp_path: Path) -> None:
         _environment(tmp_path), allocation, fence, group, group.members[0],
         configured, selected_slot=selected,
     )
+    assert environment.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == gpu.upper()
     request = LeafRequest.for_attempt(
         fence, allocation, configured, environment, selected_slot=selected,
     )
     assert request.environment.env["TPEN_PLACEMENT_RECEIPT_VERSION"] == "2"
-    assert request.environment.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == gpu.upper()
+    assert request.environment.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == gpu
+    assert request.environment.env["CUDA_VISIBLE_DEVICES"] == gpu
+    decoded = LeafRequest.decode(request.encode())
+    assert decoded.environment.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == gpu
+    assert decoded.environment.env["CUDA_VISIBLE_DEVICES"] == gpu
 
 
 def test_review_mapping_order_is_not_foreign() -> None:
