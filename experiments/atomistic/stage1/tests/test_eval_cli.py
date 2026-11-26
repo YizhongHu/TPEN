@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -16,8 +17,8 @@ from experiments.atomistic.stage1.select_eval import select_rows
 from experiments.atomistic.stage1.launch import _binding_token, command_for_row
 from experiments.atomistic.stage1.protocol import (
     HE_H2_EVAL_CHECKPOINTS, HOOKE2_ACT50_SIGMOID_PROFILE, HOOKE2_ACT50_A27, MANIFEST_SCHEMA,
-    STAGE1_PROTOCOL, build_manifest, config_identities, derive_smoke_request,
-    manifest_hash, validate_gateway_binding,
+    STAGE1_PROTOCOL, ProtocolError, bind_evaluation_manifest, build_manifest,
+    config_identities, derive_smoke_request, manifest_hash, validate_gateway_binding,
 )
 from experiments.toolkit.run_paths import resolve_run_dir
 
@@ -88,8 +89,15 @@ def _cli(module, *args):
     assert result.returncode == 0, result.stderr
 
 
-def test_production_cli_roundtrip(phase1, tmp_path):
+@pytest.mark.parametrize("symlink_root", [False, True], ids=["direct", "alias"])
+def test_production_cli_roundtrip(phase1, tmp_path, symlink_root, monkeypatch):
     """Evidence, planner and selector preserve bindings admitted by the gateway."""
+    if symlink_root:
+        alias = tmp_path / "results-alias"
+        os.symlink(phase1["rows"][0]["results_root"], alias, target_is_directory=True)
+        for row in phase1["rows"]:
+            row["results_root"] = str(alias)
+        phase1 = _document(phase1["rows"])
     source, evidence, planned, selected = [tmp_path / name for name in
                                           ("phase1.json", "evidence.json", "phase2.json", "rows.jsonl")]
     source.write_text(json.dumps(phase1))
@@ -105,6 +113,11 @@ def test_production_cli_roundtrip(phase1, tmp_path):
     roster = {0, 1000} if phase1["rows"][0].get("evaluation_roster") else set(HOOKE2_ACT50_A27)
     assert {row["checkpoint"] for row in rows} == roster
     for row in rows:
+        directory = Path(row["checkpoint_dir"])
+        model = Path(row["checkpoint_file"])
+        assert directory == directory.resolve()
+        assert model == model.resolve() == directory / "model.pt"
+        assert row["results_root"] == phase1["rows"][0]["results_root"]
         admitted = validate_gateway_binding(binding=_binding_token(row), expected_kinds={"eval"})
         assert admitted == row
         assert "--binding" in command_for_row(row, python=sys.executable,
@@ -114,6 +127,44 @@ def test_production_cli_roundtrip(phase1, tmp_path):
          "--lineage", first["lineage"], "--checkpoint", first["checkpoint"],
          "--stream", first["stream"], "--output", selected)
     assert json.loads(selected.read_text()) == first
+    from experiments.atomistic.stage1 import eval as eval_module
+
+    seen = []
+
+    def run(cfg, **kwargs):
+        seen.append(str(cfg.load.path))
+        assert cfg.trajectory_identity.checkpoint_file == first["checkpoint_file"]
+        return 0
+
+    monkeypatch.setattr(eval_module, "run_from_config", run)
+    monkeypatch.setattr(sys, "argv", ["stage1-eval", "--binding", _binding_token(first)])
+    assert eval_module.main() == 0
+    assert seen == [first["checkpoint_dir"]]
+
+
+@pytest.mark.parametrize("bad_binding", ["alias", "foreign-file"])
+def test_caller_checkpoint_binding_remains_strict(phase1, tmp_path, bad_binding):
+    """Reject caller aliases and a canonical model outside its bound directory."""
+    evidence = build_evidence(phase1)
+    roster = sorted({int(key.split(":")[-1]) for key in evidence["checkpoints"]})
+    row = bind_evaluation_manifest(
+        phase1_rows=phase1["rows"], checkpoints=roster, checkpoint_evidence=evidence,
+    )[0]
+    model = Path(row["checkpoint_file"])
+    if bad_binding == "alias":
+        alias = tmp_path / "checkpoint-alias"
+        os.symlink(row["checkpoint_dir"], alias, target_is_directory=True)
+        row["checkpoint_dir"] = str(alias)
+        row["checkpoint_file"] = str(alias / "model.pt")
+        message = "canonical absolute paths"
+    else:
+        foreign = tmp_path / "foreign" / "model.pt"
+        foreign.parent.mkdir()
+        foreign.write_bytes(model.read_bytes())
+        row["checkpoint_file"] = str(foreign.resolve())
+        message = "checkpoint_file must equal checkpoint_dir/model.pt"
+    with pytest.raises(ProtocolError, match=message):
+        validate_gateway_binding(binding=_binding_token(row), expected_kinds={"eval"})
 
 
 @pytest.mark.parametrize("wrong_kind", [False, True], ids=["failed", "other-row-kind"])

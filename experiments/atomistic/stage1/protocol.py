@@ -2906,7 +2906,9 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
             digest = bindings.get(key)
             if digest is None:
                 raise ProtocolError(f"checkpoint evidence missing digest for {key!r}")
-            checkpoint_dir = resolve_run_dir(train_row) / "checkpoints" / f"step_{checkpoint:06d}"
+            # Derived identities use canonical paths even when the results root
+            # is an alias; caller-supplied bindings still face the strict check.
+            checkpoint_dir = (resolve_run_dir(train_row) / "checkpoints" / f"step_{checkpoint:06d}").resolve()
             for stream in range(eval_streams):
                 row_id = stable_row_id(system=system, kind="eval", lineage=lineage,
                                        checkpoint=checkpoint, stream=stream)
@@ -2925,7 +2927,7 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
                     "expected_physical_system_id": physical_ids[system],
                     "experiment_name": train_row["experiment_name"], "sector": train_row["sector"],
                     "run_id": f"{system}-lineage-{lineage}-checkpoint-{checkpoint}-stream-{stream}",
-                    "checkpoint_dir": str(checkpoint_dir), "checkpoint_file": str(checkpoint_dir / "model.pt"),
+                    "checkpoint_dir": str(checkpoint_dir), "checkpoint_file": str((checkpoint_dir / "model.pt").resolve()),
                     "checkpoint_sha256": digest, "depends_on": train_row["row_id"],
                     **({
                         "science_profile": str(hooke_profile),
