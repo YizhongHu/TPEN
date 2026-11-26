@@ -33,6 +33,8 @@ def _rows(owner, profile, results_root="/external/segmented-act50"):
 
 
 def test_overlay_changes_only_recorder_format() -> None:
+    with pytest.raises(protocol.ProtocolError, match="no diagnostics overlay"):
+        protocol.overlay_path_for_system("he", profile="diagnostics-v3")
     original = (STUDY / "configs/overlays/hooke-diagnostics-v1.yaml").read_text()
     segmented = (STUDY / "configs/overlays/hooke-diagnostics-v3.yaml").read_text()
     assert segmented == original.replace(
