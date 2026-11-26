@@ -1,0 +1,23 @@
+[
+  {
+    "id": "accept-forged-science-smoke-marker",
+    "target": "experiments/atomistic/stage1/protocol.py",
+    "old": "execution = train_row.get(\"execution\")",
+    "new": "execution = train_row.get(\"execution\") or {\"stop_at\": 1000}",
+    "killer": "experiments/atomistic/stage1/tests/test_smoke_eval_roster.py::test_science_row_cannot_claim_smoke_roster"
+  },
+  {
+    "id": "ignore-smoke-stop-at-prefix",
+    "target": "experiments/atomistic/stage1/protocol.py",
+    "old": "derived = tuple(step for step in steps if step <= stop_at and step in science)",
+    "new": "derived = tuple(step for step in steps if step in science)",
+    "killer": "experiments/atomistic/stage1/tests/test_smoke_eval_roster.py::test_derived_roster_is_exact_prefix_and_marker_is_identity_bearing[hooke2-sigmoid50k-v1]"
+  },
+  {
+    "id": "collect-smoke-as-science-grid",
+    "target": "experiments/atomistic/stage1/collect.py",
+    "old": "if not smoke_manifest:",
+    "new": "if True:",
+    "killer": "experiments/atomistic/stage1/tests/test_smoke_eval_roster.py::test_collect_accepts_smoke_roster_and_refuses_science_roster"
+  }
+]
