@@ -20,10 +20,10 @@ MUTANTS = [
     {"id": "manifest-strict", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "store.manifest(request.group)", "new": "None", "killer": "test_manifest_reconstruction_refuses_foreign_component"},
     {"id": "binding-missing", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "stored = store.read_canonical(_BINDING_PATH, CanonicalGroupBinding.decode)", "new": "stored = None", "killer": "test_missing_binding_refuses"},
     {"id": "binding-regular", "target": "executor/src/tpen_executor/storage.py", "old": "_require_regular(path, \"canonical receipt\")", "new": "pass", "killer": "test_symlink_binding_refuses"},
-    {"id": "binding-canonical", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "stored.encode() != Path(os.path.join(store.root, _BINDING_PATH)).read_bytes()", "new": "False", "killer": "test_noncanonical_binding_refuses"},
+    {"id": "binding-canonical", "target": "executor/src/tpen_executor/storage.py", "old": "if payload != record.encode():", "new": "if False:", "killer": "test_noncanonical_binding_refuses"},
     {"id": "binding-exact", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "stored != expected", "new": "False", "killer": "test_foreign_binding_refuses"},
-    {"id": "binding-ledger-anchor", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "stored.controller_lineage != generations[0].record_digest", "new": "False", "killer": "test_tampered_anchor_refuses_without_caller_anchor"},
-    {"id": "authority-fence", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "acquired = store.acquire_controller_generation(request.group, request.controller)", "new": "acquired = request.controller", "killer": "test_stale_controller_refuses"},
+    {"id": "binding-ledger-anchor", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "anchor=generations[0].record_digest", "new": "anchor=stored.controller_lineage", "killer": "test_tampered_anchor_refuses_without_caller_anchor"},
+    {"id": "authority-fence", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "acquired = store.acquire_controller_generation(request.group, request.controller)", "new": "acquired = request.controller", "killer": "test_successor_generation_reentry_and_retry"},
     {"id": "fresh-invocation", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "uuid4().hex", "new": "'fixed'", "killer": "test_reentry_gets_fresh_invocation_location"},
 ]
 
@@ -140,7 +140,10 @@ def test_missing_binding_refuses(tmp_path):
 def test_symlink_binding_refuses(tmp_path):
     group, controller = _fixture(); root = tmp_path / "store"
     initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
-    binding = root / "group-binding.json"; binding.unlink(); binding.symlink_to(root / "missing"); before = _tree(tmp_path)
+    binding = root / "group-binding.json"
+    elsewhere = tmp_path / "elsewhere.json"
+    elsewhere.write_bytes(binding.read_bytes())
+    binding.unlink(); binding.symlink_to(elsewhere); before = _tree(tmp_path)
     with pytest.raises(GroupStoreRefused): reentry(_request(group, controller), root)
     assert _tree(tmp_path) == before
 
@@ -186,7 +189,14 @@ def test_deployment_and_controller_lineage_mismatch_refuse(tmp_path):
     before = _tree(tmp_path)
     with pytest.raises(GroupStoreRefused): reentry(_request(group, controller, deployment_lineage="foreign"), root)
     assert _tree(tmp_path) == before
-    with pytest.raises(GroupStoreRefused): reentry(_request(group, controller, controller_lineage_anchor="d" * 64), root)
+
+
+def test_foreign_caller_controller_anchor_refuses(tmp_path):
+    group, controller = _fixture(); root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
+    before = _tree(tmp_path)
+    with pytest.raises(GroupStoreRefused):
+        reentry(_request(group, controller, controller_lineage_anchor="d" * 64), root)
     assert _tree(tmp_path) == before
 
 

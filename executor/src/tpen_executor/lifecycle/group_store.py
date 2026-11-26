@@ -6,7 +6,6 @@ Allocation/controller incarnation is admitted only through the controller-genera
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any, ClassVar
 from uuid import uuid4
 
@@ -150,13 +149,13 @@ def reentry(request: ReentryGroupStoreRequest, root: str | os.PathLike[str]) -> 
         store.manifest(request.group)
         stored = store.read_canonical(_BINDING_PATH, CanonicalGroupBinding.decode)
         generations = store.controller_generations(request.group)
-        if not generations or stored.controller_lineage != generations[0].record_digest:
+        if not generations:
             raise GroupStoreRefused("group binding crosses controller generation-one ledger")
         if (request.controller_lineage_anchor is not None
                 and request.controller_lineage_anchor != generations[0].record_digest):
             raise GroupStoreRefused("controller lineage anchor is foreign")
         expected = _binding(request, anchor=generations[0].record_digest)
-        if stored != expected or stored.encode() != Path(os.path.join(store.root, _BINDING_PATH)).read_bytes():
+        if stored != expected:
             raise GroupStoreRefused("group binding mismatch or non-canonical bytes")
         # The immutable binding carries only the stable lineage anchor.  The
         # successor's allocation/controller incarnation is admitted by the
