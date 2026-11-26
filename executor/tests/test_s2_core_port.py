@@ -23,8 +23,8 @@ MUTANTS = [
     {"id": "cross-digest", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if request.successor_request.get("science_input_digest") != request.science_input_digest:', "new": 'if False:', "killer": "test_crossed_digest_refused_before_spawn"},
     {"id": "timeout", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if outcome.timed_out:', "new": 'if False:', "killer": "test_timeout_is_unavailable"},
     {"id": "nonzero", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if outcome.returncode != 0:', "new": 'if False:', "killer": "test_nonzero_exit_is_unavailable"},
-    {"id": "launch-failure", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'except OSError as exc:', "new": 'except RuntimeError as exc:', "killer": "test_launch_failure_is_unavailable"},
-    {"id": "malformed-json", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'decoded = json.loads(payload)', "new": 'decoded = {}', "killer": "test_malformed_json_is_unavailable"},
+    {"id": "launch-failure", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'except (OSError, TypeError, ValueError, RuntimeError) as exc:', "new": 'except TypeError as exc:', "killer": "test_launch_failure_is_unavailable"},
+    {"id": "malformed-json", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'decoded = json.loads(payload)', "new": 'decoded = None', "killer": "test_malformed_json_is_unavailable"},
     {"id": "strict-decoder", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'return decoder.admit(member)', "new": 'return decoded', "killer": "test_extra_field_is_unavailable"},
 ]
 
@@ -80,6 +80,25 @@ def test_malformed_or_wrong_wire_is_unavailable(tmp_path: Path, payload: dict[st
     member = _member()
     worker = _Worker(payload)
     port, out, err = _port(tmp_path, worker)
+    with pytest.raises(CoreAdmissionUnavailable):
+        port.admit(_request(member), member, stdout_path=out, stderr_path=err)
+
+
+def test_extra_field_is_unavailable(tmp_path: Path) -> None:
+    """The closed decoder, rather than a duplicate classifier, rejects extras."""
+
+    member = _member()
+    payload = {
+        "schema": "tpen-core-admission-v1",
+        "outcome": "completed",
+        "admission": "unknown",
+        "checkpoint": "absent",
+        "quiescence": "unknown",
+        "profile": None,
+        "reason": "completed",
+        "extra": "reject-me",
+    }
+    port, out, err = _port(tmp_path, _Worker(payload))
     with pytest.raises(CoreAdmissionUnavailable):
         port.admit(_request(member), member, stdout_path=out, stderr_path=err)
 

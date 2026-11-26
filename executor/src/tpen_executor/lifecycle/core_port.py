@@ -153,7 +153,7 @@ class ScienceProcessCoreAdmissionPort:
                 stderr_path=stderr_path,
                 timeout=timeout,
             )
-        except OSError as exc:
+        except (OSError, TypeError, ValueError, RuntimeError) as exc:
             raise CoreAdmissionUnavailable("core admission process could not be launched") from exc
         if outcome.timed_out:
             raise CoreAdmissionUnavailable("core admission process timed out")
