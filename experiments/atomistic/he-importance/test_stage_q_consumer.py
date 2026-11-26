@@ -140,18 +140,25 @@ def test_early_inspect_source_change_refuses_without_archive(tmp_path: Path, whi
 
 
 def test_mappingproxy_records_serialize_and_archive_is_json(tmp_path: Path) -> None:
-    from dataclasses import dataclass
     from types import MappingProxyType
 
-    @dataclass(frozen=True)
-    class FrozenRecord:
-        evidence: Mapping[str, Any]
-
-    value = consumer._record(FrozenRecord(MappingProxyType({"kept": MappingProxyType({"value": 1})})))
-    assert value == {"evidence": {"kept": {"value": 1}}}
     manifest, campaign, row, roots = _fixture(tmp_path)
+    identity = {"schema": "tpen-config-identity-v1", "sha256": "2" * 64}
+    manifest_value = json.loads(manifest.read_bytes())
+    for segment in manifest_value["segments"]:
+        segment["resolved_config_identity"] = identity
+    manifest.write_bytes(_compact(manifest_value))
+
+    def inspect(core: str | Path) -> dict[str, Any]:
+        evidence = _inspect(core)
+        evidence["resolved_config_identity"] = identity
+        return evidence
+
+    results = run_results.read(manifest, inspect_run=inspect)
+    assert isinstance(results.chains[0].segments[0].resolved_config_identity, MappingProxyType)
     archive = tmp_path / "archive.json"
-    body = consumer.consume_stage_q(manifest, campaign, row, 2, archive, inspect_run=_inspect, task_id="task-a")
+    body = consumer.consume_stage_q(manifest, campaign, row, 2, archive, inspect_run=inspect, task_id="task-a")
+    assert body["selected_chain"][0]["resolved_config_identity"] == identity
     assert json.loads(archive.read_bytes()) == body
 
 
