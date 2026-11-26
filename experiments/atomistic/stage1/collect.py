@@ -137,12 +137,15 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
         raise CollectionError("smoke phase-2 rows must carry the smoke-prefix-v1 marker")
     phase1_train_rows = [row for row in phase1_rows if row.get("kind") == "train"]
     if smoke_manifest:
-        expected_smoke = {
-            (str(row["system"]), int(row["lineage"]), checkpoint, stream)
-            for row in phase1_train_rows
-            for checkpoint in smoke_eval_roster(row)
-            for stream in range(STAGE1_PROTOCOL.eval_streams)
-        }
+        try:
+            expected_smoke = {
+                (str(row["system"]), int(row["lineage"]), checkpoint, stream)
+                for row in phase1_train_rows
+                for checkpoint in smoke_eval_roster(row)
+                for stream in range(STAGE1_PROTOCOL.eval_streams)
+            }
+        except ProtocolError as exc:
+            raise CollectionError(str(exc)) from exc
         actual_smoke = {
             (str(row.get("system")), row.get("lineage"), row.get("checkpoint"), row.get("stream"))
             for row in eval_rows

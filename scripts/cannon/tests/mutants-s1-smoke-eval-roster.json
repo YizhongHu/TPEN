@@ -1,17 +1,17 @@
 [
   {
-    "id": "accept-forged-science-smoke-marker",
+    "id": "gateway-marker-check-removed",
     "target": "experiments/atomistic/stage1/protocol.py",
-    "old": "execution = train_row.get(\"execution\")",
-    "new": "execution = train_row.get(\"execution\") or {\"stop_at\": 1000}",
-    "killer": "experiments/atomistic/stage1/tests/test_smoke_eval_roster.py::test_science_row_cannot_claim_smoke_roster"
+    "old": "if effective_kind == \"train\" and marker == SMOKE_EVAL_ROSTER_MARKER:",
+    "new": "if False:",
+    "killer": "experiments/atomistic/stage1/tests/test_smoke_eval_roster.py::test_train_gateway_rejects_marker_before_config_or_runner"
   },
   {
-    "id": "ignore-smoke-stop-at-prefix",
+    "id": "smoke-stop-bound-removed",
     "target": "experiments/atomistic/stage1/protocol.py",
-    "old": "derived = tuple(step for step in steps if step <= stop_at and step in science)",
-    "new": "derived = tuple(step for step in steps if step in science)",
-    "killer": "experiments/atomistic/stage1/tests/test_smoke_eval_roster.py::test_derived_roster_is_exact_prefix_and_marker_is_identity_bearing[hooke2-sigmoid50k-v1]"
+    "old": "or updates <= 0 or stop_at <= 0 or stop_at >= updates",
+    "new": "or updates <= 0 or stop_at <= 0",
+    "killer": "experiments/atomistic/stage1/tests/test_smoke_eval_roster.py::test_saved_smoke_admission_rejects_nonpositive_or_terminal_stop"
   },
   {
     "id": "collect-smoke-as-science-grid",
@@ -19,5 +19,12 @@
     "old": "if not smoke_manifest:",
     "new": "if True:",
     "killer": "experiments/atomistic/stage1/tests/test_smoke_eval_roster.py::test_collect_accepts_smoke_roster_and_refuses_science_roster"
+  },
+  {
+    "id": "e2e-science-roster-refusal-removed",
+    "target": "experiments/atomistic/stage1/tests/test_smoke_eval_production_e2e.py",
+    "old": "with pytest.raises(CollectionError, match=\"smoke-prefix-v1\"):",
+    "new": "if False:",
+    "killer": "experiments/atomistic/stage1/tests/test_smoke_eval_production_e2e.py::test_smoke_roster_real_gateway_chain"
   }
 ]

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import copy
+import json
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +13,8 @@ from types import SimpleNamespace
 import pytest
 
 from experiments.atomistic.stage1 import collect as collect_module
+from experiments.atomistic.stage1 import train as train_module
+from experiments.atomistic.stage1.launch import _binding_token
 from experiments.atomistic.stage1.protocol import (
     CHECKPOINT_EVIDENCE_SCHEMA,
     HOOKE2_ACT50_A27,
@@ -26,6 +31,7 @@ from experiments.atomistic.stage1.protocol import (
     manifest_hash,
     smoke_eval_roster,
     stable_row_id,
+    validate_gateway_binding,
 )
 
 
@@ -93,9 +99,10 @@ def test_derived_roster_is_exact_prefix_and_marker_is_identity_bearing(
     assert all(row["evaluation_roster"] == SMOKE_EVAL_ROSTER_MARKER for row in phase1)
     assert all(smoke_eval_roster(row) == (0, 1_000) for row in phase1)
     assert all("evaluation_roster" not in row for row in _science_rows(tmp_path, profile=profile))
-    assert manifest_hash(phase1) != manifest_hash([{
-        key: value for key, value in phase1[0].items() if key != "evaluation_roster"
-    }])
+    markerless = copy.deepcopy(phase1)
+    for row in markerless:
+        row.pop("evaluation_roster")
+    assert manifest_hash(phase1) != manifest_hash(markerless)
 
 
 def test_derive_refuses_empty_roster_and_unknown_marker(tmp_path: Path) -> None:
@@ -160,6 +167,129 @@ def test_science_row_cannot_claim_smoke_roster(tmp_path: Path) -> None:
                 science_profile=HOOKE2_ACT50_SIGMOID_PROFILE,
             ),
         )
+
+
+@pytest.mark.parametrize("marker", (SMOKE_EVAL_ROSTER_MARKER, "smoke-prefix-v2"))
+def test_train_gateway_rejects_marker_before_config_or_runner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, marker: str,
+) -> None:
+    """Only a derived train request may reach the runner with a roster marker."""
+
+    science = next(
+        row for row in _science_rows(tmp_path, profile=HOOKE2_ACT50_SIGMOID_PROFILE)
+        if row["kind"] == "train"
+    )
+    forged = copy.deepcopy(science)
+    forged["evaluation_roster"] = marker
+    if marker == SMOKE_EVAL_ROSTER_MARKER:
+        forged.pop("execution", None)
+    monkeypatch.setattr(
+        train_module, "build_train_config",
+        lambda *_args, **_kwargs: pytest.fail("marker refusal must precede config composition"),
+    )
+    with monkeypatch.context() as isolated:
+        isolated.setattr(sys, "argv", ["stage1-train", "--binding", _binding_token(forged)])
+        with pytest.raises(ProtocolError, match="evaluation_roster|execution.stop_at"):
+            train_module.main()
+
+    derived = derive_smoke_request(
+        science, results_root=str(tmp_path / "smoke"), stop_at=1_000,
+    )
+    assert validate_gateway_binding(
+        binding=_binding_token(derived), expected_kinds={"train"},
+    ) == derived
+
+
+def _independent_evidence(
+    phase1_rows: list[dict[str, object]], checkpoints: tuple[int, ...],
+) -> dict[str, object]:
+    """Build checkpoint evidence without consulting the roster under test."""
+
+    return {
+        "schema": CHECKPOINT_EVIDENCE_SCHEMA,
+        "phase1_manifest_hash": manifest_hash(phase1_rows),
+        "phase1_train_row_hashes": {
+            f"{row['system']}:{row['lineage']}": manifest_hash([row])
+            for row in phase1_rows
+        },
+        "checkpoints": {
+            f"{row['system']}:{row['lineage']}:{checkpoint}": "c" * 64
+            for row in phase1_rows
+            for checkpoint in checkpoints
+        },
+    }
+
+
+@pytest.mark.parametrize("stop_at", (0, 50_000))
+def test_saved_smoke_admission_rejects_nonpositive_or_terminal_stop(
+    tmp_path: Path, stop_at: int,
+) -> None:
+    """Binder, planner, and collector all reject forged saved boundaries."""
+
+    phase1 = _smoke_phase1(tmp_path, profile=HOOKE2_ACT50_SIGMOID_PROFILE)
+    for row in phase1:
+        row["execution"] = {"stop_at": stop_at}
+    evidence = _independent_evidence(phase1, tuple(
+        checkpoint for checkpoint in HOOKE2_ACT50_A27 if checkpoint <= stop_at
+    ))
+    with pytest.raises(ProtocolError, match="stop_at"):
+        bind_evaluation_manifest(
+            phase1_rows=phase1,
+            checkpoints=list(HOOKE2_ACT50_A27),
+            checkpoint_evidence=evidence,
+            expected_physical_system_id={"hooke2": "d" * 64},
+            source_sha=SOURCE_SHA,
+            config_sha256=config_identities(
+                config_root=CONFIG_ROOT, systems=("hooke2",),
+                science_profile=HOOKE2_ACT50_SIGMOID_PROFILE,
+            ),
+            protocol=replace(STAGE1_PROTOCOL, eval_walkers=2, eval_draws=3),
+            phase1_manifest_hash=manifest_hash(phase1),
+        )
+
+    phase1_path = tmp_path / f"phase1-{stop_at}.json"
+    phase1_path.write_text(json.dumps({
+        "schema": "stage1/v4", "phase": 1,
+        "manifest_hash": manifest_hash(phase1), "rows": phase1,
+    }) + "\n", encoding="utf-8")
+    evidence_path = tmp_path / f"evidence-{stop_at}.json"
+    evidence_path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")
+    output = tmp_path / f"phase2-{stop_at}.json"
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "plan.py"), "--output", str(output),
+         "--phase1-manifest", str(phase1_path), "--checkpoint-bindings", str(evidence_path)],
+        check=False, capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert "stop_at" in result.stderr
+    assert not output.exists()
+
+    document = {
+        "schema": "stage1/v4", "manifest_hash": manifest_hash(phase1), "rows": phase1,
+    }
+    with pytest.raises(collect_module.CollectionError, match="stop_at"):
+        collect_module.collect(document)
+
+
+def test_saved_smoke_admission_accepts_positive_nonterminal_control(tmp_path: Path) -> None:
+    """A valid 1000-step derived boundary remains admitted everywhere."""
+
+    phase1 = _smoke_phase1(tmp_path, profile=HOOKE2_ACT50_SIGMOID_PROFILE, lineages=1)
+    evidence = _evidence(phase1, HOOKE2_ACT50_A27)
+    bound = bind_evaluation_manifest(
+        phase1_rows=phase1,
+        checkpoints=list(HOOKE2_ACT50_A27),
+        checkpoint_evidence=evidence,
+        expected_physical_system_id={"hooke2": "d" * 64},
+        source_sha=SOURCE_SHA,
+        config_sha256=config_identities(
+            config_root=CONFIG_ROOT, systems=("hooke2",),
+            science_profile=HOOKE2_ACT50_SIGMOID_PROFILE,
+        ),
+        protocol=replace(STAGE1_PROTOCOL, eval_walkers=2, eval_draws=3),
+        phase1_manifest_hash=manifest_hash(phase1),
+    )
+    assert {row["checkpoint"] for row in bound} == {0, 1_000}
 
 
 def test_collect_accepts_smoke_roster_and_refuses_science_roster(

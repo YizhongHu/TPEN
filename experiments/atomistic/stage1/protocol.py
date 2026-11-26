@@ -920,10 +920,15 @@ def smoke_eval_roster(
         raise ProtocolError("smoke-prefix-v1 row requires execution.stop_at")
     stop_at = execution.get("stop_at")
     steps = train_row.get("checkpoint_steps")
-    if (type(stop_at) is not int or not isinstance(steps, (list, tuple))
+    updates = train_row.get("updates")
+    if (type(stop_at) is not int or type(updates) is not int
+            or updates <= 0 or stop_at <= 0 or stop_at >= updates
+            or not isinstance(steps, (list, tuple))
             or any(type(step) is not int for step in steps)
             or stop_at not in steps):
-        raise ProtocolError("smoke-prefix-v1 stop_at must name a retained checkpoint")
+        raise ProtocolError(
+            "smoke-prefix-v1 stop_at must be positive, below H, and name a retained checkpoint"
+        )
     science = set(_smoke_eval_science_roster(train_row, science_roster))
     derived = tuple(step for step in steps if step <= stop_at and step in science)
     if not derived:
@@ -1356,6 +1361,19 @@ def validate_gateway_binding(*, binding: str, config: str | None = None,
         )
     if kind is not None and effective_kind != kind:
         raise ProtocolError("binding kind does not match gateway")
+    marker = row.get("evaluation_roster")
+    if marker is not None and marker != SMOKE_EVAL_ROSTER_MARKER:
+        raise ProtocolError("unsupported evaluation_roster marker")
+    if effective_kind == "train" and marker == SMOKE_EVAL_ROSTER_MARKER:
+        # The marker is an identity-bearing admission field.  A canonical
+        # science row cannot opt into the smoke roster by adding the marker;
+        # only a fully derived request with its bounded execution datum may
+        # cross the train gateway.
+        execution = row.get("execution")
+        if not isinstance(execution, Mapping) or set(execution) != {"stop_at"}:
+            raise ProtocolError(
+                "smoke-prefix-v1 train rows require execution.stop_at"
+            )
     _validate_act50_variant(row)
     row_config = row.get("config")
     if not isinstance(row_config, str):
