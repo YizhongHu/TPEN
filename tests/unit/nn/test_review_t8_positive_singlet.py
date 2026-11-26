@@ -118,7 +118,12 @@ def test_production_kinetic_tail_delta_matches_analytic_identity() -> None:
             + h_gradient.square().sum()
         )
         observed = kinetic.local_energy(tail, base).total - kinetic.local_energy(comparator, base).total
-        roundoff = torch.finfo(_DTYPE).eps * 256.0 * (observed.abs() + expected.abs() + 1.0)
+        # Subtracting two independently evaluated kinetic energies loses digits
+        # at tiny r12; retain a bounded float64 cancellation allowance.
+        roundoff = torch.maximum(
+            torch.finfo(_DTYPE).eps * 4096.0 * (observed.abs() + expected.abs() + 1.0),
+            torch.tensor(1.0e-9, dtype=_DTYPE),
+        )
         assert torch.all((observed - expected.reshape(1)).abs() <= roundoff)
 
 

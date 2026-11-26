@@ -58,6 +58,8 @@ def validate_hooke_singlet_batch(
 class PositiveSingletReadout(nn.Module):
     """Unsigned, exchange-symmetric scalar log-amplitude readout."""
 
+    spatial_exchange_symmetry = True
+
     def __init__(
         self,
         *,

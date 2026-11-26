@@ -447,6 +447,31 @@ class TPENWaveFunction(EquivariantMap):
     def _readout_output(self, batch: ElectronBatch) -> WavefunctionOutput:
         """Build readout output once for the public evaluation path."""
 
+        output = self._readout_output_once(batch)
+        if not getattr(self.readout, "spatial_exchange_symmetry", False):
+            return output
+        if batch.n_electrons != 2:
+            raise ValueError("spatial singlet symmetrization requires exactly two electrons")
+        swapped_positions = batch.positions.index_select(
+            -2,
+            torch.tensor((1, 0), device=batch.positions.device),
+        )
+        exchanged = self._readout_output_once(replace(batch, positions=swapped_positions))
+        aux = dict(output.aux)
+        for key, value in output.aux.items():
+            other = exchanged.aux.get(key)
+            if isinstance(value, torch.Tensor) and isinstance(other, torch.Tensor):
+                aux[key] = 0.5 * (value + other)
+        return WavefunctionOutput(
+            logabs=0.5 * (output.logabs + exchanged.logabs),
+            sign=output.sign,
+            phase=output.phase,
+            aux=aux,
+        )
+
+    def _readout_output_once(self, batch: ElectronBatch) -> WavefunctionOutput:
+        """Build one readout evaluation without model-boundary symmetrization."""
+
         basis_features = self.basis(batch) if self.basis is not None else None
         context = TPENForwardContext(batch=batch, basis_features=basis_features)
         embedded_input = basis_features if basis_features is not None else batch
