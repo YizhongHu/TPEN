@@ -1,0 +1,4 @@
+[
+  {"id": "explicit-env", "target": "executor/src/tpen_executor/lifecycle/group_runtime.py", "old": "materialize(env=self.env)", "new": "materialize()", "killer": "test_materialize_forwards_explicit_env_to_both_owner_processes"},
+  {"id": "finite-deadline", "target": "executor/src/tpen_executor/lifecycle/group_runtime.py", "old": "raise ValueError(\"timeouts must be positive\")", "new": "pass", "killer": "test_dispatcher_has_finite_deadlines"}
+]
