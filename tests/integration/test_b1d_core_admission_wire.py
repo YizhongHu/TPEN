@@ -190,7 +190,12 @@ def _port_admit(payload):
         stdout_path=Path(payload["stdout_path"]),
         stderr_path=Path(payload["stderr_path"]),
     )
-    return {"verdict": None if verdict is None else verdict.to_dict()}
+    return {
+        "verdict": None if verdict is None else verdict.to_dict(),
+        "tpen_modules": sorted(
+            name for name in sys.modules if name == "tpen" or name.startswith("tpen.")
+        ),
+    }
 
 
 def _controller(payload):
@@ -448,6 +453,7 @@ def test_real_process_port_producer_to_decoder_round_trip(tmp_path: Path) -> Non
     result = executor_call(_EXECUTOR_CHILD, tmp_path, "port", payload)
     assert result["verdict"]["outcome"] == "completed"
     assert result["verdict"]["admission"] == "unknown"
+    assert result["tpen_modules"] == []
 
 
 def test_real_process_port_missing_leaf_returns_none(tmp_path: Path) -> None:
@@ -467,6 +473,7 @@ def test_real_process_port_missing_leaf_returns_none(tmp_path: Path) -> None:
     }
     result = executor_call(_EXECUTOR_CHILD, tmp_path, "port", payload)
     assert result["verdict"] is None
+    assert result["tpen_modules"] == []
 
 
 def test_executor_rejects_core_quiescence_claim(tmp_path: Path) -> None:

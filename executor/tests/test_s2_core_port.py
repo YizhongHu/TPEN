@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -18,8 +20,9 @@ from tpen_executor.workers import ProcessOutcome
 
 
 MUTANTS = [
-    {"id": "cross-task", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if request.task_id != member.task_id:', "new": 'if False:', "killer": "test_crossed_task_refused_before_spawn"},
+    {"id": "cross-member-task", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if request.task_id != member.task_id:', "new": 'if False:', "killer": "test_crossed_member_task_refused_before_spawn"},
     {"id": "cross-lineage", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if request.lineage_id != member.lineage_id:', "new": 'if False:', "killer": "test_crossed_lineage_refused_before_spawn"},
+    {"id": "cross-successor-task", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if predecessor.get("task_id") != request.task_id or successor.get("task_id") != request.task_id:', "new": 'if False:', "killer": "test_crossed_task_refused_before_spawn"},
     {"id": "cross-digest", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if request.successor_request.get("science_input_digest") != request.science_input_digest:', "new": 'if False:', "killer": "test_crossed_digest_refused_before_spawn"},
     {"id": "timeout", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if outcome.timed_out:', "new": 'if False:', "killer": "test_timeout_is_unavailable"},
     {"id": "nonzero", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if outcome.returncode != 0:', "new": 'if False:', "killer": "test_nonzero_exit_is_unavailable"},
@@ -122,11 +125,23 @@ def test_timeout_is_unavailable(tmp_path: Path) -> None:
 
 def test_crossed_task_refused_before_spawn(tmp_path: Path) -> None:
     member = _member()
-    successor = {"predecessor": {"task_id": "other"}, "successor": {"task_id": "task"}, "science_input_digest": "a" * 64}
+    successor = {"predecessor": {"task_id": "other"}, "successor": {"task_id": "other"}, "science_input_digest": "a" * 64}
     worker = _Worker(None)
     port, out, err = _port(tmp_path, worker)
     with pytest.raises(CoreAdmissionUnavailable):
         port.admit(_request(member, successor_request=successor), member, stdout_path=out, stderr_path=err)
+    assert worker.calls == 0
+
+
+def test_crossed_member_task_refused_before_spawn(tmp_path: Path) -> None:
+    member = _member()
+    crossed_member = member.__class__(
+        "other", member.lineage_id, member.attempt_id, member.start_receipt, member.outcome_receipt
+    )
+    worker = _Worker(None)
+    port, out, err = _port(tmp_path, worker)
+    with pytest.raises(CoreAdmissionUnavailable):
+        port.admit(_request(member), crossed_member, stdout_path=out, stderr_path=err)
     assert worker.calls == 0
 
 
@@ -172,10 +187,56 @@ def test_malformed_json_is_unavailable(tmp_path: Path) -> None:
 def test_control_interpreter_has_no_tpen_import(tmp_path: Path) -> None:
     member = _member()
     port = ScienceProcessCoreAdmissionPort()
-    assert port.admit(
-        _request(member), member, stdout_path=tmp_path / "out.json", stderr_path=tmp_path / "err.log"
-    ) is None
-    assert not any(name == "tpen" or name.startswith("tpen.") for name in sys.modules)
+    stderr_path = tmp_path / "err.log"
+    with pytest.raises(CoreAdmissionUnavailable):
+        port.admit(
+            _request(member), member, stdout_path=tmp_path / "out.json", stderr_path=stderr_path
+        )
+    assert stderr_path.exists()
+    assert "No module named 'tpen'" in stderr_path.read_text(encoding="utf-8")
+
+    child = r'''
+import json
+import sys
+from pathlib import Path
+
+from tpen_executor.lifecycle.core_port import ScienceProcessCoreAdmissionPort
+from tpen_executor.recovery import CoreAdmissionUnavailable
+from test_s2_core_port import _member, _request
+
+root = Path(sys.argv[1])
+member = _member()
+stderr_path = root / "fresh-err.log"
+try:
+    ScienceProcessCoreAdmissionPort().admit(
+        _request(member), member, stdout_path=root / "fresh-out.json", stderr_path=stderr_path
+    )
+except CoreAdmissionUnavailable:
+    pass
+else:
+    raise AssertionError("missing science interpreter must park")
+print(json.dumps({
+    "modules": sorted(name for name in sys.modules if name == "tpen" or name.startswith("tpen.")),
+    "stderr_exists": stderr_path.exists(),
+    "stderr": stderr_path.read_text(encoding="utf-8"),
+}))
+'''
+    child_env = os.environ.copy()
+    child_env["PYTHONPATH"] = os.pathsep.join(
+        (str(Path(__file__).parent), child_env.get("PYTHONPATH", ""))
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", child, str(tmp_path)],
+        cwd=tmp_path,
+        env=child_env,
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    result = json.loads(completed.stdout)
+    assert result["modules"] == []
+    assert result["stderr_exists"] is True
+    assert "No module named 'tpen'" in result["stderr"]
 
 
 def test_mutant_rows_have_unique_source_anchors_and_killers() -> None:
