@@ -164,11 +164,28 @@ def test_foreign_binding_refuses(tmp_path):
     assert _tree(tmp_path) == before
 
 
-@pytest.mark.parametrize("generation,predecessor", [(1, None), (3, "wrong")])
-def test_stale_skipped_or_forked_successor_refuses(tmp_path, generation, predecessor):
+def test_stale_controller_generation_refuses(tmp_path):
     group, controller = _fixture(); root = tmp_path / "store"
     initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
-    candidate = ControllerGenerationV1(group.group_id, generation, AllocationId("allocation-2"), BackendJobId("job-2"), "b" * 64, "nonce-2", predecessor)
+    candidate = ControllerGenerationV1(group.group_id, 1, AllocationId("allocation-stale"), BackendJobId("job-2"), "b" * 64, "nonce-stale", None)
+    before = _tree(tmp_path)
+    with pytest.raises(GroupStoreRefused): reentry(_request(group, candidate), root)
+    assert _tree(tmp_path) == before
+
+
+def test_skipped_controller_generation_refuses(tmp_path):
+    group, controller = _fixture(); root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
+    candidate = ControllerGenerationV1(group.group_id, 3, AllocationId("allocation-skipped"), BackendJobId("job-2"), "b" * 64, "nonce-skipped", controller.record_digest)
+    before = _tree(tmp_path)
+    with pytest.raises(GroupStoreRefused): reentry(_request(group, candidate), root)
+    assert _tree(tmp_path) == before
+
+
+def test_forked_controller_generation_refuses(tmp_path):
+    group, controller = _fixture(); root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
+    candidate = ControllerGenerationV1(group.group_id, 2, AllocationId("allocation-forked"), BackendJobId("job-2"), "b" * 64, "nonce-forked", "e" * 64)
     before = _tree(tmp_path)
     with pytest.raises(GroupStoreRefused): reentry(_request(group, candidate), root)
     assert _tree(tmp_path) == before
