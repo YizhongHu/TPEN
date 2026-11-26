@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +24,7 @@ import numpy as np
 from omegaconf import OmegaConf
 
 from tpen.artifacts import RunContext
-from tpen.checkpoint import CheckpointRestored
+from tpen.checkpoint import CheckpointRestored, checkpoint_ref, resolve_checkpoint_dir
 from tpen.events import DomainState, Started, started
 from tpen.events import Event as TypedEvent
 from tpen.events import Occurrence, Subscription
@@ -42,7 +43,7 @@ EVENTS_FILENAME = "events.jsonl"
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 _V3_COLUMNS = (
     "iteration_step",
@@ -439,7 +440,7 @@ def _require_keys(value: Mapping[str, Any], required: set[str], *, optional: set
     if not isinstance(value, Mapping):
         raise ValueError("v3 object must be a JSON object")
     allowed = required | (optional or set())
-    if set(value) != allowed:
+    if not required <= set(value) or not set(value) <= allowed:
         missing = sorted(required - set(value))
         extra = sorted(set(value) - allowed)
         raise ValueError(f"v3 object keys invalid (missing={missing}, extra={extra})")
@@ -464,6 +465,35 @@ def _safe_relative_path(value: Any, *, name: str) -> str:
     if path.is_absolute() or any(part in {"", ".", ".."} for part in value.split("/")):
         raise ValueError(f"v3 {name} escapes its owning history root")
     return value
+
+
+def _reject_symlink_components(root: Path, relative: str, *, name: str) -> None:
+    """Reject a path whose directory or file component is a symlink."""
+
+    current = root
+    try:
+        root_stat = current.lstat()
+    except OSError as exc:
+        raise ValueError(f"v3 {name} owning history root is unavailable") from exc
+    if os.path.islink(current) or not stat.S_ISDIR(root_stat.st_mode):
+        raise ValueError(f"v3 {name} owning history root is not a real directory")
+    for component in Path(relative).parts:
+        current = current / component
+        try:
+            mode = current.lstat().st_mode
+        except OSError as exc:
+            raise ValueError(f"v3 {name} path is missing") from exc
+        if os.path.islink(current):
+            raise ValueError(f"v3 {name} path contains a symlink")
+
+
+def _finite_number(value: Any, *, name: str, minimum: float = 0.0) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"v3 {name} must be a finite number >= {minimum}")
+    result = float(value)
+    if not math.isfinite(result) or result < minimum:
+        raise ValueError(f"v3 {name} must be a finite number >= {minimum}")
+    return result
 
 
 def _validate_v3_contract(contract: Any) -> None:
@@ -514,8 +544,11 @@ class _V3Node:
     digests: list[str]
     fragments: list[tuple[dict[str, Any], dict[str, np.ndarray], dict[str, Any]]]
     seals: list[dict[str, Any]]
+    effective_seals: list[dict[str, Any]]
     completion: dict[str, int] | None
     rows: dict[str, np.ndarray]
+    active_steps: set[int]
+    active_identities: set[tuple[int, int]]
     provenance: list[dict[str, Any]]
 
 
@@ -564,6 +597,7 @@ def _validate_v3_sidecar(
     step_from_name = re.fullmatch(r"step-(\d{12,})\.json", sidecar_name)
     if Path(sidecar_rel).parent.as_posix() != "fragments" or step_from_name is None or int(step_from_name.group(1)) != int(event["start_step"]):
         raise ValueError("v3 fragment sidecar does not use the approved step naming")
+    _reject_symlink_components(root, sidecar_rel, name="sidecar")
     sidecar_path = root / sidecar_rel
     if not sidecar_path.is_file() or _sha256(sidecar_path) != event["sidecar_sha256"]:
         raise ValueError("v3 sidecar is missing or its hash does not match the fragment event")
@@ -586,6 +620,11 @@ def _validate_v3_sidecar(
     step = _int(event["start_step"], name="fragment start_step")
     if event["end_step"] != step + 1 or sidecar["start_step"] != step or sidecar["end_step"] != step + 1:
         raise ValueError("v3 fragment interval is invalid")
+    _int(sidecar["group_index"], name="sidecar group_index")
+    _int(sidecar["start_step"], name="sidecar start_step")
+    _int(sidecar["end_step"], name="sidecar end_step", minimum=1)
+    _int(sidecar["walker_count"], name="sidecar walker_count", minimum=1)
+    _int(sidecar["row_count"], name="sidecar row_count", minimum=1)
     if sidecar["group_index"] != event["group_index"] or event["group_index"] != step // int(contract["partition_size_steps"]):
         raise ValueError("v3 fragment group_index is invalid")
     if sidecar["walker_count"] != contract["walker_count"] or sidecar["row_count"] != contract["walker_count"]:
@@ -598,6 +637,7 @@ def _validate_v3_sidecar(
     compressed_rel = _safe_relative_path(sidecar["compressed_filename"], name="compressed_filename")
     if compressed_rel != str(Path(sidecar_rel).with_suffix(".npz")):
         raise ValueError("v3 sidecar and fragment event disagree about the bundle")
+    _reject_symlink_components(root, compressed_rel, name="compressed bundle")
     bundle_path = root / compressed_rel
     if not bundle_path.is_file() or _sha256(bundle_path) != sidecar["compressed_sha256"]:
         raise ValueError("v3 bundle is missing or its hash does not match the sidecar")
@@ -611,13 +651,31 @@ def _validate_v3_sidecar(
     )
     if provenance["run_id"] != header["run_id"] or not isinstance(provenance["config_hash"], str) or not _HASH_RE.fullmatch(provenance["config_hash"]):
         raise ValueError("v3 sidecar provenance identity is invalid")
-    if provenance["source_revision"] is not None and not isinstance(provenance["source_revision"], str):
+    if provenance["source_revision"] is not None and (
+        not isinstance(provenance["source_revision"], str) or not provenance["source_revision"]
+    ):
         raise ValueError("v3 sidecar source_revision is invalid")
     if not isinstance(provenance["sampler_settings"], Mapping) or not isinstance(provenance["acceptance_proposal_stats"], list):
         raise ValueError("v3 sidecar sampler provenance is invalid")
+    if any(not isinstance(item, Mapping) for item in provenance["acceptance_proposal_stats"]):
+        raise ValueError("v3 sidecar acceptance proposal stats are invalid")
+    measurements = sidecar.get("measurements")
+    if measurements is not None:
+        if not isinstance(measurements, Mapping):
+            raise ValueError("v3 sidecar measurements must be an object")
+        allowed_measurements = {
+            "compressed_byte_count", "uncompressed_byte_count", "compression_ratio", "write_time_sec",
+        }
+        _require_keys(measurements, set(), optional=allowed_measurements)
+        for key in ("compressed_byte_count", "uncompressed_byte_count"):
+            if key in measurements:
+                _int(measurements[key], name=f"measurement {key}")
+        for key in ("compression_ratio", "write_time_sec"):
+            if key in measurements:
+                _finite_number(measurements[key], name=f"measurement {key}")
     try:
-        loaded = np.load(bundle_path, allow_pickle=False)
-        arrays = {name: loaded[name] for name in loaded.files}
+        with np.load(bundle_path, allow_pickle=False) as loaded:
+            arrays = {name: loaded[name] for name in loaded.files}
     except Exception as exc:
         raise ValueError("v3 bundle cannot be read") from exc
     if sorted(arrays) != sorted(columns):
@@ -752,7 +810,14 @@ class TrainingBatchReader:
         end_step: int | None = None,
         require_complete: bool = False,
     ) -> dict[str, np.ndarray]:
-        node = self._load_v3_node(self.root.resolve(), stack=(), seen_streams=set(), limit=None)
+        node = self._load_v3_node(
+            self.root.resolve(),
+            stack=(),
+            seen_streams=set(),
+            limit=None,
+            select_start=start_step,
+            select_end=end_step,
+        )
         self._v3_completion = node.completion
         self.provenance = {index: value for index, value in enumerate(node.provenance)}
         if require_complete and node.completion is None:
@@ -776,6 +841,9 @@ class TrainingBatchReader:
         stack: tuple[Path, ...],
         seen_streams: set[str],
         limit: int | None,
+        expected_prefix_sha256: str | None = None,
+        select_start: int | None = None,
+        select_end: int | None = None,
     ) -> _V3Node:
         if root in stack:
             raise ValueError("v3 lineage contains a cycle")
@@ -814,8 +882,8 @@ class TrainingBatchReader:
             raise ValueError("v3 parent pin event_count exceeds its committed prefix")
         if not events:
             raise ValueError("v3 history has no committed origin event")
-        if limit is not None and digests[-1] != self._expected_pin_digest(root, limit):
-            raise ValueError("v3 parent pin prefix_sha256 does not match its own event chain")
+        if limit is not None and expected_prefix_sha256 is not None and digests[-1] != expected_prefix_sha256:
+            raise ValueError("v3 parent pin prefix_sha256 does not match the pinned parent bytes")
         if limit is not None and limit < len(events):
             events = events[:limit]
             digests = digests[:limit]
@@ -830,6 +898,8 @@ class TrainingBatchReader:
         seals: list[dict[str, Any]] = []
         completion: dict[str, int] | None = None
         fragment_steps: list[int] = []
+        active_steps: set[int] = set()
+        active_identities: set[tuple[int, int]] = set()
         seal_positions: dict[int, int] = {}
         for index, event in enumerate(events):
             if event["type"] == "resume":
@@ -846,15 +916,22 @@ class TrainingBatchReader:
                 if header["origin"] == "train_resume" and step < event0_cut(events[0]):
                     raise ValueError("v3 resumed fragment precedes its supersede cut")
                 arrays, sidecar = _validate_v3_sidecar(root, header, header["contract"], event)
-                fragments.append((dict(event), arrays, sidecar))
+                for walker in arrays["walker_index"]:
+                    identity = (step, int(walker))
+                    if identity in active_identities:
+                        raise ValueError("duplicate active (iteration_step, walker_index) in v3 lineage")
+                    active_identities.add(identity)
+                active_steps.add(step)
+                selected = _select_v3_arrays(arrays, start=select_start, end=select_end)
+                fragments.append((dict(event), selected, sidecar))
                 fragment_steps.append(step)
             elif event["type"] == "window_seal":
                 group = _int(event["group_index"], name="window_seal group_index")
                 start = _int(event["start_step"], name="window_seal start_step")
                 end = _int(event["end_step"], name="window_seal end_step", minimum=1)
                 partition = int(header["contract"]["partition_size_steps"])
-                if start != group * partition or not start < end <= start + partition or group in seal_positions:
-                    raise ValueError("v3 window seal interval is invalid or duplicated")
+                if start != group * partition or not start < end <= start + partition:
+                    raise ValueError("v3 window seal interval is invalid")
                 seal_positions[group] = index
                 seals.append(dict(event))
             elif event["type"] == "complete":
@@ -885,58 +962,101 @@ class TrainingBatchReader:
                 if not isinstance(parent_pin["root"], str) or not Path(parent_pin["root"]).is_absolute():
                     raise ValueError("v3 parent root must be an absolute path")
                 parent_root = Path(parent_pin["root"])
-                parent_node = self._load_v3_node(parent_root.resolve(), stack=stack + (root,), seen_streams=local_seen, limit=count)
+                parent_node = self._load_v3_node(
+                    parent_root.resolve(),
+                    stack=stack + (root,),
+                    seen_streams=local_seen,
+                    limit=count,
+                    expected_prefix_sha256=parent_pin["prefix_sha256"],
+                    select_start=select_start,
+                    select_end=select_end,
+                )
                 if parent_node.header["contract"] != header["contract"]:
                     raise ValueError("v3 resumed contract is incompatible with its parent")
-            _require_keys(checkpoint, {"path", "manifest_sha256", "model_sha256", "next_iteration", "completed_updates"})
-            if not isinstance(checkpoint["path"], str) or not Path(checkpoint["path"]).is_absolute():
-                raise ValueError("v3 checkpoint.path must be an absolute path")
-            _hash(checkpoint["manifest_sha256"], name="manifest_sha256")
-            _hash(checkpoint["model_sha256"], name="model_sha256")
-            _int(checkpoint["next_iteration"], name="checkpoint next_iteration")
-            _int(checkpoint["completed_updates"], name="checkpoint completed_updates")
-            if checkpoint["completed_updates"] > checkpoint["next_iteration"] or checkpoint["next_iteration"] != cut:
-                raise ValueError("v3 checkpoint counters do not bind supersede_from_step")
+            self._validate_v3_checkpoint(checkpoint, header, parent_node, cut)
         elif origin["type"] == "genesis":
             if header["origin"] != "fresh":
                 raise ValueError("v3 genesis header has the wrong origin")
         inherited_rows = parent_node.rows if parent_node is not None else {}
-        local_arrays = [arrays for _, arrays, _ in fragments]
+        local_arrays = [arrays for _, arrays, _ in fragments if arrays]
         rows = _merge_v3_rows(inherited_rows, local_arrays, cut)
-        if parent_node is not None and not _v3_has_scheduled_prefix(parent_node.rows, header["contract"], cut):
+        inherited_steps = parent_node.active_steps if parent_node is not None else set()
+        inherited_ids = parent_node.active_identities if parent_node is not None else set()
+        if parent_node is not None and not _v3_has_scheduled_prefix(inherited_steps, header["contract"], cut):
             raise ValueError("v3 parent pin does not cover the required scheduled prefix")
-        inherited_seals = [dict(seal) for seal in (parent_node.seals if parent_node is not None else []) if int(seal["end_step"]) <= cut]
+        partition = int(header["contract"]["partition_size_steps"])
+        inherited_seals = [
+            dict(seal)
+            for seal in (parent_node.effective_seals if parent_node is not None else [])
+            if int(seal["end_step"]) <= cut
+            and int(seal["end_step"]) == (int(seal["group_index"]) + 1) * partition
+        ]
         effective_seals = inherited_seals + seals
         if len({int(seal["group_index"]) for seal in effective_seals}) != len(effective_seals):
             raise ValueError("v3 lineage contains duplicate active window seals")
-        self._validate_v3_seals(events, seals, fragments, parent_node, rows, header["contract"], cut, completion)
-        self._validate_v3_completion(completion, rows, effective_seals, parent_node, header["contract"], cut)
+        combined_steps = set(inherited_steps)
+        combined_steps = {step for step in combined_steps if step < cut} | active_steps
+        combined_ids = {identity for identity in inherited_ids if identity[0] < cut} | active_identities
+        self._validate_v3_seals(events, seals, fragments, parent_node, combined_steps, header["contract"], cut, completion)
+        self._validate_v3_completion(completion, combined_steps, effective_seals, parent_node, header["contract"], cut)
         provenance = []
         if parent_node is not None:
-            provenance.extend(dict(item, inherited=True) for item in parent_node.provenance if item.get("start_step", -1) < cut)
-        for event, _, sidecar in fragments:
+            provenance.extend(dict(item) for item in parent_node.provenance if item.get("start_step", -1) < cut)
+        for event, arrays, sidecar in fragments:
+            if not arrays:
+                continue
             provenance.append({
-                "stream_id": header["stream_id"], "run_id": header["run_id"], "root": str(root),
-                "group_index": event["group_index"], "start_step": event["start_step"],
-                "end_step": event["end_step"], "provenance": sidecar["provenance"], "inherited": False,
+                **dict(sidecar["provenance"]),
+                "stream_id": header["stream_id"],
+                "history_root": str(root),
+                "group_index": int(event["group_index"]),
+                "start_step": int(event["start_step"]),
+                "end_step": int(event["end_step"]),
             })
-        return _V3Node(root, header, events, digests, fragments, seals, completion, rows, provenance)
+        compact_fragments = [(event, {}, sidecar) for event, _, sidecar in fragments]
+        return _V3Node(
+            root, header, events, digests, compact_fragments, seals, effective_seals, completion,
+            rows, combined_steps, combined_ids, provenance,
+        )
 
     @staticmethod
-    def _expected_pin_digest(root: Path, count: int) -> str:
-        raw = (root / EVENTS_FILENAME).read_bytes()
-        lines = raw.splitlines(keepends=True)
-        if len(lines) < count:
-            raise ValueError("v3 parent pin is shorter than event_count")
-        header_hash = hashlib.sha256((root / HISTORY_FILENAME).read_bytes()).hexdigest()
-        previous = None
-        for line in lines[:count]:
-            event = _strict_json_loads(line)
-            if previous is not None and event.get("previous_event_sha256") != previous:
-                raise ValueError("v3 parent prefix chain is invalid")
-            previous = _v3_event_digest(header_hash, line)
-        assert previous is not None
-        return previous
+    def _validate_v3_checkpoint(
+        checkpoint: Mapping[str, Any],
+        header: Mapping[str, Any],
+        parent: _V3Node | None,
+        cut: int,
+    ) -> None:
+        _require_keys(checkpoint, {"path", "manifest_sha256", "model_sha256", "next_iteration", "completed_updates"})
+        path_value = checkpoint["path"]
+        if not isinstance(path_value, str) or not Path(path_value).is_absolute():
+            raise ValueError("v3 checkpoint.path must be an absolute checkpoint domain path")
+        checkpoint_path = Path(path_value)
+        try:
+            resolved_dir = resolve_checkpoint_dir(checkpoint_path)
+            ref = checkpoint_ref(resolved_dir)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ValueError("v3 checkpoint path is not a valid complete checkpoint") from exc
+        _hash(checkpoint["manifest_sha256"], name="manifest_sha256")
+        _hash(checkpoint["model_sha256"], name="model_sha256")
+        _int(checkpoint["next_iteration"], name="checkpoint next_iteration")
+        _int(checkpoint["completed_updates"], name="checkpoint completed_updates")
+        if checkpoint["manifest_sha256"] != ref.manifest_sha256 or checkpoint["model_sha256"] != ref.model_sha256:
+            raise ValueError("v3 checkpoint hashes do not match the referenced checkpoint bytes")
+        if checkpoint["next_iteration"] != ref.next_iteration or checkpoint["completed_updates"] != ref.completed_updates:
+            raise ValueError("v3 checkpoint counters do not match its manifest")
+        if checkpoint["completed_updates"] > checkpoint["next_iteration"] or checkpoint["next_iteration"] != cut:
+            raise ValueError("v3 checkpoint counters do not bind supersede_from_step")
+        expected_run_id = parent.header["run_id"] if parent is not None else header["run_id"]
+        checkpoint_run_id = ref.provenance.get("run_id")
+        if checkpoint_run_id != expected_run_id:
+            raise ValueError("v3 checkpoint provenance does not bind the pinned history")
+        if parent is not None:
+            source_revisions = {
+                item.get("source_revision") for item in parent.provenance
+                if item.get("source_revision") is not None
+            }
+            if len(source_revisions) == 1 and ref.provenance.get("git_sha") not in source_revisions:
+                raise ValueError("v3 checkpoint source provenance does not bind the pinned history")
 
     @staticmethod
     def _validate_v3_resume_event(event: Mapping[str, Any], header: Mapping[str, Any]) -> None:
@@ -953,7 +1073,7 @@ class TrainingBatchReader:
         seals: list[dict[str, Any]],
         fragments: list[tuple[dict[str, Any], dict[str, np.ndarray], dict[str, Any]]],
         parent: _V3Node | None,
-        rows: Mapping[str, np.ndarray],
+        active_steps: set[int],
         contract: Mapping[str, Any],
         cut: int,
         completion: Mapping[str, int] | None,
@@ -975,15 +1095,10 @@ class TrainingBatchReader:
                 event_index = events.index(event)
                 if event_index > seal_indices[group]:
                     raise ValueError("v3 fragment follows its window seal")
-        if parent is not None:
-            for seal in parent.seals:
-                if int(seal["end_step"]) > cut and int(seal["start_step"]) < cut:
-                    raise ValueError("v3 resume cut crosses an inherited window seal")
         for seal in seals:
             start, end = int(seal["start_step"]), int(seal["end_step"])
             expected_steps = {
-                int(step) for step in np.unique(rows.get("iteration_step", np.asarray([], dtype=np.int64)))
-                if start <= step < end
+                step for step in active_steps if start <= step < end
             }
             cadence_start = int(contract["start_step"])
             every = int(contract["every_n_steps"])
@@ -995,7 +1110,7 @@ class TrainingBatchReader:
     @staticmethod
     def _validate_v3_completion(
         completion: Mapping[str, int] | None,
-        rows: Mapping[str, np.ndarray],
+        active_steps: set[int],
         seals: list[Mapping[str, Any]],
         parent: _V3Node | None,
         contract: Mapping[str, Any],
@@ -1004,7 +1119,7 @@ class TrainingBatchReader:
         if completion is None:
             return
         next_iteration = int(completion["next_iteration"])
-        steps = set(int(step) for step in np.unique(rows.get("iteration_step", np.asarray([], dtype=np.int64))))
+        steps = set(active_steps)
         start = int(contract["start_step"])
         every = int(contract["every_n_steps"])
         expected = set(range(start, next_iteration, every)) if next_iteration > start else set()
@@ -1024,6 +1139,22 @@ def event0_cut(event: Mapping[str, Any]) -> int:
     return int(event["supersede_from_step"]) if event.get("type") == "resume" else 0
 
 
+def _select_v3_arrays(
+    arrays: Mapping[str, np.ndarray], *, start: int | None, end: int | None
+) -> dict[str, np.ndarray]:
+    """Copy only rows in the requested inclusive range from one fragment."""
+
+    if not arrays:
+        return {}
+    steps = arrays["iteration_step"]
+    mask = np.ones(len(steps), dtype=bool)
+    if start is not None:
+        mask &= steps >= int(start)
+    if end is not None:
+        mask &= steps <= int(end)
+    return {name: value[mask].copy() for name, value in arrays.items()} if bool(mask.any()) else {}
+
+
 def _merge_v3_rows(parent: Mapping[str, np.ndarray], local: Iterable[Mapping[str, np.ndarray]], cut: int) -> dict[str, np.ndarray]:
     parts: list[dict[str, np.ndarray]] = []
     if parent:
@@ -1033,18 +1164,15 @@ def _merge_v3_rows(parent: Mapping[str, np.ndarray], local: Iterable[Mapping[str
     if not parts:
         return {}
     result = {name: np.concatenate([part[name] for part in parts]) for name in parts[0]}
-    identities = set(zip(result["iteration_step"].tolist(), result["walker_index"].tolist()))
-    if len(identities) != len(result["iteration_step"]):
-        raise ValueError("duplicate active (iteration_step, walker_index) in v3 lineage")
     return result
 
 
-def _v3_has_scheduled_prefix(rows: Mapping[str, np.ndarray], contract: Mapping[str, Any], cut: int) -> bool:
+def _v3_has_scheduled_prefix(active_steps: set[int], contract: Mapping[str, Any], cut: int) -> bool:
     start, every = int(contract["start_step"]), int(contract["every_n_steps"])
     if cut <= start:
         return True
     expected = set(range(start, cut, every))
-    actual = set(int(step) for step in np.unique(rows.get("iteration_step", np.asarray([], dtype=np.int64))) if start <= step < cut)
+    actual = {int(step) for step in active_steps if start <= step < cut}
     return expected == actual
 
 
