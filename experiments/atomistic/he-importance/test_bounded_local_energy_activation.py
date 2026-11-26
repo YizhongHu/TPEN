@@ -39,8 +39,8 @@ def test_resolver_binds_both_consumed_limbs_and_default_is_unbounded(tmp_path: P
     assert bounded.runner.trainer.local_energy_chunk_size == 3
 
     legacy = train_config.resolve_train_config(cell)
-    assert legacy.trainer.local_energy_chunk_size is None
-    assert legacy.runner.trainer.local_energy_chunk_size is None
+    assert train_config.OmegaConf.select(legacy, "trainer.local_energy_chunk_size") is None
+    assert train_config.OmegaConf.select(legacy, "runner.trainer.local_energy_chunk_size") is None
 
 
 def test_truthfulness_guard_rejects_consumed_limb_drift(tmp_path: Path) -> None:

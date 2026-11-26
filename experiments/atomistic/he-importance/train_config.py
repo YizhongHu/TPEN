@@ -680,12 +680,15 @@ def resolve_train_config(
     OmegaConf.update(cfg, "sampler.n_walkers", walkers, merge=False)
     OmegaConf.update(cfg, "trainer.max_steps", stage.updates, merge=False)
     override_chunk_size = next(
-        (value for path, value in override_items if path == "trainer.local_energy_chunk_size"),
+        (value for path, value in override_items if str.__eq__(path, "trainer.local_energy_chunk_size") is True),
         _OVERRIDE_MISSING,
     )
     if override_chunk_size is not _OVERRIDE_MISSING:
         override_chunk_size = validate_local_energy_chunk_size(override_chunk_size)
-        if local_energy_chunk_size is not None and override_chunk_size != local_energy_chunk_size:
+        if local_energy_chunk_size is not None and (
+            override_chunk_size is None
+            or int.__ne__(override_chunk_size, local_energy_chunk_size) is True
+        ):
             raise TrainConfigResolutionError(
                 "local_energy_chunk_size conflicts with trainer.local_energy_chunk_size override"
             )
