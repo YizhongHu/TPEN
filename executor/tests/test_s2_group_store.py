@@ -1,6 +1,8 @@
 """S2-L2 canonical group-store creation and reopen contract."""
 
 import hashlib
+import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -11,7 +13,7 @@ from tpen_executor._codec import digest
 from tpen_executor.allocations import ControllerGenerationV1
 from tpen_executor.contracts import ExecutionPlanV2, GroupId, ProgramSpecRef, ReadyGroupV2, TaskSpec, AllocationId, BackendJobId
 from tpen_executor.lifecycle.group_store import (
-    CanonicalGroupBinding, GroupStoreRefused, InitialGroupStoreRequest, ReentryGroupStoreRequest, initial, reentry,
+    CanonicalGroupBinding, GroupStoreAuthorityPublished, GroupStoreRefused, InitialGroupStoreRequest, ReentryGroupStoreRequest, initial, reentry,
 )
 
 
@@ -25,6 +27,10 @@ MUTANTS = [
     {"id": "binding-ledger-anchor", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "anchor=generations[0].record_digest", "new": "anchor=stored.controller_lineage", "killer": "test_tampered_anchor_refuses_without_caller_anchor"},
     {"id": "authority-fence", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "acquired = store.acquire_controller_generation(request.group, request.controller)", "new": "acquired = request.controller", "killer": "test_successor_generation_reentry_and_retry"},
     {"id": "fresh-invocation", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "uuid4().hex", "new": "'fixed'", "killer": "test_reentry_gets_fresh_invocation_location"},
+    {"id": "invocation-parent-symlink", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "if not stat.S_ISDIR(info.st_mode):", "new": "if False:", "killer": "test_invocation_parent_symlink_refuses"},
+    {"id": "pre-acquire-order", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "invocation_parent = os.path.join(store.root, \"invocations\")\n        _validate_invocation_parent(invocation_parent)", "new": "invocation_parent = os.path.join(store.root, \"invocations\")\n        None", "killer": "test_regular_invocation_parent_refuses_before_acquire"},
+    {"id": "missing-controller-lock", "target": "executor/src/tpen_executor/storage.py", "old": "with _existing_lock(os.path.join(directory, _CONTROLLER_LOCK)):", "new": "with _task_lock(os.path.join(directory, _CONTROLLER_LOCK)):", "killer": "test_missing_controller_lock_refuses"},
+    {"id": "single-component-path", "target": "executor/src/tpen_executor/storage.py", "old": "raise ValueError(\"relative_path must be one non-empty filename component\")", "new": "return", "killer": "test_seams_refuse_nested_and_symlinked_ancestors"},
 ]
 
 
@@ -45,7 +51,23 @@ def _request(group, controller, **changes):
 
 
 def _tree(root):
-    return sorted((str(path.relative_to(root)), hashlib.sha256(path.read_bytes()).hexdigest()) for path in root.rglob("*") if path.is_file())
+    entries = []
+    pending = [Path(root)]
+    while pending:
+        base = pending.pop()
+        for path in sorted(base.iterdir(), key=lambda item: str(item), reverse=True):
+            info = path.lstat()
+            rel = str(path.relative_to(root))
+            if stat.S_ISLNK(info.st_mode):
+                entries.append((rel, "symlink", os.readlink(path)))
+            elif stat.S_ISDIR(info.st_mode):
+                entries.append((rel, "dir"))
+                pending.append(path)
+            elif stat.S_ISREG(info.st_mode):
+                entries.append((rel, "file", hashlib.sha256(path.read_bytes()).hexdigest()))
+            else:
+                entries.append((rel, "other"))
+    return sorted(entries)
 
 
 def test_initial_create_and_identical_reentry(tmp_path):
@@ -81,6 +103,68 @@ def test_initial_existing_root_refuses(tmp_path):
     with pytest.raises(GroupStoreRefused):
         initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
     assert _tree(tmp_path) == before
+
+
+def test_tree_detects_empty_directory_and_dangling_symlink(tmp_path):
+    before = _tree(tmp_path)
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "dangling").symlink_to(tmp_path / "missing")
+    assert _tree(tmp_path) != before
+    assert ("empty", "dir") in _tree(tmp_path)
+    assert ("dangling", "symlink", str(tmp_path / "missing")) in _tree(tmp_path)
+
+
+def test_invocation_parent_symlink_refuses(tmp_path):
+    group, controller = _fixture(); root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
+    outside = tmp_path / "outside"; outside.mkdir()
+    (root / "invocations").symlink_to(outside, target_is_directory=True)
+    before = _tree(tmp_path)
+    with pytest.raises(GroupStoreRefused): reentry(_request(group, controller), root)
+    assert _tree(tmp_path) == before
+
+
+def test_regular_invocation_parent_refuses_before_acquire(tmp_path):
+    group, controller = _fixture(); root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
+    (root / "invocations").write_bytes(b"not-a-directory")
+    successor = ControllerGenerationV1(group.group_id, 2, AllocationId("allocation-2"), BackendJobId("job-2"), "b" * 64, "nonce-2", controller.record_digest)
+    before = _tree(tmp_path)
+    with pytest.raises(GroupStoreRefused): reentry(_request(group, successor), root)
+    assert _tree(tmp_path) == before
+    assert not (root / "groups" / group.identity / "generation-2.json").exists()
+
+
+def test_post_acquire_failure_is_authority_published(tmp_path, monkeypatch):
+    group, controller = _fixture(); root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
+    successor = ControllerGenerationV1(group.group_id, 2, AllocationId("allocation-2"), BackendJobId("job-2"), "b" * 64, "nonce-2", controller.record_digest)
+    from tpen_executor.storage import DirectoryStore, ControllerGenerationRejected
+    monkeypatch.setattr(DirectoryStore, "require_current_controller", lambda *args: (_ for _ in ()).throw(ControllerGenerationRejected("superseded")))
+    with pytest.raises(GroupStoreAuthorityPublished) as error:
+        reentry(_request(group, successor), root)
+    assert not isinstance(error.value, GroupStoreRefused)
+    assert (root / "groups" / group.identity / "generation-2.json").is_file()
+
+
+def test_missing_controller_lock_refuses(tmp_path):
+    group, controller = _fixture(); root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
+    lock = root / "groups" / group.identity / "controller.lock"; lock.unlink()
+    before = _tree(tmp_path)
+    with pytest.raises(GroupStoreRefused): reentry(_request(group, controller, execution_bundle_digest="d" * 64), root)
+    assert _tree(tmp_path) == before
+    assert not lock.exists()
+
+
+def test_missing_controller_lock_matching_bundle_refuses(tmp_path):
+    group, controller = _fixture(); root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
+    lock = root / "groups" / group.identity / "controller.lock"; lock.unlink()
+    before = _tree(tmp_path)
+    with pytest.raises(GroupStoreRefused): reentry(_request(group, controller), root)
+    assert _tree(tmp_path) == before
+    assert not lock.exists()
 
 
 def test_manifest_reconstruction_refuses_foreign_component(tmp_path):
@@ -194,10 +278,35 @@ def test_forked_controller_generation_refuses(tmp_path):
 def test_group_binding_mismatch_refuses(tmp_path):
     group, controller = _fixture(); root = tmp_path / "store"
     initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
-    other, _ = _fixture(); other = ReadyGroupV2(GroupId("foreign"), other.members, other.execution_plan)
+    other, _ = _fixture()
+    other = ReadyGroupV2(group.group_id, other.members, other.execution_plan)
+    from tpen_executor.storage import DirectoryStore
+    # Keep the ledger/controller identity fixed so this detector reaches only
+    # the canonical binding's group comparison.
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(DirectoryStore, "manifest", lambda *args: None)
     before = _tree(tmp_path)
-    with pytest.raises(GroupStoreRefused): reentry(_request(other, controller), root)
-    assert _tree(tmp_path) == before
+    try:
+        with pytest.raises(GroupStoreRefused): reentry(_request(other, controller), root)
+        assert _tree(tmp_path) == before
+    finally:
+        monkeypatch.undo()
+
+
+def test_seams_refuse_nested_and_symlinked_ancestors(tmp_path):
+    group, controller = _fixture(); root = tmp_path / "store"
+    created = initial(InitialGroupStoreRequest(group, "c" * 64, "deployment-lineage", controller), root)
+    outside = tmp_path / "outside"; (outside / "subdir").mkdir(parents=True)
+    (outside / "subdir" / "existing.json").write_bytes(created.binding.encode())
+    (root / "link").symlink_to(outside, target_is_directory=True)
+    from tpen_executor.storage import DirectoryStore, FenceRejected
+    store = DirectoryStore(root)
+    with pytest.raises((FenceRejected, ValueError)):
+        store.write_once("link/subdir/new.json", created.binding.encode())
+    with pytest.raises((FenceRejected, ValueError)):
+        store.read_canonical("link/subdir/existing.json", CanonicalGroupBinding.decode)
+    store.write_once("single.json", created.binding.encode())
+    assert store.read_canonical("single.json", CanonicalGroupBinding.decode) == created.binding
 
 
 def test_deployment_and_controller_lineage_mismatch_refuse(tmp_path):

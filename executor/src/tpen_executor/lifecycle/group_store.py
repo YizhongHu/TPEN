@@ -6,6 +6,7 @@ Allocation/controller incarnation is admitted only through the controller-genera
 from __future__ import annotations
 
 import os
+import stat
 from typing import Any, ClassVar
 from uuid import uuid4
 
@@ -16,8 +17,16 @@ from ..contracts import ReadyGroupV2
 from ..storage import ControllerGenerationRejected, DirectoryStore, FenceRejected
 
 
-class GroupStoreRefused(ValueError):
+class GroupStoreError(ValueError):
+    """Base class for typed group-store admission outcomes."""
+
+
+class GroupStoreRefused(GroupStoreError):
     """The requested create or reopen cannot be admitted without mutation."""
+
+
+class GroupStoreAuthorityPublished(GroupStoreError):
+    """Controller authority advanced; outcome is uncertain and must be reconciled."""
 
 
 @frozen_record
@@ -99,6 +108,16 @@ class GroupStoreResult:
 _BINDING_PATH = "group-binding.json"
 
 
+def _validate_invocation_parent(path: str) -> None:
+    """Validate an existing invocation parent without following symlinks."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(info.st_mode):
+        raise GroupStoreRefused("invocation parent is not a real directory")
+
+
 def _binding(request: InitialGroupStoreRequest | ReentryGroupStoreRequest, *, anchor: str | None = None) -> CanonicalGroupBinding:
     controller = request.controller
     if not isinstance(request.group, ReadyGroupV2) or not isinstance(controller, ControllerGenerationV1):
@@ -157,15 +176,25 @@ def reentry(request: ReentryGroupStoreRequest, root: str | os.PathLike[str]) -> 
         expected = _binding(request, anchor=generations[0].record_digest)
         if stored != expected:
             raise GroupStoreRefused("group binding mismatch or non-canonical bytes")
+        invocation_parent = os.path.join(store.root, "invocations")
+        _validate_invocation_parent(invocation_parent)
         # The immutable binding carries only the stable lineage anchor.  The
         # successor's allocation/controller incarnation is admitted by the
         # existing monotonic generation fence and is never compared bytewise
         # with the creation-time controller.
         acquired = store.acquire_controller_generation(request.group, request.controller)
-        store.require_current_controller(request.group, acquired.generation, acquired.claimant_nonce)
-        invocation_dir = os.path.join(store.root, "invocations", uuid4().hex)
-        os.makedirs(os.path.dirname(invocation_dir), exist_ok=True)
-        os.mkdir(invocation_dir)
+        try:
+            store.require_current_controller(request.group, acquired.generation, acquired.claimant_nonce)
+            try:
+                os.mkdir(invocation_parent)
+            except FileExistsError:
+                _validate_invocation_parent(invocation_parent)
+            invocation_dir = os.path.join(invocation_parent, uuid4().hex)
+            os.mkdir(invocation_dir)
+        except (ControllerGenerationRejected, FenceRejected, OSError, ValueError, TypeError) as error:
+            raise GroupStoreAuthorityPublished(str(error)) from error
+    except GroupStoreAuthorityPublished:
+        raise
     except GroupStoreRefused:
         raise
     except (ControllerGenerationRejected, FenceRejected, OSError, ValueError, TypeError) as error:
@@ -174,6 +203,6 @@ def reentry(request: ReentryGroupStoreRequest, root: str | os.PathLike[str]) -> 
 
 
 __all__ = [
-    "CanonicalGroupBinding", "GroupStoreRefused", "GroupStoreResult",
+    "CanonicalGroupBinding", "GroupStoreAuthorityPublished", "GroupStoreError", "GroupStoreRefused", "GroupStoreResult",
     "InitialGroupStoreRequest", "ReentryGroupStoreRequest", "initial", "reentry",
 ]

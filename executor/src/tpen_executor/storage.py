@@ -339,6 +339,14 @@ def _require_regular(path: str, name: str, error_type: type[Exception] = FenceRe
         raise error_type(f"{name} is not a regular file")
 
 
+def _validate_single_component(relative_path: str) -> None:
+    """Reject absolute, empty, dot, or nested store-relative paths."""
+    if (type(relative_path) is not str or not relative_path or os.path.isabs(relative_path)
+            or os.sep in relative_path or (os.altsep and os.altsep in relative_path)
+            or relative_path in {".", ".."}):
+        raise ValueError("relative_path must be one non-empty filename component")
+
+
 def _canonical_completed_at(value: str) -> str:
     """Render a durable UTC outcome timestamp in the completion wire form."""
     try:
@@ -358,6 +366,27 @@ def _task_lock(path: str):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise FenceRejected("task lock is not a regular file")
+        fcntl.lockf(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.lockf(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _existing_lock(path: str):
+    """Hold an existing POSIX lock without repairing a missing lock file."""
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError as error:
+        raise ControllerGenerationRejected("controller lock is missing") from error
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ControllerGenerationRejected("controller lock is not a regular file")
         fcntl.lockf(fd, fcntl.LOCK_EX)
         try:
             yield
@@ -415,9 +444,13 @@ class DirectoryStore:
         object.__setattr__(self, "root", root)
 
     def write_once(self, relative_path: str, payload: bytes) -> str:
-        """Publish one canonical payload beneath this store without replacement."""
-        if type(relative_path) is not str or not relative_path or os.path.isabs(relative_path):
-            raise ValueError("relative_path must be a non-empty relative path")
+        """Publish one root-level canonical payload without replacement.
+
+        ``relative_path`` is exactly one non-empty filename component; nested
+        paths are rejected so no pre-existing symlinked ancestor can redirect
+        publication outside the store.
+        """
+        _validate_single_component(relative_path)
         destination = _lexical(os.path.join(self.root, relative_path))
         if not _inside(self.root, destination):
             raise FenceRejected("write path escapes store root")
@@ -425,9 +458,12 @@ class DirectoryStore:
         return destination
 
     def read_canonical(self, relative_path: str, decoder: Any) -> Any:
-        """Read one regular, non-symlink canonical receipt through a decoder."""
-        if type(relative_path) is not str or not relative_path or os.path.isabs(relative_path):
-            raise ValueError("relative_path must be a non-empty relative path")
+        """Read one root-level regular, non-symlink receipt through a decoder.
+
+        ``relative_path`` is exactly one non-empty filename component, which
+        prevents traversal through a pre-existing symlinked ancestor.
+        """
+        _validate_single_component(relative_path)
         path = _lexical(os.path.join(self.root, relative_path))
         if not _inside(self.root, path):
             raise FenceRejected("read path escapes store root")
@@ -514,7 +550,7 @@ class DirectoryStore:
         directory = self._controller_dir(group)
         group_id = group.group_id if isinstance(group, ReadyGroupV2) else group
         _require_directory(directory, "controller ledger", ControllerGenerationRejected)
-        with _task_lock(os.path.join(directory, _CONTROLLER_LOCK)):
+        with _existing_lock(os.path.join(directory, _CONTROLLER_LOCK)):
             return self._controller_records(directory, group_id)
 
     def _prepare_controller_dir(self, group: ReadyGroupV2) -> str:
