@@ -10,12 +10,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import Protocol, TYPE_CHECKING, TypeAlias
+from typing import Protocol, TYPE_CHECKING, TypeAlias, cast
 
 from tpen.artifacts import ArtifactManager, RunContext
 from tpen.events import Ended, Event as TypedEvent, Occurrence, Operation, Started
@@ -45,14 +45,19 @@ class _OperatorRow(Protocol):
 
 
 class _ProfilerBackend(Protocol):
-    """Required backend API; missing methods are never silently ignored."""
+    """Lifecycle backend API shared by typed summary contracts."""
 
     def start(self) -> None: ...
     def step(self) -> None: ...
     def stop(self) -> None: ...
-    def key_averages(self) -> Sequence[_OperatorRow]: ...
     def record_function(self, label: str) -> AbstractContextManager[object]: ...
     def export_chrome_trace(self, path: str) -> None: ...
+
+
+class _KeyAveragesBackend(_ProfilerBackend, Protocol):
+    """Explicit compatibility contract for fake/custom backends."""
+
+    def key_averages(self) -> Sequence[_OperatorRow]: ...
 
 
 _BackendFactory: TypeAlias = Callable[[], _ProfilerBackend]
@@ -64,8 +69,83 @@ class _RawTorchProfiler(Protocol):
     def start(self) -> None: ...
     def step(self) -> None: ...
     def stop(self) -> None: ...
-    def key_averages(self) -> Sequence[_OperatorRow]: ...
     def export_chrome_trace(self, path: str) -> None: ...
+
+    kineto_results: "_KinetoResults | None"
+
+
+class _KinetoEvent(Protocol):
+    """Typed CPU Kineto event surface used by the streaming collector."""
+
+    def name(self) -> str: ...
+    def is_hidden_event(self) -> bool: ...
+    def device_type(self) -> object: ...
+    def start_ns(self) -> int: ...
+    def end_ns(self) -> int: ...
+    def start_thread_id(self) -> int: ...
+    def end_thread_id(self) -> int: ...
+    def is_async(self) -> bool: ...
+    def is_user_annotation(self) -> bool: ...
+
+
+class _KinetoResults(Protocol):
+    def events(self) -> Iterable[_KinetoEvent]: ...
+
+
+@dataclass
+class _StreamingOperatorStats:
+    key: str
+    count: int = 0
+    cpu_time_total_us: float = 0.0
+    self_cpu_time_total_us: float = 0.0
+
+
+@dataclass(frozen=True)
+class _StreamingOperatorRow:
+    """Compact equivalent of the CPU fields used by ``FunctionEventAvg``."""
+
+    key: str
+    count: int
+    cpu_time_total_us: float
+    self_cpu_time_total_us: float
+
+    def __str__(self) -> str:
+        return (
+            f"<FunctionEventAvg key={self.key} "
+            f"self_cpu_time={_format_stream_time(self.self_cpu_time_total_us)} "
+            f"cpu_time={_format_stream_time(self.cpu_time_total_us / self.count)}  "
+            f"self_cuda_time=0.000us cuda_time=0.000us input_shapes= "
+            "cpu_memory_usage=0 cuda_memory_usage=0>"
+        )
+
+
+@dataclass
+class _StreamingFrame:
+    key: tuple[str, object, bool]
+    name: str
+    start_ns: int
+    end_ns: int
+    is_async: bool
+    child_count: int = 0
+    child_duration_us: float = 0.0
+    sole_child: "_ClosedStreamingFrame | None" = None
+
+
+@dataclass(frozen=True)
+class _ClosedStreamingFrame:
+    key: tuple[str, object, bool]
+    name: str
+    duration_us: float
+    self_duration_us: float
+    effective_child_duration_us: float
+
+
+def _format_stream_time(time_us: float) -> str:
+    if time_us >= 1_000_000.0:
+        return f"{time_us / 1_000_000.0:.3f}s"
+    if time_us >= 1_000.0:
+        return f"{time_us / 1_000.0:.3f}ms"
+    return f"{time_us:.3f}us"
 
 
 class _TorchProfilerBackend:
@@ -88,8 +168,126 @@ class _TorchProfilerBackend:
     def stop(self) -> None:
         self._raw.stop()
 
-    def key_averages(self) -> Sequence[_OperatorRow]:
-        return self._raw.key_averages()
+    def streaming_rows(self) -> tuple[_StreamingOperatorRow, ...]:
+        """Aggregate CPU Kineto events without constructing FunctionEvents."""
+
+        from torch.autograd import DeviceType
+        from torch.autograd.profiler_util import _filter_name, _rewrite_name
+
+        results = self._raw.kineto_results
+        if results is None:
+            raise RuntimeError("Torch profiler backend has no kineto_results")
+
+        stats: dict[tuple[str, object, bool], _StreamingOperatorStats] = {}
+        first_seen: dict[tuple[str, object, bool], int] = {}
+        stacks: dict[tuple[int, object], list[_StreamingFrame]] = {}
+        seen = 0
+
+        def add(frame: _ClosedStreamingFrame) -> None:
+            nonlocal seen
+            if frame.key not in first_seen:
+                first_seen[frame.key] = seen
+                seen += 1
+            current = stats.setdefault(
+                frame.key, _StreamingOperatorStats(frame.name)
+            )
+            current.count += 1
+            current.cpu_time_total_us += frame.duration_us
+            current.self_cpu_time_total_us += frame.self_duration_us
+
+        def remove(frame: _ClosedStreamingFrame) -> None:
+            current = stats[frame.key]
+            current.count -= 1
+            current.cpu_time_total_us -= frame.duration_us
+            current.self_cpu_time_total_us -= frame.self_duration_us
+            if current.count == 0:
+                del stats[frame.key]
+
+        def close(frame: _StreamingFrame) -> _ClosedStreamingFrame:
+            duration_us = (frame.end_ns - frame.start_ns) / 1_000.0
+            if frame.is_async:
+                closed = _ClosedStreamingFrame(
+                    frame.key, frame.name, duration_us, 0.0, 0.0
+                )
+            elif (
+                frame.child_count == 1
+                and frame.sole_child is not None
+                and frame.sole_child.name == frame.name
+            ):
+                # EventList._remove_dup_nodes lifts the child's children to the
+                # parent, then removes the same-name child.
+                remove(frame.sole_child)
+                closed = _ClosedStreamingFrame(
+                    frame.key,
+                    frame.name,
+                    duration_us,
+                    duration_us - frame.sole_child.effective_child_duration_us,
+                    frame.sole_child.effective_child_duration_us,
+                )
+            else:
+                closed = _ClosedStreamingFrame(
+                    frame.key,
+                    frame.name,
+                    duration_us,
+                    duration_us - frame.child_duration_us,
+                    frame.child_duration_us,
+                )
+            add(closed)
+            return closed
+
+        for event in results.events():
+            name = event.name()
+            if _filter_name(name) or event.is_hidden_event():
+                continue
+            if event.device_type() != DeviceType.CPU:
+                continue
+            name = _rewrite_name(name=name, with_wildcard=True)
+            is_async = event.is_async() or (
+                event.start_thread_id() != event.end_thread_id()
+            )
+            key = (name, -1, bool(event.is_user_annotation()))
+            frame = _StreamingFrame(
+                key=key,
+                name=name,
+                start_ns=event.start_ns(),
+                end_ns=event.end_ns(),
+                is_async=is_async,
+            )
+            if is_async:
+                close(frame)
+                continue
+            stack_key = (event.start_thread_id(), -1)
+            stack = stacks.setdefault(stack_key, [])
+            while stack and (
+                frame.start_ns >= stack[-1].end_ns
+                or frame.end_ns > stack[-1].end_ns
+            ):
+                child = close(stack.pop())
+                if stack:
+                    parent = stack[-1]
+                    parent.child_count += 1
+                    parent.child_duration_us += child.duration_us
+                    parent.sole_child = child if parent.child_count == 1 else None
+            stack.append(frame)
+
+        for stack in stacks.values():
+            while stack:
+                child = close(stack.pop())
+                if stack:
+                    parent = stack[-1]
+                    parent.child_count += 1
+                    parent.child_duration_us += child.duration_us
+                    parent.sole_child = child if parent.child_count == 1 else None
+
+        return tuple(
+            _StreamingOperatorRow(
+                key=current.key,
+                count=current.count,
+                cpu_time_total_us=current.cpu_time_total_us,
+                self_cpu_time_total_us=current.self_cpu_time_total_us,
+            )
+            for key, current in sorted(stats.items(), key=lambda item: first_seen[item[0]])
+        )
 
     def record_function(self, label: str) -> AbstractContextManager[object]:
         return self._record_function(label)
@@ -124,7 +322,13 @@ def _load_enabled_event_types() -> _EnabledEventTypes:
 
 @dataclass(frozen=True)
 class TrainingIterationWindow:
-    """Immutable durable-step window for one native profile."""
+    """Immutable durable-step window for one native profile.
+
+    Eager VMC dispatches roughly 135k Kineto operations per step. Prefer
+    ``active_steps=1`` or ``2`` when a compact diagnostic is sufficient; this
+    keeps the native capture buffer near 180--350 MiB and Chrome traces near
+    37--74 MB.
+    """
 
     start_step: int
     warmup_steps: int
@@ -161,7 +365,11 @@ class TrainingIterationWindow:
 
 @dataclass(frozen=True)
 class TorchOperatorSummary:
-    """Bounded conversion of a backend ``key_averages`` table."""
+    """Bounded conversion of a backend operator table.
+
+    Real Torch profiler backends use the streaming Kineto collector. Test and
+    custom backends retain their explicit ``key_averages`` contract.
+    """
 
     max_rows: int = 64
 
@@ -176,7 +384,10 @@ class TorchOperatorSummary:
     ) -> tuple[tuple[Mapping[str, object], ...], int, bool]:
         """Return bounded rows, the true source count, and truncation state."""
 
-        table = list(backend.key_averages())
+        if isinstance(backend, _TorchProfilerBackend):
+            table = backend.streaming_rows()
+        else:
+            table = list(cast(_KeyAveragesBackend, backend).key_averages())
         rows = tuple(
             {"name": str(item.key), "repr": str(item)[:512]}
             for item in table[: self.max_rows]
@@ -255,6 +466,10 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
         self._writer_open_failed: bool = False
         self.trace_path: Path | None = None
         self.trace_ref: ObservabilityArtifactRef | None = None
+        self._summary_rows: tuple[Mapping[str, object], ...] = ()
+        self._summary_total_rows = 0
+        self._summary_truncated = False
+        self._summary_attempted = False
 
     def __getstate__(self) -> object:
         raise TypeError("NativeProfiler live state cannot be serialized")
@@ -378,6 +593,28 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
         finally:
             self._stop_bracket_ns = (started_before, time.monotonic_ns())
 
+    def _extract_summary_and_release(self) -> None:
+        """Capture bounded artifacts while live, then release Kineto state."""
+
+        if self._summary_attempted:
+            return
+        if self.backend is None or not self.started:
+            self._summary_attempted = True
+            return
+        self._summary_attempted = True
+        try:
+            (
+                self._summary_rows,
+                self._summary_total_rows,
+                self._summary_truncated,
+            ) = self.callback.summary.collect(self.backend)
+        except BaseException as exc:
+            self._diagnostic("summary_failed", exc)
+        try:
+            self._export_trace()
+        finally:
+            self.backend = None
+
     def _close_range(self, operation: Operation, count: int) -> None:
         if not self._range_stack:
             return
@@ -453,7 +690,12 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
 
 
 class NativeProfiler(Callback):
-    """Opt-in managed native profiler with fixed typed ranges."""
+    """Opt-in managed native profiler with fixed typed ranges.
+
+    Eager VMC dispatches roughly 135k Kineto operations per step; choose
+    ``active_steps=1`` or ``2`` for bounded diagnostics (about 180--350 MiB
+    of native capture data and 37--74 MB Chrome traces).
+    """
 
     def __init__(
         self,
@@ -667,6 +909,7 @@ class NativeProfiler(Callback):
                         session.window_completed = True
                         session.request_stop()
                         session._stop()
+                        session._extract_summary_and_release()
                 except BaseException as exc:
                     session._diagnostic("backend_step_failed", exc)
             return
@@ -688,18 +931,14 @@ class NativeProfiler(Callback):
             writer = session.writer
             if writer is None or self.window is None:
                 return
-            rows: tuple[Mapping[str, object], ...] = ()
-            total_rows = 0
-            summary_truncated = False
-            summary_succeeded = not session.started
-            if session.backend is not None and session.started:
-                try:
-                    rows, total_rows, summary_truncated = self.summary.collect(session.backend)
-                    summary_succeeded = True
-                except BaseException as exc:
-                    summary_succeeded = False
-                    session._diagnostic("summary_failed", exc)
-            session._export_trace()
+            session._stop()
+            session._extract_summary_and_release()
+            rows = session._summary_rows
+            total_rows = session._summary_total_rows
+            summary_truncated = session._summary_truncated
+            summary_succeeded = not any(
+                item.startswith("summary_failed") for item in session._diagnostics
+            )
             if application_error is not None:
                 session._diagnostic(f"application_error={type(application_error).__name__}")
             if session._overshoot_steps:
