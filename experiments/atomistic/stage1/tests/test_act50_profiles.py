@@ -207,12 +207,38 @@ def test_eval_profiles_resolve_the_same_model_variant(
 
 
 def test_nolayer_profile_removes_only_layer_diagnostic_groups() -> None:
-    cfg = build_train_config(_rows(HOOKE2_ACT50_NOLAYER_PROFILE)[0])
-    assert list(cfg.model.layers) == []
-    assert cfg.trainer.max_steps == 50_000
-    for callback in cfg.callbacks:
-        if callback["_target_"] in {"tpen.callback.ModuleNorms", "tpen.callback.OptimizerState"}:
-            assert set(callback.groups) == {"embedding", "readout", "factors"}
+    diagnostic_targets = {"tpen.callback.ModuleNorms", "tpen.callback.OptimizerState"}
+
+    def diagnostic_groups(profile: str) -> dict[str, dict[str, list[str]]]:
+        cfg = build_train_config(_rows(profile)[0])
+        return {
+            callback["_target_"]: OmegaConf.to_container(callback.groups, resolve=True)
+            for callback in cfg.callbacks
+            if callback["_target_"] in diagnostic_targets
+        }
+
+    native = diagnostic_groups(HOOKE2_ACT50_SIGMOID_PROFILE)
+    assert set(native) == diagnostic_targets
+    assert all(
+        {"layer_0_mixing", "layer_0_path_aggregation"}.issubset(groups)
+        for groups in native.values()
+    )
+
+    # A/B retain the native diagnostics-v1 groups, while C removes exactly the
+    # two layer groups and preserves every other group and module path.
+    for profile in (HOOKE2_ACT50_SIGMOID_PROFILE, HOOKE2_ACT50_TANH_PROFILE):
+        assert diagnostic_groups(profile) == native
+
+    nolayer = diagnostic_groups(HOOKE2_ACT50_NOLAYER_PROFILE)
+    expected_nolayer = {
+        target: {
+            name: paths
+            for name, paths in groups.items()
+            if name not in {"layer_0_mixing", "layer_0_path_aggregation"}
+        }
+        for target, groups in native.items()
+    }
+    assert nolayer == expected_nolayer
 
 
 def test_nolayer_profile_forward_grad_local_energy_and_fermionic_exchange(
