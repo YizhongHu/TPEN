@@ -274,6 +274,7 @@ def _materialized_eval_row(tmp_path: Path) -> tuple[dict[str, object], Path]:
     eval_output_dir = f"{protocol.resolve_run_dir(row)}/mcmc_energy"
     rendered["evaluation_tasks"]["mcmc_energy"]["output_dir"] = eval_output_dir  # type: ignore[index]
     rendered["evaluator"]["tasks"][0]["output_dir"] = eval_output_dir  # type: ignore[index]
+    rendered["runner"]["evaluator"]["tasks"][0]["output_dir"] = eval_output_dir  # type: ignore[index]
     row["row_extension"] = {
         "version": protocol.ROW_EXTENSION_VERSION,
         "rendered_config": {"path": str(rendered_path), "sha256": ""},
