@@ -1034,7 +1034,7 @@ def test_backend_failures_clear_session_and_preserve_primary(failure: str, tmp_p
 def test_real_torch_profiler_adapter_emits_phases_and_fixed_ranges(
     warmup_steps: int, tmp_path
 ) -> None:
-    """The CPU adapter must use module-level record_function on Cannon's torch."""
+    """The CPU adapter must use module-level record_function on the pinned Torch 2.11 build."""
 
     import torch
     from torch.profiler import ProfilerAction
