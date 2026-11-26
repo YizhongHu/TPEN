@@ -64,7 +64,7 @@ class PositiveSingletReadout(nn.Module):
         self,
         *,
         channels: int,
-        system_descriptor: SystemDescriptor | None = None,
+        system_descriptor: object | None = None,
     ) -> None:
         super().__init__()
         self.channels = _positive_int(channels, "channels")

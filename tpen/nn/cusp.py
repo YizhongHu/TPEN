@@ -1210,7 +1210,7 @@ class HookeSingletTailFactor(LogAmplitudeFactor):
         self,
         *,
         kappa: float,
-        system_descriptor: SystemDescriptor | None = None,
+        system_descriptor: object | None = None,
     ) -> None:
         super().__init__()
         value = float(kappa)
