@@ -12,7 +12,7 @@ def test_sampler_produces_typed_walkers_with_fixed_spin() -> None:
     model = build_tiny_spenn()
     sampler = build_tiny_sampler()
 
-    walkers, stats = sampler.collect_samples(model)
+    walkers, stats = sampler.collect_samples(model, emitter=None)
     batch = walkers.make_batch()
 
     n_walkers = batch.positions.shape[0]

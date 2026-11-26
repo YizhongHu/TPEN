@@ -9,7 +9,7 @@
   {
     "id": "omit-job-sha-check",
     "target": "scripts/cannon/submit-lint.sh",
-    "old": "[[ \"$M_JOB_NAME_HAS\" == 1 && \"$M_JOB_NAME\" == *\"$short_sha\"* ]] || fail \"JOB_NAME does not contain SHA[:12] ('$short_sha'): '${M_JOB_NAME:-<missing>}'\"",
+    "old": "[[ \"$M_JOB_NAME_HAS\" == 1 && \"$M_JOB_NAME\" == *\"$short_sha\"* ]] || fail \"JOB_NAME does not contain SHA[:8] ('$short_sha'): '${M_JOB_NAME:-<missing>}'\"",
     "new": "[[ \"$M_JOB_NAME_HAS\" == 1 && \"$M_JOB_NAME\" == *\"$short_sha\"* ]] || true  # mutant: omit-job-sha-check",
     "killer": "test_cannon_submit_lint.py::test_job_name_missing_short_sha_rejected"
   },

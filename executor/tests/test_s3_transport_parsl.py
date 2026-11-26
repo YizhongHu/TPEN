@@ -57,7 +57,7 @@ from tpen_executor.dispatch.transport import LeafRequest, LeafResult, LeafTeardo
 from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.placement import AllocationSlot, ChildPlacementObservation
-from tpen_executor.programs import WorkerProgram
+from tpen_executor.programs import ConfiguredProgram, WorkerProgram
 from tpen_executor.storage import DirectoryStore
 from tpen_executor.tasks import ConfiguredRun, ConfiguredRunTable
 
@@ -68,6 +68,10 @@ WORKERS_MODULE = "executor/src/tpen_executor/workers.py"
 HAS_PARSL = importlib.util.find_spec("parsl") is not None
 WORKER_MARK = "S3B_WORKER_MARK"
 LABEL = "s3b-htex"
+# Item 6f249ad4: leave child startup ample margin while making ``late``
+# deterministically exceed the per-member timeout.
+OUTCOME_PARITY_TIMEOUT = 5
+OUTCOME_PARITY_LATE_SLEEP = OUTCOME_PARITY_TIMEOUT * 4
 
 
 S3B_MUTANT_TABLE = (
@@ -294,6 +298,19 @@ def _runs(tmp_path: Path, *task_ids: str, modes: dict[str, str] | None = None) -
     return result
 
 
+def _configured_run(tmp_path: Path, task_id: str = "member") -> ConfiguredRun:
+    root = Path(__file__).parents[2]
+    program = ConfiguredProgram(
+        "stage-q",
+        str(root / "experiments/atomistic/he-importance/run_stage_q.py"),
+        str(root / "experiments/atomistic/he-importance/o1_scan_manifest_v1.json"),
+        "0" * 64,
+        str(tmp_path / "configured-output"),
+        load={"mode": "fresh", "path": None},
+    )
+    return ConfiguredRun(task_id, "", (), program)
+
+
 def _make_fake_core(tmp_path: Path) -> Path:
     """Write a fake ``tpen`` whose science records its process and binding.
 
@@ -318,7 +335,7 @@ def _make_fake_core(tmp_path: Path) -> Path:
                 overrides = dict(item.split("=", 1) for item in argv if "=" in item)
                 run_dir = Path(overrides["run.root"]) / overrides["run.run_id"]
                 if mode == "sleep":
-                    time.sleep(4)
+                    time.sleep({OUTCOME_PARITY_LATE_SLEEP})
                 if mode == "fail":
                     return 7
                 run_dir.mkdir(parents=True)
@@ -1048,9 +1065,11 @@ def test_attached_outcomes_match_local_dispatch(tmp_path: Path, fake_parsl: _Par
     group = _group("s3b-parity", "ok", "bad", "late")
     runs = _runs(tmp_path, "ok", "bad", "late", modes={"bad": "fail", "late": "sleep"})
     worker = _worker(tmp_path)
-    local = LocalDispatcher(worker).run(group, runs, _lifecycle(tmp_path, "local"), timeout=1)
+    local = LocalDispatcher(worker).run(
+        group, runs, _lifecycle(tmp_path, "local"), timeout=OUTCOME_PARITY_TIMEOUT,
+    )
     attached = parsl_dispatch.ParslDispatcher(worker, binding=BINDING, transport=_transport()).run(
-        group, runs, _lifecycle(tmp_path, "attached"), timeout=1,
+        group, runs, _lifecycle(tmp_path, "attached"), timeout=OUTCOME_PARITY_TIMEOUT,
     )
     assert _summary(attached) == _summary(local) == {"ok": ("completed", False), "bad": ("failed", True), "late": ("timed_out", True)}
     assert {segment.task_id for segment in attached.segments} == {segment.task_id for segment in local.segments} == {"ok"}
@@ -1327,6 +1346,29 @@ def test_an_invalid_worker_mask_is_refused_before_science(
 
 
 # ------------------------------------------------------- unchanged routes
+
+
+def test_configured_parsl_public_admission_accepts_typed_binding_before_dfk(
+    tmp_path: Path, fake_parsl: _Parsl,
+) -> None:
+    """Configured Parsl admission validates before backend construction."""
+
+    group = _group("s3b-configured-refuse", "member")
+    lifecycle = _lifecycle(tmp_path)
+    dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path), binding=BINDING)
+    dispatcher.validate(group, {"member": _configured_run(tmp_path)}, lifecycle, timeout=60)
+    assert fake_parsl.dfks == []
+    assert fake_parsl.submissions == []
+    with pytest.raises(ValueError):
+        dispatcher.validate(group, {}, lifecycle, timeout=60)
+    legacy_group = _group("s3b-configured-legacy", "member")
+    legacy = _runs(tmp_path, "member")
+    manifest = dispatcher.run(legacy_group, legacy, lifecycle, timeout=60)
+    assert _summary(manifest) == {"member": ("completed", False)}
+    process_submission = fake_parsl.submissions[-1]
+    launch_args = process_submission["args"][3]
+    expected_args = legacy["member"].command().args
+    assert launch_args[: len(expected_args)] == expected_args
 
 
 def test_threadpool_and_local_routes_never_build_a_leaf(tmp_path: Path, fake_parsl: _Parsl, monkeypatch: pytest.MonkeyPatch) -> None:

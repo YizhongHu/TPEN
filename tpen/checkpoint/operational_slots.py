@@ -100,6 +100,8 @@ OPERATIONAL_SLOT_MANIFEST: dict[str, OperationalSlot] = {
     "tpen.callback.factor_scalars.FactorScalars": _sink_free(),
     "tpen.callback.module_norms.ModuleNorms": _sink_free(),
     "tpen.callback.optimizer_state.OptimizerState": _sink_free(),
+    "tpen.callback.resource_samples.ResourceSamples": _sink_free(),
+    "tpen.callback.native_profiler.NativeProfiler": _sink_free(),
     "tpen.callback.resource_usage.ResourceUsage": _sink_free(),
     "tpen.callback.health.data_integrity.DataIntegrity": _sink_free(),
     "tpen.callback.health.gradient_stats.GradientStats": _sink_free(),

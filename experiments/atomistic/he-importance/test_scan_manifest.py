@@ -22,7 +22,7 @@ sys.modules[spec.name] = manifest_module
 spec.loader.exec_module(manifest_module)
 
 _PER_TEST_TIMEOUT_SECONDS = 120
-_FROZEN_ROW_ID_SET_SHA256 = "d18b3ceb95fac95c3249154344a290d3807ea46e8d246b10f699286ba6644c6b"
+_FROZEN_ROW_ID_SET_SHA256 = "3c5a3d15efd603d702ca9078664cde58a0327bac55481ad20ec1e0866a2eea2f"
 
 
 @contextmanager
@@ -62,15 +62,20 @@ def test_committed_manifest_regenerates_byte_identically() -> None:
     path = HERE / "o1_scan_manifest_v1.json"
     assert path.stat().st_size < 1_000_000
     committed = path.read_bytes()
-    rendered = manifest_module.render_manifest_text().encode("utf-8")
     committed_hash = hashlib.sha256(committed).hexdigest()
-    rendered_hash = hashlib.sha256(rendered).hexdigest()
-    if committed_hash != rendered_hash or len(committed) != len(rendered):
-        raise AssertionError(
-            "manifest bytes differ: "
-            f"committed_sha256={committed_hash} rendered_sha256={rendered_hash} "
-            f"committed_length={len(committed)} rendered_length={len(rendered)}"
-        )
+    assert committed_hash == "6e077a97fedc29eee4228c6e33c086cc7d8a45ab1c6a9f9a728d565a0c62bee6"
+
+
+def test_committed_v2_matches_live_render() -> None:
+    assert (HERE / "o1_scan_manifest_v2.json").read_text(encoding="utf-8") == (
+        manifest_module.render_manifest_text()
+    )
+
+
+def test_v1_manifest_is_inspection_only_and_names_v2_for_launch() -> None:
+    manifest = manifest_module.load_manifest(HERE / "o1_scan_manifest_v1.json")
+    with pytest.raises(manifest_module.ScanManifestError, match="v2"):
+        manifest_module.validate_live_row(manifest, manifest["rows"][0]["row_id"])
 
 
 def test_manifest_counts_sources_and_admission_reason() -> None:
@@ -204,7 +209,7 @@ def test_manifest_tamper_stale_and_unknown_refuse_before_materialization(
         runner.execute(_args(runner, tampered_path, tampered["rows"][0]["row_id"], tmp_path / "tampered-out"))
     assert not (tmp_path / "tampered-out").exists()
     with pytest.raises(runner.scan_manifest.ScanManifestError, match="unknown manifest row"):
-        runner.execute(_args(runner, HERE / "o1_scan_manifest_v1.json", "missing-row", tmp_path / "unknown-out"))
+        runner.execute(_args(runner, HERE / "o1_scan_manifest_v2.json", "missing-row", tmp_path / "unknown-out"))
     assert not (tmp_path / "unknown-out").exists()
     original = runner.scan_manifest._materialized_rows()
     drifted = deepcopy(original)
@@ -215,7 +220,7 @@ def test_manifest_tamper_stale_and_unknown_refuse_before_materialization(
     calls: list[str] = []
     monkeypatch.setattr(runner.train_config, "resolve_train_config", lambda *_args, **_kwargs: calls.append("resolve"))
     with pytest.raises(runner.scan_manifest.ScanManifestError) as excinfo:
-        runner.execute(_args(runner, HERE / "o1_scan_manifest_v1.json", admitted["row_id"], tmp_path / "stale-out"))
+        runner.execute(_args(runner, HERE / "o1_scan_manifest_v2.json", admitted["row_id"], tmp_path / "stale-out"))
     assert not (tmp_path / "stale-out").exists()
     assert admitted["row_id"] in str(excinfo.value)
     assert calls == []
@@ -227,7 +232,7 @@ def test_manifest_positive_consumes_same_runner_limbs_and_horizon(
     runner = _runner()
     manifest = manifest_module.load_manifest()
     row = _row(manifest, status="available", method="adam")
-    path = HERE / "o1_scan_manifest_v1.json"
+    path = HERE / "o1_scan_manifest_v2.json"
     manifest_report = tmp_path / "manifest-report"
     assert runner.execute(_args(runner, path, row["row_id"], manifest_report)) == 0
     manifest_report_json = json.loads(capsys.readouterr().out)
@@ -410,7 +415,7 @@ def test_every_admitted_manifest_row_consumes_materialized_w4096(
         if row["seed_label"] != 820001:
             continue
         assert runner.execute(
-            _args(runner, HERE / "o1_scan_manifest_v1.json", row["row_id"], tmp_path / row["row_id"])
+            _args(runner, HERE / "o1_scan_manifest_v2.json", row["row_id"], tmp_path / row["row_id"])
         ) == 0
         report = json.loads(capsys.readouterr().out)
         assert report["resolved_config"]["sampler"]["n_walkers"] == 4096
@@ -434,7 +439,7 @@ def test_manifest_rejects_explicit_flag_selection(tmp_path: Path, flag: str) -> 
         "--lr": "0.005", "--beta2": "0.999", "--seed-label": str(row["seed_label"]),
         "--walkers": "4096",
     }[flag]
-    args = _args(runner, HERE / "o1_scan_manifest_v1.json", row["row_id"], tmp_path / "out", flag, value)
+    args = _args(runner, HERE / "o1_scan_manifest_v2.json", row["row_id"], tmp_path / "out", flag, value)
     with pytest.raises(runner.StageQSelectionError, match="mutually exclusive"):
         runner.execute(args)
     assert not (tmp_path / "out").exists()

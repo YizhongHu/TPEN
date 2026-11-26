@@ -183,6 +183,10 @@ def save_checkpoint(
                 effective_payload.validate_state(trainer_state)
             _write_json_mapping(tmp_dir / "trainer.json", trainer_state)
             files["trainer"] = "trainer.json"
+            method_tensor_state = _method_tensor_state_from(trainer)
+            if method_tensor_state is not None:
+                torch.save(method_tensor_state, tmp_dir / "method_state.pt")
+                files["method_state"] = "method_state.pt"
 
         if save_sampler:
             sampler_state = _sampler_state_dict(sampler)
@@ -380,6 +384,20 @@ def _state_dict_from(value: Any, owner: str) -> Mapping[str, Any]:
     state = state_dict()
     if not isinstance(state, Mapping):
         raise TypeError(f"{owner}.state_dict() must return a mapping")
+    return state
+
+
+def _method_tensor_state_from(trainer: Any) -> Mapping[str, Any] | None:
+    """Return optional binary method tensor state for ``method_state.pt``."""
+
+    getter = getattr(trainer, "method_tensor_state_dict", None)
+    if not callable(getter):
+        return None
+    state = getter()
+    if state is None:
+        return None
+    if not isinstance(state, Mapping):
+        raise TypeError("trainer.method_tensor_state_dict() must return a mapping or None")
     return state
 
 

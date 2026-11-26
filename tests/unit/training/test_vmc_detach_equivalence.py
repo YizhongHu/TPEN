@@ -31,8 +31,8 @@ class _FixedSampler:
     def __init__(self, batch: ElectronBatch) -> None:
         self.walkers = _FixedWalkers(batch)
 
-    def collect_samples(self, model: Any, *, device: Any = None):
-        del model, device
+    def collect_samples(self, model: Any, *, reset: bool = False, device: Any = None, emitter=None):
+        del model, reset, device, emitter
         return self.walkers, None
 
 

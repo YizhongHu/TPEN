@@ -6,6 +6,7 @@ import argparse
 import getpass
 import json
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -28,6 +29,7 @@ from lock import expected_torch_version  # noqa: E402
 
 RUNTIME_KIND = "polaris-gpu-qualification"
 ALLOWED_WALKERS = {2048, 4096}
+JOB_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,39}$")
 STORED_FILES = ("common.py", "lock.py", "gpu_job.py", "qualification.py", "job.pbs", "facility_profile.json")
 PROFILE_PATH = Path(__file__).resolve().parent / "facility_profile.json"
 
@@ -85,6 +87,24 @@ def validate_queue(queue: str) -> str:
     return queue
 
 
+def validate_job_name(name: str) -> str:
+    if not JOB_NAME_RE.fullmatch(name):
+        raise ValueError("qualification job name must be alphanumeric/hyphen, start with a letter, and be <=40 chars")
+    return name
+
+
+def qualification_job_name(cell_id: str, target_sha: str) -> str:
+    """Build a validated name, sanitizing the cell-id fragment for PBS.
+
+    Non-alphanumeric cell-id characters become hyphens; repeated, leading, and
+    trailing hyphens are removed. An empty fragment is omitted.
+    """
+    fragment = re.sub(r"[^A-Za-z0-9]", "-", cell_id[:8]).lower()
+    fragment = re.sub(r"-+", "-", fragment).strip("-")
+    subject = f"hi{fragment}"
+    return validate_job_name(f"{subject}-gate-hi-{target_sha[:8]}")
+
+
 def _validate(args: argparse.Namespace) -> None:
     if len(args.target_sha) != 40 or any(char not in "0123456789abcdef" for char in args.target_sha):
         raise ValueError("target-sha must be a full lowercase 40-hex SHA")
@@ -105,7 +125,7 @@ def build_manifest(args: argparse.Namespace, run_root: Path, target_repo: Path, 
     expected = expected_torch_version(lock, profile["extra"])
     return {"schema": 1, "runtime_kind": RUNTIME_KIND, "created_utc": datetime.now(timezone.utc).isoformat(), "target_sha": target_sha,
             "harness_sha": _git(Path(__file__).resolve().parents[3], "rev-parse", "HEAD"), "required_ancestors": list(args.required_ancestor),
-            "cell": {"stage": args.stage, "context": args.context, "optimizer": args.optimizer, "lr": args.lr, "beta2": args.beta2,
+            "cell": {"cell_id": args.cell_id, "stage": args.stage, "context": args.context, "optimizer": args.optimizer, "lr": args.lr, "beta2": args.beta2,
                      "seed_label": args.seed_label, "walkers": args.walkers, "updates": args.updates, "checkpoint_every": args.checkpoint_every},
             "nodes": args.nodes, "scheduler": {"account": args.account, "queue": args.queue, "walltime": args.walltime, "filesystems": "home:eagle"},
             "run_root": str(run_root), "target_repo": str(target_repo), "output_root": str(run_root / "output"), "evidence_dir": str(paths["evidence_dir"]),
@@ -156,7 +176,7 @@ def stage(args: argparse.Namespace) -> int:
         encoding="utf-8")
     _atomic_json(Path(manifest["staging_receipt"]), {"runtime_kind": RUNTIME_KIND, "target_sha": args.target_sha, "cache_dir": manifest["cache_dir"], "extra": profile["extra"], "manifest": str(manifest_path)})
     if not _queue_gate(args.queue, getpass.getuser(), run_root, "pre-submit"): raise RuntimeError("refusing qsub because the queue-aware gate refused admission")
-    scheduler = manifest["scheduler"]; qsub = ["qsub", "-V", "-A", scheduler["account"], "-q", scheduler["queue"], "-l", f"select={manifest['nodes']}:system=polaris", "-l", f"walltime={scheduler['walltime']}", "-l", f"filesystems={scheduler['filesystems']}", "-o", str(paths["pbs_dir"]) + "/", "-e", str(paths["pbs_dir"]) + "/", "-v", f"RUN_ENV_PATH={env_path}", str(paths["harness_dir"] / "job.pbs")]
+    scheduler = manifest["scheduler"]; job_name = qualification_job_name(manifest["cell"]["cell_id"], manifest["target_sha"]); qsub = ["qsub", "-N", job_name, "-V", "-A", scheduler["account"], "-q", scheduler["queue"], "-l", f"select={manifest['nodes']}:system=polaris", "-l", f"walltime={scheduler['walltime']}", "-l", f"filesystems={scheduler['filesystems']}", "-o", str(paths["pbs_dir"]) + "/", "-e", str(paths["pbs_dir"]) + "/", "-v", f"RUN_ENV_PATH={env_path}", str(paths["harness_dir"] / "job.pbs")]
     print("SUBMIT " + shlex.join(qsub), flush=True); job_id = _run(qsub, capture=True); (run_root / "submission.txt").write_text(job_id + "\n" + shlex.join(qsub) + "\n", encoding="utf-8"); return 0
 
 

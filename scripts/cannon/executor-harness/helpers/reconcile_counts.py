@@ -12,7 +12,12 @@ from pathlib import Path
 from path_guard import assert_write_path
 
 
-_SUMMARY_RE = re.compile(r"(?P<count>\d+)\s+(?P<kind>passed|failed|errors?|skipped)\b")
+# JUnit records pytest "xfailed" as <skipped> and "xpassed" (non-strict) as a
+# passed testcase; strict xpass already surfaces as "failed". Fold both terminal
+# categories into the JUnit-equivalent buckets (dev full suite 59762785: #659
+# added strict-xfail tests and the old regex aborted reconciliation).
+_SUMMARY_RE = re.compile(r"(?P<count>\d+)\s+(?P<kind>passed|failed|errors?|skipped|xfailed|xpassed)\b")
+_KIND_ALIAS = {"error": "errors", "xfailed": "skipped", "xpassed": "passed"}
 _SUBTEST_SUMMARY_RE = re.compile(
     r"(?P<count>\d+)\s+subtests?\s+(?P<kind>passed|failed|errors?|skipped)\b"
 )
@@ -39,11 +44,7 @@ def main() -> int:
         raise SystemExit(f"pytest terminal summary not found: {log_path}")
     summary = {"passed": 0, "failed": 0, "errors": 0, "skipped": 0}
     for match in _SUMMARY_RE.finditer(terminal_lines[-1]):
-        kind = match.group("kind")
-        if kind == "error":
-            kind = "errors"
-        elif kind == "errors":
-            kind = "errors"
+        kind = _KIND_ALIAS.get(match.group("kind"), match.group("kind"))
         summary[kind] += int(match.group("count"))
     # Pytest reports successful subtests separately from the test-case count,
     # while JUnit records each subtest as a testcase.  Include that explicit

@@ -1,5 +1,5 @@
 experiment: {name: stage1_hooke1, sector: atomistic, run_name: hooke1_train}
-run: {root: "${oc.env:TPEN_STAGE1_RESULTS_ROOT}", run_id: null, dir: null, timezone: America/New_York, layout: nested}
+run: {root: "???", run_id: null, dir: null, timezone: America/New_York, layout: nested}
 runtime: {seed: 0, device: cpu, dtype: float64}
 checkpoint_steps: [1000]
 system: {id: hooke_one_electron_omega0.5, n_particles: 1, spatial_dim: 3, spin: {n_up: 1, n_down: 0}, nuclei: {positions: [[0.0, 0.0, 0.0]], charges: [0.0]}}

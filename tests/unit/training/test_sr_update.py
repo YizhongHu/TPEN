@@ -303,31 +303,31 @@ def test_nonfinite_energy_samples_are_excluded_exactly_as_the_objective_does() -
     assert method.last_telemetry.n_finite_samples == 6
 
 
-def test_a_nonfinite_score_row_is_dropped_with_its_sample() -> None:
-    """One exploded score row cannot poison the whole QGT through its outer product."""
+def test_a_nonfinite_score_row_on_a_pinned_sample_refuses_the_step() -> None:
+    """Consolidated 377f6b0f/02859027 ruling: a bad score on a pinned row raises.
+
+    Previously ``test_a_nonfinite_score_row_is_dropped_with_its_sample`` asserted
+    that SR silently dropped row 2 and applied the step on the remaining rows.
+    Under the consolidated ``377f6b0f`` / ``02859027`` operator ruling
+    (``NONFINITE_SCORE_ROW_POLICY = "fail_on_pinned"``), the step pins its finite
+    row mask at the local-energy evaluation and refuses any pinned row whose
+    parameter scores are non-finite -- even under ``nonfinite_local_energy_policy="mask"``
+    -- leaving parameters bitwise unchanged and ``completed_updates`` untouched.
+    """
 
     parameter, features, energies = _problem(n_samples=7, n_parameters=3, seed=6)
     poisoned = features.clone()
     poisoned[2, 1] = float("nan")
-    keep = [0, 1, 3, 4, 5, 6]
 
     before = parameter.detach().clone()
     method = _method(parameter)
-    method.update(_step_input(parameter, poisoned, energies))
+    assert method.nonfinite_local_energy_policy == "mask"
 
-    expected = sr_direction(
-        features.numpy()[keep],
-        energies.numpy()[keep],
-        absolute=0.0,
-        relative=1.0e-2,
-    )
-    np.testing.assert_allclose(
-        (before - parameter.detach()).numpy(),
-        LEARNING_RATE * expected.direction,
-        rtol=SOLVE_TOLERANCE,
-        atol=SOLVE_TOLERANCE,
-    )
-    assert method.last_telemetry.n_finite_samples == 6
+    with pytest.raises(RuntimeError, match=r"non-finite parameter scores.*\[2\]"):
+        method.update(_step_input(parameter, poisoned, energies))
+
+    assert torch.equal(parameter.detach(), before)
+    assert method.completed_updates == 0
 
 
 def test_trust_cap_rescales_the_step_without_turning_it() -> None:
@@ -481,6 +481,87 @@ def test_state_envelope_round_trips_and_rejects_layout_drift() -> None:
 
     with pytest.raises(ValueError, match="unsupported SR state version"):
         restored.load_method_state_dict({**state, "version": "sr-state-0"})
+
+
+def test_state_envelope_round_trips_with_squared_update_norm_bound() -> None:
+    """The sr-state-2 envelope preserves the policy's squared trust cap."""
+
+    parameter, _, _ = _problem(n_samples=8, n_parameters=4, seed=16)
+    policy = SRPolicy(
+        damping=DampingPolicy(absolute=0.0, relative=1.0e-2),
+        learning_rate=LEARNING_RATE,
+        squared_update_norm_bound=0.25,
+    )
+    method = _method(parameter, policy=policy)
+    state = method.method_state_dict()
+
+    restored = _method(torch.nn.Parameter(parameter.detach().clone()), policy=policy)
+    restored.load_method_state_dict(state)
+
+    assert state["version"] == "sr-state-2"
+    assert restored.policy.fingerprint() == policy.fingerprint()
+
+
+@pytest.mark.parametrize(
+    ("field", "changed_policy"),
+    [
+        (
+            "squared_update_norm_bound",
+            SRPolicy(
+                damping=DampingPolicy(absolute=0.0, relative=1.0e-2),
+                learning_rate=LEARNING_RATE,
+                squared_update_norm_bound=0.5,
+            ),
+        ),
+        (
+            "learning_rate",
+            SRPolicy(
+                damping=DampingPolicy(absolute=0.0, relative=1.0e-2),
+                learning_rate=LEARNING_RATE * 2.0,
+                squared_update_norm_bound=0.25,
+            ),
+        ),
+        (
+            "damping",
+            SRPolicy(
+                damping=DampingPolicy(absolute=0.0, relative=2.0e-2),
+                learning_rate=LEARNING_RATE,
+                squared_update_norm_bound=0.25,
+            ),
+        ),
+    ],
+)
+def test_state_envelope_rejects_policy_drift(field: str, changed_policy: SRPolicy) -> None:
+    """Every persisted policy component is part of the resume identity."""
+
+    parameter, _, _ = _problem(n_samples=8, n_parameters=4, seed=17)
+    saved_policy = SRPolicy(
+        damping=DampingPolicy(absolute=0.0, relative=1.0e-2),
+        learning_rate=LEARNING_RATE,
+        squared_update_norm_bound=0.25,
+    )
+    source = _method(parameter, policy=saved_policy)
+    state = source.method_state_dict()
+    restored = _method(torch.nn.Parameter(parameter.detach().clone()), policy=changed_policy)
+
+    with pytest.raises(ValueError, match="SR checkpoint policy does not match"):
+        restored.load_method_state_dict(state)
+
+
+def test_state_envelope_rejects_missing_policy_without_mutating_state() -> None:
+    """Legacy envelopes fail closed before touching the live update counter."""
+
+    parameter, _, _ = _problem(n_samples=8, n_parameters=4, seed=18)
+    method = _method(parameter)
+    method.completed_updates = 7
+    state = dict(method.method_state_dict())
+    state["completed_updates"] = 11
+    state.pop("policy")
+
+    with pytest.raises(ValueError, match="SR checkpoint policy does not match"):
+        method.load_method_state_dict(state)
+
+    assert method.completed_updates == 7
 
 
 def test_binding_drift_is_rejected_rather_than_updating_a_stale_reference() -> None:

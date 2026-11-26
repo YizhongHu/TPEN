@@ -12,6 +12,7 @@ from tpen.data.indices import (
 )
 from tpen.data.paths import SupportPath, VirtualPath
 from tpen.dependencies import require_torch
+from tpen.nn.structured_curvature import active_structured_curvature_session
 
 torch = require_torch(feature="TPEN mixing kernels")
 
@@ -185,6 +186,12 @@ def execute_unary(
 
     aggregation = normalize_aggregation(aggregation)
     implementation = normalize_implementation(implementation)
+    session = active_structured_curvature_session()
+    if session is not None and implementation is MixingImplementation.SLOW:
+        raise ValueError(
+            "StructuredCurvatureForwardRequest requires MixingImplementation.VECTORIZED "
+            "in execute_unary; MixingImplementation.SLOW is unsupported for KFAC capture"
+        )
     if len(paths) != len(weights):
         raise ValueError("unary paths and weights must have matching lengths")
     block = torch.zeros(
@@ -221,6 +228,13 @@ def execute_unary(
         else:
             input_values = _gather_tuple_values(source, plan.input_indices)
             contribution = torch.einsum("oc,bcv->bov", weight, input_values)
+            if session is not None:
+                session.record_mixing_kronecker(
+                    weight=weight,
+                    flattened_input=input_values.detach(),
+                    contribution=contribution,
+                    label=f"execute_unary[{path_index}]",
+                )
             block_flat[:, :, path_index].scatter_add_(
                 2,
                 plan.flat_output_indices.reshape(1, 1, -1).expand(source.shape[0], output_channels, -1),
@@ -254,6 +268,12 @@ def execute_binary(
 
     aggregation = normalize_aggregation(aggregation)
     implementation = normalize_implementation(implementation)
+    session = active_structured_curvature_session()
+    if session is not None and implementation is MixingImplementation.SLOW:
+        raise ValueError(
+            "StructuredCurvatureForwardRequest requires MixingImplementation.VECTORIZED "
+            "in execute_binary; MixingImplementation.SLOW is unsupported for KFAC capture"
+        )
     if not (len(paths) == len(weights) == len(left) == len(right)):
         raise ValueError("binary paths, weights, and input blocks must have matching lengths")
     block = torch.zeros(
@@ -285,6 +305,23 @@ def execute_binary(
             left_values = _gather_tuple_values(left_block, plan.left_indices)
             right_values = _gather_tuple_values(right_block, plan.right_indices)
             contribution = torch.einsum("ocd,bcv,bdv->bov", weight, left_values, right_values)
+            if session is not None:
+                n_supports = int(left_values.shape[2])
+                in_dim = int(left_values.shape[1]) * int(right_values.shape[1])
+                if n_supports == 0:
+                    flattened_input = left_values.detach().new_empty((block.shape[0], in_dim, 0))
+                else:
+                    # Detach operands before forming the flattened bilinear input so
+                    # KFAC capture never allocates a transient MulBackward0 node.
+                    flattened_input = (
+                        left_values.detach().unsqueeze(2) * right_values.detach().unsqueeze(1)
+                    ).reshape(block.shape[0], in_dim, n_supports)
+                session.record_mixing_kronecker(
+                    weight=weight,
+                    flattened_input=flattened_input,
+                    contribution=contribution,
+                    label=f"execute_binary[g{path.global_id}]",
+                )
             block_flat[:, :, path_index].scatter_add_(
                 2,
                 plan.flat_output_indices.reshape(1, 1, -1).expand(block.shape[0], output_channels, -1),

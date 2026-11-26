@@ -1,0 +1,25 @@
+{
+  "mutants": [
+    {
+      "id": "v1-composition-applies-v2-order-r2",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "        if key == \"callbacks\" and overlay_profile == OVERLAY_PROFILE_V2:",
+      "new": "        if key == \"callbacks\":",
+      "killer": "experiments/atomistic/stage1/tests/test_overlay_composition.py::test_v1_matches_origin_dev_golden_bytes"
+    },
+    {
+      "id": "v1-validation-requires-v2-order-r2",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "    if overlay_profile == OVERLAY_PROFILE_V2:\n        targets = [entry.get(\"_target_\") if isinstance(entry, Mapping) else None for entry in callbacks]",
+      "new": "    if overlay_profile in OVERLAY_PROFILES:\n        targets = [entry.get(\"_target_\") if isinstance(entry, Mapping) else None for entry in callbacks]",
+      "killer": "experiments/atomistic/stage1/tests/test_overlay_composition.py::test_v1_resolved_config_accepts_recorder_after_checkpoint"
+    },
+    {
+      "id": "v1-provenance-adds-profile-r2",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "    if overlay_profile == OVERLAY_PROFILE_V2:\n        provenance[\"profile\"] = OVERLAY_PROFILE_V2",
+      "new": "    if overlay_profile in OVERLAY_PROFILES:\n        provenance[\"profile\"] = OVERLAY_PROFILE_V2",
+      "killer": "experiments/atomistic/stage1/tests/test_overlay_composition.py::test_v1_resolved_config_accepts_recorder_after_checkpoint"
+    }
+  ]
+}

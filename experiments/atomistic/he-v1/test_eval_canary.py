@@ -470,8 +470,8 @@ def test_factor_common_collector_contract_uses_real_generator_emission() -> None
     """The common factor oracle must agree with the producer's real snapshot."""
 
     class FixedSampler:
-        def collect_samples(self, model, *, device=None):
-            del model, device
+        def collect_samples(self, model, *, reset=False, device=None, emitter=None):
+            del model, reset, device, emitter
             walkers = Walkers(positions=torch.zeros(3, 1, 3, dtype=torch.float64))
             return walkers, object()
 

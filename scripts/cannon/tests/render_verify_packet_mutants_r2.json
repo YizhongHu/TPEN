@@ -1,0 +1,37 @@
+[
+  {
+    "id": "packet-containment-check-removed",
+    "target": "scripts/cannon/render_verify_packet.py",
+    "old": "    if not _inside(packet, run):\n        raise RenderError(f\"packet directory must be inside run root: {packet}\")",
+    "new": "    if False:  # mutant: allow packet output outside run root\n        raise RenderError(f\"packet directory must be inside run root: {packet}\")",
+    "killer": "test_render_verify_packet.py::test_packet_dir_outside_run_root_is_rejected"
+  },
+  {
+    "id": "approved-root-check-removed",
+    "target": "scripts/cannon/render_verify_packet.py",
+    "old": "    _validate_run_root(run, facility)",
+    "new": "    pass  # mutant: accept run roots outside the approved facility tree",
+    "killer": "test_render_verify_packet.py::test_cli_rejects_run_root_outside_approved_prefix"
+  },
+  {
+    "id": "relative-spec-check-removed",
+    "target": "scripts/cannon/render_verify_packet.py",
+    "old": "        if not Path(mutants).is_absolute():\n            raise RenderError(\"mutant spec path must be absolute\")",
+    "new": "        if False:  # mutant: accept a relative mutant spec\n            raise RenderError(\"mutant spec path must be absolute\")",
+    "killer": "test_render_verify_packet.py::test_relative_spec_path_is_rejected"
+  },
+  {
+    "id": "consumer-export-removed",
+    "target": "scripts/cannon/render_verify_packet.py",
+    "old": "            \"export HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT DRY_RUN PYTHON USER WORK_ROOT \"\n            \"FACILITY_RUN_PREFIX SHARED_ENV_PREFIX UV_BIN REPO_URL\",",
+    "new": "            \"export HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT DRY_RUN PYTHON USER WORK_ROOT \"\n            \"FACILITY_RUN_PREFIX SHARED_ENV_PREFIX UV_BIN\",",
+    "killer": "test_render_verify_packet.py::test_rendered_body_consumes_real_verify_interface"
+  },
+  {
+    "id": "consumer-run-root-option-renamed",
+    "target": "scripts/cannon/render_verify_packet.py",
+    "old": "            '  --run-root \"$RUN_ROOT\"',",
+    "new": "            '  --runroot \"$RUN_ROOT\"',",
+    "killer": "test_render_verify_packet.py::test_rendered_body_consumes_real_verify_interface"
+  }
+]

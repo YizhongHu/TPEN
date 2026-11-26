@@ -72,7 +72,7 @@ running tests or allocating compute:
   requested exact SHA; the temporary directory is removed before continuing;
 - rejects a line beginning with `SBATCH` unless it begins with `#SBATCH`;
 - runs both wrapper precheck functions with job id `99999999`, name containing
-  the 12-character SHA prefix, and partition `test`;
+  the 8-character SHA prefix, and partition `test`;
 - runs the executor harness `DRY_RUN=1` path, which stops before clone, uv,
   pytest, and scheduler work; and
 - runs `sbatch --test-only` for both submitted wrappers.
@@ -93,7 +93,7 @@ Do not use that branch during rehearsal. The current task permits only
 ## Safety and scope
 
 - No repository files are changed, committed, or pushed by this template.
-- Every job name contains `SHA[:12]`; every path is absolute and under the
+- Every job name contains `SHA[:8]`; every path is absolute and under the
   Cannon `Lab/rhu/verify` prefix, with node-local `/scratch/$USER/$SLURM_JOB_ID`
   reserved for job work.
 - The root arm stages the whole `scripts/cannon/` tree because the current

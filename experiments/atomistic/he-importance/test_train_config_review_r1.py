@@ -107,6 +107,26 @@ def _literal(manifest: dict[str, Any]) -> dict[str, Any]:
     return manifest["scientific_identity"]["context"]["literal_configuration"]
 
 
+def _prechange_cell(cell: Any) -> Any:
+    """Build the legacy manifest view consumed only by the pinned oracle."""
+
+    manifest = stage_coordinate._thaw(cell.manifest)
+    identity = manifest["scientific_identity"]
+    optimizer_cell = dict(identity["optimizer_cell"])
+    optimizer_cell.update({"status": cell.availability["status"]})
+    reason = cell.availability.get("unavailable_reason")
+    if reason is not None:
+        optimizer_cell["unavailable_reason"] = reason
+    identity["optimizer_cell"] = optimizer_cell
+    digest = stage_coordinate.content_hash(manifest)
+    return replace(
+        cell,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=digest,
+        output_path=cell.output_path.parent / digest,
+    )
+
+
 # T1 ------------------------------------------------------------------------
 @pytest.mark.parametrize("axis", ("A", "B"))
 def test_resolver_forwards_exactly_the_package_labels_to_ab3(
@@ -306,15 +326,14 @@ def _assert_matches_prechange(cells: Any, resolver: Any, prechange: types.Module
 
     for cell in cells:
         try:
-            expected = prechange.resolve_train_config(cell)
+            expected = prechange.resolve_train_config(_prechange_cell(cell))
         except Exception as expected_error:  # noqa: BLE001
             try:
                 resolver(cell)
             except Exception as observed_error:  # noqa: BLE001
                 assert type(observed_error).__name__ == type(expected_error).__name__
                 if type(expected_error).__name__ == "UnavailableOptimizerError":
-                    optimizer_cell = cell.manifest["scientific_identity"]["optimizer_cell"]
-                    reason = optimizer_cell.get("unavailable_reason")
+                    reason = cell.availability.get("unavailable_reason")
                     if reason:
                         method = cell.manifest["scientific_identity"]["optimizer"]["method"]
                         assert str(observed_error) == (
@@ -339,8 +358,8 @@ def test_prechange_oracle_refusal_arm_is_a_live_control(tmp_path: Path) -> None:
     cells = stage_coordinate.materialize_intended_configurations(
         tmp_path / "materialized", availability=optimizer_grid.roster_availability(), stages=("Q",)
     )
-    refused = [c for c in cells if c.manifest["scientific_identity"]["optimizer_cell"]["status"] != "available"]
-    accepted = [c for c in cells if c.manifest["scientific_identity"]["optimizer_cell"]["status"] == "available"]
+    refused = [c for c in cells if c.availability["status"] != "available"]
+    accepted = [c for c in cells if c.availability["status"] == "available"]
     assert refused and accepted
     _assert_matches_prechange(refused[:1], train_config.resolve_train_config, prechange)  # sanity: green
 

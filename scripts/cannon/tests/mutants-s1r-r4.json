@@ -1,0 +1,39 @@
+{
+  "mutants": [
+    {
+      "id": "parity-helper-drops-checkpoint-payload-r4",
+      "target": "experiments/atomistic/stage1/tests/test_stage1_restart.py",
+      "old": "        name: _assert_checkpoint_payload_equal(resumed_checkpoint / name, reference_checkpoint / name)",
+      "new": "        name: frozenset()  # mutant: drop checkpoint payload comparison",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart.py::test_real_fresh_process_restore_parity_with_checkpoint_zero_and_overlay"
+    },
+    {
+      "id": "hooke-recorder-refusal-skipped-r4",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "    if configured_overlay is not None:",
+      "new": "    if False:  # mutant: skip recorder refusal for every composed overlay",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart.py::test_real_recorder_compositions_refuse_before_runner_call"
+    },
+    {
+      "id": "system-identity-check-removed-r4",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "    if (\n        not isinstance(system, str)\n        or not isinstance(row_system_id, str)\n        or expected_system_ids.get(system) != row_system_id\n        or config_system_id != row_system_id\n    ):",
+      "new": "    if False:  # mutant: allow a row to resume another Hamiltonian",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart.py::test_manifest_system_identity_refuses_before_runner_call"
+    },
+    {
+      "id": "system-identity-check-inverted-r5-own",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "config_system_id != row_system_id",
+      "new": "config_system_id == row_system_id",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart.py::test_valid_but_different_system_identity_refuses_before_runner_call"
+    },
+    {
+      "id": "system-identity-comparison-removed-r5-own",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "config_system_id != row_system_id",
+      "new": "False",
+      "killer": "experiments/atomistic/stage1/tests/test_stage1_restart.py::test_valid_but_different_system_identity_refuses_before_runner_call"
+    }
+  ]
+}

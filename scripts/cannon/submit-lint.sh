@@ -683,10 +683,10 @@ IFS=$'\x1f' read -r M_JOB_NAME_HAS M_JOB_NAME <<< "$(kv_get "$MANIFEST" JOB_NAME
 # Check 1: HEAD_SHA must be exactly 40 hex characters.
 [[ "$M_HEAD_SHA_HAS" == 1 && "$M_HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || fail "HEAD_SHA is not a 40-hex SHA: '${M_HEAD_SHA:-<missing>}'"
 
-# Check 2: JOB_NAME must contain the short SHA (first 12 chars).
+# Check 2: JOB_NAME must contain the short SHA (first 8 chars).
 if [[ "$M_HEAD_SHA_HAS" == 1 && "$M_HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
-  short_sha="${M_HEAD_SHA:0:12}"
-  [[ "$M_JOB_NAME_HAS" == 1 && "$M_JOB_NAME" == *"$short_sha"* ]] || fail "JOB_NAME does not contain SHA[:12] ('$short_sha'): '${M_JOB_NAME:-<missing>}'"
+  short_sha="${M_HEAD_SHA:0:8}"
+  [[ "$M_JOB_NAME_HAS" == 1 && "$M_JOB_NAME" == *"$short_sha"* ]] || fail "JOB_NAME does not contain SHA[:8] ('$short_sha'): '${M_JOB_NAME:-<missing>}'"
 else
   fail "JOB_NAME check skipped: no usable HEAD_SHA"
 fi

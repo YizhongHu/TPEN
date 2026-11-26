@@ -63,6 +63,14 @@ from ..tasks import ConfiguredRun
 _ACTIVE_DISPATCH: ContextVar[bool] = ContextVar("tpen_executor_dispatch", default=False)
 
 
+class LeafRefused(RuntimeError):
+    """Raised when a leaf refuses to launch science for a request."""
+
+
+class ConfiguredProgramRouteRefused(LeafRefused):
+    """Configured leaf entries await faithful C2.2 dispatcher binding."""
+
+
 def _lexical(path: str | os.PathLike[str]) -> str:
     """Return an absolute normalized path without resolving symlinks."""
 
@@ -120,6 +128,94 @@ def _member_paths(fence: Any) -> tuple[str, str, str, str, str, str]:
         if not _inside(output_dir, path):
             raise RuntimeError("dispatcher log path escapes the attempt fence")
     return output_dir, core_dir, stdout_path, stderr_path, evidence_stdout, evidence_stderr
+
+
+def _fence_placement_overlay(
+    fence: Any,
+    allocation: Any,
+    configured: ConfiguredRun,
+    *,
+    group_digest: str,
+    task_id: str,
+    attempt_id: str,
+    slot_id: str | None = None,
+) -> dict[str, str]:
+    """Build the controller-owned placement identities for one fenced attempt."""
+
+    payload_digest = (
+        configured.attempt_binding_digest(
+            fence.output_dir,
+            root=fence.root,
+            group_digest=group_digest,
+            task_id=task_id,
+            attempt_id=attempt_id,
+        )
+        if getattr(configured, "program", None) is not None
+        else digest({"config": getattr(configured, "config", ""), "overrides": list(getattr(configured, "overrides", ()))})
+    )
+    values = {
+        PLACEMENT_OUTPUT_ENV: os.path.join(fence.output_dir, "child-placement.json"),
+        "TPEN_PLACEMENT_OUTPUT_DIR": fence.output_dir,
+        "TPEN_PLACEMENT_TASK_ID": task_id,
+        "TPEN_PLACEMENT_ATTEMPT_ID": attempt_id,
+        "TPEN_PLACEMENT_GROUP_DIGEST": group_digest,
+        "TPEN_PLACEMENT_ALLOCATION_ID": allocation.allocation_id.value,
+        "TPEN_PLACEMENT_BACKEND_JOB_ID": allocation.backend_job_id.value,
+        "TPEN_PLACEMENT_PAYLOAD_DIGEST": payload_digest,
+    }
+    if slot_id:
+        values["TPEN_SLOT_ID"] = slot_id
+        values["TPEN_PLACEMENT_SLOT_ID"] = slot_id
+    return values
+
+
+def _require_configured_physical_slot(allocation: Any, selected_slot: Any = None) -> Any:
+    """Return a validated configured-run slot, preserving the legacy gate."""
+
+    try:
+        slots = physical_slots_from_allocation(allocation)
+    except PlacementRefusal:
+        raise
+    except (BindingError, TypeError, ValueError) as error:
+        raise PlacementRefusal("configured-physical-slot-required", str(error)) from error
+    if selected_slot is None:
+        if len(slots) != 1:
+            raise PlacementRefusal(
+                "configured-physical-slot-required",
+                "configured programs require exactly one resolved physical slot (slot ID, host, and CPUs)",
+            )
+        slot = slots[0]
+    else:
+        matching = tuple(
+            candidate for candidate in slots
+            if candidate.slot_id == getattr(selected_slot, "slot_id", None)
+        )
+        if (
+            len(matching) != 1
+            or not isinstance(selected_slot, type(matching[0]))
+            or matching[0].to_dict() != selected_slot.to_dict()
+        ):
+            raise PlacementRefusal(
+                "configured-physical-slot-foreign",
+                "selected configured-run slot is not an exact entitlement of this allocation",
+            )
+        slot = matching[0]
+    if not slot.slot_id or not slot.node or not slot.cpus:
+        raise PlacementRefusal(
+            "configured-physical-slot-required",
+            "configured programs require a physical slot ID, host, and CPUs",
+        )
+    return slot
+
+
+def _physical_slot_overlay(slot: Any) -> dict[str, str]:
+    """Return declared physical placement facts for one resolved slot."""
+
+    return {
+        "TPEN_PLACEMENT_DECLARED_HOST": slot.node,
+        "TPEN_PLACEMENT_DECLARED_CPUS": ",".join(str(cpu) for cpu in slot.cpus),
+        "TPEN_PLACEMENT_DECLARED_DEVICES": ",".join(slot.devices),
+    }
 
 
 def _status(process_outcome: Any) -> str:
@@ -198,6 +294,7 @@ def _with_child_placement(
     check_controller_affinity: bool = True,
     slot_resolver: Any = None,
     strict_host: bool = False,
+    selected_slot: Any = None,
 ) -> Any:
     """Overlay the one concrete slot and fenced identities for the child.
 
@@ -255,7 +352,15 @@ def _with_child_placement(
         )
     devices = values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "")
     resolve_slots = slot_resolver or physical_slots_from_allocation
-    if not (slot_id and host and cpus):
+    if getattr(configured, "program", None) is not None:
+        slot = _require_configured_physical_slot(allocation, selected_slot)
+        slot_facts = _physical_slot_overlay(slot)
+        slot_id = slot.slot_id
+        host = slot_facts["TPEN_PLACEMENT_DECLARED_HOST"]
+        cpus = slot_facts["TPEN_PLACEMENT_DECLARED_CPUS"]
+        devices = slot_facts["TPEN_PLACEMENT_DECLARED_DEVICES"]
+        values.update(slot.env)
+    elif not (slot_id and host and cpus):
         try:
             slots = resolve_slots(allocation)
         except PlacementRefusal:
@@ -317,21 +422,20 @@ def _with_child_placement(
                 "code": "placement-cpu-outside-controller-affinity",
                 "reason": "declared slot CPUs are not all permitted to this controller",
             }
-    payload_digest = digest({"config": configured.config, "overrides": list(configured.overrides)})
-    placement_values = {
-        PLACEMENT_OUTPUT_ENV: os.path.join(fence.output_dir, "child-placement.json"),
-        "TPEN_PLACEMENT_OUTPUT_DIR": fence.output_dir,
-        "TPEN_PLACEMENT_TASK_ID": member.task_id,
-        "TPEN_PLACEMENT_ATTEMPT_ID": fence.attempt_id.value,
-        "TPEN_PLACEMENT_GROUP_DIGEST": group.identity,
-        "TPEN_PLACEMENT_ALLOCATION_ID": allocation.allocation_id.value,
-        "TPEN_PLACEMENT_BACKEND_JOB_ID": allocation.backend_job_id.value,
-        "TPEN_PLACEMENT_SLOT_ID": slot_id,
+    placement_values = _fence_placement_overlay(
+        fence,
+        allocation,
+        configured,
+        group_digest=group.identity,
+        task_id=member.task_id,
+        attempt_id=fence.attempt_id.value,
+        slot_id=slot_id,
+    )
+    placement_values.update({
         "TPEN_PLACEMENT_DECLARED_HOST": host,
         "TPEN_PLACEMENT_DECLARED_CPUS": ",".join(str(cpu) for cpu in declared_cpus),
         "TPEN_PLACEMENT_DECLARED_DEVICES": devices,
-        "TPEN_PLACEMENT_PAYLOAD_DIGEST": payload_digest,
-    }
+    })
     if v2_requested:
         placement_values[PLACEMENT_RECEIPT_VERSION_ENV] = "2"
         placement_values["TPEN_PLACEMENT_HOST_STATUS"] = "mapped" if scheduler_metadata is not None else "declared"
@@ -502,7 +606,17 @@ def _placement_receipt(
     if not isinstance(environment, PreparedPythonEnvironment):
         raise PlacementRefusal("placement-environment", "child environment is not a prepared Python environment")
     values = environment.env
-    expected_payload = digest({"config": configured.config, "overrides": list(configured.overrides)})
+    expected_payload = (
+        configured.attempt_binding_digest(
+            fence.output_dir,
+            root=fence.root,
+            group_digest=group.identity,
+            task_id=member.task_id,
+            attempt_id=fence.attempt_id.value,
+        )
+        if getattr(configured, "program", None) is not None
+        else digest({"config": getattr(configured, "config", ""), "overrides": list(getattr(configured, "overrides", ()))})
+    )
     checks = {
         "task": observation.task_id == member.task_id,
         "attempt": observation.attempt_id == fence.attempt_id.value,
@@ -776,7 +890,7 @@ def _placement_refusal_receipt(
         allocation.allocation_id.value,
         allocation.backend_job_id.value,
         values.get("TPEN_SLOT_ID", "unavailable"),
-        digest({"config": configured.config, "overrides": list(configured.overrides)}),
+        digest({"config": getattr(configured, "config", ""), "overrides": list(getattr(configured, "overrides", ())) }),
         fence.output_dir,
         {
             "host": values.get("TPEN_SLOT_NODE", "unknown") if not _placement_v2_requested(allocation, values) else "unavailable",
@@ -915,7 +1029,7 @@ def _ensure_placement_refusal_environment(
         "TPEN_PLACEMENT_DECLARED_HOST": host,
         "TPEN_PLACEMENT_DECLARED_CPUS": ",".join(str(cpu) for cpu in declared_cpus),
         "TPEN_PLACEMENT_DECLARED_DEVICES": values.get("TPEN_PLACEMENT_DECLARED_DEVICES", ""),
-        "TPEN_PLACEMENT_PAYLOAD_DIGEST": digest({"config": configured.config, "overrides": list(configured.overrides)}),
+        "TPEN_PLACEMENT_PAYLOAD_DIGEST": digest({"config": getattr(configured, "config", ""), "overrides": list(getattr(configured, "overrides", ())) }),
         PLACEMENT_REFUSAL_ENV: json.dumps(refusal.to_dict(), sort_keys=True),
     }
     if v2_requested:
@@ -1006,6 +1120,8 @@ class DispatcherContract:
         fence: AttemptFence,
         request: Mapping[str, Any],
         core_acceptance_digest: str,
+        *,
+        recovery_admission: Any | None = None,
     ) -> SuccessorAdmissionRecord:
         """Persist a caller-confirmed core admission without launching work.
 
@@ -1019,6 +1135,7 @@ class DispatcherContract:
             raise TypeError("lifecycle must expose successor admission storage")
         return lifecycle.store.record_successor_admission(
             fence, request, core_acceptance_digest,
+            recovery_admission=recovery_admission,
         )
 
     def _begin_dispatch(
@@ -1147,7 +1264,13 @@ class DispatcherContract:
                 if not callable(getattr(evidence, "read", None)):
                     raise TypeError("materialized worker evidence reader lacks read()")
                 output_dir, _core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = _member_paths(fence)
-                args = (*configured.command().args, f"run.root={output_dir}", "run.layout=flat", "run.run_id=core")
+                args = configured.command_for_attempt(
+                    output_dir,
+                    root=fence.root,
+                    group_digest=group.identity,
+                    task_id=member.task_id,
+                    attempt_id=fence.attempt_id.value,
+                ).args
                 outcome = self._execute_process(
                     materialized,
                     environment,
@@ -1219,6 +1342,7 @@ class DispatcherContract:
         *,
         error: BaseException | None = None,
         child_refusal: PlacementRefusal | None = None,
+        accept_segment: bool = True,
     ) -> Exception | None:
         """Write one completion's records in the established order."""
 
@@ -1303,6 +1427,8 @@ class DispatcherContract:
         if inspection_error is not None:
             raise inspection_error
         if (
+            accept_segment
+            and
             status == "completed"
             and segment_evidence is not None
             and segment_evidence.verdict in {"completed", "incomplete"}
@@ -1443,4 +1569,4 @@ class DispatcherContract:
                 raise ValueError("ConfiguredRun.id must match its mapping task ID")
 
 
-__all__ = ["DispatcherContract"]
+__all__ = ["ConfiguredProgramRouteRefused", "DispatcherContract", "LeafRefused"]

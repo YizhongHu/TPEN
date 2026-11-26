@@ -57,6 +57,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+import math
+import numbers
 from typing import Any, Literal, Self
 
 from tpen.dependencies import require_torch
@@ -69,11 +71,13 @@ from tpen.training.qgt import (
     solve_sample_space,
 )
 from tpen.training.score_geometry import (
+    NONFINITE_SCORE_ROW_POLICY,
     ScoreConventions,
     build_energy_residual,
     build_score_geometry_from_rows,
     flatten_parameter_score_blocks,
     layout_convention_fingerprint,
+    select_score_update_rows,
     unflatten_to_layout,
 )
 from tpen.training.statistics import IdentityStatisticsReducer, StatisticsReducer
@@ -98,9 +102,15 @@ torch = require_torch(feature="VMC stochastic reconfiguration")
 
 
 # Bump when the persisted state envelope changes shape or meaning.
-SR_STATE_VERSION = "sr-state-1"
+# sr-state-2 adds `nonfinite_local_energy_policy` and `nonfinite_score_row_policy`.
+SR_STATE_VERSION = "sr-state-2"
 
 SolveSpace = Literal["auto", "parameter", "sample"]
+
+# Exact authority-factor vocabulary for SR/minSR grid mapping.
+SR_GRID_FACTOR_KEYS: frozenset[str] = frozenset(
+    {"eta", "relative_damping", "squared_update_norm_bound"}
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -124,10 +134,18 @@ class SRPolicy:
         Step size applied to the preconditioned direction.  Retained here as
         well as in the optimizer so that a telemetry record is self-describing.
     max_update_norm : float or None, optional
-        Trust cap on the Euclidean norm of the applied parameter displacement
-        ``lr * delta``.  ``None`` disables the cap.  A cap is a scale limit,
-        not a direction change: the direction is rescaled, never clipped
-        per-coordinate.
+        Trust cap on the Euclidean norm ``||Delta theta||_2`` of the applied
+        parameter displacement ``lr * delta``.  ``None`` disables this cap.
+        Mutually exclusive with ``squared_update_norm_bound``.  A cap is a
+        scale limit, not a direction change: the direction is rescaled, never
+        clipped per-coordinate.
+    squared_update_norm_bound : float or None, optional
+        Trust cap on the squared Euclidean norm ``||Delta theta||_2^2`` of the
+        applied parameter displacement ``lr * delta``.  ``None`` disables this
+        cap.  Mutually exclusive with ``max_update_norm``.  Enforcing
+        ``||Delta theta||_2^2 <= C`` rescales the direction proportionally by
+        ``sqrt(C) / ||lr * delta||_2`` when exceeded, never substituting the
+        unsquared condition ``||Delta theta||_2 <= C``.
     score_chunk_size : int or None, optional
         Sample chunk size passed to the score-bearing forward request.
         ``None`` leaves the choice to the model.  This is a memory control:
@@ -146,17 +164,41 @@ class SRPolicy:
     rank_cutoff: float = 0.0
     learning_rate: float = 1.0e-2
     max_update_norm: float | None = None
+    squared_update_norm_bound: float | None = None
     score_chunk_size: int | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "rank_cutoff", float(self.rank_cutoff))
-        object.__setattr__(self, "learning_rate", float(self.learning_rate))
+        object.__setattr__(
+            self,
+            "rank_cutoff",
+            _coerce_real_float(self.rank_cutoff, field_name="SRPolicy.rank_cutoff"),
+        )
+        object.__setattr__(
+            self,
+            "learning_rate",
+            _coerce_real_float(self.learning_rate, field_name="SRPolicy.learning_rate"),
+        )
         if self.max_update_norm is not None:
-            object.__setattr__(self, "max_update_norm", float(self.max_update_norm))
+            object.__setattr__(
+                self,
+                "max_update_norm",
+                _coerce_real_float(
+                    self.max_update_norm, field_name="SRPolicy.max_update_norm"
+                ),
+            )
+        if self.squared_update_norm_bound is not None:
+            object.__setattr__(
+                self,
+                "squared_update_norm_bound",
+                _coerce_real_float(
+                    self.squared_update_norm_bound,
+                    field_name="SRPolicy.squared_update_norm_bound",
+                ),
+            )
         self.validate()
 
     def validate(self) -> Self:
-        """Validate route selection, cutoff range, and step-size positivity."""
+        """Validate route selection, cutoff range, step-size positivity, and trust caps."""
 
         if self.solve_space not in ("auto", "parameter", "sample"):
             raise ValueError(
@@ -166,13 +208,37 @@ class SRPolicy:
         if not isinstance(self.damping, DampingPolicy):
             raise TypeError("SRPolicy.damping must be a DampingPolicy")
         self.damping.validate()
-        if not 0.0 <= self.rank_cutoff < 1.0:
+        rank_cutoff = _coerce_real_float(self.rank_cutoff, field_name="SRPolicy.rank_cutoff")
+        if not _is_finite(rank_cutoff) or not 0.0 <= rank_cutoff < 1.0:
             raise ValueError("SRPolicy.rank_cutoff must satisfy 0.0 <= rank_cutoff < 1.0")
-        if not self.learning_rate > 0.0 or not _is_finite(self.learning_rate):
+        learning_rate = _coerce_real_float(
+            self.learning_rate, field_name="SRPolicy.learning_rate"
+        )
+        if not learning_rate > 0.0 or not _is_finite(learning_rate):
             raise ValueError("SRPolicy.learning_rate must be finite and positive")
+        if (
+            self.max_update_norm is not None
+            and self.squared_update_norm_bound is not None
+        ):
+            raise ValueError(
+                "SRPolicy cannot set both max_update_norm and squared_update_norm_bound; "
+                "specify at most one displacement cap"
+            )
         if self.max_update_norm is not None:
-            if not self.max_update_norm > 0.0 or not _is_finite(self.max_update_norm):
+            max_update_norm = _coerce_real_float(
+                self.max_update_norm, field_name="SRPolicy.max_update_norm"
+            )
+            if not max_update_norm > 0.0 or not _is_finite(max_update_norm):
                 raise ValueError("SRPolicy.max_update_norm must be finite and positive, or None")
+        if self.squared_update_norm_bound is not None:
+            squared_bound = _coerce_real_float(
+                self.squared_update_norm_bound,
+                field_name="SRPolicy.squared_update_norm_bound",
+            )
+            if not squared_bound > 0.0 or not _is_finite(squared_bound):
+                raise ValueError(
+                    "SRPolicy.squared_update_norm_bound must be finite and positive, or None"
+                )
         if self.score_chunk_size is not None:
             if type(self.score_chunk_size) is not int or self.score_chunk_size < 1:
                 raise ValueError("SRPolicy.score_chunk_size must be a positive integer, or None")
@@ -189,6 +255,38 @@ class SRPolicy:
             return self.solve_space
         return "sample" if n_samples < n_parameters else "parameter"
 
+    def trust_scale(self, *, direction_norm: float) -> float:
+        """Return the multiplicative trust factor for one update direction.
+
+        Parameters
+        ----------
+        direction_norm : float
+            Euclidean norm ``||delta||_2`` of the unscaled update direction.
+
+        Returns
+        -------
+        float
+            Scalar in ``(0, 1]`` applied proportionally to ``delta``.  Returns
+            ``1.0`` when no cap is active, when ``direction_norm == 0.0``, or
+            when the proposed displacement already satisfies the active bound.
+        """
+
+        norm = _coerce_real_float(direction_norm, field_name="direction_norm")
+        if not _is_finite(norm) or norm < 0.0:
+            raise ValueError(f"direction_norm must be finite and non-negative, got {norm!r}")
+        if norm == 0.0:
+            return 1.0
+        proposed = self.learning_rate * norm
+        if self.max_update_norm is not None:
+            return 1.0 if proposed <= self.max_update_norm else self.max_update_norm / proposed
+        if self.squared_update_norm_bound is not None:
+            # Enforce ||Delta theta||_2^2 <= squared_update_norm_bound (never ||Delta theta||_2 <= C).
+            proposed_sq = proposed * proposed
+            if proposed_sq <= self.squared_update_norm_bound:
+                return 1.0
+            return min(1.0, math.sqrt(self.squared_update_norm_bound) / proposed)
+        return 1.0
+
     def fingerprint(self) -> dict[str, Any]:
         """Return JSON-safe policy metadata for telemetry or a state envelope."""
 
@@ -198,8 +296,278 @@ class SRPolicy:
             "rank_cutoff": self.rank_cutoff,
             "learning_rate": self.learning_rate,
             "max_update_norm": self.max_update_norm,
+            "squared_update_norm_bound": self.squared_update_norm_bound,
             "score_chunk_size": self.score_chunk_size,
         }
+
+
+@dataclass(frozen=True, kw_only=True)
+class SRGridHyperparameters:
+    """Validated SR/minSR authority-grid factor triple.
+
+    Parameters
+    ----------
+    eta : float
+        Positive finite learning rate mapped to :attr:`SRPolicy.learning_rate`.
+    relative_damping : float
+        Positive finite relative diagonal damping mapped to
+        :attr:`DampingPolicy.relative`.
+    squared_update_norm_bound : float
+        Positive finite upper bound ``C`` on the squared Euclidean displacement
+        norm ``||Delta theta||_2^2 <= C``, mapped to
+        :attr:`SRPolicy.squared_update_norm_bound`.
+    """
+
+    eta: float
+    relative_damping: float
+    squared_update_norm_bound: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "eta",
+            _coerce_positive_finite_float(
+                self.eta, field_name="SRGridHyperparameters.eta"
+            ),
+        )
+        object.__setattr__(
+            self,
+            "relative_damping",
+            _coerce_positive_finite_float(
+                self.relative_damping,
+                field_name="SRGridHyperparameters.relative_damping",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "squared_update_norm_bound",
+            _coerce_positive_finite_float(
+                self.squared_update_norm_bound,
+                field_name="SRGridHyperparameters.squared_update_norm_bound",
+            ),
+        )
+        self.validate()
+
+    def validate(self) -> Self:
+        """Validate that all three authority factors are non-bool positive finite floats."""
+
+        _coerce_positive_finite_float(
+            self.eta, field_name="SRGridHyperparameters.eta"
+        )
+        _coerce_positive_finite_float(
+            self.relative_damping,
+            field_name="SRGridHyperparameters.relative_damping",
+        )
+        _coerce_positive_finite_float(
+            self.squared_update_norm_bound,
+            field_name="SRGridHyperparameters.squared_update_norm_bound",
+        )
+        return self
+
+    @classmethod
+    def from_mapping(cls, factors: Mapping[str, Any]) -> SRGridHyperparameters:
+        """Parse and strictly validate an SR authority-factor mapping.
+
+        Parameters
+        ----------
+        factors : Mapping[str, Any]
+            Mapping containing the exact key set
+            ``{"eta", "relative_damping", "squared_update_norm_bound"}``.
+
+        Returns
+        -------
+        SRGridHyperparameters
+            Validated factor record.
+
+        Raises
+        ------
+        TypeError
+            If ``factors`` is not a mapping, or if any factor value is a
+            boolean or non-real value.
+        ValueError
+            If any required key is missing, any unknown or extra key is
+            present, or any numeric value is non-finite or not strictly
+            positive.
+        """
+
+        if not isinstance(factors, Mapping):
+            raise TypeError(
+                "SR grid factors must be a Mapping with keys "
+                f"{sorted(SR_GRID_FACTOR_KEYS)}, got {type(factors).__name__}"
+            )
+        provided_keys = set(factors.keys())
+        missing = sorted(SR_GRID_FACTOR_KEYS - provided_keys)
+        unknown = sorted(
+            (key for key in provided_keys if key not in SR_GRID_FACTOR_KEYS),
+            key=repr,
+        )
+        if missing or unknown:
+            details: list[str] = []
+            if missing:
+                details.append(f"missing keys: {missing!r}")
+            if unknown:
+                details.append(f"unknown keys: {unknown!r}")
+            raise ValueError(
+                "SR grid factors must have exact keys "
+                f"{sorted(SR_GRID_FACTOR_KEYS)!r} ({'; '.join(details)})"
+            )
+        # Validate and coerce before constructing so bool/None/non-real values
+        # consistently raise TypeError with exact field diagnostics under both
+        # Typeguard-ON and suppressed-typecheck execution.
+        eta = _coerce_positive_finite_float(
+            factors["eta"], field_name="SRGridHyperparameters.eta"
+        )
+        relative_damping = _coerce_positive_finite_float(
+            factors["relative_damping"],
+            field_name="SRGridHyperparameters.relative_damping",
+        )
+        squared_update_norm_bound = _coerce_positive_finite_float(
+            factors["squared_update_norm_bound"],
+            field_name="SRGridHyperparameters.squared_update_norm_bound",
+        )
+        return cls(
+            eta=eta,
+            relative_damping=relative_damping,
+            squared_update_norm_bound=squared_update_norm_bound,
+        )
+
+    def to_factors(self) -> dict[str, float]:
+        """Return the exact authority-factor dictionary for readback."""
+
+        return {
+            "eta": self.eta,
+            "relative_damping": self.relative_damping,
+            "squared_update_norm_bound": self.squared_update_norm_bound,
+        }
+
+
+def sr_policy_from_factors(
+    factors: Mapping[str, Any] | SRGridHyperparameters,
+    *,
+    solve_space: SolveSpace = "auto",
+    damping_minimum: float = 1.0e-12,
+    rank_cutoff: float = 0.0,
+    score_chunk_size: int | None = None,
+) -> SRPolicy:
+    """Map validated SR authority factors onto a concrete :class:`SRPolicy`.
+
+    Parameters
+    ----------
+    factors : Mapping[str, Any] or SRGridHyperparameters
+        Exact authority factor mapping or validated record specifying ``eta``,
+        ``relative_damping``, and ``squared_update_norm_bound``.
+    solve_space : {"auto", "parameter", "sample"}, optional
+        QGT solve route forwarded to :class:`SRPolicy`.
+    damping_minimum : float, optional
+        Non-negative finite floor forwarded to :attr:`DampingPolicy.minimum`.
+    rank_cutoff : float, optional
+        Relative eigenvalue cutoff forwarded to :class:`SRPolicy`.
+    score_chunk_size : int or None, optional
+        Sample chunk size forwarded to :class:`SRPolicy`.
+
+    Returns
+    -------
+    SRPolicy
+        Concrete policy with ``learning_rate=eta``,
+        ``damping=DampingPolicy(relative=relative_damping, absolute=0.0,
+        minimum=damping_minimum)``, ``max_update_norm=None``, and
+        ``squared_update_norm_bound=squared_update_norm_bound``.
+    """
+
+    if isinstance(factors, SRGridHyperparameters):
+        resolved = factors.validate()
+    else:
+        resolved = SRGridHyperparameters.from_mapping(factors)
+    minimum = _coerce_real_float(damping_minimum, field_name="damping_minimum")
+    if not _is_finite(minimum) or minimum < 0.0:
+        raise ValueError(
+            f"damping_minimum must be finite and non-negative, got {minimum!r}"
+        )
+    return SRPolicy(
+        solve_space=solve_space,
+        damping=DampingPolicy(
+            absolute=0.0,
+            relative=resolved.relative_damping,
+            minimum=minimum,
+        ),
+        rank_cutoff=rank_cutoff,
+        learning_rate=resolved.eta,
+        max_update_norm=None,
+        squared_update_norm_bound=resolved.squared_update_norm_bound,
+        score_chunk_size=score_chunk_size,
+    )
+
+
+def build_sr_update_from_factors(
+    factors: Mapping[str, Any] | SRGridHyperparameters,
+    *,
+    model_parameters: ModelParameterBinding,
+    solve_space: SolveSpace = "auto",
+    damping_minimum: float = 1.0e-12,
+    rank_cutoff: float = 0.0,
+    score_chunk_size: int | None = None,
+    conventions: ScoreConventions | None = None,
+    reducer: StatisticsReducer | None = None,
+    nonfinite_local_energy_policy: str = DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY,
+) -> tuple[torch.optim.SGD, StochasticReconfigurationUpdate]:
+    """Construct a matched plain-SGD optimizer and SR update from authority factors.
+
+    Parameters
+    ----------
+    factors : Mapping[str, Any] or SRGridHyperparameters
+        Exact authority factor mapping or validated record specifying ``eta``,
+        ``relative_damping``, and ``squared_update_norm_bound``.
+    model_parameters : ModelParameterBinding
+        Bound live parameter domain owned by the constructed SR method.
+    solve_space : {"auto", "parameter", "sample"}, optional
+        QGT solve route forwarded to :func:`sr_policy_from_factors`.
+    damping_minimum : float, optional
+        Non-negative finite floor forwarded to :attr:`DampingPolicy.minimum`.
+    rank_cutoff : float, optional
+        Relative eigenvalue cutoff forwarded to :class:`SRPolicy`.
+    score_chunk_size : int or None, optional
+        Sample chunk size forwarded to :class:`SRPolicy`.
+    conventions : ScoreConventions or None, optional
+        Score conventions forwarded to :class:`StochasticReconfigurationUpdate`.
+    reducer : StatisticsReducer or None, optional
+        Statistics reducer forwarded to :class:`StochasticReconfigurationUpdate`.
+    nonfinite_local_energy_policy : str, optional
+        Non-finite local-energy policy forwarded to
+        :class:`StochasticReconfigurationUpdate`.
+
+    Returns
+    -------
+    tuple of (torch.optim.SGD, StochasticReconfigurationUpdate)
+        Plain SGD optimizer whose learning rate equals ``eta`` and the bound
+        SR update method exposing exact readback on ``policy``,
+        ``policy.fingerprint()``, and ``describe().settings``.
+    """
+
+    if not isinstance(model_parameters, ModelParameterBinding):
+        raise TypeError(
+            "build_sr_update_from_factors requires model_parameters to be a "
+            "ModelParameterBinding"
+        )
+    policy = sr_policy_from_factors(
+        factors,
+        solve_space=solve_space,
+        damping_minimum=damping_minimum,
+        rank_cutoff=rank_cutoff,
+        score_chunk_size=score_chunk_size,
+    )
+    optimizer = torch.optim.SGD(
+        model_parameters.parameters,
+        lr=policy.learning_rate,
+    )
+    method = StochasticReconfigurationUpdate(
+        optimizer,
+        model_parameters=model_parameters,
+        policy=policy,
+        conventions=conventions,
+        reducer=reducer,
+        nonfinite_local_energy_policy=nonfinite_local_energy_policy,
+    )
+    return optimizer, method
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -221,6 +589,10 @@ class SRTelemetry(UpdateDiagnostics):
     applied_update_norm: float
     trust_scale: float
     diagnostics: SolveDiagnostics | None = None
+    n_nonfinite_energy_samples: int = 0
+    n_nonfinite_score_samples: int = 0
+    nonfinite_local_energy_policy: str = DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY
+    nonfinite_score_row_policy: str = NONFINITE_SCORE_ROW_POLICY
 
     def as_metrics(self, *, prefix: str = "sr") -> dict[str, Any]:
         """Return JSON-safe telemetry keys for a training metrics record.
@@ -246,6 +618,14 @@ class SRTelemetry(UpdateDiagnostics):
             f"{prefix}_step": int(self.step),
             f"{prefix}_samples": int(self.n_samples),
             f"{prefix}_finite_samples": int(self.n_finite_samples),
+            f"{prefix}_nonfinite_energy_samples": int(self.n_nonfinite_energy_samples),
+            f"{prefix}_nonfinite_score_samples": int(self.n_nonfinite_score_samples),
+            f"{prefix}_nonfinite_local_energy_policy": json_safe_scalar(
+                self.nonfinite_local_energy_policy
+            ),
+            f"{prefix}_nonfinite_score_row_policy": json_safe_scalar(
+                self.nonfinite_score_row_policy
+            ),
             f"{prefix}_parameters": int(self.n_parameters),
             f"{prefix}_energy_gradient_norm": json_safe_scalar(self.energy_gradient_norm),
             f"{prefix}_update_direction_norm": json_safe_scalar(self.update_direction_norm),
@@ -306,6 +686,7 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         self.nonfinite_local_energy_policy = resolve_nonfinite_local_energy_policy(
             nonfinite_local_energy_policy
         )
+        self.nonfinite_score_row_policy = NONFINITE_SCORE_ROW_POLICY
         resolved_policy = SRPolicy() if policy is None else policy
         if not isinstance(resolved_policy, SRPolicy):
             raise TypeError("StochasticReconfigurationUpdate.policy must be an SRPolicy")
@@ -380,6 +761,11 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
 
         return "energy_gradient_l2_preconditioned_direction_in_grad"
 
+    def declared_nonfinite_local_energy_policy(self) -> str:
+        """Return the non-finite local-energy policy enforced by this SR method."""
+
+        return self.nonfinite_local_energy_policy
+
     def describe(self) -> UpdateMethodDescription:
         """Add SR's resolved policy to the generic description."""
 
@@ -388,6 +774,8 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         settings.update(flatten_settings(self.policy.fingerprint(), prefix="policy_"))
         settings.update(flatten_settings(self.conventions.fingerprint(), prefix="conventions_"))
         settings["reducer_class"] = type(self.reducer).__qualname__
+        settings["nonfinite_local_energy_policy"] = self.nonfinite_local_energy_policy
+        settings["nonfinite_score_row_policy"] = self.nonfinite_score_row_policy
         return replace(base, settings=settings)
 
     def update_state(self) -> VMCUpdateState:
@@ -429,11 +817,20 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
                 self.conventions,
             ),
             "policy": self.policy.fingerprint(),
+            "nonfinite_local_energy_policy": self.nonfinite_local_energy_policy,
+            "nonfinite_score_row_policy": self.nonfinite_score_row_policy,
             "completed_updates": self.completed_updates,
         }
 
     def load_method_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Restore the envelope, rejecting a mismatched layout or convention."""
+        """Restore the envelope, rejecting layout, convention, or policy drift."""
+
+        self.validate_method_state_dict(state)
+        completed = state.get("completed_updates", 0)
+        self.completed_updates = completed
+
+    def validate_method_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Validate the envelope without mutating the live update method."""
 
         if not isinstance(state, Mapping):
             raise TypeError("StochasticReconfigurationUpdate state must be a mapping")
@@ -448,10 +845,23 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             raise ValueError(
                 "SR checkpoint layout/convention fingerprint does not match the live model"
             )
+        if state.get("policy") != self.policy.fingerprint():
+            raise ValueError("SR checkpoint policy does not match the live method")
+        recorded_energy_policy = state.get("nonfinite_local_energy_policy")
+        if recorded_energy_policy != self.nonfinite_local_energy_policy:
+            raise ValueError(
+                "SR checkpoint nonfinite_local_energy_policy does not match the live method: "
+                f"recorded {recorded_energy_policy!r}, live {self.nonfinite_local_energy_policy!r}"
+            )
+        recorded_score_policy = state.get("nonfinite_score_row_policy")
+        if recorded_score_policy != self.nonfinite_score_row_policy:
+            raise ValueError(
+                "SR checkpoint nonfinite_score_row_policy does not match the live method: "
+                f"recorded {recorded_score_policy!r}, live {self.nonfinite_score_row_policy!r}"
+            )
         completed = state.get("completed_updates", 0)
         if type(completed) is not int or completed < 0:
             raise ValueError("SR state completed_updates must be a non-negative integer")
-        self.completed_updates = completed
 
     def update(self, update_input: ScoreUpdateInput) -> VMCUpdateResult:
         """Apply one SR/minSR step and report the outcome.
@@ -476,7 +886,10 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             If the wavefunction is complex, or the score binding disagrees
             with the bound parameter domain.
         RuntimeError
-            If a nonzero-electron batch has no finite local-energy sample.
+            If ``nonfinite_local_energy_policy == "fail"`` and any local energy
+            is non-finite, if any pinned finite local-energy row carries a
+            non-finite parameter score under :data:`NONFINITE_SCORE_ROW_POLICY`,
+            or if a nonzero-electron batch has no finite local-energy sample.
         """
 
         if not isinstance(update_input, ScoreUpdateInput):
@@ -494,35 +907,19 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             sample_shape=tuple(update_input.wavefunction.logabs.shape),
         )
 
-        # Drop samples that cannot contribute a defined gradient.  This mirrors
-        # compute_vmc_objective, which excludes non-finite local energies from
-        # the objective; if SR kept them the Euclidean-limit agreement between
-        # the two would fail exactly on the steps where a sample blew up.
-        # A row with a non-finite score is dropped for the same reason: it
-        # would otherwise poison the whole QGT through the outer product.
-        # SECOND MASKING SITE. `compute_vmc_objective` is the other one, and the
-        # same policy governs both -- correcting only the first would fix the
-        # claim in a proper subset of the places it lives, leaving SR silently
-        # masking while the objective refused.
-        #
-        # SCOPE, stated because it is narrower than the mask above: the policy
-        # governs non-finite LOCAL ENERGIES, which is what the acceptance
-        # contract names. A row whose SCORES are non-finite is still dropped
-        # unconditionally, because it would otherwise poison the whole QGT
-        # through the outer product. That drop carries the same selection-bias
-        # hazard and is NOT closed here; it is filed separately rather than
-        # folded in silently.
-        energy_finite = torch.isfinite(local_energy)
-        if self.nonfinite_local_energy_policy == "fail" and not bool(energy_finite.all()):
-            n_bad = int((~energy_finite).sum().item())
-            raise RuntimeError(
-                f"stochastic reconfiguration refused a step: {n_bad} of "
-                f"{int(energy_finite.numel())} local-energy samples are non-finite and the "
-                "active policy is 'fail'. Masking them would drop a systematically "
-                "selected subsample, biasing the estimator by an uncharacterised amount"
-            )
-        finite_mask = energy_finite & torch.isfinite(rows).all(dim=1)
-        n_finite = int(finite_mask.sum().item())
+        # Pin the finite row mask at the first (local-energy) evaluation and
+        # refuse any pinned row with non-finite parameter scores rather than
+        # silently re-masking (consolidated 377f6b0f / 02859027 ruling).
+        selection = select_score_update_rows(
+            local_energy=local_energy,
+            rows=rows,
+            nonfinite_local_energy_policy=self.nonfinite_local_energy_policy,
+            method_name="stochastic reconfiguration",
+        )
+        finite_mask = selection.finite_mask
+        n_finite = selection.n_finite
+        n_nonfinite_energy = selection.n_nonfinite_energy
+        n_nonfinite_score = selection.n_nonfinite_score_total
 
         if update_input.batch.n_electrons == 0:
             # The zero-electron vacuum has no sampled coordinate degrees of
@@ -534,6 +931,8 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
                 n_samples=n_samples,
                 n_finite=n_finite,
                 n_parameters=n_parameters,
+                n_nonfinite_energy=n_nonfinite_energy,
+                n_nonfinite_score=n_nonfinite_score,
             )
         if n_finite == 0:
             raise RuntimeError(
@@ -550,6 +949,8 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
                 n_samples=n_samples,
                 n_finite=n_finite,
                 n_parameters=n_parameters,
+                n_nonfinite_energy=n_nonfinite_energy,
+                n_nonfinite_score=n_nonfinite_score,
             )
 
         if n_finite != n_samples:
@@ -593,6 +994,8 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
                 n_parameters=n_parameters,
                 energy_gradient_norm=energy_gradient_norm,
                 diagnostics=diagnostics,
+                n_nonfinite_energy=n_nonfinite_energy,
+                n_nonfinite_score=n_nonfinite_score,
             )
 
         direction_norm = float(torch.linalg.vector_norm(direction).item())
@@ -607,6 +1010,10 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             step=update_input.step,
             n_samples=n_samples,
             n_finite_samples=n_finite,
+            n_nonfinite_energy_samples=n_nonfinite_energy,
+            n_nonfinite_score_samples=n_nonfinite_score,
+            nonfinite_local_energy_policy=self.nonfinite_local_energy_policy,
+            nonfinite_score_row_policy=self.nonfinite_score_row_policy,
             n_parameters=n_parameters,
             energy_gradient_norm=energy_gradient_norm,
             update_direction_norm=direction_norm,
@@ -622,13 +1029,9 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         )
 
     def _trust_scale(self, direction_norm: float) -> float:
-        """Return the factor capping the applied displacement norm."""
+        """Return the factor capping the applied displacement."""
 
-        cap = self.policy.max_update_norm
-        if cap is None or direction_norm == 0.0:
-            return 1.0
-        proposed = self.policy.learning_rate * direction_norm
-        return 1.0 if proposed <= cap else cap / proposed
+        return self.policy.trust_scale(direction_norm=direction_norm)
 
     def _apply(self, direction: Any) -> None:
         """Write the preconditioned direction into ``.grad`` and step."""
@@ -651,6 +1054,8 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         n_parameters: int,
         energy_gradient_norm: float = 0.0,
         diagnostics: SolveDiagnostics | None = None,
+        n_nonfinite_energy: int = 0,
+        n_nonfinite_score: int = 0,
     ) -> VMCUpdateResult:
         """Record a non-applied step with an explicit reason."""
 
@@ -660,6 +1065,10 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             step=step,
             n_samples=n_samples,
             n_finite_samples=n_finite,
+            n_nonfinite_energy_samples=n_nonfinite_energy,
+            n_nonfinite_score_samples=n_nonfinite_score,
+            nonfinite_local_energy_policy=self.nonfinite_local_energy_policy,
+            nonfinite_score_row_policy=self.nonfinite_score_row_policy,
             n_parameters=n_parameters,
             energy_gradient_norm=energy_gradient_norm,
             update_direction_norm=0.0,
@@ -742,6 +1151,27 @@ def _validate_plain_sgd(optimizer: Any, *, learning_rate: float) -> None:
             )
 
 
+def _coerce_real_float(value: Any, *, field_name: str) -> float:
+    """Coerce a non-boolean real scalar to ``float``."""
+
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise TypeError(
+            f"{field_name} must be a real number (not bool), got {type(value).__name__}"
+        )
+    return float(value)
+
+
+def _coerce_positive_finite_float(value: Any, *, field_name: str) -> float:
+    """Validate and coerce a non-boolean, finite, strictly positive real scalar."""
+
+    coerced = _coerce_real_float(value, field_name=field_name)
+    if not _is_finite(coerced) or not coerced > 0.0:
+        raise ValueError(
+            f"{field_name} must be finite and strictly positive, got {coerced!r}"
+        )
+    return coerced
+
+
 def _is_finite(value: float) -> bool:
     """Return whether a Python float is finite."""
 
@@ -749,9 +1179,13 @@ def _is_finite(value: float) -> bool:
 
 
 __all__ = [
+    "SR_GRID_FACTOR_KEYS",
     "SR_STATE_VERSION",
+    "SRGridHyperparameters",
     "SRPolicy",
     "SRTelemetry",
     "SolveSpace",
     "StochasticReconfigurationUpdate",
+    "build_sr_update_from_factors",
+    "sr_policy_from_factors",
 ]

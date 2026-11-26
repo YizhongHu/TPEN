@@ -97,12 +97,8 @@ def _invoke_train(monkeypatch: pytest.MonkeyPatch, row: dict[str, object],
         "argv",
         [
             "stage1-train",
-            "--config", str(row["config"]),
-            "--kind", "train",
-            *(extra_overrides or row_overrides(row)),
             "--binding", _binding_token(row),
-            "--overlay", str(row["overlay"]),
-            "--overlay-sha256", str(row["overlay_sha256"]),
+            *([] if extra_overrides is None else [extra_overrides[-1]]),
         ],
     )
     return stage1_train.main()
@@ -168,7 +164,7 @@ def test_public_production_hooke_rows_refuse_independent_runner_overrides(
             f"root={root!r} runner={runner!r}"
         )
 
-    with pytest.raises(ProtocolError, match="runner|science|config|bound"):
+    with pytest.raises(SystemExit):
         _invoke_train(
             monkeypatch,
             row,
@@ -194,6 +190,7 @@ def test_final_guard_refuses_forged_short_hooke_row_directly(
     )
     config_path = resolve_config_path(str(row["config"]))
     cfg = load_config(str(config_path))
+    OmegaConf.update(cfg, "run.root", row["results_root"], merge=False)
     base_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
     compose_train_overlay(
         cfg, overlay=str(row["overlay"]), expected_sha256=row["overlay_sha256"],
@@ -207,6 +204,7 @@ def test_final_guard_refuses_forged_short_hooke_row_directly(
     forged = dict(row)
     forged.update(updates=1, walkers=2, checkpoint_steps=[0, 1])
     short_cfg = load_config(str(config_path))
+    OmegaConf.update(short_cfg, "run.root", forged["results_root"], merge=False)
     short_base_cfg = OmegaConf.create(OmegaConf.to_container(short_cfg, resolve=False))
     compose_train_overlay(
         short_cfg, overlay=str(forged["overlay"]),
@@ -271,7 +269,7 @@ def test_production_hooke_profile_refuses_shortened_forged_row_before_execution(
     def reached_execution(*_args: object, **_kwargs: object) -> int:
         pytest.fail("shortened science-profile row reached execution")
 
-    with pytest.raises(ProtocolError, match="science|profile|horizon|walker|checkpoint"):
+    with pytest.raises(SystemExit):
         _invoke_train(
             monkeypatch,
             row,

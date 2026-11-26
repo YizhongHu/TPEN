@@ -48,7 +48,21 @@ def _invoke_eval(
     monkeypatch.setattr(
         stage1_eval,
         "validate_gateway_binding",
-        lambda **_: {},
+        lambda **_: {
+            "kind": "eval",
+            "config": str(config_path),
+            "seed": 0,
+            "walkers": 1,
+            "draws": 1,
+            "checkpoint_dir": str(tmp_path / "checkpoint"),
+            "checkpoint_file": str(tmp_path / "checkpoint" / "model.pt"),
+            "checkpoint_sha256": "a" * 64,
+            "results_root": str(cfg.run.root),
+            "experiment_name": str(cfg.experiment.name),
+            "sector": str(cfg.experiment.sector),
+            "run_id": str(cfg.run.run_id),
+            "layout": str(cfg.run.layout),
+        },
     )
     import tpen.run
 
@@ -63,14 +77,8 @@ def _invoke_eval(
         "argv",
         [
             "eval.py",
-            "--config",
-            str(config_path),
             "--binding",
             "unused",
-            "--kind",
-            "eval",
-            "--expected-checkpoint-sha256",
-            "a" * 64,
         ],
     )
     return stage1_eval.main()

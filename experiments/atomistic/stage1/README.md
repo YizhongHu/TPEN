@@ -16,13 +16,13 @@ records checkpoint provenance. S1-A3 system
 eval configs must define a `trajectory_identity` block with `checkpoint_file`
 for this override to be accepted by Hydra.
 
-Planning is two-phase: phase 1 may select systems and emits smoke/train rows;
+Planning is two-phase: phase 1 selects systems and emits train rows;
 phase 2 consumes that manifest and binds checkpoint digests to eval rows without
 replanning seeds or source/config identity. For He/H2, phase 1 retains every
 0-to-100,000 update at 1,000-update cadence, while phase 2 selects only roster
 B (`0, 1000, 2000, 4000, 8000, 16000, 25000, 40000, 60000, 80000, 100000`).
 That is 3 lineages x 11 checkpoints x 4 streams = 132 eval rows per system,
-plus one smoke and three train rows (136 total); selection never replaces the
+plus three train rows (135 total); selection never replaces the
 full phase-1 retention set. `config_sha256` is computed by the
 planner under `stage1-config-v1`: sorted `configs/<system>/{train,eval}.yaml`
 paths and their canonical bytes are hashed. The rule id is recorded in each row;
@@ -33,6 +33,13 @@ only diagnostics bytes change, so `stage1-config-v1` alone never identifies an
 overlay-backed execution.
 The one-shot compatibility `--config-sha256` input is recorded as
 `legacy-config-sha256`; two-phase planning always records the computed rule.
+
+New planner output uses `stage1/v4`. A bounded qualification is a separate
+request derived from one retained train row: it keeps the full science recipe
+and fixed horizon, changes only its isolated `results_root`, and carries the
+single operational `execution.stop_at` coordinate. It is not a second smoke
+recipe or a row in the science manifest. The planner selects each committed
+system overlay and its digest; callers do not repeat those identities.
 
 Phase-2 checkpoint input is a `stage1-checkpoint-evidence/v1` envelope, not a
 bare digest map. It contains `phase1_manifest_hash`, a
@@ -108,28 +115,26 @@ The supported submission directory is the repository root. `render` and the
 CLI require an explicit absolute `checkout_root`/`--checkout-root`: this is the
 exact execution checkout staged for the job, and it owns the driver,
 `experiments` protocol, configs, and source identity. The checkout used to
-render the command may be different. When `render` is called with the
-repository-relative driver path, it emits commands of this form, with the
-row's relative config preserved:
+render the command may be different. The row's kind selects the fixed driver;
+the encoded row binding supplies config, identity, overlays, and checkpoint
+provenance:
 
 ```text
-/absolute/path/to/python /absolute/execution/checkout/experiments/atomistic/stage1/train.py --config configs/he/train.yaml --kind smoke <row overrides> --binding <row token>
+/absolute/path/to/python /absolute/execution/checkout/experiments/atomistic/stage1/train.py --binding <row token>
 ```
 
-The Stage-1 drivers resolve relative configs against this directory, not the
-process cwd. An absolute `--config` path is accepted when it names the same
-bound config. The eval driver emits the corresponding absolute driver path and
-its strict-checkpoint arguments. A CLI caller rendering from the repository
-root for a staged checkout passes `--checkout-root /path/to/staged/checkout`;
-it must not rely on the launch module's own location or the submission cwd.
+The Stage-1 drivers resolve the bound config against this directory, not the
+process cwd. The eval driver applies its strict model-only checkpoint binding
+from the same row. A CLI caller rendering from the repository root for a
+staged checkout passes `--checkout-root /path/to/staged/checkout`; it must not
+rely on the launch module's own location or the submission cwd.
 
-Smoke rows use the same `configs/<system>/train.yaml` files as train rows. Their
-smoke-ness is only the bounded budget supplied by `launch.row_overrides`:
-`sampler.n_walkers`, `trainer.max_steps`, and `checkpoint_steps` are set from
-the manifest row, with the final checkpoint at `smoke_updates`. A smoke checks
-that the launch path, gateway, real train config, and final checkpoint can run
-to `COMPLETE` at the planned cluster directory. It does not measure energy
-accuracy and does not run evaluation or collection.
+Qualification requests use the same train row and `configs/<system>/train.yaml`
+recipe as science. Their only application difference is the isolated output
+root plus `execution.stop_at`, which is translated to the public
+`PlannedYield` runtime callback. The fixed trainer horizon, walkers, seeds,
+overlay, and checkpoint schedule remain unchanged; a successful prefix is
+reported as `planned_yield`, not `COMPLETE`, and is not collected as science.
 
 The real-producer integration test is marked `stage1_real_producer` and remains
 in default collection. Mutant packets select their test paths explicitly so

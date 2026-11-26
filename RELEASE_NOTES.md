@@ -1,5 +1,89 @@
 # Release Notes
 
+## v0.6.0 - Stage 1 ACT50 profiles, executor contracts, and observability
+
+56 commits since `v0.5.6`, merged into `dev` through PRs #825, #826, #828,
+#829, #830, #832, #833, #834, #835, #836, #837, #838, #839, #840, #841,
+#842, #843, #844, #845, #846, #848, #849, #850, #852, #853, #854, #855,
+#857, #858, #859, #864, #866, #867, #868, #869, #870, #871, #872, #873,
+#877, #878, #879, #880, #881, #882, #884, #885, #887, #888, #889, #890,
+#891, #893, #894, #896, #897.
+
+The entries below correspond one-for-one with the commits in
+`git log --oneline origin/main..origin/dev`; they describe code and test
+changes only and make no claims about science or verification results.
+
+### Stage 1 and science configuration
+
+- Opt in to the ACT50 Hooke-2e 50k Sigmoid, Tanh, and no-layer profiles (#897).
+- Make PBS consume one selected Stage 1 row in the launch redesign (LR-4) (#887).
+- Request one CPU per Cannon GPU job in the Stage 1 launcher (#882).
+- Pin the precise H2 baseline reference (#881).
+- Make the Stage 1 smoke a published prefix in the launch redesign (LR-3) (#878).
+- Put one selected Stage 1 row on the wire in the launch redesign (LR-2) (#867).
+- Resume Stage 1 through configured `train_resume` and remove `restart.py` core-internal imports (S1-R2) (#848).
+- Add descriptive Stage 1 analysis tooling for pooled error/variance, train-window joins, and trajectory figures (#841).
+- Bind Stage 1 run output before resolution with one train config builder (LR-1) (#835).
+- Apply the operator job-naming scheme to Stage 1 job creators (#836).
+- Make the Polaris qualification job name follow the operator scheme (#834).
+- Move availability out of He-importance manifest identity and add O1 scan manifest v2 (#849).
+- Add a cell-level write-once Stage-Q selection receipt (S6B-0) (#828).
+- Prevalidate update-method state before live checkpoint restore writes (#873).
+
+### Executor
+
+- Make the executor teardown deadline check deterministic (#896).
+- Bind configured executor rows to selected slots (#894).
+- Add the B1-R2C full-horizon completion record (#890).
+- Reconcile R2 recovery consumers (#880).
+- Version executor recovery admission (#877).
+- Bind configured attempt outputs (#855).
+- Add a configured Stage-Q leaf entry (#842).
+- Wire B1d controller submit/collect (#845).
+- Cover the C1 admission reader (#840).
+- Wire bounded controller collection (#830).
+- Add the public successor-admission reader (#829).
+
+### Optimizers, SR, SOAP, and training
+
+- Add SOAP pilot rows and offline checks (#893).
+- Add the bounded replay SR benchmark harness (#891).
+- Assert that legacy-layout refusal leaves the model and optimizer unchanged (#888).
+- Update sampler scope consumers (#885).
+- Add sampler burn-in and production scopes (#872).
+- Enforce the SR policy fingerprint on method-state load (#870).
+- Add HI-shape Linear Method dense-refusal evidence (#871).
+- Add the dense Hamiltonian-tangent Linear Method update (P5) (#866).
+- Map SR/minSR grid factors with a squared-displacement cap (#857).
+- Enforce the `fail_on_pinned` score-row policy for SR and SPRING (#852).
+- Add typed VMC step request/produce support (#854).
+- Add the pure-PyTorch multi-mode tensor SOAP optimizer (#853).
+- Implement native pure-PyTorch structured KFAC and HI grid mapping (#858).
+
+### Observability and profiling
+
+- Export native profiler Chrome traces (O8b) (#889).
+- Add the opt-in native profiler with a code-owned `TrainingIterationWindow` (O8) (#879).
+- Add O7 recovery boundaries and bounded operator-summary reconciliation (#869).
+- Add an explicit NVIDIA physical-device probe and `NvidiaDeviceSource` (O6) (#868).
+- Add bounded Linux descendant and cgroup-v2 sources (O5) (#859).
+- Add the Linux exact-generation current-memory source (O4) (#864).
+- Add `ResourceSamples`, self-RUSAGE, and Torch allocator ownership (O3) (#850).
+- Add `tpen.run-observability/v1` artifacts, a bounded writer, and pure inspection (O2) (#846).
+- Add the O1 managed callback lifecycle and `RunContext` readiness contract (#844).
+
+### Test infrastructure and documentation
+
+- Put the raw-batch recorder before every Checkpoint in the diagnostics-v2 profile (#884).
+- Track cluster verification files (#843).
+- Add the strict venue profile loader (#839).
+- Stabilize S3 outcome-parity timing (#838).
+- Adopt SHA-8 job names in the harness (#837).
+- Add the tested `render_verify_packet.py` renderer for verify.sh packets (#833).
+- Make verify.sh collect the full-suite artifact tarball and SHA-256 manifest (#825).
+- Reconcile the harness expected-failure count (#826).
+- Restore the v0.5.5 release-notes section dropped by #827 (#832).
+
 ## v0.5.6 - QHO-2e control, executor progress, and release fixes
 
 21 commits since `v0.5.5` (`95cbb3bc`), merged into `dev` through PRs
@@ -25,6 +109,49 @@
 - Import the executor harness and devsuite launcher templates byte-identically (#817, #819).
 - Make the Stage 1 lineage-claim race deterministic and wire core admission through the executor (#814, #815).
 - Extract public leaf completion and qualify the HI continuation state (#820, #812).
+
+## v0.5.5 - Stage 1 Hooke science shape, 100k overlays, and executor/cache fixes
+
+36 commits since `v0.5.4` (`7272dca6`), merged into `dev` through PRs
+#740, #752, #753, #755, #756, #758, #759, #760, #761, #762, #763, #764,
+#765, #766, #767, #768, #771, #772, #773, #774, #775, #776, #778, #780,
+#781, #782, #783, #784, #785, #786, #788, #789, #790, #791, #792, #793,
+#796, #797.
+
+### Added
+
+- **Core restart primitives (CX-08)**: expose read-only published checkpoint
+  discovery and atomic exclusive JSON receipt creation through `tpen.execution`.
+  Discovery uses checkpoint publication records only; receipts never overwrite
+  an existing path. Restore and takeover policies are unchanged.
+- **Hooke-1e/2e science shape and 100k overlays** (#776, #790): bind the H-v2-matched Hooke systems and add diagnostic and identity overlays for 100k runs.
+- **Executor lifecycle and transport** (#740, #753, #758, #764, #765, #775, #778): add attached transport, typed continuation refusal, routed leaves, allocation-group reconciliation, durable publication, and Balsam lifecycle support.
+- **Stage 1 and recovery capabilities** (#755, #756, #763, #768, #771, #772, #773, #774): add native recovery guards, He/H2 runbook support, the Stage 1 checkpoint, diagnostics, width and retention bindings, baseline reporting, restart primitives, and recovery-profile admission.
+- **Executor successor publication** (#788, #796, #793, #797): add admitted-successor startup, multi-generation publication, launch intents, and the controller-generation authority ledger; #796 and #797 re-land #788 and #793.
+- **He-importance state handling** (#753): add the HI-S5 mutable-state inventory and typed continuation refusal.
+
+### Fixed
+
+- **Native restore guard [CX-09]**: all `run_from_config` train-resume loads,
+  including operational requests and direct configured loads, check the existing
+  native recovery profile before construction or state mutation. Unsupported
+  callbacks/loggers/cadence now refuse with `UnsupportedMutableStateError` and
+  the existing profile code. Positional Train loads are covered; admission
+  precedes HI resolver evaluation. Indeterminate load syntax refuses with
+  `malformed-config`, including indeterminate runner targets with a possible
+  positional load (sixth argument or indeterminate `_args_`). Syntactically
+  determined fresh and model-only loads skip profile admission.
+- **Persistent Metropolis cache** (#780): invalidate the sampler cache when its persistent state changes.
+- **He-importance evaluator guards** (#762, #783, #785, #786, #791): enforce identity horizons, typed loader errors, duplicate-id refusal, argument screening, and rank-artifact identifier screening.
+- **Evaluation and launch paths** (#761, #766, #767): scale trajectory reconciliation, surface roster-unavailable reasons, and bootstrap planning scripts by path.
+- **Core resume admission** (#774): refuse unsupported mutable state before construction or state mutation, including indeterminate load syntax.
+
+### Tests and documentation
+
+- **HI horizon coverage** (#792): add refusal coverage for the HI #762 horizon boundary.
+- **HI policy boundary guard** (#789): test the fail-closed HI policy boundary.
+- **GPU guard coverage** (#759): prove the Stage 1 GPU guard reaches the driver.
+- **Cannon runbooks and documentation** (#752, #781, #782, #784): add He/H2 science runbooks, document test purposes and stop conditions, update Netscratch retention guidance, and expose testing skills to Claude.
 
 ## v0.5.4 - Stage 1 production GPU launch, reconciled collector statistics, two-phase manifest identity
 

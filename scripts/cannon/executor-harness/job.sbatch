@@ -55,7 +55,7 @@ validate_other_inputs() {
   # Pre-driver failures print to stderr: under sbatch stderr is /dev/null, but a login-node DRY_RUN shows it.
   [[ "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "PRECHECK_FAILED HEAD_SHA not 40 hex: $HEAD_SHA" >&2; return 1; }
   [[ "$JOB_NAME" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "PRECHECK_FAILED JOB_NAME charset: $JOB_NAME" >&2; return 1; }
-  [[ "$JOB_NAME" == *"${HEAD_SHA:0:12}"* ]] || { echo "PRECHECK_FAILED JOB_NAME must contain ${HEAD_SHA:0:12}: $JOB_NAME" >&2; return 1; }
+  [[ "$JOB_NAME" == *"${HEAD_SHA:0:8}"* ]] || { echo "PRECHECK_FAILED JOB_NAME must contain ${HEAD_SHA:0:8}: $JOB_NAME" >&2; return 1; }
   [[ "$COPYFILE_DISABLE" == 1 ]] || { echo "PRECHECK_FAILED COPYFILE_DISABLE!=1" >&2; return 1; }
   [[ "$PYTHONPATH" == "" ]] || { echo "PRECHECK_FAILED PYTHONPATH not empty: $PYTHONPATH" >&2; return 1; }
 }

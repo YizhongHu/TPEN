@@ -73,7 +73,9 @@ MANIFEST_FILENAME = "manifest.json"
 #: Components whose bytes are the restorable model/train-resume state, as
 #: opposed to descriptive metadata about that state. Matches the component
 #: names ``save_checkpoint`` uses as keys in its ``files`` mapping.
-PAYLOAD_COMPONENT_NAMES = frozenset({"model", "optimizer", "trainer", "sampler", "rng"})
+PAYLOAD_COMPONENT_NAMES = frozenset(
+    {"model", "optimizer", "trainer", "method_state", "sampler", "rng"}
+)
 
 #: Pseudo-component names for the two files every checkpoint directory has
 #: that are not listed in the manifest's own ``files`` mapping.

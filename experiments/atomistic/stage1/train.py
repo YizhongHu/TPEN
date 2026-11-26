@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from omegaconf import DictConfig, OmegaConf
@@ -16,11 +17,84 @@ if _REPO_ROOT not in sys.path:
 
 from tpen.run import run_from_config
 from experiments.atomistic.stage1.protocol import (
+    OVERLAY_PROFILE_V1,
+    compose_model_profile,
     compose_train_overlay,
     resolve_config_path,
+    row_config_values,
     validate_resolved_train_config,
     validate_gateway_binding,
 )
+
+
+def _bind_output_identity(cfg: DictConfig, row: Mapping[str, object]) -> None:
+    """Bind the row-owned output identity before any config snapshot."""
+
+    for path, key in (
+        ("run.root", "results_root"),
+        ("experiment.name", "experiment_name"),
+        ("experiment.sector", "sector"),
+        ("run.run_id", "run_id"),
+        ("run.layout", "layout"),
+    ):
+        value = row.get(key, "nested" if key == "layout" else None)
+        if value is None:
+            raise ValueError(f"manifest row is missing {key}")
+        OmegaConf.update(cfg, path, value, merge=False)
+
+
+def build_train_config(
+    row: Mapping[str, object], *, config_path: str | Path | None = None,
+    overrides: Sequence[str] | None = None, overlay: str | None = None,
+    overlay_sha256: str | None = None,
+) -> DictConfig:
+    """Compose one train row and validate its final producer configuration.
+
+    The output identity is bound before preserving the base snapshot.  This
+    makes the config self-contained even when the YAML deliberately contains
+    a mandatory output slot instead of an environment interpolation.
+    """
+
+    selected_config = resolve_config_path(config_path or str(row.get("config", "")))
+    if not selected_config.is_file():
+        raise FileNotFoundError(f"Stage-1 config path does not exist: {selected_config}")
+    from tpen.run import load_config
+    cfg = load_config(str(selected_config))
+    compose_model_profile(cfg, str(row.get("science_profile")) if row.get("science_profile") else None)
+    _bind_output_identity(cfg, row)
+    base_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+
+    selected_overlay = overlay if overlay is not None else row.get("overlay")
+    selected_overlay_sha = (
+        overlay_sha256 if overlay_sha256 is not None else row.get("overlay_sha256")
+    )
+    if selected_overlay is not None:
+        if selected_overlay_sha is None:
+            raise ValueError("train overlay is missing its sha256 binding")
+        compose_train_overlay(
+            cfg, overlay=str(selected_overlay), expected_sha256=str(selected_overlay_sha),
+            overlay_profile=str(row.get("overlay_profile", OVERLAY_PROFILE_V1)),
+            science_profile=str(row.get("science_profile")) if row.get("science_profile") else None,
+        )
+
+    cfg = OmegaConf.merge(cfg, OmegaConf.create(row_config_values(row)))
+    # The optional dotlist remains only for the pinned restart adapter.  The
+    # real gateway has no positional override channel and never reaches this
+    # branch.
+    if overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(overrides)))
+    # A caller-supplied compatibility override must not redirect artifacts.
+    _bind_output_identity(cfg, row)
+    if row.get("science_profile") == "hooke-hv2-v1":
+        # Preserve the producer-boundary guard while keeping composition in
+        # this shared builder for both fresh and restart gateways.
+        if cfg.runtime.seed != row["seed"] or cfg.sampler.seed != row["sampler_seed"]:
+            raise ValueError("Hooke science runtime and sampler seeds are not bound")
+        if cfg.runtime.seed == cfg.sampler.seed:
+            raise ValueError("Hooke science runtime and sampler seeds must be distinct")
+    prepare_initial_checkpoint_config(cfg)
+    validate_resolved_train_config(cfg, row, base_config=base_cfg)
+    return cfg
 
 
 def prepare_initial_checkpoint_config(cfg: DictConfig) -> None:
@@ -49,57 +123,17 @@ def main() -> int:
     """Run one configured training job through TPEN's public gateway."""
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
-    parser.add_argument("overrides", nargs="*")
     parser.add_argument("--binding", required=True)
-    parser.add_argument("--kind", choices=("smoke", "train"), required=True)
-    parser.add_argument("--overlay")
-    parser.add_argument("--overlay-sha256")
-    parser.add_argument(
-        "--restart", action="store_true",
-        help="run the admitted row through the Stage-1 restart protocol",
-    )
     args = parser.parse_args()
-    config_path = resolve_config_path(args.config)
-    row = validate_gateway_binding(
-        binding=args.binding, config=str(config_path), overrides=args.overrides,
-        kind=args.kind, overlay=args.overlay, overlay_sha256=args.overlay_sha256,
-    )
-    if not config_path.is_file():
-        raise FileNotFoundError(f"Stage-1 config path does not exist: {config_path}")
-    # Config loading remains owned by the installed tpen entrypoint; this
-    # wrapper is intentionally only a gateway and does not duplicate Runner.
-    from tpen.run import load_config
-    # Compose the declared train overlay before applying row overrides so the
-    # manifest remains authoritative for seeds, sizes, and run identity.
-    cfg = load_config(str(config_path))
-    # Keep an immutable resolved snapshot for the final Hooke science boundary;
-    # the same object is intentionally mutated by overlay composition below.
-    base_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
-    if args.overlay is not None:
-        compose_train_overlay(
-            cfg, overlay=args.overlay, expected_sha256=args.overlay_sha256,
-        )
-    if args.overrides:
-        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(args.overrides)))
-    if row.get("science_profile") == "hooke-hv2-v1":
-        # Recheck the resolved producer boundary after OmegaConf composition;
-        # checking only the textual override list would allow a later merge to
-        # alias the initialization and sampler streams.
-        if cfg.runtime.seed != row["seed"] or cfg.sampler.seed != row["sampler_seed"]:
-            raise ValueError("Hooke science runtime and sampler seeds are not bound")
-        if cfg.runtime.seed == cfg.sampler.seed:
-            raise ValueError("Hooke science runtime and sampler seeds must be distinct")
-    prepare_initial_checkpoint_config(cfg)
-    validate_resolved_train_config(cfg, row, base_config=base_cfg)
-    if args.restart:
-        from experiments.atomistic.stage1.restart import execute_restart
+    row = validate_gateway_binding(binding=args.binding, expected_kinds={"smoke", "train"})
+    cfg = build_train_config(row)
+    config_path = resolve_config_path(str(row["config"]))
+    from experiments.atomistic.stage1.restart import execute_train
 
-        result = execute_restart(
-            cfg=cfg, row=row, config_path=config_path, command="stage1 restart",
-        )
-        return 0 if result.outcome == "completed" else 1
-    return run_from_config(cfg, config_path=str(config_path), command="stage1 train")
+    return execute_train(
+        cfg=cfg, row=row, config_path=config_path, command="stage1 train",
+        run=run_from_config,
+    )
 
 
 if __name__ == "__main__":

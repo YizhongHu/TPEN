@@ -6,8 +6,9 @@ from collections.abc import Mapping
 from typing import Any, Callable
 
 from tpen.artifacts import RunContext
-from tpen.data.batch import WavefunctionOutput
+from tpen.data.batch import WavefunctionOutput, select_flat_batch_mask
 from tpen.dependencies import require_torch
+from tpen.nn.forward import StructuredCurvatureForwardRequest
 from tpen.physics.hamiltonian import (
     LocalEnergyResult,
     evaluate_local_energy_in_chunks,
@@ -28,7 +29,18 @@ from tpen.training.events import (
     UpdateSkipped,
 )
 from tpen.training.state import TrainerState
-from tpen.nn.forward import ParameterScoreRequest
+from tpen.training.step_requests import (
+    AutogradStepRequest,
+    HamiltonianTangentUpdateInput,
+    MaterializedHamiltonianTangentStepRequest,
+    ParameterScoreStepRequest,
+    ProducedVMCStep,
+    StructuredCurvatureStepRequest,
+    StructuredCurvatureUpdateInput,
+    _resolve_live_parameter_binding,
+    evaluate_hamiltonian_tangent_step,
+    resolve_step_request,
+)
 from tpen.training.optim import (
     UpdateMethodSpec,
     # Aliased because this trainer's own binding boundary below is also
@@ -159,6 +171,354 @@ def _detach_local_energy_value(result: Any) -> Any:
     return result
 
 
+class _TrainerStepProducer:
+    """Concrete trainer-owned producer for one VMC iteration.
+
+    Defined in :mod:`tpen.training.trainer` so module-level test seams
+    (``local_energy``, ``evaluate_local_energy_in_chunks``,
+    ``compute_vmc_objective``, ``_detach_local_energy_value``, and
+    ``_detach_wavefunction_output``) intercept every producer call directly.
+    """
+
+    def __init__(
+        self,
+        *,
+        trainer: VMCTrainer,
+        model: Any,
+        hamiltonian_terms: Any,
+        batch: Any,
+        step: int,
+        context: RunContext,
+        state: TrainerState,
+    ) -> None:
+        self._trainer = trainer
+        self._model = model
+        self._hamiltonian_terms = hamiltonian_terms
+        self._batch = batch
+        self._step = step
+        self._context = context
+        self._state = state
+
+    def _evaluate_detached_local_energy_with_output(
+        self,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None, WavefunctionOutput | None]:
+        """Run the configured local-energy path and retain any detached output."""
+
+        with self._context.scope(LocalEnergy(step=self._step), state=self._state):
+            if self._trainer.local_energy_chunk_size is None:
+                result = local_energy(
+                    self._hamiltonian_terms,
+                    self._model,
+                    self._batch,
+                    return_terms=self._trainer.return_terms,
+                )
+            else:
+                # Bounded route: each chunk's derivative graph is released
+                # before the next chunk is evaluated.
+                result = evaluate_local_energy_in_chunks(
+                    self._hamiltonian_terms,
+                    self._model,
+                    self._batch,
+                    return_terms=self._trainer.return_terms,
+                    chunk_size=self._trainer.local_energy_chunk_size,
+                )
+        # The objective deliberately differentiates through the wavefunction
+        # output, not through local energy.  Its closure re-evaluation builds
+        # a fresh local-energy graph when needed, so no consumer in this step
+        # needs to retain this one.
+        result = _detach_local_energy_value(result)
+        if isinstance(result, LocalEnergyResult):
+            return result.total, result.terms, result.wavefunction_output
+        return result, None, None
+
+    def _evaluate_detached_local_energy(
+        self,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+        """Run the configured local-energy path and hand off detached values."""
+
+        total, terms, _wf_output = self._evaluate_detached_local_energy_with_output()
+        return total, terms
+
+    def produce_autograd_step(
+        self,
+        request: AutogradStepRequest,
+    ) -> ProducedVMCStep[AutogradUpdateInput]:
+        """Produce the historical live autograd objective and step payload."""
+
+        del request
+        total_local_energy, term_energies = self._evaluate_detached_local_energy()
+        with self._context.scope(Forward(step=self._step), state=self._state):
+            output = self._model(self._batch)
+        with self._context.scope(Objective(step=self._step), state=self._state):
+            objective = compute_vmc_objective(
+                output.logabs,
+                total_local_energy,
+                nonfinite_policy=self._trainer.nonfinite_local_energy_policy,
+            )
+        update_input = AutogradUpdateInput(
+            batch=self._batch,
+            wavefunction=output,
+            local_energy=total_local_energy,
+            step=self._step,
+            objective=objective.loss,
+            # A TRUE closure optimizer re-evaluates the objective one or more
+            # times per step at parameters it has already mutated in place, so
+            # it cannot use `objective.loss`: backward on that retained graph
+            # raises once the saved-tensor versions have moved. The
+            # re-evaluation is built over THIS step's fixed `batch` and carries
+            # the SAME resolved non-finite policy, so a second evaluation cannot
+            # resample, cannot advance the sampler RNG the resume path depends
+            # on, and cannot switch estimators midway through one step.
+            reevaluate=vmc_objective_reevaluation(
+                model=self._model,
+                hamiltonian_terms=self._hamiltonian_terms,
+                batch=self._batch,
+                primary_local_energy=total_local_energy,
+                nonfinite_policy=self._trainer.nonfinite_local_energy_policy,
+            ),
+        )
+        return ProducedVMCStep(
+            update_input=update_input,
+            objective=objective,
+            local_energy=total_local_energy,
+            term_energies=term_energies,
+            wavefunction_output=output,
+        )
+
+    def produce_parameter_score_step(
+        self,
+        request: ParameterScoreStepRequest,
+    ) -> ProducedVMCStep[ScoreUpdateInput]:
+        """Produce the detached parameter-score step payload in one forward."""
+
+        total_local_energy, term_energies = self._evaluate_detached_local_energy()
+        with self._context.scope(Forward(step=self._step), state=self._state):
+            packet = request.forward_request.evaluate(self._model, self._batch).detach()
+            output = packet.as_output()
+            parameter_scores = packet.parameter_scores
+        with self._context.scope(Objective(step=self._step), state=self._state):
+            objective = compute_vmc_objective(
+                output.logabs,
+                total_local_energy,
+                nonfinite_policy=self._trainer.nonfinite_local_energy_policy,
+            )
+        update_input = ScoreUpdateInput(
+            batch=self._batch,
+            wavefunction=output,
+            local_energy=total_local_energy,
+            step=self._step,
+            parameter_scores=parameter_scores,
+            parameter_binding=self._model.parameter_binding,
+        )
+        return ProducedVMCStep(
+            update_input=update_input,
+            objective=objective,
+            local_energy=total_local_energy,
+            term_energies=term_energies,
+            wavefunction_output=output,
+        )
+
+    def produce_materialized_hamiltonian_tangent_step(
+        self,
+        request: MaterializedHamiltonianTangentStepRequest,
+    ) -> ProducedVMCStep[HamiltonianTangentUpdateInput]:
+        """Produce detached scores and local-energy derivatives in one pass."""
+
+        # No synthetic 0s Forward scope is emitted: the single-pass tangent
+        # evaluator reuses the kinetic term's forward graph inside LocalEnergy.
+        with self._context.scope(LocalEnergy(step=self._step), state=self._state):
+            update_input, term_energies = evaluate_hamiltonian_tangent_step(
+                model=self._model,
+                hamiltonian_terms=self._hamiltonian_terms,
+                batch=self._batch,
+                step=self._step,
+                chunk_size=request.chunk_size,
+                trainer_chunk_size=self._trainer.local_energy_chunk_size,
+                return_terms=self._trainer.return_terms,
+                local_energy_fn=local_energy,
+            )
+        with self._context.scope(Objective(step=self._step), state=self._state):
+            objective = compute_vmc_objective(
+                update_input.wavefunction.logabs,
+                update_input.local_energy,
+                nonfinite_policy=self._trainer.nonfinite_local_energy_policy,
+            )
+        return ProducedVMCStep(
+            update_input=update_input,
+            objective=objective,
+            local_energy=update_input.local_energy,
+            term_energies=term_energies,
+            wavefunction_output=update_input.wavefunction,
+        )
+
+    def produce_structured_curvature_step(
+        self,
+        request: StructuredCurvatureStepRequest,
+    ) -> ProducedVMCStep[StructuredCurvatureUpdateInput]:
+        """Produce detached KFAC curvature factors and half-gradient with two-path masking."""
+
+        total_local_energy, term_energies, local_energy_wf_output = (
+            self._evaluate_detached_local_energy_with_output()
+        )
+        policy = self._trainer.nonfinite_local_energy_policy
+        flat_batch = self._batch.flatten_samples()
+        n_samples = flat_batch.batch_size
+        energy_flat = total_local_energy.reshape(-1)
+        if int(energy_flat.numel()) != n_samples:
+            raise ValueError(
+                f"local_energy numel {int(energy_flat.numel())} disagrees with batch_size={n_samples}"
+            )
+        energy_finite = torch.isfinite(energy_flat)
+        n_finite = int(energy_finite.sum().item())
+
+        def _detached_full_output() -> WavefunctionOutput:
+            if (
+                local_energy_wf_output is not None
+                and tuple(local_energy_wf_output.logabs.shape) == tuple(total_local_energy.shape)
+            ):
+                return _detach_wavefunction_output(local_energy_wf_output)
+            with self._context.scope(Forward(step=self._step), state=self._state):
+                with torch.no_grad():
+                    return _detach_wavefunction_output(self._model(self._batch))
+
+        # Policy-"fail" non-finite rows and all-non-finite batches flow directly
+        # into compute_vmc_objective without entering KFAC curvature capture.
+        if n_finite == 0 or (policy == "fail" and n_finite < n_samples):
+            output = _detached_full_output()
+            with self._context.scope(Objective(step=self._step), state=self._state):
+                objective = compute_vmc_objective(
+                    output.logabs,
+                    total_local_energy,
+                    nonfinite_policy=policy,
+                )
+            # compute_vmc_objective raises loudly for both cases above; keep
+            # an explicit guard in case a custom test stub intercepts it.
+            raise RuntimeError(
+                "structured curvature step refused non-finite local-energy batch"
+            )
+
+        # Degenerate batches (vacuum or <2 finite rows) skip cleanly without
+        # running curvature backward or mutating EMA/refresh state.
+        if flat_batch.n_electrons == 0 or n_finite < 2:
+            output = _detached_full_output()
+            with self._context.scope(Objective(step=self._step), state=self._state):
+                objective = compute_vmc_objective(
+                    output.logabs,
+                    total_local_energy,
+                    nonfinite_policy=policy,
+                )
+            binding = _resolve_live_parameter_binding(self._model)
+            update_input = StructuredCurvatureUpdateInput(
+                batch=self._batch,
+                wavefunction=output,
+                local_energy=total_local_energy,
+                step=self._step,
+                parameter_binding=binding,
+                solve_dtype=request.solve_dtype,
+                kronecker_blocks=(),
+                dense_blocks=(),
+                energy_half_gradient=(),
+                n_finite_samples=n_finite,
+                curvature_available=False,
+            )
+            return ProducedVMCStep(
+                update_input=update_input,
+                objective=objective,
+                local_energy=total_local_energy,
+                term_energies=term_energies,
+                wavefunction_output=output,
+            )
+
+        if n_finite == n_samples:
+            # Fast path: all rows finite, one forward on the full batch.
+            weights = (energy_flat - energy_flat.mean()).detach() / float(n_samples)
+            fwd_request = StructuredCurvatureForwardRequest(
+                sample_weights=weights,
+                solve_dtype=request.solve_dtype,
+                max_dense_block_numel=request.max_dense_block_numel,
+            )
+            with self._context.scope(Forward(step=self._step), state=self._state):
+                packet = fwd_request.evaluate(self._model, self._batch).detach()
+                output = packet.as_output()
+        else:
+            # Masked subset path under "mask": evaluate strictly on pinned
+            # finite rows so dropped rows can never leak 0.0 * NaN = NaN.
+            batch_pinned = select_flat_batch_mask(flat_batch, energy_finite)
+            energy_pinned = energy_flat[energy_finite]
+            weights_pinned = (energy_pinned - energy_pinned.mean()).detach() / float(n_finite)
+            fwd_request = StructuredCurvatureForwardRequest(
+                sample_weights=weights_pinned,
+                solve_dtype=request.solve_dtype,
+                max_dense_block_numel=request.max_dense_block_numel,
+            )
+            with self._context.scope(Forward(step=self._step), state=self._state):
+                packet = fwd_request.evaluate(self._model, batch_pinned).detach()
+                pinned_out = packet.as_output()
+                out_device = pinned_out.logabs.device
+                out_dtype = pinned_out.logabs.dtype
+                mask_dev = energy_finite.to(device=out_device)
+                full_logabs = torch.empty((n_samples,), device=out_device, dtype=out_dtype)
+                full_sign = torch.empty((n_samples,), device=out_device, dtype=pinned_out.sign.dtype)
+                full_logabs[mask_dev] = pinned_out.logabs.reshape(-1)
+                full_sign[mask_dev] = pinned_out.sign.reshape(-1)
+                if (
+                    local_energy_wf_output is not None
+                    and int(local_energy_wf_output.logabs.numel()) == n_samples
+                    and local_energy_wf_output.phase is None
+                ):
+                    full_logabs[~mask_dev] = (
+                        local_energy_wf_output.logabs.detach()
+                        .reshape(-1)
+                        .to(device=out_device, dtype=out_dtype)[~mask_dev]
+                    )
+                    full_sign[~mask_dev] = (
+                        local_energy_wf_output.sign.detach()
+                        .reshape(-1)
+                        .to(device=out_device, dtype=pinned_out.sign.dtype)[~mask_dev]
+                    )
+                else:
+                    batch_dropped = select_flat_batch_mask(flat_batch, ~energy_finite)
+                    with torch.no_grad():
+                        dropped_out = _detach_wavefunction_output(self._model(batch_dropped))
+                    full_logabs[~mask_dev] = dropped_out.logabs.reshape(-1).to(
+                        device=out_device, dtype=out_dtype
+                    )
+                    full_sign[~mask_dev] = dropped_out.sign.reshape(-1).to(
+                        device=out_device, dtype=pinned_out.sign.dtype
+                    )
+                output = WavefunctionOutput(
+                    logabs=full_logabs.reshape(total_local_energy.shape),
+                    sign=full_sign.reshape(total_local_energy.shape),
+                )
+
+        with self._context.scope(Objective(step=self._step), state=self._state):
+            objective = compute_vmc_objective(
+                output.logabs,
+                total_local_energy,
+                nonfinite_policy=policy,
+            )
+        update_input = StructuredCurvatureUpdateInput(
+            batch=self._batch,
+            wavefunction=output,
+            local_energy=total_local_energy,
+            step=self._step,
+            parameter_binding=packet.parameter_binding,
+            solve_dtype=packet.solve_dtype,
+            kronecker_blocks=packet.kronecker_blocks,
+            dense_blocks=packet.dense_blocks,
+            energy_half_gradient=packet.energy_half_gradient,
+            n_finite_samples=n_finite,
+            curvature_available=True,
+        )
+        return ProducedVMCStep(
+            update_input=update_input,
+            objective=objective,
+            local_energy=total_local_energy,
+            term_energies=term_energies,
+            wavefunction_output=output,
+        )
+
+
 class VMCTrainer:
     """Run a fixed number of VMC optimization steps over an event stream.
 
@@ -243,7 +603,7 @@ class VMCTrainer:
         # resolved method and model here gives checkpoint restore one owner for
         # rebuilding direct parameter references after model weights load.
         self._resolved_model = None
-        self._resolved_update_method: VMCUpdateMethod[AutogradUpdateInput] | None = None
+        self._resolved_update_method: VMCUpdateMethod[Any] | None = None
         # The spec this run was BOUND from, kept only to detect a conflicting
         # late selector. It is NOT the lifecycle authority: the retained
         # `_resolved_update_method` above is, and it is what decides whether a
@@ -309,26 +669,39 @@ class VMCTrainer:
                 state["update_method"] = dict(method_state)
         return state
 
-    def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Restore trainer progress state for ``train_resume``.
+    def method_tensor_state_dict(self) -> Mapping[str, Any] | None:
+        """Return optional binary method tensor state for ``method_state.pt``."""
 
-        Parameters
-        ----------
-        state : Mapping
-            Trainer state read from a checkpoint's ``trainer.json``. Both
-            ``next_iteration`` and ``completed_updates`` are required.
+        if self._resolved_update_method is None:
+            return None
+        getter = getattr(self._resolved_update_method, "method_tensor_state_dict", None)
+        if not callable(getter):
+            return None
+        return getter()
 
-        Raises
-        ------
-        KeyError
-            If either required key is missing. Checkpoints written before the
-            rename (``global_step``/``completed_steps``) are unsupported and
-            fail here rather than silently resuming from step 0.
-        ValueError or TypeError
-            If either value cannot be coerced to ``int``. Both coercions run
-            before either assignment, so a rejected state leaves the trainer's
-            progress counters unmutated.
-        """
+    def load_method_tensor_state_dict(self, state: Mapping[str, Any] | None) -> None:
+        """Restore optional binary method tensor state from ``method_state.pt``."""
+
+        if self._resolved_update_method is None:
+            if state is not None:
+                raise ValueError(
+                    "method tensor state restore requires update-state resolution before restore"
+                )
+            return
+        loader = getattr(self._resolved_update_method, "load_method_tensor_state_dict", None)
+        if not callable(loader):
+            if state is not None:
+                raise ValueError(
+                    f"{type(self._resolved_update_method).__name__} does not support "
+                    "binary method tensor state restore"
+                )
+            return
+        loader(state)
+
+    def _parse_trainer_state_prefix(
+        self, state: Mapping[str, Any]
+    ) -> tuple[int, int, Any]:
+        """Validate and parse counters, non-finite policy, and optional layout without mutation."""
 
         for key in ("next_iteration", "completed_updates"):
             if key not in state:
@@ -380,6 +753,166 @@ class VMCTrainer:
                 raise ValueError(
                     "parameter layout restore requires update-state resolution before restore"
                 )
+        return next_iteration, completed_updates, restored_layout
+
+    def validate_checkpoint_state(
+        self,
+        state: Mapping[str, Any],
+        *,
+        method_tensor_state: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Validate trainer JSON state and optional binary tensor state without mutation.
+
+        Called by :func:`tpen.checkpoint.restore.restore_checkpoint` before
+        model or optimizer weights are loaded so any semantic refusal leaves
+        live model, optimizer, trainer, and update-method state untouched.
+        """
+
+        _, _, restored_layout = self._parse_trainer_state_prefix(state)
+        if restored_layout is not None:
+            if self._resolved_model is None or self._resolved_update_state is None:
+                raise ValueError(
+                    "parameter layout restore requires resolved model and update state"
+                )
+            # ``rebind`` is pure: it validates the checkpoint layout against
+            # the live model and returns a new binding.  Prevalidation must
+            # discard that candidate; adoption belongs to the commit path.
+            self._resolved_update_state.model_parameters.rebind(
+                tuple(self._resolved_model.parameters()),
+                layout=restored_layout,
+            )
+
+        if "update_method" in state:
+            if self._resolved_update_method is None:
+                raise ValueError(
+                    "update-method state restore requires update-state resolution "
+                    "before restore"
+                )
+            method = self._resolved_update_method
+            method_state = state["update_method"]
+            if not isinstance(method_state, Mapping):
+                raise TypeError("VMCUpdateMethod method state must be a mapping")
+            method.validate_method_state_dict(method_state)
+            validator = getattr(method, "validate_method_tensor_state_dict", None)
+            if callable(validator):
+                validator(method_tensor_state, method_state=method_state)
+            elif method_tensor_state is not None:
+                loader = getattr(method, "load_method_tensor_state_dict", None)
+                if not callable(loader):
+                    raise ValueError(
+                        f"{type(method).__name__} does not support "
+                        "binary method tensor state restore"
+                    )
+        else:
+            if self._resolved_update_method is None:
+                if method_tensor_state is not None:
+                    raise ValueError(
+                        "method tensor state restore requires update-state resolution before restore"
+                    )
+                return
+            method = self._resolved_update_method
+            if method.method_state_dict():
+                raise ValueError(
+                    "checkpoint state has no 'update_method' payload, but the resolved "
+                    f"update method {type(method).__name__} owns "
+                    "persistent method state; refusing a partial resume"
+                )
+            validator = getattr(method, "validate_method_tensor_state_dict", None)
+            if callable(validator):
+                validator(method_tensor_state, method_state=None)
+            elif method_tensor_state is not None:
+                loader = getattr(method, "load_method_tensor_state_dict", None)
+                if not callable(loader):
+                    raise ValueError(
+                        f"{type(method).__name__} does not support "
+                        "binary method tensor state restore"
+                    )
+
+    def load_checkpoint_state(
+        self,
+        state: Mapping[str, Any],
+        *,
+        method_tensor_state: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Atomically validate and restore trainer JSON state and binary tensor state."""
+
+        next_iteration, completed_updates, restored_layout = self._parse_trainer_state_prefix(
+            state
+        )
+        if restored_layout is not None:
+            if self._resolved_update_method is None or self._resolved_update_state is None:
+                raise RuntimeError("update state must be resolved before it can be rebuilt")
+            self._resolved_update_state.model_parameters.rebind(
+                tuple(self._resolved_model.parameters()),
+                layout=restored_layout,
+            )
+
+        if "update_method" in state:
+            if self._resolved_update_method is None:
+                raise ValueError(
+                    "update-method state restore requires update-state resolution "
+                    "before restore"
+                )
+            method = self._resolved_update_method
+            method_state = state["update_method"]
+            combined_loader = getattr(method, "load_method_state_and_tensors", None)
+            if callable(combined_loader):
+                combined_loader(method_state, method_tensor_state)
+            else:
+                validator = getattr(method, "validate_method_tensor_state_dict", None)
+                if callable(validator):
+                    validator(method_tensor_state, method_state=method_state)
+                elif method_tensor_state is not None:
+                    loader = getattr(method, "load_method_tensor_state_dict", None)
+                    if not callable(loader):
+                        raise ValueError(
+                            f"{type(method).__name__} does not support "
+                            "binary method tensor state restore"
+                        )
+                method.load_method_state_dict(method_state)
+                self.load_method_tensor_state_dict(method_tensor_state)
+        else:
+            if (
+                self._resolved_update_method is not None
+                and self._resolved_update_method.method_state_dict()
+            ):
+                raise ValueError(
+                    "checkpoint state has no 'update_method' payload, but the resolved "
+                    f"update method {type(self._resolved_update_method).__name__} owns "
+                    "persistent method state; refusing a partial resume"
+                )
+            self.load_method_tensor_state_dict(method_tensor_state)
+
+        self._checkpoint_parameter_layout = restored_layout
+        if restored_layout is not None:
+            self.rebuild_update_state(model=self._resolved_model)
+        self.next_iteration = next_iteration
+        self.completed_updates = completed_updates
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore trainer progress state for ``train_resume``.
+
+        Parameters
+        ----------
+        state : Mapping
+            Trainer state read from a checkpoint's ``trainer.json``. Both
+            ``next_iteration`` and ``completed_updates`` are required.
+
+        Raises
+        ------
+        KeyError
+            If either required key is missing. Checkpoints written before the
+            rename (``global_step``/``completed_steps``) are unsupported and
+            fail here rather than silently resuming from step 0.
+        ValueError or TypeError
+            If either value cannot be coerced to ``int``. Both coercions run
+            before either assignment, so a rejected state leaves the trainer's
+            progress counters unmutated.
+        """
+
+        next_iteration, completed_updates, restored_layout = self._parse_trainer_state_prefix(
+            state
+        )
 
         # Restore method state before the layout rebind below, so a method
         # whose fingerprint disagrees with this checkpoint fails while the
@@ -519,7 +1052,7 @@ class VMCTrainer:
         model,
         optimizer: torch.optim.Optimizer,
         update_method: UpdateMethodSpec = None,
-    ) -> VMCUpdateMethod[AutogradUpdateInput]:
+    ) -> VMCUpdateMethod[Any]:
         """Bind one update method for this run, then keep returning that one.
 
         Parameters
@@ -666,9 +1199,21 @@ class VMCTrainer:
         *,
         model,
         optimizer: torch.optim.Optimizer,
-        update_method: VMCUpdateMethod[AutogradUpdateInput],
+        update_method: VMCUpdateMethod[Any],
     ) -> VMCUpdateState:
         """Validate a selected method and return its single authority."""
+
+        # Validate the method's typed step request before inspecting state or
+        # sampling, including for stateless methods (`update_state() is None`).
+        resolve_step_request(update_method)
+        method_policy = update_method.declared_nonfinite_local_energy_policy()
+        if method_policy is not None and method_policy != self.nonfinite_local_energy_policy:
+            raise ValueError(
+                "update method nonfinite_local_energy_policy disagrees with VMCTrainer: "
+                f"{type(update_method).__name__} declared {method_policy!r}, "
+                f"trainer is configured for {self.nonfinite_local_energy_policy!r}. "
+                "Match both policies so the objective and update method run under one estimator"
+            )
 
         owned_state = update_method.update_state()
         if owned_state is None:
@@ -782,66 +1327,30 @@ class VMCTrainer:
 
                 with context.scope(CollectSamples(step=step), state=state):
                     walkers, sampler_stats = sampler.collect_samples(
-                        model, device=context.metadata.device
+                        model, device=context.metadata.device, emitter=context
                     )
                 with context.scope(BuildBatch(step=step), state=state):
                     batch = walkers.make_batch()
-                with context.scope(LocalEnergy(step=step), state=state):
-                    if self.local_energy_chunk_size is None:
-                        result = local_energy(
-                            hamiltonian_terms,
-                            model,
-                            batch,
-                            return_terms=self.return_terms,
-                        )
-                    else:
-                        # Bounded route: each chunk's derivative graph is
-                        # released before the next chunk is evaluated.
-                        result = evaluate_local_energy_in_chunks(
-                            hamiltonian_terms,
-                            model,
-                            batch,
-                            return_terms=self.return_terms,
-                            chunk_size=self.local_energy_chunk_size,
-                        )
-                # The objective deliberately differentiates through the
-                # wavefunction output, not through local energy.  Its closure
-                # re-evaluation builds a fresh local-energy graph when needed,
-                # so no consumer in this step needs to retain this one.
-                result = _detach_local_energy_value(result)
-                if isinstance(result, LocalEnergyResult):
-                    total_local_energy = result.total
-                    term_energies = result.terms
-                else:
-                    total_local_energy = result
-                    term_energies = None
 
-                # `_detach_local_energy_value` already detached each term in
-                # the structured result. Reuse that mapping for callbacks so
-                # recorder-off training does not rebuild it on every step.
-                detached_term_energies = term_energies
+                # Dispatch on the typed step request declared by the method so
+                # each strategy produces its exact input record in one pass.
+                producer = _TrainerStepProducer(
+                    trainer=self,
+                    model=model,
+                    hamiltonian_terms=hamiltonian_terms,
+                    batch=batch,
+                    step=step,
+                    context=context,
+                    state=state,
+                )
+                request = resolve_step_request(selected_update_method)
+                produced = request.produce(producer)
 
-                # One forward, shaped by what the update method actually needs.
-                # A score method receives its raw per-sample score blocks in
-                # this same packet; running an ordinary forward and then
-                # recomputing derivatives would double the step's forward and
-                # derivative work.
-                forward_request = selected_update_method.forward_request()
-                with context.scope(Forward(step=step), state=state):
-                    if forward_request is None:
-                        output = model(batch)
-                        parameter_scores = None
-                    else:
-                        packet = forward_request.evaluate(model, batch)
-                        output = packet.as_output()
-                        parameter_scores = packet.parameter_scores
-                with context.scope(Objective(step=step), state=state):
-                    objective = compute_vmc_objective(
-                        output.logabs,
-                        total_local_energy,
-                        nonfinite_policy=self.nonfinite_local_energy_policy,
-                    )
+                objective = produced.objective
                 loss = objective.loss
+                total_local_energy = produced.local_energy
+                detached_term_energies = produced.term_energies
+                output = produced.wavefunction_output
 
                 # Read the parameter norm here, before any update, so the whole
                 # `train` record describes exactly one model version: the model
@@ -852,46 +1361,7 @@ class VMCTrainer:
                 # reports this same pre-update value.
                 param_norm = _parameter_norm(model)
 
-                # Dispatch on the typed request the method already declared,
-                # never on a name or a capability flag: a method cannot receive
-                # a score input without having asked for the score payload.
-                update_input: AutogradUpdateInput | ScoreUpdateInput
-                if isinstance(forward_request, ParameterScoreRequest):
-                    assert parameter_scores is not None
-                    update_input = ScoreUpdateInput(
-                        batch=batch,
-                        wavefunction=output,
-                        local_energy=total_local_energy,
-                        step=step,
-                        parameter_scores=parameter_scores,
-                        parameter_binding=model.parameter_binding,
-                    )
-                else:
-                    update_input = AutogradUpdateInput(
-                        batch=batch,
-                        wavefunction=output,
-                        local_energy=total_local_energy,
-                        step=step,
-                        objective=loss,
-                        # A TRUE closure optimizer re-evaluates the objective
-                        # one or more times per step at parameters it has
-                        # already mutated in place, so it cannot use `loss`:
-                        # backward on that retained graph raises once the
-                        # saved-tensor versions have moved. The re-evaluation
-                        # is built over THIS step's fixed `batch` and carries
-                        # the SAME resolved non-finite policy, so a second
-                        # evaluation cannot resample, cannot advance the
-                        # sampler RNG the resume path depends on, and cannot
-                        # switch estimators midway through one step.
-                        reevaluate=vmc_objective_reevaluation(
-                            model=model,
-                            hamiltonian_terms=hamiltonian_terms,
-                            batch=batch,
-                            primary_local_energy=total_local_energy,
-                            nonfinite_policy=self.nonfinite_local_energy_policy,
-                        ),
-                    )
-                update_result = selected_update_method.update(update_input)
+                update_result = selected_update_method.update(produced.update_input)
                 optimizer_step = False
                 if update_result.applied:
                     # The update counts only once `optimizer.step()` has

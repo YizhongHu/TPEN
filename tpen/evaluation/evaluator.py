@@ -166,6 +166,7 @@ class Evaluator:
             resolved_config_identity=identity.resolved_config_identity,
             model_provenance=identity.model_provenance,
             checkpoint_sha256=identity.checkpoint_sha256,
+            emitter=context,
         )
 
     def _evaluate_task(

@@ -509,7 +509,7 @@ def test_c3_injected_roster_reasons_reach_every_o1_row_verbatim(tmp_path: Path) 
     )
     per_method: dict[str, int] = {}
     for cell in cells:
-        optimizer_cell = dict(cell.manifest["scientific_identity"]["optimizer_cell"])
+        optimizer_cell = dict(cell.availability)
         method = optimizer_cell["method"]
         assert optimizer_cell == _INJECTED_EXPECTED[method]
         per_method[method] = per_method.get(method, 0) + 1
@@ -534,7 +534,7 @@ def test_c3_live_roster_report_agrees_with_materialized_statuses(tmp_path: Path)
     cells = _materialize_o1(tmp_path)
     by_status: dict[str, int] = {}
     for cell in cells:
-        status = cell.manifest["scientific_identity"]["optimizer_cell"]["status"]
+        status = cell.availability["status"]
         by_status[status] = by_status.get(status, 0) + 1
     report = optimizer_grid.stage_report("O1")
     assert report["lineages"]["declared"] == len(cells) == 1_920
@@ -565,7 +565,7 @@ def test_c3_unavailable_roster_reasons_reach_refusals_verbatim(tmp_path: Path) -
     cells = _materialize_o1(tmp_path)
     unavailable_by_method: dict[str, tuple[Any, Any]] = {}
     for cell in cells:
-        optimizer_cell = cell.manifest["scientific_identity"]["optimizer_cell"]
+        optimizer_cell = cell.availability
         if optimizer_cell["status"] == "unavailable":
             unavailable_by_method.setdefault(optimizer_cell["method"], (cell, optimizer_cell))
 

@@ -290,13 +290,33 @@ def test_contract_clause_4_roster_change_leaves_declared_universe_fixed(tmp_path
 
     def _sr_statuses(cells: tuple) -> set[str]:
         return {
-            cell.manifest["scientific_identity"]["optimizer_cell"]["status"]
+            cell.availability["status"]
             for cell in cells
-            if cell.manifest["scientific_identity"]["optimizer_cell"]["method"] == "sr"
+            if cell.availability["method"] == "sr"
         }
 
     assert _sr_statuses(cells_a) == {"unavailable"}
     assert _sr_statuses(cells_b) == {"available"}
+
+
+def test_contract_clause_4_roster_flip_preserves_content_addresses(tmp_path: Path) -> None:
+    """Availability changes beside a row, never inside its content address."""
+
+    roster_a = _fake_roster(admitted={"adam": True, "sr": False, "kfac": False, "spring": False, "linear_method": False})
+    roster_b = _fake_roster(admitted={"adam": True, "sr": True, "kfac": False, "spring": False, "linear_method": False})
+    cells_a = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "a", availability=optimizer_grid.roster_availability(roster_a), stages=("O1",)
+    )
+    cells_b = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "b", availability=optimizer_grid.roster_availability(roster_b), stages=("O1",)
+    )
+    assert [(cell.content_hash, cell.output_path.name) for cell in cells_a] == [
+        (cell.content_hash, cell.output_path.name) for cell in cells_b
+    ]
+    sr_a = [cell for cell in cells_a if cell.availability["method"] == "sr"]
+    sr_b = [cell for cell in cells_b if cell.availability["method"] == "sr"]
+    assert {cell.availability["status"] for cell in sr_a} == {"unavailable"}
+    assert {cell.availability["status"] for cell in sr_b} == {"available"}
 
 
 # ---------------------------------------------------------------------------
@@ -340,9 +360,9 @@ def test_unavailable_arms_are_present_and_carry_the_roster_reason_verbatim(tmp_p
     ]
     # 32 declared kfac cells x 2 contexts x 2 seeds.
     assert len(kfac_cells) == 32 * 2 * 2
+    assert all(cell.manifest["scientific_identity"]["optimizer_cell"] == {"method": "kfac"} for cell in kfac_cells)
     assert all(
-        cell.manifest["scientific_identity"]["optimizer_cell"]
-        == {"method": "kfac", "status": "unavailable", "unavailable_reason": reason}
+        cell.availability == {"method": "kfac", "status": "unavailable", "unavailable_reason": reason}
         for cell in kfac_cells
     )
 

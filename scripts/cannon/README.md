@@ -32,6 +32,39 @@ only where a measured speed-up justifies it (e.g. the full suite).
 
 This default is required by manager rule `manager-rule-verify-typecheck-on-20261112`.
 
+## Render one verification packet
+
+`render_verify_packet.py` is the canonical packet generator for a one-shot
+Cannon quick verification.  It uses only the Python standard library, stages
+the `scripts/cannon/` tree from the requested exact commit, validates an
+optional `mutants.py` specification, runs `bash -n` and an `env -i` dry
+execution of the rendered body, and refuses to overwrite an existing packet.
+It never calls `sbatch`; review the printed `HEADROOM_GATE` and
+`SBATCH_COMMAND` before submitting.
+
+The renderer enforces the approved Cannon run-root prefix
+`/n/netscratch/kozinsky_lab/Lab/rhu/`; there is no CLI override for that
+policy.  A typical invocation from a clean exact-head checkout is:
+
+```
+SHA=$(git rev-parse HEAD)
+python3 scripts/cannon/render_verify_packet.py \
+  --sha "$SHA" \
+  --test scripts/cannon/tests/test_render_verify_packet.py \
+  --run-root <facility-run-root>/<unique-run> \
+  --packet-dir <facility-run-root>/<unique-run>/packet \
+  --shared-env-prefix <shared-reuse-only-env-root> \
+  --mutants "$(pwd)/scripts/cannon/tests/render_verify_packet_mutants.json" \
+  --job-name verify-renderer \
+  --time 00:45:00
+```
+
+The packet contains `verify.sbatch`, a `submission.manifest`, a staged
+`scripts/cannon/` tree (and copied mutant spec when requested), and
+`packet-manifest.sha256`.  The generated job invokes the versioned
+`scripts/cannon/verify.sh` in quick mode with type checking on and serial
+execution.
+
 `PYTHON`'s overlay interpreter is also exported as `TPEN_PYTHON` and
 `ROOT_PYTHON`, and `$OVERLAY/bin` is prepended to `PATH` so tests that spawn a
 bare `python` subprocess resolve the overlay interpreter. The runner discovers
@@ -333,7 +366,7 @@ Checks performed (exit 0 on `LINT_PASS`, non-zero on `LINT_FAIL`):
 | # | Check |
 |---|---|
 | 1 | `HEAD_SHA` is exactly 40 hex characters |
-| 2 | `JOB_NAME` contains `HEAD_SHA[:12]` |
+| 2 | `JOB_NAME` contains `HEAD_SHA[:8]` |
 | 3 | sbatch path is absolute, canonical, and inside a declared `--allowed-root` |
 | 4 | critical exports (`HEAD_SHA`, `JOB_NAME`, `TASK_ROOT`, `RUN_ROOT`, `DRY_RUN`, `PYTHON`, `SHARED_ENV_PREFIX`) match exactly between the manifest and the job's effective exported environment — no stale, missing, or extra values; `HEAD_SHA`/`JOB_NAME`/`TASK_ROOT`/`RUN_ROOT`/`DRY_RUN` must additionally be present and nonempty in both files (a field absent from both passes the match test but is still rejected), and `PYTHON` is required the same way whenever `DRY_RUN=1`. The effective environment is computed by a deliberately narrow shell subset (documented in full at the top of the parser in `submit-lint.sh`), never by running anything and never from the manifest: it is SEEDED from the submit helper's own `sbatch ... --export=SPEC <job>` line when `--submit-helper` has one (a command-line option overrides the directive, as in Slurm), else from the last `#SBATCH --export=SPEC` directive in the leading comment block; SPEC must be literal `NAME=VALUE,...` (a bare `NAME` there is unknown). Then `export` and plain `NAME=VALUE` statements apply in file order: a bare `export NAME` keeps NAME's CURRENT value; `$NAME`/`${NAME}`/`${NAME:-DEFAULT}` expand against the current value; single quotes are literal; an unquoted `#` starts a comment; a `NAME=VALUE cmd` prefix does not change the job environment. Unsupported syntax (command substitution, other expansions, unquoted globs/tilde/operators, an unterminated quote, `unset`/`declare` on a critical key) is a LINT_FAIL when the statement could set a critical key, and a critical key exported with a value the linter cannot determine is a LINT_FAIL; it never guesses. `SHARED_ENV_PREFIX` is optional (a job that never mentions it is genuinely absent on both sides, which passes), but a bare `export SHARED_ENV_PREFIX` with no prior assignment leaves it exported with no determined value, which this check also rejects rather than silently treating as absent. Not modelled: control flow, functions, heredoc bodies, `source` |
 | 5 | `TASK_ROOT`/`RUN_ROOT` are not staged under `$HOME`, literally or after canonicalization (catches a symlink into `$HOME`) |

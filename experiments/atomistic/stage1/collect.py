@@ -16,14 +16,18 @@ from experiments.toolkit.trajectory_records import (
 from experiments.atomistic.stage1.protocol import (
     CONFIG_IDENTITY_RULE,
     LEGACY_CONFIG_IDENTITY_RULE,
+    LEGACY_MANIFEST_SCHEMA,
+    MANIFEST_SCHEMA,
     _validate_config_identity_for_row,
     HOOKE_SCIENCE_PROFILE,
+    HOOKE2_ACT50_PROFILES,
     HOOKE_SYSTEMS,
     _is_he_h2_production_phase,
     manifest_hash,
     ProtocolError,
     resolve_config_path,
     resolve_run_dir,
+    _validate_act50_variant,
     validate_he_h2_eval_grid,
     validate_hooke_eval_grid,
 )
@@ -98,8 +102,10 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
     does not carry it.
     """
     document = _load(manifest)
-    if document.get("schema") != "stage1/v3":
-        raise CollectionError("unsupported manifest schema; expected stage1/v3")
+    if document.get("schema") not in {LEGACY_MANIFEST_SCHEMA, MANIFEST_SCHEMA}:
+        raise CollectionError(
+            "unsupported manifest schema; expected stage1/v3 or stage1/v4"
+        )
     rows = document.get("rows")
     if not isinstance(rows, list):
         raise CollectionError("manifest rows must be a list")
@@ -108,6 +114,11 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
         raise CollectionError("manifest_hash does not match manifest rows")
     if any(not isinstance(row, Mapping) for row in rows):
         raise CollectionError("manifest contains a malformed eval row")
+    try:
+        for row in rows:
+            _validate_act50_variant(row)
+    except ProtocolError as exc:
+        raise CollectionError(f"manifest contains an invalid ACT50 variant: {exc}") from exc
     eval_rows = [row for row in rows if row.get("kind") == "eval"]
     phase1_rows = [row for row in rows if row.get("kind") != "eval"]
     phase1_hooke_train_rows = [
@@ -118,19 +129,22 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
         row.get("science_profile") for row in phase1_hooke_train_rows
         if row.get("science_profile") is not None
     }
-    hooke_science = HOOKE_SCIENCE_PROFILE in phase1_train_profiles
+    admitted_hooke_profiles = {HOOKE_SCIENCE_PROFILE, *HOOKE2_ACT50_PROFILES}
+    hooke_science = bool(phase1_train_profiles & admitted_hooke_profiles)
     if hooke_science:
         # Train rows are the science authority.  A missing/null profile on a
         # train row is mixed science/legacy input; smoke rows are deliberately
         # excluded so legacy smoke fixtures remain readable.
-        if (phase1_train_profiles != {HOOKE_SCIENCE_PROFILE}
-                or any(row.get("science_profile") != HOOKE_SCIENCE_PROFILE
+        if (len(phase1_train_profiles) != 1
+                or phase1_train_profiles - admitted_hooke_profiles
+                or any(row.get("science_profile") != next(iter(phase1_train_profiles))
                        for row in phase1_hooke_train_rows)):
             raise CollectionError("Hooke phase-1 rows mix science and legacy profiles")
     elif phase1_train_profiles:
         raise CollectionError("Hooke phase-1 rows use an unsupported science profile")
     # Science collection derives its required systems from the frozen phase-1
     # train rows.  The explicit no-profile path preserves genuinely legacy manifests.
+    hooke_profile = next(iter(phase1_train_profiles), None) if hooke_science else None
     expected_systems = tuple(dict.fromkeys(
         str(row["system"]) for row in phase1_hooke_train_rows
     )) if hooke_science else None
@@ -151,7 +165,7 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
         validate_hooke_eval_grid(
             eval_rows,
             expected_systems=expected_systems,
-            expected_profile=HOOKE_SCIENCE_PROFILE if hooke_science else None,
+            expected_profile=hooke_profile if hooke_science else None,
         )
     except ProtocolError as exc:
         raise CollectionError(f"Hooke evaluation grid is incomplete: {exc}") from exc

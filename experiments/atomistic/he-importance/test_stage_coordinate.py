@@ -170,13 +170,13 @@ def _available_roster_for(module: object) -> dict[str, object]:
 def _identity_pairs(cells: tuple[object, ...], output_root: Path) -> list[tuple[str, str, str]]:
     pairs = []
     for cell in cells:
-        try:
-            relative_path = cell.output_path.relative_to(output_root).as_posix()
-        except ValueError as error:
-            raise AssertionError(
-                f"output path escaped supplied root {output_root}: {cell.output_path}"
-            ) from error
-        pairs.append((cell.manifest["stage"], cell.content_hash, relative_path))
+        manifest = json.loads(json.dumps(stage_coordinate._thaw(cell.manifest)))
+        optimizer_cell = manifest["scientific_identity"].get("optimizer_cell")
+        if isinstance(optimizer_cell, dict):
+            manifest["scientific_identity"]["optimizer_cell"] = {
+                "method": optimizer_cell["method"]
+            }
+        pairs.append((cell.manifest["stage"], stage_coordinate.content_hash(manifest)))
     return pairs
 
 
@@ -252,7 +252,7 @@ def test_inventory_and_every_q_override_match_exact_base_with_deliberate_red(
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
     )
-    assert named.content_hash == "0b51514133bcb9e11ff8ad412390a994f29c0b8b9a222c92894a0374cd09f5da"
+    assert named.content_hash == "be215cf996902752eda3d736a2f88ded079769d8e463274ca26f06fd50a5cd37"
 
     original_canonical_json = stage_coordinate.canonical_json
 
@@ -599,10 +599,8 @@ def test_materialized_union_deduplicates_only_resolved_scientific_identity(tmp_p
     assert len({cell.content_hash for cell in cells}) == 16
     assert len({cell.output_path for cell in cells}) == 16
     assert all(cell.output_path.is_absolute() for cell in cells)
-    assert all(
-        cell.manifest["scientific_identity"]["optimizer_cell"] == {"method": "adam", "status": "available"}
-        for cell in cells
-    )
+    assert all(cell.manifest["scientific_identity"]["optimizer_cell"] == {"method": "adam"} for cell in cells)
+    assert all(cell.availability == {"method": "adam", "status": "available"} for cell in cells)
     with pytest.raises(TypeError):
         cells[0].manifest["stage"] = "F"  # type: ignore[index]
     assert stage_coordinate.content_hash(cells[0].manifest) == cells[0].content_hash
@@ -722,13 +720,10 @@ def test_unavailable_optimizer_is_explicit_and_never_becomes_adam(tmp_path: Path
         tmp_path,
     )
     assert len(cells) == 8
+    assert all(cell.manifest["scientific_identity"]["optimizer_cell"] == {"method": "linear_method"} for cell in cells)
     assert all(
-        cell.manifest["scientific_identity"]["optimizer_cell"]
-        == {
-            "method": "linear_method",
-            "status": "unavailable",
-            "unavailable_reason": "full tangent unavailable",
-        }
+        cell.availability
+        == {"method": "linear_method", "status": "unavailable", "unavailable_reason": "full tangent unavailable"}
         for cell in cells
     )
     with pytest.raises(stage_coordinate.MaterializationError, match="need a reason"):

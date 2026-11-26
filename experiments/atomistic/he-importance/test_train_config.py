@@ -214,13 +214,42 @@ def _load_prechange_resolver() -> types.ModuleType:
     return module
 
 
-def _canonical_resolved_config(config: object) -> str:
-    """Serialize one resolved config with a stable, sorted-key encoding."""
+def _canonical_resolved_config(
+    config: object, *, replacements: tuple[tuple[str, str], ...] = ()
+) -> str:
+    """Serialize one resolved config with stable keys and optional value normalization."""
 
-    return json.dumps(
+    serialized = json.dumps(
         OmegaConf.to_container(config, resolve=True),
         sort_keys=True,
         separators=(",", ":"),
+    )
+    for old, new in replacements:
+        serialized = serialized.replace(old, new)
+    return serialized
+
+
+def _prechange_cell(cell: object) -> object:
+    """Build the legacy manifest view consumed only by the pinned oracle."""
+
+    manifest = stage_coordinate._thaw(cell.manifest)
+    identity = manifest["scientific_identity"]
+    optimizer_cell = dict(identity["optimizer_cell"])
+    optimizer_cell.update(
+        {
+            "status": cell.availability["status"],
+        }
+    )
+    reason = cell.availability.get("unavailable_reason")
+    if reason is not None:
+        optimizer_cell["unavailable_reason"] = reason
+    identity["optimizer_cell"] = optimizer_cell
+    digest = stage_coordinate.content_hash(manifest)
+    return replace(
+        cell,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=digest,
+        output_path=cell.output_path.parent / digest,
     )
 
 
@@ -230,8 +259,9 @@ def _assert_matches_prechange(
     """Compare current output or refusal with the mechanically loaded oracle."""
 
     for cell in cells:
+        legacy_cell = _prechange_cell(cell)
         try:
-            expected = prechange.resolve_train_config(cell)
+            expected = prechange.resolve_train_config(legacy_cell)
         except Exception as expected_error:  # noqa: BLE001 - refusal is part of the oracle
             try:
                 resolver(cell)
@@ -242,7 +272,13 @@ def _assert_matches_prechange(
                 raise AssertionError("current resolver accepted a prechange-refused cell")
         else:
             observed = resolver(cell)
-            assert _canonical_resolved_config(observed) == _canonical_resolved_config(expected)
+            assert _canonical_resolved_config(observed) == _canonical_resolved_config(
+                expected,
+                replacements=(
+                    (str(legacy_cell.content_hash), str(cell.content_hash)),
+                    (str(legacy_cell.output_path), str(cell.output_path)),
+                ),
+            )
 
 
 def _independent_initializer_paths(value: object, path: str = "") -> set[str]:
@@ -1050,8 +1086,7 @@ def test_resolve_refuses_available_optimizer_when_roster_entry_is_not_admitted(
         ),
     )
 
-    optimizer_cell = cell.manifest["scientific_identity"]["optimizer_cell"]
-    assert optimizer_cell["status"] == "available"
+    assert cell.availability["status"] == "available"
     patched_entry = next(entry for entry in schema.HI_METHOD_ROSTER if entry.method == "adam")
     assert not patched_entry.admitted
     assert patched_entry.target == original_entry.target
@@ -1066,7 +1101,7 @@ def test_resolve_refuses_unavailable_optimizer_cell_without_adam_substitution(tm
     with pytest.raises(train_config.UnavailableOptimizerError, match="unavailable"):
         train_config.resolve_train_config(cell)
 
-    assert cell.manifest["scientific_identity"]["optimizer_cell"]["status"] == "unavailable"
+    assert cell.availability["status"] == "unavailable"
 
 
 def test_resolve_refuses_stage_without_fixed_training_horizon(tmp_path: Path) -> None:
@@ -1277,8 +1312,7 @@ def _assert_prechange_error_matches(
         assert str(observed_error) == str(expected_error)
         return
 
-    optimizer_cell = cell.manifest["scientific_identity"]["optimizer_cell"]
-    reason = optimizer_cell.get("unavailable_reason")
+    reason = cell.availability.get("unavailable_reason")
     if reason:
         method = cell.manifest["scientific_identity"]["optimizer"]["method"]
         assert str(observed_error) == f"optimizer method {method!r} is unavailable: {reason}"

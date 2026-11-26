@@ -23,12 +23,13 @@ from experiments.atomistic.stage1.protocol import (
     _validate_run_identity,
     identity_expectations,
 )
-
 ALLOWED_PARTITIONS = ("test", "gpu_test", "seas_gpu", "kozinsky_gpu", "gpu")
 GPU_PARTITIONS = frozenset(ALLOWED_PARTITIONS[1:])
 _MAX_CPUS = 256
 _MAX_MEMORY_GIB = 2048
 _MAX_TIME_SECONDS = 7 * 24 * 60 * 60
+_DEFAULT_GPU_CPUS = 1
+_DEFAULT_GPU_MEMORY = "4G"
 FACILITY_RESULTS_PREFIX = "/n/netscratch/kozinsky_lab/Lab/rhu/"
 _SAFE_RENDERED_VALUE = re.compile(r"[A-Za-z0-9_./:+,@=\[\]-]+\Z")
 
@@ -104,7 +105,19 @@ def _partition_names(partition: str) -> list[str]:
 
 def _validate_gpu_resources(*, cpus_per_task: int | None, mem: str | None,
                             time: str | None) -> tuple[int, str, str]:
-    """Validate the explicit resource shape required for GPU rows."""
+    """Validate GPU resources, applying the measured Stage-1 defaults.
+
+    The default one CPU and 4 GiB request is based on the 2026-11-25 Cannon
+    ``jobstats`` sweeps: the flagged evaluation jobs used one effective CPU
+    and at most 1.2 GiB host memory, while nine representative Stage 1
+    training jobs reached 1.5 GiB.  Callers may still provide a larger
+    measured shape.
+    """
+
+    if cpus_per_task is None:
+        cpus_per_task = _DEFAULT_GPU_CPUS
+    if mem is None:
+        mem = _DEFAULT_GPU_MEMORY
 
     if not isinstance(cpus_per_task, int) or not 1 <= cpus_per_task <= _MAX_CPUS:
         raise ValueError(f"cpus_per_task must be between 1 and {_MAX_CPUS}")
@@ -167,35 +180,32 @@ fi
 '''.replace("__GPU_PYTHON__", shlex.quote(python))
 
 
-def command_for_row(row: Mapping[str, Any], *, python: str, driver: str) -> str:
-    """Build the only driver command permitted by the launcher."""
+_DRIVER_BY_KIND = {
+    "smoke": "experiments/atomistic/stage1/train.py",
+    "train": "experiments/atomistic/stage1/train.py",
+    "eval": "experiments/atomistic/stage1/eval.py",
+}
+
+
+def command_for_row(
+    row: Mapping[str, Any], *, python: str, checkout_root: str | None = None,
+    driver: str | None = None,
+) -> str:
+    """Build the single-binding driver command permitted by the launcher."""
 
     if row.get("kind") not in {"smoke", "train", "eval"}:
         raise ValueError("manifest row has an invalid kind")
     _require_sha(row.get("source_sha"), length=40, field="source_sha")
     _require_sha(row.get("config_sha256"), length=64, field="config_sha256")
+    if checkout_root is not None:
+        driver = _resolve_driver_path(_DRIVER_BY_KIND[row["kind"]], checkout_root)
+    if driver is None:
+        raise ValueError("checkout_root is required to derive the Stage-1 driver")
     values = {"python": python, "driver": driver, "config": row.get("config"),
               "row_id": row.get("row_id", "")}
     for field, value in values.items():
         _require_safe_value(value, field=field)
-    args = [python, driver, "--config", str(row["config"]), "--kind", str(row["kind"])]
-    for override in row_overrides(row):
-        _require_safe_value(override, field="override")
-        args.append(override)
-    args.extend(["--binding", _binding_token(row)])
-    if row.get("overlay") is not None or row.get("overlay_sha256") is not None:
-        if row.get("kind") != "train":
-            raise ValueError("only train rows may declare an overlay")
-        if not isinstance(row.get("overlay"), str) or not isinstance(row.get("overlay_sha256"), str):
-            raise ValueError("overlay rows require overlay and overlay_sha256")
-        args.extend([
-            "--overlay", str(row["overlay"]),
-            "--overlay-sha256", str(row["overlay_sha256"]),
-        ])
-    if row.get("kind") == "eval":
-        args.extend([
-            "--expected-checkpoint-sha256", str(row["checkpoint_sha256"]),
-        ])
+    args = [python, driver, "--binding", _binding_token(row)]
     return shlex.join(args)
 
 
@@ -208,10 +218,14 @@ def _resolve_driver_path(driver: str, checkout_root: str) -> str:
     return str((Path(checkout_root) / path).resolve())
 
 
-def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
-           checkout_root: str, results_root: str, partition: str = "test",
+def render(*, row: Mapping[str, Any], checkout_root: str, python: str,
+           partition: str = "test",
            scratch_base: str = "/scratch", cpus_per_task: int | None = None,
-           mem: str | None = None, time: str | None = None) -> str:
+           mem: str | None = None, time: str | None = None,
+           # Compatibility-only parameters for callers pinned to LR-1.  They
+           # are checked against the row and never become application inputs.
+           driver: str | None = None, head_sha: str | None = None,
+           results_root: str | None = None) -> str:
     """Render a fail-closed script for one identity-bound row.
 
     ``checkout_root`` is the exact checkout staged for execution. It is
@@ -224,11 +238,14 @@ def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
     if not Path(checkout_root).is_absolute() or checkout_root == "/":
         raise ValueError("checkout_root must be absolute and not '/'")
     _require_safe_value(checkout_root, field="checkout_root")
-    _require_safe_value(driver, field="driver")
     _require_safe_value(scratch_base, field="scratch_base")
     if not Path(scratch_base).is_absolute() or scratch_base == "/":
         raise ValueError("scratch_base must be absolute and not '/'")
-    _require_sha(head_sha, length=40, field="head_sha")
+    _require_sha(row.get("source_sha"), length=40, field="row.source_sha")
+    if head_sha is not None:
+        _require_sha(head_sha, length=40, field="head_sha")
+        if head_sha != row.get("source_sha"):
+            raise ValueError("rendered head_sha does not match row source_sha")
     partitions = _partition_names(partition)
     is_gpu = bool(GPU_PARTITIONS.intersection(partitions))
     if is_gpu:
@@ -239,6 +256,12 @@ def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
             raise ValueError("GPU partitions require a row device binding of cuda")
     elif row.get("device") not in (None, "cpu"):
         raise ValueError("CPU partitions require a row device binding of cpu")
+    row_results_root = row.get("results_root")
+    if not isinstance(row_results_root, str):
+        raise ValueError("row results_root is required")
+    if results_root is not None and results_root.rstrip("/") != row_results_root.rstrip("/"):
+        raise ValueError("rendered results_root does not match row results_root")
+    results_root = row_results_root
     if not results_root.startswith(FACILITY_RESULTS_PREFIX):
         raise ValueError("results_root must be below the approved Netscratch prefix")
     _require_safe_value(results_root, field="results_root")
@@ -248,16 +271,15 @@ def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
             or (row_root != approved_root and not row_root.startswith(approved_root + "/"))):
         raise ValueError("row results_root is not bound to the rendered root")
     _require_safe_value(row_root, field="row.results_root")
-    if row.get("source_sha") != head_sha:
-        raise ValueError("manifest source_sha does not match rendered head_sha")
     _validate_run_identity(row)
     if row.get("kind") == "eval":
         identity_expectations(row)
     for field in ("experiment_name", "sector", "run_id"):
         _require_path_component(row.get(field), field=field)
-    command = command_for_row(
-        row, python=python, driver=_resolve_driver_path(driver, checkout_root)
-    )
+    command = command_for_row(row, python=python, checkout_root=checkout_root)
+    from experiments.toolkit.job_names import stage1_row_job_name
+
+    job_name = stage1_row_job_name(row)
     template_path = Path(__file__).with_name("templates") / "cannon.sbatch"
     template = template_path.read_text(encoding="utf-8")
     if is_gpu:
@@ -286,7 +308,8 @@ def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
     for marker, value in {
         "__PARTITION__": partition,
         "__RESULTS_ROOT__": results_root,
-        "__HEAD_SHA__": head_sha,
+        "__HEAD_SHA__": str(row["source_sha"]),
+        "__JOB_NAME__": job_name,
         "__SCRATCH_BASE__": scratch_base.rstrip("/"),
         "__COMMAND__": command,
     }.items():
@@ -300,11 +323,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--row", type=Path, required=True)
-    parser.add_argument("--driver", required=True)
     parser.add_argument("--checkout-root", required=True)
     parser.add_argument("--python", required=True)
-    parser.add_argument("--head-sha", required=True)
-    parser.add_argument("--results-root", required=True)
     parser.add_argument("--partition", default="test")
     parser.add_argument("--scratch-base", default="/scratch")
     parser.add_argument("--cpus-per-task", type=int)
@@ -312,9 +332,8 @@ def main() -> int:
     parser.add_argument("--time")
     args = parser.parse_args()
     row = json.loads(args.row.read_text(encoding="utf-8"))
-    args.output.write_text(render(row=row, driver=args.driver, python=args.python,
+    args.output.write_text(render(row=row, python=args.python,
                                   checkout_root=args.checkout_root,
-                                  head_sha=args.head_sha, results_root=args.results_root,
                                   partition=args.partition, scratch_base=args.scratch_base,
                                   cpus_per_task=args.cpus_per_task, mem=args.mem,
                                   time=args.time), encoding="utf-8")

@@ -8,6 +8,7 @@ import torch
 
 from tpen.evaluation.bundle import GeneratedConfigurations
 from tpen.evaluation.protocols import EvaluationContext
+from tpen.sampling.protocols import SamplingCollector
 
 
 class MCMCGenerator:
@@ -18,7 +19,7 @@ class MCMCGenerator:
     def __init__(
         self,
         *,
-        sampler: object,
+        sampler: SamplingCollector,
         seed: int | None = None,
         max_samples: int | None = None,
     ) -> None:
@@ -34,10 +35,9 @@ class MCMCGenerator:
     ) -> GeneratedConfigurations:
         """Collect sampler configurations and expose bookkeeping metadata."""
 
-        collect = getattr(self.sampler, "collect_samples", None)
-        if not callable(collect):
-            raise TypeError("MCMCGenerator sampler must expose collect_samples(model, device=...)")
-        walkers, sampler_stats = collect(model, device=context.device)
+        walkers, sampler_stats = self.sampler.collect_samples(
+            model, device=context.device, emitter=context.emitter
+        )
         batch = walkers.make_batch().flatten_samples()
         if self.max_samples is not None and self.max_samples >= 0:
             batch = _slice_batch(batch, 0, min(self.max_samples, batch.batch_size))

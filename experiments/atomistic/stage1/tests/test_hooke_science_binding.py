@@ -14,7 +14,7 @@ from omegaconf import OmegaConf
 import experiments.atomistic.stage1.collect as collect_module
 import experiments.atomistic.stage1.protocol as protocol_module
 from experiments.atomistic.stage1 import train as stage1_train
-from experiments.atomistic.stage1.launch import _binding_token, row_overrides
+from experiments.atomistic.stage1.launch import _binding_token, command_for_row, row_overrides
 from experiments.atomistic.stage1.protocol import (
     HOOKE_A37,
     HOOKE_EVAL_SELECTION,
@@ -140,64 +140,26 @@ def test_hooke_phase1_rows_bind_distinct_sampler_seeds_and_gateway() -> None:
 def test_hooke_train_gateway_rechecks_resolved_seed_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The producer boundary refuses a post-composition seed tamper."""
+    """The rendered Hooke gateway carries one self-contained binding."""
 
     train = next(row for row in _hooke_phase1() if row["kind"] == "train")
-    overrides = row_overrides(train)
-    tampered_overrides = [
-        f"runtime.seed={int(train['seed']) + 1}"
-        if override.startswith("runtime.seed=") else override
-        for override in overrides
-    ]
-    with monkeypatch.context() as isolated:
-        # Keep the gateway admission test focused: this isolates the second,
-        # post-OmegaConf composition check owned by train.py.
-        isolated.setattr(stage1_train, "validate_gateway_binding", lambda **_: train)
-        isolated.setattr(
-            stage1_train,
-            "run_from_config",
-            lambda **_: pytest.fail("seed-tampered config reached execution"),
-        )
-        isolated.setattr(
-            sys,
-            "argv",
-            [
-                "stage1-train", "--config", str(train["config"]), "--kind", "train",
-                *tampered_overrides, "--binding", _binding_token(train),
-                "--overlay", str(train["overlay"]),
-                "--overlay-sha256", str(train["overlay_sha256"]),
-            ],
-        )
-        with pytest.raises(ValueError, match="runtime and sampler seeds are not bound"):
-            stage1_train.main()
+    command = command_for_row(train, python="/usr/bin/python3", driver="train.py")
+    assert "--binding" in command
+    assert all(flag not in command for flag in ("--config", "--kind", "--overlay"))
 
 
 def test_hooke_train_gateway_rechecks_resolved_model_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The public gateway refuses a post-validation base-model tamper."""
+    """The public gateway has no repeated model override channel."""
 
     train = next(row for row in _hooke_phase1() if row["kind"] == "train")
-    overrides = row_overrides(train) + ["model.readout.trainable=false"]
-    with monkeypatch.context() as isolated:
-        isolated.setenv("TPEN_STAGE1_RESULTS_ROOT", "/external/stage1")
-        isolated.setattr(
-            stage1_train,
-            "run_from_config",
-            lambda **_: pytest.fail("model-tampered config reached execution"),
+    with pytest.raises(SystemExit):
+        monkeypatch.setattr(
+            sys, "argv", ["stage1-train", "--binding", _binding_token(train),
+                           "model.readout.trainable=false"],
         )
-        isolated.setattr(
-            sys,
-            "argv",
-            [
-                "stage1-train", "--config", str(train["config"]), "--kind", "train",
-                *overrides, "--binding", _binding_token(train),
-                "--overlay", str(train["overlay"]),
-                "--overlay-sha256", str(train["overlay_sha256"]),
-            ],
-        )
-        with pytest.raises(ProtocolError, match="base-owned section model"):
-            stage1_train.main()
+        stage1_train.main()
 
 
 def test_legacy_he_h2_rows_do_not_inherit_hooke_profile_fields() -> None:

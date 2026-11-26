@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+import inspect
 import logging
 import random
 import sys
+import threading
 import traceback
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
+from uuid import uuid4
 
 from hydra.utils import get_class, instantiate
 from hydra.errors import InstantiationException
@@ -22,8 +27,11 @@ from tpen.artifacts import (
     ArtifactManager,
     ArtifactRoutingError,
     RunContext,
+    RunContextReadiness,
+    RunMetadata,
     RunResult,
     build_run_metadata,
+    collect_hardware_metadata,
     resolve_run_clock,
     resolve_run_id,
     write_artifact_routing_receipt,
@@ -36,7 +44,21 @@ from tpen.distributed import (
     RankLocalJSONLWriter,
     execution_topology_from_facts,
 )
-from tpen.callback import configure_terminal_logging
+from tpen.callback import (
+    _KNOWN_NON_MANAGED_CALLBACK_TARGETS,
+    configure_terminal_logging,
+)
+from tpen.callback.base import (
+    ManagedLifecycleError,
+    ResourceOwnershipClaim,
+    ResourceOwnershipConflictError,
+    RunResource,
+    _is_managed_callback_class,
+    canonicalize_allocator_reset_scope,
+    claims_conflict,
+    is_managed_callback,
+    validate_run_resource,
+)
 from tpen.checkpoint.hashing import populate_resolved_config_defaults
 from tpen.config import register_resolvers
 from tpen.dependencies import OptionalDependencyError, require_torch
@@ -147,6 +169,1125 @@ def _nonempty_text(value: object) -> str | None:
     return text or None
 
 
+_FORBIDDEN_CALLBACK_SELECTOR_KEYS: frozenset[str] = frozenset(
+    {
+        "typed_groups",
+        "selectors",
+        "subscriptions",
+        "triggers",
+        "event_selector",
+        "event_selectors",
+        "event_type",
+        "event_types",
+        "operation",
+        "operation_selector",
+        "operation_selectors",
+        "operation_type",
+        "operation_types",
+    }
+)
+_FORBIDDEN_CALLBACK_SELECTOR_TARGETS: frozenset[str] = frozenset(
+    {
+        "tpen.events.Subscription",
+        "tpen.events.started",
+        "tpen.events.ended",
+        "tpen.callback.cadence.SubscriptionGroup",
+        "tpen.callback.SubscriptionGroup",
+    }
+)
+_RESOURCE_USAGE_QUALIFIED_NAME = "tpen.callback.resource_usage.ResourceUsage"
+_RESOURCE_USAGE_TARGETS: frozenset[str] = frozenset(
+    {
+        "tpen.callback.ResourceUsage",
+        _RESOURCE_USAGE_QUALIFIED_NAME,
+    }
+)
+
+
+def _is_forbidden_callback_selector_target(target: str) -> bool:
+    """Return whether ``target`` names or accesses a forbidden selector callable."""
+
+    normalized = target.strip()
+    return any(
+        normalized == forbidden or normalized.startswith(f"{forbidden}.")
+        for forbidden in _FORBIDDEN_CALLBACK_SELECTOR_TARGETS
+    )
+
+
+def _extract_callbacks_view(cfg: DictConfig, *, resolved: bool) -> Any:
+    """Return configured ``callbacks`` without resolving unrelated placeholders."""
+
+    if resolved:
+        callbacks = OmegaConf.select(cfg, "callbacks", default=None)
+        if OmegaConf.is_config(callbacks):
+            return OmegaConf.to_container(callbacks, resolve=True)
+        return callbacks
+    if isinstance(cfg, DictConfig):
+        raw_root = OmegaConf.to_container(cfg, resolve=False, throw_on_missing=False)
+        callbacks = raw_root.get("callbacks") if isinstance(raw_root, Mapping) else None
+    elif isinstance(cfg, Mapping):
+        callbacks = cfg.get("callbacks")
+    else:
+        callbacks = None
+    # If the callbacks section itself is an interpolation (e.g. ``${my_cbs}``),
+    # try resolving only that node without touching unrelated keys like run.dir.
+    if isinstance(callbacks, str) and "${" in callbacks and isinstance(cfg, DictConfig):
+        try:
+            selected = OmegaConf.select(cfg, "callbacks", default=None)
+        except Exception:
+            return None
+        if OmegaConf.is_config(selected):
+            callbacks = OmegaConf.to_container(selected, resolve=False, throw_on_missing=False)
+        else:
+            callbacks = selected
+    # Resolve interpolated callback list elements (e.g. ``callbacks: ["${obs_cb}"]``)
+    # without resolving unrelated placeholders such as ``${run.dir}`` inside them.
+    if isinstance(callbacks, (list, tuple)) and isinstance(cfg, DictConfig):
+        resolved_entries: list[Any] = []
+        for index, entry in enumerate(callbacks):
+            if isinstance(entry, str) and "${" in entry:
+                try:
+                    selected = OmegaConf.select(cfg, f"callbacks[{index}]", default=None)
+                except Exception:
+                    resolved_entries.append(entry)
+                    continue
+                if OmegaConf.is_config(selected):
+                    resolved_entries.append(
+                        OmegaConf.to_container(
+                            selected, resolve=False, throw_on_missing=False
+                        )
+                    )
+                else:
+                    resolved_entries.append(selected)
+            else:
+                resolved_entries.append(entry)
+        return resolved_entries
+    return callbacks
+
+
+def _walk_callback_spec(node: object, *, path: str) -> None:
+    """Recursively reject free-form event/type selector keys or targets."""
+
+    if isinstance(node, Mapping):
+        target = node.get("_target_")
+        if isinstance(target, str) and _is_forbidden_callback_selector_target(target):
+            raise ValueError(
+                f"{path}._target_={target!r} is forbidden: configured callbacks "
+                "must not supply free-form event or subscription selectors"
+            )
+        for key, value in node.items():
+            key_text = str(key)
+            if key_text in _FORBIDDEN_CALLBACK_SELECTOR_KEYS:
+                raise ValueError(
+                    f"{path}.{key_text} is forbidden: configured callbacks "
+                    "must not supply free-form event/type selectors"
+                )
+            _walk_callback_spec(value, path=f"{path}.{key_text}")
+    elif isinstance(node, (list, tuple)):
+        for index, item in enumerate(node):
+            _walk_callback_spec(item, path=f"{path}[{index}]")
+
+
+def _validate_configured_callback_specs(cfg: DictConfig, *, resolved: bool = False) -> None:
+    """Refuse free-form configured event/type selectors before any side effect."""
+
+    callbacks = _extract_callbacks_view(cfg, resolved=resolved)
+    if not isinstance(callbacks, (list, tuple)):
+        return
+    for index, entry in enumerate(callbacks):
+        _walk_callback_spec(entry, path=f"callbacks[{index}]")
+
+
+def _try_resolve_target_class(target: str) -> type | None:
+    """Resolve a dotted ``_target_`` to its class, returning ``None`` if unimportable."""
+
+    try:
+        resolved = get_class(target)
+    except Exception:
+        return None
+    return resolved if isinstance(resolved, type) else None
+
+
+def _has_managed_callbacks(
+    cfg: DictConfig,
+    runtime_callbacks: Sequence[object] = (),
+    *,
+    resolved: bool = False,
+) -> bool:
+    """Return whether any runtime or configured callback declares ``run_scope``."""
+
+    for callback in runtime_callbacks:
+        if is_managed_callback(callback):
+            return True
+    callbacks = _extract_callbacks_view(cfg, resolved=resolved)
+    if not isinstance(callbacks, (list, tuple)):
+        return False
+    for index, entry in enumerate(callbacks):
+        if isinstance(entry, Mapping):
+            target = entry.get("_target_")
+            if (
+                isinstance(target, str)
+                and "${" in target
+                and not resolved
+                and isinstance(cfg, DictConfig)
+            ):
+                try:
+                    target = OmegaConf.select(cfg, f"callbacks[{index}]._target_", default=None)
+                except Exception:
+                    target = None
+            if isinstance(target, str) and target.strip() and "${" not in target:
+                normalized_target = target.strip()
+                if normalized_target in _KNOWN_NON_MANAGED_CALLBACK_TARGETS:
+                    continue
+                klass = _try_resolve_target_class(normalized_target)
+                if klass is not None and _is_managed_callback_class(klass):
+                    return True
+        elif is_managed_callback(entry):
+            return True
+    return False
+
+
+class _ManagedLifecycleRegistry:
+    """Process-wide lock-guarded tracker for active and unsafe managed scopes."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active_callbacks: set[int] = set()
+        self._unsafe_callbacks: dict[int, weakref.ref[object] | None] = {}
+        self._active_claims: dict[str, list[ResourceOwnershipClaim]] = {}
+        self._unsafe_claims: list[ResourceOwnershipClaim] = []
+
+    def _prune_dead_unsafe_callbacks_locked(self) -> None:
+        """Remove collected weak references while ``self._lock`` is already held."""
+
+        dead_ids = [
+            cb_id
+            for cb_id, ref in self._unsafe_callbacks.items()
+            if ref is not None and ref() is None
+        ]
+        for cb_id in dead_ids:
+            self._unsafe_callbacks.pop(cb_id, None)
+
+    def _is_unsafe_callback(self, callback: object) -> bool:
+        cb_id = id(callback)
+        if cb_id not in self._unsafe_callbacks:
+            return False
+        ref = self._unsafe_callbacks[cb_id]
+        if ref is None:
+            return True
+        alive = ref()
+        if alive is None:
+            self._unsafe_callbacks.pop(cb_id, None)
+            return False
+        return alive is callback
+
+    def _mark_unsafe_callback(self, callback: object) -> None:
+        self._prune_dead_unsafe_callbacks_locked()
+        cb_id = id(callback)
+        try:
+            # Bare weakref without a finalizer callback: cyclic GC may collect
+            # a callback while ``self._lock`` is held, so a finalizer acquiring
+            # this non-reentrant lock would self-deadlock.
+            self._unsafe_callbacks[cb_id] = weakref.ref(callback)
+        except TypeError:
+            self._unsafe_callbacks[cb_id] = None
+
+    def _validate_locked(
+        self,
+        callbacks: Sequence[object],
+        claims: Sequence[ResourceOwnershipClaim],
+    ) -> None:
+        self._prune_dead_unsafe_callbacks_locked()
+        seen_ids: set[int] = set()
+        for callback in callbacks:
+            cb_id = id(callback)
+            if cb_id in seen_ids:
+                raise ManagedLifecycleError(
+                    f"duplicate managed callback instance {type(callback).__name__} "
+                    "in the same invocation"
+                )
+            seen_ids.add(cb_id)
+            if self._is_unsafe_callback(callback):
+                raise ManagedLifecycleError(
+                    f"managed callback {type(callback).__name__} has unconfirmed "
+                    "prior cleanup and cannot be reused in this process"
+                )
+            if cb_id in self._active_callbacks:
+                raise ManagedLifecycleError(
+                    f"managed callback {type(callback).__name__} is already active "
+                    "in another managed scope"
+                )
+            is_active_fn = getattr(callback, "is_managed_scope_active", None)
+            if callable(is_active_fn) and is_active_fn():
+                raise ManagedLifecycleError(
+                    f"managed callback {type(callback).__name__} arrived already "
+                    "active; core owns first activation"
+                )
+        for index, first in enumerate(claims):
+            for second in claims[index + 1 :]:
+                if claims_conflict(first, second):
+                    raise ResourceOwnershipConflictError(
+                        f"conflicting resource ownership claims within invocation: "
+                        f"{first!r} vs {second!r}"
+                    )
+        for claim in claims:
+            for unsafe_claim in self._unsafe_claims:
+                if claims_conflict(claim, unsafe_claim):
+                    raise ResourceOwnershipConflictError(
+                        f"resource ownership claim {claim!r} conflicts with unsafe "
+                        f"prior claim {unsafe_claim!r}"
+                    )
+            for active_list in self._active_claims.values():
+                for active_claim in active_list:
+                    if claims_conflict(claim, active_claim):
+                        raise ResourceOwnershipConflictError(
+                            f"resource ownership claim {claim!r} conflicts with "
+                            f"active claim {active_claim!r}"
+                        )
+
+    def preflight_check(
+        self,
+        callbacks: Sequence[object],
+        claims: Sequence[ResourceOwnershipClaim],
+    ) -> None:
+        """Validate callbacks and ownership claims without acquiring leases."""
+
+        with self._lock:
+            self._validate_locked(callbacks, claims)
+
+    def acquire(
+        self,
+        invocation_id: str,
+        callbacks: Sequence[object],
+        claims: Sequence[ResourceOwnershipClaim],
+    ) -> None:
+        """Atomically validate and register active callbacks and claims."""
+
+        with self._lock:
+            self._validate_locked(callbacks, claims)
+            for callback in callbacks:
+                self._active_callbacks.add(id(callback))
+            self._active_claims[invocation_id] = list(claims)
+
+    def check_and_add_claims(
+        self,
+        invocation_id: str,
+        extra_claims: Sequence[ResourceOwnershipClaim],
+    ) -> None:
+        """Validate and append late-discovered claims for an active invocation."""
+
+        if not extra_claims:
+            return
+        with self._lock:
+            for index, first in enumerate(extra_claims):
+                for second in extra_claims[index + 1 :]:
+                    if claims_conflict(first, second):
+                        raise ResourceOwnershipConflictError(
+                            f"conflicting resource ownership claims: {first!r} vs {second!r}"
+                        )
+            for claim in extra_claims:
+                for unsafe_claim in self._unsafe_claims:
+                    if claims_conflict(claim, unsafe_claim):
+                        raise ResourceOwnershipConflictError(
+                            f"resource ownership claim {claim!r} conflicts with unsafe "
+                            f"prior claim {unsafe_claim!r}"
+                        )
+                for active_list in self._active_claims.values():
+                    for active_claim in active_list:
+                        if claims_conflict(claim, active_claim):
+                            raise ResourceOwnershipConflictError(
+                                f"resource ownership claim {claim!r} conflicts with "
+                                f"active claim {active_claim!r}"
+                            )
+            self._active_claims.setdefault(invocation_id, []).extend(extra_claims)
+
+    def release(
+        self,
+        invocation_id: str,
+        *,
+        clean_callbacks: Sequence[object],
+        unsafe_callbacks: Sequence[object],
+        unsafe_claims: Sequence[ResourceOwnershipClaim],
+    ) -> None:
+        """Release active leases and retain unsafe callbacks/claims on failure."""
+
+        with self._lock:
+            for callback in clean_callbacks:
+                self._active_callbacks.discard(id(callback))
+            for callback in unsafe_callbacks:
+                self._active_callbacks.discard(id(callback))
+                self._mark_unsafe_callback(callback)
+            self._active_claims.pop(invocation_id, None)
+            self._unsafe_claims.extend(unsafe_claims)
+
+
+_MANAGED_LIFECYCLE_REGISTRY = _ManagedLifecycleRegistry()
+
+
+def _callback_ownership_claims(
+    callback: object,
+    *,
+    cfg: DictConfig,
+    run_dir: Path,
+    metadata: RunMetadata,
+    artifact_manager: ArtifactManager | None = None,
+    invocation_id: str | None = None,
+) -> list[ResourceOwnershipClaim]:
+    """Collect optional ``ResourceOwnershipClaim`` declarations from a callback."""
+
+    provider = getattr(callback, "ownership_claims", None)
+    if provider is None:
+        return []
+    if not callable(provider):
+        raise TypeError(f"{type(callback).__name__}.ownership_claims must be callable")
+    sig = inspect.signature(provider)
+    params = [
+        param
+        for param in sig.parameters.values()
+        if param.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    ]
+    if not params:
+        raw = provider()
+    else:
+        available = {
+            "cfg": cfg,
+            "run_dir": run_dir,
+            "metadata": metadata,
+            "artifact_manager": artifact_manager,
+            "invocation_id": invocation_id,
+        }
+        named_compatible = all(
+            param.name in available or param.default is not inspect.Parameter.empty
+            for param in params
+            if param.kind
+            in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        ) and not any(param.kind is inspect.Parameter.POSITIONAL_ONLY for param in params)
+        if named_compatible:
+            kwargs = {param.name: available[param.name] for param in params if param.name in available}
+            raw = provider(**kwargs)
+        elif len(params) == 1:
+            raw = provider(cfg)
+        else:
+            raw = provider()
+    claims = list(raw) if raw is not None else []
+    for claim in claims:
+        if not isinstance(claim, ResourceOwnershipClaim):
+            raise TypeError(
+                f"{type(callback).__name__}.ownership_claims must return "
+                f"ResourceOwnershipClaim values, got {type(claim).__name__}"
+            )
+    return claims
+
+
+def _is_resource_usage_target(target: str) -> bool:
+    """Return whether a configured ``_target_`` names ``ResourceUsage``."""
+
+    normalized = target.strip()
+    if normalized in _RESOURCE_USAGE_TARGETS:
+        return True
+    if normalized in _KNOWN_NON_MANAGED_CALLBACK_TARGETS:
+        return False
+    klass = _try_resolve_target_class(normalized)
+    if klass is None:
+        return False
+    return any(
+        f"{base.__module__}.{base.__qualname__}" == _RESOURCE_USAGE_QUALIFIED_NAME
+        for base in klass.__mro__
+    )
+
+
+def _resource_usage_instance_claim(
+    callback: object, resolved_cfg: DictConfig
+) -> ResourceOwnershipClaim | None:
+    """Infer conservative allocator-reset claim for a live ``ResourceUsage``."""
+
+    ru_module = sys.modules.get("tpen.callback.resource_usage")
+    ru_cls = getattr(ru_module, "ResourceUsage", None) if ru_module is not None else None
+    if ru_cls is None or not isinstance(callback, ru_cls):
+        return None
+    if getattr(callback, "_injected_allocator_probe", False) and (
+        getattr(callback, "allocator_probe", None) is not None
+    ):
+        probe = callback.allocator_probe
+        probe_device = getattr(probe, "device", None)
+        if probe_device is not None:
+            scope = canonicalize_allocator_reset_scope(str(probe_device))
+        else:
+            probe_kind = getattr(probe, "kind", None)
+            kind_text = (
+                str(getattr(probe_kind, "value", probe_kind)).strip().lower()
+                if probe_kind is not None
+                else ""
+            )
+            scope = None if kind_text == "cpu" else "unknown"
+    else:
+        device = str(OmegaConf.select(resolved_cfg, "runtime.device", default="cpu"))
+        scope = canonicalize_allocator_reset_scope(device)
+    if scope is None:
+        return None
+    return ResourceOwnershipClaim(kind="allocator_reset", scope=scope)
+
+
+def _resource_usage_spec_claim(
+    item: object, resolved_cfg: DictConfig
+) -> ResourceOwnershipClaim | None:
+    """Infer conservative allocator-reset claim for a configured ``ResourceUsage``."""
+
+    if isinstance(item, (DictConfig, Mapping)) and "_target_" in item:
+        target = str(item["_target_"])
+        if not _is_resource_usage_target(target):
+            return None
+        probe_cfg = item.get("allocator_probe")
+        if probe_cfg is not None:
+            if isinstance(probe_cfg, (DictConfig, Mapping)) and probe_cfg.get("device") is not None:
+                scope = canonicalize_allocator_reset_scope(str(probe_cfg["device"]))
+            else:
+                scope = "unknown"
+        else:
+            device = str(OmegaConf.select(resolved_cfg, "runtime.device", default="cpu"))
+            scope = canonicalize_allocator_reset_scope(device)
+        if scope is None:
+            return None
+        return ResourceOwnershipClaim(kind="allocator_reset", scope=scope)
+    return _resource_usage_instance_claim(item, resolved_cfg)
+
+
+@dataclass
+class _EnteredScope:
+    """One entered managed callback scope tracked for LIFO teardown."""
+
+    callback: Any
+    cm: Any
+    handle: RunResource | None = None
+    unsafe: bool = False
+
+
+class _ManagedRunSession:
+    """Core-owned lifecycle session shared by ``open_run_context`` and ``run_from_config``."""
+
+    def __init__(
+        self,
+        cfg: DictConfig,
+        *,
+        config_path: str | None = None,
+        command: str | None = None,
+        bootstrap: _BootstrapState | None = None,
+        topology: ExecutionTopology | None = None,
+        artifact_destination: ArtifactDestination | None = None,
+        runtime_callbacks: Sequence[object] = (),
+    ) -> None:
+        self._cfg = cfg
+        self._config_path = config_path
+        self._command = command
+        self._bootstrap = bootstrap
+        self._topology = topology
+        self._artifact_destination = artifact_destination
+        self._runtime_callbacks = list(runtime_callbacks)
+        self.context: RunContext | None = None
+        self._invocation_id: str | None = None
+        self._managed_callbacks: list[Any] = []
+        self._claims_by_callback: dict[int, list[ResourceOwnershipClaim]] = {}
+        self._entered_scopes: list[_EnteredScope] = []
+        self._enter_attempted_callbacks: list[Any] = []
+        self._registry_acquired = False
+        self._closed = False
+
+    def checkpoint(self) -> None:
+        """Advance due cooperative work on every entered resource handle."""
+
+        for entry in self._entered_scopes:
+            if entry.handle is not None:
+                entry.handle.checkpoint()
+
+    def _checkpoint_best_effort(self, cleanup_errors: list[Exception]) -> None:
+        """Attempt cooperative checkpoints during finalization without aborting cleanup."""
+
+        for entry in self._entered_scopes:
+            if entry.handle is None:
+                continue
+            try:
+                entry.handle.checkpoint()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+
+    def enter(self) -> RunContext:
+        """Run preflight, activate managed scopes, complete preparation, and reach ``READY``."""
+
+        # 1. Preflight before make_dirs() and before any scope activation.
+        validate_hi_train_config(self._cfg)
+        _validate_configured_callback_specs(self._cfg, resolved=False)
+        if self._artifact_destination is not None:
+            self._artifact_destination.require_fresh()
+
+        run_clock = resolve_run_clock(self._cfg)
+        source_cfg = _rerunnable_config(
+            OmegaConf.create(
+                populate_resolved_config_defaults(self._cfg, timezone=run_clock.timezone)
+            )
+        )
+        resolved_cfg = OmegaConf.create(
+            populate_resolved_config_defaults(self._cfg, timezone=run_clock.timezone)
+        )
+        experiment_name = _nonempty_text(OmegaConf.select(resolved_cfg, "experiment.name"))
+        run_name = (
+            _nonempty_text(OmegaConf.select(resolved_cfg, "experiment.run_name"))
+            or experiment_name
+            or "tpen_run"
+        )
+        OmegaConf.update(resolved_cfg, "experiment.run_name", run_name, merge=False, force_add=True)
+        configured_run_id = OmegaConf.select(resolved_cfg, "run.run_id", default=None)
+        run_id = resolve_run_id(
+            configured_run_id, run_name, clock=run_clock, topology=self._topology
+        )
+        if configured_run_id is None:
+            OmegaConf.update(resolved_cfg, "run.run_id", run_id, merge=False, force_add=True)
+        experiment_name = experiment_name or "experiment"
+        sector = str(OmegaConf.select(resolved_cfg, "experiment.sector", default="default"))
+        root = Path(str(OmegaConf.select(resolved_cfg, "run.root", default="outputs")))
+        layout = str(OmegaConf.select(resolved_cfg, "run.layout", default="nested"))
+        admitted_run_dir = (
+            _nonempty_text(OmegaConf.select(resolved_cfg, "run.dir", default=None))
+            if self._artifact_destination is not None
+            else None
+        )
+        artifact_manager = ArtifactManager(
+            root,
+            experiment_name,
+            sector,
+            str(run_id),
+            layout=layout,
+            destination=self._artifact_destination,
+            logical_run_dir=(
+                Path(admitted_run_dir)
+                if self._artifact_destination is not None and admitted_run_dir is not None
+                else None
+            ),
+        )
+        logical_run_dir = artifact_manager.logical_run_dir
+        OmegaConf.update(
+            resolved_cfg, "run.dir", str(logical_run_dir), merge=False, force_add=True
+        )
+        OmegaConf.resolve(resolved_cfg)
+        _validate_configured_callback_specs(resolved_cfg, resolved=True)
+
+        logger_specs = list(OmegaConf.select(resolved_cfg, "loggers", default=[]) or [])
+        callback_specs = list(OmegaConf.select(resolved_cfg, "callbacks", default=[]) or [])
+        routed = self._artifact_destination is not None
+
+        # Exact-type routed admission precedes any constructor or directory write.
+        if routed:
+            for item in logger_specs:
+                if isinstance(item, DictConfig) and "_target_" in item:
+                    _admit_configured_target(str(item["_target_"]))
+                else:
+                    _admit_runtime_sink(item)
+            for item in callback_specs:
+                if isinstance(item, DictConfig) and "_target_" in item:
+                    _admit_configured_target(str(item["_target_"]))
+                else:
+                    _admit_runtime_sink(item)
+            for runtime_callback in self._runtime_callbacks:
+                _admit_runtime_sink(runtime_callback)
+
+        _validate_callbacks(self._runtime_callbacks)
+        runtime_managed: list[Any] = []
+        runtime_ordinary: list[Any] = []
+        for runtime_callback in self._runtime_callbacks:
+            if is_managed_callback(runtime_callback):
+                runtime_managed.append(runtime_callback)
+            else:
+                runtime_ordinary.append(runtime_callback)
+
+        # Instantiate ONLY managed configured callbacks at preflight; ordinary
+        # callbacks and loggers wait until inside the PREPARING scope.
+        configured_managed: list[tuple[int, Any]] = []
+        configured_ordinary_specs: list[tuple[int, Any]] = []
+        for index, item in enumerate(callback_specs):
+            if isinstance(item, DictConfig) and "_target_" in item:
+                target = str(item["_target_"]).strip()
+                if target in _KNOWN_NON_MANAGED_CALLBACK_TARGETS:
+                    configured_ordinary_specs.append((index, item))
+                    continue
+                klass = _try_resolve_target_class(target)
+                if klass is not None and _is_managed_callback_class(klass):
+                    instance = instantiate(item)
+                    if not is_managed_callback(instance):
+                        raise ManagedLifecycleError(
+                            f"callbacks[{index}]={type(instance).__name__} did not "
+                            "preserve its managed run_scope contract after instantiation"
+                        )
+                    configured_managed.append((index, instance))
+                else:
+                    configured_ordinary_specs.append((index, item))
+            elif is_managed_callback(item):
+                configured_managed.append((index, item))
+            else:
+                configured_ordinary_specs.append((index, item))
+
+        _validate_callbacks([callback for _, callback in configured_managed])
+        managed_callbacks = [callback for _, callback in configured_managed] + runtime_managed
+        # Refuse active, unsafe, duplicate, or arrive-active callbacks BEFORE
+        # routing checks so live callbacks are never mutated or misdiagnosed.
+        _MANAGED_LIFECYCLE_REGISTRY.preflight_check(managed_callbacks, ())
+        planned_managed_routes: list[tuple[object, str, str, Path]] = []
+        if routed:
+            assert self._artifact_destination is not None
+            planned_managed_routes = _plan_artifact_sink_routes(
+                managed_callbacks,
+                logical_run_dir=logical_run_dir,
+                destination=self._artifact_destination,
+            )
+
+        metadata = build_run_metadata(
+            resolved_cfg,
+            command=self._command,
+            config_path=self._config_path,
+            clock=run_clock,
+            include_hardware=False,
+        )
+
+        invocation_id = str(uuid4())
+        all_claims: list[ResourceOwnershipClaim] = []
+        claims_by_callback: dict[int, list[ResourceOwnershipClaim]] = {}
+        for callback in managed_callbacks:
+            cb_claims = _callback_ownership_claims(
+                callback,
+                cfg=resolved_cfg,
+                run_dir=artifact_manager.run_dir,
+                metadata=metadata,
+                artifact_manager=artifact_manager,
+                invocation_id=invocation_id,
+            )
+            ru_claim = _resource_usage_instance_claim(callback, resolved_cfg)
+            if ru_claim is not None:
+                cb_claims.append(ru_claim)
+            claims_by_callback[id(callback)] = cb_claims
+            all_claims.extend(cb_claims)
+
+        preflight_ru_indices: set[int] = set()
+        for index, item in configured_ordinary_specs:
+            ru_claim = _resource_usage_spec_claim(item, resolved_cfg)
+            if ru_claim is not None:
+                preflight_ru_indices.add(index)
+                all_claims.append(ru_claim)
+        for runtime_callback in runtime_ordinary:
+            ru_claim = _resource_usage_instance_claim(runtime_callback, resolved_cfg)
+            if ru_claim is not None:
+                all_claims.append(ru_claim)
+
+        # Acquire leases atomically BEFORE mutating sinks or calling make_dirs()
+        # so even a concurrent conflict leaves zero directories or mutated sinks.
+        _MANAGED_LIFECYCLE_REGISTRY.acquire(invocation_id, managed_callbacks, all_claims)
+        self._invocation_id = invocation_id
+        self._managed_callbacks = managed_callbacks
+        self._claims_by_callback = claims_by_callback
+        self._registry_acquired = True
+
+        try:
+            managed_routed_sinks = (
+                _apply_artifact_sink_routes(planned_managed_routes) if routed else {}
+            )
+            # 2. Create run directories and the PREPARING RunContext.
+            artifact_manager.make_dirs()
+            if self._bootstrap is not None:
+                self._bootstrap.run_dir = artifact_manager.run_dir
+            _configure_terminal_logging(resolved_cfg)
+
+            context = RunContext(
+                cfg=resolved_cfg,
+                source_cfg=source_cfg,
+                artifact_manager=artifact_manager,
+                metadata=metadata,
+                clock=run_clock,
+                callbacks=[],
+                loggers=[],
+                topology=self._topology,
+                profile_writer=None,
+                invocation_id=invocation_id,
+                initial_readiness=RunContextReadiness.PREPARING,
+            )
+            self.context = context
+
+            # 3. Bind typed context once and enter managed callback scopes.
+            for callback in managed_callbacks:
+                callback.bind_typed_context(context)
+                self._enter_attempted_callbacks.append(callback)
+                cm = callback.run_scope(context)
+                if not (
+                    callable(getattr(cm, "__enter__", None))
+                    and callable(getattr(cm, "__exit__", None))
+                ):
+                    raise TypeError(
+                        f"{type(callback).__name__}.run_scope() must return a context manager"
+                    )
+                handle = cm.__enter__()
+                # Register immediately after __enter__ returns so even an
+                # invalid handle triggers cm.__exit__ during partial-enter rollback.
+                entry = _EnteredScope(callback=callback, cm=cm, handle=None)
+                self._entered_scopes.append(entry)
+                validate_run_resource(handle)
+                entry.handle = handle
+
+            context._checkpoint_hook = self.checkpoint
+
+            # 4. Complete preparation inside PREPARING with checkpoints at each boundary.
+            self.checkpoint()
+            context.metadata.extra = collect_hardware_metadata(
+                device=context.metadata.device,
+                dtype=context.metadata.dtype,
+            )
+            if context.topology is None:
+                try:
+                    device_identity = TorchAllocatorPeakProbe(context.metadata.device).identity()
+                except RuntimeError:
+                    device_identity = None
+                context.topology = ExecutionTopology.single_process(
+                    device=context.metadata.device,
+                    device_identity=device_identity,
+                )
+            context.profile_writer = (
+                None
+                if context.topology.global_rank is None
+                else RankLocalJSONLWriter(
+                    artifact_manager.run_dir,
+                    context.topology,
+                    path=artifact_manager.path(
+                        "profiles", context.topology.rank_path_component, "resources.jsonl"
+                    ),
+                )
+            )
+            self.checkpoint()
+
+            for item in logger_specs:
+                self.checkpoint()
+                logger = (
+                    instantiate(item)
+                    if isinstance(item, DictConfig) and "_target_" in item
+                    else item
+                )
+                self.checkpoint()
+                _validate_loggers([logger])
+                context.loggers.append(logger)
+
+            configured_ordinary: list[tuple[int, Any]] = []
+            for index, item in configured_ordinary_specs:
+                self.checkpoint()
+                callback = (
+                    instantiate(item)
+                    if isinstance(item, DictConfig) and "_target_" in item
+                    else item
+                )
+                self.checkpoint()
+                if is_managed_callback(callback):
+                    raise ManagedLifecycleError(
+                        f"callbacks[{index}]={type(callback).__name__} resolved to a "
+                        "managed callback after preflight; refusing late activation"
+                    )
+                configured_ordinary.append((index, callback))
+            _validate_callbacks([callback for _, callback in configured_ordinary])
+
+            ordered_configured: list[Any] = [None] * len(callback_specs)
+            for index, callback in configured_managed:
+                ordered_configured[index] = callback
+            for index, callback in configured_ordinary:
+                ordered_configured[index] = callback
+            context.callbacks = [*ordered_configured, *self._runtime_callbacks]
+
+            routed_sinks: dict[str, str] = dict(managed_routed_sinks)
+            if routed:
+                ordinary_routed = _route_artifact_sinks(
+                    [
+                        *(callback for _, callback in configured_ordinary),
+                        *runtime_ordinary,
+                        *context.loggers,
+                    ],
+                    logical_run_dir=logical_run_dir,
+                    destination=self._artifact_destination,
+                )
+                routed_sinks.update(ordinary_routed)
+
+            late_claims: list[ResourceOwnershipClaim] = []
+            for index, callback in configured_ordinary:
+                if index in preflight_ru_indices:
+                    continue
+                ru_claim = _resource_usage_instance_claim(callback, resolved_cfg)
+                if ru_claim is not None:
+                    late_claims.append(ru_claim)
+            if late_claims:
+                _MANAGED_LIFECYCLE_REGISTRY.check_and_add_claims(invocation_id, late_claims)
+
+            write_run_start_artifact(context)
+            if self._artifact_destination is not None:
+                write_artifact_routing_receipt(
+                    context,
+                    destination=self._artifact_destination,
+                    logical_run_dir=logical_run_dir,
+                    routed=routed_sinks,
+                )
+            self.checkpoint()
+            context._transition_readiness(RunContextReadiness.READY)
+            return context
+        except BaseException as exc:
+            cleanup_errors = self.close(exc)
+            _log_cleanup_errors(
+                cleanup_errors,
+                context_label="secondary cleanup error during preparation rollback",
+            )
+            raise
+
+    def close(self, primary_exc: BaseException | None = None) -> list[Exception]:
+        """Finalize loggers and all entered managed scopes in guaranteed order.
+
+        Idempotent: repeated calls after closure return an empty list. Never
+        suppresses ``primary_exc``; secondary exceptions are collected and
+        returned to the caller for error-precedence enforcement.
+        """
+
+        if self._closed:
+            return []
+        self._closed = True
+        cleanup_errors: list[Exception] = []
+        context = self.context
+        if context is not None:
+            if context.readiness in (
+                RunContextReadiness.PREPARING,
+                RunContextReadiness.READY,
+            ):
+                context._transition_readiness(RunContextReadiness.FINALIZING)
+            context._checkpoint_hook = None
+            self._checkpoint_best_effort(cleanup_errors)
+            if context.loggers:
+                for logger in context.loggers:
+                    try:
+                        logger.finish()
+                    except Exception as exc:
+                        cleanup_errors.append(exc)
+                self._checkpoint_best_effort(cleanup_errors)
+
+        # Signal nonblocking stop to EVERY entered handle BEFORE calling ANY
+        # potentially blocking __exit__().
+        for entry in self._entered_scopes:
+            if entry.handle is None:
+                continue
+            try:
+                entry.handle.request_stop()
+            except Exception as exc:
+                entry.unsafe = True
+                cleanup_errors.append(exc)
+
+        exc_type = None if primary_exc is None else type(primary_exc)
+        exc_val = primary_exc
+        exc_tb = None if primary_exc is None else primary_exc.__traceback__
+
+        # Exit all entered scopes in reverse LIFO order; ignore return values
+        # so an exit handler can never suppress a primary exception.
+        for entry in reversed(self._entered_scopes):
+            try:
+                entry.cm.__exit__(exc_type, exc_val, exc_tb)
+            except Exception as exc:
+                entry.unsafe = True
+                cleanup_errors.append(exc)
+            else:
+                is_active_fn = getattr(entry.callback, "is_managed_scope_active", None)
+                if callable(is_active_fn):
+                    try:
+                        still_active = bool(is_active_fn())
+                    except Exception as exc:
+                        entry.unsafe = True
+                        cleanup_errors.append(exc)
+                    else:
+                        if still_active:
+                            entry.unsafe = True
+                            cleanup_errors.append(
+                                ManagedLifecycleError(
+                                    f"managed callback {type(entry.callback).__name__} "
+                                    "failed to confirm quiescence after scope exit"
+                                )
+                            )
+
+        entered_ids = {id(entry.callback) for entry in self._entered_scopes}
+        unsafe_ids = {id(entry.callback) for entry in self._entered_scopes if entry.unsafe}
+
+        # Check callbacks whose run_scope() / __enter__() was attempted without
+        # completing entry: if a failed entry left an exclusive resource active
+        # (or failed to confirm quiescence), retain it and its claims as unsafe.
+        for callback in self._enter_attempted_callbacks:
+            cb_id = id(callback)
+            if cb_id in entered_ids:
+                continue
+            is_active_fn = getattr(callback, "is_managed_scope_active", None)
+            if callable(is_active_fn):
+                try:
+                    still_active = bool(is_active_fn())
+                except Exception as exc:
+                    unsafe_ids.add(cb_id)
+                    cleanup_errors.append(exc)
+                else:
+                    if still_active:
+                        unsafe_ids.add(cb_id)
+                        cleanup_errors.append(
+                            ManagedLifecycleError(
+                                f"managed callback {type(callback).__name__} "
+                                "remained active after failed scope entry"
+                            )
+                        )
+
+        if self._registry_acquired and self._invocation_id is not None:
+            clean_callbacks = [
+                cb for cb in self._managed_callbacks if id(cb) not in unsafe_ids
+            ]
+            unsafe_callbacks = [
+                cb for cb in self._managed_callbacks if id(cb) in unsafe_ids
+            ]
+            unsafe_claims: list[ResourceOwnershipClaim] = []
+            for cb in unsafe_callbacks:
+                unsafe_claims.extend(self._claims_by_callback.get(id(cb), ()))
+            _MANAGED_LIFECYCLE_REGISTRY.release(
+                self._invocation_id,
+                clean_callbacks=clean_callbacks,
+                unsafe_callbacks=unsafe_callbacks,
+                unsafe_claims=unsafe_claims,
+            )
+            self._registry_acquired = False
+
+        if context is not None and context.readiness is RunContextReadiness.FINALIZING:
+            context._transition_readiness(RunContextReadiness.CLOSED)
+        return cleanup_errors
+
+
+def _log_cleanup_errors(
+    cleanup_errors: Sequence[BaseException], *, context_label: str
+) -> None:
+    """Emit every secondary cleanup failure on the bootstrap logger."""
+
+    bootstrap_logger = logging.getLogger(_BOOTSTRAP_LOGGER_NAME)
+    for cleanup_exc in cleanup_errors:
+        bootstrap_logger.error(
+            "FATAL: %s: %s: %s",
+            context_label,
+            type(cleanup_exc).__name__,
+            cleanup_exc,
+        )
+
+
+def _close_unmanaged_context(context: RunContext) -> list[Exception]:
+    """Finalize a non-managed context opened via ``open_run_context``."""
+
+    cleanup_errors: list[Exception] = []
+    if context.readiness in (RunContextReadiness.PREPARING, RunContextReadiness.READY):
+        context._transition_readiness(RunContextReadiness.FINALIZING)
+    context._checkpoint_hook = None
+    for logger in context.loggers:
+        try:
+            logger.finish()
+        except Exception as exc:
+            cleanup_errors.append(exc)
+    if context.readiness is RunContextReadiness.FINALIZING:
+        context._transition_readiness(RunContextReadiness.CLOSED)
+    return cleanup_errors
+
+
+@contextmanager
+def open_run_context(
+    cfg: DictConfig,
+    *,
+    config_path: str | None = None,
+    command: str | None = None,
+    topology: ExecutionTopology | Mapping[str, object] | None = None,
+    artifact_destination: ArtifactDestination | None = None,
+    runtime_callbacks: Sequence[object] = (),
+) -> Iterator[RunContext]:
+    """Prepare a ``READY`` ``RunContext`` and guarantee teardown on exit.
+
+    This is the core-owned scoped preparation API for programmatic callers.
+    When any configured or runtime callback implements ``run_scope``, this
+    uses :class:`_ManagedRunSession` (the same owner used by
+    :func:`run_from_config`). When no managed callbacks are present, it
+    prepares a legacy ``READY`` context and guarantees logger closure and
+    ``FINALIZING -> CLOSED`` readiness transitions on exit.
+    """
+
+    validate_hi_train_config(cfg)
+    _validate_configured_callback_specs(cfg, resolved=False)
+    if artifact_destination is not None:
+        artifact_destination.require_fresh()
+    normalized_topology = (
+        None if topology is None else execution_topology_from_facts(topology)
+    )
+    if _has_managed_callbacks(cfg, runtime_callbacks, resolved=False):
+        session = _ManagedRunSession(
+            cfg,
+            config_path=config_path,
+            command=command,
+            topology=normalized_topology,
+            artifact_destination=artifact_destination,
+            runtime_callbacks=runtime_callbacks,
+        )
+        context = session.enter()
+        primary_exc: BaseException | None = None
+        try:
+            yield context
+        except BaseException as exc:
+            primary_exc = exc
+            raise
+        finally:
+            cleanup_errors = session.close(primary_exc)
+            if primary_exc is not None:
+                _log_cleanup_errors(
+                    cleanup_errors,
+                    context_label="secondary cleanup error during open_run_context exit",
+                )
+            elif cleanup_errors:
+                _log_cleanup_errors(
+                    cleanup_errors[1:],
+                    context_label="additional cleanup error during open_run_context exit",
+                )
+                raise cleanup_errors[0]
+        return
+
+    context = prepare_run_context(
+        cfg,
+        config_path=config_path,
+        command=command,
+        topology=normalized_topology,
+        artifact_destination=artifact_destination,
+        runtime_callbacks=runtime_callbacks,
+    )
+    if artifact_destination is None and runtime_callbacks:
+        runtime_list = list(runtime_callbacks)
+        try:
+            _validate_callbacks(runtime_list)
+        except BaseException:
+            _log_cleanup_errors(
+                _close_unmanaged_context(context),
+                context_label="secondary cleanup error during open_run_context validation rollback",
+            )
+            raise
+        context.callbacks.extend(runtime_list)
+    primary_exc = None
+    try:
+        yield context
+    except BaseException as exc:
+        primary_exc = exc
+        raise
+    finally:
+        cleanup_errors = _close_unmanaged_context(context)
+        if primary_exc is not None:
+            _log_cleanup_errors(
+                cleanup_errors,
+                context_label="secondary cleanup error during open_run_context exit",
+            )
+        elif cleanup_errors:
+            _log_cleanup_errors(
+                cleanup_errors[1:],
+                context_label="additional cleanup error during open_run_context exit",
+            )
+            raise cleanup_errors[0]
+
+
 def prepare_run_context(
     cfg: DictConfig,
     *,
@@ -207,11 +1348,17 @@ def prepare_run_context(
     # `run_from_config` path costs one extra sweep and removes the possibility
     # that the two paths ever disagree about what is admissible.
     validate_hi_train_config(cfg)
+    _validate_configured_callback_specs(cfg, resolved=False)
     # (A) review-r2: a routed destination must be fresh -- absent, or a real,
     # empty, non-symlinked directory -- checked before anything below
     # constructs a directory, a logger, or a callback (R2.1, R2.3).
     if artifact_destination is not None:
         artifact_destination.require_fresh()
+    if _has_managed_callbacks(cfg, runtime_callbacks, resolved=False):
+        raise ManagedLifecycleError(
+            "prepare_run_context() cannot manage callbacks declaring run_scope(); "
+            "use open_run_context() or run_from_config() instead"
+        )
 
     run_clock = resolve_run_clock(cfg)
     source_cfg = _rerunnable_config(
@@ -282,8 +1429,6 @@ def prepare_run_context(
             else None
         ),
     )
-    if bootstrap is not None:
-        bootstrap.run_dir = artifact_manager.run_dir
     # `run.dir` is recorded as the LOGICAL path, never the physical one, even
     # when `artifact_destination` is supplied: several allocations of one
     # scientific cell must record the same constant C. `artifact_manager.run_dir`
@@ -294,7 +1439,15 @@ def prepare_run_context(
     logical_run_dir = artifact_manager.logical_run_dir
     OmegaConf.update(resolved_cfg, "run.dir", str(logical_run_dir), merge=False, force_add=True)
     OmegaConf.resolve(resolved_cfg)
+    _validate_configured_callback_specs(resolved_cfg, resolved=True)
+    if _has_managed_callbacks(resolved_cfg, runtime_callbacks, resolved=True):
+        raise ManagedLifecycleError(
+            "prepare_run_context() cannot manage callbacks declaring run_scope(); "
+            "use open_run_context() or run_from_config() instead"
+        )
     artifact_manager.make_dirs()
+    if bootstrap is not None:
+        bootstrap.run_dir = artifact_manager.run_dir
     _configure_terminal_logging(resolved_cfg)
 
     routed = artifact_destination is not None
@@ -309,6 +1462,13 @@ def prepare_run_context(
     callbacks = _instantiate_sequence(
         OmegaConf.select(resolved_cfg, "callbacks", default=[]), routed=routed
     )
+    for index, callback in enumerate(callbacks):
+        if is_managed_callback(callback):
+            raise ManagedLifecycleError(
+                f"callbacks[{index}]={type(callback).__name__} declares run_scope(); "
+                "prepare_run_context() cannot manage it — use open_run_context() or "
+                "run_from_config() instead"
+            )
     # CONFIGURED validation is unconditional and happens here, before this
     # context (or anything else below) is constructed (review-r3 R3.4,
     # restoring the original pre-S3 legacy ordering): fail-loud interface
@@ -480,8 +1640,41 @@ def run_from_config(
         if restore_request is not None or configured_load_mode(cfg) == "train_resume":
             validate_native_recovery_profile(cfg)
         validate_hi_train_config(cfg)
+        _validate_configured_callback_specs(cfg, resolved=False)
+        if artifact_destination is not None:
+            artifact_destination.require_fresh()
         if topology is not None:
             topology = execution_topology_from_facts(topology)
+        managed = _has_managed_callbacks(cfg, runtime_callbacks, resolved=False)
+    except Exception as exc:
+        return _handle_run_failure(
+            exc,
+            context=None,
+            runner=None,
+            bootstrap=bootstrap,
+            raise_exceptions=raise_exceptions,
+            evidence=None,
+            command=command,
+            config_path=config_path,
+        )
+
+    if managed:
+        return _run_managed_from_config(
+            cfg,
+            config_path=config_path,
+            command=command,
+            raise_exceptions=raise_exceptions,
+            bootstrap=bootstrap,
+            topology=topology,
+            runtime_callbacks=runtime_callbacks,
+            restore_request=restore_request,
+            artifact_destination=artifact_destination,
+            planned_yield_cls=PlannedYield,
+            planned_yield_signal_cls=PlannedYieldSignal,
+            checkpoint_publication_error_cls=CheckpointPublicationError,
+        )
+
+    try:
         if topology is None:
             context = prepare_run_context(
                 cfg,
@@ -606,6 +1799,189 @@ def run_from_config(
                 logger.finish()
 
 
+def _run_managed_from_config(
+    cfg: DictConfig,
+    *,
+    config_path: str | None,
+    command: str | None,
+    raise_exceptions: bool,
+    bootstrap: _BootstrapState,
+    topology: ExecutionTopology | None,
+    runtime_callbacks: Sequence[object],
+    restore_request: Any,
+    artifact_destination: ArtifactDestination | None,
+    planned_yield_cls: type,
+    planned_yield_signal_cls: type,
+    checkpoint_publication_error_cls: type,
+) -> int:
+    """Execute ``run_from_config`` through the shared core-owned ``_ManagedRunSession``."""
+
+    session = _ManagedRunSession(
+        cfg,
+        config_path=config_path,
+        command=command,
+        bootstrap=bootstrap,
+        topology=topology,
+        artifact_destination=artifact_destination,
+        runtime_callbacks=runtime_callbacks,
+    )
+    context: RunContext | None = None
+    runner: Runner | None = None
+    evidence_result: RunResult | None = None
+    primary_exc: BaseException | None = None
+    app_failed = False
+    exit_code: int | None = None
+    cleanup_errors: list[Exception] = []
+    try:
+        context = session.enter()
+        session.checkpoint()
+        _seed_runtime_rngs(context.cfg)
+        session.checkpoint()
+        context.emit(RunStarted())
+        session.checkpoint()
+        runner = _instantiate_runner(context)
+        session.checkpoint()
+        if restore_request is not None:
+            runner = _apply_operational_restore(context.cfg, runner, restore_request)
+            session.checkpoint()
+        for callback in context.callbacks:
+            if isinstance(callback, planned_yield_cls):
+                callback.validate_target(runner)
+        session.checkpoint()
+        result = runner.run(context)
+        session.checkpoint()
+        evidence_result = result if isinstance(result, RunResult) else None
+        status = result.status if isinstance(result, RunResult) else "completed"
+        if isinstance(result, RunResult):
+            write_run_outcome_artifact(context, result)
+        context.emit(
+            RunCompleted(
+                status=status,
+                result=result if isinstance(result, RunResult) else None,
+            )
+        )
+        if isinstance(result, RunResult):
+            context.metadata.status = result.status
+        exit_code = _status_to_exit_code(status)
+        if exit_code == 1:
+            app_failed = True
+    except planned_yield_signal_cls as signal:  # type: ignore[misc]
+        result = signal.result
+        if context is not None:
+            try:
+                context.metadata.status = result.status
+                write_run_outcome_artifact(context, result)
+                context.emit(RunCompleted(status=result.status, result=result))
+            except Exception as exc:
+                primary_exc = exc
+                app_failed = True
+                exit_code = _handle_run_failure(
+                    exc,
+                    context=context,
+                    runner=runner,
+                    bootstrap=bootstrap,
+                    raise_exceptions=False,
+                    evidence=result,
+                    command=command,
+                    config_path=config_path,
+                )
+        if exit_code is None:
+            exit_code = _status_to_exit_code(result.status)
+    except checkpoint_publication_error_cls as exc:  # type: ignore[misc]
+        result = RunResult(
+            status="unknown",
+            error=str(exc.original),
+            next_iteration=exc.next_iteration,
+            completed_updates=exc.completed_updates,
+            target_iterations=exc.target_iterations,
+            exception_type=type(exc.original).__name__,
+            publication_stage=exc.stage,
+        )
+        app_failed = True
+        if context is not None:
+            try:
+                context.metadata.status = result.status
+                write_run_outcome_artifact(context, result)
+                context.emit(RunCompleted(status=result.status, result=result))
+            except Exception as finalization_error:
+                primary_exc = finalization_error
+                exit_code = _handle_run_failure(
+                    finalization_error,
+                    context=context,
+                    runner=runner,
+                    bootstrap=bootstrap,
+                    raise_exceptions=False,
+                    evidence=result,
+                    command=command,
+                    config_path=config_path,
+                )
+        if exit_code is None:
+            exit_code = _status_to_exit_code(result.status)
+    except Exception as exc:
+        primary_exc = exc
+        app_failed = True
+        exit_code = _handle_run_failure(
+            exc,
+            context=context,
+            runner=runner,
+            bootstrap=bootstrap,
+            raise_exceptions=False,
+            evidence=evidence_result,
+            command=command,
+            config_path=config_path,
+            error_context=session.context,
+        )
+    except BaseException as exc:
+        primary_exc = exc
+        raise
+    finally:
+        cleanup_errors = session.close(primary_exc)
+        if primary_exc is not None:
+            _log_cleanup_errors(
+                cleanup_errors,
+                context_label="secondary cleanup error after primary failure",
+            )
+
+    if primary_exc is not None:
+        if raise_exceptions:
+            raise primary_exc
+        return 1 if exit_code is None else exit_code
+
+    if cleanup_errors:
+        if app_failed:
+            _log_cleanup_errors(
+                cleanup_errors,
+                context_label="secondary cleanup error after failed run outcome",
+            )
+            return 1
+        # Application succeeded or yielded, but mandatory cleanup failed:
+        # keep run-outcome.json untouched and report fatal cleanup failure.
+        first_cleanup_exc = cleanup_errors[0]
+        _log_cleanup_errors(
+            cleanup_errors[1:],
+            context_label="additional cleanup error",
+        )
+        _print_fatal(
+            first_cleanup_exc,
+            phase="cleanup",
+            traceback_text="".join(
+                traceback.format_exception(
+                    type(first_cleanup_exc),
+                    first_cleanup_exc,
+                    first_cleanup_exc.__traceback__,
+                )
+            ),
+            run_dir=context.run_dir if context is not None else bootstrap.run_dir,
+            command=command,
+            config_path=config_path,
+        )
+        if raise_exceptions:
+            raise first_cleanup_exc
+        return 1
+
+    return 0 if exit_code is None else exit_code
+
+
 def _handle_run_failure(
     exc: Exception,
     *,
@@ -616,6 +1992,7 @@ def _handle_run_failure(
     evidence: RunResult | None = None,
     command: str | None = None,
     config_path: str | None = None,
+    error_context: RunContext | None = None,
 ) -> int:
     """Apply the one guarded failure finalization path for every new handler."""
 
@@ -623,7 +2000,7 @@ def _handle_run_failure(
     traceback_text = traceback.format_exc()
     exception_type = type(exc).__name__
     exception_message = str(exc)
-    if context is not None:
+    if context is not None and context.readiness is RunContextReadiness.READY:
         context.metadata.status = "failed"
         failed = RunResult(
             status="failed",
@@ -654,8 +2031,13 @@ def _handle_run_failure(
             context, RunFailed(exception_type=exception_type, exception_message=exception_message)
         )
     elif bootstrap.run_dir is not None:
+        # When preparation failed while PREPARING, write error.json using the
+        # admitted context/run_dir without emitting RunFailed into incomplete callbacks.
+        error_target: RunContext | Path = (
+            error_context if error_context is not None else bootstrap.run_dir
+        )
         _write_error_if_possible(
-            bootstrap.run_dir,
+            error_target,
             exc,
             phase=phase,
             traceback_text=traceback_text,
@@ -801,8 +2183,93 @@ def _admit_runtime_sink(sink: object) -> None:
     )
 
 
+def _plan_artifact_sink_routes(
+    sinks: Sequence[object],
+    *,
+    logical_run_dir: Path,
+    destination: ArtifactDestination,
+) -> list[tuple[object, str, str, Path]]:
+    """Validate and plan physical sink bindings without mutating any sink.
+
+    Checks exact-type closed admission for every sink and computes each
+    non-``None`` registered output field's bound physical path via
+    ``destination.bind`` without invoking ``rebind_<field>()`` or
+    ``setattr()``.
+
+    Parameters
+    ----------
+    sinks : sequence of object
+        Callbacks or loggers to admit and plan routes for.
+    logical_run_dir : pathlib.Path
+        Admitted logical run directory baked into sink fields.
+    destination : tpen.artifacts.ArtifactDestination
+        Claimed physical destination root.
+
+    Returns
+    -------
+    list of tuple of (object, str, str, pathlib.Path)
+        Planned ``(sink, qualified_type_name, field_name, physical_path)``
+        entries ready for :func:`_apply_artifact_sink_routes`.
+
+    Raises
+    ------
+    tpen.artifacts.ArtifactRoutingError
+        When a sink's exact type is not a registered routed writer and is not
+        a known sink-free type, or when a field cannot be bound beneath
+        ``destination``.
+    """
+
+    planned: list[tuple[object, str, str, Path]] = []
+    for sink in sinks:
+        qualified = f"{type(sink).__module__}.{type(sink).__qualname__}"
+        fields = _registered_sink_fields(sink)
+        if fields is None:
+            if qualified not in _SINK_FREE_TYPES:
+                raise ArtifactRoutingError(
+                    f"{qualified} is not a registered routed writer or a known "
+                    "sink-free type; refusing to admit it to a routed run before "
+                    "it can write outside the claimed physical destination"
+                )
+            continue
+        for field in fields:
+            current = getattr(sink, field, None)
+            if current is None:
+                continue
+            physical = destination.bind(logical_run_dir, Path(current))
+            planned.append((sink, qualified, field, physical))
+    return planned
+
+
+def _apply_artifact_sink_routes(
+    planned: Sequence[tuple[object, str, str, Path]],
+) -> dict[str, str]:
+    """Apply planned physical sink bindings via ``rebind_<field>`` or ``setattr``.
+
+    Parameters
+    ----------
+    planned : sequence of tuple of (object, str, str, pathlib.Path)
+        Planned bindings produced by :func:`_plan_artifact_sink_routes`.
+
+    Returns
+    -------
+    dict of str to str
+        ``"<qualified type name>.<field>"`` to the physical path it was
+        rebound to.
+    """
+
+    routed: dict[str, str] = {}
+    for sink, qualified, field, physical in planned:
+        rebind = getattr(sink, f"rebind_{field}", None)
+        if callable(rebind):
+            rebind(physical)
+        else:
+            setattr(sink, field, physical)
+        routed[f"{qualified}.{field}"] = str(physical)
+    return routed
+
+
 def _route_artifact_sinks(
-    sinks: list[object],
+    sinks: Sequence[object],
     *,
     logical_run_dir: Path,
     destination: ArtifactDestination,
@@ -846,30 +2313,12 @@ def _route_artifact_sinks(
         not a known sink-free type.
     """
 
-    routed: dict[str, str] = {}
-    for sink in sinks:
-        qualified = f"{type(sink).__module__}.{type(sink).__qualname__}"
-        fields = _registered_sink_fields(sink)
-        if fields is None:
-            if qualified not in _SINK_FREE_TYPES:
-                raise ArtifactRoutingError(
-                    f"{qualified} is not a registered routed writer or a known "
-                    "sink-free type; refusing to admit it to a routed run before "
-                    "it can write outside the claimed physical destination"
-                )
-            continue
-        for field in fields:
-            current = getattr(sink, field, None)
-            if current is None:
-                continue
-            physical = destination.bind(logical_run_dir, Path(current))
-            rebind = getattr(sink, f"rebind_{field}", None)
-            if callable(rebind):
-                rebind(physical)
-            else:
-                setattr(sink, field, physical)
-            routed[f"{qualified}.{field}"] = str(physical)
-    return routed
+    planned = _plan_artifact_sink_routes(
+        sinks,
+        logical_run_dir=logical_run_dir,
+        destination=destination,
+    )
+    return _apply_artifact_sink_routes(planned)
 
 
 def _instantiate_sequence(items: ListConfig | list | tuple | None, *, routed: bool = False) -> list:
@@ -1161,8 +2610,11 @@ def _rerunnable_config(cfg: DictConfig) -> DictConfig:
 
 
 __all__ = [
+    "ManagedLifecycleError",
+    "ResourceOwnershipConflictError",
     "load_config",
     "main",
+    "open_run_context",
     "parse_args",
     "prepare_run_context",
     "run_from_config",

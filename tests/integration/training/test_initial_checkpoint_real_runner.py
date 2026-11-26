@@ -215,13 +215,13 @@ def _run_with_pre_sample_rng_snapshot(
     snapshot: dict[str, object] = {}
     original = MetropolisSampler.collect_samples
 
-    def _recording_collect_samples(self, model, *, reset: bool = False, device=None):
+    def _recording_collect_samples(self, model, *, reset: bool = False, device=None, emitter=None):
         if not snapshot:
             snapshot["torch_rng_state"] = torch.get_rng_state().clone()
             snapshot["python_random_state"] = random.getstate()
             snapshot["numpy_random_state"] = np.random.get_state()
             snapshot["sampler_generator_state"] = self._generator.get_state().clone()
-        return original(self, model, reset=reset, device=device)
+        return original(self, model, reset=reset, device=device, emitter=emitter)
 
     monkeypatch.setattr(MetropolisSampler, "collect_samples", _recording_collect_samples)
     try:

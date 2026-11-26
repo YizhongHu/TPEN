@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -38,6 +40,75 @@ def test_local_render_uses_exact_sha_harness() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert "harness_source=scripts/cannon/executor-harness" in result.stdout
     assert f"harness_source_sha={SHA}" in result.stdout
+
+
+def test_local_render_uses_operator_job_names(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [str(LAUNCHER), "--local-dry-run", SHA],
+        cwd=REPO_ROOT,
+        env={**os.environ, "DEVSUITE_LOCAL_STAGE_DIR": str(tmp_path / "staged")},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    root = (tmp_path / "staged" / "root" / "root.sbatch").read_text(encoding="utf-8")
+    executor = (tmp_path / "staged" / "executor" / "executor.sbatch").read_text(encoding="utf-8")
+    assert f"#SBATCH --job-name=devsuite-root-s1-{SHA[:8]}" in root
+    assert f"#SBATCH --job-name=devsuite-exec-s1-{SHA[:8]}" in executor
+
+
+def test_executor_harness_dry_run_accepts_sha8_job_name(tmp_path: Path) -> None:
+    """The staged executor harness enforces the launcher’s SHA8 job name."""
+
+    harness = tmp_path / "harness"
+    shutil.copytree(REPO_ROOT / "scripts/cannon/executor-harness", harness)
+    (harness / "repo.bundle").write_bytes(b"test bundle")
+    (harness / "mutants.json").write_text('{"mutants": []}\n', encoding="utf-8")
+    node_tmp = tmp_path / "node"
+    for interpreter in (node_tmp / "fake-root/bin/python", node_tmp / "fake-executor/bin/python"):
+        interpreter.parent.mkdir(parents=True, exist_ok=True)
+        interpreter.symlink_to(sys.executable)
+
+    head_sha = "0123456789abcdef" * 2 + "01234567"
+    run_root = node_tmp / "run"
+    harness_env = {
+        **os.environ,
+        "DRY_RUN": "1",
+        "DRY_NODE_TMP": str(node_tmp),
+        "HARNESS_ROOT": str(harness),
+        "HEAD_SHA": head_sha,
+        "JOB_NAME": f"devsuite-exec-s1-{head_sha[:8]}",
+        "LOCAL_FAKE": "1",
+        "LOCAL_FAKE_ROOT": str(tmp_path),
+        "MUTANT_SPEC": str(harness / "mutants.json"),
+        "RUN_ROOT": str(run_root),
+        "SLURM_JOB_ID": "99999999",
+        "SLURM_JOB_PARTITION": "test",
+        "TASK_ROOT": str(harness),
+        "USER": os.environ.get("USER", "test-user"),
+    }
+    result = subprocess.run(
+        [str(harness / "job.sbatch")],
+        cwd=harness,
+        env=harness_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "DRY_RUN=1 PASS" in (run_root / "evidence/driver.log").read_text(encoding="utf-8")
+
+    rejected = subprocess.run(
+        [str(harness / "job.sbatch")],
+        cwd=harness,
+        env={**harness_env, "JOB_NAME": "devsuite-exec-s1"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert rejected.returncode != 0
+    assert "PRECHECK_FAILED JOB_NAME must contain" in rejected.stderr
 
 
 def test_local_render_stages_harness_from_sha_not_any_other_ref(tmp_path: Path) -> None:

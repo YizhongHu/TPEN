@@ -15,6 +15,7 @@ from pathlib import Path
 from experiments.atomistic.stage1.protocol import (
     CHECKPOINT_EVIDENCE_SCHEMA,
     HE_H2_EVAL_CHECKPOINTS,
+    derive_smoke_request,
     manifest_hash,
 )
 
@@ -123,6 +124,7 @@ def _env(tmp_path: Path, *, stubs: dict[str, str] | None = None,
         "PBS_JOBID": "dry-7860235",
         "PBS_QUEUE": "debug",
         "EXPECTED_QUEUE": "debug",
+        "APPROVAL_ID": "test-approval",
         "DRY_EXEC": "1",
         "PYBIN": sys.executable,
         "CHECKOUT_ROOT": str(REPO_ROOT),
@@ -134,6 +136,20 @@ def _env(tmp_path: Path, *, stubs: dict[str, str] | None = None,
     Path(env["UV_CACHE_DIR"]).mkdir()
     env.update(stubs if stubs is not None else _stub_bin(tmp_path))
     env.update(overrides)
+    # The consumer now receives one frozen row object.  Keep older fixture
+    # callers readable by materializing their first row into a test-owned file.
+    manifest = env.pop("PLAN_MANIFEST", None)
+    if manifest is not None:
+        document = json.loads(Path(manifest).read_text(encoding="utf-8"))
+        rows = document.get("rows", [])
+        row = rows[0] if rows else {
+            "kind": "train", "lineage": 0, "row_id": "test-row-0",
+            "source_sha": env["SOURCE_SHA"], "results_root": env["RESULTS_ROOT"],
+            "device": "cuda",
+        }
+        selected = Path(manifest).with_name("selected-row.json")
+        selected.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        env["SELECTED_ROW"] = str(selected)
     env.pop("MODE", None)
     return env
 
@@ -324,18 +340,11 @@ def test_guard_rejects_symlinked_results_root_before_any_write(tmp_path: Path) -
     assert sorted(path.relative_to(outside) for path in outside.rglob("*")) == before_outside
 
 
-def test_dry_exec_runs_three_train_control_rows(tmp_path: Path) -> None:
-    rows = [
-        {
-            "kind": "train",
-            "lineage": lineage,
-            "row_id": f"he-train-{lineage}",
-            "source_sha": SOURCE_SHA,
-            "results_root": EAGLE_ROOT,
-            "device": "cuda",
-        }
-        for lineage in range(3)
-    ]
+def test_dry_exec_runs_one_selected_train_control_row(tmp_path: Path) -> None:
+    rows = [{
+        "kind": "train", "lineage": 1, "row_id": "he-train-1",
+        "source_sha": SOURCE_SHA, "results_root": EAGLE_ROOT, "device": "cuda",
+    }]
     manifest = tmp_path / "phase1.json"
     manifest.write_text(json.dumps({"rows": rows}) + "\n", encoding="utf-8")
     env = _env(
@@ -348,8 +357,36 @@ def test_dry_exec_runs_three_train_control_rows(tmp_path: Path) -> None:
     result = _run("dry-exec", env)
     assert result.returncode == 0, result.stderr
     assert "DRY_EXEC bootstrap=SKIPPED" in result.stdout
-    assert result.stdout.count("DRY_EXEC compute=SKIPPED row=he-train-") == 3
+    assert result.stdout.count("DRY_EXEC compute=SKIPPED row=he-train-1") == 1
     assert "DRY_EXEC complete=PASS" in result.stdout
+
+
+def test_selected_row_rejects_manifest_before_driver(tmp_path: Path) -> None:
+    row = {
+        "kind": "train", "lineage": 0, "row_id": "he-train-0",
+        "source_sha": SOURCE_SHA, "results_root": EAGLE_ROOT, "device": "cuda",
+    }
+    selected = tmp_path / "selected-row.json"
+    selected.write_text(json.dumps({"rows": [row]}) + "\n", encoding="utf-8")
+    result = _run("dry-exec", _env(tmp_path, SELECTED_ROW=str(selected)))
+    assert result.returncode == 2
+    assert "one frozen row object, not a manifest" in result.stderr
+
+
+def test_missing_approval_refuses_before_driver_effect(tmp_path: Path) -> None:
+    row = {
+        "kind": "train", "lineage": 0, "row_id": "he-train-0",
+        "source_sha": SOURCE_SHA, "results_root": EAGLE_ROOT, "device": "cuda",
+    }
+    selected = tmp_path / "selected-row.json"
+    selected.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    result = _run(
+        "dry-exec",
+        _env(tmp_path, SELECTED_ROW=str(selected), APPROVAL_ID=""),
+    )
+    assert result.returncode == 2
+    assert "APPROVAL_ID is required" in result.stderr
+    assert "DRY_EXEC compute=SKIPPED" not in result.stdout
 
 
 def test_dry_exec_rejects_existing_boot_root_without_touching_it(tmp_path: Path) -> None:
@@ -611,7 +648,13 @@ def test_production_rejects_promisor_checkout_before_uv(tmp_path: Path) -> None:
         check=True,
     )
     env = _production_env(tmp_path, checkout, source_sha)
-    env.update({"MODE": "train", "PLAN_MANIFEST": str(tmp_path / "manifest.json")})
+    selected = tmp_path / "selected-row.json"
+    selected.write_text(json.dumps({
+        "kind": "train", "lineage": 0, "row_id": "test-row-0",
+        "source_sha": source_sha, "results_root": env["RESULTS_ROOT"],
+        "device": "cuda",
+    }), encoding="utf-8")
+    env.update({"MODE": "train", "SELECTED_ROW": str(selected)})
     result = _run("train", env)
     assert result.returncode == 2
     assert "promisor remote" in result.stderr
@@ -646,6 +689,55 @@ def _make_exact_fixture(tmp_path: Path) -> tuple[Path, str]:
                    capture_output=True)
     sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
     return checkout, sha
+
+
+def _make_real_main_fixture(tmp_path: Path) -> tuple[Path, str, Path]:
+    """Create an exact checkout whose public runner callback is the only stub."""
+
+    checkout = tmp_path / "real-main-checkout"
+    shutil.copytree(REPO_ROOT / "experiments", checkout / "experiments")
+    shutil.copytree(REPO_ROOT / "tpen", checkout / "tpen")
+    for name in ("pyproject.toml", "uv.lock", ".python-version"):
+        shutil.copy2(REPO_ROOT / name, checkout / name)
+    (checkout / "sitecustomize.py").write_text(
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "\n"
+        "if sys.argv and sys.argv[0].endswith('train.py'):\n"
+        "    import tpen.run as _run\n"
+        "\n"
+        "    def _recording_run(cfg, **kwargs):\n"
+        "        payload = {\n"
+        "            'root': str(cfg.run.root),\n"
+        "            'run_id': str(cfg.run.run_id),\n"
+        "            'max_steps': int(cfg.trainer.max_steps),\n"
+        "            'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),\n"
+        "            'command': kwargs.get('command'),\n"
+        "            'callbacks': [\n"
+        "                {'type': type(callback).__name__,\n"
+        "                 'target_iteration': getattr(callback, 'target_iteration', None),\n"
+        "                 'target_iterations': getattr(callback, 'target_iterations', None)}\n"
+        "                for callback in kwargs.get('runtime_callbacks', ())\n"
+        "            ],\n"
+        "        }\n"
+        "        with Path(os.environ['RUN_CALLBACK_RECORD']).open('a', encoding='utf-8') as handle:\n"
+        "            handle.write(json.dumps(payload, sort_keys=True) + '\\n')\n"
+        "        return 0\n"
+        "\n"
+        "    _run.run_from_config = _recording_run\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init", str(checkout)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(checkout), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(checkout), "config", "user.name", "test"], check=True)
+    subprocess.run(["git", "-C", str(checkout), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(checkout), "commit", "-m", "real-main fixture"], check=True,
+                   capture_output=True)
+    sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+    callback_record = tmp_path / "run-callback.jsonl"
+    return checkout, sha, callback_record
 
 
 def _production_stubs(tmp_path: Path) -> dict[str, str]:
@@ -713,7 +805,8 @@ def _production_env(tmp_path: Path, checkout: Path, source_sha: str) -> dict[str
         "RESULTS_ROOT": str(results_prefix / f"t1-{tmp_path.name}"),
         "TPEN_POLARIS_TEST_RESULTS_PREFIX": str(results_prefix),
         "PBS_JOBID": "", "PBS_ENVIRONMENT": "", "PBS_QUEUE": "debug",
-        "EXPECTED_QUEUE": "debug", "DRY_EXEC": "0", "UV_CACHE_DIR": str(tmp_path / "uv-cache"),
+        "EXPECTED_QUEUE": "debug", "APPROVAL_ID": "test-approval", "DRY_EXEC": "0",
+        "UV_CACHE_DIR": str(tmp_path / "uv-cache"),
         "BOOT_PARENT": str(tmp_path / "boot-parent"),
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
     })
@@ -745,7 +838,10 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
     phase1 = json.loads(plan_path.read_text(encoding="utf-8"))
     assert [row["device"] for row in phase1["rows"] if row["kind"] == "train"] == ["cuda"] * 3
 
-    env.update({"MODE": "train", "PLAN_MANIFEST": str(plan_path), "DRIVER": env["DRIVER"]})
+    selected_train = results_root / "plan" / "selected-train.json"
+    train_row = next(row for row in phase1["rows"] if row["kind"] == "train")
+    selected_train.write_text(json.dumps(train_row), encoding="utf-8")
+    env.update({"MODE": "train", "SELECTED_ROW": str(selected_train), "DRIVER": env["DRIVER"]})
     trained = _run("train", env)
     assert trained.returncode == 0, trained.stderr
     uv_controls = Path(env["UV_RECORD"]).read_text(encoding="utf-8").splitlines()
@@ -764,24 +860,24 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
     )
 
     invalid_manifest = results_root / "plan" / "cpu-row.json"
-    invalid_doc = json.loads(plan_path.read_text(encoding="utf-8"))
-    invalid_doc["rows"][1]["device"] = "cpu"
+    invalid_doc = dict(train_row)
+    invalid_doc["device"] = "cpu"
     invalid_manifest.write_text(json.dumps(invalid_doc), encoding="utf-8")
     before_invalid = Path(env["DRIVER_RECORD"]).read_bytes()
-    env.update({"PLAN_MANIFEST": str(invalid_manifest)})
+    env.update({"SELECTED_ROW": str(invalid_manifest)})
     invalid = _run("train", env)
     assert invalid.returncode == 2
     assert "must have device=cuda" in invalid.stderr
     assert Path(env["DRIVER_RECORD"]).read_bytes() == before_invalid
-    invalid_doc["rows"][1].pop("device")
+    invalid_doc.pop("device")
     invalid_manifest.write_text(json.dumps(invalid_doc), encoding="utf-8")
     invalid_missing = _run("train", env)
     assert invalid_missing.returncode == 2
     assert "must have device=cuda" in invalid_missing.stderr
     assert Path(env["DRIVER_RECORD"]).read_bytes() == before_invalid
-    env["PLAN_MANIFEST"] = str(plan_path)
+    env["SELECTED_ROW"] = str(selected_train)
 
-    env["FAIL_DRIVER"] = "1"
+    env["FAIL_DRIVER"] = "all"
     failing = _run("train", env)
     assert failing.returncode != 0
     env.pop("FAIL_DRIVER")
@@ -811,15 +907,200 @@ def test_production_plan_train_eval_use_real_rows_and_uv_controls(tmp_path: Path
         "--checkpoints", *[str(checkpoint) for checkpoint in HE_H2_EVAL_CHECKPOINTS],
         "--lineage-seeds", "1", "2", "3",
     ], cwd=checkout, check=True)
-    env.update({"MODE": "eval", "PLAN_MANIFEST": str(phase2_path)})
+    selected_eval = results_root / "plan" / "selected-eval.json"
+    eval_row = next(row for row in json.loads(phase2_path.read_text())["rows"] if row["kind"] == "eval")
+    selected_eval.write_text(json.dumps(eval_row), encoding="utf-8")
+    env.update({"MODE": "eval", "SELECTED_ROW": str(selected_eval)})
     evaluated = _run("eval", env)
     assert evaluated.returncode == 0, evaluated.stderr
     env["FAIL_DRIVER"] = "all"
     evaluated_fail = _run("eval", env)
     assert evaluated_fail.returncode != 0
-    assert len(list(results_root.glob("logs/*.status"))) >= 132
+    statuses = sorted(results_root.glob("logs/*.status"))
+    assert len(statuses) == 2
+    status_rows = set()
+    for status in statuses:
+        fields = dict(field.split("=", 1) for field in status.read_text().split())
+        status_rows.add(fields["row_id"])
+        assert status.name.startswith(f"row-{fields['row_id']}-")
+    assert status_rows == {train_row["row_id"], eval_row["row_id"]}
+    assert len(status_rows) == len(statuses)
     assert set(Path(env["TASKSET_RECORD"]).read_text().splitlines()) == {
         "0,1,2,3,4,5,6,7,8,9",
-        "10,11,12,13,14,15,16,17,18,19",
-        "20,21,22,23,24,25,26,27,28,29",
     }
+
+
+def test_production_argv_reaches_real_train_main_for_unbounded_and_smoke_rows(
+    tmp_path: Path,
+) -> None:
+    """Generated row argv reaches train.main with only final execution stubbed."""
+
+    checkout, source_sha, callback_record = _make_real_main_fixture(tmp_path)
+    env = _production_env(tmp_path, checkout, source_sha)
+    env["RUN_CALLBACK_RECORD"] = str(callback_record)
+    env["PYTHONPATH"] = str(checkout)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    results_root = Path(env["RESULTS_ROOT"])
+    results_root.mkdir(parents=True, exist_ok=True)
+    plan_path = results_root / "plan" / "phase1.json"
+    env.update({
+        "MODE": "plan", "PLAN_PHASE": "1", "SYSTEM": "he",
+        "PLAN_OUTPUT": str(plan_path), "LINEAGE_SEEDS": "1:2:3",
+    })
+    planned = _run("plan", env)
+    assert planned.returncode == 0, planned.stderr
+    train_row = next(
+        row for row in json.loads(plan_path.read_text(encoding="utf-8"))["rows"]
+        if row["kind"] == "train" and row["lineage"] == 1
+    )
+    selected = results_root / "plan" / "selected.json"
+    selected.write_text(json.dumps(train_row), encoding="utf-8")
+    env.update({"MODE": "train", "SELECTED_ROW": str(selected)})
+    unbounded = _run("train", env)
+    assert unbounded.returncode == 0, unbounded.stderr
+
+    isolated_root = Path(env["TPEN_POLARIS_TEST_RESULTS_PREFIX"]) / "isolated-smoke"
+    bounded_row = derive_smoke_request(train_row, results_root=str(isolated_root), stop_at=50_000)
+    bounded_selected = isolated_root / "plan" / "selected.json"
+    bounded_selected.parent.mkdir(parents=True)
+    bounded_selected.write_text(json.dumps(bounded_row), encoding="utf-8")
+    env["RESULTS_ROOT"] = str(isolated_root)
+    env["SELECTED_ROW"] = str(bounded_selected)
+    bounded = _run("train", env)
+    assert bounded.returncode == 0, bounded.stderr
+
+    records = [json.loads(line) for line in callback_record.read_text().splitlines()]
+    assert len(records) == 2
+    assert records[0] == {
+        "callbacks": [], "command": "stage1 train", "cuda_visible_devices": "1",
+        "max_steps": train_row["updates"],
+        "root": train_row["results_root"], "run_id": train_row["run_id"],
+    }
+    assert records[1] == {
+        "callbacks": [{"type": "PlannedYield", "target_iteration": 50_000,
+                       "target_iterations": bounded_row["updates"]}],
+        "command": "stage1 train", "cuda_visible_devices": "1",
+        "max_steps": bounded_row["updates"],
+        "root": bounded_row["results_root"], "run_id": bounded_row["run_id"],
+    }
+    logs = list(results_root.glob("logs/*.log")) + list(isolated_root.glob("logs/*.log"))
+    assert len(logs) == 2
+    assert all("POLARIS_COMMAND" in log.read_text(encoding="utf-8") for log in logs)
+    assert all("train.py" in log.read_text(encoding="utf-8") for log in logs)
+
+
+def test_production_rejects_symlinked_plan_before_bootstrap(tmp_path: Path) -> None:
+    """Plan-parent containment must precede snapshot reservation and bootstrap."""
+
+    checkout, source_sha = _make_exact_fixture(tmp_path)
+    env = _production_env(tmp_path, checkout, source_sha)
+    results_root = Path(env["RESULTS_ROOT"])
+    results_root.mkdir(parents=True, exist_ok=True)
+    phase1 = results_root / "plan" / "phase1.json"
+    env.update({
+        "MODE": "plan", "PLAN_PHASE": "1", "SYSTEM": "he",
+        "PLAN_OUTPUT": str(phase1), "LINEAGE_SEEDS": "1:2:3",
+    })
+    planned = _run("plan", env)
+    assert planned.returncode == 0, planned.stderr
+    row = next(row for row in json.loads(phase1.read_text())["rows"] if row["kind"] == "train")
+    selected = results_root / "selected.json"
+    selected.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    outside = tmp_path / "outside-plan"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"preserve-me\0")
+    before_outside = sorted(
+        (path.relative_to(outside).as_posix(), path.read_bytes() if path.is_file() else None)
+        for path in outside.rglob("*")
+    )
+    plan_dir = results_root / "plan"
+    phase1.unlink()
+    plan_dir.rmdir()
+    plan_dir.symlink_to(outside, target_is_directory=True)
+    before_uv = Path(env["UV_RECORD"]).read_bytes()
+    before_driver = Path(env["DRIVER_RECORD"]).read_bytes() if Path(env["DRIVER_RECORD"]).exists() else None
+    before_rows = sorted(path.name for path in (results_root / "logs").glob("row-*"))
+
+    env.update({"MODE": "train", "SELECTED_ROW": str(selected)})
+    refused = _run("train", env)
+    assert refused.returncode == 2
+    assert "RESULTS_PLAN is outside" in refused.stderr
+    assert Path(env["UV_RECORD"]).read_bytes() == before_uv
+    after_driver = Path(env["DRIVER_RECORD"])
+    assert (after_driver.read_bytes() if after_driver.exists() else None) == before_driver
+    assert sorted(path.name for path in (results_root / "logs").glob("row-*")) == before_rows
+    assert sorted(
+        (path.relative_to(outside).as_posix(), path.read_bytes() if path.is_file() else None)
+        for path in outside.rglob("*")
+    ) == before_outside
+
+    plan_dir.unlink()
+    plan_dir.mkdir()
+    admitted = _run("train", env)
+    assert admitted.returncode == 0, admitted.stderr
+    assert Path(env["DRIVER_RECORD"]).read_text(encoding="utf-8").strip()
+
+
+def test_production_refuses_selected_row_replacement_during_bootstrap(tmp_path: Path) -> None:
+    """Bootstrap must not redirect a planner-admitted row before the driver boundary."""
+
+    checkout, source_sha, callback_record = _make_real_main_fixture(tmp_path)
+    env = _production_env(tmp_path, checkout, source_sha)
+    env["RUN_CALLBACK_RECORD"] = str(callback_record)
+    env["PYTHONPATH"] = str(checkout)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    results_root = Path(env["RESULTS_ROOT"])
+    results_root.mkdir(parents=True, exist_ok=True)
+    plan_path = results_root / "plan" / "phase1.json"
+    env.update({
+        "MODE": "plan", "PLAN_PHASE": "1", "SYSTEM": "he",
+        "PLAN_OUTPUT": str(plan_path), "LINEAGE_SEEDS": "1:2:3",
+    })
+    planned = _run("plan", env)
+    assert planned.returncode == 0, planned.stderr
+    admitted = next(
+        row for row in json.loads(plan_path.read_text(encoding="utf-8"))["rows"]
+        if row["kind"] == "train" and row["lineage"] == 1
+    )
+    selected = results_root / "plan" / "selected.json"
+    selected.write_text(json.dumps(admitted), encoding="utf-8")
+    redirected = {
+        **admitted,
+        "results_root": str(Path(env["TPEN_POLARIS_TEST_RESULTS_PREFIX"]) / "redirected"),
+    }
+    uv_path = Path(env["UV_STUB"])
+    uv_path.write_text(
+        uv_path.read_text(encoding="utf-8").replace(
+            "  sync) mkdir -p",
+            f"  sync) printf '%s' {shlex.quote(json.dumps(redirected))} > \"$SELECTED_ROW\"; mkdir -p",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    env.update({"MODE": "train", "SELECTED_ROW": str(selected)})
+    result = _run("train", env)
+    records = (
+        [json.loads(line) for line in callback_record.read_text().splitlines()]
+        if callback_record.exists() else []
+    )
+    assert (
+        (result.returncode != 0 and not records)
+        or (
+            result.returncode == 0
+            and len(records) == 1
+            and records[0]["root"] == admitted["results_root"]
+        )
+    ), (
+        f"redirected callback record={records!r}; stderr={result.stderr}"
+    )
+
+
+def test_polaris_mutant_old_needles_are_present_once() -> None:
+    """Keep the committed mutant registry mechanically aligned with its source."""
+
+    mutants = json.loads((HERE / "polaris-mutants.json").read_text(encoding="utf-8"))
+    source = WRAPPER.read_text(encoding="utf-8")
+    for mutant in mutants:
+        assert source.count(mutant["old"]) == 1, mutant["id"]

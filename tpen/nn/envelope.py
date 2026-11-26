@@ -31,6 +31,10 @@ from tpen.data.batch import ElectronBatch
 from tpen.dependencies import require_torch, require_torch_functional, require_torch_nn
 from tpen.nn.factor import _check_factor_tensor as _check_envelope_tensor
 from tpen.nn.factor import _inverse_softplus
+from tpen.nn.structured_curvature import (
+    active_structured_curvature_session,
+    softplus_derivative,
+)
 
 torch = require_torch(feature="TPEN envelope modules")
 nn = require_torch_nn(feature="TPEN envelope modules")
@@ -71,10 +75,18 @@ class Envelope(nn.Module):
 
         flat_batch = batch.flatten_samples()
         if not self.enabled:
+            session = active_structured_curvature_session()
+            if session is not None:
+                self._record_disabled_structured_curvature(flat_batch, session)
             return torch.zeros(flat_batch.batch_size, device=flat_batch.device, dtype=flat_batch.dtype)
         output = self.envelope_value(flat_batch)
         _check_envelope_tensor(output, flat_batch, name=type(self).__name__)
         return output
+
+    def _record_disabled_structured_curvature(self, flat_batch: ElectronBatch, session) -> None:
+        """Record zero local scores for disabled envelopes owning trainable parameters."""
+
+        del flat_batch, session
 
     def envelope_value(self, batch: ElectronBatch) -> torch.Tensor:
         """Return the enabled envelope contribution for a flattened batch.
@@ -108,6 +120,12 @@ class AdditiveEnvelope(Envelope):
     def __init__(self, envelopes: Iterable[nn.Module] = (), enabled: bool = True) -> None:
         super().__init__(enabled=enabled)
         self.envelopes = nn.ModuleList(tuple(envelopes))
+
+    def _record_disabled_structured_curvature(self, flat_batch: ElectronBatch, session) -> None:
+        for envelope in self.envelopes:
+            hook = getattr(envelope, "_record_disabled_structured_curvature", None)
+            if callable(hook):
+                hook(flat_batch, session)
 
     def envelope_value(self, batch: ElectronBatch) -> torch.Tensor:
         """Return the sum of all component envelope contributions."""
@@ -168,11 +186,34 @@ class GaussianConfinement(Envelope):
             return F.softplus(self.raw_coefficient)
         return self._coefficient
 
+    def _record_disabled_structured_curvature(self, flat_batch: ElectronBatch, session) -> None:
+        if self.trainable and self.raw_coefficient.requires_grad:
+            zeros = torch.zeros(
+                (flat_batch.batch_size, 1),
+                device=self.raw_coefficient.device,
+                dtype=session.solve_dtype,
+            )
+            session.record_local_dense_scores(
+                parameters=(self.raw_coefficient,),
+                scores=zeros,
+                label=f"{type(self).__name__}.raw_coefficient",
+            )
+
     def envelope_value(self, batch: ElectronBatch) -> torch.Tensor:
         """Return the smooth harmonic envelope contribution."""
 
         radius_squared = batch.positions.square().sum(dim=(1, 2))
         output = -self.coefficient.to(device=batch.device, dtype=batch.dtype) * radius_squared
+        session = active_structured_curvature_session()
+        if session is not None and self.trainable and self.raw_coefficient.requires_grad:
+            raw = self.raw_coefficient.detach().to(device=batch.device, dtype=session.solve_dtype)
+            r2 = radius_squared.detach().to(device=batch.device, dtype=session.solve_dtype)
+            score = (-softplus_derivative(raw) * r2).unsqueeze(1)
+            session.record_local_dense_scores(
+                parameters=(self.raw_coefficient,),
+                scores=score,
+                label=f"{type(self).__name__}.raw_coefficient",
+            )
         assert output.shape == (batch.batch_size,)
         return output
 

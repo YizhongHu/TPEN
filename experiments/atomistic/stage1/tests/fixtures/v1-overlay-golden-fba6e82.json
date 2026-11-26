@@ -1,0 +1,62 @@
+{
+  "origin_dev": "fba6e82ab1091846fbe5ea7c36707ebfafd3c66a",
+  "protocol": [1, 2, 1, 2, 3, 4, 2, 2],
+  "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "results_root": "/n/netscratch/kozinsky_lab/Lab/rhu/v1-golden",
+  "plans": {
+    "he-h2": {
+      "systems": ["he", "h2"],
+      "overlay": "configs/overlays/diagnostics-v1.yaml",
+      "overlay_sha256": "bf7a78f5b3721f0486053301a0ed8165de58366bdd6ea4748e05b1f742161096",
+      "config_sha256": {
+        "he": "3d7f4393fbd48e41d07d0fd74e4d7ff97b333baf6a86bdab6694479cf3b45bf7",
+        "h2": "880b8a8660ef30e207c2316357a29de12a2fc8b4e9acbfb879557fb04be513d3"
+      },
+      "callback_sha256": "8b4c12d6b8665e37ce6b07d806eb4d5a3222783175822459a1b8267beee7ee3d",
+      "callback_bytes_length": 1982,
+      "phase1_row_ids": [
+        "64ab378e3465b621286feaa8ab9a30346dcf8c7f53de0c7db7ccdecc344a06ee",
+        "309ba3050eaf252c89127817419d52bd4cb966be0fad5536ad62388a2449deed",
+        "c0f9675275fb0d91512b615b21b4bb2d3696431f5afe1c7e1188c9cf2688a779",
+        "7fa73f0362f35d52c0473f32496c607d67d6475d57c7052b72e3cb0b2b4f3f62",
+        "af1242175473be4740811ed18f615e0a0702bc32ec35d7a9fee8ec1562f91638",
+        "1abc8976ec4a592ea21dcd0e4fd7679bb47f49aa4231f48772aab1507902fcb6",
+        "440e451273a18cd45207c634309b4a9b50d8dc14e7adbc57e8a4cb3662539134",
+        "098dc27ef2658dfdd97e4b4bb574379ff0d590f4f6c2aa3e3f34554a114f4e70"
+      ],
+      "phase1_rows_sha256": "b3ff2a4c4820d3d719e3b86ad22a2d6d9e3562a8c1d1b64fbabc8c589740b265",
+      "phase1_rows_bytes_length": 5375,
+      "phase1_manifest_hash": "b3ff2a4c4820d3d719e3b86ad22a2d6d9e3562a8c1d1b64fbabc8c589740b265",
+      "combined_rows_sha256": "326b53075569f44f6b3fc2b6bf9db1580f2a8454676dc39915e20a479f8972f6",
+      "combined_rows_bytes_length": 36308,
+      "combined_manifest_hash": "326b53075569f44f6b3fc2b6bf9db1580f2a8454676dc39915e20a479f8972f6"
+    },
+    "hooke-qho2e": {
+      "systems": ["hooke1", "qho2e"],
+      "overlay": "configs/overlays/hooke-diagnostics-v1.yaml",
+      "overlay_sha256": "3ead9b0eb4fa19bb033eb345191542200af0c3ff3aefbfe5392379378ef96016",
+      "config_sha256": {
+        "hooke1": "8cbc76d077a5a98c8c83cbd519ccb0105a8d7c31916f7801293c867e0316175f",
+        "qho2e": "b62e62ae14e3d0388c86a662228aa458d7ce539cf8c7e3236557e4f62be8593e"
+      },
+      "callback_sha256": "ee8ce73df581b71c10ad599a9f034778fc86cfb026493b7a93475de63939989b",
+      "callback_bytes_length": 2099,
+      "phase1_row_ids": [
+        "2d384d9b251aa250ed117d8a0c5e453ef60df6724fc9e51f4a9114e56167c8c7",
+        "15c0f3d45538a77f7ab6bd7c45b253938624b19189a642fd1ea80ba8ea50c8e3",
+        "d39c344a4712e6f75395215616562ab09e861a93182789a1c17654ea7bc9f826",
+        "cd5e39245df9520ac17cb299d4dcf083d1e938f1dee293791d84a65b6cabdf1d",
+        "4b4e4aa97e835f9ea99784c4baad811a79976c20e1b684dbcaac1393f04b5927",
+        "044af9c9249dc3fc16f3427b0371a9450f1b944e2c884c908453dc4ba3dac961",
+        "9a7c502d23e3ee76b700c8af85df941c4e7dfcb8bd4225495ff5e3cbcaeb56c7",
+        "b9de835f71c372c1379a0664d9ed61891ee29ff07033801a55fbe0d3b32b59cb"
+      ],
+      "phase1_rows_sha256": "6eabb9ca07245770d04e4d7fc78932c31a4a251e8a4c066e9018643f71b4e416",
+      "phase1_rows_bytes_length": 5690,
+      "phase1_manifest_hash": "6eabb9ca07245770d04e4d7fc78932c31a4a251e8a4c066e9018643f71b4e416",
+      "combined_rows_sha256": "48da05df169265661d50449b49203a175864d3ac7015c84ed3943efefd75263c",
+      "combined_rows_bytes_length": 37713,
+      "combined_manifest_hash": "48da05df169265661d50449b49203a175864d3ac7015c84ed3943efefd75263c"
+    }
+  }
+}

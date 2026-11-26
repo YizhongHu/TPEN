@@ -71,12 +71,17 @@ from tpen_executor.lifecycle.controller import (
     MemberLaunchResult,
     run_group_controller,
 )
+from tpen_executor.dispatch.transport import LeafRequest
+from tpen_executor.environments import PreparedPythonEnvironment
+from tpen_executor.lifecycle.local_executor import LeafCompletionContext
+from tpen_executor.tasks import ConfiguredRun
 from tpen_executor.recovery import (
     MappingCoreAdmissionPort,
     MemberRecoveryInputV2,
     reconcile_group,
 )
 from tpen_executor.results import OutcomeReceipt, StartReceipt
+from test_s3_transport_wire import _synthetic_result
 
 if any(name == "tpen" or name.startswith("tpen.") for name in sys.modules):
     raise RuntimeError("executor child started with tpen already imported")
@@ -174,12 +179,29 @@ def _controller(payload):
     )
 
     class RecordingExecutor:
-        def __init__(self):
-            self.calls = []
+        capacity = 1
 
-        def launch(self, fence, invocation):
-            self.calls.append(fence.task_id)
-            return MemberLaunchResult(True)
+        def __init__(self):
+            self.submits = []
+            self.collects = []
+
+        def submit(self, fence, invocation):
+            self.submits.append(fence.task_id)
+            configured_run = ConfiguredRun(invocation.task_id, "/tmp/fake.yaml", ())
+            environment = PreparedPythonEnvironment(sys.executable)
+            request = LeafRequest.for_attempt(
+                fence, configured, configured_run, environment,
+            )
+            (Path(fence.output_dir) / "core").mkdir(parents=True, exist_ok=True)
+            context = LeafCompletionContext(
+                _synthetic_result(request), request, configured_run, environment,
+            )
+            return MemberLaunchResult(True), context
+
+        def collect(self, handle, timeout):
+            assert 0 < timeout <= 6
+            self.collects.append(handle.request.task_id)
+            return handle
 
     configured = ConfiguredAllocation(lease.allocation_id, lease.backend_job_id, {})
     facts = GroupControllerFactsV1(
@@ -203,8 +225,10 @@ def _controller(payload):
     )
     _emit({
         "member_outcomes": dict(result.member_outcomes),
-        "launch_calls": list(executor.calls),
-        "launch_count": len(executor.calls),
+        "submit_calls": list(executor.submits),
+        "submit_count": len(executor.submits),
+        "collect_calls": list(executor.collects),
+        "collect_count": len(executor.collects),
     })
 
 
@@ -237,7 +261,7 @@ MUTANTS = (
     (
         "controller-ignores-port",
         "executor/src/tpen_executor/lifecycle/controller.py",
-        "verdict = admission_port.admit(item)",
+        "verdict = None if _is_recovery_member(item) else admission_port.admit(admitted_item)",
         "verdict = item.core_verdict",
         "test_controller_unknown_mapping_overrides_prefilled_successor",
     ),
@@ -431,10 +455,12 @@ def test_real_controller_launches_only_the_admitted_successor(tmp_path: Path) ->
     )
     assert result["member_outcomes"] == {
         "ambiguous": "parked",
-        "successor": "launched",
+        "successor": "collected",
     }
-    assert result["launch_calls"] == ["successor"]
-    assert result["launch_count"] == 1
+    assert result["submit_calls"] == ["successor"]
+    assert result["submit_count"] == 1
+    assert result["collect_calls"] == ["successor"]
+    assert result["collect_count"] == 1
 
 
 def test_controller_unknown_mapping_overrides_prefilled_successor(tmp_path: Path) -> None:
@@ -466,8 +492,10 @@ def test_controller_unknown_mapping_overrides_prefilled_successor(tmp_path: Path
         {"mappings": mappings, "root": str(tmp_path / "controller-child")},
     )
     assert result["member_outcomes"] == {"ambiguous": "parked", "successor": "parked"}
-    assert result["launch_calls"] == []
-    assert result["launch_count"] == 0
+    assert result["submit_calls"] == []
+    assert result["submit_count"] == 0
+    assert result["collect_calls"] == []
+    assert result["collect_count"] == 0
 
 
 def test_mutant_rows_are_well_formed_and_have_named_killers() -> None:

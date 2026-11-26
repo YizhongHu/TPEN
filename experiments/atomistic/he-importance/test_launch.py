@@ -128,6 +128,7 @@ def test_launch_populates_topology_under_designated_key(tmp_path: Path) -> None:
     assert plan.cell.manifest["topology"]["device"] == "cuda:0"
     assert "global_rank" not in plan.cell.manifest["scientific_identity"]
     assert "global_rank" not in plan.cell.manifest["payload"]
+    assert plan.cell.availability == cell.availability
     assert launch.launch_train(cell, _topology(), runner=lambda _: 0) == 0
 
 
@@ -1135,11 +1136,20 @@ def test_exit_code_rejects_non_result_non_int() -> None:
 
 def test_source_shape_guard_has_positive_and_negative_arms(tmp_path: Path) -> None:
     cell = _cell(tmp_path)
-    admitted, admitted_hash = launch._source_cell(cell)
+    admitted, admitted_hash, admitted_availability = launch._source_cell(cell)
     assert admitted is cell
     assert admitted_hash == cell.content_hash
+    assert admitted_availability == cell.availability
     with pytest.raises(launch.LaunchValidationError, match="MaterializedCell"):
         launch._source_cell(object())
+
+    incomplete = SimpleNamespace(
+        manifest=cell.manifest,
+        content_hash=cell.content_hash,
+        output_path=cell.output_path,
+    )
+    with pytest.raises(launch.LaunchValidationError, match="availability must be a mapping"):
+        launch._source_cell(incomplete)
 
 
 class _FlipMapping(dict[str, object]):
@@ -1623,6 +1633,7 @@ def test_prepare_train_launch_owns_manifest_before_downstream_reads(
         content_hash: str
         output_path: Path
         seed_streams: Mapping[str, int]
+        availability: Mapping[str, object]
         clean: Mapping[str, object]
         dirty: Mapping[str, object]
         reads: list[int]
@@ -1660,6 +1671,7 @@ def test_prepare_train_launch_owns_manifest_before_downstream_reads(
             content_hash="unused-field",
             output_path=clean_cell.output_path,
             seed_streams=clean_cell.seed_streams,
+            availability=clean_cell.availability,
             clean=clean_manifest,
             dirty=dirty_manifest,
             reads=[0],
@@ -1713,6 +1725,8 @@ def test_content_hash_is_exact_and_binds_all_public_launch_entries(
                     return LyingHash()
                 return object.__getattribute__(self, "_source").content_hash
             if name in {"manifest", "output_path", "seed_streams"}:
+                return getattr(object.__getattribute__(self, "_source"), name)
+            if name == "availability":
                 return getattr(object.__getattribute__(self, "_source"), name)
             return object.__getattribute__(self, name)
 

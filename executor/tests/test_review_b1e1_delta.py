@@ -69,10 +69,10 @@ def test_interrupted_wait_keeps_live_leaf_handle_and_slot(
         executor.close()
 
 
-def test_leaf_timeout_during_bounded_wait_is_terminal_on_next_collect(
+def test_leaf_timeout_during_bounded_wait_consumes_handle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A newly completed leaf TimeoutError is retained, then consumed once."""
+    """A delivered leaf TimeoutError consumes its handle and slot immediately."""
     group = _group(("one", "two"))
     allocation = _allocation(1)
     leaf_error = FutureTimeoutError("terminal leaf timeout")
@@ -98,15 +98,10 @@ def test_leaf_timeout_during_bounded_wait_is_terminal_on_next_collect(
             executor.collect(handle, timeout=1)
         assert first.value is leaf_error
         assert future.done()
-        with pytest.raises(local.CapacityExceededError):
-            executor.submit(*_invocation(group, allocation, "two", tmp_path))
-        with pytest.raises(FutureTimeoutError) as second:
-            executor.collect(handle, timeout=1)
-        assert second.value is leaf_error
-        with pytest.raises(local.UnknownLaunchHandleError):
-            executor.collect(handle)
         _, next_handle = executor.submit(*_invocation(group, allocation, "two", tmp_path))
         assert next_handle.slot_id == handle.slot_id
+        with pytest.raises(local.UnknownLaunchHandleError):
+            executor.collect(handle)
         with pytest.raises(FutureTimeoutError):
             executor.collect(next_handle, timeout=1)
     finally:

@@ -9,6 +9,7 @@ from types import MappingProxyType
 from typing import Any, ClassVar, Mapping
 
 from ._codec import canonical_bytes, decode_json
+from .configured_program import AttemptDelta, ConfiguredProgram
 from .environments import PreparedPythonEnvironment
 from ._records import frozen_record
 from .workers import LaunchPurpose, SubprocessWorker
@@ -105,6 +106,61 @@ RUN_SHIM = (
     "    raise SystemExit(2)\n"
     "from tpen.run import main\n"
     "raise SystemExit(main(sys.argv[1:]))"
+)
+
+# Keep RUN_SHIM byte-identical for legacy TPENCommand callers.  The configured
+# leaf gets the same placement/observation prelude plus a closed script-path
+# handoff, derived once here rather than maintaining a second copy.
+_CONFIGURED_SHIM_IMPORT = "from tpen.run import main\n"
+# The configured prelude has the same run-root contract as RUN_SHIM, but its
+# root comes from the typed delta rather than a legacy run.root override.
+_CONFIGURED_SHIM_ROOTS = (
+    "if '--tpen-executor-script' in sys.argv[1:]:\n"
+    "    try:\n"
+    "        _delta_index = sys.argv.index('--attempt-delta')\n"
+    "        _delta = json.loads(sys.argv[_delta_index + 1])\n"
+    "        _attempt_core = _delta['attempt_core_dir']\n"
+    "        _attempt_leaf = os.path.dirname(_attempt_core)\n"
+    "        _placement_path = os.environ['TPEN_PLACEMENT_OUTPUT']\n"
+    "        _placement_leaf = os.path.dirname(_placement_path)\n"
+    "        if (type(_attempt_core) is not str or not os.path.isabs(_attempt_core)\n"
+    "                or os.path.normpath(_attempt_core) != _attempt_core\n"
+    "                or os.path.basename(_attempt_core) != 'core'\n"
+    "                or not os.path.isabs(_placement_path)\n"
+    "                or os.path.normpath(_placement_path) != _placement_path\n"
+    "                or _placement_leaf != _attempt_leaf):\n"
+    "            raise ValueError('configured attempt output does not bind placement output')\n"
+    "        run_roots = [_attempt_leaf]\n"
+    "    except (KeyError, IndexError, TypeError, ValueError):\n"
+    "        print('configured placement refused: invalid attempt delta/output binding', file=sys.stderr)\n"
+    "        raise SystemExit(2)\n"
+    "else:\n"
+    "    run_roots = [arg.split('=', 1)[1] for arg in sys.argv[1:] if arg.startswith('run.root=')]\n"
+)
+# C2.2 binds configured attempt output through one canonical delta and never
+# silently strips arbitrary run.* values from a configured command.
+_CONFIGURED_SHIM_BRANCH = (
+    "if '--tpen-executor-script' in sys.argv[1:]:\n"
+    "    import runpy\n"
+    "    script_index = sys.argv.index('--tpen-executor-script')\n"
+    "    script = sys.argv[script_index + 1]\n"
+    "    script_args = sys.argv[script_index + 2:]\n"
+    "    output_index = script_args.index('--output-root') if '--output-root' in script_args else -1\n"
+    "    declared_output = script_args[output_index + 1] if output_index >= 0 and output_index + 1 < len(script_args) else None\n"
+    "    attempt_outputs = [arg.split('=', 1)[1] for arg in script_args if arg.startswith('run.root=')]\n"
+    "    if any(path != declared_output for path in attempt_outputs) or any(arg.startswith('run.layout=') or arg.startswith('run.run_id=') for arg in script_args):\n"
+    "        print('configured program output binding is not supported until C2.2', file=sys.stderr)\n"
+    "        raise SystemExit(2)\n"
+    "    sys.argv = [script, *script_args]\n"
+    "    runpy.run_path(script, run_name='__main__')\n"
+    "    raise SystemExit(0)\n"
+)
+CONFIGURED_RUN_SHIM = RUN_SHIM.replace(
+    "run_roots = [arg.split('=', 1)[1] for arg in sys.argv[1:] if arg.startswith('run.root=')]\n",
+    _CONFIGURED_SHIM_ROOTS,
+).replace(
+    _CONFIGURED_SHIM_IMPORT,
+    _CONFIGURED_SHIM_BRANCH + _CONFIGURED_SHIM_IMPORT,
 )
 class EvidenceUnavailable(RuntimeError):
     """Raised when a child cannot provide trustworthy public evidence."""
@@ -381,6 +437,34 @@ class TPENCommand:
 
 
 @frozen_record
+class ConfiguredProgramCommand:
+    """Command for a validated :class:`ConfiguredProgram` leaf entry."""
+
+    program: Any
+    attempt_delta: AttemptDelta | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.program) is not ConfiguredProgram:
+            raise TypeError("program must be ConfiguredProgram")
+        if self.attempt_delta is not None and type(self.attempt_delta) is not AttemptDelta:
+            raise TypeError("attempt_delta must be AttemptDelta or None")
+
+    @property
+    def args(self) -> tuple[str, ...]:
+        """Return generated argv for the allowlisted script."""
+
+        args = (
+            "-c", CONFIGURED_RUN_SHIM,
+            "--tpen-executor-entry", self.program.entrypoint,
+            "--tpen-executor-script", self.program.script_path,
+            *self.program.argv(),
+        )
+        if self.attempt_delta is not None:
+            args += ("--attempt-delta", self.attempt_delta.canonical_bytes.decode("utf-8"))
+        return args
+
+
+@frozen_record
 class TPENEvidence:
     """Read public run evidence through a child inspection process.
 
@@ -473,4 +557,4 @@ class TPENEvidence:
         return CoreRunEvidence.from_mapping(decoded)
 
 
-__all__ = ["CHILD_CONTEXT_KEYS_ENV", "CHILD_OBSERVATION_FILENAME", "CONTEXT_ENV_KEY_PATTERN", "CoreRunEvidence", "EvidenceUnavailable", "RUN_EVIDENCE_SCHEMA", "RUN_EVIDENCE_SCHEMA_V2", "RUN_EVIDENCE_SCHEMA_V3", "TPENCommand", "TPENEvidence"]
+__all__ = ["CHILD_CONTEXT_KEYS_ENV", "CHILD_OBSERVATION_FILENAME", "CONFIGURED_RUN_SHIM", "CONTEXT_ENV_KEY_PATTERN", "ConfiguredProgramCommand", "CoreRunEvidence", "EvidenceUnavailable", "RUN_EVIDENCE_SCHEMA", "RUN_EVIDENCE_SCHEMA_V2", "RUN_EVIDENCE_SCHEMA_V3", "RUN_SHIM", "TPENCommand", "TPENEvidence"]

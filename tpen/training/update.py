@@ -1544,10 +1544,53 @@ class VMCUpdateMethod(Generic[InputT], ABC):
     def load_method_state_dict(self, state: Mapping[str, Any]) -> None:
         """Restore persistent method state, empty by default."""
 
+        self.validate_method_state_dict(state)
+        if state:
+            raise ValueError("stateless VMCUpdateMethod cannot load non-empty method state")
+
+    def validate_method_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Validate persistent method state without mutating live state."""
+
         if not isinstance(state, Mapping):
             raise TypeError("VMCUpdateMethod method state must be a mapping")
         if state:
             raise ValueError("stateless VMCUpdateMethod cannot load non-empty method state")
+
+    def method_tensor_state_dict(self) -> Mapping[str, Any] | None:
+        """Return optional binary tensor state persisted to ``method_state.pt``.
+
+        Returns ``None`` by default so methods without large curvature tensors
+        omit ``method_state.pt`` and keep existing checkpoints unchanged.
+        """
+
+        return None
+
+    def load_method_tensor_state_dict(self, state: Mapping[str, Any] | None) -> None:
+        """Restore optional binary tensor state from ``method_state.pt``."""
+
+        if state is not None:
+            raise ValueError(
+                f"{type(self).__name__} does not accept binary method tensor state"
+            )
+
+    def validate_method_tensor_state_dict(
+        self,
+        state: Mapping[str, Any] | None,
+        *,
+        method_state: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Validate optional binary tensor state without mutating live method state.
+
+        Methods that persist binary tensor payloads in ``method_state.pt``
+        override this hook so checkpoint restore can verify JSON metadata and
+        binary tensors together before mutating any live object.
+        """
+
+        del method_state
+        if state is not None:
+            raise ValueError(
+                f"{type(self).__name__} does not accept binary method tensor state"
+            )
 
     def forward_request(self) -> Any | None:
         """Return the typed forward request this method's input requires.
@@ -1577,6 +1620,46 @@ class VMCUpdateMethod(Generic[InputT], ABC):
         """
 
         return None
+
+    def step_request(self) -> Any:
+        """Return the typed step request this update method consumes.
+
+        Returns
+        -------
+        VMCStepRequest
+            Defaults by adapting :meth:`forward_request`: ``None`` maps to
+            :class:`~tpen.training.step_requests.AutogradStepRequest`, and a
+            :class:`~tpen.nn.forward.ParameterScoreRequest` maps to
+            :class:`~tpen.training.step_requests.ParameterScoreStepRequest`.
+            Methods consuming step-level artifacts (such as Hamiltonian
+            tangents) override this hook directly and leave
+            :meth:`forward_request` returning ``None``.
+
+        Raises
+        ------
+        TypeError
+            If :meth:`forward_request` returns an unsupported non-``None``
+            request object.
+        """
+
+        # Local imports keep the module dependency graph strictly acyclic:
+        # `tpen.training.step_requests` imports `VMCStepData` and input types
+        # from this module at top level.
+        from tpen.nn.forward import ParameterScoreRequest
+        from tpen.training.step_requests import (
+            AutogradStepRequest,
+            ParameterScoreStepRequest,
+        )
+
+        legacy_request = self.forward_request()
+        if legacy_request is None:
+            return AutogradStepRequest()
+        if isinstance(legacy_request, ParameterScoreRequest):
+            return ParameterScoreStepRequest(forward_request=legacy_request)
+        raise TypeError(
+            "VMCUpdateMethod.forward_request must return ParameterScoreRequest or None, "
+            f"got {type(legacy_request).__name__}"
+        )
 
     @property
     def last_result(self) -> VMCUpdateResult | None:
@@ -1654,12 +1737,9 @@ class VMCUpdateMethod(Generic[InputT], ABC):
             n_parameters = int(layout.total_numel)
             n_parameter_tensors = len(layout.slots)
             layout_fingerprint = parameter_layout_fingerprint(layout)
-        request = self.forward_request()
-        forward_request = (
-            "value"
-            if request is None
-            else f"{type(request).__module__}.{type(request).__qualname__}"
-        )
+        from tpen.training.step_requests import resolve_step_request
+
+        forward_request = resolve_step_request(self).describe_label()
         return UpdateMethodDescription(
             method_class=f"{type(self).__module__}.{type(self).__qualname__}",
             carrier_class=carrier_class,
@@ -1679,6 +1759,20 @@ class VMCUpdateMethod(Generic[InputT], ABC):
         """
 
         return "method_defined"
+
+    def declared_nonfinite_local_energy_policy(self) -> str | None:
+        """Return the non-finite local-energy policy this method enforces, or ``None``.
+
+        Score-based methods (such as SR and SPRING) consume local energies
+        directly and override this hook to expose their resolved
+        ``nonfinite_local_energy_policy``.
+        :class:`~tpen.training.trainer.VMCTrainer` checks this declaration
+        before sampling or checkpoint restore so the trainer and update method
+        cannot silently run under disagreeing estimators. Methods that rely
+        solely on the trainer's objective return ``None``.
+        """
+
+        return None
 
     def set_step_scopes(
         self,

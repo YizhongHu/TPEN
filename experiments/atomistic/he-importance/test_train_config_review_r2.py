@@ -151,7 +151,7 @@ def test_o_contexts_are_not_routed_into_the_ab_branch(tmp_path: Path) -> None:
     cells = stage_coordinate.materialize_intended_configurations(
         tmp_path / "materialized", availability=optimizer_grid.roster_availability(), stages=("Q",)
     )
-    adam_cells = [c for c in cells if c.manifest["scientific_identity"]["optimizer_cell"]["status"] == "available"]
+    adam_cells = [c for c in cells if c.availability["status"] == "available"]
     raw = next(c for c in adam_cells if c.manifest["scientific_identity"]["context"]["name"] == "O-raw")
     composite = next(c for c in adam_cells if c.manifest["scientific_identity"]["context"]["name"] == "O-composite")
     assert train_config.resolve_train_config(raw).model is not None

@@ -45,7 +45,7 @@ from .._codec import canonical_bytes, digest
 from ..results import RunManifest
 from ..contracts import ReadyGroup
 from ..lifecycle.attached import AttachedAllocation
-from ..runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
+from ..runners import ConfiguredProgramCommand, CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
 from ..tasks import ConfiguredRun
 from ..workers import ProcessOutcome, SubprocessWorker
 from .contract import (
@@ -380,7 +380,7 @@ def _require_standard_worker(materialized: Any) -> None:
     expected = {
         "environment": PreparedPythonEnvironment,
         "process": SubprocessWorker,
-        "runner": TPENCommand,
+        "runner": (TPENCommand, ConfiguredProgramCommand),
         "evidence": TPENEvidence,
     }
     for name, kind in expected.items():
@@ -388,9 +388,11 @@ def _require_standard_worker(materialized: Any) -> None:
             value = materialized[name]
         except (KeyError, TypeError) as error:
             raise UnsupportedTransportError(f"remote worker program lacks its {name} slot") from error
-        if type(value) is not kind:
+        valid = type(value) in kind if isinstance(kind, tuple) else type(value) is kind
+        if not valid:
+            expected_name = " or ".join(item.__name__ for item in kind) if isinstance(kind, tuple) else kind.__name__
             raise UnsupportedTransportError(
-                f"remote worker program {name} must be exactly {kind.__name__}, got {type(value).__name__}"
+                f"remote worker program {name} must be exactly {expected_name}, got {type(value).__name__}"
             )
     if materialized["environment"].setup is not None and type(materialized["environment"].setup) is not SourceScript:
         raise UnsupportedTransportError("remote worker program setup must be exactly SourceScript")
@@ -1183,7 +1185,13 @@ class ParslDispatcher(DispatcherContract):
                 if not callable(getattr(evidence, "read", None)):
                     raise TypeError("materialized worker evidence reader lacks read()")
                 output_dir, _core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = _member_paths(fence)
-                args = (*configured.command().args, f"run.root={output_dir}", "run.layout=flat", "run.run_id=core")
+                args = configured.command_for_attempt(
+                    output_dir,
+                    root=fence.root,
+                    group_digest=group.identity,
+                    task_id=member.task_id,
+                    attempt_id=fence.attempt_id.value,
+                ).args
                 if self.transport is not None:
                     future, handle = self._submit_leaf(
                         materialized, environment, lifecycle, fence, configured, timeout, binding,

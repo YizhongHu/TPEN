@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from omegaconf import DictConfig, OmegaConf
@@ -15,12 +16,59 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from tpen.run import run_from_config
-from experiments.atomistic.stage1.protocol import resolve_config_path, validate_gateway_binding
+from experiments.atomistic.stage1.protocol import (
+    is_hooke2_act50_profile,
+    compose_model_profile,
+    resolve_config_path,
+    row_config_values,
+    validate_gateway_binding,
+)
 from experiments.toolkit.run_paths import resolve_run_dir
 
 
 class EvalRunRefusal(ValueError):
     """Raised when a Stage-1 eval would reuse an existing result directory."""
+
+
+def _bind_output_identity(cfg: DictConfig, row: Mapping[str, object]) -> None:
+    """Bind the row-owned eval output identity before config resolution."""
+
+    for path, key in (
+        ("run.root", "results_root"),
+        ("experiment.name", "experiment_name"),
+        ("experiment.sector", "sector"),
+        ("run.run_id", "run_id"),
+        ("run.layout", "layout"),
+    ):
+        value = row.get(key, "nested" if key == "layout" else None)
+        if value is None:
+            raise ValueError(f"manifest row is missing {key}")
+        OmegaConf.update(cfg, path, value, merge=False)
+
+
+def build_eval_config(
+    row: Mapping[str, object], *, config_path: str | Path | None = None,
+    overrides: Sequence[str] | None = None,
+) -> DictConfig:
+    """Compose one eval row with its output slot filled from the row."""
+
+    selected_config = resolve_config_path(config_path or str(row.get("config", "")))
+    if not selected_config.is_file():
+        raise FileNotFoundError(f"Stage-1 config path does not exist: {selected_config}")
+    from tpen.run import load_config
+
+    cfg = load_config(str(selected_config))
+    compose_model_profile(cfg, str(row.get("science_profile")) if row.get("science_profile") else None)
+    _bind_output_identity(cfg, row)
+    cfg = OmegaConf.merge(cfg, OmegaConf.create(row_config_values(row)))
+    # Kept solely for the pinned pre-LR-2 restart adapter; the real eval
+    # gateway has no repeated override channel.
+    if overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(overrides)))
+    # Keep the row authoritative for artifact placement if a compatibility
+    # caller supplied a contradictory run.root override.
+    _bind_output_identity(cfg, row)
+    return cfg
 
 
 def _config_run_dir(cfg: DictConfig) -> Path:
@@ -49,25 +97,41 @@ def _refuse_existing_eval_run(cfg: DictConfig) -> None:
         )
 
 
+def _refuse_cross_variant_checkpoint(cfg: DictConfig, row: Mapping[str, object]) -> None:
+    """Refuse a checkpoint from another ACT50 model before creating eval output."""
+
+    profile = row.get("science_profile")
+    if not is_hooke2_act50_profile(profile):
+        return
+    checkpoint_dir = Path(str(row["checkpoint_dir"]))
+    manifest_path = checkpoint_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise EvalRunRefusal(
+            f"ACT50 checkpoint compatibility manifest is missing: {manifest_path}"
+        )
+    # Keep checkpoint internals lazy for the outside-checkout driver probe.
+    from experiments.toolkit.checkpoint_compat import (
+        checkpoint_model_config_hash,
+        config_model_config_hash,
+    )
+    expected = config_model_config_hash(cfg)
+    actual = checkpoint_model_config_hash(checkpoint_dir)
+    if expected is None or actual is None or expected != actual:
+        raise EvalRunRefusal(
+            "ACT50 refuses a checkpoint from a different model profile before eval writes"
+        )
+
+
 def main() -> int:
     """Run evaluation through the public gateway with model-only restore."""
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
-    parser.add_argument("overrides", nargs="*")
     parser.add_argument("--binding", required=True)
-    parser.add_argument("--kind", choices=("eval",), required=True)
-    parser.add_argument("--expected-checkpoint-sha256", required=True)
     args = parser.parse_args()
-    config_path = resolve_config_path(args.config)
-    validate_gateway_binding(
-        binding=args.binding, config=str(config_path), overrides=args.overrides, kind=args.kind,
-        expected_checkpoint_sha256=args.expected_checkpoint_sha256,
-    )
-    if not config_path.is_file():
-        raise FileNotFoundError(f"Stage-1 config path does not exist: {config_path}")
-    from tpen.run import load_config
-    cfg = load_config(str(config_path), args.overrides)
+    row = validate_gateway_binding(binding=args.binding, expected_kinds={"eval"})
+    cfg = build_eval_config(row)
+    config_path = resolve_config_path(str(row["config"]))
+    _refuse_cross_variant_checkpoint(cfg, row)
     _refuse_existing_eval_run(cfg)
     # The config/launcher supplies the strict model-only restore policy; this
     # driver does not import checkpoint internals or silently alter identity.

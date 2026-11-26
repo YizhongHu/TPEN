@@ -293,8 +293,8 @@ MUTANTS = (
     # No mutant row for successor.lineage_id: group identity binds the member lineage before this check.
     ("crossed-successor-attempt", "storage.py", "or successor.allocation_attempt != allocation_attempt", "or False", "test_admitted_successor_crossed_allocation_attempt_refuses_with_genuine_admission"),
     # No mutant row for predecessor-current: _validate_fence repeats the pointer check immediately after it.
-    ("partial-start-recovery", "storage.py", "if current not in {successor.attempt_id.value, admission.predecessor_attempt_id.value}:", "if current != successor.attempt_id.value:", "test_admitted_start_recovers_after_durable_boundary"),
+    ("partial-start-recovery", "storage.py", "if current not in {successor.attempt_id.value, current_attempt_id}:", "if current != successor.attempt_id.value:", "test_admitted_start_recovers_after_durable_boundary"),
     ("lease-facts-consistency", "results.py", "if previous is not None and previous != binding.allocation_attempt:", "if False:", "test_conflicting_lease_facts_park_before_publication"),
-    ("drop-recovery-predecessor-fence", "storage.py", "if current == admission.predecessor_attempt_id.value:\n                    self._validate_fence(predecessor_fence, task_dir)", "if False:\n                    pass", "test_partial_start_rechecks_predecessor_before_writes"),
+    ("drop-recovery-predecessor-fence", "storage.py", "if current == current_attempt_id:\n                    self._validate_fence(current_fence or predecessor_fence, task_dir)", "if False:\n                    pass", "test_partial_start_rechecks_predecessor_before_writes"),
     ("drop-recovery-directory-fsync", "storage.py", "_fsync_directory(output_dir)", "pass", "test_recovery_syncs_visible_receipts_before_pointer_commit"),
 )

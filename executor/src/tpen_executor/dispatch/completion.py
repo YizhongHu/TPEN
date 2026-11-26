@@ -43,6 +43,7 @@ def complete_leaf_result(
     binding: Any = None,
     inspection_error: BaseException | None = None,
     placement_error: PlacementRefusal | None = None,
+    accept_segment: bool = True,
 ) -> Exception | None:
     """Publish one validated local or remote leaf result.
 
@@ -84,6 +85,7 @@ def complete_leaf_result(
         inspection_error,
         error=error,
         child_refusal=child_refusal,
+        accept_segment=accept_segment,
     )
 
 
