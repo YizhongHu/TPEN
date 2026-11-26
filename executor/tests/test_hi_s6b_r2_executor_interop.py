@@ -5,14 +5,12 @@ from __future__ import annotations
 import json
 import importlib
 from pathlib import Path
-import sys
 
 import pytest
 
 from tpen_executor.configured_program import AttemptDelta, ConfiguredLoad
 from tpen_executor._codec import canonical_bytes
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "executor" / "tests"))
 from test_b1r2c_full_horizon import _publish, _single_fixture  # noqa: E402
 
 
@@ -49,6 +47,16 @@ def _record(core: Path, *, final: str = "attempt-S", chain: list[dict[str, str]]
 def _write_completion(core: Path, value: dict[str, object]) -> None:
     core.mkdir(parents=True)
     (core.parent.parent / "full-horizon-completion.json").write_bytes(canonical_bytes(value))
+
+
+def test_executor_begin_creates_attempt_but_not_core_source_contract() -> None:
+    storage = Path(__file__).parents[1] / "src" / "tpen_executor" / "storage.py"
+    transport = Path(__file__).parents[1] / "src" / "tpen_executor" / "dispatch" / "transport.py"
+    storage_source = storage.read_text(encoding="utf-8")
+    transport_source = transport.read_text(encoding="utf-8")
+    assert "_mkdir_new(output_dir)" in storage_source
+    assert "_mkdir_new(os.path.join(output_dir, \"core\"))" not in storage_source
+    assert "existing core directory or log means the request is a replay" in transport_source
 
 
 def test_real_executor_publication_reaches_hi_reader_and_science_mismatch_is_false(tmp_path: Path) -> None:
