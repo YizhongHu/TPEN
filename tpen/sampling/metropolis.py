@@ -74,6 +74,9 @@ class MetropolisSampler(nn.Module):
     n_up, n_down : int or None, optional
         Spin partition. When both are given, walkers are initialized with the
         corresponding ``+1``/``-1`` spin labels.
+    system : object or None, optional
+        Configured physical-system descriptor carried into sampler-produced
+        batches as immutable construction metadata.
     nuclear_positions : torch.Tensor or None, optional
         Fixed nuclear coordinates with shape ``[n_nuclei, spatial_dim]``.
     nuclear_charges : torch.Tensor or None, optional
@@ -97,6 +100,7 @@ class MetropolisSampler(nn.Module):
         spatial_dim: int = 3,
         n_up: int | None = None,
         n_down: int | None = None,
+        system: object | None = None,
         nuclear_positions: torch.Tensor | None = None,
         nuclear_charges: torch.Tensor | None = None,
         initial_scale: float = 1.0,
@@ -114,6 +118,7 @@ class MetropolisSampler(nn.Module):
         self.spatial_dim = spatial_dim
         self.n_up = n_up
         self.n_down = n_down
+        self.system = system
         self.dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
         fixed_positions, fixed_charges = _fixed_nuclear_context(
             nuclear_positions,
@@ -201,6 +206,7 @@ class MetropolisSampler(nn.Module):
             positions=positions,
             spins=spins,
             atomic_configuration=_configuration_on(self.atomic_configuration, self._generator_device, self.dtype),
+            aux={"system": self.system} if self.system is not None else {},
         )
 
     def reset(self, n_walkers: int | None = None, device=None) -> Walkers:

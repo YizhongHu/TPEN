@@ -8,6 +8,8 @@ from tpen.nn.readout.positive_singlet import (
     HookeSingletPositiveReadout,
     HookeSingletReadout,
     PositiveSingletReadout,
+    validate_hooke_singlet_batch,
+    validate_hooke_singlet_system,
 )
 
 __all__ = [
@@ -15,4 +17,6 @@ __all__ = [
     "HookeSingletReadout",
     "PfaffianReadout",
     "PositiveSingletReadout",
+    "validate_hooke_singlet_batch",
+    "validate_hooke_singlet_system",
 ]

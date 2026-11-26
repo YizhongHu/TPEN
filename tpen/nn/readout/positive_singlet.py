@@ -5,16 +5,49 @@ from __future__ import annotations
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
 from tpen.data.real import Feature
 from tpen.dependencies import require_torch, require_torch_nn
+from tpen.physics.operators import ELECTRON_ELECTRON_COULOMB, HARMONIC_TRAP, KINETIC_ENERGY
+from tpen.physics.system import SystemDescriptor
 
 torch = require_torch(feature="positive singlet readout")
 nn = require_torch_nn(feature="positive singlet readout")
 
 
-def validate_hooke_singlet_batch(batch: ElectronBatch, *, system_name: str) -> None:
+_HOOKE_SINGLET_OPERATORS = frozenset(
+    {KINETIC_ENERGY, HARMONIC_TRAP, ELECTRON_ELECTRON_COULOMB}
+)
+
+
+def validate_hooke_singlet_system(system: object) -> SystemDescriptor:
+    """Validate and return the exact physical sector for the positive ansatz."""
+
+    if not isinstance(system, SystemDescriptor):
+        raise ValueError("positive singlet ansatz requires a configured SystemDescriptor")
+    particle = system.particle
+    if (
+        particle.n_electrons != 2
+        or particle.n_spin_up != 1
+        or particle.n_spin_down != 1
+    ):
+        raise ValueError("positive singlet ansatz requires the Hooke 2e singlet sector")
+    operators = frozenset(term.operator_id for term in system.terms)
+    if len(system.terms) != 3 or operators != _HOOKE_SINGLET_OPERATORS:
+        raise ValueError(
+            "positive singlet ansatz requires exactly kinetic + harmonic_trap + electron_electron terms"
+        )
+    return system
+
+
+def validate_hooke_singlet_batch(
+    batch: ElectronBatch,
+    *,
+    system_descriptor: SystemDescriptor | None,
+) -> None:
     """Validate the narrow sector admitted by the positive-singlet ansatz."""
 
-    if system_name.lower() not in {"hooke_pair", "hooke-2e", "hooke2", "hooke_2e"}:
-        raise ValueError("positive singlet ansatz is only defined for system_name='hooke_pair'")
+    declared = system_descriptor if system_descriptor is not None else batch.system
+    validate_hooke_singlet_system(declared)
+    if batch.system is not None:
+        validate_hooke_singlet_system(batch.system)
     if batch.n_electrons != 2:
         raise ValueError("positive singlet ansatz requires exactly two electrons")
     if batch.spins is None:
@@ -22,44 +55,26 @@ def validate_hooke_singlet_batch(batch: ElectronBatch, *, system_name: str) -> N
     spins = batch.spins.reshape(-1, 2)
     if not torch.all((spins[:, 0] + spins[:, 1]) == 0):
         raise ValueError("positive singlet ansatz requires one up and one down electron")
-    declared = batch.system if batch.system is not None else batch.aux.get("system_name")
-    if declared is None:
-        return
-    label = declared if isinstance(declared, str) else getattr(declared, "name", None)
-    if label is not None and "hooke" not in str(label).lower():
-        raise ValueError("positive singlet ansatz refuses non-Hooke systems")
-    particle = getattr(declared, "particle", None)
-    if label is None and hasattr(declared, "terms"):
-        operators = " ".join(
-            f"{getattr(getattr(term, 'operator_id', None), 'namespace', '')}."
-            f"{getattr(getattr(term, 'operator_id', None), 'name', '')}"
-            for term in declared.terms
-        ).lower()
-        if "harmonic" not in operators and "hooke" not in operators:
-            raise ValueError("positive singlet ansatz refuses non-Hooke systems")
-    if particle is not None and (
-        getattr(particle, "n_electrons", None) != 2
-        or getattr(particle, "n_spin_up", None) != 1
-        or getattr(particle, "n_spin_down", None) != 1
-    ):
-        raise ValueError("positive singlet ansatz requires the Hooke 2e singlet sector")
-
-
 class PositiveSingletReadout(nn.Module):
     """Unsigned, exchange-symmetric scalar log-amplitude readout."""
 
-    def __init__(self, *, channels: int, system_name: str = "hooke_pair") -> None:
+    def __init__(
+        self,
+        *,
+        channels: int,
+        system_descriptor: SystemDescriptor | None = None,
+    ) -> None:
         super().__init__()
         self.channels = _positive_int(channels, "channels")
-        self.system_name = str(system_name)
-        if self.system_name.lower() not in {"hooke_pair", "hooke-2e", "hooke2", "hooke_2e"}:
-            raise ValueError("positive singlet ansatz is only defined for system_name='hooke_pair'")
+        self.system_descriptor = (
+            None if system_descriptor is None else validate_hooke_singlet_system(system_descriptor)
+        )
         self.scalar_readout = nn.Linear(self.channels, 1)
 
     def forward(self, features: Feature, batch: ElectronBatch) -> WavefunctionOutput:
         """Return ``log|A| = g_theta`` and a strictly positive sign."""
 
-        validate_hooke_singlet_batch(batch, system_name=self.system_name)
+        validate_hooke_singlet_batch(batch, system_descriptor=self.system_descriptor)
         if 2 not in features:
             raise KeyError("PositiveSingletReadout requires an order-2 Feature block")
         pair = features.blocks[2]
@@ -92,5 +107,6 @@ __all__ = [
     "HookeSingletPositiveReadout",
     "HookeSingletReadout",
     "PositiveSingletReadout",
+    "validate_hooke_singlet_system",
     "validate_hooke_singlet_batch",
 ]

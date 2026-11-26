@@ -34,6 +34,8 @@ from tpen.data.permutation import Permutation
 from tpen.dependencies import require_torch, require_torch_functional, require_torch_nn
 from tpen.nn.envelope import Envelope
 from tpen.nn.factor import LogAmplitudeFactor, _inverse_softplus
+from tpen.nn.readout.positive_singlet import validate_hooke_singlet_batch, validate_hooke_singlet_system
+from tpen.physics.system import SystemDescriptor
 from tpen.nn.structured_curvature import (
     active_structured_curvature_session,
     softplus_derivative,
@@ -1204,31 +1206,25 @@ class HookeSingletTailFactor(LogAmplitudeFactor):
     autodiff kinetic path see the exact derivatives.
     """
 
-    def __init__(self, *, kappa: float, system_name: str = "hooke_pair") -> None:
+    def __init__(
+        self,
+        *,
+        kappa: float,
+        system_descriptor: SystemDescriptor | None = None,
+    ) -> None:
         super().__init__()
         value = float(kappa)
         if not torch.isfinite(torch.tensor(value)) or value <= 0.0:
             raise ValueError(f"kappa must be finite and strictly positive, got {kappa!r}")
         self.kappa = value
-        self.system_name = str(system_name)
-        if self.system_name.lower() not in {"hooke_pair", "hooke-2e", "hooke2", "hooke_2e"}:
-            raise ValueError("HookeSingletTailFactor is only defined for system_name='hooke_pair'")
+        self.system_descriptor = (
+            None if system_descriptor is None else validate_hooke_singlet_system(system_descriptor)
+        )
 
     def factor_value(self, batch: ElectronBatch) -> torch.Tensor:
         """Return the tail contribution in analytic log space."""
 
-        if batch.n_electrons != 2:
-            raise ValueError("HookeSingletTailFactor requires exactly two electrons")
-        if batch.spins is None:
-            raise ValueError("HookeSingletTailFactor requires explicit opposite-spin labels")
-        spins = batch.spins.reshape(-1, 2)
-        if not torch.all((spins[:, 0] + spins[:, 1]) == 0):
-            raise ValueError("HookeSingletTailFactor requires one up and one down electron")
-        declared = batch.system if batch.system is not None else batch.aux.get("system_name")
-        if declared is not None:
-            label = declared if isinstance(declared, str) else getattr(declared, "name", None)
-            if label is not None and "hooke" not in str(label).lower():
-                raise ValueError("HookeSingletTailFactor refuses non-Hooke systems")
+        validate_hooke_singlet_batch(batch, system_descriptor=self.system_descriptor)
         displacement = batch.positions[:, 0] - batch.positions[:, 1]
         r12_squared = displacement.square().sum(dim=-1)
         return 0.5 * torch.log1p(batch.positions.new_tensor(self.kappa) * r12_squared)

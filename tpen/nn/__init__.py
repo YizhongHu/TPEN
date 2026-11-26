@@ -74,6 +74,8 @@ from tpen.nn.readout import (
     HookeSingletPositiveReadout,
     HookeSingletReadout,
     PositiveSingletReadout,
+    validate_hooke_singlet_batch,
+    validate_hooke_singlet_system,
 )
 from tpen.nn.tpen_layer import TPENLayer
 from tpen.nn.tpen_wave_function import TPENWaveFunction
@@ -125,6 +127,8 @@ __all__ = [
     "ParameterScoreProvider",
     "PathAggregation",
     "PositiveSingletReadout",
+    "validate_hooke_singlet_batch",
+    "validate_hooke_singlet_system",
     "RawCoordinateBasis",
     "RMSNorm",
     "ReplaceUpdater",
