@@ -28,17 +28,13 @@ class CanonicalGroupBinding:
     allocation_lineage: str
     deployment_lineage: str
     controller_lineage: str
-    controller_generation: int
-    controller_nonce: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "group_identity", sha256_text(self.group_identity, "group_identity"))
         object.__setattr__(self, "execution_bundle_digest", sha256_text(self.execution_bundle_digest, "execution_bundle_digest"))
         object.__setattr__(self, "controller_lineage", sha256_text(self.controller_lineage, "controller_lineage"))
-        for name in ("allocation_lineage", "deployment_lineage", "controller_nonce"):
+        for name in ("allocation_lineage", "deployment_lineage"):
             object.__setattr__(self, name, text(getattr(self, name), name))
-        if type(self.controller_generation) is not int or self.controller_generation < 1:
-            raise TypeError("controller_generation must be a positive integer")
 
     @property
     def group_digest(self) -> str:
@@ -53,8 +49,6 @@ class CanonicalGroupBinding:
             "allocation_lineage": self.allocation_lineage,
             "deployment_lineage": self.deployment_lineage,
             "controller_lineage": self.controller_lineage,
-            "controller_generation": self.controller_generation,
-            "controller_nonce": self.controller_nonce,
         }
 
     def encode(self) -> bytes:
@@ -63,10 +57,10 @@ class CanonicalGroupBinding:
     @classmethod
     def from_mapping(cls, data: Any) -> "CanonicalGroupBinding":
         fields(data, {"schema", "group_identity", "execution_bundle_digest", "allocation_lineage",
-                      "deployment_lineage", "controller_lineage", "controller_generation", "controller_nonce"},
+                      "deployment_lineage", "controller_lineage"},
                cls.schema, cls.__name__)
         return cls(data["group_identity"], data["execution_bundle_digest"], data["allocation_lineage"],
-                   data["deployment_lineage"], data["controller_lineage"], data["controller_generation"], data["controller_nonce"])
+                   data["deployment_lineage"], data["controller_lineage"])
 
     @classmethod
     def decode(cls, data: bytes | str | dict[str, Any]) -> "CanonicalGroupBinding":
@@ -82,6 +76,7 @@ class InitialGroupStoreRequest:
     allocation_lineage: str
     deployment_lineage: str
     controller: ControllerGenerationV1
+    controller_lineage_anchor: str | None = None
 
 
 @frozen_record
@@ -93,6 +88,7 @@ class ReentryGroupStoreRequest:
     allocation_lineage: str
     deployment_lineage: str
     controller: ControllerGenerationV1
+    controller_lineage_anchor: str | None = None
 
 
 @frozen_record
@@ -106,22 +102,25 @@ class GroupStoreResult:
 _BINDING_PATH = "group-binding.json"
 
 
-def _binding(request: InitialGroupStoreRequest | ReentryGroupStoreRequest) -> CanonicalGroupBinding:
+def _binding(request: InitialGroupStoreRequest | ReentryGroupStoreRequest, *, anchor: str | None = None) -> CanonicalGroupBinding:
     controller = request.controller
     if not isinstance(request.group, ReadyGroupV2) or not isinstance(controller, ControllerGenerationV1):
         raise TypeError("group and controller must be typed records")
     if controller.group_id != request.group.group_id:
         raise GroupStoreRefused("controller group mismatch")
-    return CanonicalGroupBinding(
-        request.group.identity, request.execution_bundle_digest, request.allocation_lineage,
-        request.deployment_lineage, digest(controller.to_dict()), controller.generation, controller.claimant_nonce,
-    )
+    if anchor is None:
+        anchor = request.controller_lineage_anchor or digest(controller.to_dict())
+    return CanonicalGroupBinding(request.group.identity, request.execution_bundle_digest,
+                                 request.allocation_lineage, request.deployment_lineage, anchor)
 
 
 def initial(request: InitialGroupStoreRequest, root: str | os.PathLike[str]) -> GroupStoreResult:
     """Create one store and publish its binding exactly once."""
     if not isinstance(request, InitialGroupStoreRequest):
         raise TypeError("initial requires InitialGroupStoreRequest")
+    if (request.controller_lineage_anchor is not None
+            and request.controller_lineage_anchor != digest(request.controller.to_dict())):
+        raise GroupStoreRefused("initial controller lineage anchor is foreign")
     binding = _binding(request)
     root_path = os.path.abspath(os.path.normpath(os.fspath(root)))
     try:
@@ -133,7 +132,9 @@ def initial(request: InitialGroupStoreRequest, root: str | os.PathLike[str]) -> 
     store = DirectoryStore(root_path)
     try:
         store.acquire_controller_generation(request.group, request.controller)
-        store.require_current_controller(request.group, binding.controller_generation, binding.controller_nonce)
+        if request.controller.generation != 1:
+            raise GroupStoreRefused("initial controller must be generation one")
+        store.require_current_controller(request.group, request.controller.generation, request.controller.claimant_nonce)
         store.write_once(_BINDING_PATH, binding.encode())
     except (ControllerGenerationRejected, FenceRejected, OSError, ValueError, TypeError) as error:
         raise GroupStoreRefused(str(error)) from error
@@ -144,16 +145,21 @@ def reentry(request: ReentryGroupStoreRequest, root: str | os.PathLike[str]) -> 
     """Strictly reconstruct and reopen a store without replacing any record."""
     if not isinstance(request, ReentryGroupStoreRequest):
         raise TypeError("reentry requires ReentryGroupStoreRequest")
-    expected = _binding(request)
     try:
         store = DirectoryStore(root)
         # The manifest is receipt-derived and rejects malformed, foreign,
         # truncated, or symlinked components before admission proceeds.
         store.manifest(request.group)
         stored = store.read_canonical(_BINDING_PATH, CanonicalGroupBinding.decode)
+        expected = _binding(request, anchor=request.controller_lineage_anchor or stored.controller_lineage)
         if stored != expected or stored.encode() != Path(os.path.join(store.root, _BINDING_PATH)).read_bytes():
             raise GroupStoreRefused("group binding mismatch or non-canonical bytes")
-        store.require_current_controller(request.group, expected.controller_generation, expected.controller_nonce)
+        # The immutable binding carries only the stable lineage anchor.  The
+        # successor's allocation/controller incarnation is admitted by the
+        # existing monotonic generation fence and is never compared bytewise
+        # with the creation-time controller.
+        acquired = store.acquire_controller_generation(request.group, request.controller)
+        store.require_current_controller(request.group, acquired.generation, acquired.claimant_nonce)
         invocation_dir = os.path.join(store.root, "invocations", uuid4().hex)
         os.makedirs(os.path.dirname(invocation_dir), exist_ok=True)
         os.mkdir(invocation_dir)

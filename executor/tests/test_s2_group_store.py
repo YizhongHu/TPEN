@@ -1,7 +1,6 @@
 """S2-L2 canonical group-store creation and reopen contract."""
 
 import hashlib
-import inspect
 import subprocess
 import sys
 from pathlib import Path
@@ -17,11 +16,14 @@ from tpen_executor.lifecycle.group_store import (
 
 
 MUTANTS = [
-    {"id": "root-exists", "target": "group_store.py", "old": "os.mkdir(root_path)", "new": "pass", "killer": "test_initial_existing_root_refuses"},
-    {"id": "binding-canonical", "target": "group_store.py", "old": "stored.encode() != Path(os.path.join(store.root, _BINDING_PATH)).read_bytes()", "new": "False", "killer": "test_noncanonical_binding_refuses"},
-    {"id": "binding-exact", "target": "group_store.py", "old": "stored != expected", "new": "False", "killer": "test_foreign_binding_refuses"},
-    {"id": "authority-current", "target": "group_store.py", "old": "store.require_current_controller(request.group, expected.controller_generation, expected.controller_nonce)", "new": "pass", "killer": "test_stale_controller_refuses"},
-    {"id": "fresh-invocation", "target": "group_store.py", "old": "uuid4().hex", "new": "'fixed'", "killer": "test_reentry_gets_fresh_invocation_location"},
+    {"id": "root-exists", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "os.mkdir(root_path)", "new": "pass", "killer": "test_initial_existing_root_refuses"},
+    {"id": "manifest-strict", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "store.manifest(request.group)", "new": "None", "killer": "test_manifest_reconstruction_refuses_foreign_component"},
+    {"id": "binding-missing", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "stored = store.read_canonical(_BINDING_PATH, CanonicalGroupBinding.decode)", "new": "stored = None", "killer": "test_missing_binding_refuses"},
+    {"id": "binding-regular", "target": "executor/src/tpen_executor/storage.py", "old": "_require_regular(path, \"canonical receipt\")", "new": "pass", "killer": "test_symlink_binding_refuses"},
+    {"id": "binding-canonical", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "stored.encode() != Path(os.path.join(store.root, _BINDING_PATH)).read_bytes()", "new": "False", "killer": "test_noncanonical_binding_refuses"},
+    {"id": "binding-exact", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "stored != expected", "new": "False", "killer": "test_foreign_binding_refuses"},
+    {"id": "authority-fence", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "acquired = store.acquire_controller_generation(request.group, request.controller)", "new": "acquired = request.controller", "killer": "test_stale_controller_refuses"},
+    {"id": "fresh-invocation", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "uuid4().hex", "new": "'fixed'", "killer": "test_reentry_gets_fresh_invocation_location"},
 ]
 
 
@@ -54,6 +56,16 @@ def test_initial_create_and_identical_reentry(tmp_path):
     assert reopened.invocation_result_path != reentry(_request(group, controller), root).invocation_result_path
 
 
+def test_successor_generation_reentry_and_retry(tmp_path):
+    group, controller = _fixture(); root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, "c" * 64, "allocation-lineage", "deployment-lineage", controller), root)
+    successor = ControllerGenerationV1(group.group_id, 2, AllocationId("allocation-2"), BackendJobId("job-2"), "b" * 64, "nonce-2", controller.record_digest)
+    first = reentry(_request(group, successor), root)
+    retry = reentry(_request(group, successor), root)
+    assert first.binding == retry.binding
+    assert first.invocation_result_path != retry.invocation_result_path
+
+
 def test_reentry_gets_fresh_invocation_location(tmp_path):
     group, controller = _fixture(); root = tmp_path / "store"
     initial(InitialGroupStoreRequest(group, "c" * 64, "allocation-lineage", "deployment-lineage", controller), root)
@@ -67,6 +79,29 @@ def test_initial_existing_root_refuses(tmp_path):
     before = _tree(tmp_path)
     with pytest.raises(GroupStoreRefused):
         initial(InitialGroupStoreRequest(group, "c" * 64, "allocation-lineage", "deployment-lineage", controller), root)
+    assert _tree(tmp_path) == before
+
+
+def test_manifest_reconstruction_refuses_foreign_component(tmp_path):
+    group, controller = _fixture(); root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, "c" * 64, "allocation-lineage", "deployment-lineage", controller), root)
+    (root / "groups" / group.identity / "foreign").mkdir(parents=True)
+    before = _tree(tmp_path)
+    with pytest.raises(GroupStoreRefused): reentry(_request(group, controller), root)
+    assert _tree(tmp_path) == before
+
+
+def test_initial_partial_failure_is_left_for_later_refusal(tmp_path, monkeypatch):
+    group, controller = _fixture(); root = tmp_path / "store"
+    from tpen_executor.storage import DirectoryStore
+    monkeypatch.setattr(DirectoryStore, "acquire_controller_generation", lambda *args: (_ for _ in ()).throw(OSError("injected")))
+    with pytest.raises(GroupStoreRefused):
+        initial(InitialGroupStoreRequest(group, "c" * 64, "allocation-lineage", "deployment-lineage", controller), root)
+    before = _tree(tmp_path)
+    with pytest.raises(GroupStoreRefused):
+        initial(InitialGroupStoreRequest(group, "c" * 64, "allocation-lineage", "deployment-lineage", controller), root)
+    with pytest.raises(GroupStoreRefused):
+        reentry(_request(group, controller), root)
     assert _tree(tmp_path) == before
 
 
@@ -93,6 +128,22 @@ def test_binding_faults_do_not_change_bytes(tmp_path, name, change):
     assert _tree(tmp_path) == before
 
 
+def test_missing_binding_refuses(tmp_path):
+    group, controller = _fixture(); root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, "c" * 64, "allocation-lineage", "deployment-lineage", controller), root)
+    (root / "group-binding.json").unlink(); before = _tree(tmp_path)
+    with pytest.raises(GroupStoreRefused): reentry(_request(group, controller), root)
+    assert _tree(tmp_path) == before
+
+
+def test_symlink_binding_refuses(tmp_path):
+    group, controller = _fixture(); root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, "c" * 64, "allocation-lineage", "deployment-lineage", controller), root)
+    binding = root / "group-binding.json"; binding.unlink(); binding.symlink_to(root / "missing"); before = _tree(tmp_path)
+    with pytest.raises(GroupStoreRefused): reentry(_request(group, controller), root)
+    assert _tree(tmp_path) == before
+
+
 def test_noncanonical_binding_refuses(tmp_path):
     group, controller = _fixture(); root = tmp_path / "store"
     initial(InitialGroupStoreRequest(group, "c" * 64, "allocation-lineage", "deployment-lineage", controller), root)
@@ -109,6 +160,35 @@ def test_foreign_binding_refuses(tmp_path):
     assert _tree(tmp_path) == before
 
 
+@pytest.mark.parametrize("generation,predecessor", [(1, None), (3, "wrong")])
+def test_stale_skipped_or_forked_successor_refuses(tmp_path, generation, predecessor):
+    group, controller = _fixture(); root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, "c" * 64, "allocation-lineage", "deployment-lineage", controller), root)
+    candidate = ControllerGenerationV1(group.group_id, generation, AllocationId("allocation-2"), BackendJobId("job-2"), "b" * 64, "nonce-2", predecessor)
+    before = _tree(tmp_path)
+    with pytest.raises(GroupStoreRefused): reentry(_request(group, candidate), root)
+    assert _tree(tmp_path) == before
+
+
+def test_group_binding_mismatch_refuses(tmp_path):
+    group, controller = _fixture(); root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, "c" * 64, "allocation-lineage", "deployment-lineage", controller), root)
+    other, _ = _fixture(); other = ReadyGroupV2(GroupId("foreign"), other.members, other.execution_plan)
+    before = _tree(tmp_path)
+    with pytest.raises(GroupStoreRefused): reentry(_request(other, controller), root)
+    assert _tree(tmp_path) == before
+
+
+def test_deployment_and_controller_lineage_mismatch_refuse(tmp_path):
+    group, controller = _fixture(); root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, "c" * 64, "allocation-lineage", "deployment-lineage", controller), root)
+    before = _tree(tmp_path)
+    with pytest.raises(GroupStoreRefused): reentry(_request(group, controller, deployment_lineage="foreign"), root)
+    assert _tree(tmp_path) == before
+    with pytest.raises(GroupStoreRefused): reentry(_request(group, controller, controller_lineage_anchor="d" * 64), root)
+    assert _tree(tmp_path) == before
+
+
 def test_stale_controller_refuses(tmp_path):
     group, controller = _fixture(); root = tmp_path / "store"
     initial(InitialGroupStoreRequest(group, "c" * 64, "allocation-lineage", "deployment-lineage", controller), root)
@@ -121,9 +201,9 @@ def test_stale_controller_refuses(tmp_path):
 
 
 def test_mutants_are_unique_compilable_and_have_killers():
-    source = Path(inspect.getfile(initial)).read_text()
     names = {name for name, value in globals().items() if callable(value)}
     for row in MUTANTS:
+        source = (Path(__file__).parents[2] / row["target"]).read_text()
         assert source.count(row["old"]) == 1
         assert row["killer"] in names
         assert compile(source.replace(row["old"], row["new"], 1), row["target"], "exec")
