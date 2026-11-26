@@ -472,7 +472,7 @@ class MetropolisSampler(nn.Module):
         # is emitted for the default path.  A configured descriptor is also
         # stored at the sampler boundary so a checkpoint taken before reset()
         # retains the sector binding, not just the copy in walkers.aux.
-        if self.system is not None:
+        if isinstance(self.system, SystemDescriptor):
             state["system"] = self.system
         return state
 
@@ -514,17 +514,18 @@ class MetropolisSampler(nn.Module):
             raise ValueError("MetropolisSampler checkpoint carries an invalid SystemDescriptor")
         if restored_walkers is not None and "system" in restored_walkers.aux:
             walker_system = restored_walkers.aux["system"]
-            if not isinstance(walker_system, SystemDescriptor):
-                raise ValueError("MetropolisSampler walkers carry an invalid SystemDescriptor")
-            if restored_system is None:
-                restored_system = walker_system
-            elif walker_system.system_id() != restored_system.system_id():
+            if isinstance(walker_system, SystemDescriptor):
+                if restored_system is None:
+                    restored_system = walker_system
+                elif walker_system.system_id() != restored_system.system_id():
+                    raise ValueError(
+                        "MetropolisSampler checkpoint's walkers.system does not match its canonical system"
+                    )
+            elif restored_system is not None:
                 raise ValueError(
                     "MetropolisSampler checkpoint's walkers.system does not match its canonical system"
                 )
-        if self.system is not None and not isinstance(self.system, SystemDescriptor):
-            raise ValueError("MetropolisSampler is configured with an invalid SystemDescriptor")
-        if self.system is not None and restored_system is not None:
+        if isinstance(self.system, SystemDescriptor) and restored_system is not None:
             if self.system.system_id() != restored_system.system_id():
                 raise ValueError(
                     "MetropolisSampler is configured with a SystemDescriptor that does not "
@@ -550,7 +551,7 @@ class MetropolisSampler(nn.Module):
         self.atomic_configuration = _configuration_on(self.atomic_configuration, self._generator_device, self.dtype)
         walkers = state["walkers"]
         self._walkers = None if walkers is None else walkers.to(device=self._generator_device)
-        if self._walkers is not None and self.system is not None:
+        if self._walkers is not None and isinstance(self.system, SystemDescriptor):
             # Rebind the resumed chain to the validated sampler-owned
             # descriptor.  This makes reset() and continuation retain the
             # sector guard even when a legacy checkpoint omitted aux metadata.
