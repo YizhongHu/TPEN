@@ -1,0 +1,30 @@
+[
+  {
+    "id": "status-bypass",
+    "target": "experiments/atomistic/stage1/evidence.py",
+    "old": "if status.get(\"status\") != expected_status:",
+    "new": "if False:",
+    "killer": "experiments/atomistic/stage1/tests/test_eval_cli.py::test_status_refusal"
+  },
+  {
+    "id": "roster-truncated",
+    "target": "experiments/atomistic/stage1/evidence.py",
+    "old": "for step in rosters[row[\"row_id\"]]:",
+    "new": "for step in rosters[row[\"row_id\"]][:1]:",
+    "killer": "experiments/atomistic/stage1/tests/test_eval_cli.py::test_production_cli_roundtrip"
+  },
+  {
+    "id": "manifest-hash-bypass",
+    "target": "experiments/atomistic/stage1/select_eval.py",
+    "old": "if document.get(\"manifest_hash\") != manifest_hash(rows):",
+    "new": "if False:",
+    "killer": "experiments/atomistic/stage1/tests/test_eval_cli.py::test_selector_filters"
+  },
+  {
+    "id": "selector-filter-bypass",
+    "target": "experiments/atomistic/stage1/select_eval.py",
+    "old": "and (system is None or row.get(\"system\") == system)",
+    "new": "and True",
+    "killer": "experiments/atomistic/stage1/tests/test_eval_cli.py::test_selector_filters"
+  }
+]
