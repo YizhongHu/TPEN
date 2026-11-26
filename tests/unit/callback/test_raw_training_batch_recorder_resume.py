@@ -107,8 +107,7 @@ def test_yield_seals_durable_partial_window(tmp_path: Path) -> None:
 def test_v3_unscheduled_step_skips_host_transfer(tmp_path: Path) -> None:
     from types import SimpleNamespace
     import numpy as np
-    from tpen.events import TrainingIterationCompleted
-    from tpen.training.events import TrainingIteration
+    from tpen.training.events import TrainingIteration, TrainingIterationCompleted
 
     class _NoCpuTensor:
         def __init__(self, shape: tuple[int, ...]) -> None:
