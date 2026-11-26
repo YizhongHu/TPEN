@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -85,7 +86,18 @@ def _science_snapshot() -> bytes:
 
 _BASE_SCRIPT = r'''
 import json
+import sys
 from pathlib import Path
+source_root = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(source_root))
+import tpen
+import experiments.atomistic.stage1.protocol as protocol_module
+for module in (protocol_module, tpen):
+    module_path = Path(module.__file__).resolve()
+    if source_root not in module_path.parents:
+        raise AssertionError(
+            f"{module.__name__} imported outside archive: {module_path}"
+        )
 from experiments.atomistic.stage1.protocol import (
     CHECKPOINT_EVIDENCE_SCHEMA, HOOKE2_ACT50_A27,
     HOOKE2_ACT50_SIGMOID_PROFILE, HOOKE_A37, HOOKE_SCIENCE_PROFILE,
@@ -127,8 +139,8 @@ print(json.dumps(out, indent=2, sort_keys=True) + "\n", end="")
 '''
 
 
-def _base_snapshot() -> bytes:
-    """Run the same serializer from the exact merge-base checkout."""
+def _base_snapshot(*, hostile_pythonpath: Path | None = None) -> bytes:
+    """Run the same serializer from an isolated exact-merge-base checkout."""
 
     base = subprocess.check_output(
         ["git", "merge-base", "HEAD", "origin/dev"], cwd=REPO_ROOT, text=True,
@@ -143,8 +155,16 @@ def _base_snapshot() -> bytes:
                 if checkout.resolve() not in target.parents:
                     raise AssertionError("git archive escaped the fixture checkout")
                 tar.extract(member, checkout)
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("PYTHON")
+        }
+        if hostile_pythonpath is not None:
+            env["PYTHONPATH"] = str(hostile_pythonpath)
         return subprocess.check_output(
-            [sys.executable, "-c", _BASE_SCRIPT], cwd=checkout, text=False,
+            [sys.executable, "-c", _BASE_SCRIPT, str(checkout.resolve())],
+            cwd=checkout.resolve(), env=env, text=False,
         )
     finally:
         for path in sorted(checkout.rglob("*"), reverse=True):
@@ -159,4 +179,10 @@ def test_native_and_act50_science_rows_are_byte_identical_to_merge_base() -> Non
     """The smoke change must not perturb either science manifest family."""
 
     assert _science_snapshot() == _base_snapshot()
+
+
+def test_merge_base_serializer_rejects_head_pythonpath_self_comparison() -> None:
+    """A hostile checkout path cannot redirect the exact-base serializer."""
+
+    assert _science_snapshot() == _base_snapshot(hostile_pythonpath=REPO_ROOT)
 
