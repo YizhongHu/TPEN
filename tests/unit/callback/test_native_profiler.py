@@ -214,6 +214,8 @@ def test_real_torch_streaming_summary_matches_key_averages() -> None:
     assert total_rows == len(expected)
     assert truncated is (len(expected) > 64)
     assert [row["name"] for row in rows] == [str(row.key) for row in expected[:64]]
+
+
 def test_window_close_releases_backend_and_preserves_post_window_diagnostics(tmp_path) -> None:
     backend = _FakeBackend()
     callback = NativeProfiler(
@@ -276,6 +278,10 @@ def test_torch_streaming_backend_missing_kineto_results_fails_without_fallback(t
 
         def export_chrome_trace(self, path: str) -> None:
             del path
+
+        @property
+        def kineto_results(self):
+            raise AttributeError("kineto_results contract is missing")
 
     raw = _RawWithoutKineto()
     backend = _TorchProfilerBackend(raw, lambda _label: nullcontext())
