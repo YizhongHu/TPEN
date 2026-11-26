@@ -116,6 +116,16 @@ def test_nonempty_root_refused_in_all_states(tmp_path: Path, variant: str) -> No
         _writer(root)
 
 
+def test_nonempty_root_without_fragments_is_refused_by_fresh_root_guard(tmp_path: Path) -> None:
+    # A stray file and no fragments/ directory: only the fresh-root guard can
+    # refuse this root (fragments.mkdir would otherwise succeed).
+    root = tmp_path / "stray"
+    root.mkdir()
+    (root / "stray.txt").write_bytes(b"stray")
+    with pytest.raises(FileExistsError, match="fresh, empty, non-symlink"):
+        _writer(root)
+    assert sorted(path.name for path in root.iterdir()) == ["stray.txt"]
+
 def test_empty_root_is_accepted_and_symlink_root_refused(tmp_path: Path) -> None:
     empty = tmp_path / "empty"
     empty.mkdir()
