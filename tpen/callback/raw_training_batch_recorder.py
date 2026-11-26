@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 from typing import Any, ClassVar, Mapping
 
 import numpy as np
@@ -32,7 +35,26 @@ from .cadence import StepCadenceGate, SubscriptionGroup, pop_step_cadence
 
 LEGACY_SCHEMA = "training_history/v1"
 SCHEMA = "training_history/v2"
+V3_SCHEMA = "training_history/v3"
 MANIFEST_FILENAME = "manifest.json"
+HISTORY_FILENAME = "history.json"
+EVENTS_FILENAME = "events.jsonl"
+
+_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+_V3_COLUMNS = (
+    "iteration_step",
+    "completed_updates",
+    "update_applied",
+    "walker_index",
+    "positions",
+    "local_energy",
+    "logabs",
+    "sign",
+    "finite",
+)
 
 
 def _array(value: Any, *, dtype: np.dtype[Any]) -> np.ndarray:
@@ -373,16 +395,314 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _strict_json_loads(data: bytes | str) -> Any:
+    """Decode JSON without accepting duplicate keys, NaN, or Infinity."""
+
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-finite JSON constant: {value}")
+
+    def finite_float(value: str) -> float:
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError(f"non-finite JSON number: {value}")
+        return result
+
+    return json.loads(
+        data,
+        object_pairs_hook=reject_duplicates,
+        parse_constant=reject_constant,
+        parse_float=finite_float,
+    )
+
+
+def _pretty_json(value: Any) -> bytes:
+    """Return the approved J(x) encoding used by immutable v3 JSON objects."""
+
+    return (json.dumps(value, sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False) + "\n").encode()
+
+
+def _compact_json(value: Any) -> bytes:
+    """Return the approved L(x) encoding used by v3 event lines."""
+
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n").encode()
+
+
+def _require_keys(value: Mapping[str, Any], required: set[str], *, optional: set[str] | None = None) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("v3 object must be a JSON object")
+    allowed = required | (optional or set())
+    if set(value) != allowed:
+        missing = sorted(required - set(value))
+        extra = sorted(set(value) - allowed)
+        raise ValueError(f"v3 object keys invalid (missing={missing}, extra={extra})")
+
+
+def _int(value: Any, *, name: str, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"v3 {name} must be an integer >= {minimum}")
+    return value
+
+
+def _hash(value: Any, *, name: str) -> str:
+    if not isinstance(value, str) or not _HASH_RE.fullmatch(value):
+        raise ValueError(f"v3 {name} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _safe_relative_path(value: Any, *, name: str) -> str:
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ValueError(f"v3 {name} must be a relative POSIX path")
+    path = Path(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in value.split("/")):
+        raise ValueError(f"v3 {name} escapes its owning history root")
+    return value
+
+
+def _validate_v3_contract(contract: Any) -> None:
+    if not isinstance(contract, Mapping):
+        raise ValueError("v3 contract must be an object")
+    required = {
+        "coordinate", "start_step", "every_n_steps", "partition_size_steps",
+        "walker_count", "n_electrons", "spatial_dim", "term_names", "capture_semantics",
+    }
+    _require_keys(contract, required)
+    if contract["coordinate"] != "iteration_step" or contract["capture_semantics"] != "pre_update_model_forward":
+        raise ValueError("v3 contract coordinate or capture semantics is incompatible")
+    for key, minimum in (
+        ("start_step", 0), ("every_n_steps", 1), ("partition_size_steps", 1),
+        ("walker_count", 1), ("n_electrons", 0), ("spatial_dim", 1),
+    ):
+        _int(contract[key], name=key, minimum=minimum)
+    terms = contract["term_names"]
+    if not isinstance(terms, list) or any(not isinstance(term, str) for term in terms) or terms != sorted(set(terms)):
+        raise ValueError("v3 contract term_names must be sorted and unique")
+
+
+def _validate_v3_header(raw: bytes, header: Any) -> dict[str, Any]:
+    if not isinstance(header, Mapping):
+        raise ValueError("v3 history header must be an object")
+    _require_keys(header, {"schema", "stream_id", "run_id", "origin", "contract"})
+    if raw != _pretty_json(header):
+        raise ValueError("v3 history.json is not canonical immutable JSON")
+    if header["schema"] != V3_SCHEMA or not isinstance(header["stream_id"], str) or not _UUID_RE.fullmatch(header["stream_id"]):
+        raise ValueError("v3 history header has an invalid schema or stream_id")
+    if not isinstance(header["run_id"], str) or not header["run_id"]:
+        raise ValueError("v3 run_id must be a non-empty string")
+    if header["origin"] not in {"fresh", "train_resume"}:
+        raise ValueError("v3 history origin is invalid")
+    _validate_v3_contract(header["contract"])
+    return dict(header)
+
+
+def _v3_event_digest(header_hash: str, line: bytes) -> str:
+    return hashlib.sha256(bytes.fromhex(header_hash) + line).hexdigest()
+
+
+@dataclass
+class _V3Node:
+    root: Path
+    header: dict[str, Any]
+    events: list[dict[str, Any]]
+    digests: list[str]
+    fragments: list[tuple[dict[str, Any], dict[str, np.ndarray], dict[str, Any]]]
+    seals: list[dict[str, Any]]
+    completion: dict[str, int] | None
+    rows: dict[str, np.ndarray]
+    provenance: list[dict[str, Any]]
+
+
+def _v3_event_shape(event: Mapping[str, Any], index: int) -> None:
+    event_type = event.get("type")
+    common = {"type", "previous_event_sha256"}
+    shapes = {
+        "genesis": common,
+        "resume": common | {"parent", "checkpoint", "supersede_from_step"},
+        "fragment": common | {"group_index", "start_step", "end_step", "sidecar", "sidecar_sha256"},
+        "window_seal": common | {"group_index", "start_step", "end_step"},
+        "complete": common | {"next_iteration", "completed_updates"},
+    }
+    if event_type not in shapes:
+        raise ValueError("v3 event type is invalid")
+    _require_keys(event, shapes[event_type])
+    if index == 0 and event_type not in {"genesis", "resume"}:
+        raise ValueError("v3 event[0] must be genesis or resume")
+    if index > 0 and event_type in {"genesis", "resume"}:
+        raise ValueError("v3 origin event may occur only at event[0]")
+    if not (event["previous_event_sha256"] is None if index == 0 else isinstance(event["previous_event_sha256"], str)):
+        raise ValueError("v3 event previous_event_sha256 has the wrong type")
+    if index > 0:
+        _hash(event["previous_event_sha256"], name="previous_event_sha256")
+
+
+def _v3_array_digest(arrays: Mapping[str, np.ndarray]) -> str:
+    digest = hashlib.sha256()
+    for name in sorted(arrays):
+        value = np.ascontiguousarray(arrays[name])
+        digest.update(name.encode())
+        digest.update(str(value.dtype).encode())
+        digest.update(str(value.shape).encode())
+        digest.update(value.tobytes())
+    return digest.hexdigest()
+
+
+def _validate_v3_sidecar(
+    root: Path,
+    header: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    event: Mapping[str, Any],
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    sidecar_rel = _safe_relative_path(event["sidecar"], name="sidecar")
+    sidecar_name = Path(sidecar_rel).name
+    step_from_name = re.fullmatch(r"step-(\d{12,})\.json", sidecar_name)
+    if Path(sidecar_rel).parent.as_posix() != "fragments" or step_from_name is None or int(step_from_name.group(1)) != int(event["start_step"]):
+        raise ValueError("v3 fragment sidecar does not use the approved step naming")
+    sidecar_path = root / sidecar_rel
+    if not sidecar_path.is_file() or _sha256(sidecar_path) != event["sidecar_sha256"]:
+        raise ValueError("v3 sidecar is missing or its hash does not match the fragment event")
+    sidecar_bytes = sidecar_path.read_bytes()
+    sidecar = _strict_json_loads(sidecar_bytes)
+    if sidecar_bytes != _pretty_json(sidecar) or not isinstance(sidecar, Mapping):
+        raise ValueError("v3 sidecar is not canonical JSON")
+    required = {
+        "schema", "source", "capture_semantics", "stream_id", "contract_sha256", "group_index",
+        "start_step", "end_step", "walker_count", "row_count", "term_names", "columns",
+        "compressed_filename", "compressed_sha256", "logical_sha256", "provenance",
+    }
+    _require_keys(sidecar, required, optional={"measurements"})
+    if sidecar["schema"] != V3_SCHEMA or sidecar["source"] != "tpen.callback.RawTrainingBatchRecorder" or sidecar["capture_semantics"] != "pre_update_model_forward":
+        raise ValueError("v3 sidecar source or schema is incompatible")
+    if sidecar["stream_id"] != header["stream_id"]:
+        raise ValueError("v3 sidecar stream_id does not match its owning header")
+    if sidecar["contract_sha256"] != hashlib.sha256(_pretty_json(contract)).hexdigest():
+        raise ValueError("v3 sidecar contract hash does not match its owning header")
+    step = _int(event["start_step"], name="fragment start_step")
+    if event["end_step"] != step + 1 or sidecar["start_step"] != step or sidecar["end_step"] != step + 1:
+        raise ValueError("v3 fragment interval is invalid")
+    if sidecar["group_index"] != event["group_index"] or event["group_index"] != step // int(contract["partition_size_steps"]):
+        raise ValueError("v3 fragment group_index is invalid")
+    if sidecar["walker_count"] != contract["walker_count"] or sidecar["row_count"] != contract["walker_count"]:
+        raise ValueError("v3 fragment row count disagrees with its contract")
+    if sidecar["term_names"] != contract["term_names"]:
+        raise ValueError("v3 fragment term_names disagree with its contract")
+    columns = list(_V3_COLUMNS) + [f"term/{name}" for name in contract["term_names"]]
+    if sidecar["columns"] != sorted(columns) or len(sidecar["columns"]) != len(set(sidecar["columns"])):
+        raise ValueError("v3 fragment columns are malformed")
+    compressed_rel = _safe_relative_path(sidecar["compressed_filename"], name="compressed_filename")
+    if compressed_rel != str(Path(sidecar_rel).with_suffix(".npz")):
+        raise ValueError("v3 sidecar and fragment event disagree about the bundle")
+    bundle_path = root / compressed_rel
+    if not bundle_path.is_file() or _sha256(bundle_path) != sidecar["compressed_sha256"]:
+        raise ValueError("v3 bundle is missing or its hash does not match the sidecar")
+    provenance = sidecar["provenance"]
+    if not isinstance(provenance, Mapping):
+        raise ValueError("v3 sidecar provenance must be an object")
+    _require_keys(
+        provenance,
+        {"run_id", "config_hash", "source_revision", "sampler_settings", "acceptance_proposal_stats"},
+        optional=set(provenance) - {"run_id", "config_hash", "source_revision", "sampler_settings", "acceptance_proposal_stats"},
+    )
+    if provenance["run_id"] != header["run_id"] or not isinstance(provenance["config_hash"], str) or not _HASH_RE.fullmatch(provenance["config_hash"]):
+        raise ValueError("v3 sidecar provenance identity is invalid")
+    if provenance["source_revision"] is not None and not isinstance(provenance["source_revision"], str):
+        raise ValueError("v3 sidecar source_revision is invalid")
+    if not isinstance(provenance["sampler_settings"], Mapping) or not isinstance(provenance["acceptance_proposal_stats"], list):
+        raise ValueError("v3 sidecar sampler provenance is invalid")
+    try:
+        loaded = np.load(bundle_path, allow_pickle=False)
+        arrays = {name: loaded[name] for name in loaded.files}
+    except Exception as exc:
+        raise ValueError("v3 bundle cannot be read") from exc
+    if sorted(arrays) != sorted(columns):
+        raise ValueError("v3 bundle columns disagree with its sidecar")
+    walkers = int(contract["walker_count"])
+    expected_dtypes = {
+        "iteration_step": "<i8", "completed_updates": "<i8", "update_applied": "|b1",
+        "walker_index": "<i8", "positions": "<f8", "local_energy": "<f8",
+        "logabs": "<f8", "sign": "<f8", "finite": "|b1",
+    }
+    for name in columns:
+        expected = expected_dtypes.get(name, "<f8")
+        if arrays[name].dtype.str != expected:
+            raise ValueError(f"v3 bundle dtype is invalid for {name}")
+    if arrays["iteration_step"].shape != (walkers,) or arrays["walker_index"].shape != (walkers,):
+        raise ValueError("v3 bundle row shape is invalid")
+    if arrays["positions"].shape != (walkers, int(contract["n_electrons"]), int(contract["spatial_dim"])):
+        raise ValueError("v3 positions shape disagrees with its contract")
+    for name in columns:
+        if name not in {"positions"} and arrays[name].shape != (walkers,):
+            raise ValueError("v3 scalar column shape is invalid")
+    if not np.all(arrays["iteration_step"] == step) or not np.array_equal(arrays["walker_index"], np.arange(walkers, dtype=np.int64)):
+        raise ValueError("v3 bundle has an invalid step or walker grid")
+    if np.any(arrays["completed_updates"] > step + 1) or np.any(arrays["completed_updates"] < 0) or not np.all(arrays["completed_updates"] == arrays["completed_updates"][0]):
+        raise ValueError("v3 completed_updates is invalid")
+    if not np.all(arrays["update_applied"] == arrays["update_applied"][0]):
+        raise ValueError("v3 update_applied is not constant within a fragment")
+    finite = (
+        np.isfinite(arrays["positions"]).all(axis=(1, 2))
+        & np.isfinite(arrays["local_energy"])
+        & np.isfinite(arrays["logabs"])
+        & np.isfinite(arrays["sign"])
+    )
+    for name in columns:
+        if name.startswith("term/"):
+            finite &= np.isfinite(arrays[name])
+    if not np.array_equal(arrays["finite"], finite) or not bool(finite.all()):
+        raise ValueError("v3 finite flags are invalid")
+    if sidecar["logical_sha256"] != _v3_array_digest(arrays):
+        raise ValueError("v3 logical digest does not match the sidecar")
+    return arrays, dict(sidecar)
+
+
 class TrainingBatchReader:
-    """Read only manifest-selected, integrity-validated partitions."""
+    """Read v1/v2 manifests or a strict v3 lineage rooted at ``root``."""
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self.provenance: dict[int, Mapping[str, Any]] = {}
+        self._v3_completion: dict[str, int] | None = None
 
     def read(self, *, start_step: int | None = None, end_step: int | None = None) -> dict[str, np.ndarray]:
-        """Return rows in the requested iteration range after full validation."""
+        """Validate the complete selected graph, then return an inclusive step range."""
 
+        if (self.root / HISTORY_FILENAME).is_file():
+            raw = (self.root / HISTORY_FILENAME).read_bytes()
+            header = _strict_json_loads(raw)
+            if isinstance(header, Mapping) and header.get("schema") == V3_SCHEMA:
+                return self._read_v3(start_step=start_step, end_step=end_step)
+        self._v3_completion = None
+        return self._read_legacy(start_step=start_step, end_step=end_step)
+
+    def validate(self, *, require_complete: bool = False) -> None:
+        """Validate every committed object; optionally require a v3 completion event."""
+
+        if (self.root / HISTORY_FILENAME).is_file():
+            raw = (self.root / HISTORY_FILENAME).read_bytes()
+            header = _strict_json_loads(raw)
+            if isinstance(header, Mapping) and header.get("schema") == V3_SCHEMA:
+                self._read_v3(require_complete=require_complete)
+                return
+        if require_complete:
+            raise ValueError("require_complete is unavailable for legacy training histories")
+        self._read_legacy()
+
+    @property
+    def completion(self) -> dict[str, int] | None:
+        """Return v3 completion counters, or ``None`` for open/legacy histories."""
+
+        if (self.root / HISTORY_FILENAME).is_file():
+            self._read_v3()
+            return dict(self._v3_completion) if self._v3_completion is not None else None
+        return None
+
+    def _read_legacy(self, *, start_step: int | None = None, end_step: int | None = None) -> dict[str, np.ndarray]:
         manifest_path = self.root / MANIFEST_FILENAME
         manifest = json.loads(manifest_path.read_text())
         if manifest.get("schema") not in {LEGACY_SCHEMA, SCHEMA}:
@@ -403,10 +723,7 @@ class TrainingBatchReader:
             if not isinstance(expected_sidecar_hash, str):
                 raise ValueError("training manifest entry is missing the sidecar digest")
             if not sidecar_path.exists() or _sha256(sidecar_path) != expected_sidecar_hash:
-                raise ValueError(
-                    "training partition sidecar digest does not match its manifest entry"
-                    " (partition integrity failure)"
-                )
+                raise ValueError("training partition sidecar digest does not match its manifest entry (partition integrity failure)")
             sidecar = json.loads(sidecar_path.read_text())
             _validate_sidecar(self.root, sidecar, entry=entry)
             if sidecar["schema"] == SCHEMA:
@@ -428,10 +745,302 @@ class TrainingBatchReader:
             return {}
         return {name: np.concatenate([part[name] for part in selected]) for name in selected[0]}
 
-    def validate(self) -> None:
-        """Validate every manifest-selected partition without returning rows."""
+    def _read_v3(
+        self,
+        *,
+        start_step: int | None = None,
+        end_step: int | None = None,
+        require_complete: bool = False,
+    ) -> dict[str, np.ndarray]:
+        node = self._load_v3_node(self.root.resolve(), stack=(), seen_streams=set(), limit=None)
+        self._v3_completion = node.completion
+        self.provenance = {index: value for index, value in enumerate(node.provenance)}
+        if require_complete and node.completion is None:
+            raise ValueError("v3 training history is open and is not complete")
+        arrays = node.rows
+        if not arrays:
+            return {}
+        order = np.lexsort((arrays["walker_index"], arrays["iteration_step"]))
+        result = {name: value[order] for name, value in arrays.items()}
+        mask = np.ones(len(result["iteration_step"]), dtype=bool)
+        if start_step is not None:
+            mask &= result["iteration_step"] >= int(start_step)
+        if end_step is not None:
+            mask &= result["iteration_step"] <= int(end_step)
+        return {name: value[mask] for name, value in result.items()}
 
-        self.read()
+    def _load_v3_node(
+        self,
+        root: Path,
+        *,
+        stack: tuple[Path, ...],
+        seen_streams: set[str],
+        limit: int | None,
+    ) -> _V3Node:
+        if root in stack:
+            raise ValueError("v3 lineage contains a cycle")
+        history_path = root / HISTORY_FILENAME
+        events_path = root / EVENTS_FILENAME
+        if not history_path.is_file() or not events_path.is_file():
+            raise ValueError("v3 history is missing history.json or events.jsonl")
+        header_raw = history_path.read_bytes()
+        header = _validate_v3_header(header_raw, _strict_json_loads(header_raw))
+        stream_id = header["stream_id"]
+        if stream_id in seen_streams:
+            raise ValueError("v3 lineage contains a duplicate stream_id")
+        local_seen = set(seen_streams)
+        local_seen.add(stream_id)
+        header_hash = hashlib.sha256(header_raw).hexdigest()
+        raw_log = events_path.read_bytes()
+        complete_bytes = raw_log if raw_log.endswith(b"\n") else raw_log[: raw_log.rfind(b"\n") + 1]
+        events: list[dict[str, Any]] = []
+        digests: list[str] = []
+        for line in complete_bytes.splitlines(keepends=True):
+            if not line.endswith(b"\n") or line in {b"\n", b"\r\n"}:
+                raise ValueError("v3 events.jsonl contains an empty or malformed LF-terminated line")
+            event = _strict_json_loads(line)
+            if not isinstance(event, Mapping) or line != _compact_json(event):
+                raise ValueError("v3 event line is not canonical JSON")
+            event = dict(event)
+            _v3_event_shape(event, len(events))
+            if events and event["previous_event_sha256"] != digests[-1]:
+                raise ValueError("v3 event chain predecessor digest is invalid")
+            digest = _v3_event_digest(header_hash, line)
+            events.append(event)
+            digests.append(digest)
+            if limit is not None and len(events) == limit:
+                break
+        if limit is not None and len(events) != limit:
+            raise ValueError("v3 parent pin event_count exceeds its committed prefix")
+        if not events:
+            raise ValueError("v3 history has no committed origin event")
+        if limit is not None and digests[-1] != self._expected_pin_digest(root, limit):
+            raise ValueError("v3 parent pin prefix_sha256 does not match its own event chain")
+        if limit is not None and limit < len(events):
+            events = events[:limit]
+            digests = digests[:limit]
+        origin = events[0]
+        if (header["origin"] == "fresh") != (origin["type"] == "genesis"):
+            raise ValueError("v3 header origin disagrees with event[0]")
+        if header["origin"] == "train_resume" and origin["type"] != "resume":
+            raise ValueError("v3 resumed history must begin with resume")
+        if header["origin"] == "fresh" and origin["type"] != "genesis":
+            raise ValueError("v3 fresh history must begin with genesis")
+        fragments: list[tuple[dict[str, Any], dict[str, np.ndarray], dict[str, Any]]] = []
+        seals: list[dict[str, Any]] = []
+        completion: dict[str, int] | None = None
+        fragment_steps: list[int] = []
+        seal_positions: dict[int, int] = {}
+        for index, event in enumerate(events):
+            if event["type"] == "resume":
+                self._validate_v3_resume_event(event, header)
+            elif event["type"] == "fragment":
+                _int(event["group_index"], name="fragment group_index")
+                step = _int(event["start_step"], name="fragment start_step")
+                _int(event["end_step"], name="fragment end_step", minimum=1)
+                _hash(event["sidecar_sha256"], name="sidecar_sha256")
+                if event["end_step"] != step + 1 or (fragment_steps and step <= fragment_steps[-1]):
+                    raise ValueError("v3 local fragment steps are not strictly increasing")
+                if header["origin"] == "train_resume" and step < event0_cut(events[0]):
+                    raise ValueError("v3 resumed fragment precedes its supersede cut")
+                arrays, sidecar = _validate_v3_sidecar(root, header, header["contract"], event)
+                fragments.append((dict(event), arrays, sidecar))
+                fragment_steps.append(step)
+            elif event["type"] == "window_seal":
+                group = _int(event["group_index"], name="window_seal group_index")
+                start = _int(event["start_step"], name="window_seal start_step")
+                end = _int(event["end_step"], name="window_seal end_step", minimum=1)
+                partition = int(header["contract"]["partition_size_steps"])
+                if start != group * partition or not start < end <= start + partition or group in seal_positions:
+                    raise ValueError("v3 window seal interval is invalid or duplicated")
+                seal_positions[group] = index
+                seals.append(dict(event))
+            elif event["type"] == "complete":
+                if completion is not None or index != len(events) - 1:
+                    raise ValueError("v3 complete must be the sole final event")
+                completion = {
+                    "next_iteration": _int(event["next_iteration"], name="next_iteration"),
+                    "completed_updates": _int(event["completed_updates"], name="completed_updates"),
+                }
+                if completion["completed_updates"] > completion["next_iteration"]:
+                    raise ValueError("v3 completed_updates exceeds next_iteration")
+        parent_node: _V3Node | None = None
+        cut = 0
+        if origin["type"] == "resume":
+            cut = origin["supersede_from_step"]
+            parent_pin = origin["parent"]
+            checkpoint = origin["checkpoint"]
+            if not isinstance(parent_pin, Mapping):
+                if cut != 0:
+                    raise ValueError("v3 nonzero resume requires a parent pin")
+            else:
+                _require_keys(parent_pin, {"root", "event_count", "prefix_sha256"})
+                count = _int(parent_pin["event_count"], name="parent event_count", minimum=1)
+                _hash(parent_pin["prefix_sha256"], name="parent prefix_sha256")
+                if not isinstance(parent_pin["root"], str) or not Path(parent_pin["root"]).is_absolute():
+                    raise ValueError("v3 parent root must be an absolute path")
+                parent_root = Path(parent_pin["root"])
+                parent_node = self._load_v3_node(parent_root.resolve(), stack=stack + (root,), seen_streams=local_seen, limit=count)
+                if parent_node.header["contract"] != header["contract"]:
+                    raise ValueError("v3 resumed contract is incompatible with its parent")
+            _require_keys(checkpoint, {"path", "manifest_sha256", "model_sha256", "next_iteration", "completed_updates"})
+            if not isinstance(checkpoint["path"], str) or not Path(checkpoint["path"]).is_absolute():
+                raise ValueError("v3 checkpoint.path must be an absolute path")
+            _hash(checkpoint["manifest_sha256"], name="manifest_sha256")
+            _hash(checkpoint["model_sha256"], name="model_sha256")
+            _int(checkpoint["next_iteration"], name="checkpoint next_iteration")
+            _int(checkpoint["completed_updates"], name="checkpoint completed_updates")
+            if checkpoint["completed_updates"] > checkpoint["next_iteration"] or checkpoint["next_iteration"] != cut:
+                raise ValueError("v3 checkpoint counters do not bind supersede_from_step")
+        elif origin["type"] == "genesis":
+            if header["origin"] != "fresh":
+                raise ValueError("v3 genesis header has the wrong origin")
+        inherited_rows = parent_node.rows if parent_node is not None else {}
+        local_arrays = [arrays for _, arrays, _ in fragments]
+        rows = _merge_v3_rows(inherited_rows, local_arrays, cut)
+        if parent_node is not None and not _v3_has_scheduled_prefix(parent_node.rows, header["contract"], cut):
+            raise ValueError("v3 parent pin does not cover the required scheduled prefix")
+        inherited_seals = [dict(seal) for seal in (parent_node.seals if parent_node is not None else []) if int(seal["end_step"]) <= cut]
+        effective_seals = inherited_seals + seals
+        if len({int(seal["group_index"]) for seal in effective_seals}) != len(effective_seals):
+            raise ValueError("v3 lineage contains duplicate active window seals")
+        self._validate_v3_seals(events, seals, fragments, parent_node, rows, header["contract"], cut, completion)
+        self._validate_v3_completion(completion, rows, effective_seals, parent_node, header["contract"], cut)
+        provenance = []
+        if parent_node is not None:
+            provenance.extend(dict(item, inherited=True) for item in parent_node.provenance if item.get("start_step", -1) < cut)
+        for event, _, sidecar in fragments:
+            provenance.append({
+                "stream_id": header["stream_id"], "run_id": header["run_id"], "root": str(root),
+                "group_index": event["group_index"], "start_step": event["start_step"],
+                "end_step": event["end_step"], "provenance": sidecar["provenance"], "inherited": False,
+            })
+        return _V3Node(root, header, events, digests, fragments, seals, completion, rows, provenance)
+
+    @staticmethod
+    def _expected_pin_digest(root: Path, count: int) -> str:
+        raw = (root / EVENTS_FILENAME).read_bytes()
+        lines = raw.splitlines(keepends=True)
+        if len(lines) < count:
+            raise ValueError("v3 parent pin is shorter than event_count")
+        header_hash = hashlib.sha256((root / HISTORY_FILENAME).read_bytes()).hexdigest()
+        previous = None
+        for line in lines[:count]:
+            event = _strict_json_loads(line)
+            if previous is not None and event.get("previous_event_sha256") != previous:
+                raise ValueError("v3 parent prefix chain is invalid")
+            previous = _v3_event_digest(header_hash, line)
+        assert previous is not None
+        return previous
+
+    @staticmethod
+    def _validate_v3_resume_event(event: Mapping[str, Any], header: Mapping[str, Any]) -> None:
+        _int(event["supersede_from_step"], name="supersede_from_step")
+        if header["origin"] != "train_resume":
+            raise ValueError("v3 resume event requires train_resume origin")
+        parent = event["parent"]
+        if parent is not None and not isinstance(parent, Mapping):
+            raise ValueError("v3 resume parent must be null or an object")
+
+    @staticmethod
+    def _validate_v3_seals(
+        events: list[dict[str, Any]],
+        seals: list[dict[str, Any]],
+        fragments: list[tuple[dict[str, Any], dict[str, np.ndarray], dict[str, Any]]],
+        parent: _V3Node | None,
+        rows: Mapping[str, np.ndarray],
+        contract: Mapping[str, Any],
+        cut: int,
+        completion: Mapping[str, int] | None,
+    ) -> None:
+        partition = int(contract["partition_size_steps"])
+        seal_indices: dict[int, int] = {}
+        for index, event in enumerate(events):
+            if event["type"] == "window_seal":
+                group = int(event["group_index"])
+                seal_indices[group] = index
+                end = int(event["end_step"])
+                if end < (group + 1) * partition and completion is None:
+                    raise ValueError("v3 partial window seal requires completion")
+                if end < (group + 1) * partition and (completion is None or index != len(events) - 2):
+                    raise ValueError("v3 partial window seal must immediately precede complete")
+        for event, _, _ in fragments:
+            group = int(event["group_index"])
+            if group in seal_indices:
+                event_index = events.index(event)
+                if event_index > seal_indices[group]:
+                    raise ValueError("v3 fragment follows its window seal")
+        if parent is not None:
+            for seal in parent.seals:
+                if int(seal["end_step"]) > cut and int(seal["start_step"]) < cut:
+                    raise ValueError("v3 resume cut crosses an inherited window seal")
+        for seal in seals:
+            start, end = int(seal["start_step"]), int(seal["end_step"])
+            expected_steps = {
+                int(step) for step in np.unique(rows.get("iteration_step", np.asarray([], dtype=np.int64)))
+                if start <= step < end
+            }
+            cadence_start = int(contract["start_step"])
+            every = int(contract["every_n_steps"])
+            first = cadence_start + max(0, (start - cadence_start + every - 1) // every) * every
+            scheduled = set(range(first, end, every))
+            if expected_steps != scheduled:
+                raise ValueError("v3 window seal coverage is incomplete or contains an extra step")
+
+    @staticmethod
+    def _validate_v3_completion(
+        completion: Mapping[str, int] | None,
+        rows: Mapping[str, np.ndarray],
+        seals: list[Mapping[str, Any]],
+        parent: _V3Node | None,
+        contract: Mapping[str, Any],
+        cut: int,
+    ) -> None:
+        if completion is None:
+            return
+        next_iteration = int(completion["next_iteration"])
+        steps = set(int(step) for step in np.unique(rows.get("iteration_step", np.asarray([], dtype=np.int64))))
+        start = int(contract["start_step"])
+        every = int(contract["every_n_steps"])
+        expected = set(range(start, next_iteration, every)) if next_iteration > start else set()
+        if steps != expected or any(step >= next_iteration for step in steps):
+            raise ValueError("v3 complete history has incorrect scheduled fragment coverage")
+        partition = int(contract["partition_size_steps"])
+        expected_seals = {
+            group: (group * partition, min((group + 1) * partition, next_iteration))
+            for group in range((next_iteration + partition - 1) // partition)
+        }
+        actual = {int(seal["group_index"]): (int(seal["start_step"]), int(seal["end_step"])) for seal in seals}
+        if actual != expected_seals:
+            raise ValueError("v3 complete history has incorrect window seals")
+
+
+def event0_cut(event: Mapping[str, Any]) -> int:
+    return int(event["supersede_from_step"]) if event.get("type") == "resume" else 0
+
+
+def _merge_v3_rows(parent: Mapping[str, np.ndarray], local: Iterable[Mapping[str, np.ndarray]], cut: int) -> dict[str, np.ndarray]:
+    parts: list[dict[str, np.ndarray]] = []
+    if parent:
+        mask = parent["iteration_step"] < cut
+        parts.append({name: values[mask] for name, values in parent.items()})
+    parts.extend(dict(values) for values in local)
+    if not parts:
+        return {}
+    result = {name: np.concatenate([part[name] for part in parts]) for name in parts[0]}
+    identities = set(zip(result["iteration_step"].tolist(), result["walker_index"].tolist()))
+    if len(identities) != len(result["iteration_step"]):
+        raise ValueError("duplicate active (iteration_step, walker_index) in v3 lineage")
+    return result
+
+
+def _v3_has_scheduled_prefix(rows: Mapping[str, np.ndarray], contract: Mapping[str, Any], cut: int) -> bool:
+    start, every = int(contract["start_step"]), int(contract["every_n_steps"])
+    if cut <= start:
+        return True
+    expected = set(range(start, cut, every))
+    actual = set(int(step) for step in np.unique(rows.get("iteration_step", np.asarray([], dtype=np.int64))) if start <= step < cut)
+    return expected == actual
 
 
 def _validate_sidecar(root: Path, sidecar: Mapping[str, Any], *, entry: Mapping[str, Any]) -> None:
