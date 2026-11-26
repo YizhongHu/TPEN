@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -248,10 +249,19 @@ def test_nolayer_profile_forward_grad_local_energy_and_singlet_swap(
     energy = local_energy(terms, model, batch)
     assert energy.shape == batch.positions.shape[:-2]
     assert torch.isfinite(energy).all()
-    # Hooke-2e has n_up=1,n_down=1: this exchanges opposite-spin labels, so
-    # the singlet spatial wavefunction has the expected +1 sign ratio.
-    swapped = model(batch.permute(Permutation((1, 0))))
-    assert torch.equal(output.sign * swapped.sign, torch.ones_like(output.sign))
+    exchange = Permutation((1, 0))
+    # Full particle-label exchange permutes positions and spins, so fermionic
+    # antisymmetry requires a -1 sign ratio while preserving |psi|.
+    full_exchange = model(batch.permute(exchange))
+    assert torch.allclose(output.logabs, full_exchange.logabs, atol=1e-10, rtol=1e-10)
+    assert torch.equal(output.sign * full_exchange.sign, -torch.ones_like(output.sign))
+
+    # Spatial exchange keeps the opposite-spin labels fixed, so the Hooke-2e
+    # singlet spatial wavefunction has a +1 sign ratio while preserving |psi|.
+    spatial_batch = replace(batch.permute(exchange), spins=batch.spins)
+    spatial_exchange = model(spatial_batch)
+    assert torch.allclose(output.logabs, spatial_exchange.logabs, atol=1e-10, rtol=1e-10)
+    assert torch.equal(output.sign * spatial_exchange.sign, torch.ones_like(output.sign))
 
     context = type("Context", (), {
         "cfg": cfg,
