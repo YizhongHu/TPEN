@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
+import re
 from typing import Any, Mapping
 
 from experiments.atomistic.stage1.launch import command_for_row
@@ -143,6 +144,8 @@ def finalize_eval_row(
 
     if publication.step != template.checkpoint_step:
         raise P3RenderError("SOAP publication is not checkpoint-100")
+    if not publication.publication_id or publication.publication_id in {"zero", "duplicate", "missing"}:
+        raise P3RenderError("SOAP100 publication identity is missing or non-unique")
     checkpoint_root = Path(checkpoint_dir).resolve()
     model = checkpoint_root / "model.pt"
     complete = checkpoint_root / "COMPLETE"
@@ -156,12 +159,15 @@ def finalize_eval_row(
     if parent.row_id != train_row.get("row_id"):
         raise P3RenderError("SOAP100 publication parent is not the named train row")
     try:
+        final_path = Path(template.output_dir) / "r2-soap-eval-100.yaml"
+        if final_path.exists():
+            raise P3RenderError("eval destination already exists")
         config, _ = _materialize_eval(
             results_root=template.results_root, run_id=template.run_id,
             checkpoint_dir=str(checkpoint_root), checkpoint_file=str(model),
             source_sha=template.source_sha, device=template.device,
         )
-        rendered = _write_yaml(Path(template.output_dir) / "r2-soap-eval-100.yaml", config)
+        rendered = _write_yaml(final_path, config)
         return make_eval_row(
             train_row=train_row, parent=parent, checkpoint=publication,
             rendered=rendered,
@@ -181,19 +187,56 @@ def render_pbs_audit() -> dict[str, Any]:
 
     wrapper = Path(__file__).resolve().parents[1] / "stage1" / "polaris" / "pbs_stage1.sh"
     text = wrapper.read_text(encoding="utf-8")
-    required_env = (
-        "MODE", "SOURCE_SHA", "CHECKOUT_ROOT", "UV_CACHE_DIR", "RESULTS_ROOT",
-        "SELECTED_ROW", "APPROVAL_ID", "EXPECTED_QUEUE",
-    )
+    # Derive the environment contract from the wrapper's declarations rather
+    # than duplicating an echoed list in the P3 implementation.
+    required_env = tuple(re.findall(r"^([A-Z][A-Z0-9_]*)=\"\$\{\1:-\}\"", text, re.MULTILINE))
+    expected_env = {"MODE", "SOURCE_SHA", "CHECKOUT_ROOT", "UV_CACHE_DIR", "RESULTS_ROOT", "SELECTED_ROW", "APPROVAL_ID", "EXPECTED_QUEUE"}
+    if not expected_env <= set(required_env):
+        raise P3RenderError(f"PBS environment declarations incomplete: {sorted(expected_env - set(required_env))}")
     required_outputs = ("$RESULTS_ROOT/logs/row-", "checkpoints")
     missing = [token for token in (*required_env, *required_outputs, "command_for_row") if token not in text]
     if missing:
         raise P3RenderError(f"PBS contract evidence missing: {missing}")
-    return {"wrapper": str(wrapper), "env": required_env, "outputs": required_outputs, "command_owner": "stage1.launch.command_for_row"}
+    command_form = re.search(r"command_for_row\(row, python=python, checkout_root=checkout\)", text)
+    log_form = re.search(r'\$RESULTS_ROOT/logs/row-\$\{row_id\}-\$\{PBS_JOBID\}\.log', text)
+    status_form = re.search(r'\$RESULTS_ROOT/logs/row-\$\{row_id\}-\$\{PBS_JOBID\}\.status', text)
+    lr4_guards = tuple(token for token in ("assert_pbs_context", "assert_selected_row", "assert_contained_path", "DRY_EXEC", "EXPECTED_QUEUE") if token in text)
+    if command_form is None or log_form is None or status_form is None or len(lr4_guards) != 5:
+        raise P3RenderError("PBS argv/output/LR-4 guard evidence is incomplete")
+    return {"wrapper": str(wrapper), "env": required_env, "outputs": required_outputs, "command_owner": "stage1.launch.command_for_row", "argv": command_form.group(0), "log": log_form.group(0), "status": status_form.group(0), "lr4_guards": lr4_guards}
+
+
+def recipe_diff(expected: Mapping[str, Any], actual: Mapping[str, Any], *, allowed_paths: set[str] | frozenset[str] = frozenset()) -> dict[str, tuple[Any, Any]]:
+    """Return changed leaf paths, retaining only recipe-level identity."""
+
+    changes: dict[str, tuple[Any, Any]] = {}
+
+    def visit(left: Any, right: Any, path: str) -> None:
+        if isinstance(left, Mapping) and isinstance(right, Mapping):
+            for key in sorted(set(left) | set(right)):
+                visit(left.get(key), right.get(key), f"{path}.{key}" if path else str(key))
+            return
+        if isinstance(left, list) and isinstance(right, list):
+            if left != right:
+                changes[path] = (left, right)
+            return
+        if left != right:
+            changes[path] = (left, right)
+
+    visit(expected, actual, "")
+    return {path: pair for path, pair in changes.items() if not any(path == allowed or path.startswith(f"{allowed}.") for allowed in allowed_paths)}
+
+
+def fail_closed_recipe_diff(expected: Mapping[str, Any], actual: Mapping[str, Any], *, allowed_paths: set[str] | frozenset[str] = frozenset()) -> None:
+    """Refuse any rendered recipe difference outside enumerated paths."""
+
+    changes = recipe_diff(expected, actual, allowed_paths=allowed_paths)
+    if changes:
+        raise P3RenderError(f"unenumerated recipe diff: {sorted(changes)}")
 
 
 __all__ = [
     "AdmittedCommand", "EvalTemplate", "P3RenderError", "admit_row_and_command",
     "finalize_eval_row", "render_eval_template", "render_pbs_audit",
-    "render_r2_train_packet",
+    "render_r2_train_packet", "recipe_diff", "fail_closed_recipe_diff",
 ]
