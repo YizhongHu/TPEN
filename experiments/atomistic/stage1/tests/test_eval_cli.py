@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -165,6 +166,41 @@ def test_caller_checkpoint_binding_remains_strict(phase1, tmp_path, bad_binding)
         message = "checkpoint_file must equal checkpoint_dir/model.pt"
     with pytest.raises(ProtocolError, match=message):
         validate_gateway_binding(binding=_binding_token(row), expected_kinds={"eval"})
+
+
+def test_canonical_root_preserves_prefix_rows_byte_for_byte(phase1, monkeypatch):
+    """Compare science and smoke bindings with the pinned pre-fix protocol."""
+    from experiments.atomistic.stage1 import protocol as current
+
+    for row in phase1["rows"]:
+        assert Path(row["results_root"]) == Path(row["results_root"]).resolve()
+    baseline = json.loads((ROOT / "tests/fixtures/eval_canon_baseline.json").read_text())
+    source = subprocess.check_output(
+        ["git", "show", f"{baseline['commit']}:experiments/atomistic/stage1/protocol.py"],
+        text=True,
+    )
+    assert hashlib.sha256(source.encode()).hexdigest() == baseline["protocol_sha256"]
+    # Load historical protocol code separately; unchanged config resources use
+    # their real location so the comparison isolates the path-binding change.
+    previous = ModuleType("experiments.atomistic.stage1._eval_canon_baseline")
+    previous.__file__ = current.__file__
+    monkeypatch.setitem(sys.modules, previous.__name__, previous)
+    exec(compile(source, current.__file__, "exec"), previous.__dict__)
+    evidence = build_evidence(phase1)
+    arguments = {
+        "phase1_rows": phase1["rows"],
+        "checkpoints": sorted({int(key.split(":")[-1]) for key in evidence["checkpoints"]}),
+        "checkpoint_evidence": evidence,
+    }
+    before = previous.bind_evaluation_manifest(**arguments)
+    after = bind_evaluation_manifest(**arguments)
+    assert json.dumps(after, indent=2, sort_keys=True).encode() == json.dumps(
+        before, indent=2, sort_keys=True,
+    ).encode()
+    assert manifest_hash(after) == previous.manifest_hash(before)
+    assert [manifest_hash([row]) for row in after] == [
+        previous.manifest_hash([row]) for row in before
+    ]
 
 
 @pytest.mark.parametrize("wrong_kind", [False, True], ids=["failed", "other-row-kind"])
