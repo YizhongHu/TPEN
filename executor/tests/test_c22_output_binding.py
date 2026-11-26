@@ -525,7 +525,7 @@ MUTANTS = (
     {
         "id": "serialized-slot-gate-bypass",
         "target": "executor/src/tpen_executor/dispatch/transport.py",
-        "old": "            slot = _require_configured_physical_slot(allocation)\n",
+        "old": "            slot = _require_configured_physical_slot(allocation, selected_slot)\n",
         "new": "            slot = type(\"MutatedSlot\", (), {\"slot_id\": \"mutant-slot\", \"node\": \"mutant-host\", \"cpus\": (0,), \"devices\": (), \"env\": {\"TPEN_SLOT_ID\": \"mutant-slot\", \"TPEN_SLOT_NODE\": \"mutant-host\", \"TPEN_SLOT_CPUS\": \"0\"}})()\n",
         "killer": "test_no_slot_configured_serialized_for_attempt_refuses_before_leaf",
     },
