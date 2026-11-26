@@ -199,6 +199,7 @@ def test_collection_freezes_parameters_but_leaves_autograd_enabled(initial_train
     assert all(p.requires_grad for p in model.parameters())
 
 
+@pytest.mark.requires_typeguard
 @pytest.mark.parametrize("sampler", [object(), None])
 def test_sampler_without_collect_samples_raises_type_error(sampler: object) -> None:
     """Require the public sampler collection contract."""

@@ -438,8 +438,11 @@ def collect_observable_trajectory_with_diagnostics(
     Raises
     ------
     TypeError
-        If `sampler` does not expose ``collect_samples``, or `observable` does
-        not return a tensor.
+        If `observable` does not return a tensor.
+    AttributeError
+        If `sampler` lacks ``collect_samples`` and runtime type checking is
+        disabled. The argument must satisfy the `SamplingCollector` contract;
+        when enabled, type checking rejects an incompatible sampler first.
     ValueError
         If `n_draws` is below one, `discard_draws` is negative, or the
         observable's shape does not match the walker count.
