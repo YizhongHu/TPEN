@@ -14,6 +14,7 @@ from tpen.sampling.diagnostics import summarize_walker_geometry
 from tpen.sampling.moves import GaussianMove
 from tpen.sampling.stats import SamplerStats
 from tpen.events import EventEmitter
+from tpen.physics.system import SystemDescriptor
 from tpen.sampling.events import SamplerBurnIn, SamplerProduction
 
 torch = require_torch(feature="Metropolis sampling")
@@ -459,7 +460,7 @@ class MetropolisSampler(nn.Module):
         before the chain has ever been reset/initialized.
         """
 
-        return {
+        state = {
             "walkers": self._walkers,
             "atomic_configuration": self.atomic_configuration,
             "has_burned_in": self._has_burned_in,
@@ -467,6 +468,13 @@ class MetropolisSampler(nn.Module):
             "generator_state": self._generator.get_state(),
             "generator_device": str(self._generator_device),
         }
+        # Keep the historical system=None state byte-compatible: no new key
+        # is emitted for the default path.  A configured descriptor is also
+        # stored at the sampler boundary so a checkpoint taken before reset()
+        # retains the sector binding, not just the copy in walkers.aux.
+        if self.system is not None:
+            state["system"] = self.system
+        return state
 
     def load_mcmc_state_dict(self, state: Mapping[str, Any], *, device=None) -> None:
         """Restore Markov-chain and RNG state from `mcmc_state_dict`.
@@ -500,6 +508,31 @@ class MetropolisSampler(nn.Module):
                     "MetropolisSampler checkpoint's walkers.atomic_configuration does not match "
                     "its canonical atomic_configuration entry"
                 )
+
+        restored_system = state.get("system")
+        if restored_system is not None and not isinstance(restored_system, SystemDescriptor):
+            raise ValueError("MetropolisSampler checkpoint carries an invalid SystemDescriptor")
+        if restored_walkers is not None and "system" in restored_walkers.aux:
+            walker_system = restored_walkers.aux["system"]
+            if not isinstance(walker_system, SystemDescriptor):
+                raise ValueError("MetropolisSampler walkers carry an invalid SystemDescriptor")
+            if restored_system is None:
+                restored_system = walker_system
+            elif walker_system.system_id() != restored_system.system_id():
+                raise ValueError(
+                    "MetropolisSampler checkpoint's walkers.system does not match its canonical system"
+                )
+        if self.system is not None and not isinstance(self.system, SystemDescriptor):
+            raise ValueError("MetropolisSampler is configured with an invalid SystemDescriptor")
+        if self.system is not None and restored_system is not None:
+            if self.system.system_id() != restored_system.system_id():
+                raise ValueError(
+                    "MetropolisSampler is configured with a SystemDescriptor that does not "
+                    "match the restored checkpoint's system"
+                )
+        elif self.system is None and restored_system is not None:
+            self.system = restored_system
+
         if self.atomic_configuration is None:
             self.atomic_configuration = restored_configuration
         elif restored_configuration is not None and restored_configuration != self.atomic_configuration:
@@ -517,6 +550,14 @@ class MetropolisSampler(nn.Module):
         self.atomic_configuration = _configuration_on(self.atomic_configuration, self._generator_device, self.dtype)
         walkers = state["walkers"]
         self._walkers = None if walkers is None else walkers.to(device=self._generator_device)
+        if self._walkers is not None and self.system is not None:
+            # Rebind the resumed chain to the validated sampler-owned
+            # descriptor.  This makes reset() and continuation retain the
+            # sector guard even when a legacy checkpoint omitted aux metadata.
+            self._walkers = replace(
+                self._walkers,
+                aux={**self._walkers.aux, "system": self.system},
+            )
         if self._walkers is not None and self.atomic_configuration is not None:
             # Normalize to the single resolved reference so reset()/inference
             # never see two distinct-but-equal AtomicConfiguration instances.
