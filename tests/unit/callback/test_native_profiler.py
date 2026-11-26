@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import hashlib
 import os
 import json
@@ -10,6 +11,8 @@ import pickle
 import subprocess
 import sys
 import warnings
+import weakref
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -33,6 +36,7 @@ from tpen.observability_artifacts import (
 )
 import tpen.observability_artifacts as observability_artifacts
 from tpen.observability_reconciliation import reconcile_run_observability
+from tpen.callback.native_profiler import _TorchProfilerBackend
 from tpen.sampling.events import SamplerBurnIn, SamplerProduction
 from tpen.training.events import CollectSamples, TrainingIteration
 
@@ -179,6 +183,178 @@ def test_fake_backend_is_started_stepped_and_stopped(tmp_path) -> None:
 def test_summary_is_bounded() -> None:
     backend = _FakeBackend()
     assert len(TorchOperatorSummary(max_rows=3).rows(backend)) == 3
+
+
+def test_real_torch_streaming_summary_matches_key_averages() -> None:
+    """Streaming rows preserve Torch's bounded CPU aggregate semantics."""
+
+    import torch
+
+    from torch.profiler import ProfilerActivity, profile
+
+    raw = profile(activities=[ProfilerActivity.CPU], record_shapes=False)
+    raw.start()
+    for index in range(70):
+        with torch.profiler.record_function(f"streaming_equivalence_{index}"):
+            value = torch.ones(8)
+            _ = value + 1
+    raw.stop()
+
+    backend = _TorchProfilerBackend(raw, torch.profiler.record_function)
+    streaming = backend.streaming_rows()
+    expected = list(raw.key_averages())
+    assert len(expected) > 64
+    assert len(streaming) == len(expected)
+    for actual, reference in zip(streaming[:64], expected[:64]):
+        assert actual.key == str(reference.key)
+        assert actual.count == reference.count
+        assert actual.cpu_time_total_us == pytest.approx(reference.cpu_time_total)
+        assert actual.self_cpu_time_total_us == pytest.approx(
+            reference.self_cpu_time_total
+        )
+        assert str(actual) == str(reference)
+    summary = TorchOperatorSummary(max_rows=64)
+    rows, total_rows, truncated = summary.collect(backend)
+    assert total_rows == len(expected)
+    assert truncated is True
+    assert len(rows) == 64
+    assert [row["name"] for row in rows] == [str(row.key) for row in expected[:64]]
+
+
+def test_real_torch_window_close_does_not_retain_kineto_cycle(tmp_path) -> None:
+    """Diagnose Torch 2.11's bound-method action_map retention after release."""
+
+    import torch
+
+    def has_kineto(raw_ref: weakref.ReferenceType[object]) -> bool:
+        raw = raw_ref()
+        retained = bool(
+            raw is not None
+            and raw.profiler is not None
+            and raw.profiler.kineto_results is not None
+        )
+        del raw
+        return retained
+
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+    )
+    context = make_run_context(tmp_path)
+    was_enabled = gc.isenabled()
+    pre_gc_retained = False
+    raw_ref: weakref.ReferenceType[object] | None = None
+    gc.disable()
+    try:
+        with callback.run_scope(context) as session:
+            callback.handle_occurrence(
+                Occurrence(Started(TrainingIteration(0)), 1), context
+            )
+            backend = session.backend
+            assert isinstance(backend, _TorchProfilerBackend)
+            raw_ref = weakref.ref(backend._raw)
+            del backend
+            with torch.profiler.record_function("retention_probe"):
+                _ = torch.ones(2) + 1
+            callback.handle_occurrence(
+                Occurrence(Ended(TrainingIteration(0)), 1), context
+            )
+            assert session.backend is None
+            # Do not collect before this observation: this distinguishes an
+            # ordinary release from a cycle that cyclic GC can break.
+            assert raw_ref is not None
+            pre_gc_retained = has_kineto(raw_ref)
+    finally:
+        gc.collect()
+        if was_enabled:
+            gc.enable()
+    assert not pre_gc_retained
+
+
+def test_window_close_releases_backend_and_preserves_post_window_diagnostics(tmp_path) -> None:
+    backend = _FakeBackend()
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        backend_factory=lambda: backend,
+    )
+    context = make_run_context(tmp_path)
+    primary = RuntimeError("application failed after profile window")
+    with pytest.raises(RuntimeError, match="application failed"):
+        with callback.run_scope(context) as session:
+            callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
+            callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
+            assert session.backend is None
+            callback.handle_occurrence(Occurrence(Started(TrainingIteration(1)), 1), context)
+            callback.handle_occurrence(Occurrence(Ended(TrainingIteration(1)), 1), context)
+            raise primary
+
+    status = json.loads(next(context.run_dir.rglob("profile-status.json")).read_text())
+    assert status["observed_event_counts"]["TrainingIteration"] == 2
+    assert "overshoot_steps=1" in status["activity_diagnostics"]
+    assert "application_error=RuntimeError" in status["activity_diagnostics"]
+
+
+def test_error_during_window_extracts_summary_and_releases_backend(tmp_path) -> None:
+    backend = _FakeBackend()
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 2),
+        backend_factory=lambda: backend,
+    )
+    context = make_run_context(tmp_path)
+    primary = RuntimeError("application failed during profile window")
+    with pytest.raises(RuntimeError, match="application failed"):
+        with callback.run_scope(context) as session:
+            callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
+            assert session.backend is not None
+            raise primary
+    assert session.backend is None
+    summary = json.loads(next(context.run_dir.rglob("summary.json")).read_text())
+    status = json.loads(next(context.run_dir.rglob("profile-status.json")).read_text())
+    assert summary["total_rows"] == 20
+    assert "application_error=RuntimeError" in status["activity_diagnostics"]
+    assert status["data_completeness"] == "partial"
+
+
+def test_torch_streaming_backend_missing_kineto_results_fails_without_fallback(tmp_path) -> None:
+    class _InnerWithoutKineto:
+        kineto_results: object | None = None
+
+    class _RawWithoutKineto:
+        action_map: dict[object, list[object]] = {}
+        profiler = _InnerWithoutKineto()
+
+        def start(self) -> None:
+            pass
+
+        def step(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def key_averages(self) -> list[object]:
+            raise AssertionError("key_averages fallback must not run")
+
+        def export_chrome_trace(self, path: str) -> None:
+            del path
+
+    raw = _RawWithoutKineto()
+    backend = _TorchProfilerBackend(raw, lambda _label: nullcontext())
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+        backend_factory=lambda: backend,
+    )
+    context = make_run_context(tmp_path)
+    with callback.run_scope(context):
+        callback.handle_occurrence(Occurrence(Started(TrainingIteration(0)), 1), context)
+        callback.handle_occurrence(Occurrence(Ended(TrainingIteration(0)), 1), context)
+    status = json.loads(next(context.run_dir.rglob("profile-status.json")).read_text())
+    assert status["export_status"] == "failed"
+    assert status["data_completeness"] == "partial"
+    assert any(item.startswith("summary_failed:RuntimeError") for item in status["activity_diagnostics"])
 
 
 def test_chrome_trace_export_is_fixed_and_published_to_both_refs(tmp_path) -> None:
@@ -858,7 +1034,7 @@ def test_backend_failures_clear_session_and_preserve_primary(failure: str, tmp_p
 def test_real_torch_profiler_adapter_emits_phases_and_fixed_ranges(
     warmup_steps: int, tmp_path
 ) -> None:
-    """The CPU adapter must use module-level record_function on Cannon's torch."""
+    """The CPU adapter must use module-level record_function on the pinned Torch 2.11 build."""
 
     import torch
     from torch.profiler import ProfilerAction
