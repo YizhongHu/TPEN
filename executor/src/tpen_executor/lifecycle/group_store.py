@@ -1,4 +1,7 @@
-"""Fail-closed creation and reopening of one canonical execution group store."""
+"""Fail-closed creation and reopening of one canonical execution group store.
+
+Allocation/controller incarnation is admitted only through the controller-generation fence.
+"""
 
 from __future__ import annotations
 
@@ -25,7 +28,6 @@ class CanonicalGroupBinding:
     schema: ClassVar[str] = "tpen-executor/canonical-group-binding-v1"
     group_identity: str
     execution_bundle_digest: str
-    allocation_lineage: str
     deployment_lineage: str
     controller_lineage: str
 
@@ -33,7 +35,7 @@ class CanonicalGroupBinding:
         object.__setattr__(self, "group_identity", sha256_text(self.group_identity, "group_identity"))
         object.__setattr__(self, "execution_bundle_digest", sha256_text(self.execution_bundle_digest, "execution_bundle_digest"))
         object.__setattr__(self, "controller_lineage", sha256_text(self.controller_lineage, "controller_lineage"))
-        for name in ("allocation_lineage", "deployment_lineage"):
+        for name in ("deployment_lineage",):
             object.__setattr__(self, name, text(getattr(self, name), name))
 
     @property
@@ -46,7 +48,6 @@ class CanonicalGroupBinding:
             "schema": self.schema,
             "group_identity": self.group_identity,
             "execution_bundle_digest": self.execution_bundle_digest,
-            "allocation_lineage": self.allocation_lineage,
             "deployment_lineage": self.deployment_lineage,
             "controller_lineage": self.controller_lineage,
         }
@@ -56,11 +57,10 @@ class CanonicalGroupBinding:
 
     @classmethod
     def from_mapping(cls, data: Any) -> "CanonicalGroupBinding":
-        fields(data, {"schema", "group_identity", "execution_bundle_digest", "allocation_lineage",
-                      "deployment_lineage", "controller_lineage"},
+        fields(data, {"schema", "group_identity", "execution_bundle_digest", "deployment_lineage", "controller_lineage"},
                cls.schema, cls.__name__)
-        return cls(data["group_identity"], data["execution_bundle_digest"], data["allocation_lineage"],
-                   data["deployment_lineage"], data["controller_lineage"])
+        return cls(data["group_identity"], data["execution_bundle_digest"], data["deployment_lineage"],
+                   data["controller_lineage"])
 
     @classmethod
     def decode(cls, data: bytes | str | dict[str, Any]) -> "CanonicalGroupBinding":
@@ -73,7 +73,6 @@ class InitialGroupStoreRequest:
 
     group: ReadyGroupV2
     execution_bundle_digest: str
-    allocation_lineage: str
     deployment_lineage: str
     controller: ControllerGenerationV1
     controller_lineage_anchor: str | None = None
@@ -85,7 +84,6 @@ class ReentryGroupStoreRequest:
 
     group: ReadyGroupV2
     execution_bundle_digest: str
-    allocation_lineage: str
     deployment_lineage: str
     controller: ControllerGenerationV1
     controller_lineage_anchor: str | None = None
@@ -111,7 +109,7 @@ def _binding(request: InitialGroupStoreRequest | ReentryGroupStoreRequest, *, an
     if anchor is None:
         anchor = request.controller_lineage_anchor or controller.record_digest
     return CanonicalGroupBinding(request.group.identity, request.execution_bundle_digest,
-                                 request.allocation_lineage, request.deployment_lineage, anchor)
+                                 request.deployment_lineage, anchor)
 
 
 def initial(request: InitialGroupStoreRequest, root: str | os.PathLike[str]) -> GroupStoreResult:
