@@ -366,7 +366,7 @@ def _act50_gateway_rows(tmp_path: Path) -> tuple[dict[str, object], dict[str, ob
         include_smoke=False,
         auto_overlay=True,
     )
-    train_row = next(row for row in phase1_rows if row["kind"] == "train")
+    source_train_row = next(row for row in phase1_rows if row["kind"] == "train")
     phase1_hash = protocol.manifest_hash(phase1_rows)
     evidence = {
         "schema": protocol.CHECKPOINT_EVIDENCE_SCHEMA,
@@ -397,6 +397,13 @@ def _act50_gateway_rows(tmp_path: Path) -> tuple[dict[str, object], dict[str, ob
     checkpoint_file.parent.mkdir(parents=True)
     checkpoint_file.write_bytes(b"act50-checkpoint")
     eval_row["checkpoint_sha256"] = hashlib.sha256(checkpoint_file.read_bytes()).hexdigest()
+    # The production eval binding intentionally stores its checkpoint beneath
+    # the source train row's run directory.  Give the native train control a
+    # distinct test root so that checkpoint setup cannot turn it into a
+    # continuation before the admission assertion is exercised.
+    train_row = dict(source_train_row)
+    train_row["results_root"] = str(tmp_path / "native-train-results")
+    _refreeze_row_id(train_row)
     return train_row, eval_row
 
 
