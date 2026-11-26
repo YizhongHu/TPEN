@@ -221,7 +221,18 @@ def test_real_hydra_runner_constructs_and_executes_bounded_helper(
     monkeypatch.setattr(trainer_mod, "local_energy", spy_local)
     monkeypatch.setattr(helper_mod, "slice_flat_batch", spy_slice)
     context_helper = importlib.import_module("tests.helpers.run_context")
-    constructed.run(context_helper.make_run_context(tmp_path / "context", device="cpu"))
+    context = context_helper.make_run_context(tmp_path / "context", device="cpu")
+    walkers = constructed.sampler.initialize(8, device="cpu")
+    producer = trainer_mod._TrainerStepProducer(
+        trainer=constructed.trainer,
+        model=constructed.model,
+        hamiltonian_terms=constructed.hamiltonian_terms,
+        batch=walkers.make_batch(),
+        step=0,
+        context=context,
+        state=None,
+    )
+    producer._evaluate_detached_local_energy_with_output()
     assert chunk_calls == [3]
     assert tuple(row_sizes) == (3, 3, 2)
     assert local_calls == []
@@ -253,7 +264,18 @@ def test_real_hydra_runner_legacy_helper_is_single_unchunked_batch(
     monkeypatch.setattr(trainer_mod, "evaluate_local_energy_in_chunks", spy_chunked)
     monkeypatch.setattr(trainer_mod, "local_energy", spy_local)
     context_helper = importlib.import_module("tests.helpers.run_context")
-    constructed.run(context_helper.make_run_context(tmp_path / "context", device="cpu"))
+    context = context_helper.make_run_context(tmp_path / "context", device="cpu")
+    walkers = constructed.sampler.initialize(8, device="cpu")
+    producer = trainer_mod._TrainerStepProducer(
+        trainer=constructed.trainer,
+        model=constructed.model,
+        hamiltonian_terms=constructed.hamiltonian_terms,
+        batch=walkers.make_batch(),
+        step=0,
+        context=context,
+        state=None,
+    )
+    producer._evaluate_detached_local_energy_with_output()
     assert chunk_calls == []
     assert local_calls == [8]
 
