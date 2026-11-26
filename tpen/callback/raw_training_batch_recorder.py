@@ -1578,7 +1578,7 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
             walker_count=record.n_walkers,
             n_electrons=record.positions.shape[1],
             spatial_dim=record.positions.shape[2],
-            term_names=list(record.term_names),
+            term_names=sorted(record.term_names),
         )
         assert self._v3_writer is not None
         if scheduled:
