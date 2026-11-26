@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .._records import frozen_record
 from ..allocations import ConfiguredAllocation, ControllerGenerationV1
@@ -19,7 +19,6 @@ from ..environments import PreparedPythonEnvironment
 from ..storage import DirectoryStore
 from ..tasks import ConfiguredRun
 from ..recovery import CoreAdmissionPort, CoreAdmissionUnavailable, MemberRecoveryInputV2
-from ..programs import MaterializedProgram
 from .controller import GroupControllerFactsV1, GroupControllerOutcome, run_group_controller
 from .core_port import CoreAdmissionProcessRequest, ScienceProcessCoreAdmissionPort
 from .group_store import (
@@ -30,7 +29,9 @@ from .group_store import (
     initial,
     reentry,
 )
-from .local_executor import LocalLeafExecutor
+
+if TYPE_CHECKING:
+    from ..programs import MaterializedProgram
 
 
 @frozen_record
@@ -151,10 +152,14 @@ class GroupRuntimeDispatcher:
 
     def __init__(self, *, core_port: ScienceProcessCoreAdmissionPort | None = None,
                  controller_runner: Callable[..., Any] = run_group_controller,
-                 local_executor_factory: Callable[..., Any] = LocalLeafExecutor,
+                 local_executor_factory: Callable[..., Any] | None = None,
                  timeout: float = 30.0, core_timeout: float = 30.0) -> None:
         if type(timeout) not in (int, float) or timeout <= 0 or type(core_timeout) not in (int, float) or core_timeout <= 0:
             raise ValueError("timeouts must be positive")
+        if local_executor_factory is None:
+            from .local_executor import LocalLeafExecutor
+
+            local_executor_factory = LocalLeafExecutor
         self.core_port = ScienceProcessCoreAdmissionPort() if core_port is None else core_port
         self.controller_runner = controller_runner
         self.local_executor_factory = local_executor_factory
