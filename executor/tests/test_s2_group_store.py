@@ -18,7 +18,7 @@ from tpen_executor.lifecycle.group_store import (
 MUTANTS = [
     {"id": "root-exists", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "os.mkdir(root_path)", "new": "pass", "killer": "test_initial_existing_root_refuses"},
     {"id": "manifest-strict", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "store.manifest(request.group)", "new": "None", "killer": "test_manifest_reconstruction_refuses_foreign_component"},
-    {"id": "binding-missing", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "stored = store.read_canonical(_BINDING_PATH, CanonicalGroupBinding.decode)", "new": "stored = None", "killer": "test_missing_binding_refuses"},
+    {"id": "binding-read-from-store", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "stored = store.read_canonical(_BINDING_PATH, CanonicalGroupBinding.decode)", "new": "stored = _binding(request, anchor=store.controller_generations(request.group)[0].record_digest)", "killer": "test_missing_binding_refuses"},
     {"id": "binding-regular", "target": "executor/src/tpen_executor/storage.py", "old": "_require_regular(path, \"canonical receipt\")", "new": "pass", "killer": "test_symlink_binding_refuses"},
     {"id": "binding-canonical", "target": "executor/src/tpen_executor/storage.py", "old": "if payload != record.encode():", "new": "if False:", "killer": "test_noncanonical_binding_refuses"},
     {"id": "binding-exact", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "stored != expected", "new": "False", "killer": "test_foreign_binding_refuses"},
