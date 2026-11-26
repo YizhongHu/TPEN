@@ -11,7 +11,7 @@ from tpen_executor._codec import digest
 from tpen_executor.allocations import ControllerGenerationV1
 from tpen_executor.contracts import ExecutionPlanV2, GroupId, ProgramSpecRef, ReadyGroupV2, TaskSpec, AllocationId, BackendJobId
 from tpen_executor.lifecycle.group_store import (
-    GroupStoreRefused, InitialGroupStoreRequest, ReentryGroupStoreRequest, initial, reentry,
+    CanonicalGroupBinding, GroupStoreRefused, InitialGroupStoreRequest, ReentryGroupStoreRequest, initial, reentry,
 )
 
 
@@ -22,6 +22,7 @@ MUTANTS = [
     {"id": "binding-regular", "target": "executor/src/tpen_executor/storage.py", "old": "_require_regular(path, \"canonical receipt\")", "new": "pass", "killer": "test_symlink_binding_refuses"},
     {"id": "binding-canonical", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "stored.encode() != Path(os.path.join(store.root, _BINDING_PATH)).read_bytes()", "new": "False", "killer": "test_noncanonical_binding_refuses"},
     {"id": "binding-exact", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "stored != expected", "new": "False", "killer": "test_foreign_binding_refuses"},
+    {"id": "binding-ledger-anchor", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "stored.controller_lineage != generations[0].record_digest", "new": "False", "killer": "test_tampered_anchor_refuses_without_caller_anchor"},
     {"id": "authority-fence", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "acquired = store.acquire_controller_generation(request.group, request.controller)", "new": "acquired = request.controller", "killer": "test_stale_controller_refuses"},
     {"id": "fresh-invocation", "target": "executor/src/tpen_executor/lifecycle/group_store.py", "old": "uuid4().hex", "new": "'fixed'", "killer": "test_reentry_gets_fresh_invocation_location"},
 ]
@@ -186,6 +187,18 @@ def test_deployment_and_controller_lineage_mismatch_refuse(tmp_path):
     with pytest.raises(GroupStoreRefused): reentry(_request(group, controller, deployment_lineage="foreign"), root)
     assert _tree(tmp_path) == before
     with pytest.raises(GroupStoreRefused): reentry(_request(group, controller, controller_lineage_anchor="d" * 64), root)
+    assert _tree(tmp_path) == before
+
+
+def test_tampered_anchor_refuses_without_caller_anchor(tmp_path):
+    group, controller = _fixture(); root = tmp_path / "store"
+    created = initial(InitialGroupStoreRequest(group, "c" * 64, "allocation-lineage", "deployment-lineage", controller), root)
+    path = root / "group-binding.json"
+    path.write_bytes(CanonicalGroupBinding(created.binding.group_identity, created.binding.execution_bundle_digest,
+                                           created.binding.allocation_lineage, created.binding.deployment_lineage,
+                                           "d" * 64).encode())
+    before = _tree(tmp_path)
+    with pytest.raises(GroupStoreRefused): reentry(_request(group, controller), root)
     assert _tree(tmp_path) == before
 
 

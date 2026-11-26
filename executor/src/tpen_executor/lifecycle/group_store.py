@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 from uuid import uuid4
 
-from .._codec import canonical_bytes, decode_json, digest, fields, sha256_text, text
+from .._codec import canonical_bytes, decode_json, fields, sha256_text, text
 from .._records import frozen_record
 from ..allocations import ControllerGenerationV1
 from ..contracts import ReadyGroupV2
@@ -109,7 +109,7 @@ def _binding(request: InitialGroupStoreRequest | ReentryGroupStoreRequest, *, an
     if controller.group_id != request.group.group_id:
         raise GroupStoreRefused("controller group mismatch")
     if anchor is None:
-        anchor = request.controller_lineage_anchor or digest(controller.to_dict())
+        anchor = request.controller_lineage_anchor or controller.record_digest
     return CanonicalGroupBinding(request.group.identity, request.execution_bundle_digest,
                                  request.allocation_lineage, request.deployment_lineage, anchor)
 
@@ -119,7 +119,7 @@ def initial(request: InitialGroupStoreRequest, root: str | os.PathLike[str]) -> 
     if not isinstance(request, InitialGroupStoreRequest):
         raise TypeError("initial requires InitialGroupStoreRequest")
     if (request.controller_lineage_anchor is not None
-            and request.controller_lineage_anchor != digest(request.controller.to_dict())):
+            and request.controller_lineage_anchor != request.controller.record_digest):
         raise GroupStoreRefused("initial controller lineage anchor is foreign")
     binding = _binding(request)
     root_path = os.path.abspath(os.path.normpath(os.fspath(root)))
@@ -151,7 +151,13 @@ def reentry(request: ReentryGroupStoreRequest, root: str | os.PathLike[str]) -> 
         # truncated, or symlinked components before admission proceeds.
         store.manifest(request.group)
         stored = store.read_canonical(_BINDING_PATH, CanonicalGroupBinding.decode)
-        expected = _binding(request, anchor=request.controller_lineage_anchor or stored.controller_lineage)
+        generations = store.controller_generations(request.group)
+        if not generations or stored.controller_lineage != generations[0].record_digest:
+            raise GroupStoreRefused("group binding crosses controller generation-one ledger")
+        if (request.controller_lineage_anchor is not None
+                and request.controller_lineage_anchor != generations[0].record_digest):
+            raise GroupStoreRefused("controller lineage anchor is foreign")
+        expected = _binding(request, anchor=generations[0].record_digest)
         if stored != expected or stored.encode() != Path(os.path.join(store.root, _BINDING_PATH)).read_bytes():
             raise GroupStoreRefused("group binding mismatch or non-canonical bytes")
         # The immutable binding carries only the stable lineage anchor.  The

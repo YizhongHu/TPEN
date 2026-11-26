@@ -509,6 +509,14 @@ class DirectoryStore:
             previous = record
         return [record for _, record in records]
 
+    def controller_generations(self, group: ReadyGroupV2 | GroupId) -> list[ControllerGenerationV1]:
+        """Read the complete store-owned controller chain under its lock."""
+        directory = self._controller_dir(group)
+        group_id = group.group_id if isinstance(group, ReadyGroupV2) else group
+        _require_directory(directory, "controller ledger", ControllerGenerationRejected)
+        with _task_lock(os.path.join(directory, _CONTROLLER_LOCK)):
+            return self._controller_records(directory, group_id)
+
     def _prepare_controller_dir(self, group: ReadyGroupV2) -> str:
         """Create and durably publish the controller ledger ancestry."""
         directory = self._controller_dir(group)
