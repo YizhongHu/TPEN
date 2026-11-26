@@ -17,8 +17,13 @@ if _REPO_ROOT not in sys.path:
 
 from tpen.run import run_from_config
 from experiments.atomistic.stage1.protocol import (
+    MaterializedConfigAdmission,
+    compose_model_profile,
+    is_hooke2_act50_profile,
+    load_materialized_config,
     resolve_config_path,
     row_config_values,
+    validate_materialized_admission,
     validate_gateway_binding,
 )
 from experiments.toolkit.run_paths import resolve_run_dir
@@ -50,12 +55,29 @@ def build_eval_config(
 ) -> DictConfig:
     """Compose one eval row with its output slot filled from the row."""
 
+    cfg, _ = _build_eval_config(row, config_path=config_path, overrides=overrides)
+    return cfg
+
+
+def _build_eval_config(
+    row: Mapping[str, object], *, config_path: str | Path | None = None,
+    overrides: Sequence[str] | None = None,
+) -> tuple[DictConfig, MaterializedConfigAdmission | None]:
+    """Build an eval config and retain materialized admission identity."""
+
+    if "row_extension" in row:
+        if config_path is not None or overrides:
+            raise ValueError("materialized rows do not accept native config/override inputs")
+        cfg, admission = load_materialized_config(row, expected_kind="eval")
+        return cfg, admission
+
     selected_config = resolve_config_path(config_path or str(row.get("config", "")))
     if not selected_config.is_file():
         raise FileNotFoundError(f"Stage-1 config path does not exist: {selected_config}")
     from tpen.run import load_config
 
     cfg = load_config(str(selected_config))
+    compose_model_profile(cfg, str(row.get("science_profile")) if row.get("science_profile") else None)
     _bind_output_identity(cfg, row)
     cfg = OmegaConf.merge(cfg, OmegaConf.create(row_config_values(row)))
     # Kept solely for the pinned pre-LR-2 restart adapter; the real eval
@@ -65,7 +87,7 @@ def build_eval_config(
     # Keep the row authoritative for artifact placement if a compatibility
     # caller supplied a contradictory run.root override.
     _bind_output_identity(cfg, row)
-    return cfg
+    return cfg, None
 
 
 def _config_run_dir(cfg: DictConfig) -> Path:
@@ -94,6 +116,31 @@ def _refuse_existing_eval_run(cfg: DictConfig) -> None:
         )
 
 
+def _refuse_cross_variant_checkpoint(cfg: DictConfig, row: Mapping[str, object]) -> None:
+    """Refuse a checkpoint from another ACT50 model before creating eval output."""
+
+    profile = row.get("science_profile")
+    if not is_hooke2_act50_profile(profile):
+        return
+    checkpoint_dir = Path(str(row["checkpoint_dir"]))
+    manifest_path = checkpoint_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise EvalRunRefusal(
+            f"ACT50 checkpoint compatibility manifest is missing: {manifest_path}"
+        )
+    # Keep checkpoint internals lazy for the outside-checkout driver probe.
+    from experiments.toolkit.checkpoint_compat import (
+        checkpoint_model_config_hash,
+        config_model_config_hash,
+    )
+    expected = config_model_config_hash(cfg)
+    actual = checkpoint_model_config_hash(checkpoint_dir)
+    if expected is None or actual is None or expected != actual:
+        raise EvalRunRefusal(
+            "ACT50 refuses a checkpoint from a different model profile before eval writes"
+        )
+
+
 def main() -> int:
     """Run evaluation through the public gateway with model-only restore."""
 
@@ -101,9 +148,14 @@ def main() -> int:
     parser.add_argument("--binding", required=True)
     args = parser.parse_args()
     row = validate_gateway_binding(binding=args.binding, expected_kinds={"eval"})
-    cfg = build_eval_config(row)
-    config_path = resolve_config_path(str(row["config"]))
+    cfg, admission = _build_eval_config(row)
+    config_path = admission.rendered_path if admission is not None else resolve_config_path(str(row["config"]))
+    _refuse_cross_variant_checkpoint(cfg, row)
     _refuse_existing_eval_run(cfg)
+    if admission is not None:
+        # Recheck the retained bytes and mapping immediately before the public
+        # gateway so a post-admission replacement cannot be executed.
+        validate_materialized_admission(cfg, row, admission)
     # The config/launcher supplies the strict model-only restore policy; this
     # driver does not import checkpoint internals or silently alter identity.
     return run_from_config(cfg, config_path=str(config_path), command="stage1 eval")
