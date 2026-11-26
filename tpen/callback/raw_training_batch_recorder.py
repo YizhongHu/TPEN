@@ -768,7 +768,9 @@ class TrainingBatchReader:
                 return
         if require_complete:
             raise ValueError("require_complete is unavailable for legacy training histories")
-        self._read_legacy(publish_provenance=not self._has_read_view)
+        # Legacy validation deliberately republishes the current manifest view.
+        # The read-view retention policy is a v3-only behavior.
+        self._read_legacy()
 
     @property
     def completion(self) -> dict[str, int] | None:
