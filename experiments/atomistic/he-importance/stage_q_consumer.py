@@ -1,8 +1,11 @@
 """Consume one committed Stage-Q result as one logical HI sample."""
 from __future__ import annotations
 from dataclasses import fields, is_dataclass
-import hashlib, importlib, json, re
+import hashlib
+import importlib
+import json
 from pathlib import Path
+import re
 from typing import Any, Callable, Mapping
 
 class StageQConsumerError(ValueError):
@@ -32,7 +35,10 @@ def _record(value: Any) -> Any:
     raise StageQConsumerError("reader returned an invalid evidence record")
 
 def _canonical_cell(path: Path, row_id: str) -> tuple[dict[str, Any], str]:
-    raw = path.read_bytes()
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise StageQConsumerError("selection receipt is unreadable") from error
     try: value = json.loads(raw)
     except json.JSONDecodeError as error: raise StageQConsumerError("selection receipt is invalid JSON") from error
     if not isinstance(value, dict): raise StageQConsumerError("selection receipt must be an object")
@@ -45,11 +51,21 @@ def _canonical_cell(path: Path, row_id: str) -> tuple[dict[str, Any], str]:
 
 def _checkpoint_core(segment: Any) -> tuple[Path, str]:
     checkpoint = Path(segment.checkpoint_dir)
-    if not checkpoint.is_absolute() or any(part in {".", ".."} for part in checkpoint.parts):
+    if (
+        str(checkpoint) != segment.checkpoint_dir
+        or not checkpoint.is_absolute()
+        or any(part in {".", ".."} for part in checkpoint.parts)
+    ):
         raise StageQConsumerError("selected checkpoint path is not normalized and absolute")
-    if checkpoint.parent.name != "checkpoints": raise StageQConsumerError("selected checkpoint is not under core/checkpoints")
-    core, resolved_checkpoint, resolved_core = checkpoint.parent.parent, checkpoint.resolve(), checkpoint.parent.parent.resolve()
-    if resolved_checkpoint == resolved_checkpoint.parent or resolved_checkpoint.parent.name != "checkpoints" or resolved_checkpoint.parent.parent != resolved_core:
+    if checkpoint.parent.name != "checkpoints":
+        raise StageQConsumerError("selected checkpoint is not under core/checkpoints")
+    core = checkpoint.parent.parent
+    resolved_checkpoint, resolved_core = checkpoint.resolve(), core.resolve()
+    if (
+        resolved_checkpoint == resolved_checkpoint.parent
+        or resolved_checkpoint.parent.name != "checkpoints"
+        or resolved_checkpoint.parent.parent != resolved_core
+    ):
         raise StageQConsumerError("selected checkpoint is not directly beneath its core")
     if len(core.parts) < 4 or core.name != "core" or core.parent.name != segment.attempt_id or core.parent.parent.name != segment.task_id:
         raise StageQConsumerError("selected checkpoint core identity mismatch")
@@ -85,7 +101,11 @@ def consume_stage_q(manifest_path: str | Path, campaign_root: str | Path, row_id
     if receipt.exists() or receipt.is_symlink(): raise StageQConsumerError("archive receipt already exists")
     c_path = campaign / "cells" / row_id / "selection_receipt.json"
     c_value, c_hash = _canonical_cell(c_path, row_id)
-    before = {str(c_path): c_hash, str(manifest): _digest(manifest)}
+    try:
+        manifest_hash = _digest(manifest)
+    except OSError as error:
+        raise StageQConsumerError("manifest is unreadable") from error
+    before = {str(c_path): c_hash, str(manifest): manifest_hash}
     reader = importlib.import_module("experiments.toolkit.run_results")
     try: results = reader.read(manifest, inspect_run=inspect_run)
     except TypeError: results = reader.read(manifest)
