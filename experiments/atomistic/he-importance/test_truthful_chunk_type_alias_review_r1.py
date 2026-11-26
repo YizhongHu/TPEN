@@ -45,6 +45,8 @@ def _cell(tmp_path: Path) -> object:
         ("top", 1.0),
         ("consumed", True),
         ("consumed", 1.0),
+        ("both", True),
+        ("both", 1.0),
     ],
 )
 def test_truthfulness_guard_rejects_bool_and_float_aliases_at_bound_one(
@@ -54,9 +56,9 @@ def test_truthfulness_guard_rejects_bool_and_float_aliases_at_bound_one(
 
     cell = _cell(tmp_path)
     config = train_config.resolve_train_config(cell, local_energy_chunk_size=1)
-    if limb == "top":
+    if limb in {"top", "both"}:
         config.trainer.local_energy_chunk_size = value
-    else:
+    if limb in {"consumed", "both"}:
         config.runner.trainer.local_energy_chunk_size = value
 
     with pytest.raises(run_stage_q.StageQSelectionError, match="local_energy_chunk_size"):
