@@ -40,6 +40,7 @@ class PilotProfile:
     score_chunk_size: int | None = None
     evaluation: bool = False
     checkpoint: int | None = None
+    train_timing_synchronize: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,9 +52,9 @@ class ComposedRow:
 
 
 R2_PROFILES = (
-    PilotProfile("r2-adam-100", "adam", 100, 512, (100,), "diagnostics-v2"),
-    PilotProfile("r2-soap-100", "soap", 100, 512, (100,), "diagnostics-v2"),
-    PilotProfile("r2-minsr64-100", "minsr64", 100, 512, (100,), "diagnostics-v2", 64),
+    PilotProfile("r2-adam-100", "adam", 100, 512, (100,), "diagnostics-v2", train_timing_synchronize=True),
+    PilotProfile("r2-soap-100", "soap", 100, 512, (100,), "diagnostics-v2", train_timing_synchronize=True),
+    PilotProfile("r2-minsr64-100", "minsr64", 100, 512, (100,), "diagnostics-v2", 64, train_timing_synchronize=True),
     PilotProfile("r2-minsr64-20", "minsr64", 20, 512, (20,), "diagnostics-v2", 64),
 )
 TARGET_PROFILES = (
@@ -119,23 +120,35 @@ def _callback(target: str, **values: Any) -> dict[str, Any]:
     return result
 
 
-def _callbacks(base: list[Mapping[str, Any]], family: str, profile: str) -> list[dict[str, Any]]:
-    callbacks = deepcopy(base)
+def _callbacks(base: list[Mapping[str, Any]], family: str, profile: str, *, synchronize: bool) -> list[dict[str, Any]]:
+    dynamic_targets = {
+        "tpen.callback.OptimizerState",
+        "tpen.callback.InitialCheckpoint",
+        "tpen.callback.ResourceUsage",
+        "tpen.callback.TrainPhaseTiming",
+        "tpen.callback.TrainStepTiming",
+        "tpen.callback.RunTiming",
+        "tpen.callback.RawTrainingBatchRecorder",
+        "tpen.callback.ParameterActivity",
+        "tpen.callback.Checkpoint",
+    }
+    callbacks = [item for item in deepcopy(base) if item.get("_target_") not in dynamic_targets]
     # The protocol requires OptimizerState for Adam/SOAP only.  This is a
     # policy derived from the P0 contract, not a Stage-1 optimizer branch.
-    callbacks = [item for item in callbacks if item.get("_target_") != "tpen.callback.OptimizerState"]
     if family in {"adam", "soap"}:
         callbacks.append(_callback("tpen.callback.OptimizerState", every_n_steps=1))
-    callbacks = [item for item in callbacks if item.get("_target_") != "tpen.callback.InitialCheckpoint"]
-    callbacks.insert(0, _callback("tpen.callback.InitialCheckpoint", output_dir="${run.dir}/checkpoints"))
+    callbacks.append(_callback("tpen.callback.RawTrainingBatchRecorder", path="${run.dir}/training_history", every_n_steps=50, partition_size_steps=1000))
+    callbacks.append(_callback("tpen.callback.Checkpoint", terminal=False, schedule={"_target_": "tpen.checkpoint.ExplicitUpdates", "updates": "${checkpoint_steps}"}, payload={"_target_": "tpen.checkpoint.TrainResume"}, output_dir="${run.dir}/checkpoints"))
+    callbacks.append(_callback("tpen.callback.InitialCheckpoint", output_dir="${run.dir}/checkpoints"))
+    callbacks.append(_callback("tpen.callback.ParameterActivity", output_path="${run.dir}/parameter_activity.json"))
     callbacks.append(_callback("tpen.callback.ResourceUsage", allocator_probe={"_target_": "tpen.accelerator.TorchAllocatorPeakProbe", "device": "${runtime.device}"}))
-    callbacks.append(_callback("tpen.callback.TrainPhaseTiming", every_n_steps=1, accelerator_synchronize=False))
-    callbacks.append(_callback("tpen.callback.TrainStepTiming", every_n_steps=1, rolling_window=20, accelerator_synchronize=False))
+    callbacks.append(_callback("tpen.callback.TrainPhaseTiming", every_n_steps=1, accelerator_synchronize=synchronize))
+    callbacks.append(_callback("tpen.callback.TrainStepTiming", every_n_steps=1, rolling_window=20, accelerator_synchronize=synchronize))
     for item in callbacks:
         if item.get("_target_") in {"tpen.callback.TrainPhaseTiming", "tpen.callback.TrainStepTiming"}:
             # R2/20, R1, and target keep synchronization disabled; the R2/100
             # callback rule is represented by RunTiming's synchronized clock.
-            item["accelerator_synchronize"] = False
+            item["accelerator_synchronize"] = synchronize
     callbacks.append(_callback("tpen.callback.RunTiming", accelerator_synchronize=True))
     return callbacks
 
@@ -159,6 +172,7 @@ def _load_base(path: Path) -> dict[str, Any]:
 
 def _materialize_train(profile: PilotProfile, *, results_root: str, run_id: str, source_sha: str, device: str) -> tuple[dict[str, Any], str]:
     config = _load_base(_TRAIN_BASE)
+    diagnostics = _load_base(_OVERLAY_BASE)
     optimizer, trainer = _optimizer_and_trainer(profile)
     _set(config, "run.root", results_root)
     _set(config, "run.run_id", run_id)
@@ -171,7 +185,10 @@ def _materialize_train(profile: PilotProfile, *, results_root: str, run_id: str,
     _set(config, "trainer", trainer)
     _set(config, "optimizer", optimizer)
     _set(config, "checkpoint_steps", list(profile.checkpoint_steps))
-    _set(config, "callbacks", _callbacks(config.get("callbacks", []), profile.family, profile.diagnostics_profile))
+    # Compose the committed base callbacks with the committed diagnostic
+    # profile.  The renderer only changes the explicitly declared pilot knobs;
+    # it does not invent a second smoke callback set.
+    _set(config, "callbacks", _callbacks(config.get("callbacks", []) + diagnostics.get("callbacks", []), profile.family, profile.diagnostics_profile, synchronize=profile.train_timing_synchronize))
     _set(config, "stage1_overlay", {"path": str(_OVERLAY_BASE), "sha256": sha256_file(_OVERLAY_BASE), "profile": profile.diagnostics_profile})
     config = _resolve_document(config)
     if any("${" in repr(value) or value == "???" for value in config.values()):
@@ -190,6 +207,9 @@ def _materialize_eval(*, results_root: str, run_id: str, checkpoint_dir: str, ch
     _set(config, "load.path", checkpoint_dir)
     _set(config, "trajectory_identity.checkpoint_file", checkpoint_file)
     config = _resolve_document(config)
+    load = config.get("load", {})
+    if load.get("mode") != "model_only" or load.get("strict") is not True or load.get("allow_protocol_mismatch") is not False:
+        raise ValueError("frozen evaluation must be strict model_only")
     return config, "eval"
 
 
@@ -234,12 +254,15 @@ def render_eval(*, output_dir: str | Path, results_root: str, source_sha: str, c
     config, _ = _materialize_eval(results_root=results_root, run_id=run_id, checkpoint_dir=checkpoint_dir, checkpoint_file="model.pt", source_sha=source_sha, device=device)
     rendered = _write_yaml(Path(output_dir) / "r2-soap-eval-100.yaml", config)
     parent = parent_row or {"row_id": "parent", "system": "hooke_pair_singlet_omega0.5", "system_id": "hooke_pair_singlet_omega0.5", "seed": 2435329684536531677, "source_sha": source_sha, "config_sha256": sha256_file(_EVAL_BASE), "results_root": results_root, "experiment_name": "stage1_hooke2", "sector": "atomistic", "device": device, "lineage": 0}
+    evaluation_sampler = config["evaluation_sampler"]
+    task = config["evaluation_tasks"]["mcmc_energy"]
+    generator = task["generator"]
     row = {
         "system": parent["system"], "system_id": parent["system_id"], "kind": "eval", "seed": 6348702091350892190,
         "source_sha": source_sha, "config_sha256": sha256_file(_EVAL_BASE), "config_identity_rule": "stage1-config-v1",
         "config": "configs/hooke2/eval.yaml", "results_root": results_root, "experiment_name": "stage1_hooke2", "sector": "atomistic",
-        "run_id": run_id, "updates": 100, "walkers": 4096, "device": device, "row_extension": {"version": "stage1-rendered-config/v1", "rendered_config": {"path": rendered.path, "sha256": rendered.sha256}, "diagnostics_profile": "diagnostics-v2"},
-        "lineage": parent.get("lineage", 0), "checkpoint": 100, "stream": 0, "draws": 256, "expected_physical_system_id": parent["system_id"],
+        "run_id": run_id, "updates": int(parent.get("updates", 100)), "walkers": int(evaluation_sampler["n_walkers"]), "device": device, "row_extension": {"version": "stage1-rendered-config/v1", "rendered_config": {"path": rendered.path, "sha256": rendered.sha256}, "diagnostics_profile": "diagnostics-v2"},
+        "lineage": parent.get("lineage", 0), "checkpoint": int(parent.get("updates", 100)), "stream": 0, "draws": int(generator["n_draws"]), "expected_physical_system_id": parent["system_id"],
         "checkpoint_dir": checkpoint_dir, "checkpoint_file": "model.pt", "checkpoint_sha256": checkpoint_sha256,
         "depends_on": parent["row_id"], "phase1_manifest_hash": canonical_hash([parent]), "phase1_train_row_hash": canonical_hash(parent),
     }

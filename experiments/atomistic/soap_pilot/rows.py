@@ -66,6 +66,17 @@ def _path(value: Any, field_name: str) -> str:
     return value
 
 
+def _contained(path: Path, root: Path, field_name: str) -> None:
+    """Reject lexical, sibling-prefix, and symlink escapes from an input root."""
+
+    try:
+        path.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except (FileNotFoundError, ValueError) as exc:
+        raise RowContractError(f"{field_name} escapes its admitted root") from exc
+    if path.resolve() == root.resolve():
+        raise RowContractError(f"{field_name} must name a file below its admitted root")
+
+
 @dataclass(frozen=True)
 class RenderedConfig:
     """One immutable rendered/resolved configuration artifact."""
@@ -108,6 +119,21 @@ class CheckpointEvidence:
     complete: bool
     files: Mapping[str, str]
 
+    def validate(self, *, expected_step: int | None = None) -> None:
+        """Validate the named publication without discovering sibling files."""
+
+        if type(self.step) is not int or self.step < 0:
+            raise RowContractError("checkpoint step must be a non-negative integer")
+        if expected_step is not None and self.step != expected_step:
+            raise RowContractError("checkpoint step does not match the parent schedule")
+        if not self.publication_id or not isinstance(self.publication_id, str):
+            raise RowContractError("checkpoint publication identity is required")
+        _sha(self.model_sha256, "checkpoint model SHA")
+        if not self.complete:
+            raise RowContractError("checkpoint publication is not COMPLETE")
+        if not isinstance(self.files, Mapping) or "model.pt" not in self.files or "COMPLETE" not in self.files:
+            raise RowContractError("checkpoint publication must name model.pt and COMPLETE")
+
 
 @dataclass(frozen=True)
 class CampaignMember:
@@ -144,6 +170,24 @@ class ComparisonGroup:
             raise RowContractError("initialization and sampler seeds must be distinct")
         if len({member.invocation_id for member in self.members}) != len(self.members):
             raise RowContractError("comparison members must be distinct invocations")
+
+
+def validate_seed_domain(rows: list[Mapping[str, Any]], *, matched_invocations: set[str] | None = None) -> None:
+    """Reject seed/domain collisions outside an explicit matched comparison.
+
+    The native global seed rule is not relaxed: matched reuse is allowed only
+    when the caller names every invocation in one comparison group.
+    """
+
+    matched_invocations = matched_invocations or set()
+    seen: dict[tuple[Any, Any], str] = {}
+    for row in rows:
+        invocation = row.get("invocation_id", row.get("run_id"))
+        key = (row.get("seed"), row.get("sampler_seed", row.get("stream")))
+        previous = seen.get(key)
+        if previous is not None and not ({previous, invocation} <= matched_invocations):
+            raise RowContractError(f"seed/domain collision between {previous!r} and {invocation!r}")
+        seen[key] = invocation
 
 
 TRAIN_KEYS = frozenset({
@@ -192,6 +236,9 @@ def validate_row(row: Mapping[str, Any], *, expected_kind: str | None = None) ->
     rendered_path = Path(rendered["path"])
     if not rendered_path.is_file():
         raise RowContractError("rendered_config.path must name an existing regular file")
+    results_root = Path(row.get("results_root", ""))
+    if results_root.is_absolute():
+        _contained(rendered_path, results_root / "inputs", "rendered_config.path")
     if sha256_file(rendered_path) != rendered["sha256"]:
         raise RowContractError("rendered_config.sha256 does not match the named bytes")
     if ext.get("diagnostics_profile") not in {"diagnostics-v1", "diagnostics-v2"}:
@@ -207,8 +254,10 @@ def validate_row(row: Mapping[str, Any], *, expected_kind: str | None = None) ->
         checkpoints = row.get("checkpoint_steps")
         if not isinstance(checkpoints, list) or not checkpoints or any(type(x) is not int or x <= 0 for x in checkpoints):
             raise RowContractError("checkpoint_steps must be positive integers")
-        if len(set(checkpoints)) != len(checkpoints) or row["updates"] not in checkpoints:
+        if checkpoints != sorted(checkpoints) or len(set(checkpoints)) != len(checkpoints) or row["updates"] not in checkpoints:
             raise RowContractError("checkpoint_steps must be unique and include updates")
+        if "overlay_profile" in row and row["overlay_profile"] != ext["diagnostics_profile"]:
+            raise RowContractError("overlay_profile must match diagnostics_profile")
     else:
         for key in ("checkpoint", "stream", "draws"):
             _int(row.get(key), key, positive=key == "draws")
@@ -230,6 +279,8 @@ def make_parent_join(*, campaign_id: str, invocation_id: str, row: Mapping[str, 
     """Create a parent join after validating a singleton train row."""
 
     validate_row(row, expected_kind="train")
+    if not campaign_id or not invocation_id:
+        raise RowContractError("campaign and invocation identities are required")
     ext = row["row_extension"]
     return ParentJoin(
         campaign_id=campaign_id,
@@ -248,12 +299,15 @@ def make_eval_row(*, train_row: Mapping[str, Any], parent: ParentJoin, checkpoin
                   rendered: RenderedConfig, row_base: Mapping[str, Any]) -> dict[str, Any]:
     """Build an eval row joined to actual parent and publication evidence."""
 
-    if not checkpoint.complete:
-        raise RowContractError("cannot create an eval row from an incomplete publication")
+    checkpoint.validate()
     if checkpoint.step not in parent.checkpoint_steps:
         raise RowContractError("checkpoint is not in the parent schedule")
     if parent.row_id != train_row.get("row_id"):
         raise RowContractError("parent row does not match train row")
+    if parent.manifest_hash != manifest_hash([dict(train_row)]) or parent.train_row_hash != canonical_hash(dict(train_row)):
+        raise RowContractError("parent hashes do not match the actual singleton row")
+    if parent.source_sha != train_row.get("source_sha") or parent.rendered_config_sha256 != train_row["row_extension"]["rendered_config"]["sha256"]:
+        raise RowContractError("parent provenance does not match the actual train row")
     result = dict(row_base)
     result.update({
         "kind": "eval", "system": train_row["system"], "system_id": train_row["system_id"],
@@ -276,5 +330,5 @@ def make_eval_row(*, train_row: Mapping[str, Any], parent: ParentJoin, checkpoin
 __all__ = [
     "CampaignMember", "CheckpointEvidence", "ComparisonGroup", "EVAL_KEYS", "ParentJoin",
     "RenderedConfig", "RowContractError", "TRAIN_KEYS", "canonical_hash", "make_eval_row",
-    "make_parent_join", "manifest_hash", "row_id", "sha256_file", "validate_row",
+    "make_parent_join", "manifest_hash", "row_id", "sha256_file", "validate_row", "validate_seed_domain",
 ]

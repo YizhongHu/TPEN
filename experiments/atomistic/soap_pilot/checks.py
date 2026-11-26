@@ -12,7 +12,7 @@ from enum import Enum
 import hashlib
 import math
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 
 class Verdict(str, Enum):
@@ -57,6 +57,14 @@ def _ok(name: str, detail: str, evidence: Mapping[str, Any] | None = None) -> Ch
     return CheckResult(name, Verdict.PASS, detail, evidence=evidence or {})
 
 
+def _compare(expected: Any, actual: Any, name: str, field: str) -> CheckResult | None:
+    if actual is None:
+        return _missing(name, f"missing {field}")
+    if expected != actual:
+        return _failure(name, f"{field} mismatch: expected={expected!r}, actual={actual!r}")
+    return None
+
+
 def _finite(value: Any) -> bool:
     try:
         return math.isfinite(float(value))
@@ -89,6 +97,252 @@ def check_resume_metric_keys(uninterrupted: Mapping[Any, Mapping[str, Any]] | No
             if left[key] != right[key]:
                 return _failure(name, f"step {step}: metric {key!r} differs")
     return _ok(name, f"exact logical state and metric keys at {len(overlap)} overlapping steps", {"steps": overlap})
+
+
+def check_resume_parity(
+    uninterrupted: Mapping[Any, Mapping[str, Any]] | None,
+    resumed: Mapping[Any, Mapping[str, Any]] | None,
+    *,
+    tolerances: Mapping[str, tuple[float, float]] | None = None,
+    discrete_fields: Sequence[str] = ("cursor", "step", "state"),
+) -> CheckResult:
+    """Check finite-first resume parity with exact state and field tolerances.
+
+    # Rev3 §3.1 sentence: “Same-chunk train_resume ... with identical N,
+    # chunk, max_steps and policies”; Rev3 §3.1 requires finite checks before
+    # field-specific atol/rtol comparisons and exact discrete state values.
+    """
+
+    name = "resume-finite-state-cursor-tolerance"
+    if uninterrupted is None or resumed is None:
+        return _missing(name, "uninterrupted and resumed evidence is required")
+    overlap = sorted(set(uninterrupted) & set(resumed))
+    if not overlap:
+        return _missing(name, "no overlapping steps were supplied")
+    tolerances = tolerances or {}
+    for step in overlap:
+        left, right = uninterrupted[step], resumed[step]
+        if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+            return _invalid(name, f"step {step!r} evidence is not a mapping")
+        if set(left) != set(right):
+            return _failure(name, f"step {step}: metric key sets differ; uninterrupted-only={sorted(set(left)-set(right))!r}; resumed-only={sorted(set(right)-set(left))!r}")
+        for key in left:
+            a, b = left[key], right[key]
+            if key in discrete_fields:
+                if a != b:
+                    return _failure(name, f"step {step}: discrete field {key!r} differs")
+                continue
+            if isinstance(a, (int, float)) or isinstance(b, (int, float)):
+                if not (_finite(a) and _finite(b)):
+                    return _failure(name, f"step {step}: metric {key!r} is non-finite")
+                atol, rtol = tolerances.get(key, (0.0, 0.0))
+                if abs(float(a) - float(b)) > atol + rtol * max(abs(float(a)), abs(float(b))):
+                    return _failure(name, f"step {step}: metric {key!r} exceeds tolerance", {"atol": atol, "rtol": rtol})
+            elif a != b:
+                return _failure(name, f"step {step}: metric {key!r} differs")
+    return _ok(name, f"finite-first resume parity passed at {len(overlap)} overlapping steps", {"steps": overlap, "tolerances": tolerances})
+
+
+def check_parent_join(expected: Mapping[str, Any] | None, actual: Mapping[str, Any] | None) -> CheckResult:
+    """Check an eval parent against the actual singleton train document.
+
+    # P0 §6 sentence: “P2 ... recomputes its row ID/full hashes ... A foreign
+    # parent ... refuses BEFORE launch.”
+    """
+
+    name = "parent-join"
+    if expected is None or actual is None:
+        return _missing(name, "expected and actual parent evidence are required")
+    for field in ("campaign_id", "invocation_id", "manifest_hash", "train_row_hash", "row_id", "source_sha", "rendered_config_sha256"):
+        mismatch = _compare(expected.get(field), actual.get(field), name, field)
+        if mismatch is not None:
+            return mismatch
+    return _ok(name, "parent join matches its singleton source and rendered identity")
+
+
+def check_profile(expected: Mapping[str, Any] | None, actual: Mapping[str, Any] | None) -> CheckResult:
+    """Reject profile/configuration drift, including missing or extra fields.
+
+    # P0 §6 sentence: “Each entry binds source, full row_id/full row hash,
+    # rendered bytes, input document hashes, run_id/results_root and diagnostic
+    # basis.”
+    """
+
+    name = "profile-identity"
+    if expected is None or actual is None:
+        return _missing(name, "expected and actual profile evidence are required")
+    if set(expected) != set(actual):
+        return _failure(name, f"profile key sets differ: expected-only={sorted(set(expected)-set(actual))!r}; actual-only={sorted(set(actual)-set(expected))!r}")
+    for field, value in expected.items():
+        mismatch = _compare(value, actual.get(field), name, field)
+        if mismatch is not None:
+            return mismatch
+    return _ok(name, "profile identity and all derived fields match")
+
+
+def check_config_identity(config: Mapping[str, Any] | None, *, rendered_bytes: bytes | None = None,
+                          expected_sha256: str | None = None) -> CheckResult:
+    """Verify the checked rendered bytes and resolved mapping identity.
+
+    # P0 §4.1 sentence: “Read the named rendered file once into bytes, hash
+    # those bytes and parse that same in-memory buffer.”
+    """
+
+    name = "rendered-config-identity"
+    if config is None or rendered_bytes is None or expected_sha256 is None:
+        return _missing(name, "config, checked bytes, and expected digest are required")
+    actual = hashlib.sha256(rendered_bytes).hexdigest()
+    if actual != expected_sha256:
+        return _failure(name, "rendered bytes do not match the admitted digest")
+    if not isinstance(config, Mapping) or not config:
+        return _invalid(name, "resolved rendered config is not a non-empty mapping")
+    return _ok(name, "rendered bytes and resolved mapping are admitted", {"sha256": actual})
+
+
+def check_checkpoint(expected_step: int | None, evidence: Mapping[str, Any] | None) -> CheckResult:
+    """Require the named complete publication and model-byte identity.
+
+    # Rev3 §4.2 sentence: “For each checkpoint read the exact scheduled step's
+    # manifest.json and the named publications.jsonl/publication_receipts.jsonl/latest.json.”
+    """
+
+    name = "checkpoint-publication"
+    if expected_step is None or evidence is None:
+        return _missing(name, "expected checkpoint step and publication evidence are required")
+    if evidence.get("step") != expected_step:
+        return _failure(name, "checkpoint step is not the scheduled step")
+    if evidence.get("complete") is not True:
+        return _missing(name, "checkpoint publication is not COMPLETE")
+    if not evidence.get("publication_id") or not evidence.get("model_sha256"):
+        return _missing(name, "checkpoint publication/model identity is missing")
+    files = evidence.get("files")
+    if not isinstance(files, Mapping) or "model.pt" not in files or "COMPLETE" not in files:
+        return _missing(name, "checkpoint manifest does not name model.pt and COMPLETE")
+    return _ok(name, "scheduled checkpoint publication is complete and named")
+
+
+def check_hash(expected: str | None, actual: str | None, *, name: str = "hash-identity") -> CheckResult:
+    """Compare a producer digest without treating shape-only hashes as proof."""
+
+    # P0 §6 sentence: “A claimed matching string triplet is not proof.”
+    if expected is None or actual is None:
+        return _missing(name, "both expected and actual hashes are required")
+    if not isinstance(expected, str) or not isinstance(actual, str):
+        return _invalid(name, "hash identities must be strings")
+    return _ok(name, "hash identity matches") if expected == actual else _failure(name, "hash identity mismatch")
+
+
+def check_seed_domain(rows: Sequence[Mapping[str, Any]] | None, *, matched_groups: Sequence[set[str]] = ()) -> CheckResult:
+    """Check seed/domain collisions while preserving explicit matched groups."""
+
+    # P0 §6 sentence: “A repeated seed outside declared matched membership is
+    # invalid, not silently accepted because documents differ.”
+    name = "seed-domain"
+    if rows is None:
+        return _missing(name, "seed-domain rows are required")
+    seen: dict[tuple[Any, Any], str] = {}
+    groups = [set(group) for group in matched_groups]
+    for row in rows:
+        invocation = row.get("invocation_id", row.get("run_id"))
+        key = (row.get("seed"), row.get("sampler_seed", row.get("stream")))
+        prior = seen.get(key)
+        if prior is not None and not any({prior, invocation} <= group for group in groups):
+            return _failure(name, f"seed/domain collision between {prior!r} and {invocation!r}")
+        seen[key] = invocation
+    return _ok(name, "seed/domain membership has no undeclared collision")
+
+
+def check_metric_integrity(metrics: Mapping[str, Any] | None, *, expected_dtypes: Mapping[str, str] | None = None) -> CheckResult:
+    """Reject NaN/Inf and dtype drift before any numerical comparison.
+
+    # Rev3 §3.1 sentence: “All floating model tensors must retain the
+    # configured float64 dtype. Compare EVERY non-floating model state value exactly.”
+    """
+
+    name = "metric-finite-dtype"
+    if metrics is None:
+        return _missing(name, "metric evidence is required")
+    expected_dtypes = expected_dtypes or {}
+    for key, value in metrics.items():
+        if isinstance(value, float) and not math.isfinite(value):
+            return _failure(name, f"metric {key!r} is non-finite")
+        dtype = getattr(value, "dtype", None)
+        if key in expected_dtypes and dtype is not None and str(dtype).replace("torch.", "") != expected_dtypes[key]:
+            return _failure(name, f"metric {key!r} dtype drifted")
+    return _ok(name, "metrics are finite and have the configured dtypes")
+
+
+def check_state_cursor_tolerance(actual: Mapping[str, Any] | None, expected: Mapping[str, Any] | None,
+                                 *, tolerances: Mapping[str, tuple[float, float]] | None = None) -> CheckResult:
+    """Check exact discrete state/cursor and declared numeric tolerances."""
+
+    # Rev3 §3.1 sentence: “finite/shape/dtype/discrete checks ... no
+    # tolerances may be widened after observation.”
+    if actual is None or expected is None:
+        return _missing("state-cursor-tolerance", "state and expected evidence are required")
+    tolerances = tolerances or {}
+    for key, expected_value in expected.items():
+        if key not in actual:
+            return _missing("state-cursor-tolerance", f"missing field {key!r}")
+        actual_value = actual[key]
+        if key in {"state", "cursor", "step", "dtype", "shape"}:
+            if actual_value != expected_value:
+                return _failure("state-cursor-tolerance", f"discrete field {key!r} drifted")
+            continue
+        if isinstance(expected_value, (int, float)):
+            if not (_finite(actual_value) and _finite(expected_value)):
+                return _failure("state-cursor-tolerance", f"field {key!r} is non-finite")
+            atol, rtol = tolerances.get(key, (0.0, 0.0))
+            if abs(float(actual_value)-float(expected_value)) > atol + rtol * max(abs(float(actual_value)), abs(float(expected_value))):
+                return _failure("state-cursor-tolerance", f"field {key!r} exceeds tolerance")
+        elif actual_value != expected_value:
+            return _failure("state-cursor-tolerance", f"field {key!r} differs")
+    return _ok("state-cursor-tolerance", "state/cursor exact and numeric fields within declared tolerances")
+
+
+def check_callbacks(config: Mapping[str, Any] | None, *, family: str, train_timing_synchronize: bool) -> CheckResult:
+    """Validate the profile-specific callback set from a rendered config.
+
+    # P0 callback sentence: “OptimizerState Adam/SOAP ONLY; ...
+    # TrainPhaseTiming/TrainStepTiming accelerator_synchronize=true for R2/100,
+    # false for R1/target and R2/20; RunTiming true throughout.”
+    """
+
+    name = "profile-callbacks"
+    if config is None or not isinstance(config.get("callbacks"), list):
+        return _missing(name, "rendered callback list is required")
+    callbacks = config["callbacks"]
+    targets = [item.get("_target_") for item in callbacks if isinstance(item, Mapping)]
+    has_optimizer_state = "tpen.callback.OptimizerState" in targets
+    if has_optimizer_state != (family in {"adam", "soap"}):
+        return _failure(name, "OptimizerState callback set does not match the optimizer family")
+    for target in ("tpen.callback.TrainPhaseTiming", "tpen.callback.TrainStepTiming"):
+        matching = [item for item in callbacks if isinstance(item, Mapping) and item.get("_target_") == target]
+        if len(matching) != 1 or matching[0].get("accelerator_synchronize") is not train_timing_synchronize:
+            return _failure(name, f"{target} synchronization policy drifted")
+    run_timing = [item for item in callbacks if isinstance(item, Mapping) and item.get("_target_") == "tpen.callback.RunTiming"]
+    if len(run_timing) != 1 or run_timing[0].get("accelerator_synchronize", True) is not True:
+        return _failure(name, "RunTiming must synchronize throughout")
+    return _ok(name, "rendered callback set matches the profile policy")
+
+
+def check_eval_metrics(evidence: Mapping[str, Any] | None) -> CheckResult:
+    """Reject metrics not configured by the frozen evaluation recipe.
+
+    # P0 §4.2 sentence: “That task's generator ... contains exactly the
+    # single cfg.evaluation_tasks.mcmc_energy mapping.”
+    """
+
+    name = "configured-evaluation-metrics"
+    if evidence is None:
+        return _missing(name, "evaluation metric evidence is required")
+    configured = evidence.get("configured_metric_keys")
+    observed = evidence.get("metric_keys")
+    if not isinstance(configured, (list, tuple, set)) or not isinstance(observed, (list, tuple, set)):
+        return _missing(name, "configured and observed metric-key sets are required")
+    if set(configured) != set(observed):
+        return _failure(name, f"evaluation metric keys differ: configured-only={sorted(set(configured)-set(observed))!r}; observed-only={sorted(set(observed)-set(configured))!r}")
+    return _ok(name, "evaluation metrics are exactly the configured set")
 
 
 def check_step_zero(values: Mapping[str, Any] | None) -> CheckResult:
@@ -205,10 +459,12 @@ def check_named_outputs(manifest: Mapping[str, Any] | None, root: str | Path | N
     entries = manifest.get("files")
     if not isinstance(entries, list) or not entries:
         return _missing(name, "declared output file list is missing")
+    declared_names: set[str] = set()
     for entry in entries:
         if not isinstance(entry, Mapping) or not isinstance(entry.get("path"), str) or not isinstance(entry.get("sha256"), str):
             return _invalid(name, "output entries must contain path and sha256")
         path = Path(entry["path"])
+        declared_names.add(str(path.resolve()))
         if root is not None:
             try:
                 path.resolve().relative_to(Path(root).resolve())
@@ -219,8 +475,16 @@ def check_named_outputs(manifest: Mapping[str, Any] | None, root: str | Path | N
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         if digest != entry["sha256"]:
             return _failure(name, f"declared output hash mismatch: {path}")
+        if entry.get("complete") is False:
+            return _missing(name, f"declared writer output is incomplete: {path}")
     if manifest.get("complete") is not True:
         return _missing(name, "output manifest is not marked COMPLETE")
+    complete = manifest.get("complete_path")
+    if complete is not None and not Path(complete).is_file():
+        return _missing(name, "writer COMPLETE marker is missing")
+    extra = manifest.get("present_undeclared")
+    if extra:
+        return _failure(name, f"present undeclared writer outputs: {extra!r}")
     return _ok(name, "all declared TPEN outputs exist with matching bytes and hashes")
 
 
@@ -239,7 +503,32 @@ def check_evaluation(evidence: Mapping[str, Any] | None) -> CheckResult:
         return _failure(name, "frozen evaluation is not strict/complete/finite/unclipped")
     if type(evidence["records"]) is not int or evidence["records"] <= 0:
         return _missing(name, "evaluation record count is absent or empty")
+    metric_result = check_eval_metrics(evidence)
+    if metric_result.verdict is not Verdict.PASS:
+        return metric_result
     return _ok(name, "frozen evaluation is strict, complete, finite, and unclipped")
+
+
+def check_path_containment(path: str | Path | None, root: str | Path | None) -> CheckResult:
+    """Refuse relative, missing, symlink, and sibling-prefix path escapes.
+
+    # P0 §3 sentence: “Reject lexical '..', relative/noncanonical paths,
+    # symlink escape and sibling-prefix tricks before opening/creating anything.”
+    """
+
+    name = "path-containment"
+    if path is None or root is None:
+        return _missing(name, "path and admitted root are required")
+    candidate, admitted = Path(path), Path(root)
+    if not candidate.is_absolute() or not admitted.is_absolute():
+        return _invalid(name, "path and root must be absolute")
+    try:
+        candidate.resolve(strict=True).relative_to(admitted.resolve(strict=True))
+    except (FileNotFoundError, ValueError):
+        return _invalid(name, "path escapes the admitted root")
+    if candidate.resolve() == admitted.resolve():
+        return _invalid(name, "path must be below the admitted root")
+    return _ok(name, "path is contained by the admitted root")
 
 
 def run_rung1_checks(evidence: Mapping[str, Any], *, config: Mapping[str, Any] | None = None) -> list[CheckResult]:
@@ -247,12 +536,15 @@ def run_rung1_checks(evidence: Mapping[str, Any], *, config: Mapping[str, Any] |
 
     return [
         check_resume_metric_keys(evidence.get("uninterrupted"), evidence.get("resumed")),
+        check_resume_parity(evidence.get("uninterrupted"), evidence.get("resumed"), tolerances=evidence.get("tolerances")),
         check_step_zero(evidence.get("step_zero")),
         check_model_float64(config or evidence.get("config"), evidence.get("checkpoints")),
         check_disconnected_optimizer_state(evidence.get("optimizer_state")),
         check_rendered_diff(config or evidence.get("config"), evidence.get("rendered_diff")),
         check_named_outputs(evidence.get("outputs"), evidence.get("outputs_root")),
         check_evaluation(evidence.get("evaluation")),
+        check_eval_metrics(evidence.get("evaluation")),
+        check_path_containment(evidence.get("outputs_root"), evidence.get("protected_root")) if evidence.get("protected_root") else _missing("path-containment", "protected_root is required"),
     ]
 
 
@@ -270,4 +562,11 @@ def summarize(results: Iterable[CheckResult]) -> dict[str, Any]:
     return {"overall": overall.value, "counts": counts, "checks": [result.__dict__ for result in results]}
 
 
-__all__ = ["CheckResult", "Verdict", "check_disconnected_optimizer_state", "check_evaluation", "check_model_float64", "check_named_outputs", "check_rendered_diff", "check_resume_metric_keys", "check_step_zero", "run_rung1_checks", "summarize"]
+__all__ = [
+    "CheckResult", "Verdict", "check_callbacks", "check_checkpoint", "check_config_identity",
+    "check_disconnected_optimizer_state", "check_eval_metrics", "check_evaluation", "check_hash",
+    "check_metric_integrity", "check_model_float64", "check_named_outputs", "check_parent_join",
+    "check_path_containment", "check_profile", "check_rendered_diff", "check_resume_metric_keys",
+    "check_resume_parity", "check_seed_domain", "check_state_cursor_tolerance", "check_step_zero",
+    "run_rung1_checks", "summarize",
+]
