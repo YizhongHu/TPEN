@@ -29,7 +29,7 @@ MUTANTS = [
     {"id": "timeout", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if outcome.timed_out:', "new": 'if False:', "killer": "test_timeout_is_unavailable"},
     {"id": "nonzero", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if outcome.returncode != 0:', "new": 'if False:', "killer": "test_nonzero_exit_is_unavailable"},
     {"id": "launch-failure", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'except (OSError, TypeError, ValueError, RuntimeError) as exc:', "new": 'except TypeError as exc:', "killer": "test_launch_failure_is_unavailable"},
-    {"id": "result-read-guard", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": "if not stat.S_ISREG(result_path.lstat().st_mode):", "new": "if False:", "killer": "test_missing_result_envelope_is_unavailable"},
+    {"id": "result-read-guard", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": "except (OSError, UnicodeError) as exc:", "new": "except UnicodeError as exc:", "killer": "test_missing_result_envelope_is_unavailable"},
     {"id": "malformed-json", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": "except (TypeError, ValueError) as exc:", "new": "except TypeError as exc:", "killer": "test_malformed_json_is_unavailable"},
     {"id": "nonce", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if decoded["nonce"] != nonce:', "new": "if False:", "killer": "test_wrong_nonce_envelope_is_unavailable"},
     {"id": "request-digest", "target": "executor/src/tpen_executor/lifecycle/core_port.py", "old": 'if decoded["request_digest"] != request_digest:', "new": "if False:", "killer": "test_wrong_request_digest_envelope_is_unavailable"},
