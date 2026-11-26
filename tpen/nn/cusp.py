@@ -1196,8 +1196,52 @@ class ElectronElectronCusp(Envelope, LogAmplitudeFactor):
         return output
 
 
+class HookeSingletTailFactor(LogAmplitudeFactor):
+    """Analytic ``0.5*log1p(kappa*r12**2)`` Hooke-singlet tail factor.
+
+    ``kappa`` is a fixed configuration scalar.  Squared distance keeps this
+    factor smooth through coalescence and lets the existing coordinate-
+    autodiff kinetic path see the exact derivatives.
+    """
+
+    def __init__(self, *, kappa: float, system_name: str = "hooke_pair") -> None:
+        super().__init__()
+        value = float(kappa)
+        if not torch.isfinite(torch.tensor(value)) or value <= 0.0:
+            raise ValueError(f"kappa must be finite and strictly positive, got {kappa!r}")
+        self.kappa = value
+        self.system_name = str(system_name)
+        if self.system_name.lower() not in {"hooke_pair", "hooke-2e", "hooke2", "hooke_2e"}:
+            raise ValueError("HookeSingletTailFactor is only defined for system_name='hooke_pair'")
+
+    def factor_value(self, batch: ElectronBatch) -> torch.Tensor:
+        """Return the tail contribution in analytic log space."""
+
+        if batch.n_electrons != 2:
+            raise ValueError("HookeSingletTailFactor requires exactly two electrons")
+        if batch.spins is None:
+            raise ValueError("HookeSingletTailFactor requires explicit opposite-spin labels")
+        spins = batch.spins.reshape(-1, 2)
+        if not torch.all((spins[:, 0] + spins[:, 1]) == 0):
+            raise ValueError("HookeSingletTailFactor requires one up and one down electron")
+        declared = batch.system if batch.system is not None else batch.aux.get("system_name")
+        if declared is not None:
+            label = declared if isinstance(declared, str) else getattr(declared, "name", None)
+            if label is not None and "hooke" not in str(label).lower():
+                raise ValueError("HookeSingletTailFactor refuses non-Hooke systems")
+        displacement = batch.positions[:, 0] - batch.positions[:, 1]
+        r12_squared = displacement.square().sum(dim=-1)
+        return 0.5 * torch.log1p(batch.positions.new_tensor(self.kappa) * r12_squared)
+
+
+HookePairTailFactor = HookeSingletTailFactor
+SqrtOnePlusKappaR12Squared = HookeSingletTailFactor
+
+
 __all__ = [
     "ElectronElectronCusp",
+    "HookePairTailFactor",
+    "HookeSingletTailFactor",
     "ElectronNucleusCusp",
     "ElectronNucleusCuspEvaluation",
     "ElectronNucleusCuspLaw",
@@ -1205,4 +1249,5 @@ __all__ = [
     "CurvatureElectronNucleusCuspLaw",
     "TailSafeElectronNucleusCuspLaw",
     "rational_pair_cusp",
+    "SqrtOnePlusKappaR12Squared",
 ]

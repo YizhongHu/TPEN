@@ -4,5 +4,15 @@ Readouts consume :class:`tpen.data.real.Feature`.
 """
 
 from tpen.nn.readout.pfaffian import PfaffianReadout
+from tpen.nn.readout.positive_singlet import (
+    HookeSingletPositiveReadout,
+    HookeSingletReadout,
+    PositiveSingletReadout,
+)
 
-__all__ = ["PfaffianReadout"]
+__all__ = [
+    "HookeSingletPositiveReadout",
+    "HookeSingletReadout",
+    "PfaffianReadout",
+    "PositiveSingletReadout",
+]
