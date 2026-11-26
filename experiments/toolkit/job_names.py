@@ -10,9 +10,10 @@ import re
 from typing import Any, Mapping, Optional
 
 
-MAX_JOB_NAME_LENGTH = 64
+MAX_JOB_NAME_LENGTH = 40
 _COMPONENT_RE = re.compile(r"[a-z0-9][a-z0-9_.-]*\Z")
 _SHA_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
+_COMPACT_VARIANTS = {"sigmoid": "sg", "tanh": "th", "nolayer": "nl"}
 
 # ``root`` and ``exec`` are the two explicit arms of the devsuite creator.
 PURPOSES = frozenset({
@@ -66,6 +67,20 @@ def build_job_name(
     return validate_job_name("-".join(parts))
 
 
+def _compact_variant(value: str) -> str:
+    """Use short stable tokens for the bounded ACT50 job-name namespace."""
+
+    return _COMPACT_VARIANTS.get(value, value)
+
+
+def _checkpoint_token(value: int) -> str:
+    """Encode retained checkpoints compactly while preserving their coordinate."""
+
+    if value >= 1_000 and value % 1_000 == 0:
+        return f"c{value // 1_000}k"
+    return f"c{value}"
+
+
 def stage1_row_job_name(row: Mapping[str, Any]) -> str:
     """Build the job name for a rendered Stage-1 manifest row.
 
@@ -75,7 +90,7 @@ def stage1_row_job_name(row: Mapping[str, Any]) -> str:
     """
 
     kind = row.get("kind")
-    if kind not in {"smoke", "train", "eval"}:
+    if kind not in {"smoke", "train", "eval", "collect"}:
         raise ValueError("manifest row has an invalid kind")
     subject = row.get("system") or row.get("sector")
     if not isinstance(subject, str):
@@ -89,6 +104,7 @@ def stage1_row_job_name(row: Mapping[str, Any]) -> str:
     profile_variant = row.get("variant")
     if profile_variant is not None:
         _component(profile_variant, field="variant")
+        profile_variant = _compact_variant(profile_variant)
     if kind in {"train", "eval"}:
         variant = f"l{lineage}"
     if profile_variant is not None:
@@ -100,7 +116,7 @@ def stage1_row_job_name(row: Mapping[str, Any]) -> str:
             raise ValueError("checkpoint must be a non-negative integer")
         if type(stream) is not int or stream < 0:
             raise ValueError("stream must be a non-negative integer")
-        variant = f"{variant}-c{checkpoint}-s{stream}"
+        variant = f"{variant}-{_checkpoint_token(checkpoint)}-s{stream}"
     return build_job_name(subject, kind, variant=variant, lane="s1", sha=row.get("source_sha"))
 
 

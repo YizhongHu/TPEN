@@ -1964,7 +1964,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
             if seed in seen_seeds:
                 raise ProtocolError("seed collision across Stage-1 rows")
             seen_seeds.add(seed)
-            rows.append({
+            smoke_row = {
                 "row_id": stable_row_id(system=spec.name, kind="smoke"),
                 "system": spec.name, "system_id": spec.system_id, "kind": "smoke",
                 "seed": seed, "source_sha": source_sha, "config_sha256": config_ids[spec.name],
@@ -1976,7 +1976,13 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                 "updates": protocol.smoke_updates,
                 "walkers": protocol.smoke_walkers,
                 "checkpoint_steps": [protocol.smoke_updates],
-            })
+            }
+            if is_hooke2_act50_profile(science_profile):
+                smoke_row.update({
+                    "science_profile": str(science_profile),
+                    "variant": hooke2_act50_profile(str(science_profile))["variant"],
+                })
+            rows.append(smoke_row)
         for lineage, seed in enumerate(lineage_seeds):
             train_seed = training_seed(system=spec.name, lineage=lineage, lineage_seed=seed)
             if train_seed in seen_seeds:

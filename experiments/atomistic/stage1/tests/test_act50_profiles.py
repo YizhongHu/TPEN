@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 
 import pytest
+import torch
+from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
 from experiments.atomistic.stage1.protocol import (
@@ -23,6 +27,19 @@ from experiments.toolkit.job_names import stage1_row_job_name
 
 
 CONFIG_ROOT = Path(__file__).parents[1] / "configs"
+ACT50_JOB_VARIANTS = {"sigmoid": "sg", "tanh": "th", "nolayer": "nl"}
+
+
+def _snapshot(root: Path) -> tuple[bool, tuple[tuple[str, bool, bytes], ...]]:
+    """Capture an output tree before and after a refusal boundary."""
+
+    if not root.exists():
+        return False, ()
+    entries = []
+    for path in sorted(root.rglob("*")):
+        is_file = path.is_file()
+        entries.append((str(path.relative_to(root)), is_file, path.read_bytes() if is_file else b""))
+    return True, tuple(entries)
 
 
 def _rows(profile: str) -> list[dict[str, object]]:
@@ -57,8 +74,50 @@ def test_act50_manifest_is_finite_50k_and_a27(profile: str) -> None:
     expected_variant = profile.removeprefix("hooke2-").removesuffix("50k-v1")
     assert {row["variant"] for row in rows} == {expected_variant}
     assert stage1_row_job_name(rows[0]) == (
-        f"hooke2-train-{expected_variant}-l0-s1-aaaaaaaa"
+        f"hooke2-train-{ACT50_JOB_VARIANTS[expected_variant]}-l0-s1-aaaaaaaa"
     )
+
+
+@pytest.mark.parametrize("profile", HOOKE2_ACT50_PROFILES)
+def test_act50_compatibility_smoke_has_variant_bound_job_name(profile: str) -> None:
+    identities = config_identities(
+        config_root=CONFIG_ROOT, systems=("hooke2",), science_profile=profile,
+    )
+    rows = build_manifest(
+        protocol=STAGE1_PROTOCOL,
+        source_sha="a" * 40,
+        config_sha256=identities,
+        checkpoints=list(range(0, 50_001, 1_000)),
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root="/external/act50-test",
+        systems=("hooke2",),
+        phase=1,
+        science_profile=profile,
+        include_smoke=True,
+        auto_overlay=True,
+    )
+    smoke = next(row for row in rows if row["kind"] == "smoke")
+    variant = str(smoke["variant"])
+    assert smoke["science_profile"] == profile
+    assert stage1_row_job_name(smoke) == (
+        f"hooke2-smoke-{ACT50_JOB_VARIANTS[variant]}-s1-aaaaaaaa"
+    )
+
+
+def test_act50_job_names_are_bounded_and_unique_across_row_kinds() -> None:
+    names: list[str] = []
+    for profile in HOOKE2_ACT50_PROFILES:
+        variant = profile.removeprefix("hooke2-").removesuffix("50k-v1")
+        rows = [
+            {"kind": kind, "system": "hooke2", "variant": variant,
+             "lineage": 0, "checkpoint": 50_000, "stream": 0,
+             "source_sha": "a" * 40}
+            for kind in ("smoke", "train", "eval", "collect")
+        ]
+        names.extend(stage1_row_job_name(row) for row in rows)
+    assert all(len(name) <= 40 for name in names)
+    assert len(names) == len(set(names))
 
 
 def test_act50_profile_hashes_are_distinct_and_native_hash_is_unchanged() -> None:
@@ -96,7 +155,8 @@ def test_act50_smoke_derivation_preserves_profile_and_stops_at_1000(profile: str
     )
     assert smoke["science_profile"] == profile
     assert smoke["variant"] == train["variant"]
-    assert smoke["updates"] == 1_000
+    assert smoke["execution"] == {"stop_at": 1_000}
+    assert smoke["updates"] == train["updates"] == 50_000
     assert smoke["config_sha256"] == train["config_sha256"]
 
 
@@ -155,6 +215,70 @@ def test_nolayer_profile_removes_only_layer_diagnostic_groups() -> None:
             assert set(callback.groups) == {"embedding", "readout", "factors"}
 
 
+def test_nolayer_profile_forward_grad_local_energy_and_singlet_swap(
+    tmp_path: Path,
+) -> None:
+    from tpen.checkpoint import restore_checkpoint, save_checkpoint
+    from tpen.data.batch import ElectronBatch
+    from tpen.data.permutation import Permutation
+    from tpen.physics.hamiltonian import local_energy
+
+    row = _rows(HOOKE2_ACT50_NOLAYER_PROFILE)[0]
+    cfg = build_train_config(row)
+    model = instantiate(cfg.model).to(dtype=torch.float64)
+    positions = torch.tensor(
+        [[[0.3, -0.2, 0.8], [-0.1, 0.5, 0.3]],
+         [[1.0, 0.0, 0.5], [0.0, -0.5, 1.5]]],
+        dtype=torch.float64,
+    )
+    batch = ElectronBatch(
+        positions=positions,
+        spins=torch.tensor([[1.0, -1.0], [1.0, -1.0]], dtype=torch.float64),
+    )
+    output = model(batch)
+    assert torch.isfinite(output.logabs).all()
+    assert torch.isfinite(output.sign).all()
+    output.logabs.square().mean().backward()
+    gradients = [
+        parameter.grad for parameter in model.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    assert gradients and all(torch.isfinite(gradient).all() for gradient in gradients)
+    terms = instantiate(cfg.hamiltonian_terms)
+    energy = local_energy(terms, model, batch)
+    assert torch.isfinite(energy.total).all()
+    # Hooke-2e has n_up=1,n_down=1: this exchanges opposite-spin labels, so
+    # the singlet spatial wavefunction has the expected +1 sign ratio.
+    swapped = model(batch.permute(Permutation((1, 0))))
+    assert torch.equal(output.sign * swapped.sign, torch.ones_like(output.sign))
+
+    context = type("Context", (), {
+        "cfg": cfg,
+        "run_dir": tmp_path,
+        "metadata": type("Metadata", (), {"device": "cpu", "dtype": "float64"})(),
+    })()
+    checkpoint = save_checkpoint(
+        output_dir=tmp_path / "checkpoints",
+        next_iteration=1,
+        completed_updates=1,
+        model=model,
+        context=context,
+        save_optimizer=False,
+        save_trainer=False,
+        save_sampler=False,
+        save_rng=False,
+    )
+    restored = instantiate(cfg.model).to(dtype=torch.float64)
+    report = restore_checkpoint(
+        load={"mode": "model_only", "path": str(checkpoint)},
+        model=restored,
+        context=context,
+        strict=True,
+    )
+    assert report.loaded_model
+    torch.testing.assert_close(restored(batch).logabs, output.logabs)
+
+
 def test_act50_refuses_non_a27_phase2_roster() -> None:
     identities = config_identities(
         config_root=CONFIG_ROOT, systems=("hooke2",),
@@ -178,28 +302,63 @@ def test_act50_refuses_non_a27_phase2_roster() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "source_profile,target_profile",
+    (
+        (HOOKE2_ACT50_SIGMOID_PROFILE, HOOKE2_ACT50_TANH_PROFILE),
+        (HOOKE2_ACT50_TANH_PROFILE, HOOKE2_ACT50_SIGMOID_PROFILE),
+        (HOOKE2_ACT50_SIGMOID_PROFILE, HOOKE2_ACT50_NOLAYER_PROFILE),
+        (HOOKE2_ACT50_NOLAYER_PROFILE, HOOKE2_ACT50_SIGMOID_PROFILE),
+    ),
+)
 def test_act50_eval_refuses_cross_variant_checkpoint_before_writes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    source_profile: str, target_profile: str, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from experiments.atomistic.stage1 import eval as stage1_eval
-    import tpen.checkpoint
+    from tpen.checkpoint import save_checkpoint
 
-    checkpoint_dir = tmp_path / "checkpoint"
-    checkpoint_dir.mkdir()
-    (checkpoint_dir / "manifest.json").write_text("{}\n", encoding="utf-8")
-    monkeypatch.setattr(
-        tpen.checkpoint, "read_manifest",
-        lambda *_args, **_kwargs: type("Manifest", (), {
-            "hashes": {"model_config": "checkpoint-profile"},
-        })(),
+    source_row = _rows(source_profile)[0]
+    source_cfg = build_train_config(source_row)
+    source_model = instantiate(source_cfg.model).to(dtype=torch.float64)
+    checkpoint_root = tmp_path / "source-checkpoints"
+    source_context = SimpleNamespace(
+        cfg=source_cfg,
+        run_dir=tmp_path / "source-run",
+        metadata=SimpleNamespace(device="cpu", dtype="float64"),
     )
-    monkeypatch.setattr(
-        tpen.checkpoint, "checkpoint_hashes",
-        lambda _cfg: {"model_config": "eval-profile"},
+    checkpoint_dir = save_checkpoint(
+        output_dir=checkpoint_root,
+        next_iteration=1,
+        completed_updates=1,
+        model=source_model,
+        context=source_context,
+        save_optimizer=False,
+        save_trainer=False,
+        save_sampler=False,
+        save_rng=False,
     )
-    row = {
-        "science_profile": HOOKE2_ACT50_SIGMOID_PROFILE,
+    row = dict(_rows(target_profile)[0])
+    results_root = tmp_path / "eval-results"
+    row.update({
+        "kind": "eval",
+        "config": str(CONFIG_ROOT / "hooke2" / "eval.yaml"),
+        "results_root": str(results_root),
+        "experiment_name": "act50_eval",
+        "sector": "atomistic",
+        "run_id": f"cross-{source_profile[:6]}-{target_profile[:6]}",
+        "checkpoint": 50_000,
+        "stream": 0,
+        "draws": 1,
         "checkpoint_dir": str(checkpoint_dir),
-    }
+        "checkpoint_file": str(checkpoint_dir / "model.pt"),
+    })
+    before = _snapshot(results_root)
+    monkeypatch.setattr(stage1_eval, "validate_gateway_binding", lambda **_: row)
+    monkeypatch.setattr(
+        stage1_eval, "run_from_config", lambda *_args, **_kwargs: pytest.fail("eval ran")
+    )
+    monkeypatch.setattr(sys, "argv", ["eval.py", "--binding", "unused"])
     with pytest.raises(stage1_eval.EvalRunRefusal, match="different model profile"):
-        stage1_eval._refuse_cross_variant_checkpoint(OmegaConf.create({}), row)
+        stage1_eval.main()
+    assert _snapshot(results_root) == before
