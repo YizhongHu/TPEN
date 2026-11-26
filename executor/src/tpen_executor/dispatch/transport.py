@@ -545,25 +545,28 @@ class LeafRequest:
         overrides = tuple(configured.overrides)
         if program is not None:
             slot = _require_configured_physical_slot(allocation, selected_slot)
-            bound_values = {
-                "TPEN_SLOT_ID": slot.slot_id,
-                "TPEN_SLOT_NODE": slot.node,
-                "TPEN_SLOT_CPUS": ",".join(str(cpu) for cpu in slot.cpus),
-                "TPEN_PLACEMENT_SLOT_ID": slot.slot_id,
-                "TPEN_PLACEMENT_DECLARED_HOST": slot.node,
-                "TPEN_PLACEMENT_DECLARED_CPUS": ",".join(str(cpu) for cpu in slot.cpus),
-                "TPEN_PLACEMENT_DECLARED_DEVICES": ",".join(slot.devices),
-            }
-            crossed = sorted(
-                key for key, expected in bound_values.items()
-                if key in environment.env and environment.env[key] != expected
-            )
-            if crossed:
-                raise PlacementRefusal(
-                    "configured-physical-slot-crossed",
-                    "prepared environment placement identity crosses the selected request slot: "
-                    + ",".join(crossed),
+            if selected_slot is not None:
+                slot_cpus = ",".join(str(cpu) for cpu in slot.cpus)
+                bound_values = {
+                    "TPEN_SLOT_ID": slot.slot_id,
+                    "TPEN_SLOT_NODE": slot.node,
+                    "TPEN_SLOT_CPUS": slot_cpus,
+                    "TPEN_PLACEMENT_SLOT_ID": slot.slot_id,
+                    "TPEN_PLACEMENT_DECLARED_HOST": slot.node,
+                    "TPEN_PLACEMENT_DECLARED_CPUS": ",".join(
+                        str(cpu) for cpu in parse_cpu_set(slot_cpus)
+                    ),
+                }
+                crossed = sorted(
+                    key for key, expected in bound_values.items()
+                    if key in environment.env and environment.env[key] != expected
                 )
+                if crossed:
+                    raise PlacementRefusal(
+                        "configured-physical-slot-crossed",
+                        "prepared environment placement identity crosses the selected request slot: "
+                        + ",".join(crossed),
+                    )
             attempt_delta = configured.attempt_delta(
                 fence.output_dir,
                 root=fence.root,

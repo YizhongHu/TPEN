@@ -68,8 +68,8 @@ MUTANTS = [
     {
         "id": "PA1-crossed-request-guard",
         "target": "executor/src/tpen_executor/dispatch/transport.py",
-        "old": "            if crossed:\n                raise PlacementRefusal(\n                    \"configured-physical-slot-crossed\",\n",
-        "new": "            if False:\n                raise PlacementRefusal(\n                    \"configured-physical-slot-crossed\",\n",
+        "old": "            if selected_slot is not None:\n",
+        "new": "            if False:\n",
         "killer": "test_review_crossed_overlay_request_refused",
     },
     {
@@ -189,6 +189,30 @@ def test_review_crossed_overlay_request_refused(tmp_path: Path) -> None:
     with pytest.raises(PlacementRefusal) as refused:
         LeafRequest.for_attempt(fence, allocation, configured, environment, selected_slot=b)
     assert refused.value.code == "configured-physical-slot-crossed"
+
+
+def test_review_same_lowercase_gpu_slot_succeeds_v2(tmp_path: Path) -> None:
+    gpu = "GPU-3b0c1234-1234-1234-1234-123456789abc"
+    base = _allocation(1)
+    group, allocation, _, configured, fence = _begin(
+        tmp_path, task_id="member", facts=base.facts,
+    )
+    raw_slot = replace(_allocation_slot(allocation, 0), devices=(gpu,))
+    allocation = replace(allocation, facts={
+        "slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": [raw_slot.to_dict()]},
+        "scheduler": {"PBS_NODEFILE": "localhost\n"},
+    })
+    configured = replace(configured, config="", overrides=(), program=_program(tmp_path))
+    selected = _allocation_slot(allocation, 0)
+    environment = _with_child_placement(
+        _environment(tmp_path), allocation, fence, group, group.members[0],
+        configured, selected_slot=selected,
+    )
+    request = LeafRequest.for_attempt(
+        fence, allocation, configured, environment, selected_slot=selected,
+    )
+    assert request.environment.env["TPEN_PLACEMENT_RECEIPT_VERSION"] == "2"
+    assert request.environment.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == gpu.upper()
 
 
 def test_review_mapping_order_is_not_foreign() -> None:
