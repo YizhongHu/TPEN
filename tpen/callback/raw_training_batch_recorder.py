@@ -24,7 +24,7 @@ import numpy as np
 from omegaconf import OmegaConf
 
 from tpen.artifacts import RunContext
-from tpen.checkpoint import CheckpointRestored, checkpoint_ref, resolve_checkpoint_dir
+from tpen.checkpoint import CheckpointRestored, checkpoint_ref
 from tpen.events import DomainState, Started, started
 from tpen.events import Event as TypedEvent
 from tpen.events import Occurrence, Subscription
@@ -512,8 +512,12 @@ def _validate_v3_contract(contract: Any) -> None:
     ):
         _int(contract[key], name=key, minimum=minimum)
     terms = contract["term_names"]
-    if not isinstance(terms, list) or any(not isinstance(term, str) for term in terms) or terms != sorted(set(terms)):
-        raise ValueError("v3 contract term_names must be sorted and unique")
+    if (
+        not isinstance(terms, list)
+        or any(not isinstance(term, str) or not term for term in terms)
+        or terms != sorted(set(terms))
+    ):
+        raise ValueError("v3 contract term_names must be sorted, unique, and non-empty strings")
 
 
 def _validate_v3_header(raw: bytes, header: Any) -> dict[str, Any]:
@@ -659,20 +663,26 @@ def _validate_v3_sidecar(
         raise ValueError("v3 sidecar sampler provenance is invalid")
     if any(not isinstance(item, Mapping) for item in provenance["acceptance_proposal_stats"]):
         raise ValueError("v3 sidecar acceptance proposal stats are invalid")
-    measurements = sidecar.get("measurements")
-    if measurements is not None:
+    if "measurements" in sidecar:
+        measurements = sidecar["measurements"]
         if not isinstance(measurements, Mapping):
             raise ValueError("v3 sidecar measurements must be an object")
         allowed_measurements = {
-            "compressed_byte_count", "uncompressed_byte_count", "compression_ratio", "write_time_sec",
+            "compressed_byte_count", "uncompressed_byte_count", "uncompressed_sha256",
+            "compression_ratio", "write_time_sec",
         }
         _require_keys(measurements, set(), optional=allowed_measurements)
         for key in ("compressed_byte_count", "uncompressed_byte_count"):
             if key in measurements:
-                _int(measurements[key], name=f"measurement {key}")
-        for key in ("compression_ratio", "write_time_sec"):
-            if key in measurements:
-                _finite_number(measurements[key], name=f"measurement {key}")
+                _int(measurements[key], name=f"measurement {key}", minimum=1)
+        if "uncompressed_sha256" in measurements:
+            _hash(measurements["uncompressed_sha256"], name="measurement uncompressed_sha256")
+        if "compression_ratio" in measurements:
+            _finite_number(measurements["compression_ratio"], name="measurement compression_ratio")
+            if measurements["compression_ratio"] <= 0:
+                raise ValueError("v3 measurement compression_ratio must be positive")
+        if "write_time_sec" in measurements:
+            _finite_number(measurements["write_time_sec"], name="measurement write_time_sec")
     try:
         with np.load(bundle_path, allow_pickle=False) as loaded:
             arrays = {name: loaded[name] for name in loaded.files}
@@ -745,7 +755,7 @@ class TrainingBatchReader:
             raw = (self.root / HISTORY_FILENAME).read_bytes()
             header = _strict_json_loads(raw)
             if isinstance(header, Mapping) and header.get("schema") == V3_SCHEMA:
-                self._read_v3(require_complete=require_complete)
+                self._read_v3(require_complete=require_complete, retain_rows=False)
                 return
         if require_complete:
             raise ValueError("require_complete is unavailable for legacy training histories")
@@ -756,7 +766,7 @@ class TrainingBatchReader:
         """Return v3 completion counters, or ``None`` for open/legacy histories."""
 
         if (self.root / HISTORY_FILENAME).is_file():
-            self._read_v3()
+            self._read_v3(retain_rows=False)
             return dict(self._v3_completion) if self._v3_completion is not None else None
         return None
 
@@ -809,6 +819,7 @@ class TrainingBatchReader:
         start_step: int | None = None,
         end_step: int | None = None,
         require_complete: bool = False,
+        retain_rows: bool = True,
     ) -> dict[str, np.ndarray]:
         node = self._load_v3_node(
             self.root.resolve(),
@@ -817,6 +828,7 @@ class TrainingBatchReader:
             limit=None,
             select_start=start_step,
             select_end=end_step,
+            retain_rows=retain_rows,
         )
         self._v3_completion = node.completion
         self.provenance = {index: value for index, value in enumerate(node.provenance)}
@@ -844,6 +856,7 @@ class TrainingBatchReader:
         expected_prefix_sha256: str | None = None,
         select_start: int | None = None,
         select_end: int | None = None,
+        retain_rows: bool = True,
     ) -> _V3Node:
         if root in stack:
             raise ValueError("v3 lineage contains a cycle")
@@ -854,7 +867,7 @@ class TrainingBatchReader:
         header_raw = history_path.read_bytes()
         header = _validate_v3_header(header_raw, _strict_json_loads(header_raw))
         stream_id = header["stream_id"]
-        if stream_id in seen_streams:
+        if stream_id in seen_streams and root not in stack:
             raise ValueError("v3 lineage contains a duplicate stream_id")
         local_seen = set(seen_streams)
         local_seen.add(stream_id)
@@ -898,6 +911,7 @@ class TrainingBatchReader:
         seals: list[dict[str, Any]] = []
         completion: dict[str, int] | None = None
         fragment_steps: list[int] = []
+        fragment_updates: list[int] = []
         active_steps: set[int] = set()
         active_identities: set[tuple[int, int]] = set()
         seal_positions: dict[int, int] = {}
@@ -922,9 +936,14 @@ class TrainingBatchReader:
                         raise ValueError("duplicate active (iteration_step, walker_index) in v3 lineage")
                     active_identities.add(identity)
                 active_steps.add(step)
-                selected = _select_v3_arrays(arrays, start=select_start, end=select_end)
+                selected = (
+                    _select_v3_arrays(arrays, start=select_start, end=select_end)
+                    if retain_rows
+                    else {}
+                )
                 fragments.append((dict(event), selected, sidecar))
                 fragment_steps.append(step)
+                fragment_updates.append(int(arrays["completed_updates"][0]))
             elif event["type"] == "window_seal":
                 group = _int(event["group_index"], name="window_seal group_index")
                 start = _int(event["start_step"], name="window_seal start_step")
@@ -943,7 +962,7 @@ class TrainingBatchReader:
                 }
                 if completion["completed_updates"] > completion["next_iteration"]:
                     raise ValueError("v3 completed_updates exceeds next_iteration")
-        updates = [int(arrays["completed_updates"][0]) for _, arrays, _ in fragments]
+        updates = fragment_updates
         if any(later < earlier for earlier, later in zip(updates, updates[1:])):
             raise ValueError("v3 completed_updates is not monotone across fragments")
         parent_node: _V3Node | None = None
@@ -969,7 +988,12 @@ class TrainingBatchReader:
                     limit=count,
                     expected_prefix_sha256=parent_pin["prefix_sha256"],
                     select_start=select_start,
-                    select_end=select_end,
+                    select_end=(
+                        cut - 1
+                        if select_end is None
+                        else min(select_end, cut - 1)
+                    ),
+                    retain_rows=retain_rows,
                 )
                 if parent_node.header["contract"] != header["contract"]:
                     raise ValueError("v3 resumed contract is incompatible with its parent")
@@ -1032,8 +1056,9 @@ class TrainingBatchReader:
             raise ValueError("v3 checkpoint.path must be an absolute checkpoint domain path")
         checkpoint_path = Path(path_value)
         try:
-            resolved_dir = resolve_checkpoint_dir(checkpoint_path)
-            ref = checkpoint_ref(resolved_dir)
+            # §C pins one concrete step directory; root/latest.json locators
+            # are mutable convenience pointers and are not wire data.
+            ref = checkpoint_ref(checkpoint_path)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise ValueError("v3 checkpoint path is not a valid complete checkpoint") from exc
         _hash(checkpoint["manifest_sha256"], name="manifest_sha256")
@@ -1051,11 +1076,14 @@ class TrainingBatchReader:
         if checkpoint_run_id != expected_run_id:
             raise ValueError("v3 checkpoint provenance does not bind the pinned history")
         if parent is not None:
-            source_revisions = {
-                item.get("source_revision") for item in parent.provenance
-                if item.get("source_revision") is not None
-            }
-            if len(source_revisions) == 1 and ref.provenance.get("git_sha") not in source_revisions:
+            run_dir = ref.provenance.get("run_dir")
+            if not isinstance(run_dir, str) or not run_dir:
+                raise ValueError("v3 checkpoint source provenance does not bind the pinned history")
+            try:
+                checkpoint_run_dir = Path(run_dir).resolve()
+            except OSError as exc:
+                raise ValueError("v3 checkpoint source provenance does not bind the pinned history") from exc
+            if checkpoint_run_dir != parent.root.resolve():
                 raise ValueError("v3 checkpoint source provenance does not bind the pinned history")
 
     @staticmethod

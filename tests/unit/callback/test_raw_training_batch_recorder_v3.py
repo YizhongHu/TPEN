@@ -32,7 +32,9 @@ def _digest(header: bytes, line: bytes) -> str:
     return hashlib.sha256(hashlib.sha256(header).digest() + line).hexdigest()
 
 
-def _write_real_checkpoint(root: Path, *, step: int, run_id: str) -> Path:
+def _write_real_checkpoint(
+    root: Path, *, step: int, run_id: str, run_dir: Path | None = None
+) -> Path:
     """Produce the checkpoint reference through the public checkpoint writer."""
 
     context = SimpleNamespace(
@@ -47,7 +49,7 @@ def _write_real_checkpoint(root: Path, *, step: int, run_id: str) -> Path:
             dtype="float64",
             extra={},
         ),
-        run_dir=root,
+        run_dir=root if run_dir is None else run_dir,
     )
     return save_checkpoint(
         output_dir=root,
@@ -110,12 +112,17 @@ def _write_v3_fixture(
         parent_root, event_count, prefix = parent
         parent_header = json.loads((parent_root / "history.json").read_text())
         checkpoint_root = root / "checkpoint"
-        _write_real_checkpoint(checkpoint_root, step=cut, run_id=parent_header["run_id"])
+        checkpoint_dir = _write_real_checkpoint(
+            checkpoint_root,
+            step=cut,
+            run_id=parent_header["run_id"],
+            run_dir=parent_root,
+        )
         events.append({
             "type": "resume", "previous_event_sha256": None,
             "parent": {"root": str(parent_root.resolve()), "event_count": event_count, "prefix_sha256": prefix},
             "checkpoint": {
-                "path": str(checkpoint_root.resolve()),
+                "path": str(checkpoint_dir.resolve()),
                 "manifest_sha256": "0" * 64,
                 "model_sha256": "0" * 64,
                 "next_iteration": cut,
@@ -173,13 +180,14 @@ def _write_v3_fixture(
             "start_step": step, "end_step": step + 1,
             "sidecar": f"fragments/{stem}.json", "sidecar_sha256": hashlib.sha256(sidecar_path.read_bytes()).hexdigest(),
         })
-    if complete is not None and emit_seals:
-        partition = int(contract["partition_size_steps"])
-        for group in range((complete + partition - 1) // partition):
-            events.append({
-                "type": "window_seal", "previous_event_sha256": None, "group_index": group,
-                "start_step": group * partition, "end_step": min((group + 1) * partition, complete),
-            })
+    if complete is not None:
+        if emit_seals:
+            partition = int(contract["partition_size_steps"])
+            for group in range((complete + partition - 1) // partition):
+                events.append({
+                    "type": "window_seal", "previous_event_sha256": None, "group_index": group,
+                    "start_step": group * partition, "end_step": min((group + 1) * partition, complete),
+                })
         events.append({"type": "complete", "previous_event_sha256": None, "next_iteration": complete, "completed_updates": complete})
     lines: list[bytes] = []
     for event in events:
@@ -294,6 +302,31 @@ def test_v3_multi_generation_chain_is_sorted_and_inclusive(tmp_path: Path) -> No
     _write_v3_fixture(third, stream_id="66666666-6666-4666-8666-666666666666", origin="train_resume", steps=[4], parent=_pin(second), cut=4, complete=5)
     rows = TrainingBatchReader(third).read(end_step=4)
     np.testing.assert_array_equal(rows["iteration_step"], [0, 0, 1, 1, 2, 2, 3, 3, 4, 4])
+
+
+def test_v3_range_read_excludes_committed_fragments_and_empty_selection(tmp_path: Path) -> None:
+    root = tmp_path / "range-root"
+    _write_v3_fixture(root, stream_id="67676767-6767-4676-8676-676767676767", steps=[0, 1])
+    rows = TrainingBatchReader(root).read(end_step=0)
+    np.testing.assert_array_equal(rows["iteration_step"], [0, 0])
+    rows = TrainingBatchReader(root).read(start_step=1)
+    np.testing.assert_array_equal(rows["iteration_step"], [1, 1])
+    assert TrainingBatchReader(root).read(start_step=2) == {}
+
+    parent = tmp_path / "range-parent"
+    _write_v3_fixture(parent, stream_id="68686868-6868-4868-8868-686868686868", steps=[0, 1])
+    child = tmp_path / "range-child"
+    _write_v3_fixture(
+        child,
+        stream_id="69696969-6969-4969-8969-696969696969",
+        origin="train_resume",
+        parent=_pin(parent),
+        cut=2,
+        steps=[2],
+    )
+    rows = TrainingBatchReader(child).read(end_step=0)
+    np.testing.assert_array_equal(rows["iteration_step"], [0, 0])
+    assert TrainingBatchReader(child).read(start_step=3) == {}
 
 
 def test_v3_torn_non_lf_tail_is_ignored_without_repair(tmp_path: Path) -> None:
@@ -504,6 +537,28 @@ def test_v3_checkpoint_binding_mutations_are_refused(
         TrainingBatchReader(child).validate()
 
 
+@pytest.mark.parametrize("locator", ["root", "latest"])
+def test_v3_checkpoint_refuses_mutable_root_and_latest_locators(tmp_path: Path, locator: str) -> None:
+    parent = tmp_path / f"locator-parent-{locator}"
+    _write_v3_fixture(parent, stream_id="38383838-3838-4383-8383-383838383838", steps=[0])
+    child = tmp_path / f"locator-child-{locator}"
+    _write_v3_fixture(
+        child,
+        stream_id="39393939-3939-4393-8393-393939393939",
+        origin="train_resume",
+        parent=_pin(parent),
+        cut=1,
+    )
+    events = [json.loads(line) for line in (child / "events.jsonl").read_text().splitlines()]
+    checkpoint_root = child / "checkpoint"
+    events[0]["checkpoint"]["path"] = str(
+        checkpoint_root if locator == "root" else checkpoint_root / "latest.json"
+    )
+    _rewrite_events(child, events)
+    with pytest.raises(ValueError, match="checkpoint"):
+        TrainingBatchReader(child).validate()
+
+
 def test_v3_checkpoint_provenance_is_bound_to_parent_history(tmp_path: Path) -> None:
     parent = tmp_path / "provenance-parent"
     _write_v3_fixture(parent, stream_id="32323232-3232-4232-8232-323232323232", steps=[0])
@@ -525,6 +580,103 @@ def test_v3_checkpoint_provenance_is_bound_to_parent_history(tmp_path: Path) -> 
     _rewrite_events(child, [event])
     with pytest.raises(ValueError, match="provenance"):
         TrainingBatchReader(child).validate()
+
+
+def test_v3_checkpoint_same_run_id_different_run_dir_is_refused(tmp_path: Path) -> None:
+    parent = tmp_path / "run-dir-parent"
+    _write_v3_fixture(parent, stream_id="40404040-4040-4404-8404-404040404040", steps=[0])
+    child = tmp_path / "run-dir-child"
+    _write_v3_fixture(
+        child,
+        stream_id="41414141-4141-4414-8414-414141414141",
+        origin="train_resume",
+        parent=_pin(parent),
+        cut=1,
+    )
+    manifest_path = child / "checkpoint" / "step_000001" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["provenance"]["run_dir"] = str(tmp_path / "unrelated-run")
+    manifest_path.write_bytes(_pretty(manifest))
+    events = [json.loads(line) for line in (child / "events.jsonl").read_text().splitlines()]
+    events[0]["checkpoint"]["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    _rewrite_events(child, events)
+    with pytest.raises(ValueError, match="provenance"):
+        TrainingBatchReader(child).validate()
+
+
+def test_v3_checkpoint_does_not_compare_inherited_source_revision(tmp_path: Path) -> None:
+    parent = tmp_path / "revision-parent"
+    _write_v3_fixture(parent, stream_id="45454545-4545-4454-8454-454545454545", steps=[0])
+    sidecar_path = parent / "fragments" / "step-000000000000.json"
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar["provenance"]["source_revision"] = "revision-A"
+    sidecar_path.write_bytes(_pretty(sidecar))
+    parent_events = [json.loads(line) for line in (parent / "events.jsonl").read_text().splitlines()]
+    parent_events[1]["sidecar_sha256"] = hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
+    _rewrite_events(parent, parent_events)
+
+    child = tmp_path / "revision-child"
+    _write_v3_fixture(
+        child,
+        stream_id="46464646-4646-4464-8464-464646464646",
+        origin="train_resume",
+        parent=_pin(parent),
+        cut=1,
+    )
+    TrainingBatchReader(child).validate()
+
+
+def test_v3_measurements_allow_hash_and_require_positive_values(tmp_path: Path) -> None:
+    root = tmp_path / "measurements-valid"
+    _write_v3_fixture(root, stream_id="42424242-4242-4424-8424-424242424242", steps=[0])
+    sidecar_path = root / "fragments" / "step-000000000000.json"
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar["measurements"] = {
+        "compressed_byte_count": 1,
+        "uncompressed_byte_count": 1,
+        "uncompressed_sha256": "a" * 64,
+        "compression_ratio": 0.5,
+        "write_time_sec": 0,
+    }
+    sidecar_path.write_bytes(_pretty(sidecar))
+    events = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
+    events[1]["sidecar_sha256"] = hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
+    _rewrite_events(root, events)
+    TrainingBatchReader(root).validate()
+
+
+@pytest.mark.parametrize(
+    ("measurements", "message"),
+    [
+        (None, "measurements"),
+        ({"compressed_byte_count": 0}, "measurement compressed_byte_count"),
+        ({"uncompressed_byte_count": 0}, "measurement uncompressed_byte_count"),
+        ({"compression_ratio": 0}, "compression_ratio"),
+    ],
+)
+def test_v3_measurements_refuse_null_zero_and_nonpositive_values(
+    tmp_path: Path, measurements: object, message: str
+) -> None:
+    root = tmp_path / f"measurements-invalid-{message.replace(' ', '-') }"
+    _write_v3_fixture(root, stream_id="43434343-4343-4434-8434-434343434343", steps=[0])
+    sidecar_path = root / "fragments" / "step-000000000000.json"
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar["measurements"] = measurements
+    sidecar_path.write_bytes(_pretty(sidecar))
+    events = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
+    events[1]["sidecar_sha256"] = hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
+    _rewrite_events(root, events)
+    with pytest.raises(ValueError, match=message):
+        TrainingBatchReader(root).validate()
+
+
+def test_v3_term_names_refuse_empty_string(tmp_path: Path) -> None:
+    root = tmp_path / "empty-term"
+    contract = _contract()
+    contract["term_names"] = [""]
+    _write_v3_fixture(root, stream_id="44444444-4444-4444-8444-444444444444", contract=contract)
+    with pytest.raises(ValueError, match="term_names"):
+        TrainingBatchReader(root).validate()
 
 
 def test_v3_fragment_directory_symlink_is_refused(tmp_path: Path) -> None:
@@ -639,7 +791,7 @@ MUTANTS = [
     {"id": "M04", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if identity in active_identities:", "new": "if False:", "killer": "test_v3_refuses_duplicate_active_grid"},
     {"id": "M05", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if require_complete and node.completion is None:", "new": "if False:", "killer": "test_v3_require_complete_refuses_open"},
     {"id": "M06", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if root in stack:", "new": "if False:", "killer": "test_v3_refuses_cycle"},
-    {"id": "M07", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if stream_id in seen_streams:", "new": "if False:", "killer": "test_v3_refuses_duplicate_stream_id"},
+    {"id": "M07", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if stream_id in seen_streams and root not in stack:", "new": "if False:", "killer": "test_v3_refuses_duplicate_stream_id"},
     {"id": "M08", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if not history_path.is_file() or not events_path.is_file():", "new": "if False:", "killer": "test_v3_refuses_missing_file"},
     {"id": "M09", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if not required <= set(value) or not set(value) <= allowed:", "new": "if False:", "killer": "test_v3_refuses_extra_header_key"},
     {"id": "M10", "target": "tpen/callback/raw_training_batch_recorder.py", "old": 'if parent_node.header["contract"] != header["contract"]:', "new": "if False:", "killer": "test_v3_refuses_incompatible_contract"},
