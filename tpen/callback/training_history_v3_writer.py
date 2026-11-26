@@ -265,8 +265,7 @@ class TrainingHistoryV3Writer:
             _fsync_directory(self.root)
             self._append_event(event)
         except BaseException as exc:
-            self._poisoned = True
-            raise exc
+            self._fail(exc)
 
     def _append_event(self, event: dict[str, Any]) -> None:
         event["previous_event_sha256"] = self._last_digest
@@ -344,8 +343,7 @@ class TrainingHistoryV3Writer:
             self._last_step = step
             self._captured_by_group[group] = self._captured_by_group.get(group, 0) + 1
         except BaseException as exc:
-            self._poisoned = True
-            raise exc
+            self._fail(exc)
 
     def seal_window(self, group_index: int, *, end_step: int | None = None) -> None:
         """Append a full window seal, or a final partial seal before complete."""
@@ -366,8 +364,7 @@ class TrainingHistoryV3Writer:
             self._append_event({"type": "window_seal", "group_index": group, "start_step": start, "end_step": end})
             self._sealed[group] = (start, end)
         except BaseException as exc:
-            self._poisoned = True
-            raise exc
+            self._fail(exc)
 
     # Short aliases keep the library surface convenient without creating a
     # second implementation or changing the callback's public names.
@@ -407,8 +404,7 @@ class TrainingHistoryV3Writer:
             self._append_event({"type": "complete", "next_iteration": next_iteration, "completed_updates": completed_updates})
             self._completed = True
         except BaseException as exc:
-            self._poisoned = True
-            raise exc
+            self._fail(exc)
 
     finalize = complete
 
