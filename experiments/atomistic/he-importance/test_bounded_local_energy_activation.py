@@ -227,6 +227,43 @@ def test_real_hydra_runner_constructs_and_executes_bounded_helper(
     assert tuple(result.shape) == (8,)
 
 
+def test_real_hydra_runner_legacy_helper_is_single_unchunked_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    legacy_config = _run_entrypoint_with_stubbed_runner(tmp_path / "legacy-runner", monkeypatch, None)
+    legacy_config.runtime.device = "cpu"
+    constructed = instantiate(legacy_config.runner)
+    assert constructed.trainer.local_energy_chunk_size is None
+
+    torch = importlib.import_module("torch")
+    trainer_mod = sys.modules[type(constructed.trainer).__module__]
+    calls: list[int] = []
+
+    class FakeBatch:
+        batch_size = 8
+
+    class FakeEvaluator:
+        def make_context(self, wavefunction: object, batch: object) -> object:
+            del wavefunction
+            calls.append(batch.batch_size)
+            return batch
+
+        def evaluate(self, terms: object, context: object, *, return_terms: bool) -> object:
+            del terms, return_terms
+            return torch.zeros(context.batch_size)
+
+    monkeypatch.setattr(
+        trainer_mod, "slice_flat_batch", lambda batch, start, stop: SimpleNamespace(
+            batch_size=stop - start
+        )
+    )
+    result = trainer_mod.evaluate_local_energy_in_chunks(
+        {}, constructed.model, FakeBatch(), chunk_size=None, evaluator=FakeEvaluator()
+    )
+    assert calls == [8]
+    assert tuple(result.shape) == (8,)
+
+
 def test_dropped_bound_is_refused_before_production_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
