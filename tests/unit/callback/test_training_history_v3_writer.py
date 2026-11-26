@@ -169,7 +169,13 @@ def test_creation_and_capture_order_trace(monkeypatch: pytest.MonkeyPatch, tmp_p
         module._write_private, module._publish_exclusive, module._fsync_directory, module._append_log_line
     )
     def private(path: Path, data: bytes) -> None:
-        trace.append(path.name + " fsync")
+        # Private objects are fsynced before exclusive publication under a
+        # dot-prefixed temporary name; record the eventual object name so the
+        # ordering assertion observes the real NPZ and sidecar fsyncs.
+        name = path.name
+        if name.startswith(".") and name.endswith(".tmp"):
+            name = name[1:-4]
+        trace.append(name + " fsync")
         original_private(path, data)
     def publish(temp: Path, final: Path) -> None:
         trace.append("publish " + final.name)
@@ -264,19 +270,30 @@ def test_writer_matches_fixture_reader_view(tmp_path: Path) -> None:
 
 
 def test_seal_complete_and_contract_refusals(tmp_path: Path) -> None:
+    incomplete = _writer(tmp_path / "incomplete")
+    incomplete.append_capture(_record(0))
+    with pytest.raises(ValueError, match="coverage"):
+        incomplete.seal_window(0)
+
     writer = _writer(tmp_path / "seals")
     writer.append_capture(_record(0))
-    with pytest.raises(ValueError, match="coverage"):
-        writer.seal_window(0)
     writer.append_capture(_record(1))
     writer.append_capture(_record(2))
     writer.append_capture(_record(3))
     writer.seal_window(0)
     with pytest.raises(ValueError):
         writer.seal_window(0)
+
+    writer = _writer(tmp_path / "complete")
+    for step in range(4):
+        writer.append_capture(_record(step))
+    writer.seal_window(0)
     writer.complete(next_iteration=4, completed_updates=3)
     with pytest.raises(RuntimeError):
         writer.append_capture(_record(4))
+
+    writer = _writer(tmp_path / "complete-again")
+    writer.complete(next_iteration=0, completed_updates=0)
     with pytest.raises(RuntimeError):
         writer.complete(next_iteration=4, completed_updates=3)
     bad = TrainingHistoryV3Writer(tmp_path / "bad", stream_id="29292929-2929-4292-8292-292929292929", run_id="bad", contract=_contract() | {"every_n_steps": 2}, provenance={"config_hash": "e" * 64})
