@@ -469,11 +469,12 @@ def _validate_extension_shape(row: Mapping[str, Any], *, expected_kind: str | No
         raise ProtocolError("materialized row seed is outside the Torch-compatible range")
     if row["walkers"] <= 0:
         raise ProtocolError("materialized row walkers must be positive")
+    minimum_updates = 1 if kind == "train" else 0
+    if row["updates"] < minimum_updates:
+        raise ProtocolError("materialized row updates are below the kind minimum")
     if row.get("device") not in {"cpu", "cuda"}:
         raise ProtocolError("materialized row device must be cpu or cuda")
     if kind == "train":
-        if row["updates"] <= 0:
-            raise ProtocolError("materialized train updates must be positive")
         if row["lineage"] > 2 or not _is_torch_seed(row.get("sampler_seed")):
             raise ProtocolError("materialized train lineage or sampler_seed is invalid")
         steps = row.get("checkpoint_steps")
