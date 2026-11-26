@@ -252,10 +252,18 @@ def validate_row(row: Mapping[str, Any], *, expected_kind: str | None = None) ->
     if kind == "train":
         _int(row.get("sampler_seed"), "sampler_seed")
         checkpoints = row.get("checkpoint_steps")
-        if not isinstance(checkpoints, list) or not checkpoints or any(type(x) is not int or x <= 0 for x in checkpoints):
-            raise RowContractError("checkpoint_steps must be positive integers")
-        if checkpoints != sorted(checkpoints) or len(set(checkpoints)) != len(checkpoints) or row["updates"] not in checkpoints:
-            raise RowContractError("checkpoint_steps must be unique and include updates")
+        if (
+            not isinstance(checkpoints, list)
+            or not checkpoints
+            or any(type(x) is not int or x < 0 for x in checkpoints)
+            or checkpoints != sorted(set(checkpoints))
+            or checkpoints[0] != 0
+            or checkpoints[-1] != row["updates"]
+        ):
+            # Stage-1 owns this materialized train-row contract.  Zero is the
+            # initial boundary; the rendered YAML intentionally strips it
+            # before ExplicitUpdates consumes the positive schedule.
+            raise RowContractError("checkpoint_steps must be sorted, unique, 0..H")
         if "overlay_profile" in row and row["overlay_profile"] != ext["diagnostics_profile"]:
             raise RowContractError("overlay_profile must match diagnostics_profile")
     else:
