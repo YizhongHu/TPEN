@@ -684,24 +684,29 @@ def resolve_train_config(
     OmegaConf.update(cfg, "run.layout", "flat", merge=False, force_add=True)
     OmegaConf.update(cfg, "run.dir", str(output_path), merge=False)
     OmegaConf.update(cfg, "runtime.seed", model_seed, merge=False)
+    chunk_override_values: list[int | None] = []
     for path, value in override_items:
-        OmegaConf.update(cfg, path, value, merge=False)
+        if str.__eq__(path, "trainer.local_energy_chunk_size") is True:
+            validated = validate_local_energy_chunk_size(value)
+            if chunk_override_values and (
+                validated is None
+                or chunk_override_values[0] is None
+                or int.__ne__(validated, chunk_override_values[0]) is True
+            ):
+                raise TrainConfigResolutionError(
+                    "duplicate trainer.local_energy_chunk_size overrides conflict"
+                )
+            chunk_override_values.append(validated)
+    for path, value in override_items:
+        OmegaConf.update(
+            cfg, path, value, merge=False,
+            force_add=str.__eq__(path, "trainer.local_energy_chunk_size") is True,
+        )
     override_chunk_size = OmegaConf.select(
         cfg, "trainer.local_energy_chunk_size", default=_OVERRIDE_MISSING
     )
     if override_chunk_size is not _OVERRIDE_MISSING:
         override_chunk_size = validate_local_energy_chunk_size(override_chunk_size)
-    for path, value in override_items:
-        if str.__eq__(path, "trainer.local_energy_chunk_size") is True:
-            validated = validate_local_energy_chunk_size(value)
-            if override_chunk_size is not _OVERRIDE_MISSING and (
-                validated is None
-                or override_chunk_size is None
-                or int.__ne__(validated, override_chunk_size) is True
-            ):
-                raise TrainConfigResolutionError(
-                    "duplicate trainer.local_energy_chunk_size overrides conflict"
-                )
     if local_energy_chunk_size is not None and (
         override_chunk_size is not _OVERRIDE_MISSING
         and (
