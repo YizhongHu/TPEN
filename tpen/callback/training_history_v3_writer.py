@@ -170,6 +170,8 @@ class TrainingHistoryV3Writer:
         checkpoint: Mapping[str, Any] | None = None,
         supersede_from_step: int = 0,
         provenance: Mapping[str, Any] | None = None,
+        inherited_seal_frontier: int = 0,
+        inherited_seals: Mapping[int, tuple[int, int]] | None = None,
     ) -> None:
         self.root = Path(root)
         self.fragments = self.root / "fragments"
@@ -177,8 +179,10 @@ class TrainingHistoryV3Writer:
         self._last_step: int | None = None
         self._last_digest: str | None = None
         self._event_count = 0
-        self._captured_by_group: dict[int, int] = {}
-        self._sealed: dict[int, tuple[int, int]] = {}
+        self._capture_group: int | None = None
+        self._capture_count = 0
+        self._sealed_frontier = 0
+        self._partial_sealed_group: int | None = None
         self._completed = False
         self._cut = int(supersede_from_step) if origin == "train_resume" else 0
         self.contract = dict(contract)
@@ -198,8 +202,8 @@ class TrainingHistoryV3Writer:
             if not self.root.is_dir() or self.root.is_symlink() or any(self.root.iterdir()):
                 raise FileExistsError("v3 history root must be a fresh, empty, non-symlink directory")
         else:
-            self.root.mkdir(parents=True)
-        self.fragments.mkdir()
+            self._mkdir_durable(self.root)
+        self._mkdir_durable(self.fragments)
         self._header = {
             "schema": V3_SCHEMA,
             "stream_id": stream_id or str(uuid.uuid4()),
@@ -232,6 +236,21 @@ class TrainingHistoryV3Writer:
                 "checkpoint": dict(checkpoint),
                 "supersede_from_step": int(supersede_from_step),
             }
+        partition = int(self.contract["partition_size_steps"])
+        if inherited_seals is not None:
+            if inherited_seal_frontier:
+                raise ValueError("specify one inherited seal representation")
+            if not inherited_seals or any(group not in inherited_seals for group in range(len(inherited_seals))):
+                raise ValueError("inherited seals must be a contiguous mapping")
+            inherited_seal_frontier = len(inherited_seals)
+            for group, interval in inherited_seals.items():
+                if not isinstance(group, int) or group < 0 or tuple(interval) != (group * partition, (group + 1) * partition):
+                    raise ValueError("invalid inherited full seal")
+        if inherited_seal_frontier < 0 or inherited_seal_frontier * partition > self._cut:
+            raise ValueError("inherited seal frontier exceeds the resume cut")
+        if origin != "train_resume" and inherited_seal_frontier:
+            raise ValueError("inherited seals require train_resume origin")
+        self._sealed_frontier = int(inherited_seal_frontier)
         self._header_bytes = _pretty_json(self._header)
         self._header_hash = hashlib.sha256(self._header_bytes).hexdigest()
         self._create_origin(event)
@@ -257,6 +276,19 @@ class TrainingHistoryV3Writer:
             raise RuntimeError("v3 history writer is poisoned")
         if self._completed:
             raise RuntimeError("v3 history writer is complete")
+
+    @staticmethod
+    def _mkdir_durable(path: Path) -> None:
+        missing: list[Path] = []
+        current = path
+        while not current.exists():
+            missing.append(current)
+            if current.parent == current:
+                break
+            current = current.parent
+        for directory in reversed(missing):
+            directory.mkdir()
+            _fsync_directory(directory.parent)
 
     def _create_origin(self, event: dict[str, Any]) -> None:
         try:
@@ -301,8 +333,13 @@ class TrainingHistoryV3Writer:
             }
             arrays.update({f"term/{name}": value for name, value in record.term_energies.items()})
             group = step // int(self.contract["partition_size_steps"])
-            if group in self._sealed:
+            if group < self._sealed_frontier or group == self._partial_sealed_group:
                 raise ValueError("capture follows its v3 window seal")
+            if self._capture_group is not None and group != self._capture_group:
+                if group != self._sealed_frontier:
+                    raise ValueError("capture follows an unsealed v3 window")
+                self._capture_count = 0
+            self._capture_group = group
             sidecar = {
                 "schema": V3_SCHEMA,
                 "source": "tpen.callback.RawTrainingBatchRecorder",
@@ -341,7 +378,7 @@ class TrainingHistoryV3Writer:
             _fsync_directory(self.fragments)
             self._append_event(event)
             self._last_step = step
-            self._captured_by_group[group] = self._captured_by_group.get(group, 0) + 1
+            self._capture_count += 1
         except BaseException as exc:
             self._fail(exc)
 
@@ -351,18 +388,25 @@ class TrainingHistoryV3Writer:
         try:
             self._check_open()
             group = int(group_index)
+            if group < 0:
+                raise ValueError("invalid or duplicate v3 window seal")
             partition = int(self.contract["partition_size_steps"])
             start = group * partition
             end = partition * (group + 1) if end_step is None else int(end_step)
-            if group in self._sealed or end <= start or end > start + partition:
+            if group != self._sealed_frontier or self._partial_sealed_group is not None or end <= start or end > start + partition:
                 raise ValueError("invalid or duplicate v3 window seal")
             if end < start + partition:
                 raise ValueError("partial v3 window seals are allowed only immediately before complete")
             expected = self._expected_capture_count(start, end)
-            if self._captured_by_group.get(group, 0) != expected:
+            if self._capture_group == group and self._capture_count != expected:
+                raise ValueError("v3 window seal coverage is incomplete")
+            if self._capture_group != group and expected:
                 raise ValueError("v3 window seal coverage is incomplete")
             self._append_event({"type": "window_seal", "group_index": group, "start_step": start, "end_step": end})
-            self._sealed[group] = (start, end)
+            if end == start + partition:
+                self._sealed_frontier += 1
+            else:
+                self._partial_sealed_group = group
         except BaseException as exc:
             self._fail(exc)
 
@@ -382,25 +426,31 @@ class TrainingHistoryV3Writer:
                 raise ValueError("invalid v3 completion counters")
             start = int(self.contract["start_step"])
             every = int(self.contract["every_n_steps"])
-            expected = set(range(max(start, self._cut), next_iteration, every))
+            expected_count = self._expected_capture_count(max(start, self._cut), next_iteration)
+            expected_last = self._expected_last_step(next_iteration)
             if self._last_step is not None and self._last_step >= next_iteration:
                 raise ValueError("capture is outside completion prefix")
-            if next_iteration and expected and self._last_step != max(expected):
+            if expected_count and self._last_step != expected_last:
                 raise ValueError("v3 completion has missing scheduled captures")
-            groups = range((next_iteration + int(self.contract["partition_size_steps"]) - 1) // int(self.contract["partition_size_steps"]))
-            for group in groups:
-                partition = int(self.contract["partition_size_steps"])
-                end = min((group + 1) * partition, next_iteration)
-                if end < (group + 1) * partition:
-                    if group in self._sealed:
-                        raise ValueError("partial window already sealed")
-                    expected = self._expected_capture_count(group * partition, end)
-                    if self._captured_by_group.get(group, 0) != expected:  # final partial
-                        raise ValueError("v3 partial window seal coverage is incomplete")
-                    self._append_event({"type": "window_seal", "group_index": group, "start_step": group * partition, "end_step": end})
-                    self._sealed[group] = (group * partition, end)
-                elif group not in self._sealed:
-                    raise ValueError("complete requires full window seals")
+            partition = int(self.contract["partition_size_steps"])
+            required_groups = (next_iteration + partition - 1) // partition
+            full_groups = next_iteration // partition
+            if self._sealed_frontier < full_groups:
+                raise ValueError("complete requires full window seals")
+            if self._sealed_frontier > full_groups:
+                raise ValueError("complete has seals outside its completion prefix")
+            if required_groups > full_groups:
+                group = full_groups
+                end = next_iteration
+                if self._partial_sealed_group is not None:
+                    raise ValueError("partial window already sealed")
+                expected = self._expected_capture_count(group * partition, end)
+                if self._capture_group != group or self._capture_count != expected:
+                    raise ValueError("v3 partial window seal coverage is incomplete")
+                self._append_event({"type": "window_seal", "group_index": group, "start_step": group * partition, "end_step": end})
+                self._partial_sealed_group = group
+            elif self._partial_sealed_group is not None:
+                raise ValueError("complete has seals outside its completion prefix")
             self._append_event({"type": "complete", "next_iteration": next_iteration, "completed_updates": completed_updates})
             self._completed = True
         except BaseException as exc:
@@ -428,14 +478,44 @@ class TrainingHistoryV3Writer:
             raise ValueError("capture term names disagree with the v3 contract")
         if record.positions.shape[1:] != (int(self.contract["n_electrons"]), int(self.contract["spatial_dim"])):
             raise ValueError("capture positions disagree with the v3 geometry")
+        expected = {
+            "walker_index": ("<i8", (record.n_walkers,)),
+            "positions": ("<f8", (record.n_walkers, int(self.contract["n_electrons"]), int(self.contract["spatial_dim"]))),
+            "local_energy": ("<f8", (record.n_walkers,)), "logabs": ("<f8", (record.n_walkers,)),
+            "sign": ("<f8", (record.n_walkers,)), "finite": ("|b1", (record.n_walkers,)),
+        }
+        for name, (dtype, shape) in expected.items():
+            value = getattr(record, name)
+            if value.shape != shape or value.dtype.str != dtype:
+                raise ValueError(f"capture {name} has invalid shape or dtype")
+            if name != "finite" and not np.isfinite(value).all():
+                raise ValueError("capture required arrays must be finite")
+        for name in self.contract["term_names"]:
+            value = record.term_energies[name]
+            if value.shape != (record.n_walkers,) or value.dtype.str != "<f8" or not np.isfinite(value).all():
+                raise ValueError("capture term arrays have invalid shape, dtype, or finiteness")
+        if not bool(np.all(record.finite)):
+            raise ValueError("capture finite flags must all be true")
+        if record.completed_updates < 0 or record.completed_updates > step + 1:
+            raise ValueError("capture completed_updates is out of range")
 
     def _expected_capture_count(self, start: int, end: int) -> int:
         """Count scheduled captures owned by this stream after its resume cut."""
 
-        cadence_start = max(int(self.contract["start_step"]), self._cut)
+        cadence_start = int(self.contract["start_step"])
         every = int(self.contract["every_n_steps"])
         first = cadence_start + max(0, (start - cadence_start + every - 1) // every) * every
+        first = max(first, self._cut + ((cadence_start - self._cut) % every)) if self._cut > cadence_start else first
         return len(range(first, end, every)) if first < end else 0
+
+    def _expected_last_step(self, end: int) -> int | None:
+        cadence_start = int(self.contract["start_step"])
+        every = int(self.contract["every_n_steps"])
+        first = cadence_start
+        if self._cut > first:
+            first = self._cut + ((cadence_start - self._cut) % every)
+        count = self._expected_capture_count(first, end)
+        return first + (count - 1) * every if count else None
 
 
 __all__ = ["TrainingHistoryV3Writer"]

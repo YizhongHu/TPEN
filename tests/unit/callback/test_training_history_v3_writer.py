@@ -61,6 +61,23 @@ def test_writer_round_trip_and_exact_write_set(tmp_path: Path) -> None:
     }
 
 
+def test_writer_matches_r1_fixture_bytes_for_shared_scenario(tmp_path: Path) -> None:
+    stream_id = "32323232-3232-4232-8232-323232323232"
+    fixture = tmp_path / "fixture"
+    _write_v3_fixture(fixture, stream_id=stream_id, steps=[0, 1], complete=2)
+    writer = TrainingHistoryV3Writer(
+        tmp_path / "writer", stream_id=stream_id, run_id=f"run-{stream_id[:8]}",
+        contract=_contract(), provenance={"config_hash": "3" * 64},
+    )
+    writer.append_capture(_record(0))
+    writer.append_capture(_record(1))
+    writer.complete(next_iteration=2, completed_updates=2)
+    assert (fixture / "history.json").read_bytes() == (writer.root / "history.json").read_bytes()
+    assert (fixture / "events.jsonl").read_bytes() == (writer.root / "events.jsonl").read_bytes()
+    for name in ("step-000000000000.npz", "step-000000000000.json", "step-000000000001.npz", "step-000000000001.json"):
+        assert (fixture / "fragments" / name).read_bytes() == (writer.root / "fragments" / name).read_bytes()
+
+
 def test_writer_refuses_missing_capture_and_poisoned_writer(tmp_path: Path) -> None:
     writer = _writer(tmp_path / "history")
     with pytest.raises(ValueError, match="missing"):
@@ -68,6 +85,38 @@ def test_writer_refuses_missing_capture_and_poisoned_writer(tmp_path: Path) -> N
     assert writer.poisoned
     with pytest.raises(RuntimeError, match="poisoned"):
         writer.append_capture(_record(0))
+
+
+def _resume_stub(root: Path, *, contract: dict[str, object], cut: int, frontier: int = 0) -> TrainingHistoryV3Writer:
+    return TrainingHistoryV3Writer(
+        root, stream_id="34343434-3434-4434-8434-343434343434", run_id="resume-test",
+        contract=contract, origin="train_resume", supersede_from_step=cut,
+        inherited_seal_frontier=frontier,
+        checkpoint={"path": str((root.parent / "checkpoint").resolve()), "manifest_sha256": "a" * 64,
+                    "model_sha256": "b" * 64, "next_iteration": cut, "completed_updates": cut},
+    )
+
+
+def test_resume_cadence_phase_and_inherited_full_seal_frontier(tmp_path: Path) -> None:
+    contract = _contract() | {"every_n_steps": 50, "partition_size_steps": 1000}
+    writer = _resume_stub(tmp_path / "cadence", contract=contract, cut=473)
+    assert writer._expected_capture_count(0, 1000) == 10
+    for step in range(500, 1000, 50):
+        writer.append_capture(_record(step))
+    writer.complete(next_iteration=1000, completed_updates=10)
+    writer = _resume_stub(tmp_path / "cadence-short", contract=contract, cut=473)
+    for step in range(500, 725, 50):
+        writer.append_capture(_record(step))
+    writer.complete(next_iteration=725, completed_updates=5)
+
+    small = _resume_stub(tmp_path / "inherited", contract=_contract(), cut=4, frontier=1)
+    small.complete(next_iteration=4, completed_updates=4)
+    continuing = _resume_stub(tmp_path / "continuing", contract=_contract(), cut=4, frontier=1)
+    continuing.append_capture(_record(4))
+    continuing.complete(next_iteration=5, completed_updates=5)
+
+    phased = _resume_stub(tmp_path / "phase", contract=_contract() | {"start_step": 1, "every_n_steps": 2}, cut=4)
+    assert phased._expected_capture_count(0, 10) == 3
 
 
 def test_writer_refuses_nonmonotone_capture(tmp_path: Path) -> None:
@@ -136,6 +185,42 @@ def test_empty_root_is_accepted_and_symlink_root_refused(tmp_path: Path) -> None
     component.symlink_to(target, target_is_directory=True)
     with pytest.raises(ValueError, match="symlink"):
         _writer(component / "history")
+
+
+def test_root_creation_fsyncs_new_directory_entries(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import tpen.callback.training_history_v3_writer as module
+    trace: list[str] = []
+    original = module._fsync_directory
+    monkeypatch.setattr(module, "_fsync_directory", lambda path: (trace.append(path.name), original(path))[1])
+    _writer(tmp_path / "missing" / "history")
+    assert trace[:2] == ["missing", "history"]
+
+
+@pytest.mark.parametrize("mutation", ["finite", "completed_updates", "positions"])
+def test_append_admission_rejects_mutated_record_without_log_write(tmp_path: Path, mutation: str) -> None:
+    writer = _writer(tmp_path / mutation)
+    record = _record(0)
+    before = (writer.root / "events.jsonl").read_bytes()
+    if mutation == "finite":
+        record.finite[0] = False
+    elif mutation == "completed_updates":
+        object.__setattr__(record, "completed_updates", 2)
+    else:
+        record.positions[0, 0, 0] = np.nan
+    with pytest.raises(ValueError):
+        writer.append_capture(record)
+    assert writer.poisoned
+    assert (writer.root / "events.jsonl").read_bytes() == before
+
+
+def test_complete_rejects_negative_and_extra_seals(tmp_path: Path) -> None:
+    writer = _writer(tmp_path / "negative")
+    with pytest.raises(ValueError, match="invalid or duplicate"):
+        writer.seal_window(-1)
+    writer = _writer(tmp_path / "extra")
+    writer.seal_window(0)
+    with pytest.raises(ValueError, match="outside"):
+        writer.complete(next_iteration=0, completed_updates=0)
 
 
 def test_resume_origin_written_by_writer_and_read_by_r1(tmp_path: Path) -> None:
@@ -208,7 +293,8 @@ def test_creation_and_capture_order_trace(monkeypatch: pytest.MonkeyPatch, tmp_p
     monkeypatch.setattr(module, "_fsync_log", log_fsync)
     writer = _writer(tmp_path / "history")
     creation = list(trace)
-    assert creation[:3] == ["history.json fsync", "events.jsonl fsync", "dir history"]
+    assert creation[0].startswith("dir ")
+    assert creation[1:] == ["dir history", "history.json fsync", "events.jsonl fsync", "dir history", "log append", "log fsync", "dir history"]
     trace.clear()
     writer.append_capture(_record(0))
     capture = trace
