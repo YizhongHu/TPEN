@@ -839,7 +839,9 @@ class TrainingBatchReader:
                 step = _int(event["start_step"], name="fragment start_step")
                 _int(event["end_step"], name="fragment end_step", minimum=1)
                 _hash(event["sidecar_sha256"], name="sidecar_sha256")
-                if event["end_step"] != step + 1 or (fragment_steps and step <= fragment_steps[-1]):
+                cadence_start = int(header["contract"]["start_step"])
+                cadence = int(header["contract"]["every_n_steps"])
+                if event["end_step"] != step + 1 or step < cadence_start or (step - cadence_start) % cadence != 0 or (fragment_steps and step <= fragment_steps[-1]):
                     raise ValueError("v3 local fragment steps are not strictly increasing")
                 if header["origin"] == "train_resume" and step < event0_cut(events[0]):
                     raise ValueError("v3 resumed fragment precedes its supersede cut")
@@ -864,6 +866,9 @@ class TrainingBatchReader:
                 }
                 if completion["completed_updates"] > completion["next_iteration"]:
                     raise ValueError("v3 completed_updates exceeds next_iteration")
+        updates = [int(arrays["completed_updates"][0]) for _, arrays, _ in fragments]
+        if any(later < earlier for earlier, later in zip(updates, updates[1:])):
+            raise ValueError("v3 completed_updates is not monotone across fragments")
         parent_node: _V3Node | None = None
         cut = 0
         if origin["type"] == "resume":
