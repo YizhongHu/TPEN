@@ -40,7 +40,7 @@ def _train_row(tmp_path: Path) -> tuple[dict[str, object], Path]:
     overlay = ROOT / protocol.HOOKE_OVERLAY_RELATIVE_PATH
     overlay_digest = protocol.overlay_sha256(overlay)
     row: dict[str, object] = {
-        "row_id": "hooke2-materialized-train",
+        "row_id": "",
         "system": "hooke2", "system_id": "hooke_pair_singlet_omega0.5",
         "kind": "train", "seed": 17, "source_sha": "a" * 40,
         "config_sha256": protocol.config_identities(
@@ -72,12 +72,12 @@ def _train_row(tmp_path: Path) -> tuple[dict[str, object], Path]:
         },
         "model": {"_target_": "example.Model"}, "hamiltonian_terms": {},
         "optimizer": {"_target_": "torch.optim.Adam"},
-        "sampler": {"_target_": "example.Sampler", "n_walkers": 2, "seed": 23},
+        "sampler": {"_target_": "example.Sampler", "n_walkers": 2, "seed": 23, "dtype": "float64"},
         "trainer": {"_target_": "example.Trainer", "max_steps": 10},
         "checkpoint_steps": [1, 10],
         "runner": {
             "_target_": "tpen.runner.Train", "model": {"_target_": "example.Model"},
-            "sampler": {"_target_": "example.Sampler", "n_walkers": 2, "seed": 23},
+            "sampler": {"_target_": "example.Sampler", "n_walkers": 2, "seed": 23, "dtype": "float64"},
             "hamiltonian_terms": {}, "optimizer": {"_target_": "torch.optim.Adam"},
             "trainer": {"_target_": "example.Trainer", "max_steps": 10},
         },
@@ -90,6 +90,9 @@ def _train_row(tmp_path: Path) -> tuple[dict[str, object], Path]:
         ],
     }
     row["row_extension"]["rendered_config"]["sha256"] = _write_rendered(rendered_path, payload)  # type: ignore[index]
+    row["row_id"] = protocol.manifest_hash([
+        {key: value for key, value in row.items() if key != "row_id"}
+    ])
     return row, rendered_path
 
 
@@ -239,7 +242,7 @@ def test_adding_extension_marker_to_native_row_refuses_without_fallback(
 ) -> None:
     """Old rows cannot opt into the materialized path by marker injection."""
 
-    phase1, _ = _small_native_rows("he", "/n/netscratch/kozinsky_lab/Lab/r2-native")
+    phase1, _ = _small_native_rows("he", "/fake/results-root")
     row = dict(next(row for row in phase1 if row["kind"] == "train"))
     row["row_extension"] = extension
     with pytest.raises(ProtocolError):
@@ -279,12 +282,18 @@ def test_materialized_wire_shape_fails_closed(
         )
 
 
-def _materialized_eval_row(tmp_path: Path) -> tuple[dict[str, object], Path]:
+def _materialized_eval_row(
+    tmp_path: Path, *, checkpoint: int = 1,
+) -> tuple[dict[str, object], Path]:
     """Create one valid strict fresh eval row with a real checkpoint byte."""
 
     results = tmp_path / "results"
     _, eval_rows = _small_native_rows("hooke2", str(results))
     row = dict(eval_rows[0])
+    row["checkpoint"] = checkpoint
+    row["updates"] = checkpoint
+    row["checkpoint_dir"] = str(results / f"checkpoint-{checkpoint}")
+    row["checkpoint_file"] = str(results / f"checkpoint-{checkpoint}" / "model.pt")
     checkpoint_dir = Path(str(row["checkpoint_dir"]))
     checkpoint_dir.mkdir(parents=True)
     checkpoint_file = checkpoint_dir / "model.pt"
@@ -307,7 +316,133 @@ def _materialized_eval_row(tmp_path: Path) -> tuple[dict[str, object], Path]:
     row["row_extension"]["rendered_config"]["sha256"] = _write_rendered(  # type: ignore[index]
         rendered_path, rendered,
     )
+    row["row_id"] = protocol.manifest_hash([
+        {key: value for key, value in row.items() if key != "row_id"}
+    ])
     return row, rendered_path
+
+
+def _rewrite_materialized_row(
+    row: dict[str, object], rendered_path: Path, mutate,
+) -> None:
+    """Change one rendered mapping and refreeze its dependent row identity."""
+
+    payload = yaml.safe_load(rendered_path.read_text(encoding="utf-8"))
+    mutate(payload)
+    row["row_extension"]["rendered_config"]["sha256"] = _write_rendered(  # type: ignore[index]
+        rendered_path, payload,
+    )
+    row["row_id"] = protocol.manifest_hash([
+        {key: value for key, value in row.items() if key != "row_id"}
+    ])
+
+
+def test_extended_row_id_is_content_addressed_with_a_refrozen_green_sibling(
+    tmp_path: Path,
+) -> None:
+    """Admission rejects stale IDs and accepts the same row after refreezing."""
+
+    row, _ = _train_row(tmp_path)
+    row["execution"] = {"stop_at": 1}
+    with pytest.raises(ProtocolError, match="row_id"):
+        protocol.validate_gateway_binding(
+            binding=_binding_token(row), expected_kinds={"train"},
+        )
+    row["row_id"] = protocol.manifest_hash([
+        {key: value for key, value in row.items() if key != "row_id"}
+    ])
+    protocol.validate_gateway_binding(
+        binding=_binding_token(row), expected_kinds={"train"},
+    )
+
+
+def test_consumed_integer_binding_requires_exact_scalar_type(tmp_path: Path) -> None:
+    """A float spelling equal to an integer row binding is refused before core."""
+
+    row, rendered_path = _train_row(tmp_path)
+
+    def mutate(payload: dict[str, object]) -> None:
+        payload["sampler"]["n_walkers"] = 2.0  # type: ignore[index]
+        payload["runner"]["sampler"]["n_walkers"] = 2.0  # type: ignore[index]
+
+    _rewrite_materialized_row(row, rendered_path, mutate)
+    with pytest.raises(ProtocolError, match="sampler bindings"):
+        protocol.load_materialized_config(row, expected_kind="train")
+
+
+def test_consumed_dtype_must_match_runtime_dtype_for_train_and_eval(
+    tmp_path: Path,
+) -> None:
+    """Consistent float32 sampler copies cannot accompany a float64 runtime."""
+
+    train_row, train_path = _train_row(tmp_path / "train")
+
+    def mutate_train(payload: dict[str, object]) -> None:
+        payload["sampler"]["dtype"] = "float32"  # type: ignore[index]
+        payload["runner"]["sampler"]["dtype"] = "float32"  # type: ignore[index]
+
+    _rewrite_materialized_row(train_row, train_path, mutate_train)
+    with pytest.raises(ProtocolError, match="sampler dtype"):
+        protocol.load_materialized_config(train_row, expected_kind="train")
+
+    eval_row, eval_path = _materialized_eval_row(tmp_path / "eval")
+
+    def mutate_eval(payload: dict[str, object]) -> None:
+        payload["evaluation_sampler"]["dtype"] = "float32"  # type: ignore[index]
+        for task in (
+            payload["evaluation_tasks"]["mcmc_energy"],  # type: ignore[index]
+            payload["evaluator"]["tasks"][0],  # type: ignore[index]
+            payload["runner"]["evaluator"]["tasks"][0],  # type: ignore[index]
+        ):
+            task["generator"]["sampler"]["dtype"] = "float32"
+
+    _rewrite_materialized_row(eval_row, eval_path, mutate_eval)
+    with pytest.raises(ProtocolError, match="evaluation sampler dtype"):
+        protocol.load_materialized_config(eval_row, expected_kind="eval")
+
+
+def test_checkpoint_zero_fresh_eval_is_admitted_but_zero_train_is_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Eval admits its zero boundary while train retains a positive horizon."""
+
+    eval_row, eval_path = _materialized_eval_row(tmp_path / "eval", checkpoint=0)
+    calls: list[object] = []
+    monkeypatch.setattr(
+        stage1_eval, "run_from_config",
+        lambda cfg, **kwargs: calls.append((cfg, kwargs)) or 0,
+    )
+    monkeypatch.setattr(sys, "argv", ["stage1-eval", "--binding", _binding_token(eval_row)])
+    assert stage1_eval.main() == 0
+    assert len(calls) == 1
+
+    train_row, _ = _train_row(tmp_path / "train")
+    train_row["updates"] = 0
+    train_row["row_id"] = protocol.manifest_hash([
+        {key: value for key, value in train_row.items() if key != "row_id"}
+    ])
+    with pytest.raises(ProtocolError, match="updates"):
+        protocol.validate_gateway_binding(
+            binding=_binding_token(train_row), expected_kinds={"train"},
+        )
+
+
+def test_materialized_system_id_must_be_from_the_finite_roster(tmp_path: Path) -> None:
+    """Changing row and config IDs together cannot invent a new system."""
+
+    row, rendered_path = _train_row(tmp_path)
+    payload = yaml.safe_load(rendered_path.read_text(encoding="utf-8"))
+    payload["system"]["id"] = "unregistered-system"
+    rendered_path.write_text(yaml.safe_dump(payload, sort_keys=True), encoding="utf-8")
+    row["row_extension"]["rendered_config"]["sha256"] = hashlib.sha256(  # type: ignore[index]
+        rendered_path.read_bytes()
+    ).hexdigest()
+    row["system_id"] = "unregistered-system"
+    row["row_id"] = protocol.manifest_hash([
+        {key: value for key, value in row.items() if key != "row_id"}
+    ])
+    with pytest.raises(ProtocolError, match="system identity"):
+        protocol.load_materialized_config(row, expected_kind="train")
 
 
 def test_real_train_and_eval_mains_reach_one_core_call_with_consumed_bindings(
@@ -538,10 +673,10 @@ def test_extended_v2_basis_provenance_and_recorder_order_are_strict(tmp_path: Pa
         protocol.validate_materialized_admission(cfg, row, admission)
 
 
-def test_lr4_row_boundary_stays_single_binding_without_override_channels() -> None:
+def test_lr4_row_boundary_stays_single_binding_without_override_channels(tmp_path: Path) -> None:
     """The row consumer remains one selected row with no fan-out parameters."""
 
-    phase1, _ = _small_native_rows("he", "/n/netscratch/kozinsky_lab/Lab/lr4")
+    phase1, _ = _small_native_rows("he", str(tmp_path / "lr4"))
     row = next(row for row in phase1 if row["kind"] == "train")
     command = command_for_row(row, python="/usr/bin/python3", driver="driver.py")
     assert command.count("--binding") == 1

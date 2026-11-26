@@ -132,6 +132,22 @@ def _is_torch_seed(value: object) -> bool:
     return _is_int_coordinate(value) and 0 <= value < _TORCH_SEED_MODULUS
 
 
+def _same_typed_scalar(actual: object, expected: object) -> bool:
+    """Compare a consumed scalar without allowing bool/int coercion."""
+
+    return type(actual) is type(expected) and actual == expected
+
+
+def _same_typed_sequence(actual: object, expected: object) -> bool:
+    """Compare a sequence of consumed scalar bindings with exact types."""
+
+    if not isinstance(actual, (list, tuple)) or not isinstance(expected, (list, tuple)):
+        return False
+    return len(actual) == len(expected) and all(
+        _same_typed_scalar(item, wanted) for item, wanted in zip(actual, expected)
+    )
+
+
 @dataclass(frozen=True)
 class SystemSpec:
     """A system-neutral descriptor used by every Stage-1 row."""
@@ -412,6 +428,9 @@ def _validate_extension_shape(row: Mapping[str, Any], *, expected_kind: str | No
         raise ProtocolError("materialized row contains unsupported top-level keys")
     if not set(row).issuperset(required):
         raise ProtocolError("materialized row is missing required top-level keys")
+    row_without_id = {key: value for key, value in row.items() if key != "row_id"}
+    if row.get("row_id") != manifest_hash([row_without_id]):
+        raise ProtocolError("materialized row_id does not match the row content")
     if kind == "train" and profile == OVERLAY_PROFILE_V2:
         if row.get("overlay_profile") != OVERLAY_PROFILE_V2:
             raise ProtocolError("diagnostics-v2 materialized train row needs overlay_profile")
@@ -424,7 +443,12 @@ def _validate_extension_shape(row: Mapping[str, Any], *, expected_kind: str | No
     ):
         raise ProtocolError("materialized execution must contain only integer stop_at")
 
-    if row.get("system") not in SYSTEMS or not isinstance(row.get("system_id"), str):
+    expected_system_ids = {spec.name: spec.system_id for spec in SYSTEM_SPECS}
+    if (
+        row.get("system") not in expected_system_ids
+        or not isinstance(row.get("system_id"), str)
+        or row["system_id"] != expected_system_ids[row["system"]]
+    ):
         raise ProtocolError("materialized row has an invalid system identity")
     if row.get("config_identity_rule") != CONFIG_IDENTITY_RULE:
         raise ProtocolError("materialized rows require stage1-config-v1")
@@ -443,11 +467,13 @@ def _validate_extension_shape(row: Mapping[str, Any], *, expected_kind: str | No
             raise ProtocolError(f"materialized row {key} must be a non-negative integer")
     if not _is_torch_seed(row["seed"]):
         raise ProtocolError("materialized row seed is outside the Torch-compatible range")
-    if row["updates"] <= 0 or row["walkers"] <= 0:
-        raise ProtocolError("materialized row dimensions must be positive")
+    if row["walkers"] <= 0:
+        raise ProtocolError("materialized row walkers must be positive")
     if row.get("device") not in {"cpu", "cuda"}:
         raise ProtocolError("materialized row device must be cpu or cuda")
     if kind == "train":
+        if row["updates"] <= 0:
+            raise ProtocolError("materialized train updates must be positive")
         if row["lineage"] > 2 or not _is_torch_seed(row.get("sampler_seed")):
             raise ProtocolError("materialized train lineage or sampler_seed is invalid")
         steps = row.get("checkpoint_steps")
@@ -508,7 +534,8 @@ def _materialized_mapping(cfg: Any, row: Mapping[str, Any]) -> dict[str, Any]:
         raise ProtocolError("materialized run.dir does not match the row run directory")
     if experiment.get("name") != row["experiment_name"] or experiment.get("sector") != row["sector"]:
         raise ProtocolError("materialized experiment identity does not match row")
-    if runtime.get("seed") != row["seed"] or runtime.get("device") != row["device"]:
+    if (not _same_typed_scalar(runtime.get("seed"), row["seed"])
+            or runtime.get("device") != row["device"]):
         raise ProtocolError("materialized runtime identity does not match row")
     if "dtype" not in runtime:
         raise ProtocolError("materialized runtime dtype is missing")
@@ -552,14 +579,17 @@ def _materialized_mapping(cfg: Any, row: Mapping[str, Any]) -> dict[str, Any]:
                 raise ProtocolError(f"materialized train runner.{name} disagrees with root config")
         sampler = mapping("sampler")
         trainer = mapping("trainer")
-        if sampler.get("n_walkers") != row["walkers"] or sampler.get("seed") != row["sampler_seed"]:
+        if (not _same_typed_scalar(sampler.get("n_walkers"), row["walkers"])
+                or not _same_typed_scalar(sampler.get("seed"), row["sampler_seed"])):
             raise ProtocolError("materialized sampler bindings disagree with row")
-        if trainer.get("max_steps") != row["updates"]:
+        if not _same_typed_scalar(trainer.get("max_steps"), row["updates"]):
             raise ProtocolError("materialized trainer horizon disagrees with row")
         steps = list(row["checkpoint_steps"])
         positive_steps = steps[1:]
-        if list(cfg.get("checkpoint_steps", ())) != positive_steps:
+        if not _same_typed_sequence(list(cfg.get("checkpoint_steps", ())), positive_steps):
             raise ProtocolError("materialized checkpoint_steps must exclude only zero")
+        if sampler.get("dtype") != runtime.get("dtype"):
+            raise ProtocolError("materialized sampler dtype disagrees with runtime dtype")
         callbacks = OmegaConf.to_container(cfg.get("callbacks"), resolve=True)
         if not isinstance(callbacks, list):
             raise ProtocolError("materialized train callbacks are missing")
@@ -602,10 +632,12 @@ def _materialized_mapping(cfg: Any, row: Mapping[str, Any]) -> dict[str, Any]:
         if cfg.get("trajectory_identity", {}).get("checkpoint_file") != row["checkpoint_file"]:
             raise ProtocolError("materialized eval checkpoint identity disagrees with row")
         sampler = mapping("evaluation_sampler")
-        if sampler.get("n_walkers") != row["walkers"] or sampler.get("seed") != row["seed"]:
+        if (not _same_typed_scalar(sampler.get("n_walkers"), row["walkers"])
+                or not _same_typed_scalar(sampler.get("seed"), row["seed"])):
             raise ProtocolError("materialized evaluation sampler disagrees with row")
         evaluator = mapping("evaluator")
-        if evaluator.get("_target_") != "tpen.evaluation.Evaluator" or evaluator.get("seed") != row["seed"]:
+        if (evaluator.get("_target_") != "tpen.evaluation.Evaluator"
+                or not _same_typed_scalar(evaluator.get("seed"), row["seed"])):
             raise ProtocolError("materialized evaluator identity disagrees with row")
         tasks = OmegaConf.to_container(evaluator.get("tasks"), resolve=True)
         task = OmegaConf.to_container(
@@ -618,9 +650,13 @@ def _materialized_mapping(cfg: Any, row: Mapping[str, Any]) -> dict[str, Any]:
         generator = task.get("generator")
         if not isinstance(generator, Mapping) or generator.get("_target_") != "tpen.evaluation.generators.TrajectoryMCMCGenerator":
             raise ProtocolError("materialized eval generator is unsupported")
-        if (generator.get("sampler") != sampler or generator.get("hamiltonian_terms") != cfg.get("hamiltonian_terms")
-                or generator.get("seed") != row["seed"] or generator.get("n_draws") != row["draws"]):
+        if (generator.get("sampler") != sampler
+                or generator.get("hamiltonian_terms") != cfg.get("hamiltonian_terms")
+                or not _same_typed_scalar(generator.get("seed"), row["seed"])
+                or not _same_typed_scalar(generator.get("n_draws"), row["draws"])):
             raise ProtocolError("materialized eval generator bindings disagree with row")
+        if sampler.get("dtype") != runtime.get("dtype"):
+            raise ProtocolError("materialized evaluation sampler dtype disagrees with runtime dtype")
     return _plain_materialized_config(cfg)
 
 
