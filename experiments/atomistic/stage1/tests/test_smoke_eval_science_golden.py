@@ -89,7 +89,8 @@ import json
 import sys
 from pathlib import Path
 source_root = Path(sys.argv[1]).resolve()
-sys.path.insert(0, str(source_root))
+if Path.cwd().resolve() != source_root:
+    raise AssertionError(f"serializer cwd is not archive: {Path.cwd()}")
 import tpen
 import experiments.atomistic.stage1.protocol as protocol_module
 for module in (protocol_module, tpen):
@@ -162,6 +163,7 @@ def _base_snapshot(*, hostile_pythonpath: Path | None = None) -> bytes:
         }
         if hostile_pythonpath is not None:
             env["PYTHONPATH"] = str(hostile_pythonpath)
+            env["PYTHONSAFEPATH"] = "1"
         return subprocess.check_output(
             [sys.executable, "-c", _BASE_SCRIPT, str(checkout.resolve())],
             cwd=checkout.resolve(), env=env, text=False,
