@@ -386,7 +386,7 @@ def test_rendered_input_scope_rejects_escape_paths(tmp_path: Path, path_kind: st
     (
         ("load.path", "load binding"),
         ("run.root", "run identity"),
-        ("evaluation_tasks.mcmc_energy.generator.n_draws", "generator bindings"),
+        ("evaluation_tasks.mcmc_energy.generator.n_draws", "evaluator task list"),
         ("trajectory_identity.checkpoint_file", "checkpoint identity"),
     ),
 )
@@ -406,6 +406,18 @@ def test_eval_load_root_and_task_mismatches_refuse_before_core(
     else:
         cfg.trajectory_identity.checkpoint_file = str(tmp_path / "foreign-model.pt")
     with pytest.raises(ProtocolError, match=message):
+        protocol.validate_materialized_admission(cfg, row, admission)
+
+
+def test_eval_generator_mismatch_refuses_after_consistent_task_copies(tmp_path: Path) -> None:
+    """A consistent task-list mutation reaches the row generator binding check."""
+
+    row, _ = _materialized_eval_row(tmp_path)
+    cfg, admission = protocol.load_materialized_config(row, expected_kind="eval")
+    cfg.evaluation_tasks.mcmc_energy.generator.n_draws = 99
+    cfg.evaluator.tasks[0].generator.n_draws = 99
+    cfg.runner.evaluator.tasks[0].generator.n_draws = 99
+    with pytest.raises(ProtocolError, match="generator bindings"):
         protocol.validate_materialized_admission(cfg, row, admission)
 
 
