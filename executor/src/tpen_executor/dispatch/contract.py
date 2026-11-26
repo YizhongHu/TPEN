@@ -190,7 +190,11 @@ def _require_configured_physical_slot(allocation: Any, selected_slot: Any = None
             candidate for candidate in slots
             if candidate.slot_id == getattr(selected_slot, "slot_id", None)
         )
-        if len(matching) != 1 or matching[0] != selected_slot:
+        if (
+            len(matching) != 1
+            or not isinstance(selected_slot, type(matching[0]))
+            or matching[0].to_dict() != selected_slot.to_dict()
+        ):
             raise PlacementRefusal(
                 "configured-physical-slot-foreign",
                 "selected configured-run slot is not an exact entitlement of this allocation",

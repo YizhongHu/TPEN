@@ -9,6 +9,7 @@ from threading import Event
 
 import pytest
 
+from tpen_executor._codec import canonical_bytes, decode_json
 from tpen_executor.dispatch.contract import _require_configured_physical_slot, _with_child_placement
 from tpen_executor.dispatch.transport import LeafRequest
 from tpen_executor.environments import PreparedPythonEnvironment
@@ -32,7 +33,7 @@ MUTANTS = [
     {
         "id": "PA1-foreign-slot",
         "target": "executor/src/tpen_executor/dispatch/contract.py",
-        "old": "        if len(matching) != 1 or matching[0] != selected_slot:\n",
+        "old": "        if (\n            len(matching) != 1\n            or not isinstance(selected_slot, type(matching[0]))\n            or matching[0].to_dict() != selected_slot.to_dict()\n        ):\n",
         "new": "        if False:\n",
         "killer": "test_foreign_selected_slot_is_refused",
     },
@@ -63,6 +64,27 @@ MUTANTS = [
         "old": "            slot = _require_configured_physical_slot(allocation, selected_slot)\n",
         "new": "            slot = _require_configured_physical_slot(allocation)\n",
         "killer": "test_serialized_leaf_request_carries_selected_slot",
+    },
+    {
+        "id": "PA1-crossed-request-guard",
+        "target": "executor/src/tpen_executor/dispatch/transport.py",
+        "old": "            if crossed:\n                raise PlacementRefusal(\n                    \"configured-physical-slot-crossed\",\n",
+        "new": "            if False:\n                raise PlacementRefusal(\n                    \"configured-physical-slot-crossed\",\n",
+        "killer": "test_review_crossed_overlay_request_refused",
+    },
+    {
+        "id": "PA1-wrong-valid-slot",
+        "target": "executor/src/tpen_executor/dispatch/contract.py",
+        "old": "        if (\n            len(matching) != 1\n            or not isinstance(selected_slot, type(matching[0]))\n            or matching[0].to_dict() != selected_slot.to_dict()\n        ):\n            raise PlacementRefusal(\n                \"configured-physical-slot-foreign\",\n                \"selected configured-run slot is not an exact entitlement of this allocation\",\n            )\n        slot = matching[0]\n",
+        "new": "        if (\n            len(matching) != 1\n            or not isinstance(selected_slot, type(matching[0]))\n            or matching[0].to_dict() != selected_slot.to_dict()\n        ):\n            raise PlacementRefusal(\n                \"configured-physical-slot-foreign\",\n                \"selected configured-run slot is not an exact entitlement of this allocation\",\n            )\n        slot = slots[0]\n",
+        "killer": "test_review_two_slots_have_distinct_wire_bindings_and_reuse",
+    },
+    {
+        "id": "PA1-slot-equality-canonical",
+        "target": "executor/src/tpen_executor/dispatch/contract.py",
+        "old": "            or matching[0].to_dict() != selected_slot.to_dict()\n",
+        "new": "            or matching[0] != selected_slot\n",
+        "killer": "test_review_mapping_order_is_not_foreign",
     },
 ]
 
@@ -150,6 +172,95 @@ def test_two_slots_admit_two_rows_and_refuse_third_until_collection(tmp_path: Pa
         executor.collect(handle_b)
     finally:
         release.set()
+        executor.close()
+
+
+def test_review_crossed_overlay_request_refused(tmp_path: Path) -> None:
+    group, allocation, _, configured, fence = _begin(
+        tmp_path, task_id="member", facts=_allocation(2).facts,
+    )
+    configured = replace(configured, config="", overrides=(), program=_program(tmp_path))
+    a, b = (_allocation_slot(allocation, i) for i in (0, 1))
+    environment = _with_child_placement(
+        _environment(tmp_path), allocation, fence, group, group.members[0],
+        configured, selected_slot=a,
+    )
+    assert environment.env["TPEN_PLACEMENT_SLOT_ID"] == a.slot_id
+    with pytest.raises(PlacementRefusal) as refused:
+        LeafRequest.for_attempt(fence, allocation, configured, environment, selected_slot=b)
+    assert refused.value.code == "configured-physical-slot-crossed"
+
+
+def test_review_mapping_order_is_not_foreign() -> None:
+    allocation = _allocation(1)
+    slot = replace(
+        _allocation_slot(allocation, 0),
+        environment=(("Z_TEST", "z"), ("A_TEST", "a")),
+        threads=(("OMP_NUM_THREADS", 1), ("MKL_NUM_THREADS", 1)),
+    )
+    allocation = replace(allocation, facts={
+        "slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": [slot.to_dict()]},
+    })
+    copied = AllocationSlot.from_mapping(decode_json(canonical_bytes(slot.to_dict())))
+    assert copied.to_dict() == slot.to_dict()
+    accepted = _require_configured_physical_slot(allocation, copied)
+    assert accepted.to_dict() == slot.to_dict()
+
+
+def test_review_two_slots_have_distinct_wire_bindings_and_reuse(tmp_path: Path) -> None:
+    names = ("one", "two", "three")
+    group, allocation = _group(names), _allocation(2)
+    captured = {}
+    started = {name: Event() for name in names}
+    release = {name: Event() for name in names}
+
+    def runner(payload: bytes) -> bytes:
+        request = LeafRequest.decode(payload)
+        captured[request.task_id] = request
+        started[request.task_id].set()
+        assert release[request.task_id].wait(5)
+        return _failure_result(request).encode()
+
+    def materializer(program):
+        return ConfiguredRun(program.config_ref["task"], "", (), _program(tmp_path))
+
+    executor = LocalLeafExecutor(group, allocation, materializer, _environment, leaf_runner=runner)
+    try:
+        _, a = executor.submit(*_invocation(group, allocation, "one", tmp_path))
+        _, b = executor.submit(*_invocation(group, allocation, "two", tmp_path))
+        assert started["one"].wait(2)
+        assert started["two"].wait(2)
+        assert not a._future.done() and not b._future.done()
+        assert captured["one"].slot_id == a.slot_id
+        assert captured["two"].slot_id == b.slot_id
+        assert a.slot_id != b.slot_id
+        for handle in (a, b):
+            expected = next(
+                _allocation_slot(allocation, i) for i in (0, 1)
+                if _allocation_slot(allocation, i).slot_id == handle.slot_id
+            )
+            request = captured[handle.task_id]
+            assert request.environment.env["TPEN_SLOT_CPUS"] == ",".join(map(str, expected.cpus))
+            assert request.environment.env["TPEN_SLOT_NODE"] == expected.node
+            assert request.environment.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == ",".join(expected.devices)
+            assert request.attempt_delta.attempt_core_dir == request.output_dir + "/core"
+        assert captured["one"].output_dir != captured["two"].output_dir
+        with pytest.raises(CapacityExceededError):
+            executor.submit(*_invocation(group, allocation, "three", tmp_path))
+        release["one"].set()
+        assert executor.collect(a, timeout=2) is not None
+        assert not b._future.done()
+        _, c = executor.submit(*_invocation(group, allocation, "three", tmp_path))
+        assert started["three"].wait(2)
+        assert c.slot_id == a.slot_id != b.slot_id
+        assert captured["three"].slot_id == c.slot_id
+        for name in names:
+            release[name].set()
+        assert executor.collect(b, timeout=2) is not None
+        assert executor.collect(c, timeout=2) is not None
+    finally:
+        for event in release.values():
+            event.set()
         executor.close()
 
 
