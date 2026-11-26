@@ -976,3 +976,14 @@ def test_real_fresh_process_restore_parity_with_checkpoint_zero_and_overlay(
         name: (prefix_checkpoint / name).read_bytes()
         for name in before_payloads
     } == before_payloads
+
+
+def test_v3_recorder_resume_is_admitted(tmp_path: Path) -> None:
+    """Only an explicitly opted-in recorder passes the Stage-1 preflight."""
+    cfg = _cfg(tmp_path)
+    cfg.callbacks.append({
+        "_target_": "tpen.callback.RawTrainingBatchRecorder",
+        "path": "training_history",
+        "format_version": 3,
+    })
+    restart._refuse_unsupported_resume_callbacks(cfg, None)

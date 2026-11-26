@@ -1,0 +1,32 @@
+{
+  "mutants": [
+    {
+      "id": "r3-resume-counters",
+      "target": "tpen/callback/raw_training_batch_recorder.py",
+      "old": "if counters != (progress[\"next_iteration\"], progress[\"completed_updates\"]):",
+      "new": "if False:",
+      "killer": "tests/unit/callback/test_raw_training_batch_recorder_resume.py::test_counter_mismatch_refused_before_publication"
+    },
+    {
+      "id": "r3-yield-observation",
+      "target": "tpen/callback/raw_training_batch_recorder.py",
+      "old": "if result is None or self._v3_counters != (result.next_iteration, result.completed_updates):",
+      "new": "if False:",
+      "killer": "tests/unit/callback/test_raw_training_batch_recorder_resume.py::test_yield_requires_observed_boundary"
+    },
+    {
+      "id": "r3-yield-seal",
+      "target": "tpen/callback/raw_training_batch_recorder.py",
+      "old": "                self._finish_v3()\n\n    def handle_occurrence_impl",
+      "new": "                pass\n\n    def handle_occurrence_impl",
+      "killer": "tests/unit/callback/test_raw_training_batch_recorder_resume.py::test_yield_seals_durable_partial_window"
+    },
+    {
+      "id": "r3-boundary-capture",
+      "target": "tpen/callback/raw_training_batch_recorder.py",
+      "old": "        if scheduled:\n            self._v3_writer.append_capture",
+      "new": "        if scheduled and record.iteration_step != 3:\n            self._v3_writer.append_capture",
+      "killer": "tests/unit/callback/test_raw_training_batch_recorder_resume.py::test_partial_window_continues_without_duplicates"
+    }
+  ]
+}

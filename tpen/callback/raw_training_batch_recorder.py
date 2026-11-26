@@ -30,6 +30,7 @@ from tpen.events import Event as TypedEvent
 from tpen.events import Occurrence, Subscription
 from tpen.training.events import TrainingCompleted, TrainingIteration, TrainingIterationCompleted
 from tpen.training.state import TrainerState
+from tpen.run_events import RunCompleted
 
 from .base import StatefulCallback
 from .cadence import StepCadenceGate, SubscriptionGroup, pop_step_cadence
@@ -1311,19 +1312,19 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
     digests.  Because partition plans are deterministic, this recorder only
     accepts the full cadence (``probability=1`` and ``max_calls=None``).
 
-    A restored ``train_resume`` lineage is refused before capture or file
-    publication. Full recorder resume semantics are deferred to item
-    ``7eaf9e0c``; accepting a resumed callback here would risk appending a
-    history whose lineage cannot be proven. Like ``InitialCheckpoint``, the
-    defensive first-lineage check runs at ``started(TrainingIteration)``:
-    this boundary is emitted before ``CollectSamples`` and therefore sees the
-    pre-update trainer cursor, rather than the post-update counters available
-    at ``TrainingIterationCompleted``.
+    The default v2 layout remains fresh-only. Opt in with
+    ``format_version=3`` for durable per-capture fragments and checkpoint-bound
+    continuation. Keep the same run-relative history path in each segment;
+    the checkpoint provenance identifies the parent run. Callback state is
+    reconstructed from that validated history, never serialized in checkpoints.
     """
 
     state_type: ClassVar[type[DomainState]] = TrainerState
 
-    def __init__(self, path: str | Path, *, partition_size_steps: int = 1000, **kwargs: Any) -> None:
+    def __init__(self, path: str | Path, *, partition_size_steps: int = 1000, format_version: int = 2, **kwargs: Any) -> None:
+        if format_version not in (2, 3):
+            raise ValueError("format_version must be 2 or 3")
+        self.format_version = format_version
         cadence = pop_step_cadence(kwargs)
         if cadence.probability != 1.0:
             raise ValueError("RawTrainingBatchRecorder requires probability=1.0")
@@ -1339,7 +1340,7 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
                     Subscription.of(TrainingCompleted),
                 )
             ),
-            SubscriptionGroup(selectors=(Subscription.of(CheckpointRestored),), stateless=True),
+            SubscriptionGroup(selectors=(Subscription.of(CheckpointRestored), Subscription.of(RunCompleted)), stateless=True),
         ), **kwargs)
         self.path = Path(path)
         self.partition_size_steps = int(partition_size_steps)
@@ -1348,6 +1349,10 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
         self.last_measurement: dict[str, Any] | None = None
         self._restored = False
         self._first_iteration_seen = False
+        self._v3_writer = None
+        self._restore_report = None
+        self._v3_counters = (0, 0)
+        self._v3_finished = False
 
     def handle_stateless_occurrence_impl(
         self, occurrence: Occurrence[TypedEvent], context: RunContext
@@ -1357,11 +1362,19 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
         del context
         if isinstance(occurrence.event, CheckpointRestored):
             self._restored = True
+            self._restore_report = occurrence.event.report
+        elif isinstance(occurrence.event, RunCompleted) and self.format_version == 3:
+            event = occurrence.event
+            if event.status == "planned_yield":
+                result = event.result
+                if result is None or self._v3_counters != (result.next_iteration, result.completed_updates):
+                    raise ValueError("v3 recorder did not observe the planned yield boundary")
+                self._finish_v3()
 
     def handle_occurrence_impl(self, occurrence: Occurrence[TypedEvent], context: RunContext, state: TrainerState) -> None:
         """Capture the state produced by the pre-update model at a scheduled step."""
 
-        if self._restored:
+        if self._restored and self.format_version == 2:
             raise ValueError(
                 "RawTrainingBatchRecorder refuses restored lineage before capture "
                 "or publication [unsupported-callback]"
@@ -1376,18 +1389,24 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
                 fresh_lineage = event.operation.step == 0 and all(
                     progress[key] == 0 for key in ("next_iteration", "completed_updates")
                 )
-                if not fresh_lineage:
+                if self.format_version == 3 and self._restored:
+                    self._resume_v3(context, progress)
+                elif not fresh_lineage:
                     raise ValueError(
                         "RawTrainingBatchRecorder refuses restored lineage before capture "
                         "or publication [unsupported-callback]"
                     )
             return
         if isinstance(event, TrainingCompleted):
-            self._publish(context, final=True)
+            if self.format_version == 3:
+                self._finish_v3()
+            else:
+                self._publish(context, final=True)
             return
         if not isinstance(event, TrainingIterationCompleted):
             return
-        if not self._steps.should_run(event.iteration.step):
+        scheduled = self._steps.should_run(event.iteration.step)
+        if not scheduled and self.format_version == 2:
             return
         if state.batch is None or state.local_energy is None or state.wavefunction_output is None:
             raise ValueError("raw training recorder requires batch, local energy, and wavefunction output")
@@ -1420,6 +1439,9 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
                 )
             ),
         )
+        if self.format_version == 3:
+            self._capture_v3(record, context, state, scheduled=scheduled)
+            return
         index = record.iteration_step // self.partition_size_steps
         if self._partition is None or self._partition.partition_index != index:
             if self._partition is not None:
@@ -1439,6 +1461,93 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
         self._partition.append(record, sampler_stats=_sampler_provenance(state.sampler_stats))
         if self._partition.planned_steps and record.iteration_step == self._partition.planned_steps[-1]:
             self._publish(context)
+
+    def _resume_v3(self, context: RunContext, progress: Mapping[str, Any]) -> None:
+        """Bind the new segment to a validated parent and restored checkpoint."""
+        from .training_history_v3_writer import TrainingHistoryV3Writer
+
+        report = self._restore_report
+        if report is None or report.mode != "train_resume" or report.checkpoint_dir is None:
+            raise ValueError("v3 recorder requires train_resume checkpoint")
+        ref = checkpoint_ref(report.checkpoint_dir)
+        counters = (ref.next_iteration, ref.completed_updates)
+        if counters != (progress["next_iteration"], progress["completed_updates"]):
+            raise ValueError("v3 restored counters disagree with checkpoint")
+        relative = self.path.resolve().relative_to(Path(context.metadata.run_dir).resolve())
+        if not relative.parts:
+            raise ValueError("v3 history must be a child of the run directory")
+        source = ref.provenance.get("run_dir")
+        if not isinstance(source, str) or not Path(source).is_absolute():
+            raise ValueError("v3 checkpoint lacks source run directory")
+        parent_root = Path(source) / relative
+        reader = TrainingBatchReader(parent_root)
+        node = reader._load_v3_node(
+            parent_root.resolve(), stack=(), seen_streams=set(), limit=None, retain_rows=False,
+        )
+        contract = node.header["contract"]
+        if (contract["start_step"], contract["every_n_steps"], contract["partition_size_steps"]) != (
+            self._steps.cadence.start, self._steps.cadence.every_n, self.partition_size_steps,
+        ):
+            raise ValueError("v3 resumed cadence is incompatible with parent")
+        if not _v3_has_scheduled_prefix(node.active_steps, contract, ref.next_iteration):
+            raise ValueError("v3 parent has missing scheduled captures")
+        binding = {
+            "path": str(ref.checkpoint_dir.resolve()), "manifest_sha256": ref.manifest_sha256,
+            "model_sha256": ref.model_sha256, "next_iteration": ref.next_iteration,
+            "completed_updates": ref.completed_updates,
+        }
+        reader._validate_v3_checkpoint(binding, node.header, node, ref.next_iteration)
+        parent = {
+            "root": str(parent_root.resolve()), "event_count": len(node.events),
+            "prefix_sha256": node.digests[-1],
+        }
+        frontier = sum(
+            seal["end_step"] == (seal["group_index"] + 1) * self.partition_size_steps
+            and seal["end_step"] <= ref.next_iteration for seal in node.effective_seals
+        )
+        if frontier != ref.next_iteration // self.partition_size_steps:
+            raise ValueError("v3 parent lacks full window seals")
+        self._v3_writer = TrainingHistoryV3Writer(
+            self.path, run_id=context.metadata.run_id, contract=contract,
+            origin="train_resume", parent=parent, checkpoint=binding,
+            supersede_from_step=ref.next_iteration, inherited_seal_frontier=frontier,
+            provenance=_context_provenance(context, None),
+        )
+        self._v3_counters = counters
+
+    def _capture_v3(self, record: TrainingBatchRecord, context: RunContext,
+                    state: TrainerState, *, scheduled: bool) -> None:
+        """Publish each selected batch before acknowledging its iteration."""
+        from .training_history_v3_writer import TrainingHistoryV3Writer
+
+        if record.iteration_step != self._v3_counters[0]:
+            raise ValueError("v3 recorder iteration gap or duplicate")
+        if self._v3_writer is None:
+            contract = {
+                "coordinate": "iteration_step", "start_step": self._steps.cadence.start,
+                "every_n_steps": self._steps.cadence.every_n,
+                "partition_size_steps": self.partition_size_steps,
+                "walker_count": record.n_walkers, "n_electrons": record.positions.shape[1],
+                "spatial_dim": record.positions.shape[2], "term_names": list(record.term_names),
+                "capture_semantics": "pre_update_model_forward",
+            }
+            self._v3_writer = TrainingHistoryV3Writer(
+                self.path, run_id=context.metadata.run_id, contract=contract,
+                provenance=_context_provenance(context, state.sampler_stats),
+            )
+        if scheduled:
+            self._v3_writer.append_capture(record, sampler_stats=_sampler_provenance(state.sampler_stats))
+        self._v3_counters = (record.iteration_step + 1, record.completed_updates)
+        if self._v3_counters[0] % self.partition_size_steps == 0:
+            self._v3_writer.seal_window(record.iteration_step // self.partition_size_steps)
+
+    def _finish_v3(self) -> None:
+        """Seal a successful segment, never a failed or partially observed one."""
+        if self._v3_writer is not None and not self._v3_finished:
+            self._v3_writer.complete(
+                next_iteration=self._v3_counters[0], completed_updates=self._v3_counters[1],
+            )
+            self._v3_finished = True
 
     def _publish(self, context: RunContext, *, final: bool = False) -> None:
         """Publish the open partition and emit only measurement metadata."""
@@ -1461,6 +1570,10 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
 
         self._restored = False
         self._first_iteration_seen = False
+        self._v3_writer = None
+        self._restore_report = None
+        self._v3_counters = (0, 0)
+        self._v3_finished = False
 
 
 TrainingBatchRecorder = RawTrainingBatchRecorder
