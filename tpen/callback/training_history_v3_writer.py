@@ -34,6 +34,16 @@ from .raw_training_batch_recorder import (
 _ZERO_HASH = "0" * 64
 
 
+def _reject_symlinked_root(path: Path) -> None:
+    """Reject an existing symlink in the root path before creating children."""
+
+    current = Path(path.anchor) if path.is_absolute() else Path()
+    for component in path.parts[1:] if path.is_absolute() else path.parts:
+        current = current / component
+        if current.exists() and current.is_symlink():
+            raise ValueError("v3 history root or root component is a symlink")
+
+
 def _write_all(fd: int, data: bytes) -> None:
     """Write all bytes, preserving short-write behavior for fault tests."""
 
@@ -77,6 +87,17 @@ def _publish_exclusive(temp: Path, final: Path) -> None:
 
     os.link(temp, final)
     temp.unlink()
+
+
+def _append_log_line(path: Path, line: bytes) -> None:
+    """Append one complete event line and fsync the log file."""
+
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    try:
+        _write_all(fd, line)
+        _fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _npz_bytes(record: TrainingBatchRecord) -> bytes:
@@ -140,6 +161,7 @@ class TrainingHistoryV3Writer:
         self._captured_by_group: dict[int, int] = {}
         self._sealed: dict[int, tuple[int, int]] = {}
         self._completed = False
+        self._cut = int(supersede_from_step) if origin == "train_resume" else 0
         self.contract = dict(contract)
         _validate_v3_contract(self.contract)
         if stream_id is not None and not _UUID_RE.fullmatch(stream_id):
@@ -152,6 +174,7 @@ class TrainingHistoryV3Writer:
         self.provenance.setdefault("source_revision", None)
         self.provenance.setdefault("sampler_settings", {})
         self.provenance.setdefault("acceptance_proposal_stats", [])
+        _reject_symlinked_root(self.root)
         if self.root.exists():
             if not self.root.is_dir() or self.root.is_symlink() or any(self.root.iterdir()):
                 raise FileExistsError("v3 history root must be a fresh, empty, non-symlink directory")
@@ -230,12 +253,7 @@ class TrainingHistoryV3Writer:
         event["previous_event_sha256"] = self._last_digest
         line = _compact_json(event)
         digest = _v3_event_digest(self._header_hash, line)
-        fd = os.open(self.root / EVENTS_FILENAME, os.O_WRONLY | os.O_APPEND)
-        try:
-            _write_all(fd, line)
-            _fsync(fd)
-        finally:
-            os.close(fd)
+        _append_log_line(self.root / EVENTS_FILENAME, line)
         _fsync_directory(self.root)
         self._last_digest = digest
         self._event_count += 1
@@ -320,10 +338,7 @@ class TrainingHistoryV3Writer:
                 raise ValueError("invalid or duplicate v3 window seal")
             if end < start + partition:
                 raise ValueError("partial v3 window seals are allowed only immediately before complete")
-            cadence_start = int(self.contract["start_step"])
-            every = int(self.contract["every_n_steps"])
-            first = cadence_start + max(0, (start - cadence_start + every - 1) // every) * every
-            expected = len(range(first, end, every)) if first < end else 0
+            expected = self._expected_capture_count(start, end)
             if self._captured_by_group.get(group, 0) != expected:
                 raise ValueError("v3 window seal coverage is incomplete")
             self._append_event({"type": "window_seal", "group_index": group, "start_step": start, "end_step": end})
@@ -348,7 +363,7 @@ class TrainingHistoryV3Writer:
                 raise ValueError("invalid v3 completion counters")
             start = int(self.contract["start_step"])
             every = int(self.contract["every_n_steps"])
-            expected = set(range(start, next_iteration, every))
+            expected = set(range(max(start, self._cut), next_iteration, every))
             if self._last_step is not None and self._last_step >= next_iteration:
                 raise ValueError("capture is outside completion prefix")
             if next_iteration and expected and self._last_step != max(expected):
@@ -360,11 +375,8 @@ class TrainingHistoryV3Writer:
                 if end < (group + 1) * partition:
                     if group in self._sealed:
                         raise ValueError("partial window already sealed")
-                    cadence_start = int(self.contract["start_step"])
-                    every = int(self.contract["every_n_steps"])
-                    first = cadence_start + max(0, (group * partition - cadence_start + every - 1) // every) * every
-                    expected = len(range(first, end, every)) if first < end else 0
-                    if self._captured_by_group.get(group, 0) != expected:
+                    expected = self._expected_capture_count(group * partition, end)
+                    if self._captured_by_group.get(group, 0) != expected:  # final partial
                         raise ValueError("v3 partial window seal coverage is incomplete")
                     self._append_event({"type": "window_seal", "group_index": group, "start_step": group * partition, "end_step": end})
                     self._sealed[group] = (group * partition, end)
@@ -390,6 +402,8 @@ class TrainingHistoryV3Writer:
             raise ValueError("capture steps must be strictly increasing")
         if step < start or (step - start) % every:
             raise ValueError("capture step is outside the v3 cadence")
+        if step < self._cut:
+            raise ValueError("resume capture precedes the supersede cut")
         if record.n_walkers != int(self.contract["walker_count"]):
             raise ValueError("capture walker count disagrees with the v3 contract")
         if record.term_names != tuple(self.contract["term_names"]):
@@ -397,8 +411,13 @@ class TrainingHistoryV3Writer:
         if record.positions.shape[1:] != (int(self.contract["n_electrons"]), int(self.contract["spatial_dim"])):
             raise ValueError("capture positions disagree with the v3 geometry")
 
+    def _expected_capture_count(self, start: int, end: int) -> int:
+        """Count scheduled captures owned by this stream after its resume cut."""
 
-TrainingBatchV3Writer = TrainingHistoryV3Writer
-TrainingHistoryWriter = TrainingHistoryV3Writer
+        cadence_start = max(int(self.contract["start_step"]), self._cut)
+        every = int(self.contract["every_n_steps"])
+        first = cadence_start + max(0, (start - cadence_start + every - 1) // every) * every
+        return len(range(first, end, every)) if first < end else 0
 
-__all__ = ["TrainingHistoryV3Writer", "TrainingBatchV3Writer", "TrainingHistoryWriter"]
+
+__all__ = ["TrainingHistoryV3Writer"]

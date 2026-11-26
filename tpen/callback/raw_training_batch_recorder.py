@@ -1239,24 +1239,6 @@ def _v3_has_scheduled_prefix(active_steps: set[int], contract: Mapping[str, Any]
     return expected == actual
 
 
-def __getattr__(name: str) -> Any:
-    """Lazily expose the library writer without importing it during startup."""
-
-    if name in {"TrainingHistoryV3Writer", "TrainingBatchV3Writer", "TrainingHistoryWriter"}:
-        from .training_history_v3_writer import (
-            TrainingBatchV3Writer,
-            TrainingHistoryV3Writer,
-            TrainingHistoryWriter,
-        )
-
-        return {
-            "TrainingHistoryV3Writer": TrainingHistoryV3Writer,
-            "TrainingBatchV3Writer": TrainingBatchV3Writer,
-            "TrainingHistoryWriter": TrainingHistoryWriter,
-        }[name]
-    raise AttributeError(name)
-
-
 def _validate_sidecar(root: Path, sidecar: Mapping[str, Any], *, entry: Mapping[str, Any]) -> None:
     """Refuse missing, altered, or internally inconsistent partition envelopes."""
 
@@ -1485,4 +1467,4 @@ TrainingBatchRecorder = RawTrainingBatchRecorder
 TrainingHistoryReader = TrainingBatchReader
 TrainingBatchValidator = TrainingBatchReader
 
-__all__ = ["RawTrainingBatchRecorder", "TrainingBatchRecorder", "TrainingBatchPartitionWriter", "TrainingBatchReader", "TrainingHistoryReader", "TrainingBatchValidator", "TrainingBatchRecord", "SCHEMA", "TrainingHistoryV3Writer", "TrainingBatchV3Writer", "TrainingHistoryWriter"]
+__all__ = ["RawTrainingBatchRecorder", "TrainingBatchRecorder", "TrainingBatchPartitionWriter", "TrainingBatchReader", "TrainingHistoryReader", "TrainingBatchValidator", "TrainingBatchRecord", "SCHEMA"]

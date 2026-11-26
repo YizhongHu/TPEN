@@ -1,18 +1,21 @@
 {
   "mutants": [
-    {
-      "id": "r2-writer-order-log-after-publish",
-      "target": "tpen/callback/training_history_v3_writer.py",
-      "old": "_fsync_directory(self.fragments)\n            self._append_event({",
-      "new": "self._append_event({",
-      "killer": "tests/unit/callback/test_training_history_v3_writer.py::test_writer_round_trip_and_exact_write_set"
-    },
-    {
-      "id": "r2-writer-monotone-guard",
-      "target": "tpen/callback/training_history_v3_writer.py",
-      "old": "if self._last_step is not None and step <= self._last_step:",
-      "new": "if False:",
-      "killer": "tests/unit/callback/test_training_history_v3_writer.py::test_writer_refuses_nonmonotone_capture"
-    }
+    {"id":"r2-nonempty-root","target":"tpen/callback/training_history_v3_writer.py","old":"if not self.root.is_dir() or self.root.is_symlink() or any(self.root.iterdir()):","new":"if False:","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_nonempty_root_refused_in_all_states"},
+    {"id":"r2-symlink-root","target":"tpen/callback/training_history_v3_writer.py","old":"raise ValueError(\"v3 history root or root component is a symlink\")","new":"return None","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_empty_root_is_accepted_and_symlink_root_refused"},
+    {"id":"r2-npz-fsync","target":"tpen/callback/training_history_v3_writer.py","old":"_write_all(fd, data)\n        _fsync(fd)","new":"_write_all(fd, data)","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_each_fsync_point_poisoning_preserves_committed_prefix[npz]"},
+    {"id":"r2-sidecar-fsync","target":"tpen/callback/training_history_v3_writer.py","old":"sidecar_tmp = self.fragments / f\".{stem}.json.tmp\"","new":"sidecar_tmp = bundle_tmp","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_each_fsync_point_poisoning_preserves_committed_prefix[sidecar]"},
+    {"id":"r2-fragments-dir-fsync","target":"tpen/callback/training_history_v3_writer.py","old":"_fsync_directory(self.fragments)\n            self._append_event({","new":"self._append_event({","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_each_fsync_point_poisoning_preserves_committed_prefix[fragments]"},
+    {"id":"r2-log-fsync","target":"tpen/callback/training_history_v3_writer.py","old":"_write_all(fd, line)\n        _fsync(fd)","new":"_write_all(fd, line)","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_each_fsync_point_poisoning_preserves_committed_prefix[log]"},
+    {"id":"r2-exclusive-publish","target":"tpen/callback/training_history_v3_writer.py","old":"os.link(temp, final)","new":"os.replace(temp, final)","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_publish_collision_and_mid_npz_failure_poison"},
+    {"id":"r2-log-after-publish","target":"tpen/callback/training_history_v3_writer.py","old":"_publish_exclusive(sidecar_tmp, self.fragments / f\"{stem}.json\")\n            _fsync_directory(self.fragments)\n            self._append_event({","new":"self._append_event({","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_creation_and_capture_order_trace"},
+    {"id":"r2-short-write","target":"tpen/callback/training_history_v3_writer.py","old":"while view:","new":"if view:","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_short_os_write_is_completed_and_reader_validates"},
+    {"id":"r2-poisoning","target":"tpen/callback/training_history_v3_writer.py","old":"self._poisoned = True\n        raise exc","new":"raise exc","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_writer_fsync_failure_poisoning"},
+    {"id":"r2-monotone","target":"tpen/callback/training_history_v3_writer.py","old":"if self._last_step is not None and step <= self._last_step:","new":"if False:","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_writer_refuses_nonmonotone_capture"},
+    {"id":"r2-cadence","target":"tpen/callback/training_history_v3_writer.py","old":"if step < start or (step - start) % every:","new":"if False:","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_off_cadence_refused"},
+    {"id":"r2-contract-shape","target":"tpen/callback/training_history_v3_writer.py","old":"if record.n_walkers != int(self.contract[\"walker_count\"]):","new":"if False:","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_contract_shape_nonfinite_and_term_mismatch_refused"},
+    {"id":"r2-seal-coverage","target":"tpen/callback/training_history_v3_writer.py","old":"if self._captured_by_group.get(group, 0) != expected:\n                raise ValueError(\"v3 window seal coverage is incomplete\")","new":"if False:","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_seal_complete_and_contract_refusals"},
+    {"id":"r2-partial-seal-placement","target":"tpen/callback/training_history_v3_writer.py","old":"if end < start + partition:","new":"if False:","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_partial_seal_requires_completion_boundary"},
+    {"id":"r2-append-after-complete","target":"tpen/callback/training_history_v3_writer.py","old":"if self._completed:","new":"if False:","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_append_after_complete_refused"},
+    {"id":"r2-complete-counters","target":"tpen/callback/training_history_v3_writer.py","old":"if next_iteration < 0 or completed_updates < 0 or completed_updates > next_iteration:","new":"if False:","killer":"tests/unit/callback/test_training_history_v3_writer.py::test_complete_counters_refused"}
   ]
 }
