@@ -21,6 +21,7 @@ from tests.helpers.executor_boundary import executor_call
 _EXECUTOR_CHILD = r'''
 import builtins
 import json
+import os
 import sys
 from pathlib import Path
 
