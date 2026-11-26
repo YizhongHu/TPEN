@@ -829,3 +829,221 @@ def test_lr4_row_boundary_stays_single_binding_without_override_channels(tmp_pat
     command = command_for_row(row, python="/usr/bin/python3", driver="driver.py")
     assert command.count("--binding") == 1
     assert all(marker not in command for marker in ("qsub", "--array", "fan-out", "optimizer"))
+
+
+def _invoke_train(
+    row: dict[str, object], monkeypatch: pytest.MonkeyPatch, calls: list[object],
+) -> None:
+    monkeypatch.setattr(
+        stage1_train,
+        "run_from_config",
+        lambda cfg, **kwargs: calls.append((cfg, kwargs)) or 0,
+    )
+    monkeypatch.setattr(sys, "argv", ["stage1-train", "--binding", _binding_token(row)])
+    stage1_train.main()
+
+
+def _invoke_eval(
+    row: dict[str, object], monkeypatch: pytest.MonkeyPatch, calls: list[object],
+) -> None:
+    monkeypatch.setattr(
+        stage1_eval,
+        "run_from_config",
+        lambda cfg, **kwargs: calls.append((cfg, kwargs)) or 0,
+    )
+    monkeypatch.setattr(sys, "argv", ["stage1-eval", "--binding", _binding_token(row)])
+    stage1_eval.main()
+
+
+def assert_type_drift_is_in_consumed_copy(
+    payload: dict[str, object], original: object,
+) -> None:
+    """Check that the root duplicate stayed intact while runner copy drifted."""
+
+    root_value = payload["evaluator"]["tasks"][0]["generator"]["n_draws"]
+    runner_value = payload["runner"]["evaluator"]["tasks"][0]["generator"]["n_draws"]
+    assert root_value == original and type(root_value) is type(original) is int
+    assert runner_value == float(original) and type(runner_value) is float
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        pytest.param(
+            lambda p: p["runner"]["sampler"].__setitem__("n_walkers", 2.0),
+            id="runner-sampler-n-walkers-float",
+        ),
+        pytest.param(
+            lambda p: p["runner"]["trainer"].__setitem__("max_steps", 10.0),
+            id="runner-trainer-max-steps-float",
+        ),
+        pytest.param(
+            lambda p: p["callbacks"][0]["schedule"]["updates"].__setitem__(0, 1.0),
+            id="checkpoint-schedule-update-float",
+        ),
+    ),
+)
+def test_train_consumed_copy_type_drift_refuses_before_core(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation,
+) -> None:
+    """Equal-by-value floats in consumed train copies are not admissible."""
+
+    row, path = _train_row(tmp_path)
+    _rewrite_materialized_row(row, path, mutation)
+    calls: list[object] = []
+    with pytest.raises((protocol.ProtocolError, restart.RestartRefusal)):
+        _invoke_train(row, monkeypatch, calls)
+    assert calls == []
+
+
+def test_eval_consumed_generator_draw_type_drift_refuses_before_core(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The evaluator task copy must preserve the row's integer draw type."""
+
+    row, path = _materialized_eval_row(tmp_path)
+    original = row["draws"]
+    _rewrite_materialized_row(
+        row,
+        path,
+        lambda p: (
+            p["runner"]["evaluator"]["tasks"][0]["generator"].__setitem__(
+                "n_draws", float(original),
+            ),
+            assert_type_drift_is_in_consumed_copy(p, original),
+        )[-1],
+    )
+    calls: list[object] = []
+    with pytest.raises((protocol.ProtocolError, restart.RestartRefusal)):
+        _invoke_eval(row, monkeypatch, calls)
+    assert calls == []
+
+
+def test_train_root_horizon_type_guard_is_separate_from_runner_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A root trainer horizon float is independently rejected."""
+
+    row, path = _train_row(tmp_path)
+    _rewrite_materialized_row(row, path, lambda p: p["trainer"].__setitem__("max_steps", 10.0))
+    calls: list[object] = []
+    with pytest.raises((protocol.ProtocolError, restart.RestartRefusal)):
+        _invoke_train(row, monkeypatch, calls)
+    assert calls == []
+
+
+@pytest.mark.parametrize("kind", ("train", "eval"))
+def test_pristine_materialized_rows_reach_core_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    """Controls prove each independent probe has a live green sibling."""
+
+    if kind == "train":
+        row, _ = _train_row(tmp_path)
+        calls: list[object] = []
+        _invoke_train(row, monkeypatch, calls)
+    else:
+        row, _ = _materialized_eval_row(tmp_path)
+        calls = []
+        _invoke_eval(row, monkeypatch, calls)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected_calls"),
+    ((None, 1), ("float64", 1), ("float32", 0)),
+)
+def test_train_sampler_dtype_is_optional_but_when_present_must_match_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dtype: str | None,
+    expected_calls: int,
+) -> None:
+    """The contract permits omitted sampler dtype but rejects a mismatch."""
+
+    row, path = _train_row(tmp_path)
+
+    def mutate(payload: dict[str, object]) -> None:
+        sampler = payload["sampler"]
+        runner_sampler = payload["runner"]["sampler"]
+        if dtype is None:
+            sampler.pop("dtype", None)
+            runner_sampler.pop("dtype", None)
+        else:
+            sampler["dtype"] = dtype
+            runner_sampler["dtype"] = dtype
+
+    _rewrite_materialized_row(row, path, mutate)
+    if expected_calls:
+        calls: list[object] = []
+        _invoke_train(row, monkeypatch, calls)
+        assert len(calls) == expected_calls
+    else:
+        calls = []
+        with pytest.raises((protocol.ProtocolError, restart.RestartRefusal)):
+            _invoke_train(row, monkeypatch, calls)
+        assert calls == []
+
+
+
+@pytest.mark.parametrize("field", ("seed", "sampler-walkers", "sampler-seed"))
+@pytest.mark.parametrize("copy_name", ("root-task", "evaluator-task", "runner-task"))
+def test_eval_consumed_task_scalar_types_refuse_before_core(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, copy_name: str,
+) -> None:
+    """Each nested task copy preserves the integer seed and sampler bindings."""
+
+    row, path = _materialized_eval_row(tmp_path)
+
+    def mutate(payload):
+        task = {
+            "root-task": payload["evaluation_tasks"]["mcmc_energy"],
+            "evaluator-task": payload["evaluator"]["tasks"][0],
+            "runner-task": payload["runner"]["evaluator"]["tasks"][0],
+        }[copy_name]
+        owner = task["generator"]
+        key = "seed"
+        if field.startswith("sampler-"):
+            owner = owner["sampler"]
+            key = "n_walkers" if field == "sampler-walkers" else "seed"
+        assert type(owner[key]) is int
+        owner[key] = float(owner[key])
+
+    _rewrite_materialized_row(row, path, mutate)
+    calls: list[object] = []
+    with pytest.raises((protocol.ProtocolError, restart.RestartRefusal)):
+        _invoke_eval(row, monkeypatch, calls)
+    assert calls == []
+
+
+@pytest.mark.parametrize("owner", ("sampler", "generator"))
+@pytest.mark.parametrize("dtype", (None, "float64", "float32"))
+def test_eval_dtype_is_optional_but_explicit_conflict_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner: str, dtype: str | None,
+) -> None:
+    """Omitted and matching dtypes admit; conflicting dtypes refuse before core."""
+
+    row, path = _materialized_eval_row(tmp_path)
+
+    def mutate(payload):
+        generators = [
+            payload["evaluation_tasks"]["mcmc_energy"]["generator"],
+            payload["evaluator"]["tasks"][0]["generator"],
+            payload["runner"]["evaluator"]["tasks"][0]["generator"],
+        ]
+        targets = generators if owner == "generator" else [
+            payload["evaluation_sampler"], *(g["sampler"] for g in generators),
+        ]
+        for target in targets:
+            if dtype is None:
+                target.pop("dtype", None)
+            else:
+                target["dtype"] = dtype
+
+    _rewrite_materialized_row(row, path, mutate)
+    calls: list[object] = []
+    if dtype == "float32":
+        with pytest.raises((protocol.ProtocolError, restart.RestartRefusal)):
+            _invoke_eval(row, monkeypatch, calls)
+        assert calls == []
+    else:
+        _invoke_eval(row, monkeypatch, calls)
+        assert len(calls) == 1

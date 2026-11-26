@@ -148,6 +148,25 @@ def _same_typed_sequence(actual: object, expected: object) -> bool:
     )
 
 
+def _same_typed_config(actual: Any, expected: Any) -> bool:
+    """Compare complete config copies without coercing nested scalar types."""
+
+    # Normalize containers only; scalar types must survive the comparison.
+    if OmegaConf.is_config(actual):
+        actual = OmegaConf.to_container(actual, resolve=True)
+    if OmegaConf.is_config(expected):
+        expected = OmegaConf.to_container(expected, resolve=True)
+    if isinstance(actual, Mapping) and isinstance(expected, Mapping):
+        return actual.keys() == expected.keys() and all(
+            _same_typed_config(actual[key], expected[key]) for key in actual
+        )
+    if isinstance(actual, list) and isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _same_typed_config(item, wanted) for item, wanted in zip(actual, expected)
+        )
+    return _same_typed_scalar(actual, expected)
+
+
 @dataclass(frozen=True)
 class SystemSpec:
     """A system-neutral descriptor used by every Stage-1 row."""
@@ -576,7 +595,7 @@ def _materialized_mapping(cfg: Any, row: Mapping[str, Any]) -> dict[str, Any]:
         if any(key in runner for key in ("_args_", "_partial_", "callbacks", "loggers", "load")):
             raise ProtocolError("materialized train runner contains an unsupported route")
         for name in ("model", "sampler", "hamiltonian_terms", "optimizer", "trainer"):
-            if runner.get(name) != cfg.get(name):
+            if not _same_typed_config(runner.get(name), cfg.get(name)):
                 raise ProtocolError(f"materialized train runner.{name} disagrees with root config")
         sampler = mapping("sampler")
         trainer = mapping("trainer")
@@ -589,7 +608,7 @@ def _materialized_mapping(cfg: Any, row: Mapping[str, Any]) -> dict[str, Any]:
         positive_steps = steps[1:]
         if not _same_typed_sequence(list(cfg.get("checkpoint_steps", ())), positive_steps):
             raise ProtocolError("materialized checkpoint_steps must exclude only zero")
-        if sampler.get("dtype") != runtime.get("dtype"):
+        if "dtype" in sampler and sampler["dtype"] != runtime.get("dtype"):
             raise ProtocolError("materialized sampler dtype disagrees with runtime dtype")
         callbacks = OmegaConf.to_container(cfg.get("callbacks"), resolve=True)
         if not isinstance(callbacks, list):
@@ -606,7 +625,7 @@ def _materialized_mapping(cfg: Any, row: Mapping[str, Any]) -> dict[str, Any]:
         schedule = checkpoint.get("schedule")
         payload = checkpoint.get("payload")
         if (not isinstance(schedule, Mapping) or schedule.get("_target_") != "tpen.checkpoint.ExplicitUpdates"
-                or list(schedule.get("updates", ())) != positive_steps
+                or not _same_typed_sequence(list(schedule.get("updates", ())), positive_steps)
                 or not isinstance(payload, Mapping) or payload.get("_target_") != "tpen.checkpoint.TrainResume"):
             raise ProtocolError("materialized checkpoint schedule/payload is unsupported")
         if initial[0].get("output_dir") != f"{expected_root}/checkpoints":
@@ -628,7 +647,8 @@ def _materialized_mapping(cfg: Any, row: Mapping[str, Any]) -> dict[str, Any]:
         }
         if dict(load) != expected_load or runner.get("load") != load:
             raise ProtocolError("materialized eval load binding disagrees with row")
-        if runner.get("model") != cfg.get("model") or runner.get("evaluator") != cfg.get("evaluator"):
+        if (not _same_typed_config(runner.get("model"), cfg.get("model"))
+                or not _same_typed_config(runner.get("evaluator"), cfg.get("evaluator"))):
             raise ProtocolError("materialized eval runner disagrees with root config")
         if cfg.get("trajectory_identity", {}).get("checkpoint_file") != row["checkpoint_file"]:
             raise ProtocolError("materialized eval checkpoint identity disagrees with row")
@@ -644,20 +664,22 @@ def _materialized_mapping(cfg: Any, row: Mapping[str, Any]) -> dict[str, Any]:
         task = OmegaConf.to_container(
             mapping("evaluation_tasks").get("mcmc_energy"), resolve=True,
         )
-        if not isinstance(tasks, list) or len(tasks) != 1 or tasks[0] != task:
+        if not isinstance(tasks, list) or len(tasks) != 1 or not _same_typed_config(tasks[0], task):
             raise ProtocolError("materialized evaluator task list disagrees with root task")
         if not isinstance(task, Mapping) or task.get("output_dir") != f"{expected_root}/mcmc_energy":
             raise ProtocolError("materialized eval output is not bound to the row")
         generator = task.get("generator")
         if not isinstance(generator, Mapping) or generator.get("_target_") != "tpen.evaluation.generators.TrajectoryMCMCGenerator":
             raise ProtocolError("materialized eval generator is unsupported")
-        if (generator.get("sampler") != sampler
+        if (not _same_typed_config(generator.get("sampler"), sampler)
                 or generator.get("hamiltonian_terms") != cfg.get("hamiltonian_terms")
                 or not _same_typed_scalar(generator.get("seed"), row["seed"])
                 or not _same_typed_scalar(generator.get("n_draws"), row["draws"])):
             raise ProtocolError("materialized eval generator bindings disagree with row")
-        if sampler.get("dtype") != runtime.get("dtype"):
+        if "dtype" in sampler and sampler["dtype"] != runtime.get("dtype"):
             raise ProtocolError("materialized evaluation sampler dtype disagrees with runtime dtype")
+        if "dtype" in generator and generator["dtype"] != runtime.get("dtype"):
+            raise ProtocolError("materialized evaluation generator dtype disagrees with runtime dtype")
     return _plain_materialized_config(cfg)
 
 
