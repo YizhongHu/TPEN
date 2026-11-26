@@ -78,6 +78,7 @@ class _RawTorchProfiler(Protocol):
     def export_chrome_trace(self, path: str) -> None: ...
 
     profiler: "_InnerTorchProfiler | None"
+    action_map: dict[object, list[Callable[[], object]]]
 
 
 class _KinetoEvent(Protocol):
@@ -172,6 +173,15 @@ class _TorchProfilerBackend:
 
     def stop(self) -> None:
         self._raw.stop()
+
+    def release(self) -> None:
+        """Detach completed capture state and the profiler action cycle."""
+
+        inner_profiler = self._raw.profiler
+        if inner_profiler is not None:
+            inner_profiler.kineto_results = None
+        self._raw.profiler = None
+        self._raw.action_map.clear()
 
     def streaming_rows(self) -> tuple[_StreamingOperatorRow, ...]:
         """Aggregate CPU Kineto events without constructing FunctionEvents."""
@@ -623,6 +633,11 @@ class _NativeSession(RunResource, AbstractContextManager["_NativeSession"]):
         try:
             self._export_trace()
         finally:
+            if self.stopped and isinstance(self.backend, _TorchProfilerBackend):
+                try:
+                    self.backend.release()
+                except BaseException as exc:
+                    self._diagnostic("backend_release_failed", exc)
             self.backend = None
 
     def _close_range(self, operation: Operation, count: int) -> None:

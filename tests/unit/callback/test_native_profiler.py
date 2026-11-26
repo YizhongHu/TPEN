@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import hashlib
 import os
 import json
@@ -10,6 +11,7 @@ import pickle
 import subprocess
 import sys
 import warnings
+import weakref
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -219,6 +221,56 @@ def test_real_torch_streaming_summary_matches_key_averages() -> None:
     assert [row["name"] for row in rows] == [str(row.key) for row in expected[:64]]
 
 
+def test_real_torch_window_close_does_not_retain_kineto_cycle(tmp_path) -> None:
+    """Diagnose Torch 2.11's bound-method action_map retention after release."""
+
+    import torch
+
+    def has_kineto(raw_ref: weakref.ReferenceType[object]) -> bool:
+        raw = raw_ref()
+        retained = bool(
+            raw is not None
+            and raw.profiler is not None
+            and raw.profiler.kineto_results is not None
+        )
+        del raw
+        return retained
+
+    callback = NativeProfiler(
+        enabled=True,
+        window=TrainingIterationWindow(0, 0, 1),
+    )
+    context = make_run_context(tmp_path)
+    was_enabled = gc.isenabled()
+    pre_gc_retained = False
+    raw_ref: weakref.ReferenceType[object] | None = None
+    gc.disable()
+    try:
+        with callback.run_scope(context) as session:
+            callback.handle_occurrence(
+                Occurrence(Started(TrainingIteration(0)), 1), context
+            )
+            backend = session.backend
+            assert isinstance(backend, _TorchProfilerBackend)
+            raw_ref = weakref.ref(backend._raw)
+            del backend
+            with torch.profiler.record_function("retention_probe"):
+                _ = torch.ones(2) + 1
+            callback.handle_occurrence(
+                Occurrence(Ended(TrainingIteration(0)), 1), context
+            )
+            assert session.backend is None
+            # Do not collect before this observation: this distinguishes an
+            # ordinary release from a cycle that cyclic GC can break.
+            assert raw_ref is not None
+            pre_gc_retained = has_kineto(raw_ref)
+    finally:
+        gc.collect()
+        if was_enabled:
+            gc.enable()
+    assert not pre_gc_retained
+
+
 def test_window_close_releases_backend_and_preserves_post_window_diagnostics(tmp_path) -> None:
     backend = _FakeBackend()
     callback = NativeProfiler(
@@ -270,6 +322,9 @@ def test_torch_streaming_backend_missing_kineto_results_fails_without_fallback(t
         kineto_results: object | None = None
 
     class _RawWithoutKineto:
+        action_map: dict[object, list[object]] = {}
+        profiler = _InnerWithoutKineto()
+
         def start(self) -> None:
             pass
 
@@ -284,10 +339,6 @@ def test_torch_streaming_backend_missing_kineto_results_fails_without_fallback(t
 
         def export_chrome_trace(self, path: str) -> None:
             del path
-
-        @property
-        def profiler(self) -> _InnerWithoutKineto:
-            return _InnerWithoutKineto()
 
     raw = _RawWithoutKineto()
     backend = _TorchProfilerBackend(raw, lambda _label: nullcontext())
