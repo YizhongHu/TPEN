@@ -19,7 +19,7 @@ from experiments.atomistic.stage1.protocol import (
     QHO_Q21, SYSTEMS, STAGE1_PROTOCOL,
     bind_evaluation_manifest, build_manifest, config_identities, manifest_hash,
     overlay_sha256, resolve_overlay_path, protocol_for_science_profile,
-    HOOKE2_ACT50_PROFILES,
+    HOOKE2_ACT50_PROFILES, HOOKE_SCIENCE_PROFILE,
 )
 
 
@@ -48,6 +48,7 @@ def main() -> int:
     parser.add_argument("--evaluation-selection")
     args = parser.parse_args()
     systems = tuple(args.systems) if args.systems else None
+    phase1_probe_rows = None
     if args.phase == 2 and args.phase1_manifest is not None:
         phase1_probe = json.loads(args.phase1_manifest.read_text(encoding="utf-8"))
         phase1_probe_rows = phase1_probe.get("rows", [])
@@ -57,6 +58,24 @@ def main() -> int:
                 for row in phase1_probe_rows
                 if isinstance(row, dict) and row.get("kind") == "train"
             )) or systems
+            phase1_probe_profiles = {
+                row.get("science_profile")
+                for row in phase1_probe_rows
+                if isinstance(row, dict)
+                and row.get("kind") == "train"
+                and row.get("science_profile") is not None
+            }
+            if len(phase1_probe_profiles) > 1:
+                raise ValueError("phase-1 rows must use one science profile")
+            phase1_probe_profile = next(iter(phase1_probe_profiles), None)
+            if (phase1_probe_profile is not None
+                    and args.science_profile is not None
+                    and args.science_profile != phase1_probe_profile):
+                raise ValueError(
+                    "explicit --science-profile conflicts with the phase-1 manifest"
+                )
+            if phase1_probe_profile is not None:
+                args.science_profile = str(phase1_probe_profile)
     selected_for_profile = set(systems or SYSTEMS)
     if args.phase == 2 and args.science_profile is None \
             and selected_for_profile.issubset(HOOKE_SYSTEMS):
@@ -176,8 +195,12 @@ def main() -> int:
                     )
             phase1_science_profiles = {
                 row.get("science_profile") for row in phase1_train_rows
-                if row.get("science_profile") in HOOKE2_ACT50_PROFILES
+                if row.get("science_profile") in {
+                    HOOKE_SCIENCE_PROFILE, *HOOKE2_ACT50_PROFILES,
+                }
             }
+            if len(phase1_science_profiles) > 1:
+                raise ValueError("phase-1 rows must use one science profile")
             phase1_science_profile = next(iter(phase1_science_profiles), args.science_profile)
             config_sha256 = config_identities(
                 config_root=config_root, systems=phase1_systems,

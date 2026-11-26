@@ -190,6 +190,19 @@ def is_hooke2_act50_profile(profile: object) -> bool:
     return isinstance(profile, str) and profile in HOOKE2_ACT50_PROFILES
 
 
+def _validate_act50_variant(row: Mapping[str, Any]) -> None:
+    """Require an ACT50 row's short variant to match its finite profile."""
+
+    profile = row.get("science_profile")
+    if not is_hooke2_act50_profile(profile):
+        return
+    expected = hooke2_act50_profile(str(profile))["variant"]
+    if row.get("variant") != expected:
+        raise ProtocolError(
+            "ACT50 row variant does not match its admitted science profile"
+        )
+
+
 def hooke_profile_selection(profile: str, system: str) -> tuple[str, str, tuple[int, ...]]:
     """Return the selection bound to an old or ACT50 Hooke science profile."""
 
@@ -1023,6 +1036,7 @@ def validate_hooke_eval_grid(
     for row in hooke_rows:
         if row.get("kind") != "eval":
             raise ProtocolError("Hooke evaluation grid contains a non-eval row")
+        _validate_act50_variant(row)
         coordinates = (row.get("system"), row.get("lineage"),
                        row.get("checkpoint"), row.get("stream"))
         if (type(coordinates[1]) is not int or type(coordinates[2]) is not int
@@ -1273,6 +1287,7 @@ def validate_gateway_binding(*, binding: str, config: str | None = None,
         )
     if kind is not None and effective_kind != kind:
         raise ProtocolError("binding kind does not match gateway")
+    _validate_act50_variant(row)
     row_config = row.get("config")
     if not isinstance(row_config, str):
         raise ProtocolError("gateway config is invalid")
@@ -1785,6 +1800,10 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         raise ProtocolError("device must be 'cpu' or 'cuda'")
     if science_profile not in {None, HOOKE_SCIENCE_PROFILE, *HOOKE2_ACT50_PROFILES}:
         raise ProtocolError("unknown science profile")
+    if include_smoke and is_hooke2_act50_profile(science_profile):
+        raise ProtocolError(
+            "ACT50 profiles refuse compatibility smoke rows; use derive_smoke_request"
+        )
     effective_protocol = protocol_for_science_profile(protocol, science_profile)
     hooke_science_profile = science_profile is not None and (
         science_profile == HOOKE_SCIENCE_PROFILE or is_hooke2_act50_profile(science_profile)
@@ -2134,6 +2153,8 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
     if len({row.get("seed") for row in phase1_rows}) != len(phase1_rows):
         raise ProtocolError("phase-1 manifest contains duplicate seed")
     train_rows = [row for row in phase1_rows if row.get("kind") == "train"]
+    for row in train_rows:
+        _validate_act50_variant(row)
     systems = tuple(dict.fromkeys(str(row["system"]) for row in train_rows))
     he_h2_selection = _is_he_h2_production_phase(phase1_rows)
     hooke_profiles = {row.get("science_profile") for row in train_rows if _is_hooke_science_row(row)}

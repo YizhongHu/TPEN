@@ -79,30 +79,25 @@ def test_act50_manifest_is_finite_50k_and_a27(profile: str) -> None:
 
 
 @pytest.mark.parametrize("profile", HOOKE2_ACT50_PROFILES)
-def test_act50_compatibility_smoke_has_variant_bound_job_name(profile: str) -> None:
+def test_act50_compatibility_smoke_is_refused(profile: str) -> None:
     identities = config_identities(
         config_root=CONFIG_ROOT, systems=("hooke2",), science_profile=profile,
     )
-    rows = build_manifest(
-        protocol=STAGE1_PROTOCOL,
-        source_sha="a" * 40,
-        config_sha256=identities,
-        checkpoints=list(range(0, 50_001, 1_000)),
-        lineage_seeds=[11, 12, 13],
-        checkpoint_sha256={},
-        results_root="/external/act50-test",
-        systems=("hooke2",),
-        phase=1,
-        science_profile=profile,
-        include_smoke=True,
-        auto_overlay=True,
-    )
-    smoke = next(row for row in rows if row["kind"] == "smoke")
-    variant = str(smoke["variant"])
-    assert smoke["science_profile"] == profile
-    assert stage1_row_job_name(smoke) == (
-        f"hooke2-smoke-{ACT50_JOB_VARIANTS[variant]}-s1-aaaaaaaa"
-    )
+    with pytest.raises(ProtocolError, match="derive_smoke_request"):
+        build_manifest(
+            protocol=STAGE1_PROTOCOL,
+            source_sha="a" * 40,
+            config_sha256=identities,
+            checkpoints=list(range(0, 50_001, 1_000)),
+            lineage_seeds=[11, 12, 13],
+            checkpoint_sha256={},
+            results_root="/external/act50-test",
+            systems=("hooke2",),
+            phase=1,
+            science_profile=profile,
+            include_smoke=True,
+            auto_overlay=True,
+        )
 
 
 def test_act50_job_names_are_bounded_and_unique_across_row_kinds() -> None:

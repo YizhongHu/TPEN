@@ -27,6 +27,7 @@ from experiments.atomistic.stage1.protocol import (
     ProtocolError,
     resolve_config_path,
     resolve_run_dir,
+    _validate_act50_variant,
     validate_he_h2_eval_grid,
     validate_hooke_eval_grid,
 )
@@ -113,6 +114,11 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
         raise CollectionError("manifest_hash does not match manifest rows")
     if any(not isinstance(row, Mapping) for row in rows):
         raise CollectionError("manifest contains a malformed eval row")
+    try:
+        for row in rows:
+            _validate_act50_variant(row)
+    except ProtocolError as exc:
+        raise CollectionError(f"manifest contains an invalid ACT50 variant: {exc}") from exc
     eval_rows = [row for row in rows if row.get("kind") == "eval"]
     phase1_rows = [row for row in rows if row.get("kind") != "eval"]
     phase1_hooke_train_rows = [
