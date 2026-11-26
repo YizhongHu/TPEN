@@ -103,6 +103,7 @@ def test_resume_cadence_phase_and_inherited_full_seal_frontier(tmp_path: Path) -
     assert writer._expected_capture_count(0, 1000) == 10
     for step in range(500, 1000, 50):
         writer.append_capture(_record(step))
+    writer.seal_window(0)
     writer.complete(next_iteration=1000, completed_updates=10)
     writer = _resume_stub(tmp_path / "cadence-short", contract=contract, cut=473)
     for step in range(500, 725, 50):
@@ -193,7 +194,7 @@ def test_root_creation_fsyncs_new_directory_entries(monkeypatch: pytest.MonkeyPa
     original = module._fsync_directory
     monkeypatch.setattr(module, "_fsync_directory", lambda path: (trace.append(path.name), original(path))[1])
     _writer(tmp_path / "missing" / "history")
-    assert trace[:2] == ["missing", "history"]
+    assert trace[:3] == [tmp_path.name, "missing", "history"]
 
 
 @pytest.mark.parametrize("mutation", ["finite", "completed_updates", "positions"])
@@ -217,7 +218,10 @@ def test_complete_rejects_negative_and_extra_seals(tmp_path: Path) -> None:
     writer = _writer(tmp_path / "negative")
     with pytest.raises(ValueError, match="invalid or duplicate"):
         writer.seal_window(-1)
-    writer = _writer(tmp_path / "extra")
+    writer = TrainingHistoryV3Writer(
+        tmp_path / "extra", stream_id="35353535-3535-4535-8535-353535353535",
+        run_id="extra", contract=_contract() | {"start_step": 100}, provenance={"config_hash": "5" * 64},
+    )
     writer.seal_window(0)
     with pytest.raises(ValueError, match="outside"):
         writer.complete(next_iteration=0, completed_updates=0)

@@ -445,7 +445,8 @@ class TrainingHistoryV3Writer:
                 if self._partial_sealed_group is not None:
                     raise ValueError("partial window already sealed")
                 expected = self._expected_capture_count(group * partition, end)
-                if self._capture_group != group or self._capture_count != expected:
+                observed = self._capture_count if self._capture_group == group else 0
+                if observed != expected:
                     raise ValueError("v3 partial window seal coverage is incomplete")
                 self._append_event({"type": "window_seal", "group_index": group, "start_step": group * partition, "end_step": end})
                 self._partial_sealed_group = group
