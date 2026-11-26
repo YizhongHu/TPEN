@@ -49,18 +49,6 @@ class ContextResolutionError(TrainConfigResolutionError):
     """A row declares a model context that this resolver does not consume."""
 
 
-def validate_local_energy_chunk_size(value: Any) -> int | None:
-    """Validate the explicit Stage-Q local-energy chunk bound."""
-
-    if value is None:
-        return None
-    if type(value) is not int or value <= 0:
-        raise TrainConfigResolutionError(
-            "local_energy_chunk_size must be None or an exact positive integer"
-        )
-    return value
-
-
 _AB_CONTEXT_KEYS = frozenset(
     {
         "producer_path",
@@ -634,7 +622,8 @@ def resolve_train_config(
         If the composed configuration fails the HI schema firewall.
     """
 
-    local_energy_chunk_size = validate_local_energy_chunk_size(local_energy_chunk_size)
+    if local_energy_chunk_size is not None:
+        local_energy_chunk_size = validate_local_energy_chunk_size(local_energy_chunk_size)
     cell, source_hash = _cell_from_source(source)
     stage_api = _stage_api()
     # Own one frozen manifest before any resolver consumer can read it again.
@@ -690,12 +679,28 @@ def resolve_train_config(
     walkers = stage_api.walker_count(manifest)
     OmegaConf.update(cfg, "sampler.n_walkers", walkers, merge=False)
     OmegaConf.update(cfg, "trainer.max_steps", stage.updates, merge=False)
+    override_chunk_size = next(
+        (value for path, value in override_items if path == "trainer.local_energy_chunk_size"),
+        _OVERRIDE_MISSING,
+    )
+    if override_chunk_size is not _OVERRIDE_MISSING:
+        override_chunk_size = validate_local_energy_chunk_size(override_chunk_size)
+        if local_energy_chunk_size is not None and override_chunk_size != local_energy_chunk_size:
+            raise TrainConfigResolutionError(
+                "local_energy_chunk_size conflicts with trainer.local_energy_chunk_size override"
+            )
+    effective_chunk_size = (
+        local_energy_chunk_size
+        if local_energy_chunk_size is not None
+        else (None if override_chunk_size is _OVERRIDE_MISSING else override_chunk_size)
+    )
     # Apply this before interpolation resolution so runner.trainer receives
     # the same bound through the committed ${trainer} limb.
-    OmegaConf.update(
-        cfg, "trainer.local_energy_chunk_size", local_energy_chunk_size,
-        merge=False, force_add=True,
-    )
+    if effective_chunk_size is not None:
+        OmegaConf.update(
+            cfg, "trainer.local_energy_chunk_size", effective_chunk_size,
+            merge=False, force_add=True,
+        )
     OmegaConf.update(cfg, "run.root", str(output_path.parent.parent), merge=False)
     OmegaConf.update(cfg, "run.run_id", source_hash, merge=False)
     OmegaConf.update(cfg, "run.layout", "flat", merge=False, force_add=True)
@@ -783,6 +788,17 @@ def resolve_train_config(
     schema.validate_hi_train_config(cfg)
     return cfg
 
+def validate_local_energy_chunk_size(value: Any) -> int | None:
+    """Validate the explicit Stage-Q local-energy chunk bound."""
+
+    if value is None:
+        return None
+    if type(value) is not int or value <= 0:
+        raise TrainConfigResolutionError(
+            "local_energy_chunk_size must be None or an exact positive integer"
+        )
+    return value
+
 
 resolve_training_config = resolve_train_config
 
@@ -793,6 +809,7 @@ __all__ = [
     "OptimizerLevelResolutionError",
     "TrainConfigResolutionError",
     "UnavailableOptimizerError",
+    "validate_local_energy_chunk_size",
     "resolve_train_config",
     "resolve_training_config",
 ]

@@ -173,6 +173,8 @@ def _canonical(value: Any) -> str:
 
 def _resolver(source: Any, *, local_energy_chunk_size: int | None = None) -> Any:
     module = importlib.import_module("experiments.atomistic.he-importance.train_config")
+    if local_energy_chunk_size is None:
+        return module.resolve_train_config(source)
     return module.resolve_train_config(source, local_energy_chunk_size=local_energy_chunk_size)
 
 

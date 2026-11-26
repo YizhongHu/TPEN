@@ -1398,12 +1398,21 @@ def _resolve_selected_config(
 
     packet = _training_packet(selection.cell)
     if architecture_stage_family.is_family_stage(str(selection.cell.manifest["stage"])):
-        resolved = architecture_stage_family.descriptor_for(
+        resolver = architecture_stage_family.descriptor_for(
             str(selection.cell.manifest["stage"])
-        ).resolver(packet, local_energy_chunk_size=local_energy_chunk_size)
+        ).resolver
+        resolved = (
+            resolver(packet)
+            if local_energy_chunk_size is None
+            else resolver(packet, local_energy_chunk_size=local_energy_chunk_size)
+        )
     else:
-        resolved = train_config.resolve_train_config(
-            packet, local_energy_chunk_size=local_energy_chunk_size
+        resolved = (
+            train_config.resolve_train_config(packet)
+            if local_energy_chunk_size is None
+            else train_config.resolve_train_config(
+                packet, local_energy_chunk_size=local_energy_chunk_size
+            )
         )
     _require_truthful_cell(selection.cell, resolved, local_energy_chunk_size)
     return packet, resolved
@@ -1667,7 +1676,11 @@ def execute(
             f"stage {args.stage!r} declares n_walkers={declared_walkers!r}"
         )
     selection = replace(selection, cell=cell)
-    packet, resolved = _resolve_selected_config(selection, local_energy_chunk_size)
+    packet, resolved = (
+        _resolve_selected_config(selection)
+        if local_energy_chunk_size is None
+        else _resolve_selected_config(selection, local_energy_chunk_size)
+    )
     recorded_resolved = OmegaConf.to_container(resolved, resolve=True)
     report = {
         "selection": selection.receipt(),
@@ -1717,21 +1730,15 @@ def execute(
 
     if architecture_stage_family.is_family_stage(args.stage):
         descriptor = architecture_stage_family.descriptor_for(args.stage)
-        exit_code = descriptor.launch_adapter(
-            packet,
-            _execution_facts(),
-            runner=_guarded_runner,
-            runtime_callbacks=runtime_callbacks,
-            local_energy_chunk_size=local_energy_chunk_size,
-        )
+        launch_kwargs = {"runner": _guarded_runner, "runtime_callbacks": runtime_callbacks}
+        if local_energy_chunk_size is not None:
+            launch_kwargs["local_energy_chunk_size"] = local_energy_chunk_size
+        exit_code = descriptor.launch_adapter(packet, _execution_facts(), **launch_kwargs)
     else:
-        exit_code = launch.launch_train(
-            packet,
-            _execution_facts(),
-            runner=_guarded_runner,
-            runtime_callbacks=runtime_callbacks,
-            local_energy_chunk_size=local_energy_chunk_size,
-        )
+        launch_kwargs = {"runner": _guarded_runner, "runtime_callbacks": runtime_callbacks}
+        if local_energy_chunk_size is not None:
+            launch_kwargs["local_energy_chunk_size"] = local_energy_chunk_size
+        exit_code = launch.launch_train(packet, _execution_facts(), **launch_kwargs)
     if exit_code == 0:
         resolved_snapshot = output_path / "resolved_config.yaml"
         if not resolved_snapshot.is_file():
