@@ -13,6 +13,7 @@ from typing import Any, Mapping, Optional
 MAX_JOB_NAME_LENGTH = 40
 _COMPONENT_RE = re.compile(r"[a-z0-9][a-z0-9_.-]*\Z")
 _SHA_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
+_COMPACT_VARIANTS = {"sigmoid": "sg", "tanh": "th", "nolayer": "nl"}
 
 # ``root`` and ``exec`` are the two explicit arms of the devsuite creator.
 PURPOSES = frozenset({
@@ -66,6 +67,20 @@ def build_job_name(
     return validate_job_name("-".join(parts))
 
 
+def _compact_variant(value: str) -> str:
+    """Use short stable tokens for the bounded ACT50 job-name namespace."""
+
+    return _COMPACT_VARIANTS.get(value, value)
+
+
+def _checkpoint_token(value: int) -> str:
+    """Encode retained checkpoints compactly while preserving their coordinate."""
+
+    if value >= 1_000 and value % 1_000 == 0:
+        return f"c{value // 1_000}k"
+    return f"c{value}"
+
+
 def stage1_row_job_name(row: Mapping[str, Any]) -> str:
     """Build the job name for a rendered Stage-1 manifest row.
 
@@ -75,7 +90,7 @@ def stage1_row_job_name(row: Mapping[str, Any]) -> str:
     """
 
     kind = row.get("kind")
-    if kind not in {"smoke", "train", "eval"}:
+    if kind not in {"smoke", "train", "eval", "collect"}:
         raise ValueError("manifest row has an invalid kind")
     subject = row.get("system") or row.get("sector")
     if not isinstance(subject, str):
@@ -86,8 +101,16 @@ def stage1_row_job_name(row: Mapping[str, Any]) -> str:
     if type(lineage) is not int or lineage < 0:
         raise ValueError("lineage must be a non-negative integer")
     variant = None
+    profile_variant = row.get("variant")
+    compact_checkpoint = False
+    if profile_variant is not None:
+        _component(profile_variant, field="variant")
+        compact_checkpoint = profile_variant in _COMPACT_VARIANTS
+        profile_variant = _compact_variant(profile_variant)
     if kind in {"train", "eval"}:
         variant = f"l{lineage}"
+    if profile_variant is not None:
+        variant = profile_variant if variant is None else f"{profile_variant}-{variant}"
     if kind == "eval":
         checkpoint = row.get("checkpoint", 0)
         stream = row.get("stream", 0)
@@ -95,7 +118,8 @@ def stage1_row_job_name(row: Mapping[str, Any]) -> str:
             raise ValueError("checkpoint must be a non-negative integer")
         if type(stream) is not int or stream < 0:
             raise ValueError("stream must be a non-negative integer")
-        variant = f"{variant}-c{checkpoint}-s{stream}"
+        checkpoint_token = _checkpoint_token(checkpoint) if compact_checkpoint else f"c{checkpoint}"
+        variant = f"{variant}-{checkpoint_token}-s{stream}"
     return build_job_name(subject, kind, variant=variant, lane="s1", sha=row.get("source_sha"))
 
 

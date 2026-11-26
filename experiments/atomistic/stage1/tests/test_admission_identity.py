@@ -34,7 +34,7 @@ from experiments.atomistic.stage1.protocol import (
 ROOT = Path(__file__).parents[1]
 CONFIG_ROOT = ROOT / "configs"
 REPO_ROOT = ROOT.parents[2]
-BASE_SHA = "6eaed38e44e1302c38bd57594dd33788884e1f00"
+BASE_SHA = "8240a55549159a0bacfba4be92a162205f2453a0"
 
 
 def _snapshot_semantics(checkout: Path) -> dict[str, object]:
@@ -320,7 +320,7 @@ def test_base_and_pr_config_identity_inputs_match(system: str, tmp_path: Path) -
         target = base_root / system / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(subprocess.check_output([
-            "git", "show", f"6eaed38e44e1302c38bd57594dd33788884e1f00:"
+            "git", "show", f"{BASE_SHA}:"
             f"experiments/atomistic/stage1/configs/{system}/{name}",
         ]))
     assert config_identities(config_root=base_root, systems=(system,))[system] == (
