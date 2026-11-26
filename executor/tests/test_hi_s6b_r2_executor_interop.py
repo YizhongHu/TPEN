@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import importlib
 from pathlib import Path
+import sys
 
 import pytest
 
 from tpen_executor.configured_program import AttemptDelta, ConfiguredLoad
 from tpen_executor._codec import canonical_bytes
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_b1r2c_full_horizon import _publish, _single_fixture  # noqa: E402
 
 
