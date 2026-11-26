@@ -136,7 +136,19 @@ def test_science_row_cannot_claim_smoke_roster(tmp_path: Path) -> None:
     phase1 = _science_rows(tmp_path, profile=HOOKE2_ACT50_SIGMOID_PROFILE)
     for row in phase1:
         row["evaluation_roster"] = SMOKE_EVAL_ROSTER_MARKER
-    evidence = _evidence(phase1, HOOKE2_ACT50_A27)
+    phase1_hash = manifest_hash(phase1)
+    evidence = {
+        "schema": CHECKPOINT_EVIDENCE_SCHEMA,
+        "phase1_manifest_hash": phase1_hash,
+        "phase1_train_row_hashes": {
+            f"{row['system']}:{row['lineage']}": manifest_hash([row])
+            for row in phase1
+        },
+        "checkpoints": {
+            f"hooke2:{row['lineage']}:{checkpoint}": "c" * 64
+            for row in phase1 for checkpoint in (0, 1_000)
+        },
+    }
     with pytest.raises(ProtocolError, match="requires execution.stop_at"):
         bind_evaluation_manifest(
             phase1_rows=phase1,
