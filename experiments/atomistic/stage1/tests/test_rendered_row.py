@@ -344,6 +344,91 @@ def _refreeze_row_id(row: dict[str, object]) -> None:
     ])
 
 
+def _act50_gateway_rows(tmp_path: Path) -> tuple[dict[str, object], dict[str, object]]:
+    """Build one native ACT50 train/eval pair for gateway admission controls."""
+
+    results_root = tmp_path / "results"
+    phase1_rows = protocol.build_manifest(
+        protocol=protocol.STAGE1_PROTOCOL,
+        source_sha="a" * 40,
+        config_sha256=protocol.config_identities(
+            config_root=ROOT / "configs", systems=("hooke2",),
+            science_profile=protocol.HOOKE2_ACT50_SIGMOID_PROFILE,
+        ),
+        checkpoints=list(range(0, 50_001, 1_000)),
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root=str(results_root),
+        systems=("hooke2",),
+        phase=1,
+        device="cuda",
+        science_profile=protocol.HOOKE2_ACT50_SIGMOID_PROFILE,
+        include_smoke=False,
+        auto_overlay=True,
+    )
+    train_row = next(row for row in phase1_rows if row["kind"] == "train")
+    phase1_hash = protocol.manifest_hash(phase1_rows)
+    evidence = {
+        "schema": protocol.CHECKPOINT_EVIDENCE_SCHEMA,
+        "phase1_manifest_hash": phase1_hash,
+        "phase1_train_row_hashes": {
+            f"{row['system']}:{row['lineage']}": protocol.manifest_hash([row])
+            for row in phase1_rows if row["kind"] == "train"
+        },
+        "checkpoints": {
+            f"{row['system']}:{row['lineage']}:{checkpoint}": "c" * 64
+            for row in phase1_rows if row["kind"] == "train"
+            for checkpoint in protocol.HOOKE2_ACT50_A27
+        },
+    }
+    eval_row = next(row for row in protocol.bind_evaluation_manifest(
+        phase1_rows=phase1_rows,
+        checkpoints=list(protocol.HOOKE2_ACT50_A27),
+        checkpoint_evidence=evidence,
+        source_sha="a" * 40,
+        config_sha256=protocol.config_identities(
+            config_root=ROOT / "configs", systems=("hooke2",),
+            science_profile=protocol.HOOKE2_ACT50_SIGMOID_PROFILE,
+        ),
+        protocol=protocol.STAGE1_PROTOCOL,
+        phase1_manifest_hash=phase1_hash,
+    ) if row["kind"] == "eval")
+    checkpoint_file = Path(str(eval_row["checkpoint_file"]))
+    checkpoint_file.parent.mkdir(parents=True)
+    checkpoint_file.write_bytes(b"act50-checkpoint")
+    eval_row["checkpoint_sha256"] = hashlib.sha256(checkpoint_file.read_bytes()).hexdigest()
+    return train_row, eval_row
+
+
+def _attach_materialized_config(
+    row: dict[str, object], cfg: object, rendered_path: Path,
+) -> None:
+    """Attach a valid rendered payload while retaining native science fields."""
+
+    rendered = OmegaConf.to_container(cfg, resolve=True)
+    assert isinstance(rendered, dict)
+    row["row_extension"] = {
+        "version": protocol.ROW_EXTENSION_VERSION,
+        "rendered_config": {"path": str(rendered_path), "sha256": ""},
+        "diagnostics_profile": protocol.OVERLAY_PROFILE_V1,
+    }
+    row["row_extension"]["rendered_config"]["sha256"] = _write_rendered(  # type: ignore[index]
+        rendered_path, rendered,
+    )
+    _refreeze_row_id(row)
+
+
+def _snapshot_files(root: Path) -> tuple[str, ...]:
+    """Return relative files under one test-owned result root."""
+
+    if not root.exists():
+        return ()
+    return tuple(sorted(
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*") if path.is_file()
+    ))
+
+
 def test_extended_row_id_is_content_addressed_with_a_refrozen_green_sibling(
     tmp_path: Path,
 ) -> None:
@@ -359,6 +444,53 @@ def test_extended_row_id_is_content_addressed_with_a_refrozen_green_sibling(
     protocol.validate_gateway_binding(
         binding=_binding_token(row), expected_kinds={"train"},
     )
+
+
+def test_act50_materialized_rows_refuse_before_core_and_output_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ACT50 science rows stay native-only when a materialized extension appears."""
+
+    train_row, eval_row = _act50_gateway_rows(tmp_path)
+    calls: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(
+        stage1_train, "run_from_config",
+        lambda cfg, **kwargs: calls.append(("train", cfg)) or 0,
+    )
+    monkeypatch.setattr(
+        stage1_eval, "run_from_config",
+        lambda cfg, **kwargs: calls.append(("eval", cfg)) or 0,
+    )
+    # This test isolates materialized-vs-native admission from the separate
+    # ACT50 checkpoint compatibility gate.
+    monkeypatch.setattr(stage1_eval, "_refuse_cross_variant_checkpoint", lambda cfg, row: None)
+
+    for kind, row in (("train", train_row), ("eval", eval_row)):
+        calls.clear()
+        monkeypatch.setattr(sys, "argv", [f"stage1-{kind}", "--binding", _binding_token(row)])
+        main = stage1_train.main if kind == "train" else stage1_eval.main
+        assert main() == 0
+        assert [entry[0] for entry in calls] == [kind]
+        run_dir = protocol.resolve_run_dir(row)
+        assert not run_dir.exists()
+
+        native_cfg = (
+            stage1_train.build_train_config(row)
+            if kind == "train" else stage1_eval.build_eval_config(row)
+        )
+        materialized = dict(row)
+        rendered_path = Path(str(row["results_root"])) / "inputs" / f"{kind}-act50.yaml"
+        _attach_materialized_config(materialized, native_cfg, rendered_path)
+        before = _snapshot_files(Path(str(row["results_root"])))
+        calls.clear()
+        monkeypatch.setattr(
+            sys, "argv", [f"stage1-{kind}", "--binding", _binding_token(materialized)],
+        )
+        with pytest.raises(ProtocolError, match="unsupported top-level keys"):
+            main()
+        assert calls == []
+        assert _snapshot_files(Path(str(row["results_root"]))) == before
 
 
 def test_consumed_integer_binding_requires_exact_scalar_type(tmp_path: Path) -> None:
