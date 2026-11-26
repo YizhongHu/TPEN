@@ -59,7 +59,36 @@ def _canonical_cell(path: Path, row_id: str) -> tuple[dict[str, Any], str]:
     return value, hashlib.sha256(raw).hexdigest()
 
 
-def _read_report(path: Path, row_id: str, segment: Any) -> tuple[dict[str, Any], str]:
+def _attempt_core(manifest: Path, task_id: str, attempt_id: str, group_digest: str) -> Path:
+    """Resolve the physical core from the manifest attempt record."""
+
+    try:
+        value = json.loads(manifest.read_bytes())
+        attempts = value["attempts"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+        raise StageQConsumerError("manifest attempt records are unreadable") from error
+    matches = [item for item in attempts if isinstance(item, dict) and item.get("task_id") == task_id and item.get("attempt_id") == attempt_id]
+    if len(matches) != 1:
+        raise StageQConsumerError("selected segment has no unique manifest attempt")
+    attempt = matches[0]
+    start = attempt.get("start_receipt")
+    if not isinstance(start, Mapping) or start.get("group_digest") != group_digest:
+        raise StageQConsumerError("manifest attempt group identity mismatch")
+    output = attempt.get("output_dir")
+    if not isinstance(output, str) or not output:
+        raise StageQConsumerError("manifest attempt output directory is missing")
+    return Path(output) / "core"
+
+
+def _inside(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return path.resolve() != parent.resolve()
+
+
+def _read_report(path: Path, row_id: str, segment: Any, core: Path) -> tuple[dict[str, Any], str]:
     raw = path.read_bytes()
     try:
         value = json.loads(raw)
@@ -70,15 +99,17 @@ def _read_report(path: Path, row_id: str, segment: Any) -> tuple[dict[str, Any],
     delta = value.get("attempt_delta")
     if not isinstance(delta, Mapping):
         raise StageQConsumerError("attempt report has no attempt delta")
-    expected = {
-        "attempt_id": segment.attempt_id,
-        "group_digest": Path(segment.checkpoint_dir).parent.parent.parent.name,
-        "task_id": segment.task_id,
-    }
-    if any(delta.get(key) != item for key, item in expected.items()):
+    if any(delta.get(key) != item for key, item in {
+        "attempt_id": segment.attempt_id, "task_id": segment.task_id,
+    }.items()):
         raise StageQConsumerError("attempt report identity mismatch")
-    core = Path(delta.get("attempt_core_dir", ""))
-    if core != Path(segment.checkpoint_dir):
+    try:
+        parsed = importlib.import_module("experiments.atomistic.he-importance.attempt_delta").parse_attempt_delta(
+            json.dumps(delta, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+    except (ValueError, TypeError, json.JSONDecodeError) as error:
+        raise StageQConsumerError("attempt delta is invalid") from error
+    if parsed.attempt_core_dir != core or parsed.group_digest != delta.get("group_digest"):
         raise StageQConsumerError("attempt report core does not match selected segment")
     return value, hashlib.sha256(raw).hexdigest()
 
@@ -91,6 +122,8 @@ def consume_stage_q(
     archive_path: str | Path,
     *,
     inspect_run: Callable[[str | Path], Any] | None = None,
+    task_id: str | None = None,
+    before_recheck: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Admit one row and write a write-once derived consumer receipt."""
 
@@ -109,28 +142,39 @@ def consume_stage_q(
         # A test seam may provide a minimal reader with the public one-argument
         # contract; no fallback decoding or directory discovery is permitted.
         results = reader.read(manifest)
-    chains = [chain for chain in results.chains if chain.segments]
+    chains = [chain for chain in results.chains if chain.segments and (task_id is None or chain.task_id == task_id)]
     if len(chains) != 1:
         raise StageQConsumerError("requested row must have exactly one nonempty committed chain")
     chain = chains[0]
     reports: list[tuple[dict[str, Any], str]] = []
     source_paths = [manifest, c_path]
+    group_digest = json.loads(manifest.read_bytes())["group_digest"]
+    cores: dict[tuple[str, str], Path] = {}
     for segment in chain.segments:
-        report_path = Path(segment.checkpoint_dir) / "attempt_report.json"
-        reports.append(_read_report(report_path, row_id, segment))
+        core = _attempt_core(manifest, segment.task_id, segment.attempt_id, group_digest)
+        checkpoint = Path(segment.checkpoint_dir)
+        if not _inside(checkpoint, core):
+            raise StageQConsumerError("selected checkpoint is outside its attempt core")
+        report_path = core / "attempt_report.json"
+        reports.append(_read_report(report_path, row_id, segment, core))
+        cores[(segment.task_id, segment.attempt_id)] = core
         source_paths.append(report_path)
     final = chain.segments[-1]
     completion = importlib.import_module("experiments.atomistic.he-importance.full_horizon_completion")
-    group_digest = Path(final.checkpoint_dir).parent.parent.parent.name
+    final_core = cores[(final.task_id, final.attempt_id)]
+    resolved = c_value.get("resolved_config")
+    declared_horizon = resolved.get("trainer", {}).get("max_steps") if isinstance(resolved, Mapping) and isinstance(resolved.get("trainer"), Mapping) else c_value.get("target_horizon")
+    if declared_horizon is not None and declared_horizon != target_horizon:
+        raise StageQConsumerError("target horizon disagrees with selection receipt")
     if not completion.read_full_horizon_completion(
-        Path(final.checkpoint_dir), group_digest=group_digest, task_id=final.task_id,
+        final_core, group_digest=group_digest, task_id=final.task_id,
         science_digest=row_id, target_iterations=target_horizon,
     ):
         raise StageQConsumerError("full-horizon completion is not proven")
-    completion_path = Path(final.checkpoint_dir).parent.parent / "full-horizon-completion.json"
+    completion_path = final_core.parent.parent / "full-horizon-completion.json"
     source_paths.append(completion_path)
     before = {str(path): _digest(path) for path in source_paths}
-    preserved = [_jsonable(_record(item)) for item in results.preserved_attempts]
+    preserved = [_jsonable(_record(item)) for item in results.preserved_attempts if item.task_id == chain.task_id]
     body: dict[str, Any] = {
         "schema": "tpen-hi/stage-q-consumer-archive-v1",
         "row_id": row_id,
@@ -146,6 +190,8 @@ def consume_stage_q(
                           **{str(path): digest for path, digest in zip(source_paths[2:], list(before.values())[2:])}},
         "attempt_report_sha256": [digest for _, digest in reports],
     }
+    if before_recheck is not None:
+        before_recheck()
     after = {str(path): _digest(path) for path in source_paths}
     if before != after:
         raise StageQConsumerError("source changed during export")
