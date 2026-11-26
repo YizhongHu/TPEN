@@ -19,14 +19,14 @@ STUDY = Path(__file__).parents[1]
 PROFILES = ("hooke2-sigmoid50k-seg-v1", "hooke2-tanh50k-seg-v1", "hooke2-nolayer50k-seg-v1")
 
 
-def _rows(owner, profile):
+def _rows(owner, profile, results_root="/external/segmented-act50"):
     return owner.build_manifest(
         protocol=owner.STAGE1_PROTOCOL, source_sha="a" * 40,
         config_sha256=owner.config_identities(
             config_root=STUDY / "configs", systems=("hooke2",), science_profile=profile,
         ),
         checkpoints=list(range(0, 50_001, 1_000)), lineage_seeds=[11, 12, 13],
-        checkpoint_sha256={}, results_root="/external/segmented-act50",
+        checkpoint_sha256={}, results_root=results_root,
         systems=("hooke2",), phase=1, device="cuda", science_profile=profile,
         include_smoke=False, auto_overlay=True,
     )
@@ -53,14 +53,16 @@ def test_planner_renders_segmented_profile(profile, tmp_path, monkeypatch) -> No
     rows = json.loads(output.read_text())["rows"]
     assert len(rows) == 3
     original_profile = profile.replace("-seg-v1", "-v1")
-    original_rows = _rows(protocol, original_profile)
+    original_rows = _rows(protocol, original_profile, str(tmp_path / "results"))
     original = build_train_config(original_rows[0])
     assert {row["config_sha256"] for row in rows}.isdisjoint(
         row["config_sha256"] for row in original_rows
     )
-    assert {row["row_id"] for row in rows}.isdisjoint(
-        row["row_id"] for row in original_rows
-    )
+    # row_id is a coordinate label; the bound row/manifest carries science identity.
+    assert protocol.manifest_hash(rows) != protocol.manifest_hash(original_rows)
+    for row, old in zip(rows, original_rows):
+        assert row["row_id"] == old["row_id"]
+        assert protocol.manifest_hash([row]) != protocol.manifest_hash([old])
     for row in rows:
         assert row["science_profile"] == profile
         assert row["overlay"] == "configs/overlays/hooke-diagnostics-v3.yaml"
