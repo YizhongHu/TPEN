@@ -262,8 +262,8 @@ replace the full roster/grid reconciliation.
 ```bash
 "$PYBIN" -m experiments.atomistic.stage1.select_eval \
   --manifest "$RESULTS_ROOT/plan/phase2-manifest.json" \
-  --system he --lineage 0 --checkpoint 50000 --stream 0 \
-  --output "$RESULTS_ROOT/plan/selected-eval.json"
+  --system he --lineage 0 --checkpoint 100000 --stream 0 \
+  --output "$RESULTS_ROOT/plan/selected-eval.json" || exit 1
 qsub -A HetRxnEnergy -q debug \
   -l select=1:system=polaris:ngpus=4:ncpus=64,walltime=00:55:00,filesystems=home:eagle,place=scatter \
   -o "$RESULTS_ROOT/logs/eval.pbs.out" -e "$RESULTS_ROOT/logs/eval.pbs.err" \

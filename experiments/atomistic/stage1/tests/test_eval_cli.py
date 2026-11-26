@@ -15,7 +15,7 @@ from experiments.atomistic.stage1.evidence import build_evidence
 from experiments.atomistic.stage1.select_eval import select_rows
 from experiments.atomistic.stage1.launch import _binding_token, command_for_row
 from experiments.atomistic.stage1.protocol import (
-    HOOKE2_ACT50_SIGMOID_PROFILE, HOOKE2_ACT50_A27, MANIFEST_SCHEMA,
+    HE_H2_EVAL_CHECKPOINTS, HOOKE2_ACT50_SIGMOID_PROFILE, HOOKE2_ACT50_A27, MANIFEST_SCHEMA,
     STAGE1_PROTOCOL, build_manifest, config_identities, derive_smoke_request,
     manifest_hash, validate_gateway_binding,
 )
@@ -32,11 +32,6 @@ def _document(rows, phase=1):
 @pytest.fixture(params=[False, True], ids=["science", "smoke"])
 def phase1(request, tmp_path):
     """Build real profile rows with tiny complete checkpoint artifacts."""
-    from experiments.atomistic.stage1.train import build_train_config
-    from tpen.checkpoint.hashing import checkpoint_hashes
-    from tpen.checkpoint.manifest import CHECKPOINT_KIND, CHECKPOINT_SCHEMA_VERSION, CheckpointManifest
-    from tpen.checkpoint.payload import MODEL_ONLY_PAYLOAD
-
     source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     rows = build_manifest(
         protocol=STAGE1_PROTOCOL, source_sha=source,
@@ -50,16 +45,28 @@ def phase1(request, tmp_path):
     if request.param:
         rows = [derive_smoke_request(row, results_root=str(tmp_path / "smoke"), stop_at=1000)
                 for row in rows]
+    _write_checkpoints(rows, (0, 1000) if request.param else HOOKE2_ACT50_A27,
+                       smoke=request.param)
+    return _document(rows)
+
+
+def _write_checkpoints(rows, roster, *, smoke=False):
+    """Write small model-only artifacts shared by the profile fixtures."""
+    from experiments.atomistic.stage1.train import build_train_config
+    from tpen.checkpoint.hashing import checkpoint_hashes
+    from tpen.checkpoint.manifest import CHECKPOINT_KIND, CHECKPOINT_SCHEMA_VERSION, CheckpointManifest
+    from tpen.checkpoint.payload import MODEL_ONLY_PAYLOAD
+
     for row in rows:
         run = resolve_run_dir(row)
         run.mkdir(parents=True)
-        status = "planned_yield" if request.param else "completed"
+        status = "planned_yield" if smoke else "completed"
         (run / "status.json").write_text(json.dumps({"status": status}))
         (run / "run-outcome.json").write_text(json.dumps({
             "status": status, "completed_updates": 1000, "next_iteration": 1000,
         }))
         cfg = build_train_config(row)
-        for step in ((0, 1000) if request.param else HOOKE2_ACT50_A27):
+        for step in roster:
             directory = run / "checkpoints" / f"step_{step:06d}"
             directory.mkdir(parents=True)
             payload = f"model-{row['lineage']}-{step}".encode()
@@ -73,7 +80,6 @@ def phase1(request, tmp_path):
                 payload=MODEL_ONLY_PAYLOAD.to_manifest(),
             ).write(directory / "manifest.json")
             (directory / "COMPLETE").write_text("fixture\n")
-    return _document(rows)
 
 
 def _cli(module, *args):
@@ -191,3 +197,37 @@ def test_selector_filters(field, value):
     document["manifest_hash"] = "f" * 64
     with pytest.raises(ValueError, match="manifest_hash"):
         select_rows(document)
+
+
+def test_he_roster_b_roundtrip(tmp_path):
+    """Select the He terminal roster-B row; refuse the old 50000 example."""
+    source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    rows = build_manifest(
+        protocol=STAGE1_PROTOCOL, source_sha=source_sha,
+        config_sha256=config_identities(config_root=ROOT / "configs", systems=("he",)),
+        checkpoints=list(range(0, STAGE1_PROTOCOL.lineage_updates + 1, 1000)),
+        lineage_seeds=[11, 12, 13], checkpoint_sha256={},
+        results_root=str(tmp_path / "he"), systems=("he",), phase=1,
+        include_smoke=False, auto_overlay=True,
+    )
+    _write_checkpoints(rows, HE_H2_EVAL_CHECKPOINTS)
+    source, evidence, planned, selected = [tmp_path / name for name in
+                                          ("phase1.json", "evidence.json", "phase2.json", "row.json")]
+    source.write_text(json.dumps(_document(rows)))
+    _cli("evidence", "--phase1-manifest", source, "--output", evidence)
+    _cli("plan", "--phase", 2, "--phase1-manifest", source,
+         "--checkpoint-bindings", evidence, "--output", planned)
+    arguments = ["--manifest", str(planned), "--system", "he", "--lineage", "0",
+                 "--stream", "0", "--output", str(selected)]
+    _cli("select_eval", *arguments, "--checkpoint", 100000)
+    row = json.loads(selected.read_text())
+    assert row["checkpoint"] == 100000
+    assert validate_gateway_binding(binding=_binding_token(row), expected_kinds={"eval"}) == row
+    before = selected.read_bytes()
+    refused = subprocess.run(
+        [sys.executable, "-m", "experiments.atomistic.stage1.select_eval",
+         *arguments, "--checkpoint", "50000"], capture_output=True, text=True,
+    )
+    assert refused.returncode != 0
+    assert "no matching eval rows" in refused.stderr
+    assert selected.read_bytes() == before

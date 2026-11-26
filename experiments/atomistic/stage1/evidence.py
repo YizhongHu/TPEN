@@ -13,8 +13,7 @@ from experiments.atomistic.stage1.protocol import (
     MANIFEST_SCHEMA, SMOKE_EVAL_ROSTER_MARKER, bind_evaluation_manifest,
     hooke_profile_selection, manifest_hash, smoke_eval_roster,
 )
-from experiments.toolkit.run_paths import resolve_run_dir
-from tpen.checkpoint.artifact import require_complete_checkpoint_dir
+from experiments.toolkit.run_paths import require_complete_checkpoint_dir, resolve_run_dir
 
 
 def build_evidence(document: Mapping[str, Any]) -> dict[str, Any]:
