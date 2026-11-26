@@ -91,7 +91,7 @@ def test_qualification_does_not_short_circuit_later_invalid_same_row_report(
     campaign, manifest, core, row = _qualification_fixture(tmp_path)
     invalid_core = core.parents[2] / "task-invalid" / "attempt-invalid" / "core"
     invalid_core.mkdir(parents=True)
-    (invalid_core.parent.parent / "full-horizon-completion.json").write_bytes(canonical_bytes({"schema": "malformed"}))
+    (invalid_core.parent.parent / "full-horizon-completion.json").write_bytes(_canonical_bytes({"schema": "malformed"}))
     invalid = invalid_core / "attempt_report.json"
     invalid.write_bytes(_canonical_bytes({"row_id": row, "attempt_delta": _delta(invalid_core, "fresh")}))
     real_rglob = Path.rglob
