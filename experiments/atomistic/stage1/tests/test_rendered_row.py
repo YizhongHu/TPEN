@@ -93,6 +93,30 @@ def _train_row(tmp_path: Path) -> tuple[dict[str, object], Path]:
     return row, rendered_path
 
 
+def _hooke_production_train_row(tmp_path: Path) -> dict[str, object]:
+    """Build one committed Hooke science row for the real train gateway."""
+
+    rows = protocol.build_manifest(
+        protocol=protocol.STAGE1_PROTOCOL,
+        source_sha="a" * 40,
+        config_sha256=protocol.config_identities(
+            config_root=ROOT / "configs", systems=("hooke1",)
+        ),
+        checkpoints=list(range(0, 100001, 1000)),
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root=str(tmp_path / "results"),
+        systems=("hooke1",),
+        phase=1,
+        device="cpu",
+        science_profile=protocol.HOOKE_SCIENCE_PROFILE,
+        evaluation_selection=protocol.HOOKE_EVAL_SELECTION,
+        include_smoke=False,
+        auto_overlay=True,
+    )
+    return next(row for row in rows if row["kind"] == "train")
+
+
 def test_materialized_train_reads_one_checked_mapping_and_retains_identity(tmp_path: Path) -> None:
     row, rendered_path = _train_row(tmp_path)
     cfg, admission = protocol.load_materialized_config(row, expected_kind="train")
@@ -343,6 +367,26 @@ def test_consumed_runner_mismatch_refuses_before_core(
             run=lambda *_args, **_kwargs: calls.append(True) or 0,
         )
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "override, rejects",
+    (
+        ("runner.optimizer._target_=torch.optim.SGD", True),
+        (f"sampler.n_walkers={protocol.STAGE1_PROTOCOL.lineage_walkers}", False),
+    ),
+)
+def test_train_build_detects_runner_wiring_but_allows_bound_leaf(
+    tmp_path: Path, override: str, rejects: bool,
+) -> None:
+    """The production train gateway guards runner wiring, not bound leaves."""
+
+    row = _hooke_production_train_row(tmp_path)
+    if rejects:
+        with pytest.raises(ProtocolError, match="overlay changed base-owned section runner"):
+            stage1_train.build_train_config(row, overrides=[override])
+    else:
+        stage1_train.build_train_config(row, overrides=[override])
 
 
 def test_rendered_bytes_replaced_after_checked_read_refuse_without_output_mutation(
