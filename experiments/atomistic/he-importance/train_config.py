@@ -679,19 +679,39 @@ def resolve_train_config(
     walkers = stage_api.walker_count(manifest)
     OmegaConf.update(cfg, "sampler.n_walkers", walkers, merge=False)
     OmegaConf.update(cfg, "trainer.max_steps", stage.updates, merge=False)
-    override_chunk_size = next(
-        (value for path, value in override_items if str.__eq__(path, "trainer.local_energy_chunk_size") is True),
-        _OVERRIDE_MISSING,
+    OmegaConf.update(cfg, "run.root", str(output_path.parent.parent), merge=False)
+    OmegaConf.update(cfg, "run.run_id", source_hash, merge=False)
+    OmegaConf.update(cfg, "run.layout", "flat", merge=False, force_add=True)
+    OmegaConf.update(cfg, "run.dir", str(output_path), merge=False)
+    OmegaConf.update(cfg, "runtime.seed", model_seed, merge=False)
+    for path, value in override_items:
+        OmegaConf.update(cfg, path, value, merge=False)
+    override_chunk_size = OmegaConf.select(
+        cfg, "trainer.local_energy_chunk_size", default=_OVERRIDE_MISSING
     )
     if override_chunk_size is not _OVERRIDE_MISSING:
         override_chunk_size = validate_local_energy_chunk_size(override_chunk_size)
-        if local_energy_chunk_size is not None and (
+    for path, value in override_items:
+        if str.__eq__(path, "trainer.local_energy_chunk_size") is True:
+            validated = validate_local_energy_chunk_size(value)
+            if override_chunk_size is not _OVERRIDE_MISSING and (
+                validated is None
+                or override_chunk_size is None
+                or int.__ne__(validated, override_chunk_size) is True
+            ):
+                raise TrainConfigResolutionError(
+                    "duplicate trainer.local_energy_chunk_size overrides conflict"
+                )
+    if local_energy_chunk_size is not None and (
+        override_chunk_size is not _OVERRIDE_MISSING
+        and (
             override_chunk_size is None
             or int.__ne__(override_chunk_size, local_energy_chunk_size) is True
-        ):
-            raise TrainConfigResolutionError(
-                "local_energy_chunk_size conflicts with trainer.local_energy_chunk_size override"
-            )
+        )
+    ):
+        raise TrainConfigResolutionError(
+            "local_energy_chunk_size conflicts with trainer.local_energy_chunk_size override"
+        )
     effective_chunk_size = (
         local_energy_chunk_size
         if local_energy_chunk_size is not None
@@ -704,13 +724,6 @@ def resolve_train_config(
             cfg, "trainer.local_energy_chunk_size", effective_chunk_size,
             merge=False, force_add=True,
         )
-    OmegaConf.update(cfg, "run.root", str(output_path.parent.parent), merge=False)
-    OmegaConf.update(cfg, "run.run_id", source_hash, merge=False)
-    OmegaConf.update(cfg, "run.layout", "flat", merge=False, force_add=True)
-    OmegaConf.update(cfg, "run.dir", str(output_path), merge=False)
-    OmegaConf.update(cfg, "runtime.seed", model_seed, merge=False)
-    for path, value in override_items:
-        OmegaConf.update(cfg, path, value, merge=False)
     OmegaConf.update(cfg, "optimizer._target_", optimizer_entry.target, merge=False)
     # Every Adam coordinate is explicit in the resolved config; no torch
     # constructor default is allowed to stand in for a declared level.
