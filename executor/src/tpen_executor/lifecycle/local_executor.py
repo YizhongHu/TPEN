@@ -360,8 +360,23 @@ class LocalLeafExecutor:
                 )
             environment = self._base_environment(task, configured, slot)
             environment = _with_child_context_keys(environment, self._allocation)
-            environment = _with_child_placement(environment, self._allocation, fence, self._group, task, configured)
-            request = LeafRequest.for_attempt(fence, self._allocation, configured, environment, self.timeout)
+            environment = _with_child_placement(
+                environment,
+                self._allocation,
+                fence,
+                self._group,
+                task,
+                configured,
+                selected_slot=slot,
+            )
+            request = LeafRequest.for_attempt(
+                fence,
+                self._allocation,
+                configured,
+                environment,
+                self.timeout,
+                selected_slot=slot,
+            )
             future = self._pool.submit(self._run_leaf, request)
         except Exception as error:
             with self._lock:

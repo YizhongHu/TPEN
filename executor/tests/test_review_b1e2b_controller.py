@@ -336,6 +336,41 @@ def test_final_reconciliation_feeds_exit(tmp_path: Path) -> None:
     assert _outcomes(Path(store.root))[0].status == "completed"
 
 
+def test_nonregular_completion_artifact_does_not_park_collected_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    group, allocation, facts, _binding, store = _fresh_group(tmp_path, ("one", "two"))
+    group = type(group)(
+        group.group_id,
+        tuple(replace(member, target_horizon_units="iterations") for member in group.members),
+        group.execution_plan,
+    )
+    facts = replace(facts, group=group)
+    binding = BalsamGroupRegistrationReceipt(
+        BalsamGroupRegistrationIntent(group.group_id, group.identity, digest({"invalid-completion": True})),
+        allocation.backend_job_id,
+    )
+    executor = EventExecutor(group, allocation)
+    original_manifest = DirectoryStore.manifest
+
+    def manifest_with_invalid_optional_completion(self, current_group):
+        task_dir = Path(self.root) / "groups" / current_group.identity / "one"
+        (task_dir / "full-horizon-completion.json").mkdir(exist_ok=True)
+        return original_manifest(self, current_group)
+
+    monkeypatch.setattr(DirectoryStore, "manifest", manifest_with_invalid_optional_completion)
+    result = run_group_controller(binding, allocation.backend_job_id, facts, store, DurableAdmission(), executor)
+
+    assert executor.calls == [("submit", "one"), ("submit", "two"), ("collect", "one"), ("collect", "two")]
+    assert result.member_outcomes == (("one", "collected"), ("two", "collected"))
+    assert all(member.action == "preserve_completed" for member in result.reconciliation.members)
+    assert result.exit_code == 0
+    invalid_destination = Path(store.root) / "groups" / executor.group.identity / "one" / "full-horizon-completion.json"
+    assert invalid_destination.is_dir()
+    valid_destination = Path(store.root) / "groups" / executor.group.identity / "two" / "full-horizon-completion.json"
+    assert valid_destination.is_file()
+
+
 def test_failed_launched_ack_write_parks_but_collects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     original = DirectoryStore.record_controller_outcome
 

@@ -19,6 +19,7 @@ from tpen.run import run_from_config
 from experiments.atomistic.stage1.protocol import (
     MaterializedConfigAdmission,
     OVERLAY_PROFILE_V1,
+    compose_model_profile,
     compose_train_overlay,
     load_materialized_config,
     resolve_config_path,
@@ -79,6 +80,7 @@ def _build_train_config(
         raise FileNotFoundError(f"Stage-1 config path does not exist: {selected_config}")
     from tpen.run import load_config
     cfg = load_config(str(selected_config))
+    compose_model_profile(cfg, str(row.get("science_profile")) if row.get("science_profile") else None)
     _bind_output_identity(cfg, row)
     base_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
 
@@ -92,6 +94,7 @@ def _build_train_config(
         compose_train_overlay(
             cfg, overlay=str(selected_overlay), expected_sha256=str(selected_overlay_sha),
             overlay_profile=str(row.get("overlay_profile", OVERLAY_PROFILE_V1)),
+            science_profile=str(row.get("science_profile")) if row.get("science_profile") else None,
         )
 
     cfg = OmegaConf.merge(cfg, OmegaConf.create(row_config_values(row)))

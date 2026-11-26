@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import field
+from datetime import datetime, timezone
+import os
 from typing import Any, ClassVar
 
 from ._codec import _freeze, canonical_bytes, decode_json, digest, fields, sequence, sha256_text, text, thaw
@@ -29,6 +31,22 @@ PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE = (
 PLACEMENT_NOT_SAMPLED_MESSAGE = (
     "GPU PLACEMENT NOT-SAMPLED: L1a intentionally does not sample devices; H-v2 performs its own delivered-GPU check."
 )
+
+
+def canonical_completed_at(value: str) -> str:
+    """Render a timezone-bearing UTC timestamp in the completion wire form."""
+
+    if type(value) is not str:
+        raise ValueError("completed_at must be a string")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("completed_at must be an ISO-8601 UTC timestamp") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise ValueError("completed_at must be a UTC timestamp")
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 # Declared-GPU v3 receipt warnings by reason class (mirrored by P8).  A v3
 # ``not-sampled`` receipt exists only for CPU-only slots, which carry no warning.
 PLACEMENT_V3_WARNINGS = {
@@ -144,6 +162,85 @@ class StartReceipt:
 
     @classmethod
     def decode(cls, data: bytes | str | dict[str, Any]) -> "StartReceipt":
+        return cls.from_mapping(decode_json(data))
+
+
+@frozen_record
+class StartProvenanceV1:
+    """Executor-internal proof of how an attempt was started."""
+
+    schema: ClassVar[str] = "tpen-executor/start-provenance-v1"
+    kind: str
+    task_id: str
+    attempt_id: AttemptId
+    group_digest: str
+    predecessor_attempt_id: AttemptId | None = None
+    request_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"fresh", "admitted"}:
+            raise ValueError("start provenance kind is invalid")
+        object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
+        _identity(self.attempt_id, AttemptId, "attempt_id")
+        object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
+        if self.kind == "fresh":
+            if self.predecessor_attempt_id is not None or self.request_digest is not None:
+                raise ValueError("fresh start provenance cannot carry admission fields")
+            return
+        _identity(self.predecessor_attempt_id, AttemptId, "predecessor_attempt_id")
+        if self.predecessor_attempt_id == self.attempt_id:
+            raise ValueError("start provenance predecessor cannot equal attempt")
+        object.__setattr__(self, "request_digest", sha256_text(self.request_digest, "request_digest"))
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "schema": self.schema,
+            "kind": self.kind,
+            "task_id": self.task_id,
+            "attempt_id": self.attempt_id.value,
+            "group_digest": self.group_digest,
+        }
+        if self.kind == "admitted":
+            result["predecessor_attempt_id"] = self.predecessor_attempt_id.value
+            result["request_digest"] = self.request_digest
+        return result
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "StartProvenanceV1":
+        if not isinstance(data, Mapping):
+            raise TypeError("StartProvenanceV1 must be a mapping")
+        kind = data.get("kind")
+        if kind == "fresh":
+            fields(data, {"schema", "kind", "task_id", "attempt_id", "group_digest"}, cls.schema, cls.__name__)
+        elif kind == "admitted":
+            fields(
+                data,
+                {"schema", "kind", "task_id", "attempt_id", "group_digest", "predecessor_attempt_id", "request_digest"},
+                cls.schema,
+                cls.__name__,
+            )
+        else:
+            raise ValueError("start provenance kind is invalid")
+        if any(type(data[key]) is not str for key in ("kind", "task_id", "attempt_id", "group_digest")):
+            raise TypeError("StartProvenanceV1 has an invalid field type")
+        if kind == "fresh":
+            return cls(kind, data["task_id"], AttemptId(data["attempt_id"]), data["group_digest"])
+        if type(data["predecessor_attempt_id"]) is not str or type(data["request_digest"]) is not str:
+            raise TypeError("StartProvenanceV1 admission fields have an invalid type")
+        return cls(
+            kind,
+            data["task_id"],
+            AttemptId(data["attempt_id"]),
+            data["group_digest"],
+            AttemptId(data["predecessor_attempt_id"]),
+            data["request_digest"],
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "StartProvenanceV1":
         return cls.from_mapping(decode_json(data))
 
 
@@ -387,6 +484,144 @@ class CoreOutcomeRecord:
     @classmethod
     def decode(cls, data: bytes | str | dict[str, Any]) -> "CoreOutcomeRecord":
         return cls.from_mapping(decode_json(data))
+
+
+@frozen_record
+class FullHorizonCompletionRecord:
+    """One immutable task-level full-horizon completion record.
+
+    The record is deliberately a plain JSON wire object.  Its producer is
+    responsible for validating the durable attempt chain and the admission
+    port verdict before constructing it.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/full-horizon-completion-v1"
+    group_digest: str
+    task_id: str
+    science_digest: str
+    final_attempt_id: AttemptId
+    completed_updates: int
+    target_iterations: int
+    final_checkpoint: Mapping[str, str]
+    completed_at: str
+    core_acceptance_digest: str
+    attempt_chain: tuple[Mapping[str, str], ...]
+    program_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
+        object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
+        object.__setattr__(self, "science_digest", sha256_text(self.science_digest, "science_digest"))
+        _identity(self.final_attempt_id, AttemptId, "final_attempt_id")
+        for value, name in ((self.completed_updates, "completed_updates"), (self.target_iterations, "target_iterations")):
+            if type(value) is not int or value < 0:
+                raise TypeError(f"{name} must be a nonnegative integer")
+        if self.completed_updates < self.target_iterations:
+            raise ValueError("completed_updates must reach target_iterations")
+        if not isinstance(self.final_checkpoint, Mapping) or set(self.final_checkpoint) != {"path", "content_id"}:
+            raise TypeError("final_checkpoint must contain path and content_id")
+        path = self.final_checkpoint["path"]
+        if type(path) is not str or not os.path.isabs(path) or os.path.normpath(path) != path:
+            raise ValueError("final_checkpoint.path must be an absolute normalized path")
+        content_id = sha256_text(self.final_checkpoint["content_id"], "final_checkpoint.content_id")
+        object.__setattr__(self, "final_checkpoint", _freeze({"path": path, "content_id": content_id}, "final_checkpoint"))
+        object.__setattr__(self, "completed_at", text(self.completed_at, "completed_at"))
+        canonical_completed = canonical_completed_at(self.completed_at)
+        if self.completed_at != canonical_completed:
+            raise ValueError("completed_at must use canonical UTC rendering")
+        object.__setattr__(self, "core_acceptance_digest", sha256_text(self.core_acceptance_digest, "core_acceptance_digest"))
+        links = sequence(self.attempt_chain, "attempt_chain")
+        normalized_links: list[Mapping[str, str]] = []
+        seen_predecessors: set[str] = set()
+        seen_successors: set[str] = set()
+        visited_nodes: set[str] = set()
+        previous_successor: str | None = None
+        for index, link in enumerate(links):
+            if not isinstance(link, Mapping) or set(link) != {"predecessor_attempt_id", "successor_attempt_id", "request_digest"}:
+                raise TypeError("attempt_chain links have an invalid shape")
+            predecessor = text(link["predecessor_attempt_id"], "attempt_chain.predecessor_attempt_id")
+            successor = text(link["successor_attempt_id"], "attempt_chain.successor_attempt_id")
+            AttemptId(predecessor)
+            AttemptId(successor)
+            if predecessor == successor:
+                raise ValueError("attempt_chain cannot contain a self-link")
+            if previous_successor is not None and predecessor != previous_successor:
+                raise ValueError("attempt_chain is not continuous")
+            if index == 0:
+                visited_nodes.add(predecessor)
+            if successor in visited_nodes:
+                raise ValueError("attempt_chain contains a cycle")
+            visited_nodes.add(successor)
+            if predecessor in seen_predecessors or successor in seen_successors:
+                raise ValueError("attempt_chain contains a duplicate identity")
+            seen_predecessors.add(predecessor)
+            seen_successors.add(successor)
+            request_digest = sha256_text(link["request_digest"], "attempt_chain.request_digest")
+            normalized_links.append(_freeze({
+                "predecessor_attempt_id": predecessor,
+                "successor_attempt_id": successor,
+                "request_digest": request_digest,
+            }, "attempt_chain[]"))
+            previous_successor = successor
+        if previous_successor is not None and previous_successor != self.final_attempt_id.value:
+            raise ValueError("attempt_chain does not terminate at final_attempt_id")
+        object.__setattr__(self, "attempt_chain", tuple(normalized_links))
+        if self.program_digest is not None:
+            object.__setattr__(self, "program_digest", sha256_text(self.program_digest, "program_digest"))
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "schema": self.schema,
+            "group_digest": self.group_digest,
+            "task_id": self.task_id,
+            "science_digest": self.science_digest,
+            "final_attempt_id": self.final_attempt_id.value,
+            "completed_updates": self.completed_updates,
+            "target_iterations": self.target_iterations,
+            "final_checkpoint": thaw(self.final_checkpoint),
+            "completed_at": self.completed_at,
+            "core_acceptance_digest": self.core_acceptance_digest,
+            "attempt_chain": thaw(self.attempt_chain),
+        }
+        if self.program_digest is not None:
+            result["program_digest"] = self.program_digest
+        return result
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "FullHorizonCompletionRecord":
+        required = {
+            "schema", "group_digest", "task_id", "science_digest", "final_attempt_id",
+            "completed_updates", "target_iterations", "final_checkpoint", "completed_at",
+            "core_acceptance_digest", "attempt_chain",
+        }
+        expected = required | ({"program_digest"} if isinstance(data, Mapping) and "program_digest" in data else set())
+        fields(data, expected, cls.schema, cls.__name__)
+        if any(type(data[key]) is not str for key in (
+            "group_digest", "task_id", "science_digest", "final_attempt_id", "completed_at", "core_acceptance_digest",
+        )):
+            raise TypeError("full-horizon completion scalar fields have invalid types")
+        if type(data["completed_updates"]) is not int or type(data["target_iterations"]) is not int:
+            raise TypeError("full-horizon completion counters have invalid types")
+        if "program_digest" in data and type(data["program_digest"]) is not str:
+            raise TypeError("program_digest must be a string when present")
+        return cls(
+            data["group_digest"], data["task_id"], data["science_digest"], AttemptId(data["final_attempt_id"]),
+            data["completed_updates"], data["target_iterations"], data["final_checkpoint"], data["completed_at"],
+            data["core_acceptance_digest"], tuple(sequence(data["attempt_chain"], "attempt_chain")),
+            data.get("program_digest"),
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "FullHorizonCompletionRecord":
+        record = cls.from_mapping(decode_json(data))
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        if isinstance(data, bytes) and data != record.encode():
+            raise ValueError("full-horizon completion record is not canonical")
+        return record
 
 
 @frozen_record
@@ -1697,7 +1932,7 @@ __all__ = [
     "AcceptedSegment", "AllocationObservation", "CoreOutcomeRecord", "ManifestAttempt", "OutcomeReceipt", "RemoteTeardownReceipt", "OUTCOME_STATUSES",
     "PLACEMENT_NOT_SAMPLED_MESSAGE", "PLACEMENT_RECEIPT_TYPES", "PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE",
     "PLACEMENT_UNQUALIFIED_MESSAGE", "PLACEMENT_V3_WARNINGS", "RunManifest", "SciencePlacementReceipt",
-    "SciencePlacementReceiptV2", "SciencePlacementReceiptV3", "StartReceipt", "SuccessorAdmission", "SuccessorAdmissionRecord", "decode_placement_receipt",
+    "SciencePlacementReceiptV2", "SciencePlacementReceiptV3", "StartReceipt", "StartProvenanceV1", "SuccessorAdmission", "SuccessorAdmissionRecord", "decode_placement_receipt",
     "placement_unqualified_message", "MemberPublicationV2", "ReconciliationPublicationV2",
 ]
 
