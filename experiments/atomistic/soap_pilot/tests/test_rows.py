@@ -23,7 +23,7 @@ from experiments.atomistic.soap_pilot.rows import (
 )
 from experiments.atomistic.stage1.collect import CollectionError, collect
 from experiments.atomistic.stage1.launch import _binding_token
-from experiments.atomistic.stage1.protocol import manifest_hash as stage1_manifest_hash, validate_gateway_binding
+from experiments.atomistic.stage1.protocol import SYSTEM_SPECS, manifest_hash as stage1_manifest_hash, validate_gateway_binding
 
 
 def test_golden_train_render_and_row_identity(tmp_path: Path) -> None:
@@ -158,10 +158,11 @@ def test_rendered_rows_pass_stage1_admission_and_registry_tamper_refuses(tmp_pat
     """Exercise the real Stage-1 gateway for every rendered train/eval row."""
 
     results = tmp_path / "results"
+    train_profiles = [*R2_PROFILES, *TARGET_PROFILES]
     train_rows = [
         render_profile(profile, output_dir=results / "inputs", results_root=str(results),
                        source_sha="7b88f833babcb82148c8f975a08b53970838be6a", device="cpu").row
-        for profile in R2_PROFILES
+        for profile in train_profiles
     ]
     checkpoint_dir = results / "checkpoint" / "step_000100"
     checkpoint_dir.mkdir(parents=True)
@@ -174,11 +175,13 @@ def test_rendered_rows_pass_stage1_admission_and_registry_tamper_refuses(tmp_pat
         parent_row=train_rows[1], device="cpu",
     ).row
 
+    hooke2 = next(spec for spec in SYSTEM_SPECS if spec.name == "hooke2")
     for row in [*train_rows, evaluation]:
         admitted = validate_gateway_binding(
             binding=_binding_token(row), expected_kinds={row["kind"]}
         )
-        assert admitted["system"] == "hooke2"
+        assert admitted["system"] == hooke2.name
+        assert admitted["system_id"] == hooke2.system_id
 
     bad_registry = dict(train_rows[0], system="hooke1")
     with pytest.raises(Exception, match="config path|known system|identity"):
