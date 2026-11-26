@@ -48,6 +48,13 @@ MUTANTS = [
         "target": "executor/src/tpen_executor/dispatch/contract.py",
         "old": "        slot = _require_configured_physical_slot(allocation, selected_slot)\n",
         "new": "        slot = _require_configured_physical_slot(allocation)\n",
+        "killer": "test_selected_slot_overlay_admits_two_slot_allocation",
+    },
+    {
+        "id": "PA1-overlay-env-precedence",
+        "target": "executor/src/tpen_executor/dispatch/contract.py",
+        "old": "        slot_id = slot.slot_id\n        host = slot_facts[\"TPEN_PLACEMENT_DECLARED_HOST\"]\n",
+        "new": "        slot_id = values.get(\"TPEN_SLOT_ID\") or slot.slot_id\n        host = slot_facts[\"TPEN_PLACEMENT_DECLARED_HOST\"]\n",
         "killer": "test_env_forgery_cannot_change_selected_slot",
     },
     {
@@ -97,6 +104,19 @@ def _allocation_slot(allocation, index: int) -> AllocationSlot:
     from tpen_executor.placement import physical_slots_from_allocation
 
     return physical_slots_from_allocation(allocation)[index]
+
+
+def test_selected_slot_overlay_admits_two_slot_allocation(tmp_path: Path) -> None:
+    group, allocation, lifecycle, configured, fence = _begin(
+        tmp_path, task_id="member", facts=_allocation(2).facts
+    )
+    configured = replace(configured, config="", overrides=(), program=_program(tmp_path))
+    selected = _allocation_slot(allocation, 0)
+    result = _with_child_placement(
+        _environment(tmp_path), allocation, fence, group, group.members[0], configured,
+        selected_slot=selected,
+    )
+    assert result.env["TPEN_PLACEMENT_SLOT_ID"] == selected.slot_id
 
 
 def test_two_slots_admit_two_rows_and_refuse_third_until_collection(tmp_path: Path) -> None:
@@ -161,9 +181,19 @@ def test_duplicate_concurrent_slot_use_is_refused(tmp_path: Path) -> None:
 
 def test_foreign_selected_slot_is_refused() -> None:
     allocation = _allocation(1)
-    foreign = AllocationSlot("foreign", "localhost", (), (999999,), (), ())
-    with pytest.raises(PlacementRefusal, match="not an exact entitlement"):
+    selected = _allocation_slot(allocation, 0)
+    foreign = replace(selected, node="foreign-node")
+    with pytest.raises(PlacementRefusal) as refused:
         _require_configured_physical_slot(allocation, foreign)
+    assert refused.value.code == "configured-physical-slot-foreign"
+
+
+def test_unknown_selected_slot_id_is_refused() -> None:
+    allocation = _allocation(1)
+    foreign = AllocationSlot("unknown-slot", "localhost", (), (999999,), (), ())
+    with pytest.raises(PlacementRefusal) as refused:
+        _require_configured_physical_slot(allocation, foreign)
+    assert refused.value.code == "configured-physical-slot-foreign"
 
 
 def test_absent_selected_slot_keeps_legacy_refusal() -> None:
@@ -182,10 +212,20 @@ def test_env_forgery_cannot_change_selected_slot(tmp_path: Path) -> None:
     )
     configured = replace(configured, config="", overrides=(), program=_program(tmp_path))
     selected = _allocation_slot(allocation, 0)
+    forged_slot = _allocation_slot(allocation, 1)
+    forged_cpus = ",".join(map(str, forged_slot.cpus))
+    forged_devices = ",".join(forged_slot.devices)
     forged = PreparedPythonEnvironment(
         _environment(tmp_path).python,
-        env={"TPEN_SLOT_ID": _allocation_slot(allocation, 1).slot_id,
-             "TPEN_SLOT_NODE": "forged-node", "TPEN_SLOT_CPUS": "999"},
+        env={
+            "TPEN_SLOT_ID": forged_slot.slot_id,
+            "TPEN_SLOT_NODE": "forged-node",
+            "TPEN_SLOT_CPUS": forged_cpus,
+            "TPEN_PLACEMENT_SLOT_ID": forged_slot.slot_id,
+            "TPEN_PLACEMENT_DECLARED_HOST": "forged-node",
+            "TPEN_PLACEMENT_DECLARED_CPUS": forged_cpus,
+            "TPEN_PLACEMENT_DECLARED_DEVICES": forged_devices,
+        },
     )
     result = _with_child_placement(
         forged, allocation, fence, group, group.members[0], configured,
@@ -193,6 +233,11 @@ def test_env_forgery_cannot_change_selected_slot(tmp_path: Path) -> None:
     )
     assert result.env["TPEN_SLOT_ID"] == selected.slot_id
     assert result.env["TPEN_SLOT_NODE"] == selected.node
+    assert result.env["TPEN_SLOT_CPUS"] == ",".join(map(str, selected.cpus))
+    assert result.env["TPEN_PLACEMENT_SLOT_ID"] == selected.slot_id
+    assert result.env["TPEN_PLACEMENT_DECLARED_HOST"] == selected.node
+    assert result.env["TPEN_PLACEMENT_DECLARED_CPUS"] == ",".join(map(str, selected.cpus))
+    assert result.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == ",".join(selected.devices)
 
 
 def test_named_crossed_slot_detector() -> None:
