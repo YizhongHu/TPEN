@@ -1145,8 +1145,27 @@ def _require_family_common_truthfulness(cell: Any, resolved: Any) -> None:
             )
 
 
-def _require_truthful_cell(cell: Any, resolved: Any) -> None:
+def _require_truthful_cell(
+    cell: Any, resolved: Any, local_energy_chunk_size: int | None = None
+) -> None:
     """Refuse a cell whose declared context or Adam levels are not consumed."""
+
+    try:
+        expected_chunk_size = train_config.validate_local_energy_chunk_size(
+            local_energy_chunk_size
+        )
+    except train_config.TrainConfigResolutionError as error:
+        raise StageQSelectionError(str(error)) from error
+    trainer = getattr(resolved, "trainer", None)
+    runner_trainer = getattr(getattr(resolved, "runner", None), "trainer", None)
+    actual_top = getattr(trainer, "local_energy_chunk_size", None)
+    actual_consumed = getattr(runner_trainer, "local_energy_chunk_size", None)
+    if actual_top != expected_chunk_size or actual_consumed != expected_chunk_size:
+        raise StageQSelectionError(
+            "truthfulness guard refused local_energy_chunk_size: "
+            f"expected {expected_chunk_size!r}, top-level trainer={actual_top!r}, "
+            f"runner.trainer={actual_consumed!r}"
+        )
 
     identity = cell.manifest["scientific_identity"]
     if architecture_stage_family.is_family_stage(str(cell.manifest["stage"])):
@@ -1352,7 +1371,9 @@ def _training_packet(cell: Any) -> Any:
     return packets.train[0]
 
 
-def _resolve_selected_config(selection: CellSelection) -> tuple[Any, Any]:
+def _resolve_selected_config(
+    selection: CellSelection, local_energy_chunk_size: int | None = None
+) -> tuple[Any, Any]:
     """Run the single selection-side resolve-and-check route.
 
     Parameters
@@ -1379,10 +1400,12 @@ def _resolve_selected_config(selection: CellSelection) -> tuple[Any, Any]:
     if architecture_stage_family.is_family_stage(str(selection.cell.manifest["stage"])):
         resolved = architecture_stage_family.descriptor_for(
             str(selection.cell.manifest["stage"])
-        ).resolver(packet)
+        ).resolver(packet, local_energy_chunk_size=local_energy_chunk_size)
     else:
-        resolved = train_config.resolve_train_config(packet)
-    _require_truthful_cell(selection.cell, resolved)
+        resolved = train_config.resolve_train_config(
+            packet, local_energy_chunk_size=local_energy_chunk_size
+        )
+    _require_truthful_cell(selection.cell, resolved, local_energy_chunk_size)
     return packet, resolved
 
 
@@ -1553,6 +1576,12 @@ def execute(
     """
 
     launch.refuse_hi_continuation(restore_request)
+    try:
+        local_energy_chunk_size = train_config.validate_local_energy_chunk_size(
+            getattr(args, "local_energy_chunk_size", None)
+        )
+    except train_config.TrainConfigResolutionError as error:
+        raise StageQSelectionError(str(error)) from error
     manifest_path = getattr(args, "manifest", None)
     row_id = getattr(args, "row", None)
     if (manifest_path is None) != (row_id is None):
@@ -1638,7 +1667,7 @@ def execute(
             f"stage {args.stage!r} declares n_walkers={declared_walkers!r}"
         )
     selection = replace(selection, cell=cell)
-    packet, resolved = _resolve_selected_config(selection)
+    packet, resolved = _resolve_selected_config(selection, local_energy_chunk_size)
     recorded_resolved = OmegaConf.to_container(resolved, resolve=True)
     report = {
         "selection": selection.receipt(),
@@ -1651,6 +1680,12 @@ def execute(
             "independent_sampler_packets": 0,
         },
         "resolved_config": recorded_resolved,
+        "local_energy_chunking": {
+            "activation_path": (
+                "stage_q_cli" if local_energy_chunk_size is not None else "legacy_default"
+            ),
+            "effective_chunk_size": local_energy_chunk_size,
+        },
     }
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
     if args.dry_run:
@@ -1668,7 +1703,7 @@ def execute(
     ) -> int:
         """Validate launch.py's late resolution before delegating to TPEN."""
 
-        _require_truthful_cell(selection.cell, config)
+        _require_truthful_cell(selection.cell, config, local_energy_chunk_size)
         launched_resolved = OmegaConf.to_container(config, resolve=True)
         if launched_resolved != recorded_resolved:
             raise StageQSelectionError(
@@ -1687,6 +1722,7 @@ def execute(
             _execution_facts(),
             runner=_guarded_runner,
             runtime_callbacks=runtime_callbacks,
+            local_energy_chunk_size=local_energy_chunk_size,
         )
     else:
         exit_code = launch.launch_train(
@@ -1694,6 +1730,7 @@ def execute(
             _execution_facts(),
             runner=_guarded_runner,
             runtime_callbacks=runtime_callbacks,
+            local_energy_chunk_size=local_energy_chunk_size,
         )
     if exit_code == 0:
         resolved_snapshot = output_path / "resolved_config.yaml"
@@ -1712,6 +1749,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beta2", type=float)
     parser.add_argument("--seed-label", type=int)
     parser.add_argument("--walkers", type=int)
+    parser.add_argument("--local-energy-chunk-size", type=int)
     parser.add_argument("--output-root", type=Path, default=Path(__file__).with_name("outputs"))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--literal-configuration", type=json.loads)

@@ -49,6 +49,18 @@ class ContextResolutionError(TrainConfigResolutionError):
     """A row declares a model context that this resolver does not consume."""
 
 
+def validate_local_energy_chunk_size(value: Any) -> int | None:
+    """Validate the explicit Stage-Q local-energy chunk bound."""
+
+    if value is None:
+        return None
+    if type(value) is not int or value <= 0:
+        raise TrainConfigResolutionError(
+            "local_energy_chunk_size must be None or an exact positive integer"
+        )
+    return value
+
+
 _AB_CONTEXT_KEYS = frozenset(
     {
         "producer_path",
@@ -591,7 +603,8 @@ def _ab_context_labels(manifest: Mapping[str, Any], axis: str) -> dict[str, str]
 
 
 def resolve_train_config(
-    source: Any, *, overrides: Mapping[str, Any] | Sequence[str] | None = None
+    source: Any, *, overrides: Mapping[str, Any] | Sequence[str] | None = None,
+    local_energy_chunk_size: int | None = None,
 ) -> DictConfig:
     """Resolve one materialized cell or training packet into a Hydra config.
 
@@ -621,6 +634,7 @@ def resolve_train_config(
         If the composed configuration fails the HI schema firewall.
     """
 
+    local_energy_chunk_size = validate_local_energy_chunk_size(local_energy_chunk_size)
     cell, source_hash = _cell_from_source(source)
     stage_api = _stage_api()
     # Own one frozen manifest before any resolver consumer can read it again.
@@ -676,6 +690,12 @@ def resolve_train_config(
     walkers = stage_api.walker_count(manifest)
     OmegaConf.update(cfg, "sampler.n_walkers", walkers, merge=False)
     OmegaConf.update(cfg, "trainer.max_steps", stage.updates, merge=False)
+    # Apply this before interpolation resolution so runner.trainer receives
+    # the same bound through the committed ${trainer} limb.
+    OmegaConf.update(
+        cfg, "trainer.local_energy_chunk_size", local_energy_chunk_size,
+        merge=False, force_add=True,
+    )
     OmegaConf.update(cfg, "run.root", str(output_path.parent.parent), merge=False)
     OmegaConf.update(cfg, "run.run_id", source_hash, merge=False)
     OmegaConf.update(cfg, "run.layout", "flat", merge=False, force_add=True)

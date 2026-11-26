@@ -530,6 +530,7 @@ def prepare_train_launch(
     topology: object | None = None,
     *,
     overrides: Mapping[str, Any] | Sequence[str] | None = None,
+    local_energy_chunk_size: int | None = None,
     restore_request: object | None = None,
     artifact_destination: object | None = None,
 ) -> LaunchPlan:
@@ -566,7 +567,9 @@ def prepare_train_launch(
     # Preserve the default call shape for existing callers and test doubles.
     if overrides is None:
         try:
-            config = _TRAIN_CONFIG.resolve_train_config(cell)
+            config = _TRAIN_CONFIG.resolve_train_config(
+                cell, local_energy_chunk_size=local_energy_chunk_size
+            )
         except Exception as error:
             if restore_request is not None:
                 raise HIContinuationRefusal(
@@ -580,7 +583,10 @@ def prepare_train_launch(
             )
         override_items = _TRAIN_CONFIG._override_items(overrides)
         try:
-            config = _TRAIN_CONFIG.resolve_train_config(cell, overrides=overrides)
+            config = _TRAIN_CONFIG.resolve_train_config(
+                cell, overrides=overrides,
+                local_energy_chunk_size=local_energy_chunk_size,
+            )
         except Exception as error:
             if restore_request is not None:
                 raise HIContinuationRefusal(
@@ -620,6 +626,7 @@ def launch_train(
     runner: Callable[..., object] = run_from_config,
     runtime_callbacks: Sequence[object] = (),
     overrides: Mapping[str, Any] | Sequence[str] | None = None,
+    local_energy_chunk_size: int | None = None,
     restore_request: object | None = None,
     artifact_destination: object | None = None,
 ) -> int:
@@ -674,6 +681,7 @@ def launch_train(
         source,
         facts,
         overrides=overrides,
+        local_energy_chunk_size=local_energy_chunk_size,
         restore_request=restore_request,
         artifact_destination=artifact_destination,
     )
