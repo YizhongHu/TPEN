@@ -260,6 +260,48 @@ def test_cell_completion_matches_receipt_row_not_decoy(tmp_path: Path) -> None:
     assert next(row for row in verdict["predicates"] if row["name"] == "cell_complete")["status"] == "FAIL"
 
 
+def test_matching_delta_report_is_fail_closed_over_stale_legacy_complete(tmp_path: Path) -> None:
+    root = tmp_path / "output"
+    row_id = "selected-row"
+    receipt = root / "cells" / row_id / "selection_receipt.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(json.dumps({"selection": {"selected": {"context": "O-raw"}}, "walkers": 1}) + "\n")
+    (root / "Q" / row_id / "COMPLETE").parent.mkdir(parents=True)
+    (root / "Q" / row_id / "COMPLETE").write_text("stale\n")
+    report = root / "attempt" / "attempt_report.json"
+    report.parent.mkdir(parents=True)
+    report.write_text(json.dumps({"row_id": row_id, "attempt_delta": {
+        "attempt_core_dir": str(root / "groups" / "g" / "t" / "a" / "core"),
+        "attempt_id": "a", "group_digest": "g", "load": {"mode": "fresh", "path": None},
+        "schema": "tpen-executor/attempt-delta-v1", "task_id": "t",
+    }}) + "\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"runtime_kind": stage.RUNTIME_KIND, "cell": {"context": "O-raw", "walkers": 1, "updates": 1, "checkpoint_every": 1}, "output_root": str(root)}) + "\n")
+    evidence = tmp_path / "evidence"
+    qualification.qualify(manifest, evidence)
+    verdict = json.loads((evidence / "qualification.json").read_text())
+    assert next(row for row in verdict["predicates"] if row["name"] == "cell_complete")["status"] == "FAIL"
+
+
+def test_unrelated_delta_report_preserves_legacy_complete(tmp_path: Path) -> None:
+    root = tmp_path / "output"
+    row_id = "selected-row"
+    receipt = root / "cells" / row_id / "selection_receipt.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(json.dumps({"selection": {"selected": {"context": "O-raw"}}, "walkers": 1}) + "\n")
+    (root / "Q" / row_id / "COMPLETE").parent.mkdir(parents=True)
+    (root / "Q" / row_id / "COMPLETE").write_text("done\n")
+    report = root / "unrelated" / "attempt_report.json"
+    report.parent.mkdir(parents=True)
+    report.write_text(json.dumps({"row_id": "other-row"}) + "\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"runtime_kind": stage.RUNTIME_KIND, "cell": {"context": "O-raw", "walkers": 1, "updates": 1, "checkpoint_every": 1}, "output_root": str(root)}) + "\n")
+    evidence = tmp_path / "evidence"
+    qualification.qualify(manifest, evidence)
+    verdict = json.loads((evidence / "qualification.json").read_text())
+    assert next(row for row in verdict["predicates"] if row["name"] == "cell_complete")["status"] == "PASS"
+
+
 def test_job_main_green_and_seam_controls(monkeypatch, tmp_path: Path) -> None:
     target = tmp_path / "target"
     route = target / job.CANONICAL_STAGE
