@@ -271,9 +271,9 @@ def _materialized_eval_row(tmp_path: Path) -> tuple[dict[str, object], Path]:
     rendered_path.parent.mkdir(parents=True)
     rendered = OmegaConf.to_container(native_cfg, resolve=True)
     rendered["run"]["dir"] = str(protocol.resolve_run_dir(row))  # type: ignore[index]
-    rendered["evaluator"]["tasks"][0]["output_dir"] = (  # type: ignore[index]
-        f"{protocol.resolve_run_dir(row)}/mcmc_energy"
-    )
+    eval_output_dir = f"{protocol.resolve_run_dir(row)}/mcmc_energy"
+    rendered["evaluation_tasks"]["mcmc_energy"]["output_dir"] = eval_output_dir  # type: ignore[index]
+    rendered["evaluator"]["tasks"][0]["output_dir"] = eval_output_dir  # type: ignore[index]
     row["row_extension"] = {
         "version": protocol.ROW_EXTENSION_VERSION,
         "rendered_config": {"path": str(rendered_path), "sha256": ""},
