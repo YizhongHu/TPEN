@@ -240,8 +240,16 @@ def test_p3_pbs_packet_env_argv_outputs_and_lr4_guards() -> None:
     audit = render_pbs_audit()
     assert set(audit["env"]) >= {"MODE", "SOURCE_SHA", "CHECKOUT_ROOT", "UV_CACHE_DIR", "RESULTS_ROOT", "SELECTED_ROW", "APPROVAL_ID", "EXPECTED_QUEUE"}
     assert "command_for_row(row, python=python, checkout_root=checkout)" in audit["argv"]
-    assert audit["log"].endswith(".log") and audit["status"].endswith(".status")
-    assert set(audit["lr4_guards"]) == {"assert_pbs_context", "assert_selected_row", "assert_contained_path", "DRY_EXEC", "EXPECTED_QUEUE"}
+    assert 'row-${row_id}-${PBS_JOBID}.log' in audit["log"]
+    assert 'row-${row_id}-${PBS_JOBID}.status' in audit["status"]
+    assert set(audit["lr4_guards"]) == {
+        "assert_pbs_context", "validate_selected_row", "assert_contained_path", "guard_gpus", "derive_cpu_layout",
+    }
+    for name in audit["lr4_guards"]:
+        evidence = audit["guard_evidence"][name]
+        assert evidence["line_range"][0] <= evidence["line_range"][1]
+        assert evidence["checks"]
+        assert all(":" in check for check in evidence["checks"])
 
 
 def test_p3_fail_closed_recipe_diff_allows_only_enumerated_r2_changes(tmp_path: Path) -> None:

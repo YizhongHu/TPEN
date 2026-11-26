@@ -187,25 +187,94 @@ def render_pbs_audit() -> dict[str, Any]:
 
     wrapper = Path(__file__).resolve().parents[1] / "stage1" / "polaris" / "pbs_stage1.sh"
     text = wrapper.read_text(encoding="utf-8")
-    # Derive the environment contract from the wrapper's declarations rather
-    # than duplicating an echoed list in the P3 implementation.
-    expected_env = {"MODE", "SOURCE_SHA", "CHECKOUT_ROOT", "UV_CACHE_DIR", "RESULTS_ROOT", "SELECTED_ROW", "APPROVAL_ID", "EXPECTED_QUEUE"}
-    declared = set(re.findall(r"^([A-Z][A-Z0-9_]*)=\"\$\{\1:-", text, re.MULTILINE))
-    required = set(re.findall(r"^\s*require_value\s+([A-Z][A-Z0-9_]*)\s*$", text, re.MULTILINE))
-    required_env = tuple(name for name in ("MODE", "SOURCE_SHA", "CHECKOUT_ROOT", "UV_CACHE_DIR", "RESULTS_ROOT", "SELECTED_ROW", "APPROVAL_ID", "EXPECTED_QUEUE") if name in declared or name in required)
-    if not expected_env <= set(required_env):
-        raise P3RenderError(f"PBS environment declarations incomplete: {sorted(expected_env - set(required_env))}")
-    required_outputs = ("$RESULTS_ROOT/logs/row-", "checkpoints")
-    missing = [token for token in (*required_env, *required_outputs, "command_for_row") if token not in text]
-    if missing:
-        raise P3RenderError(f"PBS contract evidence missing: {missing}")
-    command_form = re.search(r"command_for_row\(row, python=python, checkout_root=checkout\)", text)
-    log_form = re.search(r'\$RESULTS_ROOT/logs/row-\$\{row_id\}-\$\{PBS_JOBID\}\.log', text)
-    status_form = re.search(r'\$RESULTS_ROOT/logs/row-\$\{row_id\}-\$\{PBS_JOBID\}\.status', text)
-    lr4_guards = tuple(token for token in ("assert_pbs_context", "assert_selected_row", "assert_contained_path", "DRY_EXEC", "EXPECTED_QUEUE") if token in text)
-    if command_form is None or log_form is None or status_form is None or len(lr4_guards) != 5:
-        raise P3RenderError("PBS argv/output/LR-4 guard evidence is incomplete")
-    return {"wrapper": str(wrapper), "env": required_env, "outputs": required_outputs, "command_owner": "stage1.launch.command_for_row", "argv": command_form.group(0), "log": log_form.group(0), "status": status_form.group(0), "lr4_guards": lr4_guards}
+    lines = text.splitlines()
+
+    def source_lines(function: str) -> tuple[tuple[int, str], ...]:
+        """Return one shell function's actual numbered source lines."""
+
+        start = next((index for index, line in enumerate(lines) if line == f"{function}() {{"), None)
+        if start is None:
+            raise P3RenderError(f"PBS evidence missing function: {function}")
+        end = next(
+            (index for index in range(start + 1, len(lines))
+             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\(\) \{", lines[index])),
+            len(lines),
+        )
+        return tuple((index + 1, lines[index]) for index in range(start, end))
+
+    def quote_checks(function: str, needles: tuple[str, ...]) -> dict[str, Any]:
+        body = source_lines(function)
+        checks: list[str] = []
+        for needle in needles:
+            match = next(((number, line.strip()) for number, line in body if needle in line), None)
+            if match is None:
+                raise P3RenderError(f"PBS evidence missing {function} check: {needle}")
+            checks.append(f"{match[0]}: {match[1]}")
+        return {
+            "function": function,
+            "line_range": [body[0][0], body[-1][0]],
+            "checks": tuple(checks),
+        }
+
+    # Derive the environment contract from the wrapper's declarations and
+    # require_value calls rather than duplicating an echoed list in P3.
+    expected_env = ("MODE", "SOURCE_SHA", "CHECKOUT_ROOT", "UV_CACHE_DIR", "RESULTS_ROOT", "SELECTED_ROW", "APPROVAL_ID", "EXPECTED_QUEUE")
+    env_evidence: dict[str, str] = {}
+    for name in expected_env:
+        match = next(
+            ((index + 1, line.strip()) for index, line in enumerate(lines)
+             if re.search(rf"\b{name}\b", line) and ("=" in line or "require_value" in line)),
+            None,
+        )
+        if match is None:
+            raise P3RenderError(f"PBS environment declaration missing: {name}")
+        env_evidence[name] = f"{match[0]}: {match[1]}"
+
+    admission = quote_checks("admit_selected_row", (
+        "require_value SELECTED_ROW",
+        '[[ "$SELECTED_ROW" == /* ]] || die',
+        'if [[ "$DRY_EXEC" == 1 ]]; then',
+        'assert_contained_path "$RESULTS_ROOT/plan" "$RESULTS_ROOT" RESULTS_PLAN',
+        'assert_contained_path "$ADMITTED_ROW" "$RESULTS_ROOT" ADMITTED_ROW',
+    ))
+    command = quote_checks("run_command_for_row", (
+        'if [[ "$DRY_EXEC" == 1 ]]; then',
+        'printf \'DRY_EXEC compute=SKIPPED',
+        '[[ "$DRY_EXEC" != 1 ]] || die',
+        "from experiments.atomistic.stage1.launch import command_for_row",
+        "argv = shlex.split(command_for_row(row, python=python, checkout_root=checkout))",
+        "completed = subprocess.run(argv, cwd=checkout, env=os.environ)",
+    ))
+    output = quote_checks("run_mode", (
+        'log="$RESULTS_ROOT/logs/row-${row_id}-${PBS_JOBID}.log"',
+        'status="$RESULTS_ROOT/logs/row-${row_id}-${PBS_JOBID}.status"',
+        'assert_contained_path "$log" "$destination_root" log',
+        'assert_contained_path "$status" "$destination_root" status',
+        'run_command_for_row "$row" "$gpu" "$cpu_set" "$core_count" "$log" "$status"',
+    ))
+    guards = {
+        name: quote_checks(name, needles)
+        for name, needles in {
+            "assert_contained_path": ("if ! canonical=", "canonical.relative_to(root.resolve())"),
+            "validate_selected_row": ("if row.get(\"kind\") != kind", "if row.get(\"source_sha\") != source_sha", "row results_root is outside wrapper RESULTS_ROOT"),
+            "assert_pbs_context": ("require_value PBS_JOBID", "require_value PBS_QUEUE", "require_value EXPECTED_QUEUE", '[[ "$PBS_QUEUE" == "$EXPECTED_QUEUE" ]]'),
+            "guard_gpus": ('[[ "${#gpu_lines[@]}" == 4 ]]', 'CUDA_VISIBLE_DEVICES="$i"', '[[ "$count" == 1 ]]'),
+            "derive_cpu_layout": ('[[ "${#layout_lines[@]}" == 3 ]]', 'LINEAGE_CPU_SETS[$lineage]="$cpu_set"', 'LINEAGE_CORE_COUNTS[$lineage]="$core_count"'),
+        }.items()
+    }
+    evidence = {**guards, "admit_selected_row": admission, "run_command_for_row": command, "run_mode": output}
+    return {
+        "wrapper": str(wrapper),
+        "env": expected_env,
+        "env_evidence": env_evidence,
+        "outputs": (output["checks"][0], output["checks"][1]),
+        "command_owner": "stage1.launch.command_for_row",
+        "argv": command["checks"][4],
+        "log": output["checks"][0],
+        "status": output["checks"][1],
+        "lr4_guards": tuple(guards),
+        "guard_evidence": evidence,
+    }
 
 
 def recipe_diff(expected: Mapping[str, Any], actual: Mapping[str, Any], *, allowed_paths: set[str] | frozenset[str] = frozenset()) -> dict[str, tuple[Any, Any]]:
