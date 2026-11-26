@@ -419,6 +419,7 @@ def _attach_materialized_config(
         "rendered_config": {"path": str(rendered_path), "sha256": ""},
         "diagnostics_profile": protocol.OVERLAY_PROFILE_V1,
     }
+    rendered_path.parent.mkdir(parents=True, exist_ok=True)
     row["row_extension"]["rendered_config"]["sha256"] = _write_rendered(  # type: ignore[index]
         rendered_path, rendered,
     )
