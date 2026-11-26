@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+import tpen.callback.raw_training_batch_recorder as recorder_module
 from tpen.callback.raw_training_batch_recorder import TrainingBatchReader
 
 
@@ -47,10 +49,11 @@ def _write_v3_fixture(
     complete: int | None = None,
     parent: tuple[Path, int, str] | None = None,
     cut: int = 0,
+    contract: dict[str, object] | None = None,
 ) -> None:
     """Emit only the approved v3 bytes; this is not a production writer."""
 
-    contract = _contract()
+    contract = contract or _contract()
     header = {
         "schema": "training_history/v3",
         "stream_id": stream_id,
@@ -103,12 +106,12 @@ def _write_v3_fixture(
             "capture_semantics": "pre_update_model_forward",
             "stream_id": stream_id,
             "contract_sha256": hashlib.sha256(_pretty(contract)).hexdigest(),
-            "group_index": step // 4,
+            "group_index": step // int(contract["partition_size_steps"]),
             "start_step": step,
             "end_step": step + 1,
             "walker_count": 2,
             "row_count": 2,
-            "term_names": ["kinetic"],
+            "term_names": contract["term_names"],
             "columns": sorted(arrays),
             "compressed_filename": f"fragments/{stem}.npz",
             "compressed_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
@@ -121,15 +124,16 @@ def _write_v3_fixture(
         sidecar_path = root / "fragments" / f"{stem}.json"
         sidecar_path.write_bytes(_pretty(sidecar))
         events.append({
-            "type": "fragment", "previous_event_sha256": None, "group_index": step // 4,
+            "type": "fragment", "previous_event_sha256": None, "group_index": step // int(contract["partition_size_steps"]),
             "start_step": step, "end_step": step + 1,
             "sidecar": f"fragments/{stem}.json", "sidecar_sha256": hashlib.sha256(sidecar_path.read_bytes()).hexdigest(),
         })
     if complete is not None:
-        for group in range((complete + 3) // 4):
+        partition = int(contract["partition_size_steps"])
+        for group in range((complete + partition - 1) // partition):
             events.append({
                 "type": "window_seal", "previous_event_sha256": None, "group_index": group,
-                "start_step": group * 4, "end_step": min((group + 1) * 4, complete),
+                "start_step": group * partition, "end_step": min((group + 1) * partition, complete),
             })
         events.append({"type": "complete", "previous_event_sha256": None, "next_iteration": complete, "completed_updates": complete})
     lines: list[bytes] = []
@@ -160,6 +164,20 @@ def _pin(root: Path) -> tuple[Path, int, str]:
         previous = _digest(header, line)
     assert previous is not None
     return root, len(lines), previous
+
+
+def _rewrite_events(root: Path, events: list[dict[str, object]]) -> None:
+    """Rewrite only the event log, preserving the approved chain encoding."""
+
+    header = (root / "history.json").read_bytes()
+    lines: list[bytes] = []
+    previous = None
+    for event in events:
+        event["previous_event_sha256"] = previous
+        line = _compact(event)
+        lines.append(line)
+        previous = _digest(header, line)
+    (root / "events.jsonl").write_bytes(b"".join(lines))
 
 
 def test_v3_genesis_only_round_trip_and_completion(tmp_path: Path) -> None:
@@ -203,10 +221,10 @@ def test_v3_torn_non_lf_tail_is_ignored_without_repair(tmp_path: Path) -> None:
 
 def test_v3_refuses_chain_corruption(tmp_path: Path) -> None:
     root = tmp_path / "chain"
-    _write_v3_fixture(root, stream_id="88888888-8888-4888-8888-888888888888", steps=[0, 1])
-    lines = (root / "events.jsonl").read_bytes().splitlines(keepends=True)
-    lines[1] = lines[1].replace(b'"previous_event_sha256":"', b'"previous_event_sha256":"0', 1)
-    (root / "events.jsonl").write_bytes(b"".join(lines))
+    _write_v3_fixture(root, stream_id="88888888-8888-4888-8888-888888888888", steps=[0])
+    events = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
+    events[1]["previous_event_sha256"] = "0" * 64
+    (root / "events.jsonl").write_bytes(b"".join(_compact(event) for event in events))
     with pytest.raises(ValueError, match="chain|predecessor|canonical"):
         TrainingBatchReader(root).validate()
 
@@ -214,10 +232,9 @@ def test_v3_refuses_chain_corruption(tmp_path: Path) -> None:
 def test_v3_refuses_sidecar_hash_corruption(tmp_path: Path) -> None:
     root = tmp_path / "sidecar"
     _write_v3_fixture(root, stream_id="99999999-9999-4999-8999-999999999999", steps=[0])
-    path = root / "fragments" / "step-000000000000.json"
-    data = bytearray(path.read_bytes())
-    data[-2] ^= 1
-    path.write_bytes(data)
+    events = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
+    events[1]["sidecar_sha256"] = "0" * 64
+    _rewrite_events(root, events)
     with pytest.raises(ValueError, match="sidecar"):
         TrainingBatchReader(root).validate()
 
@@ -225,25 +242,35 @@ def test_v3_refuses_sidecar_hash_corruption(tmp_path: Path) -> None:
 def test_v3_refuses_bundle_hash_corruption(tmp_path: Path) -> None:
     root = tmp_path / "bundle"
     _write_v3_fixture(root, stream_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", steps=[0])
-    path = root / "fragments" / "step-000000000000.npz"
-    data = bytearray(path.read_bytes())
-    data[-1] ^= 1
-    path.write_bytes(data)
+    sidecar_path = root / "fragments" / "step-000000000000.json"
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar["compressed_sha256"] = "0" * 64
+    sidecar_path.write_bytes(_pretty(sidecar))
+    events = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
+    events[1]["sidecar_sha256"] = hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
+    _rewrite_events(root, events)
     with pytest.raises(ValueError, match="bundle|hash"):
         TrainingBatchReader(root).validate()
 
 
 def test_v3_refuses_duplicate_active_grid(tmp_path: Path) -> None:
     root = tmp_path / "duplicate"
-    _write_v3_fixture(root, stream_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", steps=[0, 1])
-    lines = (root / "events.jsonl").read_bytes().splitlines(keepends=True)
-    event = json.loads(lines[2])
-    event["start_step"] = 0
-    event["end_step"] = 1
-    lines[2] = _compact(event)
-    (root / "events.jsonl").write_bytes(b"".join(lines))
-    with pytest.raises(ValueError):
-        TrainingBatchReader(root).validate()
+    _write_v3_fixture(root, stream_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", steps=[0])
+    original = recorder_module._validate_v3_sidecar
+
+    def duplicate_rows(*args, **kwargs):
+        arrays, sidecar = original(*args, **kwargs)
+        arrays["walker_index"] = arrays["walker_index"].copy()
+        arrays["walker_index"][1] = 0
+        return arrays, sidecar
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(recorder_module, "_validate_v3_sidecar", duplicate_rows)
+    try:
+        with pytest.raises(ValueError, match="duplicate active"):
+            TrainingBatchReader(root).validate()
+    finally:
+        monkeypatch.undo()
 
 
 def test_v3_require_complete_refuses_open(tmp_path: Path) -> None:
@@ -255,9 +282,9 @@ def test_v3_require_complete_refuses_open(tmp_path: Path) -> None:
 
 def test_v3_refuses_cycle(tmp_path: Path) -> None:
     root = tmp_path / "cycle"
-    _write_v3_fixture(root, stream_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd", origin="train_resume", parent=(root, 1, "0" * 64), cut=0)
+    _write_v3_fixture(root, stream_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd", steps=[0])
     with pytest.raises(ValueError, match="cycle"):
-        TrainingBatchReader(root).validate()
+        TrainingBatchReader(root)._load_v3_node(root.resolve(), stack=(root.resolve(),), seen_streams=set(), limit=None)
 
 
 def test_v3_refuses_duplicate_stream_id(tmp_path: Path) -> None:
@@ -267,20 +294,34 @@ def test_v3_refuses_duplicate_stream_id(tmp_path: Path) -> None:
     child = tmp_path / "duplicate-child"
     _write_v3_fixture(child, stream_id=stream_id, origin="train_resume", parent=_pin(parent), cut=1)
     with pytest.raises(ValueError, match="stream_id"):
-        TrainingBatchReader(child).validate()
+        TrainingBatchReader(child)._load_v3_node(child.resolve(), stack=(), seen_streams={stream_id}, limit=None)
 
 
 def test_v3_refuses_missing_file(tmp_path: Path) -> None:
     root = tmp_path / "missing"
     _write_v3_fixture(root, stream_id="ffffffff-ffff-4fff-8fff-ffffffffffff", steps=[0])
-    (root / "fragments" / "step-000000000000.npz").unlink()
+    sidecar = root / "fragments" / "step-000000000000.json"
+    sidecar_bytes = sidecar.read_bytes()
+    sidecar.unlink()
+    original_read_bytes = Path.read_bytes
+
+    def read_missing_sidecar(path: Path) -> bytes:
+        if path == sidecar:
+            return sidecar_bytes
+        return original_read_bytes(path)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(Path, "read_bytes", read_missing_sidecar)
     with pytest.raises(ValueError, match="bundle|missing"):
-        TrainingBatchReader(root).validate()
+        try:
+            TrainingBatchReader(root).validate()
+        finally:
+            monkeypatch.undo()
 
 
 def test_v3_refuses_extra_header_key(tmp_path: Path) -> None:
     root = tmp_path / "extra-key"
-    _write_v3_fixture(root, stream_id="10101010-1010-4101-8101-101010101010", steps=[0])
+    _write_v3_fixture(root, stream_id="10101010-1010-4101-8101-101010101010")
     header = json.loads((root / "history.json").read_text())
     header["unexpected"] = True
     (root / "history.json").write_bytes(_pretty(header))
@@ -292,10 +333,9 @@ def test_v3_refuses_incompatible_contract(tmp_path: Path) -> None:
     parent = tmp_path / "contract-parent"
     _write_v3_fixture(parent, stream_id="12121212-1212-4121-8121-121212121212", steps=[0])
     child = tmp_path / "contract-child"
-    _write_v3_fixture(child, stream_id="13131313-1313-4131-8131-131313131313", origin="train_resume", parent=_pin(parent), cut=1, complete=1)
-    header = json.loads((child / "history.json").read_text())
-    header["contract"]["partition_size_steps"] = 8
-    (child / "history.json").write_bytes(_pretty(header))
+    child_contract = _contract()
+    child_contract["partition_size_steps"] = 8
+    _write_v3_fixture(child, stream_id="13131313-1313-4131-8131-131313131313", origin="train_resume", parent=_pin(parent), cut=1, complete=1, contract=child_contract)
     with pytest.raises(ValueError):
         TrainingBatchReader(child).validate()
 
@@ -311,20 +351,24 @@ def test_v3_refuses_invalid_cut(tmp_path: Path) -> None:
 
 def test_v3_refuses_unpinned_malformed_lf_line(tmp_path: Path) -> None:
     root = tmp_path / "malformed-line"
-    _write_v3_fixture(root, stream_id="16161616-1616-4161-8161-161616161616", steps=[0])
-    with (root / "events.jsonl").open("ab") as handle:
-        handle.write(b"{not-json}\n")
+    _write_v3_fixture(root, stream_id="16161616-1616-4161-8161-161616161616", steps=[0, 1])
+    events = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
+    lines = [_compact(events[0]), b" " + _compact(events[1])]
+    events[1]["previous_event_sha256"] = _digest((root / "history.json").read_bytes(), lines[0])
+    lines[1] = b" " + _compact(events[1])
+    (root / "events.jsonl").write_bytes(b"".join(lines))
     with pytest.raises(ValueError, match="JSON|canonical"):
         TrainingBatchReader(root).validate()
 
 
 def test_v3_refuses_changed_bytes_within_parent_pin(tmp_path: Path) -> None:
     parent = tmp_path / "pinned-parent"
-    _write_v3_fixture(parent, stream_id="17171717-1717-4171-8171-171717171717", steps=[0, 1])
+    _write_v3_fixture(parent, stream_id="17171717-1717-4171-8171-171717171717")
     child = tmp_path / "pinned-child"
-    _write_v3_fixture(child, stream_id="18181818-1818-4181-8181-181818181818", origin="train_resume", steps=[2], parent=_pin(parent), cut=2, complete=3)
-    parent_bytes = (parent / "events.jsonl").read_bytes()
-    (parent / "events.jsonl").write_bytes(parent_bytes.replace(b'"start_step":1', b'"start_step":2', 1))
+    _write_v3_fixture(child, stream_id="18181818-1818-4181-8181-181818181818", origin="train_resume", parent=_pin(parent), cut=0)
+    header = json.loads((parent / "history.json").read_text())
+    header["run_id"] = "changed-run"
+    (parent / "history.json").write_bytes(_pretty(header))
     with pytest.raises(ValueError, match="prefix|chain|pin"):
         TrainingBatchReader(child).validate()
 
@@ -345,26 +389,39 @@ def test_v3_legacy_history_cannot_pass_require_complete(tmp_path: Path) -> None:
 
 
 MUTANTS = [
-    {"id": "M01", "target": "event chain", "old": "skip previous digest", "new": "require previous digest", "killer": "test_v3_refuses_chain_corruption"},
-    {"id": "M02", "target": "sidecar hash", "old": "trust sidecar", "new": "hash sidecar", "killer": "test_v3_refuses_sidecar_hash_corruption"},
-    {"id": "M03", "target": "bundle hash", "old": "trust bundle", "new": "hash bundle", "killer": "test_v3_refuses_bundle_hash_corruption"},
-    {"id": "M04", "target": "active grid", "old": "allow duplicate row", "new": "reject duplicate row", "killer": "test_v3_refuses_duplicate_active_grid"},
-    {"id": "M05", "target": "completion", "old": "allow open", "new": "require complete", "killer": "test_v3_require_complete_refuses_open"},
-    {"id": "M06", "target": "cycle", "old": "follow parent blindly", "new": "reject cycles", "killer": "test_v3_refuses_cycle"},
-    {"id": "M07", "target": "stream identity", "old": "allow duplicate ids", "new": "reject duplicate ids", "killer": "test_v3_refuses_duplicate_stream_id"},
-    {"id": "M08", "target": "physical existence", "old": "ignore missing bundle", "new": "reject missing bundle", "killer": "test_v3_refuses_missing_file"},
-    {"id": "M09", "target": "header keys", "old": "allow extra header", "new": "reject extra header", "killer": "test_v3_refuses_extra_header_key"},
-    {"id": "M10", "target": "contract", "old": "ignore contract drift", "new": "reject contract drift", "killer": "test_v3_refuses_incompatible_contract"},
-    {"id": "M11", "target": "cut", "old": "skip prefix coverage", "new": "require prefix coverage", "killer": "test_v3_refuses_invalid_cut"},
-    {"id": "M12", "target": "LF records", "old": "skip malformed line", "new": "reject malformed line", "killer": "test_v3_refuses_unpinned_malformed_lf_line"},
-    {"id": "M13", "target": "parent pin", "old": "trust changed prefix", "new": "verify changed prefix", "killer": "test_v3_refuses_changed_bytes_within_parent_pin"},
-    {"id": "M14", "target": "seal inheritance", "old": "cross cut seal", "new": "reject crossing seal", "killer": "test_v3_refuses_seal_inheritance_violation"},
-    {"id": "M15", "target": "legacy completion", "old": "complete legacy", "new": "refuse legacy", "killer": "test_v3_legacy_history_cannot_pass_require_complete"},
+    {"id": "M01", "target": "tpen/callback/raw_training_batch_recorder.py", "old": 'if events and event["previous_event_sha256"] != digests[-1]:', "new": "if False:", "killer": "test_v3_refuses_chain_corruption"},
+    {"id": "M02", "target": "tpen/callback/raw_training_batch_recorder.py", "old": 'if not sidecar_path.is_file() or _sha256(sidecar_path) != event["sidecar_sha256"]:', "new": "if False:", "killer": "test_v3_refuses_sidecar_hash_corruption"},
+    {"id": "M03", "target": "tpen/callback/raw_training_batch_recorder.py", "old": 'if not bundle_path.is_file() or _sha256(bundle_path) != sidecar["compressed_sha256"]:', "new": "if False:", "killer": "test_v3_refuses_bundle_hash_corruption"},
+    {"id": "M04", "target": "tpen/callback/raw_training_batch_recorder.py", "old": 'if len(identities) != len(result["iteration_step"]):', "new": "if False:", "killer": "test_v3_refuses_duplicate_active_grid"},
+    {"id": "M05", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if require_complete and node.completion is None:", "new": "if False:", "killer": "test_v3_require_complete_refuses_open"},
+    {"id": "M06", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if root in stack:", "new": "if False:", "killer": "test_v3_refuses_cycle"},
+    {"id": "M07", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if stream_id in seen_streams:", "new": "if False:", "killer": "test_v3_refuses_duplicate_stream_id"},
+    {"id": "M08", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if not history_path.is_file() or not events_path.is_file():", "new": "if False:", "killer": "test_v3_refuses_missing_file"},
+    {"id": "M09", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if set(value) != allowed:", "new": "if False:", "killer": "test_v3_refuses_extra_header_key"},
+    {"id": "M10", "target": "tpen/callback/raw_training_batch_recorder.py", "old": 'if parent_node.header["contract"] != header["contract"]:', "new": "if False:", "killer": "test_v3_refuses_incompatible_contract"},
+    {"id": "M11", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if parent_node is not None and not _v3_has_scheduled_prefix(parent_node.rows, header[\"contract\"], cut):", "new": "if False:", "killer": "test_v3_refuses_invalid_cut"},
+    {"id": "M12", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if not isinstance(event, Mapping) or line != _compact_json(event):", "new": "if False:", "killer": "test_v3_refuses_unpinned_malformed_lf_line"},
+    {"id": "M13", "target": "tpen/callback/raw_training_batch_recorder.py", "old": "if limit is not None and digests[-1] != self._expected_pin_digest(root, limit):", "new": "if False:", "killer": "test_v3_refuses_changed_bytes_within_parent_pin"},
+    {"id": "M14", "target": "tpen/callback/raw_training_batch_recorder.py", "old": 'if int(seal["end_step"]) > cut and int(seal["start_step"]) < cut:', "new": "if False:", "killer": "test_v3_refuses_seal_inheritance_violation"},
+    {"id": "M15", "target": "tpen/callback/raw_training_batch_recorder.py", "old": 'if require_complete:\n            raise ValueError("require_complete is unavailable for legacy training histories")', "new": 'if False:\n            raise ValueError("require_complete is unavailable for legacy training histories")', "killer": "test_v3_legacy_history_cannot_pass_require_complete"},
 ]
 
 
-def test_v3_mutants_table_is_well_formed() -> None:
-    assert len({row["id"] for row in MUTANTS}) == len(MUTANTS)
-    assert len({row["old"] for row in MUTANTS}) == len(MUTANTS)
-    assert len({row["killer"] for row in MUTANTS}) == len(MUTANTS)
-    assert all(set(row) == {"id", "target", "old", "new", "killer"} for row in MUTANTS)
+def test_mutant_rows_are_executable() -> None:
+    """The Cannon mutation harness can apply every row without guessing."""
+
+    root = Path(__file__).resolve().parents[3]
+    test_roots = (root / "tests", root / "executor" / "tests")
+    for row in MUTANTS:
+        target = root / row["target"]
+        assert target.is_file(), row
+        source = target.read_text()
+        assert source.count(row["old"]) == 1, row
+        compile(source.replace(row["old"], row["new"], 1), str(target), "exec")
+        definitions = sum(
+            len(re.findall(rf"^def {re.escape(row['killer'])}\s*\(", path.read_text(), re.MULTILINE))
+            for test_root in test_roots
+            if test_root.is_dir()
+            for path in test_root.rglob("*.py")
+        )
+        assert definitions == 1, row
