@@ -28,7 +28,6 @@ from tpen_executor.dispatch.parsl import ParslDispatcher, _ChildProcessHandle
 from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.placement import AllocationSlot, BindingError
-from tpen_executor.configured_program import ConfiguredProgram
 from tpen_executor.results import RunManifest
 from tpen_executor.runners import EvidenceUnavailable, TPENEvidence
 from tpen_executor.storage import DirectoryStore
@@ -342,25 +341,7 @@ def test_t9_configured_multislot_forwards_distinct_member_argv(
     dispatcher = _dispatcher(tmp_path, package)
     lifecycle = AttachedAllocation(_allocation(tmp_path, slots=_slots(2)), DirectoryStore(tmp_path / "store"))
     group = _group("left", "right")
-    repo_root = Path(__file__).parents[2]
-    stage_q = repo_root / "experiments" / "atomistic" / "he-importance" / "run_stage_q.py"
-    manifest_file = repo_root / "experiments" / "atomistic" / "he-importance" / "o1_scan_manifest_v1.json"
-    runs = {
-        task_id: ConfiguredRun(
-            task_id,
-            "",
-            (),
-            ConfiguredProgram(
-                "stage-q",
-                str(stage_q),
-                str(manifest_file),
-                f"{index:064x}",
-                str(tmp_path / "campaign"),
-                load={"mode": "fresh", "path": None},
-            ),
-        )
-        for index, task_id in enumerate(("left", "right"), start=1)
-    }
+    runs = _runs(tmp_path, "left", "right")
     submitted: list[tuple[str, ...]] = []
     original_submit = ParslDispatcher._submit_process
 
