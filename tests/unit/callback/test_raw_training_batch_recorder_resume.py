@@ -140,7 +140,7 @@ def test_v3_unscheduled_step_skips_host_transfer(tmp_path: Path) -> None:
         wavefunction_output=SimpleNamespace(logabs=_NoCpuTensor((2,)), sign=_NoCpuTensor((2,))),
     )
     recorder.handle_occurrence_impl(
-        Occurrence(TrainingIterationCompleted(TrainingIteration(step=1, total_steps=4)), 1),
+        Occurrence(TrainingIterationCompleted(TrainingIteration(step=1)), 1),
         context,
         unscheduled_state,
     )
