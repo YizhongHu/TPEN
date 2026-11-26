@@ -193,7 +193,13 @@ def test_real_hydra_runner_constructs_and_executes_bounded_helper(
     cpu_config.runner.trainer.max_steps = 1
     cpu_config.runner.sampler.burn_in = 0
     cpu_config.runner.sampler.n_steps = 1
-    constructed = instantiate(cpu_config.runner)
+    torch = importlib.import_module("torch")
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        constructed = instantiate(cpu_config.runner)
+    finally:
+        torch.set_default_dtype(previous_dtype)
     assert constructed.trainer.local_energy_chunk_size == 3
 
     trainer_mod = sys.modules[type(constructed.trainer).__module__]
@@ -230,7 +236,9 @@ def test_real_hydra_runner_constructs_and_executes_bounded_helper(
         batch=walkers.make_batch(),
         step=0,
         context=context,
-        state=None,
+        state=trainer_mod.TrainerState(
+            model=constructed.model, trainer=constructed.trainer, sampler=constructed.sampler
+        ),
     )
     producer._evaluate_detached_local_energy_with_output()
     assert chunk_calls == [3]
@@ -243,7 +251,13 @@ def test_real_hydra_runner_legacy_helper_is_single_unchunked_batch(
 ) -> None:
     legacy_config = _run_entrypoint_with_stubbed_runner(tmp_path / "legacy-runner", monkeypatch, None)
     legacy_config.runtime.device = "cpu"
-    constructed = instantiate(legacy_config.runner)
+    torch = importlib.import_module("torch")
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        constructed = instantiate(legacy_config.runner)
+    finally:
+        torch.set_default_dtype(previous_dtype)
     assert constructed.trainer.local_energy_chunk_size is None
 
     trainer_mod = sys.modules[type(constructed.trainer).__module__]
@@ -273,7 +287,9 @@ def test_real_hydra_runner_legacy_helper_is_single_unchunked_batch(
         batch=walkers.make_batch(),
         step=0,
         context=context,
-        state=None,
+        state=trainer_mod.TrainerState(
+            model=constructed.model, trainer=constructed.trainer, sampler=constructed.sampler
+        ),
     )
     producer._evaluate_detached_local_energy_with_output()
     assert chunk_calls == []
