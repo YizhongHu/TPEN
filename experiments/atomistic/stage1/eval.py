@@ -21,6 +21,7 @@ from experiments.atomistic.stage1.protocol import (
     load_materialized_config,
     resolve_config_path,
     row_config_values,
+    validate_materialized_admission,
     validate_gateway_binding,
 )
 from experiments.toolkit.run_paths import resolve_run_dir
@@ -122,6 +123,10 @@ def main() -> int:
     cfg, admission = _build_eval_config(row)
     config_path = admission.rendered_path if admission is not None else resolve_config_path(str(row["config"]))
     _refuse_existing_eval_run(cfg)
+    if admission is not None:
+        # Recheck the retained bytes and mapping immediately before the public
+        # gateway so a post-admission replacement cannot be executed.
+        validate_materialized_admission(cfg, row, admission)
     # The config/launcher supplies the strict model-only restore policy; this
     # driver does not import checkpoint internals or silently alter identity.
     return run_from_config(cfg, config_path=str(config_path), command="stage1 eval")

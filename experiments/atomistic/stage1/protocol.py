@@ -444,6 +444,23 @@ def _materialized_mapping(cfg: Any, row: Mapping[str, Any]) -> dict[str, Any]:
     if row["kind"] == "train":
         if "load" in cfg:
             raise ProtocolError("materialized train does not admit a load section")
+        profile = str(row["row_extension"]["diagnostics_profile"])
+        overlay_path = str(row["overlay"])
+        expected_overlay = {
+            "schema": "stage1-overlay/v1" if profile == OVERLAY_PROFILE_V1 else "stage1-overlay/v2",
+            "path": overlay_path,
+            "sha256": row["overlay_sha256"],
+            "composition_order": (
+                OVERLAY_COMPOSITION_ORDER if profile == OVERLAY_PROFILE_V1
+                else OVERLAY_V2_COMPOSITION_ORDER
+            ),
+            "stream": "train",
+        }
+        if profile == OVERLAY_PROFILE_V2:
+            expected_overlay["profile"] = OVERLAY_PROFILE_V2
+        provenance = cfg.get("stage1_overlay")
+        if not isinstance(provenance, Mapping) or dict(provenance) != expected_overlay:
+            raise ProtocolError("materialized stage1 overlay provenance disagrees with row basis")
         required_runner = {"_target_", "model", "sampler", "hamiltonian_terms", "optimizer", "trainer"}
         if set(runner) != required_runner or runner.get("_target_") != "tpen.runner.Train":
             raise ProtocolError("materialized train runner shape is unsupported")
