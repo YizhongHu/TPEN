@@ -104,7 +104,21 @@ def test_strict_fresh_eval_golden_join(tmp_path: Path) -> None:
     assert evaluation.rendered.values["load"] == {"path": str(results / "soap" / "checkpoints" / "step_000100"), "mode": "model_only", "strict": True, "allow_protocol_mismatch": False}
     assert evaluation.row["walkers"] == evaluation.rendered.values["evaluation_sampler"]["n_walkers"] == 4096
     assert evaluation.row["draws"] == evaluation.rendered.values["evaluation_tasks"]["mcmc_energy"]["generator"]["n_draws"] == 256
-    joined = make_eval_row(train_row=train.row, parent=parent, checkpoint=checkpoint, rendered=evaluation.rendered, row_base={"run_id": "joined-eval", "stream": 0, "draws": 256})
+    joined = make_eval_row(
+        train_row=train.row,
+        parent=parent,
+        checkpoint=checkpoint,
+        rendered=evaluation.rendered,
+        row_base={
+            "run_id": "joined-eval",
+            "stream": 0,
+            "draws": 256,
+            "config": evaluation.row["config"],
+            "seed": evaluation.row["seed"],
+            "walkers": evaluation.row["walkers"],
+            "checkpoint_dir": evaluation.row["checkpoint_dir"],
+        },
+    )
     assert joined["depends_on"] == train.row["row_id"]
     assert joined["phase1_manifest_hash"] == parent.manifest_hash
 
@@ -114,7 +128,6 @@ def test_parent_checkpoint_profile_and_path_refusals(tmp_path: Path) -> None:
     rendered = render_profile(R2_PROFILES[0], output_dir=results / "inputs", results_root=str(results), source_sha="7b88f833babcb82148c8f975a08b53970838be6a", device="cpu")
     row = dict(rendered.row)
     row["run_id"] = "foreign"
-    row["row_id"] = row_id(row)
     with pytest.raises(RowContractError, match="row_id|rendered_config"):
         validate_row(row, expected_kind="train")
     escaped = dict(rendered.row)
