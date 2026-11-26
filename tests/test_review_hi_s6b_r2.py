@@ -164,14 +164,14 @@ def test_qualification_does_not_short_circuit_later_invalid_same_row_report(
     (invalid_core.parent.parent / "full-horizon-completion.json").write_bytes(canonical_bytes({"schema": "malformed"}))
     invalid = invalid_core / "attempt_report.json"
     invalid.write_bytes(canonical_bytes({"row_id": row, "attempt_delta": json.loads(_delta(invalid_core, "fresh").canonical_bytes)}))
-    real_find = qualification._find
+    real_rglob = Path.rglob
 
-    def ordered_find(root: Path, names: tuple[str, ...]) -> list[Path]:
-        if names == ("attempt_report.json",):
-            return [core / "attempt_report.json", invalid]
-        return real_find(root, names)
+    def ordered_rglob(root: Path, pattern: str):
+        if root == campaign.parent and pattern == "attempt_report.json":
+            return iter([core / "attempt_report.json", invalid])
+        return real_rglob(root, pattern)
 
-    monkeypatch.setattr(qualification, "_find", ordered_find)
+    monkeypatch.setattr(Path, "rglob", ordered_rglob)
     with pytest.raises(completion.FullHorizonCompletionError):
         qualification.qualify(manifest, tmp_path / "evidence", artifact_root=campaign.parent)
 
