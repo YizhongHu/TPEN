@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import base64
 import json
+from dataclasses import replace
 from pathlib import Path
 import shlex
 import sys
@@ -54,7 +55,7 @@ def test_p3_row_identity_path_sha_and_command_token_audit(tmp_path: Path) -> Non
         assert hashlib.sha256(Path(composed.rendered.path).read_bytes()).hexdigest() == composed.rendered.sha256
         assert row["seed"] == 2435329684536531677
         assert row["sampler_seed"] == 7066630035130326805
-        assert row["checkpoint_steps"] == [100] if row["updates"] == 100 else row["checkpoint_steps"] == [20]
+        assert row["checkpoint_steps"] == ([0, 100] if row["updates"] == 100 else [0, 20])
 
 
 def test_p3_real_train_eval_mains_core_stub_use_admitted_bytes_once(tmp_path: Path) -> None:
@@ -73,7 +74,7 @@ def test_p3_real_train_eval_mains_core_stub_use_admitted_bytes_once(tmp_path: Pa
         monkeypatch.setattr(stage1_train, "run_from_config", lambda cfg, **kwargs: train_calls.append({"cfg": OmegaConf.to_container(cfg, resolve=True), **kwargs}) or 0)
         train_argv = shlex.split(command_for_row(train.row, python=sys.executable, checkout_root=str(root)))
         monkeypatch.setattr(sys, "argv", train_argv)
-        assert stage1_train.main() == 0
+        assert stage1_train.main(train_argv[2:]) == 0
     finally:
         monkeypatch.undo()
     assert len(train_calls) == 1
@@ -98,7 +99,7 @@ def test_p3_real_train_eval_mains_core_stub_use_admitted_bytes_once(tmp_path: Pa
         eval_argv = shlex.split(command_for_row(eval_row, python=sys.executable, checkout_root=str(root)))
         assert eval_argv[-2] == "--binding"
         monkeypatch.setattr(sys, "argv", eval_argv)
-        assert stage1_eval.main() == 0
+        assert stage1_eval.main(eval_argv[2:]) == 0
     finally:
         monkeypatch.undo()
     assert len(eval_calls) == 1
@@ -155,7 +156,7 @@ def test_p3_eval_publication_refusal_matrix_has_zero_core_calls(tmp_path: Path, 
     elif case == "missing-complete":
         complete.unlink()
     elif case == "foreign-parent":
-        parent = make_parent_join(campaign_id="foreign", invocation_id="foreign", row=render_r2_train_packet(output_dir=tmp_path / "other-inputs", results_root=str(tmp_path / "other"), source_sha=SOURCE, device="cpu")["r2-soap-100"].row)
+        parent = replace(parent, campaign_id="foreign", invocation_id="foreign", row_id="foreign-parent")
     elif case == "wrong-step":
         publication = CheckpointEvidence(20, "soap100", model_sha, True, {"model.pt": str(model), "COMPLETE": str(complete)})
     elif case == "duplicate-publication":
@@ -165,7 +166,17 @@ def test_p3_eval_publication_refusal_matrix_has_zero_core_calls(tmp_path: Path, 
     else:
         (tmp_path / "inputs" / "r2-soap-eval-100.yaml").write_text("existing\n", encoding="utf-8")
     calls: list[object] = []
-    with pytest.raises(P3RenderError):
+    expected_messages = {
+        "missing-model": "COMPLETE with model.pt",
+        "sha-mismatch": "hash disagrees",
+        "missing-complete": "COMPLETE with model.pt",
+        "foreign-parent": "parent does not match train row",
+        "wrong-step": "checkpoint-100",
+        "duplicate-publication": "identity is missing or non-unique",
+        "missing-publisher": "identity is missing or non-unique",
+        "existing-destination": "destination already exists",
+    }
+    with pytest.raises(P3RenderError, match=expected_messages[case]):
         finalize_eval_row(render_eval_template(output_dir=tmp_path / "inputs", results_root=str(tmp_path), source_sha=SOURCE, device="cpu"), train_row=train.row, parent=parent, publication=publication, checkpoint_dir=checkpoint_dir)
     assert calls == []
 

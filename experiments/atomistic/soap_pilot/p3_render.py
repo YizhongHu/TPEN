@@ -189,8 +189,10 @@ def render_pbs_audit() -> dict[str, Any]:
     text = wrapper.read_text(encoding="utf-8")
     # Derive the environment contract from the wrapper's declarations rather
     # than duplicating an echoed list in the P3 implementation.
-    required_env = tuple(re.findall(r"^([A-Z][A-Z0-9_]*)=\"\$\{\1:-\}\"", text, re.MULTILINE))
     expected_env = {"MODE", "SOURCE_SHA", "CHECKOUT_ROOT", "UV_CACHE_DIR", "RESULTS_ROOT", "SELECTED_ROW", "APPROVAL_ID", "EXPECTED_QUEUE"}
+    declared = set(re.findall(r"^([A-Z][A-Z0-9_]*)=\"\$\{\1:-", text, re.MULTILINE))
+    required = set(re.findall(r"^\s*require_value\s+([A-Z][A-Z0-9_]*)\s*$", text, re.MULTILINE))
+    required_env = tuple(name for name in ("MODE", "SOURCE_SHA", "CHECKOUT_ROOT", "UV_CACHE_DIR", "RESULTS_ROOT", "SELECTED_ROW", "APPROVAL_ID", "EXPECTED_QUEUE") if name in declared or name in required)
     if not expected_env <= set(required_env):
         raise P3RenderError(f"PBS environment declarations incomplete: {sorted(expected_env - set(required_env))}")
     required_outputs = ("$RESULTS_ROOT/logs/row-", "checkpoints")
