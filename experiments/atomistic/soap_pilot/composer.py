@@ -59,15 +59,15 @@ class ComposedRow:
 
 
 R2_PROFILES = (
-    PilotProfile("r2-adam-100", "adam", 100, 512, (100,), "diagnostics-v2", train_timing_synchronize=True),
-    PilotProfile("r2-soap-100", "soap", 100, 512, (100,), "diagnostics-v2", train_timing_synchronize=True),
-    PilotProfile("r2-minsr64-100", "minsr64", 100, 512, (100,), "diagnostics-v2", 64, train_timing_synchronize=True),
-    PilotProfile("r2-minsr64-20", "minsr64", 20, 512, (20,), "diagnostics-v2", 64),
+    PilotProfile("r2-adam-100", "adam", 100, 512, (0, 100), "diagnostics-v2", train_timing_synchronize=True),
+    PilotProfile("r2-soap-100", "soap", 100, 512, (0, 100), "diagnostics-v2", train_timing_synchronize=True),
+    PilotProfile("r2-minsr64-100", "minsr64", 100, 512, (0, 100), "diagnostics-v2", 64, train_timing_synchronize=True),
+    PilotProfile("r2-minsr64-20", "minsr64", 20, 512, (0, 20), "diagnostics-v2", 64),
 )
 TARGET_PROFILES = (
-    PilotProfile("target-adam-5000", "adam", 5000, 512, (1000, 5000), "diagnostics-v2"),
-    PilotProfile("target-soap-5000", "soap", 5000, 512, (1000, 5000), "diagnostics-v2"),
-    PilotProfile("target-minsr64-5000", "minsr64", 5000, 512, (1000, 5000), "diagnostics-v2", 64),
+    PilotProfile("target-adam-5000", "adam", 5000, 512, (0, 1000, 5000), "diagnostics-v2"),
+    PilotProfile("target-soap-5000", "soap", 5000, 512, (0, 1000, 5000), "diagnostics-v2"),
+    PilotProfile("target-minsr64-5000", "minsr64", 5000, 512, (0, 1000, 5000), "diagnostics-v2", 64),
 )
 
 
@@ -191,7 +191,8 @@ def _materialize_train(profile: PilotProfile, *, results_root: str, run_id: str,
     _set(config, "sampler.seed", 7066630035130326805)
     _set(config, "trainer", trainer)
     _set(config, "optimizer", optimizer)
-    _set(config, "checkpoint_steps", list(profile.checkpoint_steps))
+    # Stage-1 rows include the zero origin; materialized YAML uses positive steps.
+    _set(config, "checkpoint_steps", list(profile.checkpoint_steps[1:]))
     # Compose the committed base callbacks with the committed diagnostic
     # profile.  The renderer only changes the explicitly declared pilot knobs;
     # it does not invent a second smoke callback set.
