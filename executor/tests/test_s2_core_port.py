@@ -64,8 +64,23 @@ def _member() -> MemberRecoveryInputV2:
     return MemberRecoveryInputV2("task", "lineage", attempt, start, outcome)
 
 
-def _request(member: MemberRecoveryInputV2, *, successor_request=None, digest_value="a" * 64) -> CoreAdmissionProcessRequest:
-    return CoreAdmissionProcessRequest(member.task_id, member.lineage_id, None, digest_value, successor_request, {"study": "s2"}, "profile", PreparedPythonEnvironment(sys.executable))
+def _request(
+    member: MemberRecoveryInputV2,
+    *,
+    task_id: str | None = None,
+    successor_request=None,
+    digest_value="a" * 64,
+) -> CoreAdmissionProcessRequest:
+    return CoreAdmissionProcessRequest(
+        member.task_id if task_id is None else task_id,
+        member.lineage_id,
+        None,
+        digest_value,
+        successor_request,
+        {"study": "s2"},
+        "profile",
+        PreparedPythonEnvironment(sys.executable),
+    )
 
 
 def _port(tmp_path: Path, worker: _Worker):
@@ -135,13 +150,10 @@ def test_crossed_task_refused_before_spawn(tmp_path: Path) -> None:
 
 def test_crossed_member_task_refused_before_spawn(tmp_path: Path) -> None:
     member = _member()
-    crossed_member = member.__class__(
-        "other", member.lineage_id, member.attempt_id, member.start_receipt, member.outcome_receipt
-    )
     worker = _Worker(None)
     port, out, err = _port(tmp_path, worker)
     with pytest.raises(CoreAdmissionUnavailable):
-        port.admit(_request(member), crossed_member, stdout_path=out, stderr_path=err)
+        port.admit(_request(member, task_id="other"), member, stdout_path=out, stderr_path=err)
     assert worker.calls == 0
 
 
