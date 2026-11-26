@@ -414,6 +414,30 @@ class DirectoryStore:
             _require_directory(root, "store root")
         object.__setattr__(self, "root", root)
 
+    def write_once(self, relative_path: str, payload: bytes) -> str:
+        """Publish one canonical payload beneath this store without replacement."""
+        if type(relative_path) is not str or not relative_path or os.path.isabs(relative_path):
+            raise ValueError("relative_path must be a non-empty relative path")
+        destination = _lexical(os.path.join(self.root, relative_path))
+        if not _inside(self.root, destination):
+            raise FenceRejected("write path escapes store root")
+        _write_new(destination, payload)
+        return destination
+
+    def read_canonical(self, relative_path: str, decoder: Any) -> Any:
+        """Read one regular, non-symlink canonical receipt through a decoder."""
+        if type(relative_path) is not str or not relative_path or os.path.isabs(relative_path):
+            raise ValueError("relative_path must be a non-empty relative path")
+        path = _lexical(os.path.join(self.root, relative_path))
+        if not _inside(self.root, path):
+            raise FenceRejected("read path escapes store root")
+        _require_regular(path, "canonical receipt")
+        payload = Path(path).read_bytes()
+        record = decoder(payload)
+        if payload != record.encode():
+            raise FenceRejected("canonical receipt is not canonical")
+        return record
+
     def record_pre_start_receipt(self, group: ReadyGroupV2 | GroupId, backend_job_id: BackendJobId, observed_job_id: BackendJobId, reason: str) -> None:
         """Durably record one refusal keyed by group and backend observations."""
         ensure_durable_directory(self.root)
