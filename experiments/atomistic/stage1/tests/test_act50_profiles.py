@@ -147,6 +147,29 @@ def test_act50_profiles_reuse_the_same_initial_seed_schedule() -> None:
     ]
 
 
+def test_act50_layered_profiles_share_initial_parameter_tensors() -> None:
+    """Parameterless activations must preserve seeded tensors across A/B.
+
+    The profiles share all parameterized modules; only the activation objects
+    differ, and those shared modules may differ if construction order drifts.
+    """
+
+    sigmoid_row = _rows(HOOKE2_ACT50_SIGMOID_PROFILE)[0]
+    tanh_row = _rows(HOOKE2_ACT50_TANH_PROFILE)[0]
+    sigmoid_cfg = build_train_config(sigmoid_row)
+    tanh_cfg = build_train_config(tanh_row)
+
+    torch.manual_seed(int(sigmoid_row["seed"]))
+    sigmoid_model = instantiate(sigmoid_cfg.model)
+    torch.manual_seed(int(tanh_row["seed"]))
+    tanh_model = instantiate(tanh_cfg.model)
+
+    sigmoid_state = sigmoid_model.state_dict()
+    tanh_state = tanh_model.state_dict()
+    assert sigmoid_state.keys() == tanh_state.keys()
+    assert all(torch.equal(sigmoid_state[key], tanh_state[key]) for key in sigmoid_state)
+
+
 @pytest.mark.parametrize("profile", HOOKE2_ACT50_PROFILES)
 def test_act50_smoke_derivation_preserves_profile_and_stops_at_1000(profile: str) -> None:
     train = _rows(profile)[0]
