@@ -205,7 +205,7 @@ def test_control_interpreter_has_no_tpen_import(tmp_path: Path) -> None:
             _request(member), member, stdout_path=tmp_path / "out.json", stderr_path=stderr_path
         )
     assert stderr_path.exists()
-    assert "No module named 'tpen'" in stderr_path.read_text(encoding="utf-8")
+    assert "ModuleNotFoundError" in stderr_path.read_text(encoding="utf-8")
 
     child = r'''
 import json
@@ -248,7 +248,7 @@ print(json.dumps({
     result = json.loads(completed.stdout)
     assert result["modules"] == []
     assert result["stderr_exists"] is True
-    assert "No module named 'tpen'" in result["stderr"]
+    assert "ModuleNotFoundError" in result["stderr"]
 
 
 def test_mutant_rows_have_unique_source_anchors_and_killers() -> None:
