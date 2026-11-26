@@ -114,7 +114,7 @@ def test_resume_cadence_phase_and_inherited_full_seal_frontier(tmp_path: Path) -
     writer.seal_window(0)
     writer.complete(next_iteration=1000, completed_updates=10)
     TrainingBatchReader(writer.root).validate(require_complete=True)
-    np.testing.assert_array_equal(TrainingBatchReader(writer.root).read()["iteration_step"], np.repeat(np.arange(500, 1000, 50), 2))
+    np.testing.assert_array_equal(TrainingBatchReader(writer.root).read()["iteration_step"], np.repeat(np.arange(0, 1000, 50), 2))
 
     parent = tmp_path / "cadence-short-parent"
     parent_writer = TrainingHistoryV3Writer(parent, stream_id="36363636-3636-4636-8636-363636363636", run_id="resume-parent-short", contract=contract, provenance={"config_hash": "c" * 64})
@@ -129,7 +129,7 @@ def test_resume_cadence_phase_and_inherited_full_seal_frontier(tmp_path: Path) -
         writer.append_capture(_record(step))
     writer.complete(next_iteration=725, completed_updates=5)
     TrainingBatchReader(writer.root).validate(require_complete=True)
-    np.testing.assert_array_equal(TrainingBatchReader(writer.root).read()["iteration_step"], np.repeat(np.arange(500, 725, 50), 2))
+    np.testing.assert_array_equal(TrainingBatchReader(writer.root).read()["iteration_step"], np.repeat(np.arange(0, 725, 50), 2))
 
     parent = tmp_path / "inherited-parent"
     parent_writer = TrainingHistoryV3Writer(parent, stream_id="38383838-3838-4838-8838-383838383838", run_id="resume-parent-inherited", contract=_contract(), provenance={"config_hash": "e" * 64})
@@ -143,12 +143,12 @@ def test_resume_cadence_phase_and_inherited_full_seal_frontier(tmp_path: Path) -
     small = TrainingHistoryV3Writer(tmp_path / "inherited", stream_id="39393939-3939-4939-8939-393939393939", run_id="inherited", contract=_contract(), origin="train_resume", parent={"root": str(parent_root.resolve()), "event_count": parent_count, "prefix_sha256": parent_prefix}, checkpoint=checkpoint_data, supersede_from_step=4, inherited_seal_frontier=1, provenance={"config_hash": "f" * 64})
     small.complete(next_iteration=4, completed_updates=4)
     TrainingBatchReader(small.root).validate(require_complete=True)
-    assert TrainingBatchReader(small.root).read()["iteration_step"].size == 0
+    np.testing.assert_array_equal(TrainingBatchReader(small.root).read()["iteration_step"], np.repeat(np.arange(0, 4), 2))
     continuing = TrainingHistoryV3Writer(tmp_path / "continuing", stream_id="40404040-4040-4040-8040-404040404040", run_id="continuing", contract=_contract(), origin="train_resume", parent={"root": str(parent_root.resolve()), "event_count": parent_count, "prefix_sha256": parent_prefix}, checkpoint=checkpoint_data, supersede_from_step=4, inherited_seal_frontier=1, provenance={"config_hash": "1" * 64})
     continuing.append_capture(_record(4))
     continuing.complete(next_iteration=5, completed_updates=5)
     TrainingBatchReader(continuing.root).validate(require_complete=True)
-    np.testing.assert_array_equal(TrainingBatchReader(continuing.root).read()["iteration_step"], [4, 4])
+    np.testing.assert_array_equal(TrainingBatchReader(continuing.root).read()["iteration_step"], np.repeat(np.arange(0, 5), 2))
 
     phased = _resume_stub(tmp_path / "phase", contract=_contract() | {"start_step": 1, "every_n_steps": 2}, cut=4)
     assert phased._expected_capture_count(0, 10) == 3
