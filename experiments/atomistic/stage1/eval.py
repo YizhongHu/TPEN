@@ -17,10 +17,13 @@ if _REPO_ROOT not in sys.path:
 
 from tpen.run import run_from_config
 from experiments.atomistic.stage1.protocol import (
-    is_hooke2_act50_profile,
+    MaterializedConfigAdmission,
     compose_model_profile,
+    is_hooke2_act50_profile,
+    load_materialized_config,
     resolve_config_path,
     row_config_values,
+    validate_materialized_admission,
     validate_gateway_binding,
 )
 from experiments.toolkit.run_paths import resolve_run_dir
@@ -52,6 +55,22 @@ def build_eval_config(
 ) -> DictConfig:
     """Compose one eval row with its output slot filled from the row."""
 
+    cfg, _ = _build_eval_config(row, config_path=config_path, overrides=overrides)
+    return cfg
+
+
+def _build_eval_config(
+    row: Mapping[str, object], *, config_path: str | Path | None = None,
+    overrides: Sequence[str] | None = None,
+) -> tuple[DictConfig, MaterializedConfigAdmission | None]:
+    """Build an eval config and retain materialized admission identity."""
+
+    if "row_extension" in row:
+        if config_path is not None or overrides:
+            raise ValueError("materialized rows do not accept native config/override inputs")
+        cfg, admission = load_materialized_config(row, expected_kind="eval")
+        return cfg, admission
+
     selected_config = resolve_config_path(config_path or str(row.get("config", "")))
     if not selected_config.is_file():
         raise FileNotFoundError(f"Stage-1 config path does not exist: {selected_config}")
@@ -68,7 +87,7 @@ def build_eval_config(
     # Keep the row authoritative for artifact placement if a compatibility
     # caller supplied a contradictory run.root override.
     _bind_output_identity(cfg, row)
-    return cfg
+    return cfg, None
 
 
 def _config_run_dir(cfg: DictConfig) -> Path:
@@ -129,10 +148,14 @@ def main() -> int:
     parser.add_argument("--binding", required=True)
     args = parser.parse_args()
     row = validate_gateway_binding(binding=args.binding, expected_kinds={"eval"})
-    cfg = build_eval_config(row)
-    config_path = resolve_config_path(str(row["config"]))
+    cfg, admission = _build_eval_config(row)
+    config_path = admission.rendered_path if admission is not None else resolve_config_path(str(row["config"]))
     _refuse_cross_variant_checkpoint(cfg, row)
     _refuse_existing_eval_run(cfg)
+    if admission is not None:
+        # Recheck the retained bytes and mapping immediately before the public
+        # gateway so a post-admission replacement cannot be executed.
+        validate_materialized_admission(cfg, row, admission)
     # The config/launcher supplies the strict model-only restore policy; this
     # driver does not import checkpoint internals or silently alter identity.
     return run_from_config(cfg, config_path=str(config_path), command="stage1 eval")

@@ -17,9 +17,11 @@ if _REPO_ROOT not in sys.path:
 
 from tpen.run import run_from_config
 from experiments.atomistic.stage1.protocol import (
+    MaterializedConfigAdmission,
     OVERLAY_PROFILE_V1,
     compose_model_profile,
     compose_train_overlay,
+    load_materialized_config,
     resolve_config_path,
     row_config_values,
     validate_resolved_train_config,
@@ -54,6 +56,24 @@ def build_train_config(
     makes the config self-contained even when the YAML deliberately contains
     a mandatory output slot instead of an environment interpolation.
     """
+
+    cfg, _ = _build_train_config(row, config_path=config_path, overrides=overrides,
+                                 overlay=overlay, overlay_sha256=overlay_sha256)
+    return cfg
+
+
+def _build_train_config(
+    row: Mapping[str, object], *, config_path: str | Path | None = None,
+    overrides: Sequence[str] | None = None, overlay: str | None = None,
+    overlay_sha256: str | None = None,
+) -> tuple[DictConfig, MaterializedConfigAdmission | None]:
+    """Build a train config and retain materialized admission identity."""
+
+    if "row_extension" in row:
+        if config_path is not None or overrides or overlay is not None or overlay_sha256 is not None:
+            raise ValueError("materialized rows do not accept native config/override inputs")
+        cfg, admission = load_materialized_config(row, expected_kind="train")
+        return cfg, admission
 
     selected_config = resolve_config_path(config_path or str(row.get("config", "")))
     if not selected_config.is_file():
@@ -94,7 +114,7 @@ def build_train_config(
             raise ValueError("Hooke science runtime and sampler seeds must be distinct")
     prepare_initial_checkpoint_config(cfg)
     validate_resolved_train_config(cfg, row, base_config=base_cfg)
-    return cfg
+    return cfg, None
 
 
 def prepare_initial_checkpoint_config(cfg: DictConfig) -> None:
@@ -126,12 +146,12 @@ def main() -> int:
     parser.add_argument("--binding", required=True)
     args = parser.parse_args()
     row = validate_gateway_binding(binding=args.binding, expected_kinds={"smoke", "train"})
-    cfg = build_train_config(row)
-    config_path = resolve_config_path(str(row["config"]))
+    cfg, admission = _build_train_config(row)
+    config_path = admission.rendered_path if admission is not None else resolve_config_path(str(row["config"]))
     from experiments.atomistic.stage1.restart import execute_train
 
     return execute_train(
-        cfg=cfg, row=row, config_path=config_path, command="stage1 train",
+        cfg=cfg, row=row, config_path=config_path, admission=admission, command="stage1 train",
         run=run_from_config,
     )
 

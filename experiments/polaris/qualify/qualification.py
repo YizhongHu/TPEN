@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 from pathlib import Path
 import math
 import tempfile
+
+
+_FULL_HORIZON = importlib.import_module(
+    "experiments.atomistic.he-importance.full_horizon_completion"
+)
 
 
 def _json(path: Path) -> object:
@@ -59,18 +65,46 @@ def qualify(manifest_path: Path, evidence: Path, *, artifact_root: Path | None =
     predicates: list[dict] = []
     selection = _find(root, ("selection_receipt.json",))
     resolved = _find(root, ("resolved_config.yaml",))
-    # C is campaign-owned; completion belongs to the selected artifact leaf
-    # for the same row, never to an unrelated COMPLETE under the campaign.
+    # C is campaign-owned. Delta-mode completion is task-level derived
+    # evidence; legacy non-delta qualification retains its historical marker.
     cell_complete = False
+    derived_attempts = list(root.rglob("attempt_report.json"))
     for path in selection:
         if path.parent.parent.name != "cells":
             continue
         row_id = path.parent.name
-        cell_complete = cell_complete or any(
-            (stage / row_id / "COMPLETE").is_file()
-            for stage in root.iterdir()
-            if stage.is_dir() and stage.name != "cells"
-        )
+        matching_reports = []
+        for attempt_report in derived_attempts:
+            try:
+                report = _json(attempt_report)
+                if isinstance(report, dict) and report.get("row_id") == row_id:
+                    matching_reports.append(report)
+            except (OSError, TypeError, json.JSONDecodeError):
+                continue
+        if matching_reports:
+            for report in matching_reports:
+                try:
+                    delta = report["attempt_delta"]
+                    completed = _FULL_HORIZON.read_full_horizon_completion(
+                        Path(delta["attempt_core_dir"]),
+                        group_digest=delta["group_digest"],
+                        task_id=delta["task_id"],
+                        science_digest=row_id,
+                        target_iterations=cell["updates"],
+                    )
+                    cell_complete = cell_complete or completed
+                except _FULL_HORIZON.FullHorizonCompletionError:
+                    # A crossed or malformed completion record is an invalid
+                    # qualification input, not evidence of ordinary absence.
+                    raise
+                except (KeyError, OSError, TypeError, json.JSONDecodeError):
+                    continue
+        else:
+            cell_complete = cell_complete or any(
+                (stage / row_id / "COMPLETE").is_file()
+                for stage in root.iterdir()
+                if stage.is_dir() and stage.name != "cells"
+            )
     predicates.append(_predicate("cell_complete", True, cell_complete))
     predicates.append(_predicate("selection_receipt", True, bool(selection)))
     predicates.append(_predicate("resolved_config", True, bool(resolved)))

@@ -16,7 +16,10 @@ from typing import Any, Callable, Mapping
 from omegaconf import OmegaConf
 
 from experiments.atomistic.stage1.protocol import (
+    MaterializedConfigAdmission,
+    ProtocolError,
     SYSTEM_SPECS,
+    validate_materialized_admission,
     validate_gateway_binding,
     validate_resolved_train_config,
 )
@@ -366,6 +369,11 @@ def execute_restart(
             binding=binding, config=str(config_path), overrides=overrides or [], kind=kind,
             overlay=overlay, overlay_sha256=overlay_sha256,
         )
+    if "row_extension" in row:
+        raise RestartRefusal(
+            "materialized Stage-1 rows are fresh-only; restart is unsupported",
+            cause=RestartCause.INVALID_RESUME,
+        )
     validate_resolved_train_config(cfg, row)
     target = _target_iterations(cfg, row)
     _refuse_unsupported_resume_callbacks(cfg, overlay)
@@ -401,6 +409,7 @@ def execute_train(
     *, cfg: Any, row: Mapping[str, Any], config_path: str | Path,
     command: str = "stage1 train", run: Callable[..., int] | None = None,
     inspector: Callable[[str | Path], RunEvidence] = inspect_run,
+    admission: MaterializedConfigAdmission | None = None,
 ) -> int:
     """Run a fresh or resumed row through one shared S1-R-shaped path.
 
@@ -409,6 +418,31 @@ def execute_train(
     a continuation and must pass the same public inspection gates; it never
     silently falls back to a fresh lineage.
     """
+
+    if "row_extension" in row:
+        if admission is None:
+            raise RestartRefusal(
+                "materialized train requires its retained config admission record",
+                cause=RestartCause.INVALID_RESUME,
+            )
+        try:
+            validate_materialized_admission(cfg, row, admission)
+        except ProtocolError as exc:
+            raise RestartRefusal(str(exc), cause=RestartCause.INVALID_RESUME) from exc
+        admitted = _admitted_run_dir(cfg, row, None)
+        if admitted.exists() or admitted.is_symlink():
+            raise RestartRefusal(
+                "materialized train requires a nonexistent run directory",
+                cause=RestartCause.RUN_DIRECTORY_MISMATCH,
+            )
+        callbacks = _runtime_callbacks(row, _target_iterations(cfg, row))
+        runner = run_from_config if run is None else run
+        kwargs: dict[str, Any] = {
+            "config_path": str(admission.rendered_path), "command": command,
+        }
+        if callbacks:
+            kwargs["runtime_callbacks"] = callbacks
+        return int(runner(cfg, **kwargs))
 
     validate_resolved_train_config(cfg, row)
     target = _target_iterations(cfg, row)

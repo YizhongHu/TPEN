@@ -1,0 +1,30 @@
+[
+  {
+    "id": "gateway-marker-check-removed",
+    "target": "experiments/atomistic/stage1/protocol.py",
+    "old": "if effective_kind == \"train\" and marker == SMOKE_EVAL_ROSTER_MARKER:",
+    "new": "if False:",
+    "killer": "experiments/atomistic/stage1/tests/test_smoke_eval_roster.py::test_train_gateway_rejects_marker_before_config_or_runner"
+  },
+  {
+    "id": "smoke-stop-bound-removed",
+    "target": "experiments/atomistic/stage1/protocol.py",
+    "old": "or updates <= 0 or stop_at <= 0 or stop_at >= updates",
+    "new": "or updates <= 0 or stop_at <= 0",
+    "killer": "experiments/atomistic/stage1/tests/test_smoke_eval_roster.py::test_saved_smoke_admission_rejects_nonpositive_or_terminal_stop"
+  },
+  {
+    "id": "collect-smoke-as-science-grid",
+    "target": "experiments/atomistic/stage1/collect.py",
+    "old": "if not smoke_manifest:",
+    "new": "if True:",
+    "killer": "experiments/atomistic/stage1/tests/test_smoke_eval_roster.py::test_collect_accepts_smoke_roster_and_refuses_science_roster"
+  },
+  {
+    "id": "e2e-science-roster-refusal-removed",
+    "target": "experiments/atomistic/stage1/tests/test_smoke_eval_production_e2e.py",
+    "old": "with pytest.raises(CollectionError, match=\"smoke-prefix-v1\"):",
+    "new": "if False:",
+    "killer": "experiments/atomistic/stage1/tests/test_smoke_eval_production_e2e.py::test_smoke_roster_real_gateway_chain"
+  }
+]

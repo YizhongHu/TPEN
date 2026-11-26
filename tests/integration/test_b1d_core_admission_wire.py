@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from tpen.execution.core_admission import evaluate_core_admission
@@ -20,6 +21,7 @@ from tests.helpers.executor_boundary import executor_call
 _EXECUTOR_CHILD = r'''
 import builtins
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -80,6 +82,7 @@ from tpen_executor.recovery import (
     MemberRecoveryInputV2,
     reconcile_group,
 )
+from tpen_executor.lifecycle.core_port import CoreAdmissionProcessRequest, ScienceProcessCoreAdmissionPort
 from tpen_executor.results import OutcomeReceipt, StartReceipt
 from test_s3_transport_wire import _synthetic_result
 
@@ -110,7 +113,7 @@ def _group(task_ids=("task",)):
     return ReadyGroupV2(GroupId("group-b1d-int"), members, plan)
 
 
-def _member(group, task_id="task", status="failed", root=Path(".")):
+def _member(group, task_id="task", status="failed", root=Path("."), lineage_id=None):
     attempt = AttemptId(f"attempt-{task_id}")
     start = StartReceipt(
         task_id,
@@ -131,7 +134,7 @@ def _member(group, task_id="task", status="failed", root=Path(".")):
     )
     return MemberRecoveryInputV2(
         task_id,
-        f"lineage-{task_id}",
+        f"lineage-{task_id}" if lineage_id is None else lineage_id,
         attempt,
         start,
         outcome,
@@ -164,6 +167,53 @@ def _reconcile(payload):
     return {
         "action": member_result.action,
         "reason_code": member_result.reason_code,
+    }
+
+
+def _port_admit(payload):
+    """Run the real process port from an executor-only control interpreter."""
+
+    task_id = payload["task_id"]
+    group = _group((task_id,))
+    member = _member(group, task_id, status="completed", lineage_id=payload["lineage_id"])
+    request = CoreAdmissionProcessRequest(
+        task_id=task_id,
+        lineage_id=payload["lineage_id"],
+        core_run_dir=payload["core_run_dir"],
+        science_input_digest=payload["science_input_digest"],
+        successor_request=payload["successor_request"],
+        unresolved_config=payload["unresolved_config"],
+        profile_name=payload["profile_name"],
+        environment=PreparedPythonEnvironment(sys.executable),
+    )
+    relative_paths = payload.get("relative_paths", False)
+    if relative_paths:
+        control = Path(payload["control_dir"])
+        science = Path(payload["science_dir"])
+        control.mkdir(parents=True, exist_ok=True)
+        science.mkdir(parents=True, exist_ok=True)
+        os.chdir(control)
+        stdout_path, stderr_path, child_cwd = "out.log", "err.log", science
+    else:
+        stdout_path, stderr_path, child_cwd = (
+            Path(payload["stdout_path"]),
+            Path(payload["stderr_path"]),
+            None,
+        )
+    verdict = ScienceProcessCoreAdmissionPort().admit(
+        request,
+        member,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        cwd=child_cwd,
+    )
+    return {
+        "verdict": None if verdict is None else verdict.to_dict(),
+        "parent_stdout_exists": Path(stdout_path).exists(),
+        "parent_stderr_exists": Path(stderr_path).exists(),
+        "tpen_modules": sorted(
+            name for name in sys.modules if name == "tpen" or name.startswith("tpen.")
+        ),
     }
 
 
@@ -238,6 +288,8 @@ if action == "reconcile":
     _emit(_reconcile(payload))
 elif action == "controller":
     _controller(payload)
+elif action == "port":
+    _emit(_port_admit(payload))
 else:
     raise SystemExit(f"unknown child action: {action}")
 '''
@@ -394,6 +446,84 @@ def test_real_mapping_does_not_claim_quiescence(tmp_path: Path) -> None:
     )
     assert mapping is not None
     assert mapping["quiescence"] == "unknown"
+
+
+def test_real_process_port_producer_to_decoder_round_trip(tmp_path: Path) -> None:
+    """The prepared science interpreter produces a mapping accepted by the executor decoder."""
+
+    completed = tmp_path / "completed-port"
+    completed.mkdir()
+    completed_ref = checkpoint(completed)
+    write_run_start(completed)
+    (completed / "status.json").write_text('{"status":"completed"}\n', encoding="utf-8")
+    write_outcome(completed, "completed", completed_ref)
+    context = admission_context(completed)
+    payload = {
+        "task_id": context.task_id,
+        "lineage_id": context.lineage_id,
+        "core_run_dir": context.core_run_dir,
+        "science_input_digest": context.science_input_digest,
+        "successor_request": None,
+        "unresolved_config": dict(context.unresolved_config),
+        "profile_name": context.profile_name,
+        "stdout_path": str(tmp_path / "port-out.json"),
+        "stderr_path": str(tmp_path / "port-err.log"),
+    }
+    result = executor_call(_EXECUTOR_CHILD, tmp_path, "port", payload)
+    assert result["verdict"]["outcome"] == "completed"
+    assert result["verdict"]["admission"] == "unknown"
+    assert result["tpen_modules"] == []
+
+
+def test_real_process_port_missing_leaf_returns_none(tmp_path: Path) -> None:
+    """The real port preserves core's genuine absent-leaf result."""
+
+    context = admission_context(None)
+    payload = {
+        "task_id": context.task_id,
+        "lineage_id": context.lineage_id,
+        "core_run_dir": None,
+        "science_input_digest": context.science_input_digest,
+        "successor_request": None,
+        "unresolved_config": dict(context.unresolved_config),
+        "profile_name": context.profile_name,
+        "stdout_path": str(tmp_path / "port-out.json"),
+        "stderr_path": str(tmp_path / "port-err.log"),
+    }
+    result = executor_call(_EXECUTOR_CHILD, tmp_path, "port", payload)
+    assert result["verdict"] is None
+    assert result["tpen_modules"] == []
+
+
+def test_real_process_port_relative_logs_cross_child_cwd(tmp_path: Path) -> None:
+    """Relative logs stay parent-relative while the sidecar follows the child cwd."""
+
+    context = admission_context(None)
+    control = tmp_path / "control"
+    science = tmp_path / "science"
+    result = executor_call(
+        _EXECUTOR_CHILD,
+        tmp_path,
+        "port",
+        {
+            "task_id": context.task_id,
+            "lineage_id": context.lineage_id,
+            "core_run_dir": None,
+            "science_input_digest": context.science_input_digest,
+            "successor_request": None,
+            "unresolved_config": dict(context.unresolved_config),
+            "profile_name": context.profile_name,
+            "relative_paths": True,
+            "control_dir": str(control),
+            "science_dir": str(science),
+        },
+    )
+    assert result["verdict"] is None
+    assert result["parent_stdout_exists"] is True
+    assert result["parent_stderr_exists"] is True
+    assert (control / "out.log").exists()
+    assert (control / "err.log").exists()
+    assert result["tpen_modules"] == []
 
 
 def test_executor_rejects_core_quiescence_claim(tmp_path: Path) -> None:

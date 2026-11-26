@@ -143,6 +143,9 @@ _MANIFEST_SPEC.loader.exec_module(scan_manifest)
 architecture_stage_family = importlib.import_module(
     "experiments.atomistic.he-importance.architecture_stage_family"
 )
+attempt_delta = importlib.import_module(
+    "experiments.atomistic.he-importance.attempt_delta"
+)
 
 
 def _require_executable_stage(stage: str) -> None:
@@ -1519,6 +1522,61 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _cell_science_report(report: Mapping[str, object]) -> dict[str, object]:
+    """Return delta-mode C with operational fields removed from comparison.
+
+    A non-delta run writes the legacy full report, so a delta successor cannot
+    silently cross that mode boundary: its normalized science view will not
+    equal the legacy bytes and validation refuses the mixed-mode record.
+    """
+
+    result = dict(report)
+    resolved = result.get("resolved_config")
+    if isinstance(resolved, Mapping):
+        resolved_copy = json.loads(json.dumps(resolved, sort_keys=True, default=str))
+        run = resolved_copy.get("run")
+        if isinstance(run, dict):
+            for key in ("dir", "root", "run_id"):
+                run.pop(key, None)
+        runner_config = resolved_copy.get("runner")
+        if isinstance(runner_config, dict):
+            # runner.load is the closed operational allowance, not C science.
+            runner_config.pop("load", None)
+        result["resolved_config"] = resolved_copy
+    return result
+
+
+def _apply_attempt_delta_load(config: Any, delta: object | None) -> None:
+    """Apply the one closed train-resume load step after config resolution.
+
+    ``mutable_state_inventory`` governs the separate HI continuation refusal
+    path; this executor-issued allowance changes only the resolved runner
+    input and therefore does not alter the inventory comparison.
+    """
+
+    if delta is None or getattr(delta, "load_mode") == "fresh":
+        return
+    OmegaConf.update(
+        config,
+        "runner.load",
+        {"mode": "train_resume", "path": str(getattr(delta, "load_path"))},
+        merge=False,
+        force_add=True,
+    )
+
+
+def _apply_attempt_delta_route(config: Any, delta: object | None) -> None:
+    """Apply the one closed physical output route after config resolution."""
+
+    if delta is not None:
+        # train_config deliberately rejects resolver-owned run.dir overrides;
+        # this is the authenticated executor leaf allowance, applied only
+        # after the science configuration has been resolved.
+        OmegaConf.update(
+            config, "run.dir", str(getattr(delta, "attempt_core_dir")), merge=False
+        )
+
+
 def execute(
     args: argparse.Namespace,
     *,
@@ -1553,6 +1611,14 @@ def execute(
     """
 
     launch.refuse_hi_continuation(restore_request)
+    raw_delta = getattr(args, "attempt_delta", None)
+    delta = (
+        attempt_delta.parse_attempt_delta(raw_delta)
+        if raw_delta is not None
+        else None
+    )
+    if delta is not None and (getattr(args, "manifest", None) is None or getattr(args, "row", None) is None):
+        raise StageQSelectionError("--attempt-delta requires --manifest and --row")
     manifest_path = getattr(args, "manifest", None)
     row_id = getattr(args, "row", None)
     if (manifest_path is None) != (row_id is None):
@@ -1639,6 +1705,12 @@ def execute(
         )
     selection = replace(selection, cell=cell)
     packet, resolved = _resolve_selected_config(selection)
+    if delta is not None:
+        # The executor owns the physical leaf.  Keep the authenticated cell
+        # identity intact and apply only the closed operational route overlay.
+        resolved = train_config.resolve_train_config(packet)
+        _apply_attempt_delta_route(resolved, delta)
+        _apply_attempt_delta_load(resolved, delta)
     recorded_resolved = OmegaConf.to_container(resolved, resolve=True)
     report = {
         "selection": selection.receipt(),
@@ -1652,13 +1724,40 @@ def execute(
         },
         "resolved_config": recorded_resolved,
     }
+    c_report = _cell_science_report(report) if delta is not None else report
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
     if args.dry_run:
         return 0
 
-    output_path = Path(packet.cell.output_path)
-    _refuse_occupied_output_path(output_path)
-    _write_cell_selection_receipt(output_root, packet.cell.content_hash, report)
+    output_path = delta.attempt_core_dir if delta is not None else Path(packet.cell.output_path)
+    if delta is None:
+        # Preserve pre-delta behavior: an occupied logical leaf refuses before
+        # C can be created or modified.
+        _refuse_occupied_output_path(output_path)
+    receipt_path = _selection_receipt_path(output_root, packet.cell.content_hash)
+    if delta is not None and delta.load_mode == "train_resume":
+        _validate_cell_selection_receipt(output_root, packet.cell.content_hash, c_report)
+    elif receipt_path.exists() or receipt_path.is_symlink():
+        _validate_cell_selection_receipt(output_root, packet.cell.content_hash, c_report)
+    if delta is not None:
+        # Executor begin_attempt creates <attempt> but not its core child;
+        # the leaf owns this fresh physical core directory.  Claim it before
+        # creating first-attempt C so an occupied physical leaf cannot leave a
+        # misleading new logical receipt behind.
+        _refuse_occupied_output_path(output_path)
+    if delta is None:
+        _write_cell_selection_receipt(output_root, packet.cell.content_hash, report)
+    elif not receipt_path.exists() and not receipt_path.is_symlink():
+        _write_cell_selection_receipt(output_root, packet.cell.content_hash, c_report)
+    if delta is not None:
+        _write_json(output_path / "attempt_report.json", {"attempt_delta": {
+            "attempt_core_dir": str(delta.attempt_core_dir),
+            "attempt_id": delta.attempt_id,
+            "group_digest": delta.group_digest,
+            "load": {"mode": delta.load_mode, "path": None if delta.load_path is None else str(delta.load_path)},
+            "schema": attempt_delta.SCHEMA,
+            "task_id": delta.task_id,
+        }, "row_id": packet.cell.content_hash, "resolved_config": recorded_resolved})
 
     def _guarded_runner(
         config: Any,
@@ -1668,7 +1767,9 @@ def execute(
     ) -> int:
         """Validate launch.py's late resolution before delegating to TPEN."""
 
+        _apply_attempt_delta_route(config, delta)
         _require_truthful_cell(selection.cell, config)
+        _apply_attempt_delta_load(config, delta)
         launched_resolved = OmegaConf.to_container(config, resolve=True)
         if launched_resolved != recorded_resolved:
             raise StageQSelectionError(
@@ -1687,6 +1788,7 @@ def execute(
             _execution_facts(),
             runner=_guarded_runner,
             runtime_callbacks=runtime_callbacks,
+            overrides=None,
         )
     else:
         exit_code = launch.launch_train(
@@ -1694,12 +1796,14 @@ def execute(
             _execution_facts(),
             runner=_guarded_runner,
             runtime_callbacks=runtime_callbacks,
+            overrides=None,
         )
     if exit_code == 0:
         resolved_snapshot = output_path / "resolved_config.yaml"
         if not resolved_snapshot.is_file():
             raise RuntimeError(f"runner returned success without {resolved_snapshot}")
-        (output_path / "COMPLETE").write_text("completed\n", encoding="utf-8")
+        if delta is None:
+            (output_path / "COMPLETE").write_text("completed\n", encoding="utf-8")
     return exit_code
 
 
@@ -1717,6 +1821,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--literal-configuration", type=json.loads)
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--row")
+    parser.add_argument("--attempt-delta")
     return parser
 
 
