@@ -53,7 +53,14 @@ def test_planner_renders_segmented_profile(profile, tmp_path, monkeypatch) -> No
     rows = json.loads(output.read_text())["rows"]
     assert len(rows) == 3
     original_profile = profile.replace("-seg-v1", "-v1")
-    original = build_train_config(_rows(protocol, original_profile)[0])
+    original_rows = _rows(protocol, original_profile)
+    original = build_train_config(original_rows[0])
+    assert {row["config_sha256"] for row in rows}.isdisjoint(
+        row["config_sha256"] for row in original_rows
+    )
+    assert {row["row_id"] for row in rows}.isdisjoint(
+        row["row_id"] for row in original_rows
+    )
     for row in rows:
         assert row["science_profile"] == profile
         assert row["overlay"] == "configs/overlays/hooke-diagnostics-v3.yaml"
