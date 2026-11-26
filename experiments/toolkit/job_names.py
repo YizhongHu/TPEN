@@ -102,8 +102,10 @@ def stage1_row_job_name(row: Mapping[str, Any]) -> str:
         raise ValueError("lineage must be a non-negative integer")
     variant = None
     profile_variant = row.get("variant")
+    compact_checkpoint = False
     if profile_variant is not None:
         _component(profile_variant, field="variant")
+        compact_checkpoint = profile_variant in _COMPACT_VARIANTS
         profile_variant = _compact_variant(profile_variant)
     if kind in {"train", "eval"}:
         variant = f"l{lineage}"
@@ -116,7 +118,8 @@ def stage1_row_job_name(row: Mapping[str, Any]) -> str:
             raise ValueError("checkpoint must be a non-negative integer")
         if type(stream) is not int or stream < 0:
             raise ValueError("stream must be a non-negative integer")
-        variant = f"{variant}-{_checkpoint_token(checkpoint)}-s{stream}"
+        checkpoint_token = _checkpoint_token(checkpoint) if compact_checkpoint else f"c{checkpoint}"
+        variant = f"{variant}-{checkpoint_token}-s{stream}"
     return build_job_name(subject, kind, variant=variant, lane="s1", sha=row.get("source_sha"))
 
 

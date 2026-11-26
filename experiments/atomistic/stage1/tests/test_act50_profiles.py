@@ -246,7 +246,8 @@ def test_nolayer_profile_forward_grad_local_energy_and_singlet_swap(
     assert gradients and all(torch.isfinite(gradient).all() for gradient in gradients)
     terms = instantiate(cfg.hamiltonian_terms)
     energy = local_energy(terms, model, batch)
-    assert torch.isfinite(energy.total).all()
+    assert energy.shape == batch.positions.shape[:-2]
+    assert torch.isfinite(energy).all()
     # Hooke-2e has n_up=1,n_down=1: this exchanges opposite-spin labels, so
     # the singlet spatial wavefunction has the expected +1 sign ratio.
     swapped = model(batch.permute(Permutation((1, 0))))

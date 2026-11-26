@@ -24,10 +24,6 @@ from experiments.atomistic.stage1.protocol import (
     validate_gateway_binding,
 )
 from experiments.toolkit.run_paths import resolve_run_dir
-from experiments.toolkit.checkpoint_compat import (
-    checkpoint_model_config_hash,
-    config_model_config_hash,
-)
 
 
 class EvalRunRefusal(ValueError):
@@ -113,6 +109,11 @@ def _refuse_cross_variant_checkpoint(cfg: DictConfig, row: Mapping[str, object])
         raise EvalRunRefusal(
             f"ACT50 checkpoint compatibility manifest is missing: {manifest_path}"
         )
+    # Keep checkpoint internals lazy for the outside-checkout driver probe.
+    from experiments.toolkit.checkpoint_compat import (
+        checkpoint_model_config_hash,
+        config_model_config_hash,
+    )
     expected = config_model_config_hash(cfg)
     actual = checkpoint_model_config_hash(checkpoint_dir)
     if expected is None or actual is None or expected != actual:
