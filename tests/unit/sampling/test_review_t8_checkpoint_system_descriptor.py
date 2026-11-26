@@ -39,8 +39,10 @@ class _ConstantWavefunction(torch.nn.Module):
 
 def _descriptor(*, omega: float = 0.5) -> SystemDescriptor:
     cfg = OmegaConf.load(_QHO_CONFIG)
-    OmegaConf.resolve(cfg)
+    # Set the source term before resolving the descriptor interpolation; after
+    # resolution, ``system_descriptor.terms`` is an independent container.
     cfg.hamiltonian_terms.harmonic_trap.omega = omega
+    OmegaConf.resolve(cfg)
     return instantiate(OmegaConf.create(cfg.system_descriptor))
 
 
