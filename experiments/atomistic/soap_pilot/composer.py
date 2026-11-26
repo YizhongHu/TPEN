@@ -258,7 +258,13 @@ def render_profile(profile: PilotProfile, *, output_dir: str | Path, results_roo
 def render_eval(*, output_dir: str | Path, results_root: str, source_sha: str, checkpoint_dir: str, checkpoint_sha256: str, run_id: str = "soap_eval_100", device: str = "cuda", parent_row: Mapping[str, Any] | None = None) -> ComposedRow:
     """Render the strict fresh SOAP checkpoint-100 evaluation row."""
 
-    config, _ = _materialize_eval(results_root=results_root, run_id=run_id, checkpoint_dir=checkpoint_dir, checkpoint_file="model.pt", source_sha=source_sha, device=device)
+    canonical_checkpoint_dir = str(Path(checkpoint_dir).resolve())
+    canonical_checkpoint_file = str((Path(canonical_checkpoint_dir) / "model.pt").resolve())
+    config, _ = _materialize_eval(
+        results_root=results_root, run_id=run_id,
+        checkpoint_dir=canonical_checkpoint_dir, checkpoint_file=canonical_checkpoint_file,
+        source_sha=source_sha, device=device,
+    )
     rendered = _write_yaml(Path(output_dir) / "r2-soap-eval-100.yaml", config)
     parent = parent_row or {"row_id": "parent", "system": _HOOKE2.name, "system_id": _HOOKE2.system_id, "seed": 2435329684536531677, "source_sha": source_sha, "config_sha256": _HOOKE2_CONFIG_SHA256, "results_root": results_root, "experiment_name": "stage1_hooke2", "sector": "atomistic", "device": device, "lineage": 0}
     evaluation_sampler = config["evaluation_sampler"]
@@ -270,7 +276,7 @@ def render_eval(*, output_dir: str | Path, results_root: str, source_sha: str, c
         "config": "configs/hooke2/eval.yaml", "results_root": results_root, "experiment_name": "stage1_hooke2", "sector": "atomistic",
         "run_id": run_id, "updates": int(parent.get("updates", 100)), "walkers": int(evaluation_sampler["n_walkers"]), "device": device, "row_extension": {"version": "stage1-rendered-config/v1", "rendered_config": {"path": rendered.path, "sha256": rendered.sha256}, "diagnostics_profile": "diagnostics-v2"},
         "lineage": parent.get("lineage", 0), "checkpoint": int(parent.get("updates", 100)), "stream": 0, "draws": int(generator["n_draws"]), "expected_physical_system_id": parent["system_id"],
-        "checkpoint_dir": checkpoint_dir, "checkpoint_file": "model.pt", "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_dir": canonical_checkpoint_dir, "checkpoint_file": canonical_checkpoint_file, "checkpoint_sha256": checkpoint_sha256,
         "depends_on": parent["row_id"], "phase1_manifest_hash": manifest_hash([dict(parent)]), "phase1_train_row_hash": manifest_hash([dict(parent)]),
     }
     row["row_id"] = row_id(row)

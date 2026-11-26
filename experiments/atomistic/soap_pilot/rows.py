@@ -263,8 +263,15 @@ def validate_row(row: Mapping[str, Any], *, expected_kind: str | None = None) ->
             _int(row.get(key), key, positive=key == "draws")
         if row["updates"] != row["checkpoint"]:
             raise RowContractError("eval updates must equal checkpoint")
-        if row.get("checkpoint_file") != "model.pt":
-            raise RowContractError("eval checkpoint_file must be model.pt")
+        checkpoint_dir = Path(row.get("checkpoint_dir", ""))
+        checkpoint_file = Path(row.get("checkpoint_file", ""))
+        if (not checkpoint_dir.is_absolute() or not checkpoint_file.is_absolute()
+                or checkpoint_dir != checkpoint_dir.resolve()
+                or checkpoint_file != checkpoint_file.resolve()
+                or checkpoint_file != checkpoint_dir / "model.pt"):
+            raise RowContractError(
+                "eval checkpoint_file must be the canonical absolute checkpoint_dir/model.pt"
+            )
     if row.get("device") not in {"cpu", "cuda"}:
         raise RowContractError("device must be cpu or cuda")
     for key in ("config", "results_root", "experiment_name", "sector", "run_id", "system", "system_id"):
@@ -316,7 +323,8 @@ def make_eval_row(*, train_row: Mapping[str, Any], parent: ParentJoin, checkpoin
         "experiment_name": train_row["experiment_name"], "sector": train_row["sector"],
         "device": train_row["device"], "lineage": train_row["lineage"],
         "checkpoint": checkpoint.step, "updates": checkpoint.step,
-        "checkpoint_file": "model.pt", "checkpoint_sha256": checkpoint.model_sha256,
+        "checkpoint_file": str((Path(row_base["checkpoint_dir"]).resolve() / "model.pt").resolve()),
+        "checkpoint_sha256": checkpoint.model_sha256,
         "depends_on": train_row["row_id"], "phase1_manifest_hash": parent.manifest_hash,
         "phase1_train_row_hash": parent.train_row_hash,
         "expected_physical_system_id": train_row["system_id"],

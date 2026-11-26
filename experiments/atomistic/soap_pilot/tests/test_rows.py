@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import hashlib
 
 import pytest
 
@@ -108,6 +109,8 @@ def test_strict_fresh_eval_golden_join(tmp_path: Path) -> None:
     checkpoint = CheckpointEvidence(100, "soap-100-step-100", "a" * 64, True, {"model.pt": "/tmp/model.pt", "COMPLETE": "/tmp/COMPLETE"})
     evaluation = render_eval(output_dir=results / "inputs", results_root=str(results), source_sha=train.row["source_sha"], checkpoint_dir=str(results / "soap" / "checkpoints" / "step_000100"), checkpoint_sha256="a" * 64, parent_row=train.row, device="cpu")
     assert evaluation.rendered.values["load"] == {"path": str(results / "soap" / "checkpoints" / "step_000100"), "mode": "model_only", "strict": True, "allow_protocol_mismatch": False}
+    assert evaluation.row["checkpoint_file"] == str((results / "soap" / "checkpoints" / "step_000100" / "model.pt").resolve())
+    assert evaluation.rendered.values["trajectory_identity"]["checkpoint_file"] == evaluation.row["checkpoint_file"]
     assert evaluation.row["walkers"] == evaluation.rendered.values["evaluation_sampler"]["n_walkers"] == 4096
     assert evaluation.row["draws"] == evaluation.rendered.values["evaluation_tasks"]["mcmc_energy"]["generator"]["n_draws"] == 256
     joined = make_eval_row(
@@ -167,7 +170,7 @@ def test_rendered_rows_pass_stage1_admission_and_registry_tamper_refuses(tmp_pat
     evaluation = render_eval(
         output_dir=results / "inputs", results_root=str(results),
         source_sha=train_rows[1]["source_sha"], checkpoint_dir=str(checkpoint_dir),
-        checkpoint_sha256=__import__("hashlib").sha256(checkpoint.read_bytes()).hexdigest(),
+        checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
         parent_row=train_rows[1], device="cpu",
     ).row
 
@@ -198,7 +201,7 @@ def test_collect_accepts_real_stage1_parent_eval_join_and_rejects_mutation(tmp_p
     checkpoint_dir.mkdir(parents=True)
     checkpoint = checkpoint_dir / "model.pt"
     checkpoint.write_bytes(b"checkpoint")
-    checkpoint_sha = __import__("hashlib").sha256(checkpoint.read_bytes()).hexdigest()
+    checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     eval_composed = render_eval(
         output_dir=results / "inputs", results_root=str(results), source_sha=train["source_sha"],
         checkpoint_dir=str(checkpoint_dir), checkpoint_sha256=checkpoint_sha,
