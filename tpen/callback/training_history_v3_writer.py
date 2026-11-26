@@ -71,20 +71,39 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _write_private(path: Path, data: bytes) -> None:
+def _write_private(path: Path, data: bytes, *, fsync: bool = True) -> None:
     """Create and durably write one temporary object without overwriting."""
 
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     try:
         _write_all(fd, data)
+        if fsync:
+            _fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_file(path: Path) -> None:
+    """Fsync one already-created file by path."""
+
+    fd = os.open(path, os.O_RDONLY)
+    try:
         _fsync(fd)
     finally:
         os.close(fd)
 
 
+def _fsync_log(fd: int) -> None:
+    """Fsync the append-only event log through its own mutation seam."""
+
+    _fsync(fd)
+
+
 def _publish_exclusive(temp: Path, final: Path) -> None:
     """Publish a closed object under an exclusive final name."""
 
+    if final.exists():
+        raise FileExistsError(f"exclusive publication collision: {final}")
     os.link(temp, final)
     temp.unlink()
 
@@ -95,7 +114,7 @@ def _append_log_line(path: Path, line: bytes) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_APPEND)
     try:
         _write_all(fd, line)
-        _fsync(fd)
+        _fsync_log(fd)
     finally:
         os.close(fd)
 
@@ -309,16 +328,19 @@ class TrainingHistoryV3Writer:
             sidecar_bytes = _pretty_json(sidecar)
             bundle_tmp = self.fragments / f".{stem}.npz.tmp"
             sidecar_tmp = self.fragments / f".{stem}.json.tmp"
-            _write_private(bundle_tmp, bundle)
-            _write_private(sidecar_tmp, sidecar_bytes)
-            _publish_exclusive(bundle_tmp, self.fragments / f"{stem}.npz")
-            _publish_exclusive(sidecar_tmp, self.fragments / f"{stem}.json")
-            _fsync_directory(self.fragments)
-            self._append_event({
+            _write_private(bundle_tmp, bundle, fsync=False)
+            _fsync_file(bundle_tmp)
+            _write_private(sidecar_tmp, sidecar_bytes, fsync=False)
+            _fsync_file(sidecar_tmp)
+            event = {
                 "type": "fragment", "group_index": group, "start_step": step,
                 "end_step": step + 1, "sidecar": sidecar_rel,
                 "sidecar_sha256": hashlib.sha256(sidecar_bytes).hexdigest(),
-            })
+            }
+            _publish_exclusive(bundle_tmp, self.fragments / f"{stem}.npz")
+            _publish_exclusive(sidecar_tmp, self.fragments / f"{stem}.json")
+            _fsync_directory(self.fragments)
+            self._append_event(event)
             self._last_step = step
             self._captured_by_group[group] = self._captured_by_group.get(group, 0) + 1
         except BaseException as exc:

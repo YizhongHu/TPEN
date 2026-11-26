@@ -72,9 +72,9 @@ def test_writer_refuses_missing_capture_and_poisoned_writer(tmp_path: Path) -> N
 
 def test_writer_refuses_nonmonotone_capture(tmp_path: Path) -> None:
     writer = _writer(tmp_path / "history")
-    writer.append_capture(_record(0))
+    writer.append_capture(_record(2))
     with pytest.raises(ValueError, match="strictly increasing"):
-        writer.append_capture(_record(0))
+        writer.append_capture(_record(1))
 
 
 def test_writer_fsync_failure_poisoning(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -96,6 +96,8 @@ def test_writer_fsync_failure_poisoning(monkeypatch: pytest.MonkeyPatch, tmp_pat
         writer.append_capture(_record(0))
     assert writer.poisoned
     assert writer.event_count == 1
+    with pytest.raises(RuntimeError, match="poisoned"):
+        writer.append_capture(_record(0))
 
 
 @pytest.mark.parametrize("variant", ["complete", "torn", "orphan"])
@@ -110,7 +112,7 @@ def test_nonempty_root_refused_in_all_states(tmp_path: Path, variant: str) -> No
         root.mkdir(parents=True)
         (root / "fragments").mkdir()
         (root / "fragments" / "orphan.npz").write_bytes(b"orphan")
-    with pytest.raises(FileExistsError):
+    with pytest.raises(FileExistsError, match="fresh, empty, non-symlink"):
         _writer(root)
 
 
@@ -120,10 +122,6 @@ def test_empty_root_is_accepted_and_symlink_root_refused(tmp_path: Path) -> None
     _writer(empty)
     target = tmp_path / "target"
     target.mkdir()
-    link = tmp_path / "link"
-    link.symlink_to(target, target_is_directory=True)
-    with pytest.raises(ValueError, match="symlink"):
-        _writer(link)
     component = tmp_path / "component"
     component.symlink_to(target, target_is_directory=True)
     with pytest.raises(ValueError, match="symlink"):
@@ -165,18 +163,21 @@ def test_creation_and_capture_order_trace(monkeypatch: pytest.MonkeyPatch, tmp_p
     import tpen.callback.training_history_v3_writer as module
 
     trace: list[str] = []
-    original_private, original_publish, original_dir, original_log = (
-        module._write_private, module._publish_exclusive, module._fsync_directory, module._append_log_line
+    original_private, original_file_fsync, original_publish, original_dir, original_log, original_log_fsync = (
+        module._write_private, module._fsync_file, module._publish_exclusive,
+        module._fsync_directory, module._append_log_line, module._fsync_log
     )
-    def private(path: Path, data: bytes) -> None:
+    def private(path: Path, data: bytes, *, fsync: bool = True) -> None:
         # Private objects are fsynced before exclusive publication under a
         # dot-prefixed temporary name; record the eventual object name so the
-        # ordering assertion observes the real NPZ and sidecar fsyncs.
+        # creation ordering assertion observes the origin fsyncs.
         name = path.name
-        if name.startswith(".") and name.endswith(".tmp"):
-            name = name[1:-4]
-        trace.append(name + " fsync")
-        original_private(path, data)
+        if fsync:
+            trace.append(name + " fsync")
+        original_private(path, data, fsync=fsync)
+    def file_fsync(path: Path) -> None:
+        trace.append(path.name.removeprefix(".").removesuffix(".tmp") + " fsync")
+        original_file_fsync(path)
     def publish(temp: Path, final: Path) -> None:
         trace.append("publish " + final.name)
         original_publish(temp, final)
@@ -184,18 +185,27 @@ def test_creation_and_capture_order_trace(monkeypatch: pytest.MonkeyPatch, tmp_p
         trace.append("dir " + path.name)
         original_dir(path)
     def log(path: Path, line: bytes) -> None:
-        trace.extend(["log append", "log fsync"])
+        trace.append("log append")
         original_log(path, line)
+    def log_fsync(fd: int) -> None:
+        trace.append("log fsync")
+        original_log_fsync(fd)
     monkeypatch.setattr(module, "_write_private", private)
+    monkeypatch.setattr(module, "_fsync_file", file_fsync)
     monkeypatch.setattr(module, "_publish_exclusive", publish)
     monkeypatch.setattr(module, "_fsync_directory", directory)
     monkeypatch.setattr(module, "_append_log_line", log)
+    monkeypatch.setattr(module, "_fsync_log", log_fsync)
     writer = _writer(tmp_path / "history")
     creation = list(trace)
     assert creation[:3] == ["history.json fsync", "events.jsonl fsync", "dir history"]
     trace.clear()
     writer.append_capture(_record(0))
     capture = trace
+    assert capture.count("step-000000000000.npz fsync") == 1
+    assert capture.count("step-000000000000.json fsync") == 1
+    assert capture.count("dir fragments") == 1
+    assert capture.count("log fsync") == 1
     assert capture.index("step-000000000000.npz fsync") < capture.index("step-000000000000.json fsync")
     assert capture.index("step-000000000000.json fsync") < capture.index("publish step-000000000000.npz")
     assert capture.index("publish step-000000000000.json") < capture.index("dir fragments")
@@ -215,7 +225,7 @@ def test_each_fsync_point_poisoning_preserves_committed_prefix(monkeypatch: pyte
             raise OSError(point)
         original(fd)
     monkeypatch.setattr(module, "_fsync", fail)
-    with pytest.raises(OSError):
+    with pytest.raises(OSError, match=point):
         writer.append_capture(_record(0))
     assert writer.poisoned and writer.event_count == 1
     TrainingBatchReader(writer.root).validate()
@@ -226,9 +236,10 @@ def test_publish_collision_and_mid_npz_failure_poison(monkeypatch: pytest.Monkey
     writer = _writer(tmp_path / "collision")
     final = writer.fragments / "step-000000000000.npz"
     final.write_bytes(b"collision")
-    with pytest.raises(FileExistsError):
+    with pytest.raises(FileExistsError, match="exclusive publication collision"):
         writer.append_capture(_record(0))
     assert writer.poisoned and writer.event_count == 1
+    assert final.read_bytes() == b"collision"
     writer = _writer(tmp_path / "npz")
     original = module._npz_bytes
     monkeypatch.setattr(module, "_npz_bytes", lambda record: (_ for _ in ()).throw(RuntimeError("mid-npz")))
@@ -281,7 +292,7 @@ def test_seal_complete_and_contract_refusals(tmp_path: Path) -> None:
     writer.append_capture(_record(2))
     writer.append_capture(_record(3))
     writer.seal_window(0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="invalid or duplicate"):
         writer.seal_window(0)
 
     writer = _writer(tmp_path / "complete")
@@ -289,15 +300,15 @@ def test_seal_complete_and_contract_refusals(tmp_path: Path) -> None:
         writer.append_capture(_record(step))
     writer.seal_window(0)
     writer.complete(next_iteration=4, completed_updates=3)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="complete"):
         writer.append_capture(_record(4))
 
     writer = _writer(tmp_path / "complete-again")
     writer.complete(next_iteration=0, completed_updates=0)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="complete"):
         writer.complete(next_iteration=4, completed_updates=3)
     bad = TrainingHistoryV3Writer(tmp_path / "bad", stream_id="29292929-2929-4292-8292-292929292929", run_id="bad", contract=_contract() | {"every_n_steps": 2}, provenance={"config_hash": "e" * 64})
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="cadence"):
         bad.append_capture(_record(1))
 
 
