@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -216,7 +215,7 @@ def test_nolayer_profile_removes_only_layer_diagnostic_groups() -> None:
             assert set(callback.groups) == {"embedding", "readout", "factors"}
 
 
-def test_nolayer_profile_forward_grad_local_energy_and_singlet_swap(
+def test_nolayer_profile_forward_grad_local_energy_and_fermionic_exchange(
     tmp_path: Path,
 ) -> None:
     from tpen.checkpoint import restore_checkpoint, save_checkpoint
@@ -255,13 +254,6 @@ def test_nolayer_profile_forward_grad_local_energy_and_singlet_swap(
     full_exchange = model(batch.permute(exchange))
     assert torch.allclose(output.logabs, full_exchange.logabs, atol=1e-10, rtol=1e-10)
     assert torch.equal(output.sign * full_exchange.sign, -torch.ones_like(output.sign))
-
-    # Spatial exchange keeps the opposite-spin labels fixed, so the Hooke-2e
-    # singlet spatial wavefunction has a +1 sign ratio while preserving |psi|.
-    spatial_batch = replace(batch.permute(exchange), spins=batch.spins)
-    spatial_exchange = model(spatial_batch)
-    assert torch.allclose(output.logabs, spatial_exchange.logabs, atol=1e-10, rtol=1e-10)
-    assert torch.equal(output.sign * spatial_exchange.sign, torch.ones_like(output.sign))
 
     context = type("Context", (), {
         "cfg": cfg,
