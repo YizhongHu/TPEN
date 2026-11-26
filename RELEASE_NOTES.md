@@ -20,6 +20,7 @@ changes only and make no claims about science or verification results.
 - Request one CPU per Cannon GPU job in the Stage 1 launcher (#882).
 - Pin the precise H2 baseline reference (#881).
 - Make the Stage 1 smoke a published prefix in the launch redesign (LR-3) (#878).
+- Put one selected Stage 1 row on the wire in the launch redesign (LR-2) (#867).
 - Resume Stage 1 through configured `train_resume` and remove `restart.py` core-internal imports (S1-R2) (#848).
 - Add descriptive Stage 1 analysis tooling for pooled error/variance, train-window joins, and trajectory figures (#841).
 - Bind Stage 1 run output before resolution with one train config builder (LR-1) (#835).
