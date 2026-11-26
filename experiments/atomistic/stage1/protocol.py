@@ -43,6 +43,12 @@ HOOKE2_ACT50_PROFILES = (
     HOOKE2_ACT50_TANH_PROFILE,
     HOOKE2_ACT50_NOLAYER_PROFILE,
 )
+HOOKE2_ACT50_SEGMENTED_PROFILES = (
+    "hooke2-sigmoid50k-seg-v1",
+    "hooke2-tanh50k-seg-v1",
+    "hooke2-nolayer50k-seg-v1",
+)
+HOOKE2_ACT50_ALL_PROFILES = HOOKE2_ACT50_PROFILES + HOOKE2_ACT50_SEGMENTED_PROFILES
 HOOKE2_ACT50_HORIZON = 50_000
 HOOKE2_ACT50_EVAL_SELECTION = "A27"
 HOOKE2_ACT50_EVAL_SELECTION_ID = "hooke2-act50-a27-v1"
@@ -58,6 +64,11 @@ _HOOKEE2_ACT50_PROFILE_DATA = {
         "variant": "nolayer", "activation": None, "layers": "empty",
     },
 }
+# Segmentation changes the history contract, not the model definition.
+_HOOKEE2_ACT50_PROFILE_DATA.update({
+    segmented: dict(_HOOKEE2_ACT50_PROFILE_DATA[original])
+    for original, segmented in zip(HOOKE2_ACT50_PROFILES, HOOKE2_ACT50_SEGMENTED_PROFILES)
+})
 QHO_EVAL_SELECTION = "Q21"
 QHO_EVAL_SELECTION_ID = "qho2e-q21-v1"
 QHO_Q21 = (0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000,
@@ -74,9 +85,11 @@ OVERLAY_RELATIVE_PATH = "configs/overlays/diagnostics-v1.yaml"
 HOOKE_OVERLAY_RELATIVE_PATH = "configs/overlays/hooke-diagnostics-v1.yaml"
 OVERLAY_V2_RELATIVE_PATH = "configs/overlays/diagnostics-v2.yaml"
 HOOKE_OVERLAY_V2_RELATIVE_PATH = "configs/overlays/hooke-diagnostics-v2.yaml"
+HOOKE_OVERLAY_V3_RELATIVE_PATH = "configs/overlays/hooke-diagnostics-v3.yaml"
+OVERLAY_PROFILE_V3 = "diagnostics-v3"
 OVERLAY_PROFILE_V1 = "diagnostics-v1"
 OVERLAY_PROFILE_V2 = "diagnostics-v2"
-OVERLAY_PROFILES = (OVERLAY_PROFILE_V1, OVERLAY_PROFILE_V2)
+OVERLAY_PROFILES = (OVERLAY_PROFILE_V1, OVERLAY_PROFILE_V2, OVERLAY_PROFILE_V3)
 OVERLAY_SYSTEMS = frozenset({"he", "h2"})
 HOOKE_OVERLAY_SYSTEMS = HOOKE_SYSTEMS
 OVERLAY_PATH_BY_SYSTEM = {
@@ -94,7 +107,7 @@ OVERLAY_V2_COMPOSITION_ORDER = (
     "base-config -> recorder-before-checkpoint diagnostics-v2 overlay -> manifest overrides"
 )
 ROW_EXTENSION_VERSION = "stage1-rendered-config/v1"
-ROW_EXTENSION_PROFILES = frozenset(OVERLAY_PROFILES)
+ROW_EXTENSION_PROFILES = frozenset((OVERLAY_PROFILE_V1, OVERLAY_PROFILE_V2))
 CHECKPOINT_EVIDENCE_SCHEMA = "stage1-checkpoint-evidence/v1"
 MANIFEST_SCHEMA = "stage1/v4"
 LEGACY_MANIFEST_SCHEMA = "stage1/v3"
@@ -246,7 +259,7 @@ def hooke2_act50_profile(profile: str) -> Mapping[str, Any]:
 def is_hooke2_act50_profile(profile: object) -> bool:
     """Return whether ``profile`` is one of the admitted ACT50 variants."""
 
-    return isinstance(profile, str) and profile in HOOKE2_ACT50_PROFILES
+    return isinstance(profile, str) and profile in HOOKE2_ACT50_ALL_PROFILES
 
 
 def _validate_act50_variant(row: Mapping[str, Any]) -> None:
@@ -749,7 +762,9 @@ def overlay_path_for_system(system: str, *, profile: str = OVERLAY_PROFILE_V1) -
     """
 
     paths = OVERLAY_PATH_BY_SYSTEM if profile == OVERLAY_PROFILE_V1 else (
-        OVERLAY_V2_PATH_BY_SYSTEM if profile == OVERLAY_PROFILE_V2 else None
+        OVERLAY_V2_PATH_BY_SYSTEM if profile == OVERLAY_PROFILE_V2 else (
+            {"hooke2": HOOKE_OVERLAY_V3_RELATIVE_PATH} if profile == OVERLAY_PROFILE_V3 else None
+        )
     )
     if paths is None:
         raise ProtocolError(f"unknown diagnostics overlay profile {profile!r}")
@@ -780,7 +795,10 @@ def _overlay_binding(*, overlay: str | Path, expected_sha256: object,
             resolve_overlay_path(candidate).resolve()
             for candidate in set(
                 OVERLAY_PATH_BY_SYSTEM.values()
-                if profile == OVERLAY_PROFILE_V1 else OVERLAY_V2_PATH_BY_SYSTEM.values()
+                if profile == OVERLAY_PROFILE_V1 else (
+                    OVERLAY_V2_PATH_BY_SYSTEM.values() if profile == OVERLAY_PROFILE_V2
+                    else (HOOKE_OVERLAY_V3_RELATIVE_PATH,)
+                )
             )
         }
     )
@@ -871,7 +889,7 @@ def _expected_overlay_callbacks(
             "fail_fast": False,
         },
     ]
-    if relative in {HOOKE_OVERLAY_RELATIVE_PATH, HOOKE_OVERLAY_V2_RELATIVE_PATH}:
+    if relative in {HOOKE_OVERLAY_RELATIVE_PATH, HOOKE_OVERLAY_V2_RELATIVE_PATH, HOOKE_OVERLAY_V3_RELATIVE_PATH}:
         callbacks.append({
             "_target_": "tpen.callback.AmplitudeRiskFraction",
             "thresholds": [-3, -4, -5, -7, -10],
@@ -885,7 +903,7 @@ def _expected_overlay_callbacks(
         "layer_0_mixing": ["stack.layers.0.mixing"],
         "layer_0_path_aggregation": ["stack.layers.0.path_aggregation"],
     }
-    if science_profile == HOOKE2_ACT50_NOLAYER_PROFILE:
+    if science_profile in {HOOKE2_ACT50_NOLAYER_PROFILE, HOOKE2_ACT50_SEGMENTED_PROFILES[2]}:
         groups.pop("layer_0_mixing")
         groups.pop("layer_0_path_aggregation")
     callbacks.extend([
@@ -904,6 +922,7 @@ def _expected_overlay_callbacks(
             "path": "${run.dir}/training_history",
             "every_n_steps": 50,
             "partition_size_steps": 1000,
+            **({"format_version": 3} if relative == HOOKE_OVERLAY_V3_RELATIVE_PATH else {}),
         },
         {
             "_target_": "tpen.callback.ParameterActivity",
@@ -944,7 +963,7 @@ def _act50_overlay_adjustments(cfg: Any, science_profile: str | None) -> None:
     OmegaConf.update(
         cfg, "trainer.max_steps", HOOKE2_ACT50_HORIZON, merge=False,
     )
-    if science_profile != HOOKE2_ACT50_NOLAYER_PROFILE:
+    if science_profile not in {HOOKE2_ACT50_NOLAYER_PROFILE, HOOKE2_ACT50_SEGMENTED_PROFILES[2]}:
         return
     callbacks = OmegaConf.to_container(cfg.callbacks, resolve=False)
     for callback in callbacks:
@@ -1057,18 +1076,21 @@ def compose_train_overlay(
         )
 
     provenance = {
-        "schema": "stage1-overlay/v1" if overlay_profile == OVERLAY_PROFILE_V1
-        else "stage1-overlay/v2",
+        "schema": {
+            OVERLAY_PROFILE_V1: "stage1-overlay/v1",
+            OVERLAY_PROFILE_V2: "stage1-overlay/v2",
+            OVERLAY_PROFILE_V3: "stage1-overlay/v3",
+        }[overlay_profile],
         "path": relative,
         "sha256": digest,
         "composition_order": (
-            OVERLAY_COMPOSITION_ORDER if overlay_profile == OVERLAY_PROFILE_V1
+            OVERLAY_COMPOSITION_ORDER if overlay_profile != OVERLAY_PROFILE_V2
             else OVERLAY_V2_COMPOSITION_ORDER
         ),
         "stream": "train",
     }
-    if overlay_profile == OVERLAY_PROFILE_V2:
-        provenance["profile"] = OVERLAY_PROFILE_V2
+    if overlay_profile != OVERLAY_PROFILE_V1:
+        provenance["profile"] = overlay_profile
     for dotted, value in _iter_mapping_leaves(provenance, "stage1_overlay"):
         OmegaConf.update(cfg, dotted, value, merge=False, force_add=True)
     _act50_overlay_adjustments(cfg, science_profile)
@@ -1862,6 +1884,9 @@ def validate_gateway_binding(*, binding: str, config: str | None = None,
     overlay_profile = str(row.get("overlay_profile", OVERLAY_PROFILE_V1))
     if overlay_profile not in OVERLAY_PROFILES:
         raise ProtocolError(f"unknown diagnostics overlay profile {overlay_profile!r}")
+    if effective_kind == "train" and row.get("science_profile") in HOOKE2_ACT50_SEGMENTED_PROFILES:
+        if overlay_profile != OVERLAY_PROFILE_V3:
+            raise ProtocolError("segmented ACT50 requires diagnostics-v3")
     if (declared_overlay is None) != (declared_overlay_sha is None):
         raise ProtocolError("binding overlay declaration is incomplete")
     if declared_overlay is None or declared_overlay_sha is None:
@@ -2022,12 +2047,12 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
         raise ProtocolError("resolved train config overlay provenance does not match binding")
     overlay_profile = str(row.get("overlay_profile", OVERLAY_PROFILE_V1))
     expected_order = (
-        OVERLAY_COMPOSITION_ORDER if overlay_profile == OVERLAY_PROFILE_V1
+        OVERLAY_COMPOSITION_ORDER if overlay_profile != OVERLAY_PROFILE_V2
         else OVERLAY_V2_COMPOSITION_ORDER
     )
     if select("stage1_overlay.composition_order") != expected_order:
         raise ProtocolError("resolved train config composition order is not canonical")
-    if overlay_profile == OVERLAY_PROFILE_V2 and select("stage1_overlay.profile") != OVERLAY_PROFILE_V2:
+    if overlay_profile != OVERLAY_PROFILE_V1 and select("stage1_overlay.profile") != overlay_profile:
         raise ProtocolError("resolved train config overlay profile does not match binding")
 
     unresolved = OmegaConf.to_container(cfg, resolve=False)
@@ -2358,8 +2383,12 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         raise ProtocolError("systems must contain distinct known Stage-1 systems")
     if device is not None and device not in {"cpu", "cuda"}:
         raise ProtocolError("device must be 'cpu' or 'cuda'")
-    if science_profile not in {None, HOOKE_SCIENCE_PROFILE, *HOOKE2_ACT50_PROFILES}:
+    if science_profile not in {None, HOOKE_SCIENCE_PROFILE, *HOOKE2_ACT50_ALL_PROFILES}:
         raise ProtocolError("unknown science profile")
+    if science_profile in HOOKE2_ACT50_SEGMENTED_PROFILES:
+        if overlay_profile not in {OVERLAY_PROFILE_V1, OVERLAY_PROFILE_V3}:
+            raise ProtocolError("segmented ACT50 requires diagnostics-v3")
+        overlay_profile = OVERLAY_PROFILE_V3
     if include_smoke and is_hooke2_act50_profile(science_profile):
         raise ProtocolError(
             "ACT50 profiles refuse compatibility smoke rows; use derive_smoke_request"

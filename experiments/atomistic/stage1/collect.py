@@ -22,7 +22,7 @@ from experiments.atomistic.stage1.protocol import (
     STAGE1_PROTOCOL,
     _validate_config_identity_for_row,
     HOOKE_SCIENCE_PROFILE,
-    HOOKE2_ACT50_PROFILES,
+    HOOKE2_ACT50_ALL_PROFILES,
     HOOKE_SYSTEMS,
     _is_he_h2_production_phase,
     manifest_hash,
@@ -162,7 +162,7 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
         row.get("science_profile") for row in phase1_hooke_train_rows
         if row.get("science_profile") is not None
     }
-    admitted_hooke_profiles = {HOOKE_SCIENCE_PROFILE, *HOOKE2_ACT50_PROFILES}
+    admitted_hooke_profiles = {HOOKE_SCIENCE_PROFILE, *HOOKE2_ACT50_ALL_PROFILES}
     hooke_science = bool(phase1_train_profiles & admitted_hooke_profiles)
     if hooke_science:
         # Train rows are the science authority.  A missing/null profile on a

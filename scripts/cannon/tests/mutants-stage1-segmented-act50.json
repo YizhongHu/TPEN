@@ -1,0 +1,25 @@
+{
+  "mutants": [
+    {
+      "id": "recorder-v2",
+      "target": "experiments/atomistic/stage1/configs/overlays/hooke-diagnostics-v3.yaml",
+      "old": "    format_version: 3",
+      "new": "    format_version: 2",
+      "killer": "experiments/atomistic/stage1/tests/test_segmented_act50_profiles.py::test_overlay_changes_only_recorder_format"
+    },
+    {
+      "id": "segmented-v1-overlay",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "        overlay_profile = OVERLAY_PROFILE_V3",
+      "new": "        overlay_profile = OVERLAY_PROFILE_V1",
+      "killer": "experiments/atomistic/stage1/tests/test_segmented_act50_profiles.py::test_planner_renders_segmented_profile"
+    },
+    {
+      "id": "original-profile-drift",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "\"variant\": \"sigmoid\", \"activation\": \"torch.nn.Sigmoid\", \"layers\": \"original\",",
+      "new": "\"variant\": \"sigmoid\", \"activation\": \"torch.nn.Tanh\", \"layers\": \"original\",",
+      "killer": "experiments/atomistic/stage1/tests/test_segmented_act50_profiles.py::test_existing_profiles_rows_and_hashes_unchanged"
+    }
+  ]
+}
