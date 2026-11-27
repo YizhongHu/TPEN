@@ -48,16 +48,16 @@ def test_concrete_binding_handoff_accepts_valid_supplied_packet(tmp_path):
     assert admitted.packet == supplied
 
 
-def test_packet_audit_uses_literal_driver_expectation_not_rendered_argv(
+def test_packet_audit_uses_literal_mode_expectation_not_rendered_packet(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ):
-    """A rendered train argv cannot redefine the literal driver policy."""
+    """A rendered train packet cannot redefine the literal mode policy."""
 
     train = p3.render_r2_train_packet(
         output_dir=tmp_path / "inputs", results_root=str(tmp_path), source_sha=SOURCE, device="cpu"
     )["r2-soap-100"]
     rendered = p3.render_row_packet(train.row, python="/usr/bin/python3", checkout_root=str(ROOT))
-    monkeypatch.setitem(p3.PACKET_EXPECTATIONS["argv"]["driver_by_kind"], "train", "foreign.py")
+    monkeypatch.setitem(p3.PACKET_EXPECTATIONS["env"]["MODE_BY_KIND"], "train", "foreign-mode")
 
     with pytest.raises(p3.P3RenderError, match="packet|argv|recipe|enumerated"):
         p3.admit_row_and_command(
