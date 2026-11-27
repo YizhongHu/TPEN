@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from tpen.callback.raw_training_batch_recorder import TrainingBatchReader, TrainingBatchRecord
-from tpen.callback.training_history_v3_writer import TrainingHistoryV3Writer
+from tpen.callback.training_history_v3_writer import EVENTS_FILENAME, TrainingHistoryV3Writer
 from tests.unit.callback.test_raw_training_batch_recorder_v3 import _pin, _write_real_checkpoint, _write_v3_fixture
 
 
@@ -60,6 +60,30 @@ def test_writer_round_trip_and_exact_write_set(tmp_path: Path) -> None:
         "fragments/step-000000000000.json", "fragments/step-000000000001.npz",
         "fragments/step-000000000001.json",
     }
+
+
+def test_writer_accepts_symlinked_caller_root_and_uses_canonical_root(tmp_path: Path) -> None:
+    real_root = tmp_path / "real" / "history"
+    alias_parent = tmp_path / "alias"
+    alias_parent.symlink_to(real_root.parent, target_is_directory=True)
+
+    writer = _writer(alias_parent / "history")
+
+    assert writer.root == real_root
+    writer.append_capture(_record(0))
+    writer.complete(next_iteration=1, completed_updates=1)
+    TrainingBatchReader(alias_parent / "history").validate(require_complete=True)
+
+
+def test_writer_refuses_symlink_below_canonical_root(tmp_path: Path) -> None:
+    root = tmp_path / "history"
+    root.mkdir()
+    target = tmp_path / "outside-events.jsonl"
+    target.write_bytes(b"")
+    (root / EVENTS_FILENAME).symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlink"):
+        _writer(root)
 
 
 def test_writer_matches_r1_fixture_bytes_for_shared_scenario(tmp_path: Path) -> None:
@@ -210,7 +234,7 @@ def test_nonempty_root_without_fragments_is_refused_by_fresh_root_guard(tmp_path
         _writer(root)
     assert sorted(path.name for path in root.iterdir()) == ["stray.txt"]
 
-def test_empty_root_is_accepted_and_symlink_root_refused(tmp_path: Path) -> None:
+def test_empty_root_and_symlinked_caller_root_are_accepted(tmp_path: Path) -> None:
     empty = tmp_path / "empty"
     empty.mkdir()
     _writer(empty)
@@ -218,8 +242,15 @@ def test_empty_root_is_accepted_and_symlink_root_refused(tmp_path: Path) -> None
     target.mkdir()
     component = tmp_path / "component"
     component.symlink_to(target, target_is_directory=True)
+    writer = _writer(component / "history")
+    assert writer.root == target / "history"
+
+    (writer.root / EVENTS_FILENAME).unlink()
+    outside = tmp_path / "outside-events.jsonl"
+    outside.write_bytes(b"")
+    (writer.root / EVENTS_FILENAME).symlink_to(outside)
     with pytest.raises(ValueError, match="symlink"):
-        _writer(component / "history")
+        _writer(writer.root)
 
 
 def test_root_creation_fsyncs_new_directory_entries(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

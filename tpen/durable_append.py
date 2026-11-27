@@ -81,6 +81,7 @@ pinned by a test; do not weaken it without changing the readers.
 from __future__ import annotations
 
 import io
+import os
 from pathlib import Path
 from typing import Callable
 
@@ -145,6 +146,7 @@ def append_record(
     record: str,
     *,
     fsync: Callable[[int], None] | None = None,
+    open_flags: int | None = None,
 ) -> None:
     """Append `record` as one newline-terminated line using a single write.
 
@@ -188,6 +190,10 @@ def append_record(
     fsync : callable, optional
         Callback receiving the open file descriptor after a complete write and
         before the handle is closed.
+    open_flags : int, optional
+        Low-level flags for the append handle.  When supplied, the file is
+        opened with ``os.open`` and wrapped as an unbuffered binary handle;
+        callers may use this to retain protections such as ``O_NOFOLLOW``.
     """
 
     # Derived from the widest production reader, not from a character list:
@@ -214,7 +220,12 @@ def append_record(
 
     # buffering=0 yields a raw FileIO: one write call in, one write syscall out,
     # with no BufferedWriter chunking the payload or retrying a short write.
-    with target.open("ab", buffering=0) as handle:
+    if open_flags is None:
+        handle_context = target.open("ab", buffering=0)
+    else:
+        fd = os.open(target, open_flags, 0o644)
+        handle_context = os.fdopen(fd, "ab", buffering=0)
+    with handle_context as handle:
         written = handle.write(encoded)
         if written != len(encoded):
             raise PartialAppendError(
