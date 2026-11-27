@@ -27,7 +27,7 @@ from experiments.atomistic.stage1.protocol import (
     validate_materialized_admission,
 )
 
-from .approved_recipes import APPROVED_RECIPES
+from .approved_recipes import APPROVED_RECIPES, PACKET_EXPECTATIONS
 from .composer import (
     ComposedRow,
     PilotProfile,
@@ -65,6 +65,7 @@ class AdmittedCommand:
     row: Mapping[str, Any]
     command: str
     config: Any
+    packet: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,7 @@ class EvalTemplate:
 
 def admit_row_and_command(
     row: Mapping[str, Any], *, python: str, checkout_root: str,
+    packet: Mapping[str, Any] | None = None,
 ) -> AdmittedCommand:
     """Admit one materialized row through the real Stage-1 gateway.
 
@@ -93,18 +95,40 @@ def admit_row_and_command(
         validate_row(row, expected_kind=row.get("kind"))
         config_path = Path(row["row_extension"]["rendered_config"]["path"])
         rendered_values = yaml.safe_load(config_path.read_bytes())
-        _audit_packet_recipe(row, rendered_values, python=python, checkout_root=checkout_root)
+        supplied_packet = (
+            render_row_packet(row, python=python, checkout_root=checkout_root)
+            if packet is None else packet
+        )
+        _audit_packet_recipe(
+            row, rendered_values, packet=supplied_packet,
+            python=python, checkout_root=checkout_root,
+        )
         admitted = validate_gateway_binding(
             binding=_binding_token(row), expected_kinds={row["kind"]},
         )
         config, admission = load_materialized_config(row, expected_kind=row["kind"])
         validate_materialized_admission(config, row, admission, check_file=True)
-        command = command_for_row(row, python=python, checkout_root=checkout_root)
+        command = supplied_packet["argv"]
     except Exception as exc:  # normalize all pre-launch refusal paths
         raise P3RenderError(f"row admission refused: {exc}") from exc
     if admitted.get("kind") != row["kind"]:
         raise P3RenderError("gateway admitted a different row kind")
-    return AdmittedCommand(row=row, command=command, config=config)
+    return AdmittedCommand(row=row, command=command, config=config, packet=supplied_packet)
+
+
+def render_row_packet(
+    row: Mapping[str, Any], *, python: str, checkout_root: str,
+) -> dict[str, Any]:
+    """Render the concrete packet handed to the P3 admission boundary.
+
+    The command portion is owned by Stage-1 ``command_for_row``.  The packet
+    remains a concrete returned object so callers can supply it to admission
+    and receive the audited object back, rather than relying on a discarded
+    private binding local.
+    """
+
+    command = command_for_row(row, python=python, checkout_root=checkout_root)
+    return dict(_runner_bindings(row, command=command, checkout_root=checkout_root))
 
 
 def render_r2_train_packet(
@@ -128,6 +152,11 @@ def render_r2_train_packet(
         _audit_packet_recipe(
             composed.row,
             composed.rendered.values,
+            packet=render_row_packet(
+                composed.row,
+                python=sys.executable,
+                checkout_root=str(Path(__file__).resolve().parents[3]),
+            ),
             python=sys.executable,
             checkout_root=str(Path(__file__).resolve().parents[3]),
         )
@@ -442,33 +471,74 @@ def _profile_for_row(row: Mapping[str, Any], config: Mapping[str, Any]) -> str |
     return candidates[0] if len(candidates) == 1 else None
 
 
-def _runner_bindings(row: Mapping[str, Any], *, command: str) -> Mapping[str, Any]:
+def _runner_bindings(
+    row: Mapping[str, Any], *, command: str, checkout_root: str,
+) -> Mapping[str, Any]:
     """Return the concrete env/argv/output binding audited for one row."""
 
-    run_dir = Path(row["results_root"]) / row["experiment_name"] / row["sector"] / row["run_id"]
+    results_root = str(Path(row["results_root"]).resolve())
+    run_dir = Path(results_root) / row["experiment_name"] / row["sector"] / row["run_id"]
     return {
         "env": {
             "MODE": row["kind"],
             "SOURCE_SHA": row["source_sha"],
-            "CHECKOUT_ROOT": "<CHECKOUT_ROOT>",
-            "UV_CACHE_DIR": "<UV_CACHE_DIR>",
-            "RESULTS_ROOT": row["results_root"],
+            "CHECKOUT_ROOT": str(Path(checkout_root).resolve()),
+            "UV_CACHE_DIR": PACKET_EXPECTATIONS["env"]["UV_CACHE_DIR"],
+            "RESULTS_ROOT": results_root,
             "SELECTED_ROW": row["row_id"],
-            "APPROVAL_ID": "<APPROVAL_ID>",
-            "EXPECTED_QUEUE": "test",
+            "APPROVAL_ID": PACKET_EXPECTATIONS["env"]["APPROVAL_ID"],
+            "EXPECTED_QUEUE": PACKET_EXPECTATIONS["env"]["EXPECTED_QUEUE"],
         },
         "argv": command,
         "output": {
             "run_dir": str(run_dir),
-            "inputs": str(Path(row["results_root"]) / "inputs"),
+            "inputs": str(Path(results_root) / "inputs"),
             "checkpoint_dir": str(run_dir / "checkpoints"),
-            "log": str(Path(row["results_root"]) / "logs" / f"row-{row['row_id']}-${{PBS_JOBID}}.log"),
-            "status": str(Path(row["results_root"]) / "logs" / f"row-{row['row_id']}-${{PBS_JOBID}}.status"),
+            "log": str(Path(results_root) / PACKET_EXPECTATIONS["output"]["log_template"].format(row_id=row["row_id"])),
+            "status": str(Path(results_root) / PACKET_EXPECTATIONS["output"]["status_template"].format(row_id=row["row_id"])),
         },
     }
 
 
-def _audit_packet_recipe(row: Mapping[str, Any], config: Mapping[str, Any], *, python: str, checkout_root: str) -> Mapping[str, Any]:
+def _expected_packet(row: Mapping[str, Any], *, python: str, checkout_root: str) -> dict[str, Any]:
+    """Build independent row-bound packet expectations from literal policy."""
+
+    policy = PACKET_EXPECTATIONS
+    results_root = str(Path(row["results_root"]).resolve())
+    run_dir = Path(results_root) / row["experiment_name"] / row["sector"] / row["run_id"]
+    kind = row.get("kind")
+    driver = policy["argv"]["driver_by_kind"].get(kind)
+    mode = policy["env"]["MODE_BY_KIND"].get(kind)
+    if driver is None or mode is None:
+        raise P3RenderError("packet kind has no independent recipe expectation")
+    token = _binding_token(row)
+    expected_argv = f"{python} {Path(checkout_root).resolve() / policy['argv']['prefix'] / driver} --binding {token}"
+    return {
+        "env": {
+            "MODE": mode,
+            "SOURCE_SHA": row["source_sha"],
+            "CHECKOUT_ROOT": str(Path(checkout_root).resolve()),
+            "UV_CACHE_DIR": policy["env"]["UV_CACHE_DIR"],
+            "RESULTS_ROOT": results_root,
+            "SELECTED_ROW": row["row_id"],
+            "APPROVAL_ID": policy["env"]["APPROVAL_ID"],
+            "EXPECTED_QUEUE": policy["env"]["EXPECTED_QUEUE"],
+        },
+        "argv": expected_argv,
+        "output": {
+            "run_dir": str(run_dir),
+            "inputs": str(Path(results_root) / "inputs"),
+            "checkpoint_dir": str(run_dir / "checkpoints"),
+            "log": str(Path(results_root) / policy["output"]["log_template"].format(row_id=row["row_id"])),
+            "status": str(Path(results_root) / policy["output"]["status_template"].format(row_id=row["row_id"])),
+        },
+    }
+
+
+def _audit_packet_recipe(
+    row: Mapping[str, Any], config: Mapping[str, Any], *, packet: Mapping[str, Any],
+    python: str, checkout_root: str,
+) -> Mapping[str, Any]:
     """Gate a rendered packet against the frozen recipe and concrete bindings."""
 
     recipe_name = _profile_for_row(row, config)
@@ -487,19 +557,14 @@ def _audit_packet_recipe(row: Mapping[str, Any], config: Mapping[str, Any], *, p
         normalized,
         allowed_paths=set(recipe["allowed_paths"]),
     )
-    command = command_for_row(row, python=python, checkout_root=checkout_root)
-    bindings = _runner_bindings(row, command=command)
+    expected_packet = _expected_packet(row, python=python, checkout_root=checkout_root)
+    fail_closed_recipe_diff(expected_packet, packet)
     binding = recipe["binding"]
     if Path(row["row_extension"]["rendered_config"]["path"]).name != binding["input_name"]:
         raise P3RenderError("rendered packet input destination is not the approved row output")
-    if _binding_token(row) not in command:
-        raise P3RenderError("runner argv is not bound to the admitted row")
-    expected_script = f"experiments/atomistic/stage1/{binding['script']}"
-    if bindings["env"]["MODE"] != binding["mode"] or expected_script not in command:
-        raise P3RenderError("concrete packet env/argv binding disagrees with the approved recipe")
-    if not bindings["output"]["log"].endswith(".log") or not bindings["output"]["status"].endswith(".status"):
-        raise P3RenderError("concrete packet env/argv/output binding is incomplete")
-    return bindings
+    if binding["mode"] != expected_packet["env"]["MODE"] or binding["script"] != PACKET_EXPECTATIONS["argv"]["driver_by_kind"][row["kind"]]:
+        raise P3RenderError("literal packet binding disagrees with row kind")
+    return packet
 
 
 def _is_approved_soap100_row(row: Mapping[str, Any]) -> bool:
@@ -517,7 +582,7 @@ def _is_approved_soap100_row(row: Mapping[str, Any]) -> bool:
 
 
 __all__ = [
-    "AdmittedCommand", "EvalTemplate", "P3RenderError", "admit_row_and_command",
+    "AdmittedCommand", "EvalTemplate", "P3RenderError", "admit_row_and_command", "render_row_packet",
     "finalize_eval_row", "render_eval_template", "render_pbs_audit",
     "render_r2_train_packet", "recipe_diff", "fail_closed_recipe_diff",
 ]

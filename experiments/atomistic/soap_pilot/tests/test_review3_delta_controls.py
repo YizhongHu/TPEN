@@ -22,21 +22,27 @@ def test_literal_eval_matches_composer():
 
 
 @pytest.mark.parametrize('field', ['env', 'argv', 'destination'])
-def test_concrete_binding_handoff_refuses_foreign_state(tmp_path, monkeypatch, field):
-    """Inject supplied state at the only current concrete-binding handoff.
-
-    There is no public supplied-packet argument. This boundary probe demonstrates
-    missing validation; it does not claim a public packet-input API exists.
-    """
+def test_concrete_binding_handoff_refuses_foreign_state(tmp_path, field):
+    """A supplied packet must match independent row-bound expectations."""
     train = p3.render_r2_train_packet(output_dir=tmp_path/'inputs', results_root=str(tmp_path), source_sha=SOURCE, device='cpu')['r2-soap-100']
-    command = p3.command_for_row(train.row, python='/usr/bin/python3', checkout_root=str(ROOT))
-    supplied = deepcopy(p3._runner_bindings(train.row, command=command))
+    admitted = p3.admit_row_and_command(train.row, python='/usr/bin/python3', checkout_root=str(ROOT))
+    supplied = deepcopy(admitted.packet)
     if field == 'env':
         supplied['env']['SOURCE_SHA'] = '0' * 40
     elif field == 'argv':
         supplied['argv'] = '/usr/bin/python3 /foreign/driver.py --unapproved'
     else:
         supplied['output']['run_dir'] = str(tmp_path/'foreign')
-    monkeypatch.setattr(p3, '_runner_bindings', lambda row, *, command: supplied)
     with pytest.raises(p3.P3RenderError, match='binding|packet|argv|env|output'):
-        p3.admit_row_and_command(train.row, python='/usr/bin/python3', checkout_root=str(ROOT))
+        p3.admit_row_and_command(train.row, python='/usr/bin/python3', checkout_root=str(ROOT), packet=supplied)
+
+
+def test_concrete_binding_handoff_accepts_valid_supplied_packet(tmp_path):
+    """A valid caller-supplied packet is audited and returned to the caller."""
+    train = p3.render_r2_train_packet(output_dir=tmp_path/'inputs', results_root=str(tmp_path), source_sha=SOURCE, device='cpu')['r2-soap-100']
+    rendered = p3.admit_row_and_command(train.row, python='/usr/bin/python3', checkout_root=str(ROOT))
+    supplied = deepcopy(rendered.packet)
+    admitted = p3.admit_row_and_command(
+        train.row, python='/usr/bin/python3', checkout_root=str(ROOT), packet=supplied
+    )
+    assert admitted.packet == supplied

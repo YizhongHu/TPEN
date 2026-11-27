@@ -65,4 +65,28 @@ APPROVED_RECIPES = json.loads(
     zlib.decompress(base64.b64decode(_APPROVED_RECIPE_ARTIFACT_B64)).decode("utf-8")
 )
 
-__all__ = ["APPROVED_RECIPES"]
+# This is deliberately literal packet policy, rather than a projection of
+# ``command_for_row`` or the P3 renderer.  The renderer substitutes only the
+# row-bound values named here before comparing a supplied packet.
+PACKET_EXPECTATIONS = {
+    "env": {
+        "keys": (
+            "MODE", "SOURCE_SHA", "CHECKOUT_ROOT", "UV_CACHE_DIR",
+            "RESULTS_ROOT", "SELECTED_ROW", "APPROVAL_ID", "EXPECTED_QUEUE",
+        ),
+        "MODE_BY_KIND": {"train": "train", "eval": "eval"},
+        "UV_CACHE_DIR": "<UV_CACHE_DIR>",
+        "APPROVAL_ID": "<APPROVAL_ID>",
+        "EXPECTED_QUEUE": "test",
+    },
+    "argv": {
+        "driver_by_kind": {"train": "train.py", "eval": "eval.py"},
+        "prefix": "experiments/atomistic/stage1",
+    },
+    "output": {
+        "log_template": "logs/row-{row_id}-${{PBS_JOBID}}.log",
+        "status_template": "logs/row-{row_id}-${{PBS_JOBID}}.status",
+    },
+}
+
+__all__ = ["APPROVED_RECIPES", "PACKET_EXPECTATIONS"]
