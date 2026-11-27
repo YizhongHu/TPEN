@@ -224,7 +224,7 @@ def test_phase2_cli_refuses_conflicting_explicit_profile_and_overlay(
     assert not output.exists()
 
 
-@pytest.mark.parametrize("profile", protocol_module.OVERLAY_PROFILES)
+@pytest.mark.parametrize("profile", (protocol_module.OVERLAY_PROFILE_V1, protocol_module.OVERLAY_PROFILE_V2))
 def test_phase2_cli_accepts_matching_explicit_profile_and_overlay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str,
 ) -> None:

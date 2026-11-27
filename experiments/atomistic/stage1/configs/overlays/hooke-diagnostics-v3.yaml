@@ -1,0 +1,83 @@
+# Versioned Hooke Stage-1 TRAIN (100k-update lineage) diagnostics overlay.
+#
+# The Hooke path is intentionally separate from diagnostics-v1.yaml: the
+# latter is the historical He/H2 instrument set, while this variant adds the
+# nucleus-free amplitude-risk diagnostic selected for both Hooke systems.
+# Checkpoint retention remains manifest-owned and is never declared here.
+
+runtime:
+  device: cuda
+  dtype: float64
+
+sampler:
+  n_walkers: 4096
+  burn_in: 100
+  n_steps: 10
+  proposal_scale: 0.5
+
+optimizer:
+  _target_: torch.optim.Adam
+  _partial_: true
+  lr: 0.005
+
+trainer:
+  max_steps: 100000
+  log_every_n_steps: 1
+  return_terms: true
+
+callbacks:
+  - _target_: tpen.callback.DataIntegrity
+    every_n_steps: 1
+    fail_fast: true
+    max_nonfinite_energy_fraction: 0.0
+    max_nonfinite_logabs_fraction: 0.0
+    check_loss: true
+    check_wavefunction_output: true
+    check_batch: true
+    strict_sign_values: true
+  - _target_: tpen.callback.GradientStats
+    every_n_steps: 1
+    fail_fast: true
+    check_finite: true
+  - _target_: tpen.callback.SamplerHealth
+    every_n_steps: 1
+    fail_fast: false
+  - _target_: tpen.callback.FactorScalars
+    every_n_steps: 1
+    fail_fast: false
+  - _target_: tpen.callback.AmplitudeRiskFraction
+    thresholds: [-3, -4, -5, -7, -10]
+    every_n_steps: 100
+    start_step: 0
+  - _target_: tpen.callback.ModuleNorms
+    every_n_steps: 1
+    groups:
+      embedding: [embedding]
+      readout: [readout]
+      factors: [factors]
+      layer_0_mixing: [stack.layers.0.mixing]
+      layer_0_path_aggregation: [stack.layers.0.path_aggregation]
+  - _target_: tpen.callback.OptimizerState
+    every_n_steps: 1
+    groups:
+      embedding: [embedding]
+      readout: [readout]
+      factors: [factors]
+      layer_0_mixing: [stack.layers.0.mixing]
+      layer_0_path_aggregation: [stack.layers.0.path_aggregation]
+  - _target_: tpen.callback.RawTrainingBatchRecorder
+    format_version: 3
+    path: ${run.dir}/training_history
+    every_n_steps: 50
+    partition_size_steps: 1000
+  - _target_: tpen.callback.ParameterActivity
+    output_path: ${run.dir}/parameter_activity.json
+  - _target_: tpen.callback.RunTiming
+  - _target_: tpen.callback.TrainStepTiming
+    every_n_steps: 1
+    rolling_window: 20
+    accelerator_synchronize: false
+
+loggers:
+  - _target_: tpen.logging.JSONL
+    path: ${run.dir}/metrics.jsonl
