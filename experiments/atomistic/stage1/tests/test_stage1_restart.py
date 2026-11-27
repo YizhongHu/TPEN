@@ -998,6 +998,7 @@ def test_stage1_execute_train_v3_recorder_same_run_dir_continuation(
     from tests.integration.test_s4_planned_yield_public_entry import _cfg as _public_cfg
 
     monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+    monkeypatch.setattr(restart, "_validate_system_identity", lambda *_a, **_k: None)
 
     def _stage1_v3_cfg(row: dict[str, object]):
         cfg = _public_cfg(Path(str(row["results_root"])), str(row["run_id"]), max_steps=4)
@@ -1033,12 +1034,13 @@ def test_stage1_execute_train_v3_recorder_same_run_dir_continuation(
         "sector": "singlet",
         "results_root": str(seg_root),
         "updates": 4,
-        "stop_at": 2,
+        "checkpoint_steps": [2, 4],
+        "execution": {"stop_at": 2},
     }
     seg_cfg_1 = _stage1_v3_cfg(seg_row)
     assert restart.execute_train(cfg=seg_cfg_1, row=seg_row, config_path=config_path) == 2
 
-    seg_row_2: dict[str, object] = {**seg_row, "stop_at": None}
+    seg_row_2: dict[str, object] = {**seg_row, "execution": None}
     seg_cfg_2 = _stage1_v3_cfg(seg_row_2)
     assert restart.execute_train(cfg=seg_cfg_2, row=seg_row_2, config_path=config_path) == 0
 
