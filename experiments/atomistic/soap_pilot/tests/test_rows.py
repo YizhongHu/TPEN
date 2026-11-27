@@ -144,6 +144,14 @@ def test_every_rendered_train_callback_hydra_instantiates_on_cpu(tmp_path: Path,
     callbacks = rendered.rendered.values["callbacks"]
     assert callbacks
 
+    for index, callback in enumerate(callbacks):
+        try:
+            instance = instantiate(OmegaConf.create(callback))
+        except Exception as exc:
+            target = callback.get("_target_", "<missing target>")
+            raise AssertionError(f"{profile.name} callback {index} ({target}) failed to instantiate") from exc
+        assert instance is not None
+
     if profile.family in {"adam", "soap"}:
         overlay = yaml.safe_load(_OVERLAY_BASE.read_text(encoding="utf-8"))
         overlay_optimizer_state = next(
@@ -153,14 +161,6 @@ def test_every_rendered_train_callback_hydra_instantiates_on_cpu(tmp_path: Path,
             item for item in callbacks if item["_target_"] == "tpen.callback.OptimizerState"
         )
         assert rendered_optimizer_state["groups"] == overlay_optimizer_state["groups"]
-
-    for index, callback in enumerate(callbacks):
-        try:
-            instance = instantiate(OmegaConf.create(callback))
-        except Exception as exc:
-            target = callback.get("_target_", "<missing target>")
-            raise AssertionError(f"{profile.name} callback {index} ({target}) failed to instantiate") from exc
-        assert instance is not None
 
 
 def test_r2_20_is_distinct_unsynchronized_cross_check(tmp_path: Path) -> None:
