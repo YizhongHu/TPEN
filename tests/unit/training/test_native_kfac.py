@@ -1551,6 +1551,45 @@ def test_step_request_protocol_and_plain_sgd_guards() -> None:
         (StructuredCurvatureStepProducer, VMCStepProducer),
     )
 
+    # Post-init / post-restore optimizer mutation must be refused inside update()
+    # before mutating EMA, counters, or parameters.
+    batch_sgd = _make_batch(batch_size=4, n_electrons=2, spatial_dim=2, seed=621)
+    e_sgd = torch.tensor([-1.0, 0.2, 0.5, 0.7], dtype=torch.float64)
+    w_sgd = (e_sgd - e_sgd.mean()) / 4.0
+    pkt_sgd = StructuredCurvatureForwardRequest(sample_weights=w_sgd).evaluate(model, batch_sgd)
+    step_sgd = StructuredCurvatureUpdateInput(
+        batch=batch_sgd,
+        wavefunction=pkt_sgd.output,
+        local_energy=e_sgd,
+        step=0,
+        parameter_binding=pkt_sgd.parameter_binding,
+        solve_dtype=pkt_sgd.solve_dtype,
+        kronecker_blocks=pkt_sgd.kronecker_blocks,
+        dense_blocks=pkt_sgd.dense_blocks,
+        energy_half_gradient=pkt_sgd.energy_half_gradient,
+        n_finite_samples=4,
+    )
+    assert method.update(step_sgd).applied is True
+    params_snap = [p.detach().clone() for p in model.parameters()]
+    assert method._kronecker_ema is not None
+    ema_snap = [e["A"].clone() for e in method._kronecker_ema]
+
+    opt.param_groups[0]["lr"] = 0.5
+    with pytest.raises(ValueError, match="disagrees"):
+        method.update(replace(step_sgd, step=1))
+
+    opt.param_groups[0]["lr"] = policy.learning_rate
+    opt.param_groups[0]["momentum"] = 0.9
+    with pytest.raises(ValueError, match="momentum"):
+        method.update(replace(step_sgd, step=1))
+
+    assert method.curvature_step == 1
+    assert method.completed_updates == 1
+    for p_after, p_before in zip(model.parameters(), params_snap, strict=True):
+        assert torch.equal(p_after, p_before)
+    for e_after, e_before in zip(method._kronecker_ema, ema_snap, strict=True):
+        assert torch.equal(e_after["A"], e_before)
+
 
 def test_kfac_route_receives_the_psiformer_clipped_energy(monkeypatch) -> None:
     """Native KFAC consumes the same clipped score residual as other score routes."""
@@ -1591,46 +1630,6 @@ def test_kfac_route_receives_the_psiformer_clipped_energy(monkeypatch) -> None:
         produced.update_input.local_energy,
         torch.tensor([0.0, 1.0, 2.0, 26.75], dtype=torch.float64),
     )
-
-    # Post-init / post-restore optimizer mutation must be refused inside update()
-    # before mutating EMA, counters, or parameters.
-    batch_sgd = _make_batch(batch_size=4, n_electrons=2, spatial_dim=2, seed=621)
-    e_sgd = torch.tensor([-1.0, 0.2, 0.5, 0.7], dtype=torch.float64)
-    w_sgd = (e_sgd - e_sgd.mean()) / 4.0
-    pkt_sgd = StructuredCurvatureForwardRequest(sample_weights=w_sgd).evaluate(model, batch_sgd)
-    step_sgd = StructuredCurvatureUpdateInput(
-        batch=batch_sgd,
-        wavefunction=pkt_sgd.output,
-        local_energy=e_sgd,
-        step=0,
-        parameter_binding=pkt_sgd.parameter_binding,
-        solve_dtype=pkt_sgd.solve_dtype,
-        kronecker_blocks=pkt_sgd.kronecker_blocks,
-        dense_blocks=pkt_sgd.dense_blocks,
-        energy_half_gradient=pkt_sgd.energy_half_gradient,
-        n_finite_samples=4,
-    )
-    assert method.update(step_sgd).applied is True
-    params_snap = [p.detach().clone() for p in model.parameters()]
-    assert method._kronecker_ema is not None
-    ema_snap = [e["A"].clone() for e in method._kronecker_ema]
-
-    opt.param_groups[0]["lr"] = 0.5
-    with pytest.raises(ValueError, match="disagrees"):
-        method.update(replace(step_sgd, step=1))
-
-    opt.param_groups[0]["lr"] = policy.learning_rate
-    opt.param_groups[0]["momentum"] = 0.9
-    with pytest.raises(ValueError, match="momentum"):
-        method.update(replace(step_sgd, step=1))
-
-    assert method.curvature_step == 1
-    assert method.completed_updates == 1
-    for p_after, p_before in zip(model.parameters(), params_snap, strict=True):
-        assert torch.equal(p_after, p_before)
-    for e_after, e_before in zip(method._kronecker_ema, ema_snap, strict=True):
-        assert torch.equal(e_after["A"], e_before)
-
 
 def test_structured_curvature_update_input_validates_block_dims_and_device() -> None:
     """StructuredCurvatureUpdateInput.validate() enforces block dims and uniform parameter device."""
