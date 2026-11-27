@@ -75,6 +75,20 @@ def test_planner_segmented_native_continuation_preserves_history(tmp_path: Path)
     assert len(identities) == len(set(identities)) == 40 * 2
     assert set(actual["iteration_step"]) == set(range(0, 2000, 50))
 
+    # Whitespace is valid JSON but changes the header's hash-bound bytes.
+    # A root reader must reject a damaged child, not fall back to its parent.
+    child_header = segments[0] / "history.json"
+    original_header = child_header.read_bytes()
+    child_header.write_bytes(original_header + b" ")
+    try:
+        with pytest.raises(ValueError):
+            TrainingHistoryReader(history).validate(require_complete=True)
+        with pytest.raises(ValueError):
+            TrainingHistoryReader(history).read()
+    finally:
+        child_header.write_bytes(original_header)
+    TrainingHistoryReader(history).validate(require_complete=True)
+
 
 def test_planner_v2_continuation_refuses_before_inspection(tmp_path: Path) -> None:
     """Legacy planner row is refused before inspecting or running a continuation."""
