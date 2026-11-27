@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tpen_executor._codec import digest
+from tpen_executor._codec import canonical_bytes, digest
 from tpen_executor.contracts import AllocationId, BackendJobId, BatchJobId, GroupId
 from tpen_executor.lifecycle.balsam import BalsamGroupParked, BalsamGroupRefusal, BalsamGroupRegistrationIntent, register_group
 from tpen_executor.lifecycle.balsam_client import BalsamBridgeAmbiguous, BalsamProcessClient, select_balsam_client_path
@@ -150,15 +150,18 @@ def test_mutation_journal_prevents_submit_retry_and_rejects_wrong_result(tmp_pat
     assert len(bridge.requests) == 1
 
 
-def test_mutation_timeout_parks_and_never_auto_retries(tmp_path: Path) -> None:
+def test_journaled_mutation_parks_and_never_auto_retries(tmp_path: Path) -> None:
     job = BackendJobId("job")
-    bridge = FakeBridge(None, error=BalsamBridgeAmbiguous("timeout"))
+    group = GroupId("group")
+    request = BalsamWireRequest.rearm(group, job, _sha("recovery"))
+    intent_dir = tmp_path / "state" / "balsam-wire" / digest(request.to_dict())
+    intent_dir.mkdir(parents=True)
+    (intent_dir / "intent.json").write_bytes(canonical_bytes(request.to_dict()))
+    bridge = FakeBridge(lambda request: BalsamWireResult.ack(request, backend_job_id=job, state="queued"))
     client = BalsamProcessClient("/bin/sh", client_path=_client_file(tmp_path), state_dir=tmp_path / "state", bridge=bridge)
     with pytest.raises(BalsamGroupParked):
-        client.rearm_group(GroupId("group"), job, _sha("recovery"))
-    with pytest.raises(BalsamGroupParked):
-        client.rearm_group(GroupId("group"), job, _sha("recovery"))
-    assert len(bridge.requests) == 1
+        client.rearm_group(group, job, _sha("recovery"))
+    assert bridge.requests == []
 
 
 def test_client_does_not_accept_an_unbound_observation_handle(tmp_path: Path) -> None:
@@ -172,7 +175,7 @@ def test_client_does_not_accept_an_unbound_observation_handle(tmp_path: Path) ->
 def test_client_rejects_crossed_response_identity(tmp_path: Path) -> None:
     group = GroupId("group")
     job = BackendJobId("job")
-    bridge = FakeBridge(lambda request: BalsamWireResult.ack(request, backend_job_id=BackendJobId("other"), state="queued"))
+    bridge = FakeBridge(lambda request: BalsamWireResult("readback", "ack", request.group_id, request.backend_job_id, state="queued"))
     client = BalsamProcessClient("/bin/sh", client_path=_client_file(tmp_path), bridge=bridge)
-    with pytest.raises(Exception, match="crosses backend Job"):
+    with pytest.raises(Exception, match="crosses request identity"):
         client.observe(group, job)
