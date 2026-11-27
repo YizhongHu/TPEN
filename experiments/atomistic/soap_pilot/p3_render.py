@@ -167,12 +167,14 @@ def finalize_eval_row(
 
     if not _is_approved_soap100_row(train_row):
         raise P3RenderError("SOAP100 eval requires the approved SOAP optimizer family and recipe")
+    if publication.step != template.checkpoint_step:
+        raise P3RenderError("SOAP publication is not checkpoint-100")
+    if not publication.publication_id or publication.publication_id in {"zero", "duplicate", "missing"}:
+        raise P3RenderError("SOAP100 publication identity is missing or non-unique")
     try:
         publication.validate(expected_step=template.checkpoint_step)
     except RowContractError as exc:
         raise P3RenderError(f"SOAP publication evidence is invalid: {exc}") from exc
-    if not publication.publication_id or publication.publication_id in {"zero", "duplicate", "missing"}:
-        raise P3RenderError("SOAP100 publication identity is missing or non-unique")
     checkpoint_root = Path(checkpoint_dir).resolve()
     model = checkpoint_root / "model.pt"
     complete = checkpoint_root / "COMPLETE"
@@ -233,7 +235,7 @@ def render_pbs_audit() -> dict[str, Any]:
     actual_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
     if actual_sha != _PBS_STAGE1_SHA256:
         raise P3RenderError(
-            "PBS wrapper digest drift: "
+            "PBS guard evidence refused: wrapper digest drift: "
             f"expected {_PBS_STAGE1_SHA256} from {_PBS_STAGE1_PIN_COMMIT}, got {actual_sha}"
         )
     lines = text.splitlines()
