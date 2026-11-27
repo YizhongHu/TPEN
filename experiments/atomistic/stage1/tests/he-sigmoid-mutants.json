@@ -10,8 +10,8 @@
     {
       "id": "he-sigmoid-activation-replaced-with-native",
       "target": "experiments/atomistic/stage1/protocol.py",
-      "old": "activation = _HE_MODEL_PROFILE_DATA[HE_SIGMOID_PROFILE][\"activation\"]",
-      "new": "activation = \"torch.nn.SiLU\"",
+      "old": "elif is_he_sigmoid_profile(science_profile):\n        activation = _HE_MODEL_PROFILE_DATA[HE_SIGMOID_PROFILE][\"activation\"]",
+      "new": "elif is_he_sigmoid_profile(science_profile):\n        activation = \"torch.nn.SiLU\"",
       "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_sigmoid_rendered_train_and_eval_diff_only_activation_leaves"
     },
     {
