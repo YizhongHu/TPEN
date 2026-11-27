@@ -778,7 +778,7 @@ class TrainingBatchReader:
     """Read v1/v2 manifests or a strict v3 lineage rooted at ``root``."""
 
     def __init__(self, root: str | Path) -> None:
-        self.root = Path(root)
+        self.root = Path(root).resolve()
         self.provenance: dict[int, Mapping[str, Any]] = {}
         self._v3_completion: dict[str, int] | None = None
         self._has_read_view = False
@@ -1393,7 +1393,8 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
             ),
             SubscriptionGroup(selectors=(Subscription.of(CheckpointRestored), Subscription.of(RunCompleted)), stateless=True),
         ), **kwargs)
-        self.path = Path(path)
+        # v3 roots may be facility aliases, but all descendants use the canonical root.
+        self.path = Path(path).resolve() if format_version == 3 else Path(path)
         self.partition_size_steps = int(partition_size_steps)
         self._steps = StepCadenceGate(cadence)
         self._partition: TrainingBatchPartitionWriter | None = None

@@ -35,13 +35,23 @@ _ZERO_HASH = "0" * 64
 
 
 def _reject_symlinked_root(path: Path) -> None:
-    """Reject an existing symlink in the root path before creating children."""
+    """Reject symlinks in root components and fixed writer-owned entries."""
 
     current = Path(path.anchor) if path.is_absolute() else Path()
     for component in path.parts[1:] if path.is_absolute() else path.parts:
         current = current / component
-        if current.exists() and current.is_symlink():
+        if current.is_symlink():
             raise ValueError("v3 history root or root component is a symlink")
+    for relative in (HISTORY_FILENAME, EVENTS_FILENAME, "fragments"):
+        if (path / relative).is_symlink():
+            raise ValueError("v3 history root or writer path is a symlink")
+
+
+def _reject_symlinked_path(path: Path) -> None:
+    """Reject a symlink on a specific path or its directly touched parent."""
+
+    if path.is_symlink() or path.parent.is_symlink():
+        raise ValueError("v3 history writer path is a symlink")
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -64,7 +74,8 @@ def _fsync(fd: int) -> None:
 def _fsync_directory(path: Path) -> None:
     """Durably persist directory entries on POSIX filesystems."""
 
-    fd = os.open(path, os.O_RDONLY)
+    _reject_symlinked_path(path)
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         _fsync(fd)
     finally:
@@ -74,7 +85,8 @@ def _fsync_directory(path: Path) -> None:
 def _write_private(path: Path, data: bytes, *, fsync: bool = True) -> None:
     """Create and durably write one temporary object without overwriting."""
 
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    _reject_symlinked_path(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
     try:
         _write_all(fd, data)
         if fsync:
@@ -86,7 +98,8 @@ def _write_private(path: Path, data: bytes, *, fsync: bool = True) -> None:
 def _fsync_file(path: Path) -> None:
     """Fsync one already-created file by path."""
 
-    fd = os.open(path, os.O_RDONLY)
+    _reject_symlinked_path(path)
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         _fsync(fd)
     finally:
@@ -102,6 +115,8 @@ def _fsync_log(fd: int) -> None:
 def _publish_exclusive(temp: Path, final: Path) -> None:
     """Publish a closed object under an exclusive final name."""
 
+    _reject_symlinked_path(temp)
+    _reject_symlinked_path(final)
     if final.exists():
         raise FileExistsError(f"exclusive publication collision: {final}")
     os.link(temp, final)
@@ -111,7 +126,8 @@ def _publish_exclusive(temp: Path, final: Path) -> None:
 def _append_log_line(path: Path, line: bytes) -> None:
     """Append one complete event line and fsync the log file."""
 
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    _reject_symlinked_path(path)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0))
     try:
         _write_all(fd, line)
         _fsync_log(fd)
@@ -173,7 +189,8 @@ class TrainingHistoryV3Writer:
         inherited_seal_frontier: int = 0,
         inherited_seals: Mapping[int, tuple[int, int]] | None = None,
     ) -> None:
-        self.root = Path(root)
+        # Resolve caller-owned aliases once; descendants remain subject to the guard.
+        self.root = Path(root).resolve()
         self.fragments = self.root / "fragments"
         self._poisoned = False
         self._last_step: int | None = None
