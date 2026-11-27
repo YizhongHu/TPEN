@@ -2159,10 +2159,7 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
             "model.layers.0.path_aggregation.activation._target_",
         ):
             if select(path) != expected_activation:
-                raise ProtocolError(
-                    f"resolved He sigmoid config mismatch at {path}; "
-                    f"model={resolved.get('model')!r}"
-                )
+                raise ProtocolError(f"resolved He sigmoid config mismatch at {path}")
 
     unresolved = OmegaConf.to_container(cfg, resolve=False)
     if not isinstance(unresolved, Mapping):
