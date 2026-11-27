@@ -4,7 +4,7 @@
       "id": "deployment-render-impure",
       "target": "executor/src/tpen_executor/deployment/balsam.py",
       "old": "return DeploymentRender(spec.deployment_digest, application_name, settings,",
-      "new": "backend.create_site(spec.site_name, spec.site_template, spec.site_directory)  # mutant: render effect",
+      "new": "return DeploymentRender(spec.deployment_digest, application_name + str(__import__('time').time_ns()), settings,",
       "killer": "executor/tests/test_s5_balsam_deployment.py::test_render_is_deterministic_and_effect_free"
     },
     {
