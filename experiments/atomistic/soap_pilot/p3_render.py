@@ -9,6 +9,7 @@ builds a driver command by hand.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import json
@@ -644,10 +645,71 @@ def _audit_row_recipe(
     normalized = _normalise_recipe(
         config, results_root=row["results_root"], run_id=row["run_id"], parent_run_dir=parent_run_dir
     )
+    if row["kind"] == "train":
+        expected_config = _bind_allocator_probe_device(
+            recipe["config"], row_device=row.get("device"), actual_config=config,
+        )
+    else:
+        runtime = config.get("runtime")
+        if not isinstance(runtime, Mapping) or runtime.get("device") != row.get("device"):
+            raise P3RenderError("rendered runtime.device does not match the admitted row device")
+        expected_config = recipe["config"]
     fail_closed_recipe_diff(
-        recipe["config"], normalized, allowed_paths=set(recipe["allowed_paths"]),
+        expected_config, normalized, allowed_paths=set(recipe["allowed_paths"]),
     )
     return recipe_name, recipe
+
+
+def _bind_allocator_probe_device(
+    expected_config: Mapping[str, Any], *, row_device: Any,
+    actual_config: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Bind only the approved allocator probe leaf to the validated row device.
+
+    The checked-in recipe artifact intentionally remains literal and independent
+    of the composer.  The Stage-1 row contract already validates ``row_device``;
+    this narrow binding reconciles the artifact's CPU reference with the
+    concrete runtime device while keeping the callback list atomic for every
+    other difference.
+    """
+
+    if row_device not in {"cpu", "cuda"}:
+        raise P3RenderError("recipe comparison requires a validated row device")
+    runtime = actual_config.get("runtime")
+    if not isinstance(runtime, Mapping) or runtime.get("device") != row_device:
+        raise P3RenderError("rendered runtime.device does not match the admitted row device")
+    callbacks = actual_config.get("callbacks")
+    if not isinstance(callbacks, list):
+        raise P3RenderError("rendered recipe callbacks must be a list")
+    actual_probe_count = 0
+    for callback in callbacks:
+        if not isinstance(callback, Mapping) or callback.get("_target_") != "tpen.callback.ResourceUsage":
+            continue
+        probe = callback.get("allocator_probe")
+        if not isinstance(probe, Mapping) or probe.get("_target_") != "tpen.accelerator.TorchAllocatorPeakProbe":
+            continue
+        actual_probe_count += 1
+        if probe.get("device") != row_device:
+            raise P3RenderError("allocator probe device does not match the admitted row device")
+    if actual_probe_count != 1:
+        raise P3RenderError("recipe must contain exactly one ResourceUsage allocator probe")
+
+    bound = deepcopy(expected_config)
+    expected_callbacks = bound.get("callbacks")
+    if not isinstance(expected_callbacks, list):
+        raise P3RenderError("approved recipe callbacks must be a list")
+    expected_probe_count = 0
+    for callback in expected_callbacks:
+        if not isinstance(callback, Mapping) or callback.get("_target_") != "tpen.callback.ResourceUsage":
+            continue
+        probe = callback.get("allocator_probe")
+        if not isinstance(probe, dict) or probe.get("_target_") != "tpen.accelerator.TorchAllocatorPeakProbe":
+            continue
+        expected_probe_count += 1
+        probe["device"] = row_device
+    if expected_probe_count != 1:
+        raise P3RenderError("approved recipe must contain exactly one ResourceUsage allocator probe")
+    return bound
 
 
 def _validate_execution_state(
@@ -692,7 +754,23 @@ def _materialize_selected_row_snapshot(
         raise P3RenderError("selected row identity does not match its canonical row hash")
     root = Path(row["results_root"]).resolve()
     inputs = root / "inputs"
+    resolved_inputs = inputs.resolve()
+    try:
+        resolved_inputs.relative_to(root)
+    except ValueError as exc:
+        raise P3RenderError(
+            "selected-row inputs directory escapes results_root"
+        ) from exc
+    if inputs.exists() and not inputs.is_dir():
+        raise P3RenderError("selected-row inputs destination is not a directory")
     snapshot = inputs / f"row-{row['row_id']}.json"
+    resolved_snapshot = snapshot.resolve()
+    try:
+        resolved_snapshot.relative_to(root)
+    except ValueError as exc:
+        raise P3RenderError(
+            "selected-row snapshot destination escapes results_root"
+        ) from exc
     payload = json.dumps(
         dict(row), sort_keys=True, separators=(",", ":"), ensure_ascii=True,
     ).encode("utf-8")
