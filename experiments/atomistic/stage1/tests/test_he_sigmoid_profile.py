@@ -11,6 +11,7 @@ import pytest
 import torch
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
+from tpen.run import load_config
 
 from experiments.atomistic.stage1 import eval as stage1_eval
 from experiments.atomistic.stage1.protocol import (
@@ -109,6 +110,11 @@ def test_he_sigmoid_rendered_train_and_eval_diff_only_activation_leaves() -> Non
     assert _diff_paths(_model(native_train), _model(sigmoid_train)) == expected
     assert _diff_paths(_model(native_eval), _model(sigmoid_eval)) == expected
     assert _model(native_train) == _model(native_eval)
+    assert _model(native_train) == _model(load_config(str(CONFIG_ROOT / "he" / "train.yaml")))
+    assert _model(native_eval) == _model(load_config(str(CONFIG_ROOT / "he" / "eval.yaml")))
+    assert OmegaConf.to_yaml(native_train.model, resolve=True) == OmegaConf.to_yaml(
+        native_eval.model, resolve=True,
+    )
     assert _model(native_train)["layers"][0]["mixing"]["activation"]["_target_"] == "torch.nn.SiLU"
     assert _model(native_train)["layers"][0]["path_aggregation"]["activation"]["_target_"] == "torch.nn.SiLU"
     assert _model(sigmoid_train)["embedding"]["activation"]["_target_"] == "torch.nn.Sigmoid"
