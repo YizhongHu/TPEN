@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from experiments.atomistic.stage1 import collect as collector
+from experiments.atomistic.stage1 import eval as stage1_eval
 from experiments.atomistic.stage1.protocol import (
     CHECKPOINT_EVIDENCE_SCHEMA,
     Protocol,
@@ -440,6 +441,29 @@ def _two_phase_document(tmp_path: Path) -> dict:
         config_sha256=config_sha256, protocol=protocol, phase1_manifest_hash=phase1_hash,
     )
     rows = list(phase1_rows) + eval_rows
+    from tpen.checkpoint.hashing import checkpoint_hashes
+    from tpen.checkpoint.manifest import (
+        CHECKPOINT_KIND, CHECKPOINT_SCHEMA_VERSION, CheckpointManifest,
+    )
+
+    for row in eval_rows:
+        checkpoint_dir = Path(str(row["checkpoint_dir"]))
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        payload = f"fixture-{row['lineage']}".encode()
+        (checkpoint_dir / "model.pt").write_bytes(payload)
+        hashes = checkpoint_hashes(stage1_eval.build_eval_config(row))
+        CheckpointManifest(
+            schema_version=CHECKPOINT_SCHEMA_VERSION,
+            kind=CHECKPOINT_KIND,
+            next_iteration=int(row["checkpoint"]),
+            completed_updates=int(row["checkpoint"]),
+            created_at_unix=0.0,
+            files={"model": "model.pt"},
+            hashes={"model": hashlib.sha256(payload).hexdigest(),
+                    "model_config": hashes["model_config"]},
+            runtime={},
+            provenance={},
+        ).write(checkpoint_dir / "manifest.json")
     return {"schema": "stage1/v3", "manifest_hash": manifest_hash(rows), "rows": rows}
 
 

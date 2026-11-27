@@ -69,6 +69,13 @@ _HOOKEE2_ACT50_PROFILE_DATA.update({
     segmented: dict(_HOOKEE2_ACT50_PROFILE_DATA[original])
     for original, segmented in zip(HOOKE2_ACT50_PROFILES, HOOKE2_ACT50_SEGMENTED_PROFILES)
 })
+HE_SIGMOID_PROFILE = "he-sigmoid-v1"
+HE_MODEL_PROFILES = (HE_SIGMOID_PROFILE,)
+_HE_MODEL_PROFILE_DATA = {
+    HE_SIGMOID_PROFILE: {
+        "system": "he", "activation": "torch.nn.Sigmoid",
+    },
+}
 QHO_EVAL_SELECTION = "Q21"
 QHO_EVAL_SELECTION_ID = "qho2e-q21-v1"
 QHO_Q21 = (0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000,
@@ -260,6 +267,18 @@ def is_hooke2_act50_profile(profile: object) -> bool:
     """Return whether ``profile`` is one of the admitted ACT50 variants."""
 
     return isinstance(profile, str) and profile in HOOKE2_ACT50_ALL_PROFILES
+
+
+def is_he_sigmoid_profile(profile: object) -> bool:
+    """Return whether ``profile`` is the admitted He sigmoid variant."""
+
+    return profile == HE_SIGMOID_PROFILE
+
+
+def is_model_profile(profile: object) -> bool:
+    """Return whether ``profile`` is an admitted model-composition profile."""
+
+    return is_hooke2_act50_profile(profile) or is_he_sigmoid_profile(profile)
 
 
 def _validate_act50_variant(row: Mapping[str, Any]) -> None:
@@ -955,6 +974,20 @@ def _iter_mapping_leaves(value: Mapping[str, Any], prefix: str) -> Iterator[tupl
             yield dotted, nested
 
 
+def _select_resolved_path(resolved: Mapping[str, Any], path: str) -> Any:
+    """Select a resolved config path through mappings and list indices."""
+
+    value: Any = resolved
+    for part in path.split("."):
+        if isinstance(value, Mapping) and part in value:
+            value = value[part]
+        elif isinstance(value, list) and part.isdigit() and int(part) < len(value):
+            value = value[int(part)]
+        else:
+            raise ProtocolError(f"resolved train config is missing {path}")
+    return value
+
+
 def _act50_overlay_adjustments(cfg: Any, science_profile: str | None) -> None:
     """Apply the finite ACT50 train overlay delta after byte validation."""
 
@@ -981,24 +1014,44 @@ def _act50_overlay_adjustments(cfg: Any, science_profile: str | None) -> None:
 
 
 def compose_model_profile(cfg: Any, science_profile: str | None) -> Any:
-    """Compose one admitted Hooke-2e model profile in train or eval config."""
+    """Compose one admitted model profile in train or eval config.
 
-    if not is_hooke2_act50_profile(science_profile):
+    Hooke ACT50 profiles retain their historical horizon and layer semantics;
+    the He profile changes only the three activation leaves shared by train and
+    eval model definitions.
+    """
+
+    if science_profile is None or science_profile == HOOKE_SCIENCE_PROFILE:
         return cfg
-    profile = hooke2_act50_profile(str(science_profile))
-    if profile["layers"] == "empty":
-        OmegaConf.update(cfg, "model.layers", [], merge=False)
-    else:
-        activation = str(profile["activation"])
+    if is_hooke2_act50_profile(science_profile):
+        profile = hooke2_act50_profile(str(science_profile))
+        if profile["layers"] == "empty":
+            OmegaConf.update(cfg, "model.layers", [], merge=False)
+        else:
+            activation = str(profile["activation"])
+            OmegaConf.update(
+                cfg, "model.embedding.activation", {"_target_": activation},
+                merge=False, force_add=True,
+            )
+            for path in (
+                "model.layers.0.mixing.activation._target_",
+                "model.layers.0.path_aggregation.activation._target_",
+            ):
+                OmegaConf.update(cfg, path, activation, merge=False)
+    elif is_he_sigmoid_profile(science_profile):
+        activation = _HE_MODEL_PROFILE_DATA[HE_SIGMOID_PROFILE]["activation"]
+        model_root = "stage1_he_model" if "stage1_he_model" in cfg else "model"
         OmegaConf.update(
-            cfg, "model.embedding.activation", {"_target_": activation},
+            cfg, f"{model_root}.embedding.activation", {"_target_": activation},
             merge=False, force_add=True,
         )
         for path in (
-            "model.layers.0.mixing.activation._target_",
-            "model.layers.0.path_aggregation.activation._target_",
+            f"{model_root}.layers.0.mixing.activation._target_",
+            f"{model_root}.layers.0.path_aggregation.activation._target_",
         ):
             OmegaConf.update(cfg, path, activation, merge=False)
+    else:
+        raise ProtocolError(f"unknown science profile {science_profile!r}")
     OmegaConf.update(cfg, "stage1_science_profile", str(science_profile), merge=False, force_add=True)
     return cfg
 
@@ -1143,11 +1196,18 @@ def config_identity(*, config_root: str | Path, systems: tuple[str, ...] | list[
         digest.update(raw)
         entries.append(relative)
     if science_profile is not None:
-        if not is_hooke2_act50_profile(science_profile):
+        if not is_model_profile(science_profile):
             raise ProtocolError(f"unknown science profile {science_profile!r}")
+        if is_he_sigmoid_profile(science_profile) and set(selected) != {"he"}:
+            raise ProtocolError("He sigmoid profile only admits the he system")
+        profile_data = (
+            hooke2_act50_profile(science_profile)
+            if is_hooke2_act50_profile(science_profile)
+            else _HE_MODEL_PROFILE_DATA[str(science_profile)]
+        )
         marker = json.dumps(
             ["stage1-science-profile-v1", science_profile,
-             dict(hooke2_act50_profile(science_profile))],
+             dict(profile_data)],
             sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")
         digest.update(b"science-profile\0")
@@ -1186,7 +1246,7 @@ def _validate_config_identity_for_row(row: Mapping[str, Any], config_path: str |
         raise ProtocolError("config path does not match the bound Stage-1 system")
     actual = config_identity(
         config_root=path.parent.parent, systems=(system,),
-        science_profile=row.get("science_profile") if is_hooke2_act50_profile(
+        science_profile=row.get("science_profile") if is_model_profile(
             row.get("science_profile")
         ) else None,
     )["sha256"]
@@ -1327,6 +1387,46 @@ def _is_hooke_science_row(row: Mapping[str, Any]) -> bool:
     return row.get("science_profile") == HOOKE_SCIENCE_PROFILE or is_hooke2_act50_profile(
         row.get("science_profile")
     )
+
+
+def _is_he_sigmoid_row(row: Mapping[str, Any]) -> bool:
+    """Return whether a row opts into the versioned He sigmoid profile."""
+
+    return row.get("science_profile") == HE_SIGMOID_PROFILE
+
+
+def _validate_science_profile_for_row(row: Mapping[str, Any]) -> None:
+    """Require each admitted profile to name exactly its supported system."""
+
+    profile = row.get("science_profile")
+    if profile is None:
+        return
+    if not is_model_profile(profile) and profile != HOOKE_SCIENCE_PROFILE:
+        raise ProtocolError(f"unknown science profile {profile!r}")
+    if is_he_sigmoid_profile(profile) and row.get("system") != "he":
+        raise ProtocolError("He sigmoid row only admits the he system")
+
+
+def _validate_he_sigmoid_train_row(row: Mapping[str, Any]) -> None:
+    """Validate the He sigmoid identity without changing native He seeds."""
+
+    if not _is_he_sigmoid_row(row):
+        return
+    _validate_science_profile_for_row(row)
+    if row.get("kind") != "train":
+        raise ProtocolError("He sigmoid profile is only valid for train rows")
+    if row.get("updates") != STAGE1_PROTOCOL.lineage_updates:
+        raise ProtocolError("He sigmoid profile requires the native He horizon")
+    if row.get("walkers") != STAGE1_PROTOCOL.lineage_walkers:
+        raise ProtocolError("He sigmoid profile requires the native He walker count")
+    if list(row.get("checkpoint_steps", ())) != list(
+        range(0, STAGE1_PROTOCOL.lineage_updates + 1, STAGE1_PROTOCOL.retention_cadence)
+    ):
+        raise ProtocolError("He sigmoid profile requires native He checkpoints")
+    if row.get("evaluation_selection") != HE_H2_EVAL_SELECTION:
+        raise ProtocolError("He sigmoid profile requires roster-B evaluation")
+    if row.get("evaluation_selection_id", row.get("selection_id")) != HE_H2_EVAL_SELECTION_ID:
+        raise ProtocolError("He sigmoid profile has an invalid roster-B selection id")
 
 
 def _hooke_profile(row: Mapping[str, Any]) -> str:
@@ -1866,6 +1966,7 @@ def validate_gateway_binding(*, binding: str, config: str | None = None,
                 "smoke-prefix-v1 train rows require execution.stop_at"
             )
     _validate_act50_variant(row)
+    _validate_science_profile_for_row(row)
     if "row_extension" in row:
         _validate_extension_shape(row, expected_kind=effective_kind)
         if overrides:
@@ -1913,6 +2014,8 @@ def validate_gateway_binding(*, binding: str, config: str | None = None,
     _validate_run_identity(row)
     if effective_kind == "train" and _is_hooke_science_row(row):
         _validate_hooke_science_train_row(row)
+    if effective_kind == "train" and _is_he_sigmoid_row(row):
+        _validate_he_sigmoid_train_row(row)
     expected = {
         f"runtime.seed={row['seed']}",
         f"run.root={row['results_root']}",
@@ -2031,29 +2134,38 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
         # The final guard is also a public boundary: callers can bypass the
         # manifest planner and present a forged science row directly here.
         _validate_hooke_science_train_row(row)
+    # ``to_container`` returns plain dict/list containers, so list indices are
+    # traversed explicitly by ``_select_resolved_path`` below.
     resolved = OmegaConf.to_container(cfg, resolve=True)
     if not isinstance(resolved, Mapping):
         raise ProtocolError("resolved train config is not a mapping")
 
-    def select(path: str) -> Any:
-        value: Any = resolved
-        for part in path.split("."):
-            if not isinstance(value, Mapping) or part not in value:
-                raise ProtocolError(f"resolved train config is missing {path}")
-            value = value[part]
-        return value
-
-    if select("stage1_overlay.path") != relative or select("stage1_overlay.sha256") != digest:
+    if _select_resolved_path(resolved, "stage1_overlay.path") != relative or _select_resolved_path(
+        resolved, "stage1_overlay.sha256"
+    ) != digest:
         raise ProtocolError("resolved train config overlay provenance does not match binding")
     overlay_profile = str(row.get("overlay_profile", OVERLAY_PROFILE_V1))
     expected_order = (
         OVERLAY_COMPOSITION_ORDER if overlay_profile != OVERLAY_PROFILE_V2
         else OVERLAY_V2_COMPOSITION_ORDER
     )
-    if select("stage1_overlay.composition_order") != expected_order:
+    if _select_resolved_path(resolved, "stage1_overlay.composition_order") != expected_order:
         raise ProtocolError("resolved train config composition order is not canonical")
-    if overlay_profile != OVERLAY_PROFILE_V1 and select("stage1_overlay.profile") != overlay_profile:
+    if overlay_profile != OVERLAY_PROFILE_V1 and _select_resolved_path(
+        resolved, "stage1_overlay.profile"
+    ) != overlay_profile:
         raise ProtocolError("resolved train config overlay profile does not match binding")
+
+    if _is_he_sigmoid_row(row):
+        _validate_he_sigmoid_train_row(row)
+        expected_activation = _HE_MODEL_PROFILE_DATA[HE_SIGMOID_PROFILE]["activation"]
+        for path in (
+            "model.embedding.activation._target_",
+            "model.layers.0.mixing.activation._target_",
+            "model.layers.0.path_aggregation.activation._target_",
+        ):
+            if _select_resolved_path(resolved, path) != expected_activation:
+                raise ProtocolError(f"resolved He sigmoid config mismatch at {path}")
 
     unresolved = OmegaConf.to_container(cfg, resolve=False)
     if not isinstance(unresolved, Mapping):
@@ -2118,13 +2230,13 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
         "optimizer.lr": 0.005,
     }
     for path, expected in expected_values.items():
-        if select(path) != expected:
+        if _select_resolved_path(resolved, path) != expected:
             raise ProtocolError(f"resolved Hooke science config mismatch at {path}")
-    checkpoint_steps = list(select("checkpoint_steps"))
+    checkpoint_steps = list(_select_resolved_path(resolved, "checkpoint_steps"))
     expected_steps = [step for step in row.get("checkpoint_steps", ()) if step > 0]
     if checkpoint_steps != expected_steps:
         raise ProtocolError("resolved Hooke checkpoint schedule does not match the manifest")
-    callbacks = select("callbacks")
+    callbacks = _select_resolved_path(resolved, "callbacks")
     targets = [entry.get("_target_") for entry in callbacks if isinstance(entry, Mapping)]
     if targets.count("tpen.callback.AmplitudeRiskFraction") != 1:
         raise ProtocolError("resolved Hooke config must contain one amplitude-risk callback")
@@ -2161,7 +2273,7 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
                 if not isinstance(base_section, Mapping) or not isinstance(resolved_section, Mapping):
                     raise ProtocolError(f"resolved train config is missing runner {section} wiring")
                 for field in fields:
-                    root_value = select(f"{section}.{field}")
+                    root_value = _select_resolved_path(resolved, f"{section}.{field}")
                     if (field not in base_section or field not in resolved_section
                             or resolved_section[field] != root_value):
                         raise ProtocolError(
@@ -2383,7 +2495,9 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         raise ProtocolError("systems must contain distinct known Stage-1 systems")
     if device is not None and device not in {"cpu", "cuda"}:
         raise ProtocolError("device must be 'cpu' or 'cuda'")
-    if science_profile not in {None, HOOKE_SCIENCE_PROFILE, *HOOKE2_ACT50_ALL_PROFILES}:
+    if science_profile not in {
+        None, HOOKE_SCIENCE_PROFILE, HE_SIGMOID_PROFILE, *HOOKE2_ACT50_ALL_PROFILES,
+    }:
         raise ProtocolError("unknown science profile")
     if science_profile in HOOKE2_ACT50_SEGMENTED_PROFILES:
         if overlay_profile not in {OVERLAY_PROFILE_V1, OVERLAY_PROFILE_V3}:
@@ -2397,6 +2511,13 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
     hooke_science_profile = science_profile is not None and (
         science_profile == HOOKE_SCIENCE_PROFILE or is_hooke2_act50_profile(science_profile)
     )
+    he_sigmoid_profile = is_he_sigmoid_profile(science_profile)
+    if he_sigmoid_profile:
+        if set(selected) != {"he"}:
+            raise ProtocolError("He sigmoid profile only admits the he system")
+        if evaluation_selection not in {None, HE_H2_EVAL_SELECTION}:
+            raise ProtocolError("He sigmoid profile requires roster-B evaluation")
+        evaluation_selection = HE_H2_EVAL_SELECTION
     if hooke_science_profile:
         allowed = {"hooke2"} if is_hooke2_act50_profile(science_profile) else HOOKE_SYSTEMS
         if not set(selected).issubset(allowed):
@@ -2423,11 +2544,16 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                 f"Hooke science phase 2 requires the exact {evaluation_selection} roster"
             )
     elif evaluation_selection is not None:
-        raise ProtocolError("evaluation_selection requires the Hooke science profile")
+        if not set(selected).issubset(HE_H2_SYSTEMS):
+            raise ProtocolError("evaluation_selection requires a Hooke or He/H2 science profile")
+        if evaluation_selection != HE_H2_EVAL_SELECTION:
+            raise ProtocolError("He/H2 science requires the exact roster-B selection")
     he_h2_selection = (
         phase == 2 and set(selected).issubset(HE_H2_SYSTEMS)
         and _is_he_h2_production_protocol(protocol)
     )
+    if he_sigmoid_profile and phase == 2:
+        he_h2_selection = True
     if he_h2_selection and list(checkpoints) != list(HE_H2_EVAL_CHECKPOINTS):
         raise ProtocolError("He/H2 production phase 2 requires the exact roster-B checkpoints")
     if (overlay is None) != (overlay_sha256 is None):
@@ -2627,6 +2753,14 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                 if is_hooke2_act50_profile(science_profile):
                     row["variant"] = hooke2_act50_profile(str(science_profile))["variant"]
                 _validate_hooke_science_train_row(row)
+            elif he_sigmoid_profile:
+                row.update({
+                    "science_profile": HE_SIGMOID_PROFILE,
+                    "evaluation_selection": HE_H2_EVAL_SELECTION,
+                    "evaluation_selection_id": HE_H2_EVAL_SELECTION_ID,
+                    "selection_id": HE_H2_EVAL_SELECTION_ID,
+                })
+                _validate_he_sigmoid_train_row(row)
             if spec.name in overlays_by_system:
                 row["overlay"], row["overlay_sha256"] = overlays_by_system[spec.name]
                 if overlay_profile != OVERLAY_PROFILE_V1:
@@ -2683,6 +2817,8 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                             "evaluation_selection": HE_H2_EVAL_SELECTION,
                             "evaluation_selection_id": HE_H2_EVAL_SELECTION_ID,
                             "selection_id": HE_H2_EVAL_SELECTION_ID,
+                            **({"science_profile": HE_SIGMOID_PROFILE}
+                               if he_sigmoid_profile else {}),
                         } if he_h2_selection else {}),
                     }
                     rows.append(eval_row)
@@ -2758,6 +2894,17 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
         _validate_act50_variant(row)
     systems = tuple(dict.fromkeys(str(row["system"]) for row in train_rows))
     he_h2_selection = _is_he_h2_production_phase(phase1_rows)
+    he_sigmoid_profiles = {
+        row.get("science_profile") for row in train_rows
+        if row.get("science_profile") is not None and row.get("system") in HE_H2_SYSTEMS
+    }
+    if he_sigmoid_profiles:
+        if he_sigmoid_profiles != {HE_SIGMOID_PROFILE} or set(systems) != {"he"}:
+            raise ProtocolError("He sigmoid phase must contain only He rows with one profile")
+        he_h2_selection = True
+        for row in train_rows:
+            if row.get("system") == "he":
+                _validate_he_sigmoid_train_row(row)
     hooke_profiles = {row.get("science_profile") for row in train_rows if _is_hooke_science_row(row)}
     hooke_science = bool(hooke_profiles)
     if hooke_science:
@@ -2975,6 +3122,8 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
                         "evaluation_selection": HE_H2_EVAL_SELECTION,
                         "evaluation_selection_id": HE_H2_EVAL_SELECTION_ID,
                         "selection_id": HE_H2_EVAL_SELECTION_ID,
+                        **({"science_profile": HE_SIGMOID_PROFILE}
+                           if he_sigmoid_profiles else {}),
                     } if he_h2_selection else {}),
                 }
                 if smoke_manifest:
