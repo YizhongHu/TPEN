@@ -15,12 +15,16 @@ from tpen.run import load_config
 
 from experiments.atomistic.stage1 import eval as stage1_eval
 from experiments.atomistic.stage1.protocol import (
+    CHECKPOINT_EVIDENCE_SCHEMA,
     HE_H2_EVAL_CHECKPOINTS,
     HE_SIGMOID_PROFILE,
     ProtocolError,
     STAGE1_PROTOCOL,
+    bind_evaluation_manifest,
     build_manifest,
     config_identities,
+    manifest_hash,
+    planned_physical_system_ids,
 )
 from experiments.atomistic.stage1.train import build_train_config
 
@@ -39,25 +43,48 @@ def _rows(profile: str | None, *, phase: int = 1) -> list[dict[str, Any]]:
     identities = config_identities(
         config_root=CONFIG_ROOT, systems=("he",), science_profile=profile,
     )
-    checkpoint_sha256 = {
-        ("he", lineage, checkpoint): "b" * 64
-        for lineage in range(STAGE1_PROTOCOL.lineages)
-        for checkpoint in checkpoints
-    }
-    return build_manifest(
+    phase1_rows = build_manifest(
         protocol=STAGE1_PROTOCOL,
         source_sha="a" * 40,
         config_sha256=identities,
-        checkpoints=checkpoints,
+        checkpoints=list(range(0, STAGE1_PROTOCOL.lineage_updates + 1,
+                               STAGE1_PROTOCOL.retention_cadence)),
         lineage_seeds=[11, 12, 13],
-        checkpoint_sha256=checkpoint_sha256,
+        checkpoint_sha256={},
         results_root="/external/he-sigmoid-test",
         systems=("he",),
-        phase=phase,
+        phase=1,
         device="cpu",
         science_profile=profile,
         include_smoke=False,
         auto_overlay=True,
+    )
+    if phase == 1:
+        return phase1_rows
+    phase1_hash = manifest_hash(phase1_rows)
+    evidence = {
+        "schema": CHECKPOINT_EVIDENCE_SCHEMA,
+        "phase1_manifest_hash": phase1_hash,
+        "phase1_train_row_hashes": {
+            f"he:{row['lineage']}": manifest_hash([row])
+            for row in phase1_rows if row["kind"] == "train"
+        },
+        "checkpoints": {
+            f"he:{lineage}:{checkpoint}": "b" * 64
+            for lineage in range(STAGE1_PROTOCOL.lineages)
+            for checkpoint in checkpoints
+        },
+    }
+    return bind_evaluation_manifest(
+        phase1_rows=phase1_rows,
+        checkpoints=checkpoints,
+        checkpoint_evidence=evidence,
+        expected_physical_system_id=planned_physical_system_ids(),
+        source_sha="a" * 40,
+        config_sha256=identities,
+        protocol=STAGE1_PROTOCOL,
+        phase1_manifest_hash=phase1_hash,
+        device="cpu",
     )
 
 

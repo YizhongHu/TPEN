@@ -1031,10 +1031,12 @@ def compose_model_profile(cfg: Any, science_profile: str | None) -> Any:
             merge=False, force_add=True,
         )
         for path in (
-            "model.layers.0.mixing.activation._target_",
-            "model.layers.0.path_aggregation.activation._target_",
+            "model.layers.0.mixing.activation",
+            "model.layers.0.path_aggregation.activation",
         ):
-            OmegaConf.update(cfg, path, activation, merge=False)
+            OmegaConf.update(
+                cfg, path, {"_target_": activation}, merge=False, force_add=True,
+            )
     else:
         raise ProtocolError(f"unknown science profile {science_profile!r}")
     OmegaConf.update(cfg, "stage1_science_profile", str(science_profile), merge=False, force_add=True)
