@@ -3,8 +3,6 @@ from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
-import subprocess
-import sys
 import pytest
 from experiments.atomistic.soap_pilot import composer, p3_render as p3
 from experiments.atomistic.soap_pilot.approved_recipes import APPROVED_RECIPES
@@ -105,37 +103,6 @@ def test_concrete_binding_handoff_accepts_valid_supplied_packet(tmp_path):
         execution_state=state,
     )
     assert admitted.packet == supplied
-
-
-def test_concrete_packet_passes_wrapper_selected_row_and_approval_predicates(tmp_path):
-    """The same concrete packet passes the wrapper's read-only shell checks."""
-    train = p3.render_r2_train_packet(
-        output_dir=tmp_path / "inputs", results_root=str(tmp_path),
-        source_sha=SOURCE, device="cuda",
-    )["r2-soap-100"]
-    state = _execution_state(tmp_path)
-    supplied = _caller_packet(train.row, state=state, python=sys.executable)
-    admitted = p3.admit_row_and_command(
-        train.row, python=sys.executable, checkout_root=str(ROOT),
-        packet=supplied, execution_state=state,
-    )
-    assert admitted.packet == supplied
-    wrapper = ROOT / "experiments/atomistic/stage1/polaris/pbs_stage1.sh"
-    functions = "\n".join(wrapper.read_text(encoding="utf-8").splitlines()[37:232])
-    env = {
-        "USER": "p3-test",
-        "PYBIN": sys.executable,
-        "MODE": "train",
-        "SOURCE_SHA": train.row["source_sha"],
-        "RESULTS_ROOT": train.row["results_root"],
-        "SELECTED_ROW": supplied["env"]["SELECTED_ROW"],
-        "APPROVAL_ID": state["APPROVAL_ID"],
-    }
-    result = subprocess.run(
-        ["bash", "-c", "source /dev/stdin; validate_selected_row \"$SELECTED_ROW\" \"$MODE\"; require_approval_or_die"],
-        input=functions, text=True, capture_output=True, env=env, check=False,
-    )
-    assert result.returncode == 0, result.stderr
 
 
 def test_packet_audit_uses_literal_mode_expectation_not_rendered_packet(

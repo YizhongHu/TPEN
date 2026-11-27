@@ -250,6 +250,9 @@ def test_p3_pbs_packet_env_argv_outputs_and_lr4_guards() -> None:
         assert evidence["line_range"][0] <= evidence["line_range"][1]
         assert evidence["checks"]
         assert all(":" in check for check in evidence["checks"])
+    state_evidence = audit["execution_state_evidence"]
+    assert all(state_evidence[name]["checks"] for name in ("cache", "approval", "queue"))
+    assert all(":" in check for item in state_evidence.values() for check in item["checks"])
 
 
 def test_p3_fail_closed_recipe_diff_allows_only_enumerated_r2_changes(tmp_path: Path) -> None:
