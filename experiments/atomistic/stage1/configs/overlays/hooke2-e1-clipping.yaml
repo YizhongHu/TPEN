@@ -1,0 +1,7 @@
+# E1 campaign overlay for the Hooke-2e score-gradient estimator.
+# The base Hooke-2e training config remains unchanged; this opt-in overlay
+# enables PsiFormer Appendix A.1 Eq. 13 clipping only in score updates.
+
+trainer:
+  energy_clipping_mode: psiformer
+  energy_clipping_k: 5.0

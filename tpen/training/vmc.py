@@ -79,6 +79,15 @@ NONFINITE_LOCAL_ENERGY_POLICIES = ("fail", "mask")
 #: cannot reach masking by omission.
 DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY = "mask"
 
+# E1 is deliberately opt-in.  ``psiformer`` follows Appendix A.1, Eq. 13 of
+# von Glehn et al., arXiv:2211.13672v1: a median window whose width is k times
+# the mean absolute deviation about that median, followed by recentering on
+# the mean of the clipped energies.  No other clipping family is admitted in
+# this slice, so a misspelled or future mode cannot silently change an estimator.
+ENERGY_CLIPPING_MODES = ("none", "psiformer")
+DEFAULT_ENERGY_CLIPPING_MODE = "none"
+DEFAULT_ENERGY_CLIPPING_K = 5.0
+
 
 def resolve_nonfinite_local_energy_policy(policy: object) -> str:
     """Validate and normalize a non-finite local-energy policy name.
@@ -109,18 +118,124 @@ def resolve_nonfinite_local_energy_policy(policy: object) -> str:
     return policy
 
 
+def resolve_energy_clipping_mode(mode: object) -> str:
+    """Validate and normalize the opt-in local-energy clipping mode."""
+
+    if not isinstance(mode, str) or mode not in ENERGY_CLIPPING_MODES:
+        raise ValueError(
+            f"energy clipping mode must be one of {list(ENERGY_CLIPPING_MODES)}, got {mode!r}"
+        )
+    return mode
+
+
+def resolve_energy_clipping_k(k: object) -> float:
+    """Validate the positive finite PsiFormer window multiplier."""
+
+    if isinstance(k, bool) or not isinstance(k, (int, float)):
+        raise ValueError(f"energy clipping k must be a positive finite number, got {k!r}")
+    value = float(k)
+    if not value > 0.0 or not torch.isfinite(torch.tensor(value)):
+        raise ValueError(f"energy clipping k must be a positive finite number, got {k!r}")
+    return value
+
+
+def _even_median(values: torch.Tensor) -> torch.Tensor:
+    """Return the conventional median, averaging the two central even values."""
+
+    ordered = torch.sort(values.reshape(-1)).values
+    count = int(ordered.numel())
+    middle = count // 2
+    if count % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def clip_local_energy_for_score(
+    local_energy: torch.Tensor,
+    *,
+    mode: str = DEFAULT_ENERGY_CLIPPING_MODE,
+    k: float = DEFAULT_ENERGY_CLIPPING_K,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Transform finite local energies for a score-gradient surrogate only.
+
+    Parameters
+    ----------
+    local_energy : torch.Tensor
+        Per-sample local energies.  Non-finite rows are preserved for the
+        caller's existing fail/mask policy.
+    mode : {"none", "psiformer"}, optional
+        ``"none"`` is the historical byte-identical path.  ``"psiformer"``
+        clips finite values to ``median +/- k * mean(abs(E - median))`` and
+        returns the clipped values; the caller recenters them before forming a
+        score residual.  This is the hard clipping rule in PsiFormer,
+        arXiv:2211.13672v1, Appendix A.1, Eq. 13.
+    k : float, optional
+        Positive finite window multiplier.
+
+    Returns
+    -------
+    transformed, diagnostics : tuple
+        A detached tensor with non-finite rows unchanged, and numeric
+        diagnostics suitable for raw training metrics.  The transform never
+        changes the raw tensor held by the training record or evaluation path.
+    """
+
+    resolved_mode = resolve_energy_clipping_mode(mode)
+    resolved_k = resolve_energy_clipping_k(k)
+    if not isinstance(local_energy, torch.Tensor):
+        raise TypeError("local_energy must be a torch.Tensor")
+    finite_mask = torch.isfinite(local_energy)
+    finite = local_energy[finite_mask].detach()
+    if int(finite.numel()) == 0:
+        return local_energy.detach(), {
+            "local_energy_clip_fraction": 0.0,
+            "local_energy_clip_lower": 0.0,
+            "local_energy_clip_upper": 0.0,
+            "local_energy_clip_n_clipped": 0,
+        }
+
+    if resolved_mode == "none":
+        lower = float(finite.min().item())
+        upper = float(finite.max().item())
+        transformed = local_energy.detach()
+        n_clipped = 0
+    else:
+        median = _even_median(finite)
+        mean_abs_deviation = torch.mean(torch.abs(finite - median))
+        lower_tensor = median - resolved_k * mean_abs_deviation
+        upper_tensor = median + resolved_k * mean_abs_deviation
+        clipped = torch.clamp(finite, min=lower_tensor, max=upper_tensor)
+        transformed = local_energy.detach().clone()
+        transformed[finite_mask] = clipped
+        lower = float(lower_tensor.item())
+        upper = float(upper_tensor.item())
+        n_clipped = int(((finite < lower_tensor) | (finite > upper_tensor)).sum().item())
+
+    diagnostics: dict[str, float | int] = {
+        "local_energy_clip_fraction": float(n_clipped / int(finite.numel())),
+        "local_energy_clip_lower": lower,
+        "local_energy_clip_upper": upper,
+        "local_energy_clip_n_clipped": n_clipped,
+    }
+    return transformed, diagnostics
+
+
 def compute_vmc_objective(
     logabs: torch.Tensor,
     local_energy: torch.Tensor,
     *,
     scale_factor: float = 2.0,
     nonfinite_policy: str = DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY,
+    energy_clipping_mode: str = DEFAULT_ENERGY_CLIPPING_MODE,
+    energy_clipping_k: float = DEFAULT_ENERGY_CLIPPING_K,
 ) -> VMCObjectiveResult:
     """Compute the VMC score-function objective and training metrics.
 
     The returned loss is differentiable with respect to ``logabs``. Local-energy
     values are detached before forming the score-function objective, so the
-    gradient flows only through ``logabs``.
+    gradient flows only through ``logabs``.  When E1 clipping is enabled, only
+    the detached score residual is transformed; all reported energy metrics
+    remain computed from the raw finite local energies.
 
     Non-finite local-energy samples are excluded from the objective and from the
     energy summary metrics. The function raises if no finite samples remain.
@@ -135,6 +250,13 @@ def compute_vmc_objective(
     scale_factor : float, optional
         Multiplicative factor on the score-function objective. The default ``2``
         corresponds to gradients of an expectation under ``|psi|^2``.
+    nonfinite_policy : {"fail", "mask"}, optional
+        Existing policy for non-finite local-energy rows.
+    energy_clipping_mode : {"none", "psiformer"}, optional
+        Opt-in score-residual transform. ``"none"`` preserves historical
+        behavior; ``"psiformer"`` applies the Appendix A.1 Eq. 13 window.
+    energy_clipping_k : float, optional
+        Positive finite multiplier for the PsiFormer median/mean-AD window.
 
     Returns
     -------
@@ -191,9 +313,14 @@ def compute_vmc_objective(
 
     finite_logabs = logabs[finite_mask]
     finite_energy = local_energy[finite_mask].detach()
+    score_energy, clip_metrics = clip_local_energy_for_score(
+        finite_energy,
+        mode=energy_clipping_mode,
+        k=energy_clipping_k,
+    )
 
     energy = finite_energy.mean()
-    centered_energy = finite_energy - energy
+    centered_energy = score_energy - score_energy.mean()
 
     loss = scale_factor * torch.mean(centered_energy * finite_logabs)
 
@@ -216,6 +343,7 @@ def compute_vmc_objective(
         "local_energy_finite_fraction": float(n_finite / n_total) if n_total else 0.0,
         "local_energy_nonfinite_count": n_total - n_finite,
     }
+    metrics.update(clip_metrics)
 
     return VMCObjectiveResult(loss=loss, metrics=metrics)
 
@@ -342,9 +470,15 @@ def summarize_logabs(logabs: torch.Tensor) -> dict[str, float]:
 
 
 __all__ = [
+    "DEFAULT_ENERGY_CLIPPING_K",
+    "DEFAULT_ENERGY_CLIPPING_MODE",
     "VMCObjectiveResult",
+    "ENERGY_CLIPPING_MODES",
+    "clip_local_energy_for_score",
     "compute_vmc_objective",
     "hamiltonian_term_metric_prefix",
     "summarize_local_energy_terms",
     "summarize_logabs",
+    "resolve_energy_clipping_k",
+    "resolve_energy_clipping_mode",
 ]

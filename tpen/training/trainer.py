@@ -66,8 +66,13 @@ from tpen.training.update import (
     vmc_objective_reevaluation,
 )
 from tpen.training.vmc import (
+    DEFAULT_ENERGY_CLIPPING_K,
+    DEFAULT_ENERGY_CLIPPING_MODE,
     DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY,
+    clip_local_energy_for_score,
     compute_vmc_objective,
+    resolve_energy_clipping_k,
+    resolve_energy_clipping_mode,
     resolve_nonfinite_local_energy_policy,
     summarize_local_energy_terms,
     summarize_logabs,
@@ -98,6 +103,22 @@ def _gradient_norm(model) -> float:
         value = param.grad.detach().pow(2).sum()
         total = value if total is None else total + value
     return float(torch.sqrt(total).item()) if total is not None else 0.0
+
+
+def _compute_trainer_objective(*, logabs, local_energy, trainer: "VMCTrainer"):
+    """Call the canonical objective with only the selected estimator knobs.
+
+    The default path keeps its historical keyword surface for producer test
+    doubles; opt-in clipping adds its two explicit estimator arguments.
+    """
+
+    kwargs = {"nonfinite_policy": trainer.nonfinite_local_energy_policy}
+    if trainer.energy_clipping_mode != DEFAULT_ENERGY_CLIPPING_MODE:
+        kwargs.update(
+            energy_clipping_mode=trainer.energy_clipping_mode,
+            energy_clipping_k=trainer.energy_clipping_k,
+        )
+    return compute_vmc_objective(logabs, local_energy, **kwargs)
 
 
 def _detach_aux_value(value: Any, path: str) -> Any:
@@ -250,10 +271,8 @@ class _TrainerStepProducer:
         with self._context.scope(Forward(step=self._step), state=self._state):
             output = self._model(self._batch)
         with self._context.scope(Objective(step=self._step), state=self._state):
-            objective = compute_vmc_objective(
-                output.logabs,
-                total_local_energy,
-                nonfinite_policy=self._trainer.nonfinite_local_energy_policy,
+            objective = _compute_trainer_objective(
+                logabs=output.logabs, local_energy=total_local_energy, trainer=self._trainer
             )
         update_input = AutogradUpdateInput(
             batch=self._batch,
@@ -275,6 +294,8 @@ class _TrainerStepProducer:
                 batch=self._batch,
                 primary_local_energy=total_local_energy,
                 nonfinite_policy=self._trainer.nonfinite_local_energy_policy,
+                energy_clipping_mode=self._trainer.energy_clipping_mode,
+                energy_clipping_k=self._trainer.energy_clipping_k,
             ),
         )
         return ProducedVMCStep(
@@ -297,15 +318,18 @@ class _TrainerStepProducer:
             output = packet.as_output()
             parameter_scores = packet.parameter_scores
         with self._context.scope(Objective(step=self._step), state=self._state):
-            objective = compute_vmc_objective(
-                output.logabs,
-                total_local_energy,
-                nonfinite_policy=self._trainer.nonfinite_local_energy_policy,
+            objective = _compute_trainer_objective(
+                logabs=output.logabs, local_energy=total_local_energy, trainer=self._trainer
             )
+        score_local_energy, _clip_metrics = clip_local_energy_for_score(
+            total_local_energy,
+            mode=self._trainer.energy_clipping_mode,
+            k=self._trainer.energy_clipping_k,
+        )
         update_input = ScoreUpdateInput(
             batch=self._batch,
             wavefunction=output,
-            local_energy=total_local_energy,
+            local_energy=score_local_energy,
             step=self._step,
             parameter_scores=parameter_scores,
             parameter_binding=self._model.parameter_binding,
@@ -324,6 +348,12 @@ class _TrainerStepProducer:
     ) -> ProducedVMCStep[HamiltonianTangentUpdateInput]:
         """Produce detached scores and local-energy derivatives in one pass."""
 
+        if self._trainer.energy_clipping_mode != DEFAULT_ENERGY_CLIPPING_MODE:
+            raise ValueError(
+                "energy clipping is unsupported for the Linear Method "
+                "Hamiltonian-tangent route; choose energy_clipping_mode='none'"
+            )
+
         # No synthetic 0s Forward scope is emitted: the single-pass tangent
         # evaluator reuses the kinetic term's forward graph inside LocalEnergy.
         with self._context.scope(LocalEnergy(step=self._step), state=self._state):
@@ -338,10 +368,10 @@ class _TrainerStepProducer:
                 local_energy_fn=local_energy,
             )
         with self._context.scope(Objective(step=self._step), state=self._state):
-            objective = compute_vmc_objective(
-                update_input.wavefunction.logabs,
-                update_input.local_energy,
-                nonfinite_policy=self._trainer.nonfinite_local_energy_policy,
+            objective = _compute_trainer_objective(
+                logabs=update_input.wavefunction.logabs,
+                local_energy=update_input.local_energy,
+                trainer=self._trainer,
             )
         return ProducedVMCStep(
             update_input=update_input,
@@ -370,6 +400,11 @@ class _TrainerStepProducer:
             )
         energy_finite = torch.isfinite(energy_flat)
         n_finite = int(energy_finite.sum().item())
+        score_energy_flat, _clip_metrics = clip_local_energy_for_score(
+            energy_flat,
+            mode=self._trainer.energy_clipping_mode,
+            k=self._trainer.energy_clipping_k,
+        )
 
         def _detached_full_output() -> WavefunctionOutput:
             if (
@@ -386,10 +421,8 @@ class _TrainerStepProducer:
         if n_finite == 0 or (policy == "fail" and n_finite < n_samples):
             output = _detached_full_output()
             with self._context.scope(Objective(step=self._step), state=self._state):
-                objective = compute_vmc_objective(
-                    output.logabs,
-                    total_local_energy,
-                    nonfinite_policy=policy,
+                objective = _compute_trainer_objective(
+                    logabs=output.logabs, local_energy=total_local_energy, trainer=self._trainer
                 )
             # compute_vmc_objective raises loudly for both cases above; keep
             # an explicit guard in case a custom test stub intercepts it.
@@ -402,16 +435,14 @@ class _TrainerStepProducer:
         if flat_batch.n_electrons == 0 or n_finite < 2:
             output = _detached_full_output()
             with self._context.scope(Objective(step=self._step), state=self._state):
-                objective = compute_vmc_objective(
-                    output.logabs,
-                    total_local_energy,
-                    nonfinite_policy=policy,
+                objective = _compute_trainer_objective(
+                    logabs=output.logabs, local_energy=total_local_energy, trainer=self._trainer
                 )
             binding = _resolve_live_parameter_binding(self._model)
             update_input = StructuredCurvatureUpdateInput(
                 batch=self._batch,
                 wavefunction=output,
-                local_energy=total_local_energy,
+                local_energy=score_energy_flat.reshape(total_local_energy.shape),
                 step=self._step,
                 parameter_binding=binding,
                 solve_dtype=request.solve_dtype,
@@ -431,7 +462,7 @@ class _TrainerStepProducer:
 
         if n_finite == n_samples:
             # Fast path: all rows finite, one forward on the full batch.
-            weights = (energy_flat - energy_flat.mean()).detach() / float(n_samples)
+            weights = (score_energy_flat - score_energy_flat.mean()).detach() / float(n_samples)
             fwd_request = StructuredCurvatureForwardRequest(
                 sample_weights=weights,
                 solve_dtype=request.solve_dtype,
@@ -444,7 +475,7 @@ class _TrainerStepProducer:
             # Masked subset path under "mask": evaluate strictly on pinned
             # finite rows so dropped rows can never leak 0.0 * NaN = NaN.
             batch_pinned = select_flat_batch_mask(flat_batch, energy_finite)
-            energy_pinned = energy_flat[energy_finite]
+            energy_pinned = score_energy_flat[energy_finite]
             weights_pinned = (energy_pinned - energy_pinned.mean()).detach() / float(n_finite)
             fwd_request = StructuredCurvatureForwardRequest(
                 sample_weights=weights_pinned,
@@ -492,15 +523,13 @@ class _TrainerStepProducer:
                 )
 
         with self._context.scope(Objective(step=self._step), state=self._state):
-            objective = compute_vmc_objective(
-                output.logabs,
-                total_local_energy,
-                nonfinite_policy=policy,
+            objective = _compute_trainer_objective(
+                logabs=output.logabs, local_energy=total_local_energy, trainer=self._trainer
             )
         update_input = StructuredCurvatureUpdateInput(
             batch=self._batch,
             wavefunction=output,
-            local_energy=total_local_energy,
+            local_energy=score_energy_flat.reshape(total_local_energy.shape),
             step=self._step,
             parameter_binding=packet.parameter_binding,
             solve_dtype=packet.solve_dtype,
@@ -575,6 +604,8 @@ class VMCTrainer:
         update_method: UpdateMethodSpec = None,
         nonfinite_local_energy_policy: str = DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY,
         local_energy_chunk_size: int | None = None,
+        energy_clipping_mode: str = DEFAULT_ENERGY_CLIPPING_MODE,
+        energy_clipping_k: float = DEFAULT_ENERGY_CLIPPING_K,
     ) -> None:
         self.max_steps = int(max_steps)
         # Validated at construction so an invalid bound refuses before any
@@ -599,6 +630,8 @@ class VMCTrainer:
         self.nonfinite_local_energy_policy = resolve_nonfinite_local_energy_policy(
             nonfinite_local_energy_policy
         )
+        self.energy_clipping_mode = resolve_energy_clipping_mode(energy_clipping_mode)
+        self.energy_clipping_k = resolve_energy_clipping_k(energy_clipping_k)
         # These are populated at the invocation boundary.  Keeping the
         # resolved method and model here gives checkpoint restore one owner for
         # rebuilding direct parameter references after model weights load.
