@@ -28,7 +28,10 @@ from tpen.nn.cusp import (
     ElectronNucleusCuspLaw,
     LinearElectronNucleusCuspLaw,
     CurvatureElectronNucleusCuspLaw,
+    HookePairTailFactor,
+    HookeSingletTailFactor,
     TailSafeElectronNucleusCuspLaw,
+    SqrtOnePlusKappaR12Squared,
 )
 from tpen.nn.embedding import Embedding
 from tpen.nn.envelope import (
@@ -67,6 +70,13 @@ from tpen.nn.interaction_config import (
 from tpen.nn.mlp import MLP
 from tpen.nn.normalization import RMSNorm
 from tpen.nn.path_aggregation import PathAggregation
+from tpen.nn.readout import (
+    HookeSingletPositiveReadout,
+    HookeSingletReadout,
+    PositiveSingletReadout,
+    validate_hooke_singlet_batch,
+    validate_hooke_singlet_system,
+)
 from tpen.nn.tpen_layer import TPENLayer
 from tpen.nn.tpen_wave_function import TPENWaveFunction
 from tpen.nn.tpen_stack import TPENStack
@@ -100,6 +110,10 @@ __all__ = [
     "GaussianDecayGate",
     "GaussianConfinement",
     "HookeGaussianConfinement",
+    "HookePairTailFactor",
+    "HookeSingletPositiveReadout",
+    "HookeSingletReadout",
+    "HookeSingletTailFactor",
     "HookeHermiteBasis",
     "HookeOrbitalBasis",
     "LinearElectronNucleusCuspLaw",
@@ -112,11 +126,15 @@ __all__ = [
     "ParameterScoreRequest",
     "ParameterScoreProvider",
     "PathAggregation",
+    "PositiveSingletReadout",
+    "validate_hooke_singlet_batch",
+    "validate_hooke_singlet_system",
     "RawCoordinateBasis",
     "RMSNorm",
     "ReplaceUpdater",
     "ResidualUpdater",
     "SeededLinear",
+    "SqrtOnePlusKappaR12Squared",
     "StructuredCurvatureForwardPacket",
     "StructuredCurvatureForwardRequest",
     "StructuredCurvatureProvider",
