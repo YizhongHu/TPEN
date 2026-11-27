@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import builtins
 from pathlib import Path
+import subprocess
 
 import pytest
 
 from tpen_executor._codec import canonical_bytes, digest
 from tpen_executor.contracts import AllocationId, BackendJobId, BatchJobId, GroupId
 from tpen_executor.lifecycle.balsam import BalsamGroupParked, BalsamGroupRefusal, BalsamGroupRegistrationIntent, register_group
-from tpen_executor.lifecycle.balsam_client import BalsamBridgeAmbiguous, BalsamProcessClient, select_balsam_client_path
+from tpen_executor.lifecycle.balsam_client import (
+    BalsamBridgeAmbiguous,
+    BalsamBridgeFailure,
+    BalsamProcessClient,
+    SubprocessBalsamBridge,
+    select_balsam_client_path,
+)
 from tpen_executor.lifecycle.balsam_wire import BalsamWireError, BalsamWireRequest, BalsamWireResult, decode_request, decode_result, encode_request, encode_result
 from tpen_executor.storage import DirectoryStore
 
@@ -179,3 +186,94 @@ def test_client_rejects_crossed_response_identity(tmp_path: Path) -> None:
     client = BalsamProcessClient("/bin/sh", client_path=_client_file(tmp_path), bridge=bridge)
     with pytest.raises(Exception, match="crosses request identity"):
         client.observe(group, job)
+
+
+@pytest.mark.parametrize("operation", ["observe", "readback", "submit", "rearm"])
+def test_refusals_are_preserved_for_all_operations_and_mutation_replays(
+    tmp_path: Path, operation: str
+) -> None:
+    group = GroupId("group")
+    job = BackendJobId("job")
+    bridge = FakeBridge(lambda request: BalsamWireResult.refused(request, "not admitted"))
+    kwargs = {"state_dir": tmp_path / "state"} if operation in {"submit", "rearm"} else {}
+    client = BalsamProcessClient("/bin/sh", client_path=_client_file(tmp_path), bridge=bridge, **kwargs)
+    call = {
+        "observe": lambda c: c.observe(group, job),
+        "readback": lambda c: c.readback(group, job),
+        "submit": lambda c: c.submit_batch(group, job, _sha("batch")),
+        "rearm": lambda c: c.rearm_group(group, job, _sha("recovery")),
+    }[operation]
+    with pytest.raises(BalsamGroupRefusal, match="not admitted"):
+        call(client)
+    if operation in {"submit", "rearm"}:
+        reopened = BalsamProcessClient("/bin/sh", client_path=_client_file(tmp_path), bridge=bridge, **kwargs)
+        with pytest.raises(BalsamGroupRefusal, match="not admitted"):
+            call(reopened)
+        assert len(bridge.requests) == 1
+
+
+@pytest.mark.parametrize("mutation", ["submit", "rearm"])
+@pytest.mark.parametrize("foreign", ["group", "job", "operation", "orphan"])
+def test_cached_mutation_evidence_is_bound_before_replay(
+    tmp_path: Path, mutation: str, foreign: str
+) -> None:
+    group = GroupId("group")
+    job = BackendJobId("job")
+    request = (BalsamWireRequest.submit(group, job, _sha("batch")) if mutation == "submit"
+               else BalsamWireRequest.rearm(group, job, _sha("recovery")))
+    result = BalsamWireResult.ack(request, backend_job_id=job,
+                                  batch_job_id=BatchJobId("batch") if mutation == "submit" else None)
+    evidence = result.to_dict()
+    if foreign == "group":
+        evidence["group_id"] = GroupId("foreign").to_dict()
+    elif foreign == "job":
+        evidence["backend_job_id"] = BackendJobId("foreign").to_dict()
+    elif foreign == "operation":
+        evidence["operation"] = "rearm" if mutation == "submit" else "submit"
+    state = tmp_path / "state" / "balsam-wire" / digest(request.to_dict())
+    state.mkdir(parents=True)
+    if foreign != "orphan":
+        (state / "intent.json").write_bytes(canonical_bytes(request.to_dict()))
+        (state / "result.json").write_bytes(canonical_bytes(evidence))
+    bridge = FakeBridge(lambda _: pytest.fail("cached evidence must not call bridge"))
+    client = BalsamProcessClient("/bin/sh", client_path=_client_file(tmp_path), state_dir=tmp_path / "state", bridge=bridge)
+    with pytest.raises(BalsamBridgeFailure):
+        (client.submit_batch(group, job, _sha("batch")) if mutation == "submit"
+         else client.rearm_group(group, job, _sha("recovery")))
+    assert bridge.requests == []
+
+
+def test_subprocess_bridge_uses_fixed_transport(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    client_path = _client_file(tmp_path)
+    calls: list[dict[str, object]] = []
+
+    def run(argv, **kwargs):
+        calls.append({"argv": argv, **kwargs})
+        return subprocess.CompletedProcess(argv, 0, stdout=b"response", stderr=b"ignored")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    bridge = SubprocessBalsamBridge("/bin/sh", client_path)
+    assert bridge.call(b"request", timeout=2.0) == b"response"
+    assert calls[0]["argv"] == ("/bin/sh", "-m", "tpen_balsam_control.bridge")
+    assert calls[0]["input"] == b"request"
+    assert calls[0]["env"]["BALSAM_CLIENT_PATH"] == str(client_path)
+    assert calls[0]["capture_output"] is True and calls[0]["check"] is False
+
+
+@pytest.mark.parametrize("failure", ["timeout", "nonzero"])
+def test_subprocess_bridge_failures_are_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str) -> None:
+    def run(*args, **kwargs):
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired("bridge", 1)
+        return subprocess.CompletedProcess(args[0], 1, stdout=b"", stderr=b"error")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    bridge = SubprocessBalsamBridge("/bin/sh", _client_file(tmp_path))
+    with pytest.raises(BalsamBridgeAmbiguous):
+        bridge.call(b"request", timeout=1.0)
+
+
+def test_subprocess_bridge_rejects_empty_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, stdout=b"", stderr=b""))
+    with pytest.raises(BalsamBridgeAmbiguous):
+        SubprocessBalsamBridge("/bin/sh", _client_file(tmp_path)).call(b"request", timeout=1.0)

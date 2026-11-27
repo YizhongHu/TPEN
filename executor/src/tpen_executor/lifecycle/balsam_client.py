@@ -143,11 +143,16 @@ class BalsamProcessClient:
             raise
         except (TypeError, ValueError, OSError) as error:
             raise BalsamBridgeFailure("control bridge returned malformed data") from error
+        self._validate_response_identity(request, result)
+        return result
+
+    @staticmethod
+    def _validate_response_identity(request: BalsamWireRequest, result: BalsamWireResult) -> None:
+        """Bind every response to its request without inventing handles on refusals."""
         if result.operation != request.operation or result.group_id != request.group_id:
             raise BalsamBridgeFailure("control bridge response crosses request identity")
-        if request.backend_job_id is not None and result.backend_job_id != request.backend_job_id:
+        if result.status == "ack" and request.backend_job_id is not None and result.backend_job_id != request.backend_job_id:
             raise BalsamBridgeFailure("control bridge response crosses backend Job identity")
-        return result
 
     @staticmethod
     def _require_ack(request: BalsamWireRequest, result: BalsamWireResult) -> BalsamWireResult:
@@ -204,7 +209,20 @@ class BalsamProcessClient:
         intent_path = prefix / "intent.json"
         result_path = prefix / "result.json"
         if result_path.exists():
-            return self._require_ack(request, decode_result(result_path.read_bytes()))
+            try:
+                intent = intent_path.read_bytes()
+            except OSError as error:
+                raise BalsamBridgeFailure("mutation result has no readable intent") from error
+            if intent != canonical_bytes(request.to_dict()):
+                raise BalsamBridgeFailure("mutation intent does not match request")
+            try:
+                result = decode_result(result_path.read_bytes())
+                self._validate_response_identity(request, result)
+            except (BalsamBridgeFailure, TypeError, ValueError, OSError) as error:
+                if isinstance(error, BalsamBridgeFailure):
+                    raise
+                raise BalsamBridgeFailure("mutation result is malformed") from error
+            return self._require_ack(request, result)
         try:
             publish_json_exclusive(str(intent_path), canonical_bytes(request.to_dict()))
         except FileExistsError as error:
