@@ -1,0 +1,25 @@
+{
+  "mutants": [
+    {
+      "id": "v3-log-bypass-append-record",
+      "target": "tpen/callback/training_history_v3_writer.py",
+      "old": "append_record(\n        path,\n        line[:-1].decode(\"ascii\"),\n        fsync=_fsync_log,\n        no_follow=True,\n    )",
+      "new": "_write_all(os.open(path, os.O_WRONLY | os.O_APPEND), line)",
+      "killer": "tests/unit/test_durable_append.py::test_no_one_record_writer_opens_its_own_append_handle"
+    },
+    {
+      "id": "v3-log-fsync-callback-removed",
+      "target": "tpen/callback/training_history_v3_writer.py",
+      "old": "append_record(\n        path,\n        line[:-1].decode(\"ascii\"),\n        fsync=_fsync_log,\n        no_follow=True,\n    )",
+      "new": "append_record(\n        path,\n        line[:-1].decode(\"ascii\"),\n        no_follow=True,\n    )",
+      "killer": "tests/unit/callback/test_training_history_v3_writer.py::test_creation_and_capture_order_trace"
+    },
+    {
+      "id": "v3-partial-write-accepted",
+      "target": "tpen/durable_append.py",
+      "old": "if written != len(encoded):",
+      "new": "if False:",
+      "killer": "tests/unit/test_durable_append.py::test_the_append_handle_is_unbuffered_so_a_short_write_is_reported_not_retried"
+    }
+  ]
+}

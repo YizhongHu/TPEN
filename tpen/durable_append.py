@@ -81,7 +81,9 @@ pinned by a test; do not weaken it without changing the readers.
 from __future__ import annotations
 
 import io
+import os
 from pathlib import Path
+from typing import Callable
 
 __all__ = ["PartialAppendError", "append_record", "ends_without_newline"]
 
@@ -139,7 +141,13 @@ def ends_without_newline(path: Path) -> bool:
         return False
 
 
-def append_record(path: str | Path, record: str) -> None:
+def append_record(
+    path: str | Path,
+    record: str,
+    *,
+    fsync: Callable[[int], None] | None = None,
+    no_follow: bool = False,
+) -> None:
     """Append `record` as one newline-terminated line using a single write.
 
     Parameters
@@ -179,6 +187,13 @@ def append_record(path: str | Path, record: str) -> None:
         If the write stored fewer bytes than the encoded record.  The requested
         record was NOT committed; see that exception's note on what the file's
         final state may be.
+    fsync : callable, optional
+        Callback receiving the open file descriptor after a complete write and
+        before the handle is closed.
+    no_follow : bool, default=False
+        Open the append handle with ``O_NOFOLLOW`` in addition to the required
+        append flags.  The low-level flags remain owned by this primitive so
+        one-record writers do not construct their own append handles.
     """
 
     # Derived from the widest production reader, not from a character list:
@@ -205,15 +220,23 @@ def append_record(path: str | Path, record: str) -> None:
 
     # buffering=0 yields a raw FileIO: one write call in, one write syscall out,
     # with no BufferedWriter chunking the payload or retrying a short write.
-    with target.open("ab", buffering=0) as handle:
+    if not no_follow:
+        handle_context = target.open("ab", buffering=0)
+    else:
+        open_flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        open_flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(target, open_flags, 0o644)
+        handle_context = os.fdopen(fd, "ab", buffering=0)
+    with handle_context as handle:
         written = handle.write(encoded)
-
-    if written != len(encoded):
-        raise PartialAppendError(
-            f"partial append to {target}: stored {written} of {len(encoded)} bytes. "
-            "The requested record was NOT committed. Inspect the file before "
-            "assuming its final state: this does NOT necessarily leave an "
-            "unterminated last line. If a torn predecessor was being repaired, "
-            "the only stored byte may be the repair newline, in which case the "
-            "file ends in a newline and contains nothing of the new record."
-        )
+        if written != len(encoded):
+            raise PartialAppendError(
+                f"partial append to {target}: stored {written} of {len(encoded)} bytes. "
+                "The requested record was NOT committed. Inspect the file before "
+                "assuming its final state: this does NOT necessarily leave an "
+                "unterminated last line. If a torn predecessor was being repaired, "
+                "the only stored byte may be the repair newline, in which case the "
+                "file ends in a newline and contains nothing of the new record."
+            )
+        if fsync is not None:
+            fsync(handle.fileno())
