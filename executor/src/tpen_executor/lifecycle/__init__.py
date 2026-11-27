@@ -5,6 +5,7 @@ from .controller import AllocationLocalExecutor, GroupControllerFactsV1, GroupCo
 from .core_port import CoreAdmissionProcessPort, CoreAdmissionProcessRequest, ScienceProcessCoreAdmissionPort
 from .group_store import (CanonicalGroupBinding, GroupStoreAuthorityPublished, GroupStoreError, GroupStoreRefused, GroupStoreResult,
                           InitialGroupStoreRequest, ReentryGroupStoreRequest, initial, reentry)
+from .group_runtime import GroupRuntimeDispatcher, PackedGroupRequest, PreparedGroupInput
 
 __all__ = [
     "AllocationLocalExecutor",
@@ -18,9 +19,12 @@ __all__ = [
     "GroupStoreError",
     "GroupStoreRefused",
     "GroupStoreResult",
+    "GroupRuntimeDispatcher",
     "InitialGroupStoreRequest",
     "MemberLaunchResult",
     "ReentryGroupStoreRequest",
+    "PackedGroupRequest",
+    "PreparedGroupInput",
     "ScienceProcessCoreAdmissionPort",
     "initial",
     "reentry",

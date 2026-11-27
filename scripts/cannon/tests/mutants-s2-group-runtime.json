@@ -1,0 +1,25 @@
+{
+  "mutants": [
+    {
+      "id": "explicit-env",
+      "target": "executor/src/tpen_executor/lifecycle/group_runtime.py",
+      "old": "self.worker_program.materialize(env=self.env)",
+      "new": "self.worker_program.materialize()",
+      "killer": "executor/tests/test_s2_group_runtime.py::test_materialize_forwards_explicit_env_to_both_owner_processes"
+    },
+    {
+      "id": "finite-deadline",
+      "target": "executor/src/tpen_executor/lifecycle/group_runtime.py",
+      "old": "raise ValueError(\"timeouts must be positive\")",
+      "new": "pass",
+      "killer": "executor/tests/test_s2_group_runtime.py::test_dispatcher_has_finite_deadlines"
+    },
+    {
+      "id": "declared-capacity",
+      "target": "executor/src/tpen_executor/lifecycle/group_runtime.py",
+      "old": "capacity=len(slots) or 1, timeout=self.timeout",
+      "new": "capacity=len(prepared.group.members), timeout=self.timeout",
+      "killer": "executor/tests/test_s2_group_runtime.py::test_real_dispatcher_controller_local_executor_refills_two_slots"
+    }
+  ]
+}

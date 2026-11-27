@@ -1,4 +1,4 @@
-"""S2-L1 process-boundary tests (run on Cannon by the executor harness)."""
+"""S2-L1 process-boundary tests for the executor harness."""
 
 from __future__ import annotations
 
