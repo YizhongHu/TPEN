@@ -9,7 +9,7 @@ import pytest
 
 from tpen_executor._codec import digest
 from tpen_executor.contracts import BackendJobId, BatchJobId, GroupId
-from tpen_executor.lifecycle.balsam_wire import BalsamWireRequest
+from tpen_executor.lifecycle.balsam_wire import BalsamWireRequest, decode_result, encode_result
 
 CONTROL_SOURCE = Path(__file__).parents[1] / "control" / "balsam" / "src"
 if str(CONTROL_SOURCE) not in sys.path:
@@ -31,6 +31,36 @@ def _sha(seed: str) -> str:
     """Return a valid fixture digest."""
 
     return digest({"seed": seed})
+
+
+def _bootstrap_inputs(tmp_path: Path) -> dict[str, Path]:
+    """Create a repository-shaped control project and qualified tools."""
+
+    project = tmp_path / "repo" / "executor" / "control" / "balsam"
+    executor_source = project.parents[1] / "src"
+    control_source = project / "src"
+    executor_source.mkdir(parents=True)
+    control_source.mkdir(parents=True)
+    (project / "pyproject.toml").write_bytes(b"project")
+    (project / "uv.lock").write_bytes(b"lock")
+    (executor_source / "executor.py").write_bytes(b"executor")
+    (control_source / "bridge.py").write_bytes(b"bridge")
+    artifact = tmp_path / "executor.whl"
+    artifact.write_bytes(b"artifact")
+    python = tmp_path / "python"
+    uv = tmp_path / "uv"
+    for path, contents in ((python, b"python"), (uv, b"uv")):
+        path.write_bytes(contents)
+        path.chmod(0o755)
+    return {
+        "project_dir": project,
+        "lock": project / "uv.lock",
+        "executor_artifact": artifact,
+        "python": python,
+        "uv": uv,
+        "cache_dir": tmp_path / "uv-cache",
+        "prefix": tmp_path / "prefix",
+    }
 
 
 class FakeOperations:
@@ -95,6 +125,73 @@ def test_dispatch_preserves_typed_refusal_and_ambiguous_effect() -> None:
     assert ambiguous.status == "ambiguous" and ambiguous.reason == "lost response"
 
 
+@pytest.mark.parametrize("operation", ["register", "submit", "rearm"])
+@pytest.mark.parametrize("error_type", [TypeError, ValueError])
+def test_mutating_post_dispatch_errors_are_ambiguous(operation: str, error_type: type[Exception]) -> None:
+    """An effect recorded before response parsing must be reconciled."""
+
+    request = {
+        "register": BalsamWireRequest.register(GroupId("group"), _sha("group"), _sha("deployment")),
+        "submit": BalsamWireRequest.submit(GroupId("group"), BackendJobId("job"), _sha("batch")),
+        "rearm": BalsamWireRequest.rearm(GroupId("group"), BackendJobId("job"), _sha("recovery")),
+    }[operation]
+    fake = FakeOperations(error=error_type("response parsing failed"))
+    result = dispatch(request, fake)
+    assert len(fake.calls) == 1
+    assert fake.calls[0][0] == operation
+    assert result.status == "ambiguous"
+    assert decode_result(encode_result(result)) == result
+
+
+@pytest.mark.parametrize("operation", ["register", "submit", "rearm"])
+def test_malformed_mutating_responses_are_ambiguous(operation: str) -> None:
+    """Malformed handles or states after dispatch are unknown effects."""
+
+    class MalformedOperations(FakeOperations):
+        def _call(self, operation: str, *values: str) -> str:
+            self.calls.append((operation, values))
+            return ""
+
+    request = {
+        "register": BalsamWireRequest.register(GroupId("group"), _sha("group"), _sha("deployment")),
+        "submit": BalsamWireRequest.submit(GroupId("group"), BackendJobId("job"), _sha("batch")),
+        "rearm": BalsamWireRequest.rearm(GroupId("group"), BackendJobId("job"), _sha("recovery")),
+    }[operation]
+    fake = MalformedOperations()
+    result = dispatch(request, fake)
+    assert fake.calls[0][0] == operation
+    assert result.status == "ambiguous"
+    assert decode_result(encode_result(result)) == result
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        BalsamControlRefusal("rejected"),
+        BalsamControlAmbiguous("uncertain"),
+        RuntimeError("sdk failed"),
+        TypeError("bad response"),
+        ValueError("bad value"),
+    ],
+    ids=["refusal", "ambiguous", "generic", "type", "value"],
+)
+@pytest.mark.parametrize("operation", ["register", "observe", "submit", "rearm", "readback"])
+def test_all_operation_failures_round_trip(error: Exception, operation: str) -> None:
+    """Failure classification is operation-aware and codec-valid."""
+
+    request = {
+        "register": BalsamWireRequest.register(GroupId("group"), _sha("group"), _sha("deployment")),
+        "observe": BalsamWireRequest.observe(GroupId("group"), BackendJobId("job")),
+        "submit": BalsamWireRequest.submit(GroupId("group"), BackendJobId("job"), _sha("batch")),
+        "rearm": BalsamWireRequest.rearm(GroupId("group"), BackendJobId("job"), _sha("recovery")),
+        "readback": BalsamWireRequest.readback(GroupId("group"), BackendJobId("job")),
+    }[operation]
+    result = dispatch(request, FakeOperations(error=error))
+    expected = "ambiguous" if operation in {"register", "submit", "rearm"} and not isinstance(error, BalsamControlRefusal) else "refused"
+    assert result.status == expected
+    assert decode_result(encode_result(result)) == result
+
+
 def test_fixed_batch_output_paths_reject_arbitrary_optional_parameters() -> None:
     """Only the two generated output destinations are exposed."""
 
@@ -122,50 +219,77 @@ def test_sdk_identity_binds_every_artifact_digest() -> None:
 def test_prefix_manifest_is_outside_home_and_refuses_drift(tmp_path: Path) -> None:
     """A final prefix is content-bound and cannot silently change identity."""
 
-    project = tmp_path / "pyproject.toml"
-    lock = tmp_path / "uv.lock"
-    artifact = tmp_path / "executor.whl"
-    python = tmp_path / "python"
-    uv = tmp_path / "uv"
-    for path, contents in ((project, b"project"), (lock, b"lock"), (artifact, b"artifact"), (python, b"python"), (uv, b"uv")):
-        path.write_bytes(contents)
-        path.chmod(0o755)
-    prefix = tmp_path / "prefix"
+    paths = _bootstrap_inputs(tmp_path)
+    project, lock, artifact = paths["project_dir"], paths["lock"], paths["executor_artifact"]
+    python, uv, cache, prefix = paths["python"], paths["uv"], paths["cache_dir"], paths["prefix"]
     calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
 
     def run(argv, **kwargs):
         calls.append((tuple(argv), kwargs))
         return __import__("subprocess").CompletedProcess(argv, 0, stdout=b"", stderr=b"")
 
-    built = build_prefix(project, lock, artifact, python=python, uv=uv, prefix=prefix, runner=run)
+    built = build_prefix(project, lock, artifact, python=python, uv=uv, prefix=prefix, cache_dir=cache, runner=run)
     assert built["prefix"] == str(prefix)
-    assert calls[0][0][:2] == (str(uv), "sync")
-    assert calls[0][0][2] == "--locked"
+    assert calls[0][0] == (str(uv), "sync", "--locked", "--no-editable", "--project", str(project), "--python", str(python))
     assert calls[0][1]["env"]["UV_PROJECT_ENVIRONMENT"] == str(prefix)
-    assert build_prefix(project, lock, artifact, python=python, uv=uv, prefix=prefix, runner=run) == built
+    assert calls[0][1]["env"]["UV_CACHE_DIR"] == str(cache)
+    assert "XDG_CACHE_HOME" not in calls[0][1]["env"]
+    assert build_prefix(project, lock, artifact, python=python, uv=uv, prefix=prefix, cache_dir=cache, runner=run) == built
     lock.write_bytes(b"changed")
     with pytest.raises(BalsamControlRefusal, match="drifted"):
-        build_prefix(project, lock, artifact, python=python, uv=uv, prefix=prefix, runner=run)
+        build_prefix(project, lock, artifact, python=python, uv=uv, prefix=prefix, cache_dir=cache, runner=run)
+
+
+def test_prefix_manifest_binds_sources_inputs_and_executables(tmp_path: Path) -> None:
+    """Source, selected inputs, and same-path tool replacement refuse reuse."""
+
+    paths = _bootstrap_inputs(tmp_path)
+    run = lambda argv, **kwargs: __import__("subprocess").CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+    build_prefix(**paths, runner=run)
+    (paths["project_dir"] / "src" / "bridge.py").write_bytes(b"changed")
+    with pytest.raises(BalsamControlRefusal, match="drifted"):
+        build_prefix(**paths, runner=run)
+
+    paths = _bootstrap_inputs(tmp_path / "other")
+    build_prefix(**paths, runner=run)
+    paths["python"].write_bytes(b"replacement")
+    with pytest.raises(BalsamControlRefusal, match="drifted"):
+        build_prefix(**paths, runner=run)
+
+
+def test_prefix_manifest_rejects_unrelated_lock_and_artifact(tmp_path: Path) -> None:
+    """The command-selected lock and previously bound artifact cannot be swapped."""
+
+    paths = _bootstrap_inputs(tmp_path)
+    run = lambda argv, **kwargs: __import__("subprocess").CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+    build_prefix(**paths, runner=run)
+    unrelated_lock = tmp_path / "unrelated.lock"
+    unrelated_lock.write_bytes(b"other lock")
+    with pytest.raises(BalsamControlRefusal, match="selected project uv.lock"):
+        build_prefix(**{**paths, "lock": unrelated_lock}, runner=run)
+    unrelated_artifact = tmp_path / "unrelated.whl"
+    unrelated_artifact.write_bytes(b"other artifact")
+    with pytest.raises(BalsamControlRefusal, match="drifted"):
+        build_prefix(**{**paths, "executor_artifact": unrelated_artifact}, runner=run)
 
 
 def test_prefix_manifest_rejects_home_and_unmanifested_prefix(tmp_path: Path) -> None:
     """Home fallback and adoption of an unknown prefix are both refused."""
 
-    project = tmp_path / "project"
-    lock = tmp_path / "lock"
-    artifact = tmp_path / "artifact"
-    python = tmp_path / "python"
-    uv = tmp_path / "uv"
-    for path in (project, lock, artifact, python, uv):
-        path.write_bytes(b"identity")
-        path.chmod(0o755)
+    paths = _bootstrap_inputs(tmp_path)
+    project, lock, artifact = paths["project_dir"], paths["lock"], paths["executor_artifact"]
+    python, uv, cache = paths["python"], paths["uv"], paths["cache_dir"]
     with pytest.raises(BalsamControlRefusal, match="outside the home"):
-        prefix_manifest(project, lock, artifact, python=python, uv=uv, prefix=Path.home() / "control-prefix")
+        prefix_manifest(project, lock, artifact, python=python, uv=uv, prefix=Path.home() / "control-prefix", cache_dir=cache)
+    with pytest.raises(BalsamControlRefusal, match="cache_dir"):
+        prefix_manifest(project, lock, artifact, python=python, uv=uv, prefix=paths["prefix"])
+    with pytest.raises(BalsamControlRefusal, match="outside the home"):
+        prefix_manifest(project, lock, artifact, python=python, uv=uv, prefix=paths["prefix"], cache_dir=Path.home() / "uv-cache")
     prefix = tmp_path / "unmanifested"
     prefix.mkdir()
     (prefix / "foreign").write_bytes(b"foreign")
     with pytest.raises(BalsamControlRefusal, match="unmanifested"):
-        build_prefix(project, lock, artifact, python=python, uv=uv, prefix=prefix)
+        build_prefix(project, lock, artifact, python=python, uv=uv, prefix=prefix, cache_dir=cache)
 
 
 def test_bridge_validates_client_path_before_sdk_import(tmp_path: Path) -> None:

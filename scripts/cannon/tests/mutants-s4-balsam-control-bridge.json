@@ -10,8 +10,8 @@
     {
       "id": "bridge-drops-refusal-status",
       "target": "executor/control/balsam/src/tpen_balsam_control/bridge.py",
-      "old": "return BalsamWireResult.refused(request, str(error))",
-      "new": "return BalsamWireResult.ambiguous(request, str(error))",
+      "old": "return BalsamWireResult.refused(request, _error_reason(error, \"SDK operation refused\"))",
+      "new": "return BalsamWireResult.ambiguous(request, _error_reason(error, \"SDK operation refused\"))",
       "killer": "executor/tests/test_s4_balsam_control_bridge.py::test_dispatch_preserves_typed_refusal_and_ambiguous_effect"
     },
     {
@@ -34,6 +34,34 @@
       "old": "if not prefix.is_absolute() or _inside(prefix, Path.home()):",
       "new": "if not prefix.is_absolute() or False:",
       "killer": "executor/tests/test_s4_balsam_control_bridge.py::test_prefix_manifest_rejects_home_and_unmanifested_prefix"
+    },
+    {
+      "id": "bootstrap-project-file-to-uv",
+      "target": "executor/control/balsam/src/tpen_balsam_control/bootstrap.py",
+      "old": "\"--project\",\n            str(project_dir),",
+      "new": "\"--project\",\n            str(project_dir / \"pyproject.toml\"),",
+      "killer": "executor/tests/test_s4_balsam_control_bridge.py::test_prefix_manifest_is_outside_home_and_refuses_drift"
+    },
+    {
+      "id": "bootstrap-drops-owned-cache",
+      "target": "executor/control/balsam/src/tpen_balsam_control/bootstrap.py",
+      "old": "\"UV_CACHE_DIR\": str(selected_cache),",
+      "new": "\"UV_CACHE_DIR\": str(Path.home() / \".cache\" / \"uv\"),",
+      "killer": "executor/tests/test_s4_balsam_control_bridge.py::test_prefix_manifest_is_outside_home_and_refuses_drift"
+    },
+    {
+      "id": "bootstrap-ignores-control-source-drift",
+      "target": "executor/control/balsam/src/tpen_balsam_control/bootstrap.py",
+      "old": "\"control_source_digest\": _tree_digest(project_dir),",
+      "new": "\"control_source_digest\": _tree_digest(executor_source),",
+      "killer": "executor/tests/test_s4_balsam_control_bridge.py::test_prefix_manifest_binds_sources_inputs_and_executables"
+    },
+    {
+      "id": "bootstrap-records-python-path-only",
+      "target": "executor/control/balsam/src/tpen_balsam_control/bootstrap.py",
+      "old": "\"python\": _executable_identity(python),",
+      "new": "\"python\": {\"path\": str(python)},",
+      "killer": "executor/tests/test_s4_balsam_control_bridge.py::test_prefix_manifest_binds_sources_inputs_and_executables"
     }
   ]
 }

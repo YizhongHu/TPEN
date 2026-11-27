@@ -22,6 +22,16 @@ from tpen_executor.lifecycle.balsam_wire import (
 from .application import BalsamControlAmbiguous, BalsamControlRefusal, InjectedSDKOperations
 
 
+_MUTATING_OPERATIONS = frozenset(("register", "submit", "rearm"))
+
+
+def _error_reason(error: BaseException, prefix: str) -> str:
+    """Return a non-empty wire reason even for an empty exception message."""
+
+    detail = str(error).strip() or error.__class__.__name__
+    return detail if str(error).strip() else f"{prefix}: {detail}"
+
+
 def dispatch(request: BalsamWireRequest, operations: InjectedSDKOperations) -> BalsamWireResult:
     """Apply one of the five closed wire operations.
 
@@ -67,13 +77,22 @@ def dispatch(request: BalsamWireRequest, operations: InjectedSDKOperations) -> B
             state = operations.readback(str(request.group_id), str(request.backend_job_id))
             return BalsamWireResult.ack(request, backend_job_id=request.backend_job_id, state=state)
     except BalsamControlRefusal as error:
-        return BalsamWireResult.refused(request, str(error))
+        return BalsamWireResult.refused(request, _error_reason(error, "SDK operation refused"))
     except BalsamControlAmbiguous as error:
-        return BalsamWireResult.ambiguous(request, str(error))
+        reason = _error_reason(error, "SDK operation is ambiguous")
+        if request.operation in _MUTATING_OPERATIONS:
+            return BalsamWireResult.ambiguous(request, reason)
+        return BalsamWireResult.refused(request, reason)
     except (TypeError, ValueError) as error:
-        return BalsamWireResult.refused(request, f"invalid SDK response: {error}")
-    except Exception as error:  # External SDK failures are unknown-effect failures.
-        return BalsamWireResult.ambiguous(request, f"SDK operation failed: {error}")
+        reason = _error_reason(error, "invalid SDK response")
+        if request.operation in _MUTATING_OPERATIONS:
+            return BalsamWireResult.ambiguous(request, reason)
+        return BalsamWireResult.refused(request, reason)
+    except Exception as error:
+        reason = _error_reason(error, "SDK operation failed")
+        if request.operation in _MUTATING_OPERATIONS:
+            return BalsamWireResult.ambiguous(request, reason)
+        return BalsamWireResult.refused(request, reason)
     raise AssertionError(f"unhandled wire operation: {request.operation}")
 
 
