@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tpen-balsam-control"
+version = "0.1.0"
+description = "Isolated, pinned control-side Balsam SDK bridge."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "balsam==0.7.0a24",
+  "tpen-executor==0.1.0",
+]
+
+[project.scripts]
+tpen-balsam-bridge = "tpen_balsam_control.bridge:main"
+
+[dependency-groups]
+dev = [
+  "pytest==9.0.3",
+  "typeguard==4.5.2",
+]
+
+[tool.uv]
+python-preference = "only-managed"
+default-groups = ["dev"]
+environments = ["sys_platform == 'linux'", "sys_platform == 'darwin'"]
+
+[tool.uv.sources]
+tpen-executor = { path = "../..", editable = false }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "--typeguard-packages=tpen_balsam_control,tpen_executor"
+pythonpath = ["src"]
