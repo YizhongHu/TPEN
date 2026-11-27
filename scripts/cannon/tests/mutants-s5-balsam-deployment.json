@@ -53,7 +53,7 @@
       "id": "rendered-application-consumer-disconnected",
       "target": "executor/src/tpen_executor/deployment/balsam.py",
       "old": "        \"ApplicationDefinition = make_application_definition(\\n\"",
-      "new": "        \"ApplicationDefinition = _PinnedApplicationDefinition  # mutant: bypass concrete policy factory\\n\"",
+      "new": "        \"ApplicationDefinition = (lambda *args, **kwargs: _PinnedApplicationDefinition)(\\n\"",
       "killer": "executor/tests/test_s5_balsam_deployment.py::test_rendered_application_is_a_concrete_pinned_consumer"
     },
     {
@@ -80,8 +80,8 @@
     {
       "id": "application-post-mutation-readback-skipped",
       "target": "executor/src/tpen_executor/deployment/balsam.py",
-      "old": "        app = backend.read_application(spec.site_name, rendered.application_name)\n    if app is None:\n        raise BalsamDeploymentRefusal(\"application readback is absent after synchronization\")",
-      "new": "        app = app\n    if app is None:\n        raise BalsamDeploymentRefusal(\"application readback is absent after synchronization\")  # mutant: trust sync acknowledgement",
+      "old": "        backend.sync_application(spec.site_name, rendered.application_name, rendered.application)\n        app = backend.read_application(spec.site_name, rendered.application_name)",
+      "new": "        app = backend.sync_application(spec.site_name, rendered.application_name, rendered.application)  # mutant: trust sync acknowledgement",
       "killer": "executor/tests/test_s5_balsam_deployment.py::test_deploy_requires_post_mutation_readback"
     }
   ]

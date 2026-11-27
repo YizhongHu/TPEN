@@ -214,7 +214,13 @@ def test_deploy_requires_post_mutation_readback(tmp_path: Path, kind: str) -> No
         assert backend.calls == ["create-site"]
     else:
         backend.sites[spec.site_name] = dict(backend.site_record)
-        backend.app_after_sync = {**backend.app_record, "deployment_digest": "0" * 64}
+        backend.app_after_sync = dict(backend.app_record)
+
+        def read_application_conflict(site_name, application_name):
+            backend.reads.append("read-application")
+            return {**backend.app_record, "deployment_digest": "0" * 64}
+
+        backend.read_application = read_application_conflict
         with pytest.raises(BalsamDeploymentRefusal, match="deployment_digest"):
             deploy_owned_site(spec, backend)
         assert backend.calls == ["sync-application"]
@@ -281,7 +287,6 @@ def test_control_application_hooks_are_explicit() -> None:
     assert observations == ["timeout-awaiting-explicit-reentry", "error-awaiting-explicit-reentry"]
     with pytest.raises(Exception, match="grant-bound"):
         app.request_rearm()
-
 
 def test_rendered_application_is_a_concrete_pinned_consumer(tmp_path: Path) -> None:
     spec = _spec(tmp_path)
