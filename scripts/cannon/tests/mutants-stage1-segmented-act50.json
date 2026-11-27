@@ -20,6 +20,13 @@
       "old": "\"variant\": \"sigmoid\", \"activation\": \"torch.nn.Sigmoid\", \"layers\": \"original\",",
       "new": "\"variant\": \"sigmoid\", \"activation\": \"torch.nn.Tanh\", \"layers\": \"original\",",
       "killer": "experiments/atomistic/stage1/tests/test_segmented_act50_profiles.py::test_existing_profiles_rows_and_hashes_unchanged"
+    },
+    {
+      "id": "collector-legacy-admission",
+      "target": "experiments/atomistic/stage1/collect.py",
+      "old": "    admitted_hooke_profiles = {HOOKE_SCIENCE_PROFILE, *HOOKE2_ACT50_ALL_PROFILES}",
+      "new": "    from experiments.atomistic.stage1.protocol import HOOKE2_ACT50_PROFILES\n    admitted_hooke_profiles = {HOOKE_SCIENCE_PROFILE, *HOOKE2_ACT50_PROFILES}",
+      "killer": "experiments/atomistic/stage1/tests/test_review_act50_r1.py::test_act50_synthetic_producer_to_collector_requires_complete_a27"
     }
   ]
 }
