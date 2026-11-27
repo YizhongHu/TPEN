@@ -27,6 +27,13 @@
       "old": "    admitted_hooke_profiles = {HOOKE_SCIENCE_PROFILE, *HOOKE2_ACT50_ALL_PROFILES}",
       "new": "    from experiments.atomistic.stage1.protocol import HOOKE2_ACT50_PROFILES\n    admitted_hooke_profiles = {HOOKE_SCIENCE_PROFILE, *HOOKE2_ACT50_PROFILES}",
       "killer": "experiments/atomistic/stage1/tests/test_review_act50_r1.py::test_act50_synthetic_producer_to_collector_requires_complete_a27"
+    },
+    {
+      "id": "reuse-parent-history-destination",
+      "target": "tpen/callback/raw_training_batch_recorder.py",
+      "old": "        dest_root = _allocate_v3_segment_root(self.path, ref.next_iteration) if self.path.exists() else self.path",
+      "new": "        dest_root = self.path",
+      "killer": "experiments/atomistic/stage1/tests/test_segmented_act50_restart.py::test_planner_segmented_native_continuation_preserves_history"
     }
   ]
 }
