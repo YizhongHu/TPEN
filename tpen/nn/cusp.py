@@ -34,6 +34,8 @@ from tpen.data.permutation import Permutation
 from tpen.dependencies import require_torch, require_torch_functional, require_torch_nn
 from tpen.nn.envelope import Envelope
 from tpen.nn.factor import LogAmplitudeFactor, _inverse_softplus
+from tpen.nn.readout.positive_singlet import validate_hooke_singlet_batch, validate_hooke_singlet_system
+from tpen.physics.system import SystemDescriptor
 from tpen.nn.structured_curvature import (
     active_structured_curvature_session,
     softplus_derivative,
@@ -1196,8 +1198,46 @@ class ElectronElectronCusp(Envelope, LogAmplitudeFactor):
         return output
 
 
+class HookeSingletTailFactor(LogAmplitudeFactor):
+    """Analytic ``0.5*log1p(kappa*r12**2)`` Hooke-singlet tail factor.
+
+    ``kappa`` is a fixed configuration scalar.  Squared distance keeps this
+    factor smooth through coalescence and lets the existing coordinate-
+    autodiff kinetic path see the exact derivatives.
+    """
+
+    def __init__(
+        self,
+        *,
+        kappa: float,
+        system_descriptor: object | None = None,
+    ) -> None:
+        super().__init__()
+        value = float(kappa)
+        if not torch.isfinite(torch.tensor(value)) or value <= 0.0:
+            raise ValueError(f"kappa must be finite and strictly positive, got {kappa!r}")
+        self.kappa = value
+        self.system_descriptor = (
+            None if system_descriptor is None else validate_hooke_singlet_system(system_descriptor)
+        )
+
+    def factor_value(self, batch: ElectronBatch) -> torch.Tensor:
+        """Return the tail contribution in analytic log space."""
+
+        validate_hooke_singlet_batch(batch, system_descriptor=self.system_descriptor)
+        displacement = batch.positions[:, 0] - batch.positions[:, 1]
+        r12_squared = displacement.square().sum(dim=-1)
+        return 0.5 * torch.log1p(batch.positions.new_tensor(self.kappa) * r12_squared)
+
+
+HookePairTailFactor = HookeSingletTailFactor
+SqrtOnePlusKappaR12Squared = HookeSingletTailFactor
+
+
 __all__ = [
     "ElectronElectronCusp",
+    "HookePairTailFactor",
+    "HookeSingletTailFactor",
     "ElectronNucleusCusp",
     "ElectronNucleusCuspEvaluation",
     "ElectronNucleusCuspLaw",
@@ -1205,4 +1245,5 @@ __all__ = [
     "CurvatureElectronNucleusCuspLaw",
     "TailSafeElectronNucleusCuspLaw",
     "rational_pair_cusp",
+    "SqrtOnePlusKappaR12Squared",
 ]

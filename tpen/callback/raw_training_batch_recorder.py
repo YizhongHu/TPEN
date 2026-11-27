@@ -30,6 +30,7 @@ from tpen.events import Event as TypedEvent
 from tpen.events import Occurrence, Subscription
 from tpen.training.events import TrainingCompleted, TrainingIteration, TrainingIterationCompleted
 from tpen.training.state import TrainerState
+from tpen.run_events import RunCompleted
 
 from .base import StatefulCallback
 from .cadence import StepCadenceGate, SubscriptionGroup, pop_step_cadence
@@ -729,6 +730,50 @@ def _validate_v3_sidecar(
     return arrays, dict(sidecar)
 
 
+_SEGMENT_DIR_RE = re.compile(r"^seg_(\d{4,})_step_(\d{12,})$")
+
+
+def _segment_entries(root: Path) -> list[tuple[int, Path]]:
+    """Return sorted ``(segment_index, path)`` pairs under ``root / 'segments'``."""
+
+    segments_dir = root / "segments"
+    if not segments_dir.exists() and not segments_dir.is_symlink():
+        return []
+    if segments_dir.is_symlink() or not segments_dir.is_dir():
+        raise ValueError("v3 segments directory must be a non-symlink directory")
+    entries: list[tuple[int, Path]] = []
+    for child in segments_dir.iterdir():
+        match = _SEGMENT_DIR_RE.fullmatch(child.name)
+        if child.is_symlink() or not child.is_dir():
+            raise ValueError(f"v3 segment entry {child.name!r} must be a non-symlink directory")
+        if match is None:
+            raise ValueError(f"v3 segment entry {child.name!r} has invalid segment directory name")
+        entries.append((int(match.group(1)), child))
+    entries.sort(key=lambda item: (item[0], item[1].name))
+    return entries
+
+
+def _resolve_v3_tip(root: Path) -> Path:
+    """Resolve the active tip segment directory for ``root``."""
+
+    entries = _segment_entries(root)
+    return entries[-1][1] if entries else root
+
+
+def _allocate_v3_segment_root(root: Path, next_iteration: int) -> Path:
+    """Allocate a fresh, empty segment subdirectory under ``root / 'segments'``."""
+
+    if not root.is_dir() or root.is_symlink() or not (root / HISTORY_FILENAME).is_file():
+        raise FileExistsError("v3 history root must be a fresh, empty, non-symlink directory")
+    segments_dir = root / "segments"
+    segments_dir.mkdir(exist_ok=True)
+    if segments_dir.is_symlink():
+        raise ValueError("v3 segments directory must not be a symlink")
+    entries = _segment_entries(root)
+    next_index = max((idx for idx, _ in entries), default=1) + 1
+    return segments_dir / f"seg_{next_index:04d}_step_{next_iteration:012d}"
+
+
 class TrainingBatchReader:
     """Read v1/v2 manifests or a strict v3 lineage rooted at ``root``."""
 
@@ -738,16 +783,23 @@ class TrainingBatchReader:
         self._v3_completion: dict[str, int] | None = None
         self._has_read_view = False
 
+    def _v3_tip_root(self) -> Path | None:
+        tip = _resolve_v3_tip(self.root)
+        history_path = tip / HISTORY_FILENAME
+        if history_path.is_file():
+            raw = history_path.read_bytes()
+            header = _strict_json_loads(raw)
+            if isinstance(header, Mapping) and header.get("schema") == V3_SCHEMA:
+                return tip
+        return None
+
     def read(self, *, start_step: int | None = None, end_step: int | None = None) -> dict[str, np.ndarray]:
         """Validate the complete selected graph, then return an inclusive step range."""
 
-        if (self.root / HISTORY_FILENAME).is_file():
-            raw = (self.root / HISTORY_FILENAME).read_bytes()
-            header = _strict_json_loads(raw)
-            if isinstance(header, Mapping) and header.get("schema") == V3_SCHEMA:
-                result = self._read_v3(start_step=start_step, end_step=end_step, publish_provenance=True)
-                self._has_read_view = True
-                return result
+        if self._v3_tip_root() is not None:
+            result = self._read_v3(start_step=start_step, end_step=end_step, publish_provenance=True)
+            self._has_read_view = True
+            return result
         self._v3_completion = None
         result = self._read_legacy(start_step=start_step, end_step=end_step, publish_provenance=True)
         self._has_read_view = True
@@ -756,16 +808,13 @@ class TrainingBatchReader:
     def validate(self, *, require_complete: bool = False) -> None:
         """Validate every committed object; optionally require a v3 completion event."""
 
-        if (self.root / HISTORY_FILENAME).is_file():
-            raw = (self.root / HISTORY_FILENAME).read_bytes()
-            header = _strict_json_loads(raw)
-            if isinstance(header, Mapping) and header.get("schema") == V3_SCHEMA:
-                self._read_v3(
-                    require_complete=require_complete,
-                    retain_rows=False,
-                    publish_provenance=not self._has_read_view,
-                )
-                return
+        if self._v3_tip_root() is not None:
+            self._read_v3(
+                require_complete=require_complete,
+                retain_rows=False,
+                publish_provenance=not self._has_read_view,
+            )
+            return
         if require_complete:
             raise ValueError("require_complete is unavailable for legacy training histories")
         # Legacy validation deliberately republishes the current manifest view.
@@ -776,7 +825,7 @@ class TrainingBatchReader:
     def completion(self) -> dict[str, int] | None:
         """Return v3 completion counters, or ``None`` for open/legacy histories."""
 
-        if (self.root / HISTORY_FILENAME).is_file():
+        if self._v3_tip_root() is not None:
             self._read_v3(retain_rows=False, publish_provenance=False)
             return dict(self._v3_completion) if self._v3_completion is not None else None
         return None
@@ -840,8 +889,11 @@ class TrainingBatchReader:
         retain_rows: bool = True,
         publish_provenance: bool = True,
     ) -> dict[str, np.ndarray]:
+        tip_root = self._v3_tip_root()
+        if tip_root is None:
+            raise ValueError("v3 history is missing history.json or events.jsonl")
         node = self._load_v3_node(
-            self.root.resolve(),
+            tip_root.resolve(),
             stack=(),
             seen_streams=set(),
             limit=None,
@@ -1311,19 +1363,19 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
     digests.  Because partition plans are deterministic, this recorder only
     accepts the full cadence (``probability=1`` and ``max_calls=None``).
 
-    A restored ``train_resume`` lineage is refused before capture or file
-    publication. Full recorder resume semantics are deferred to item
-    ``7eaf9e0c``; accepting a resumed callback here would risk appending a
-    history whose lineage cannot be proven. Like ``InitialCheckpoint``, the
-    defensive first-lineage check runs at ``started(TrainingIteration)``:
-    this boundary is emitted before ``CollectSamples`` and therefore sees the
-    pre-update trainer cursor, rather than the post-update counters available
-    at ``TrainingIterationCompleted``.
+    The default v2 layout remains fresh-only. Opt in with
+    ``format_version=3`` for durable per-capture fragments and checkpoint-bound
+    continuation. Keep the same run-relative history path in each segment;
+    the checkpoint provenance identifies the parent run. Callback state is
+    reconstructed from that validated history, never serialized in checkpoints.
     """
 
     state_type: ClassVar[type[DomainState]] = TrainerState
 
-    def __init__(self, path: str | Path, *, partition_size_steps: int = 1000, **kwargs: Any) -> None:
+    def __init__(self, path: str | Path, *, partition_size_steps: int = 1000, format_version: int = 2, **kwargs: Any) -> None:
+        if format_version not in (2, 3):
+            raise ValueError("format_version must be 2 or 3")
+        self.format_version = format_version
         cadence = pop_step_cadence(kwargs)
         if cadence.probability != 1.0:
             raise ValueError("RawTrainingBatchRecorder requires probability=1.0")
@@ -1339,7 +1391,7 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
                     Subscription.of(TrainingCompleted),
                 )
             ),
-            SubscriptionGroup(selectors=(Subscription.of(CheckpointRestored),), stateless=True),
+            SubscriptionGroup(selectors=(Subscription.of(CheckpointRestored), Subscription.of(RunCompleted)), stateless=True),
         ), **kwargs)
         self.path = Path(path)
         self.partition_size_steps = int(partition_size_steps)
@@ -1348,6 +1400,10 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
         self.last_measurement: dict[str, Any] | None = None
         self._restored = False
         self._first_iteration_seen = False
+        self._v3_writer = None
+        self._restore_report = None
+        self._v3_counters = (0, 0)
+        self._v3_finished = False
 
     def handle_stateless_occurrence_impl(
         self, occurrence: Occurrence[TypedEvent], context: RunContext
@@ -1357,11 +1413,19 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
         del context
         if isinstance(occurrence.event, CheckpointRestored):
             self._restored = True
+            self._restore_report = occurrence.event.report
+        elif isinstance(occurrence.event, RunCompleted) and self.format_version == 3:
+            event = occurrence.event
+            if event.status == "planned_yield":
+                result = event.result
+                if result is None or self._v3_counters != (result.next_iteration, result.completed_updates):
+                    raise ValueError("v3 recorder did not observe the planned yield boundary")
+                self._finish_v3()
 
     def handle_occurrence_impl(self, occurrence: Occurrence[TypedEvent], context: RunContext, state: TrainerState) -> None:
         """Capture the state produced by the pre-update model at a scheduled step."""
 
-        if self._restored:
+        if self._restored and self.format_version == 2:
             raise ValueError(
                 "RawTrainingBatchRecorder refuses restored lineage before capture "
                 "or publication [unsupported-callback]"
@@ -1376,18 +1440,26 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
                 fresh_lineage = event.operation.step == 0 and all(
                     progress[key] == 0 for key in ("next_iteration", "completed_updates")
                 )
-                if not fresh_lineage:
+                if self.format_version == 3 and self._restored:
+                    self._resume_v3(context, progress)
+                elif not fresh_lineage:
                     raise ValueError(
                         "RawTrainingBatchRecorder refuses restored lineage before capture "
                         "or publication [unsupported-callback]"
                     )
             return
         if isinstance(event, TrainingCompleted):
-            self._publish(context, final=True)
+            if self.format_version == 3:
+                self._finish_v3()
+            else:
+                self._publish(context, final=True)
             return
         if not isinstance(event, TrainingIterationCompleted):
             return
-        if not self._steps.should_run(event.iteration.step):
+        scheduled = self._steps.should_run(event.iteration.step)
+        if not scheduled:
+            if self.format_version == 3:
+                self._advance_v3_unscheduled(event.iteration.step, context, state)
             return
         if state.batch is None or state.local_energy is None or state.wavefunction_output is None:
             raise ValueError("raw training recorder requires batch, local energy, and wavefunction output")
@@ -1404,7 +1476,10 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
             walker_index=np.arange(len(local_energy), dtype=np.int64),
             positions=positions,
             local_energy=local_energy,
-            term_energies={name: value.detach().cpu().numpy().reshape(-1) for name, value in state.local_energy_terms.items()},
+            term_energies={
+                name: state.local_energy_terms[name].detach().cpu().numpy().reshape(-1)
+                for name in (sorted(state.local_energy_terms) if self.format_version == 3 else state.local_energy_terms)
+            },
             logabs=output.logabs.detach().cpu().numpy().reshape(-1),
             sign=output.sign.detach().cpu().numpy().reshape(-1),
             finite=(
@@ -1420,6 +1495,9 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
                 )
             ),
         )
+        if self.format_version == 3:
+            self._capture_v3(record, context, state, scheduled=scheduled)
+            return
         index = record.iteration_step // self.partition_size_steps
         if self._partition is None or self._partition.partition_index != index:
             if self._partition is not None:
@@ -1439,6 +1517,155 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
         self._partition.append(record, sampler_stats=_sampler_provenance(state.sampler_stats))
         if self._partition.planned_steps and record.iteration_step == self._partition.planned_steps[-1]:
             self._publish(context)
+
+    def _resume_v3(self, context: RunContext, progress: Mapping[str, Any]) -> None:
+        """Bind the new segment to a validated parent and restored checkpoint."""
+        from .training_history_v3_writer import TrainingHistoryV3Writer
+
+        report = self._restore_report
+        if report is None or report.mode != "train_resume" or report.checkpoint_dir is None:
+            raise ValueError("v3 recorder requires train_resume checkpoint")
+        ref = checkpoint_ref(report.checkpoint_dir)
+        counters = (ref.next_iteration, ref.completed_updates)
+        if counters != (progress["next_iteration"], progress["completed_updates"]):
+            raise ValueError("v3 restored counters disagree with checkpoint")
+        run_dir = Path(context.metadata.run_dir).resolve()
+        resolved_path = self.path.resolve()
+        if resolved_path.is_relative_to(run_dir):
+            relative = resolved_path.relative_to(run_dir)
+            if not relative.parts:
+                raise ValueError("v3 history must be a child of the run directory")
+        else:
+            relative = Path(resolved_path.name)
+        source = ref.provenance.get("run_dir")
+        if not isinstance(source, str) or not Path(source).is_absolute():
+            raise ValueError("v3 checkpoint lacks source run directory")
+        parent_base = Path(source) / relative
+        parent_root = _resolve_v3_tip(parent_base)
+        reader = TrainingBatchReader(parent_root)
+        node = reader._load_v3_node(
+            parent_root.resolve(), stack=(), seen_streams=set(), limit=None, retain_rows=False,
+        )
+        if node.completion is None and parent_root != parent_base:
+            # If the latest segment crashed before completion, fall back to the newest complete predecessor.
+            candidates = [parent_base, *(path for _, path in _segment_entries(parent_base) if path != parent_root)]
+            for candidate in reversed(candidates):
+                candidate_node = reader._load_v3_node(
+                    candidate.resolve(), stack=(), seen_streams=set(), limit=None, retain_rows=False,
+                )
+                if candidate_node.completion is not None and candidate_node.completion["next_iteration"] >= ref.next_iteration:
+                    parent_root = candidate
+                    node = candidate_node
+                    break
+        contract = node.header["contract"]
+        if (contract["start_step"], contract["every_n_steps"], contract["partition_size_steps"]) != (
+            self._steps.cadence.start, self._steps.cadence.every_n, self.partition_size_steps,
+        ):
+            raise ValueError("v3 resumed cadence is incompatible with parent")
+        if not _v3_has_scheduled_prefix(node.active_steps, contract, ref.next_iteration):
+            raise ValueError("v3 parent has missing scheduled captures")
+        binding = {
+            "path": str(ref.checkpoint_dir.resolve()), "manifest_sha256": ref.manifest_sha256,
+            "model_sha256": ref.model_sha256, "next_iteration": ref.next_iteration,
+            "completed_updates": ref.completed_updates,
+        }
+        reader._validate_v3_checkpoint(binding, node.header, node, ref.next_iteration)
+        parent = {
+            "root": str(parent_root.resolve()), "event_count": len(node.events),
+            "prefix_sha256": node.digests[-1],
+        }
+        frontier = sum(
+            seal["end_step"] == (seal["group_index"] + 1) * self.partition_size_steps
+            and seal["end_step"] <= ref.next_iteration for seal in node.effective_seals
+        )
+        if frontier != ref.next_iteration // self.partition_size_steps:
+            raise ValueError("v3 parent lacks full window seals")
+        dest_root = _allocate_v3_segment_root(self.path, ref.next_iteration) if self.path.exists() else self.path
+        self._v3_writer = TrainingHistoryV3Writer(
+            dest_root, run_id=context.metadata.run_id, contract=contract,
+            origin="train_resume", parent=parent, checkpoint=binding,
+            supersede_from_step=ref.next_iteration, inherited_seal_frontier=frontier,
+            provenance=_context_provenance(context, None),
+        )
+        self._v3_counters = counters
+
+    def _ensure_v3_writer(
+        self,
+        context: RunContext,
+        state: TrainerState,
+        *,
+        walker_count: int,
+        n_electrons: int,
+        spatial_dim: int,
+        term_names: list[str],
+    ) -> None:
+        from .training_history_v3_writer import TrainingHistoryV3Writer
+
+        if self._v3_writer is not None:
+            return
+        contract = {
+            "coordinate": "iteration_step", "start_step": self._steps.cadence.start,
+            "every_n_steps": self._steps.cadence.every_n,
+            "partition_size_steps": self.partition_size_steps,
+            "walker_count": walker_count, "n_electrons": n_electrons,
+            "spatial_dim": spatial_dim, "term_names": term_names,
+            "capture_semantics": "pre_update_model_forward",
+        }
+        self._v3_writer = TrainingHistoryV3Writer(
+            self.path, run_id=context.metadata.run_id, contract=contract,
+            provenance=_context_provenance(context, state.sampler_stats),
+        )
+
+    def _advance_v3_unscheduled(self, step: int, context: RunContext, state: TrainerState) -> None:
+        """Advance v3 step counters and window seals without host tensor copies."""
+        if step != self._v3_counters[0]:
+            raise ValueError("v3 recorder iteration gap or duplicate")
+        if self._v3_writer is None:
+            if state.batch is None or state.local_energy is None or state.wavefunction_output is None:
+                raise ValueError("raw training recorder requires batch, local energy, and wavefunction output")
+            if state.local_energy_terms is None:
+                raise ValueError("raw training recorder requires trainer return_terms=True")
+            batch = state.batch
+            self._ensure_v3_writer(
+                context,
+                state,
+                walker_count=int(state.local_energy.reshape(-1).shape[0]),
+                n_electrons=int(batch.n_electrons),
+                spatial_dim=int(batch.spatial_dim),
+                term_names=sorted(state.local_energy_terms),
+            )
+        completed_updates = int(getattr(state.trainer, "completed_updates", 0))
+        self._v3_counters = (step + 1, completed_updates)
+        if self._v3_counters[0] % self.partition_size_steps == 0 and self._v3_writer is not None:
+            self._v3_writer.seal_window(step // self.partition_size_steps)
+
+    def _capture_v3(self, record: TrainingBatchRecord, context: RunContext,
+                    state: TrainerState, *, scheduled: bool) -> None:
+        """Publish each selected batch before acknowledging its iteration."""
+        if record.iteration_step != self._v3_counters[0]:
+            raise ValueError("v3 recorder iteration gap or duplicate")
+        self._ensure_v3_writer(
+            context,
+            state,
+            walker_count=record.n_walkers,
+            n_electrons=record.positions.shape[1],
+            spatial_dim=record.positions.shape[2],
+            term_names=sorted(record.term_names),
+        )
+        assert self._v3_writer is not None
+        if scheduled:
+            self._v3_writer.append_capture(record, sampler_stats=_sampler_provenance(state.sampler_stats))
+        self._v3_counters = (record.iteration_step + 1, record.completed_updates)
+        if self._v3_counters[0] % self.partition_size_steps == 0:
+            self._v3_writer.seal_window(record.iteration_step // self.partition_size_steps)
+
+    def _finish_v3(self) -> None:
+        """Seal a successful segment, never a failed or partially observed one."""
+        if self._v3_writer is not None and not self._v3_finished:
+            self._v3_writer.complete(
+                next_iteration=self._v3_counters[0], completed_updates=self._v3_counters[1],
+            )
+            self._v3_finished = True
 
     def _publish(self, context: RunContext, *, final: bool = False) -> None:
         """Publish the open partition and emit only measurement metadata."""
@@ -1461,6 +1688,10 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
 
         self._restored = False
         self._first_iteration_seen = False
+        self._v3_writer = None
+        self._restore_report = None
+        self._v3_counters = (0, 0)
+        self._v3_finished = False
 
 
 TrainingBatchRecorder = RawTrainingBatchRecorder
