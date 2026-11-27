@@ -45,8 +45,8 @@ def _bootstrap_inputs(tmp_path: Path) -> dict[str, Path]:
     (project / "uv.lock").write_bytes(b"lock")
     (executor_source / "executor.py").write_bytes(b"executor")
     (control_source / "bridge.py").write_bytes(b"bridge")
-    artifact = tmp_path / "executor.whl"
-    artifact.write_bytes(b"artifact")
+    (project.parents[1] / "pyproject.toml").write_bytes(b"executor project")
+    (project.parents[1] / "uv.lock").write_bytes(b"executor lock")
     python = tmp_path / "python"
     uv = tmp_path / "uv"
     for path, contents in ((python, b"python"), (uv, b"uv")):
@@ -55,7 +55,6 @@ def _bootstrap_inputs(tmp_path: Path) -> dict[str, Path]:
     return {
         "project_dir": project,
         "lock": project / "uv.lock",
-        "executor_artifact": artifact,
         "python": python,
         "uv": uv,
         "cache_dir": tmp_path / "uv-cache",
@@ -220,7 +219,7 @@ def test_prefix_manifest_is_outside_home_and_refuses_drift(tmp_path: Path) -> No
     """A final prefix is content-bound and cannot silently change identity."""
 
     paths = _bootstrap_inputs(tmp_path)
-    project, lock, artifact = paths["project_dir"], paths["lock"], paths["executor_artifact"]
+    project, lock = paths["project_dir"], paths["lock"]
     python, uv, cache, prefix = paths["python"], paths["uv"], paths["cache_dir"], paths["prefix"]
     calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
 
@@ -228,16 +227,16 @@ def test_prefix_manifest_is_outside_home_and_refuses_drift(tmp_path: Path) -> No
         calls.append((tuple(argv), kwargs))
         return __import__("subprocess").CompletedProcess(argv, 0, stdout=b"", stderr=b"")
 
-    built = build_prefix(project, lock, artifact, python=python, uv=uv, prefix=prefix, cache_dir=cache, runner=run)
+    built = build_prefix(project, lock, python=python, uv=uv, prefix=prefix, cache_dir=cache, runner=run)
     assert built["prefix"] == str(prefix)
     assert calls[0][0] == (str(uv), "sync", "--locked", "--no-editable", "--project", str(project), "--python", str(python))
     assert calls[0][1]["env"]["UV_PROJECT_ENVIRONMENT"] == str(prefix)
     assert calls[0][1]["env"]["UV_CACHE_DIR"] == str(cache)
     assert "XDG_CACHE_HOME" not in calls[0][1]["env"]
-    assert build_prefix(project, lock, artifact, python=python, uv=uv, prefix=prefix, cache_dir=cache, runner=run) == built
+    assert build_prefix(project, lock, python=python, uv=uv, prefix=prefix, cache_dir=cache, runner=run) == built
     lock.write_bytes(b"changed")
     with pytest.raises(BalsamControlRefusal, match="drifted"):
-        build_prefix(project, lock, artifact, python=python, uv=uv, prefix=prefix, cache_dir=cache, runner=run)
+        build_prefix(project, lock, python=python, uv=uv, prefix=prefix, cache_dir=cache, runner=run)
 
 
 def test_prefix_manifest_binds_sources_inputs_and_executables(tmp_path: Path) -> None:
@@ -256,9 +255,27 @@ def test_prefix_manifest_binds_sources_inputs_and_executables(tmp_path: Path) ->
     with pytest.raises(BalsamControlRefusal, match="drifted"):
         build_prefix(**paths, runner=run)
 
+    paths = _bootstrap_inputs(tmp_path / "executor-drift")
+    build_prefix(**paths, runner=run)
+    (paths["project_dir"].parents[1] / "pyproject.toml").write_bytes(b"replacement")
+    with pytest.raises(BalsamControlRefusal, match="drifted"):
+        build_prefix(**paths, runner=run)
 
-def test_prefix_manifest_rejects_unrelated_lock_and_artifact(tmp_path: Path) -> None:
-    """The command-selected lock and previously bound artifact cannot be swapped."""
+    paths = _bootstrap_inputs(tmp_path / "executor-source-drift")
+    build_prefix(**paths, runner=run)
+    (paths["project_dir"].parents[1] / "src" / "executor.py").write_bytes(b"replacement")
+    with pytest.raises(BalsamControlRefusal, match="drifted"):
+        build_prefix(**paths, runner=run)
+
+    paths = _bootstrap_inputs(tmp_path / "uv-drift")
+    build_prefix(**paths, runner=run)
+    paths["uv"].write_bytes(b"replacement")
+    with pytest.raises(BalsamControlRefusal, match="drifted"):
+        build_prefix(**paths, runner=run)
+
+
+def test_prefix_manifest_rejects_unrelated_lock_and_arbitrary_artifact(tmp_path: Path) -> None:
+    """The selected lock is bound and no arbitrary artifact is accepted."""
 
     paths = _bootstrap_inputs(tmp_path)
     run = lambda argv, **kwargs: __import__("subprocess").CompletedProcess(argv, 0, stdout=b"", stderr=b"")
@@ -267,29 +284,38 @@ def test_prefix_manifest_rejects_unrelated_lock_and_artifact(tmp_path: Path) -> 
     unrelated_lock.write_bytes(b"other lock")
     with pytest.raises(BalsamControlRefusal, match="selected project uv.lock"):
         build_prefix(**{**paths, "lock": unrelated_lock}, runner=run)
-    unrelated_artifact = tmp_path / "unrelated.whl"
-    unrelated_artifact.write_bytes(b"other artifact")
-    with pytest.raises(BalsamControlRefusal, match="drifted"):
-        build_prefix(**{**paths, "executor_artifact": unrelated_artifact}, runner=run)
+    with pytest.raises(TypeError):
+        build_prefix(**{**paths, "executor_artifact": tmp_path / "unrelated.whl"}, runner=run)
 
 
 def test_prefix_manifest_rejects_home_and_unmanifested_prefix(tmp_path: Path) -> None:
     """Home fallback and adoption of an unknown prefix are both refused."""
 
     paths = _bootstrap_inputs(tmp_path)
-    project, lock, artifact = paths["project_dir"], paths["lock"], paths["executor_artifact"]
+    project, lock = paths["project_dir"], paths["lock"]
     python, uv, cache = paths["python"], paths["uv"], paths["cache_dir"]
     with pytest.raises(BalsamControlRefusal, match="outside the home"):
-        prefix_manifest(project, lock, artifact, python=python, uv=uv, prefix=Path.home() / "control-prefix", cache_dir=cache)
+        prefix_manifest(project, lock, python=python, uv=uv, prefix=Path.home() / "control-prefix", cache_dir=cache)
     with pytest.raises(BalsamControlRefusal, match="cache_dir"):
-        prefix_manifest(project, lock, artifact, python=python, uv=uv, prefix=paths["prefix"])
+        prefix_manifest(project, lock, python=python, uv=uv, prefix=paths["prefix"])
     with pytest.raises(BalsamControlRefusal, match="outside the home"):
-        prefix_manifest(project, lock, artifact, python=python, uv=uv, prefix=paths["prefix"], cache_dir=Path.home() / "uv-cache")
+        prefix_manifest(project, lock, python=python, uv=uv, prefix=paths["prefix"], cache_dir=Path.home() / "uv-cache")
     prefix = tmp_path / "unmanifested"
     prefix.mkdir()
     (prefix / "foreign").write_bytes(b"foreign")
     with pytest.raises(BalsamControlRefusal, match="unmanifested"):
-        build_prefix(project, lock, artifact, python=python, uv=uv, prefix=prefix, cache_dir=cache)
+        build_prefix(project, lock, python=python, uv=uv, prefix=prefix, cache_dir=cache)
+
+
+def test_prefix_manifest_rejects_nested_outputs(tmp_path: Path) -> None:
+    """Build outputs cannot become source-build inputs."""
+
+    paths = _bootstrap_inputs(tmp_path)
+    for field, nested in (("prefix", paths["project_dir"] / ".venv"), ("cache_dir", paths["project_dir"] / "cache")):
+        with pytest.raises(BalsamControlRefusal, match="overlap"):
+            prefix_manifest(**{**paths, field: nested})
+    with pytest.raises(BalsamControlRefusal, match="overlap"):
+        prefix_manifest(**{**paths, "cache_dir": paths["prefix"] / "cache"})
 
 
 def test_bridge_validates_client_path_before_sdk_import(tmp_path: Path) -> None:

@@ -52,8 +52,8 @@
     {
       "id": "bootstrap-ignores-control-source-drift",
       "target": "executor/control/balsam/src/tpen_balsam_control/bootstrap.py",
-      "old": "\"control_source_digest\": _tree_digest(project_dir),",
-      "new": "\"control_source_digest\": _tree_digest(executor_source),",
+      "old": "\"control_source_digest\": _source_build_digest(project_dir, include_lock=True),",
+      "new": "\"control_source_digest\": _source_build_digest(project_dir.parents[1], include_lock=True),",
       "killer": "executor/tests/test_s4_balsam_control_bridge.py::test_prefix_manifest_binds_sources_inputs_and_executables"
     },
     {

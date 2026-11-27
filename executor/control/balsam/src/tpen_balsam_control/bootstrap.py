@@ -58,6 +58,27 @@ def _tree_digest(root: Path) -> str:
     return result.hexdigest()
 
 
+def _source_build_digest(root: Path, *, include_lock: bool) -> str:
+    """Hash only the files that define one source build."""
+
+    result = hashlib.sha256()
+    inputs = [root / "pyproject.toml"]
+    if include_lock and (root / "uv.lock").exists():
+        inputs.append(root / "uv.lock")
+    inputs.append(root / "src")
+    for path in inputs:
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        result.update(len(relative).to_bytes(8, "big"))
+        result.update(relative)
+        if path.name == "src":
+            content = bytes.fromhex(_tree_digest(path))
+        else:
+            content = path.read_bytes()
+        result.update(len(content).to_bytes(8, "big"))
+        result.update(content)
+    return result.hexdigest()
+
+
 def _executable_identity(path: Path) -> dict[str, str]:
     """Return the resolved executable path and its current bytes digest."""
 
@@ -100,7 +121,6 @@ def _validate_cache_dir(cache_dir: Path | None) -> Path:
 def prefix_manifest(
     project_dir: Path,
     lock: Path,
-    executor_artifact: Path,
     *,
     python: Path,
     uv: Path,
@@ -113,20 +133,24 @@ def prefix_manifest(
         raise BalsamControlRefusal("control prefix must be absolute and outside the home directory")
     selected_project, selected_lock = _selected_project_inputs(project_dir, lock)
     cache = _validate_cache_dir(cache_dir)
-    artifact = executor_artifact.resolve()
-    if not executor_artifact.is_absolute() or not artifact.is_file() or artifact.is_symlink():
-        raise BalsamControlRefusal(f"executor artifact is unavailable: {executor_artifact}")
-    executor_source = project_dir.parents[1] / "src"
+    executor_root = project_dir.parents[1].resolve()
+    selected_prefix = prefix.resolve()
+    if _inside(selected_prefix, project_dir.resolve()) or _inside(selected_prefix, executor_root):
+        raise BalsamControlRefusal("prefix must not overlap project or executor inputs")
+    if _inside(cache, project_dir.resolve()) or _inside(cache, executor_root):
+        raise BalsamControlRefusal("cache_dir must not overlap project or executor inputs")
+    if _inside(selected_prefix, cache) or _inside(cache, selected_prefix):
+        raise BalsamControlRefusal("prefix and cache_dir must not overlap")
+    if not (executor_root / "pyproject.toml").is_file() or not (executor_root / "src").is_dir():
+        raise BalsamControlRefusal("executor source-build inputs are unavailable")
     return {
         "schema": MANIFEST_SCHEMA,
         "project_dir": str(project_dir.resolve()),
         "project_digest": _file_digest(selected_project),
         "lock_path": str(selected_lock.resolve()),
         "lock_digest": _file_digest(selected_lock),
-        "executor_artifact_path": str(artifact),
-        "executor_artifact_digest": _file_digest(artifact),
-        "executor_source_digest": _tree_digest(executor_source),
-        "control_source_digest": _tree_digest(project_dir),
+        "executor_source_digest": _source_build_digest(executor_root, include_lock=True),
+        "control_source_digest": _source_build_digest(project_dir, include_lock=True),
         "python": _executable_identity(python),
         "uv": _executable_identity(uv),
         "cache_dir": str(cache),
@@ -154,8 +178,6 @@ def prefix_manifest_fields() -> tuple[str, ...]:
         "project_digest",
         "lock_path",
         "lock_digest",
-        "executor_artifact_path",
-        "executor_artifact_digest",
         "executor_source_digest",
         "control_source_digest",
         "python",
@@ -168,7 +190,6 @@ def prefix_manifest_fields() -> tuple[str, ...]:
 def build_prefix(
     project_dir: Path,
     lock: Path,
-    executor_artifact: Path,
     *,
     python: Path,
     uv: Path,
@@ -186,7 +207,6 @@ def build_prefix(
     manifest = prefix_manifest(
         project_dir,
         lock,
-        executor_artifact,
         python=python,
         uv=uv,
         prefix=prefix,
