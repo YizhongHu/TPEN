@@ -6,8 +6,17 @@ from pathlib import Path
 from types import SimpleNamespace
 import hashlib
 import pytest
+from hydra.utils import instantiate
+from omegaconf import OmegaConf
+import yaml
 
-from experiments.atomistic.soap_pilot.composer import R2_PROFILES, TARGET_PROFILES, render_eval, render_profile
+from experiments.atomistic.soap_pilot.composer import (
+    R2_PROFILES,
+    TARGET_PROFILES,
+    _OVERLAY_BASE,
+    render_eval,
+    render_profile,
+)
 from experiments.atomistic.soap_pilot.p3_render import finalize_eval_row, render_eval_template
 from experiments.atomistic.soap_pilot.rows import (
     CampaignMember,
@@ -118,6 +127,40 @@ def test_every_roster_train_profile_has_golden_render_and_callback_policy(tmp_pa
         assert callback["accelerator_synchronize"] is profile.train_timing_synchronize
     run_timing = next(callback for callback in callbacks if callback["_target_"] == "tpen.callback.RunTiming")
     assert run_timing["accelerator_synchronize"] is True
+
+
+@pytest.mark.parametrize("profile", [*R2_PROFILES, *TARGET_PROFILES], ids=lambda profile: profile.name)
+def test_every_rendered_train_callback_hydra_instantiates_on_cpu(tmp_path: Path, profile) -> None:
+    """Every rendered callback has a constructible Hydra configuration."""
+
+    results = tmp_path / "results"
+    rendered = render_profile(
+        profile,
+        output_dir=results / "inputs",
+        results_root=str(results),
+        source_sha="7b88f833babcb82148c8f975a08b53970838be6a",
+        device="cpu",
+    )
+    callbacks = rendered.rendered.values["callbacks"]
+    assert callbacks
+
+    if profile.family in {"adam", "soap"}:
+        overlay = yaml.safe_load(_OVERLAY_BASE.read_text(encoding="utf-8"))
+        overlay_optimizer_state = next(
+            item for item in overlay["callbacks"] if item["_target_"] == "tpen.callback.OptimizerState"
+        )
+        rendered_optimizer_state = next(
+            item for item in callbacks if item["_target_"] == "tpen.callback.OptimizerState"
+        )
+        assert rendered_optimizer_state["groups"] == overlay_optimizer_state["groups"]
+
+    for index, callback in enumerate(callbacks):
+        try:
+            instance = instantiate(OmegaConf.create(callback))
+        except Exception as exc:
+            target = callback.get("_target_", "<missing target>")
+            raise AssertionError(f"{profile.name} callback {index} ({target}) failed to instantiate") from exc
+        assert instance is not None
 
 
 def test_r2_20_is_distinct_unsynchronized_cross_check(tmp_path: Path) -> None:

@@ -140,11 +140,18 @@ def _callbacks(base: list[Mapping[str, Any]], family: str, profile: str, *, sync
         "tpen.callback.ParameterActivity",
         "tpen.callback.Checkpoint",
     }
+    optimizer_state = next(
+        (deepcopy(item) for item in base if item.get("_target_") == "tpen.callback.OptimizerState"),
+        None,
+    )
     callbacks = [item for item in deepcopy(base) if item.get("_target_") not in dynamic_targets]
     # The protocol requires OptimizerState for Adam/SOAP only.  This is a
     # policy derived from the P0 contract, not a Stage-1 optimizer branch.
     if family in {"adam", "soap"}:
-        callbacks.append(_callback("tpen.callback.OptimizerState", every_n_steps=1))
+        if optimizer_state is None or "groups" not in optimizer_state:
+            raise ValueError("OptimizerState callback requires groups in the base overlay")
+        optimizer_state["every_n_steps"] = 1
+        callbacks.append(optimizer_state)
     callbacks.append(_callback("tpen.callback.RawTrainingBatchRecorder", path="${run.dir}/training_history", every_n_steps=50, partition_size_steps=1000))
     callbacks.append(_callback("tpen.callback.Checkpoint", terminal=False, schedule={"_target_": "tpen.checkpoint.ExplicitUpdates", "updates": "${checkpoint_steps}"}, payload={"_target_": "tpen.checkpoint.TrainResume"}, output_dir="${run.dir}/checkpoints"))
     callbacks.append(_callback("tpen.callback.InitialCheckpoint", output_dir="${run.dir}/checkpoints"))
