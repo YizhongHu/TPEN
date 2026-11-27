@@ -1404,7 +1404,7 @@ def _validate_science_profile_for_row(row: Mapping[str, Any]) -> None:
     if not is_model_profile(profile) and profile != HOOKE_SCIENCE_PROFILE:
         raise ProtocolError(f"unknown science profile {profile!r}")
     if is_he_sigmoid_profile(profile) and row.get("system") != "he":
-        raise ProtocolError("He sigmoid profile only admits the he system")
+        raise ProtocolError("He sigmoid row only admits the he system")
 
 
 def _validate_he_sigmoid_train_row(row: Mapping[str, Any]) -> None:

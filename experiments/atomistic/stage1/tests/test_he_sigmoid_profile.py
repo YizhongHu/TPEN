@@ -179,7 +179,7 @@ def test_he_sigmoid_manifest_identity_and_admission_are_he_only() -> None:
                                                     if row["kind"] == "train"}
     assert config_identities(config_root=CONFIG_ROOT, systems=("he",))["he"] != rows[0]["config_sha256"]
 
-    with pytest.raises(ProtocolError, match="He sigmoid profile"):
+    with pytest.raises(ProtocolError, match="He sigmoid profile only admits the he system"):
         build_manifest(
             protocol=STAGE1_PROTOCOL, source_sha="a" * 40,
             config_sha256=config_identities(config_root=CONFIG_ROOT, systems=("h2",)),
