@@ -64,7 +64,7 @@ def _fake_gpu_python(
     )
     record_driver += (
         f"  printf 'OMP_NUM_THREADS=%s\\nMKL_NUM_THREADS=%s\\n' "
-        f'"$OMP_NUM_THREADS" "$MKL_NUM_THREADS" > {shlex.quote(str(driver_env_sentinel))}\n'
+        f'"$OMP_NUM_THREADS" "$MKL_NUM_THREADS" >> {shlex.quote(str(driver_env_sentinel))}\n'
         if driver_env_sentinel is not None else ""
     )
     python.write_text(
