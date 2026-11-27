@@ -118,6 +118,8 @@ class CheckpointEvidence:
     model_sha256: str
     complete: bool
     files: Mapping[str, str]
+    parent_run_id: str | None = None
+    parent_output_dir: str | None = None
 
     def validate(self, *, expected_step: int | None = None) -> None:
         """Validate the named publication without discovering sibling files."""
@@ -133,6 +135,10 @@ class CheckpointEvidence:
             raise RowContractError("checkpoint publication is not COMPLETE")
         if not isinstance(self.files, Mapping) or "model.pt" not in self.files or "COMPLETE" not in self.files:
             raise RowContractError("checkpoint publication must name model.pt and COMPLETE")
+        if self.parent_run_id is not None and (not isinstance(self.parent_run_id, str) or not self.parent_run_id):
+            raise RowContractError("checkpoint publication parent run identity is invalid")
+        if self.parent_output_dir is not None:
+            _path(self.parent_output_dir, "checkpoint publication parent output directory")
 
 
 @dataclass(frozen=True)

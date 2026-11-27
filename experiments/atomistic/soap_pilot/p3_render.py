@@ -13,7 +13,10 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 import re
+import sys
 from typing import Any, Mapping
+
+import yaml
 
 from experiments.atomistic.stage1.launch import command_for_row
 from experiments.atomistic.stage1.launch import _binding_token
@@ -28,6 +31,7 @@ from .composer import (
     ComposedRow,
     PilotProfile,
     R2_PROFILES,
+    TARGET_PROFILES,
     _materialize_eval,
     _write_yaml,
     render_profile,
@@ -44,6 +48,9 @@ from .rows import (
 
 
 _HOOKE2_PHYSICAL_SYSTEM_ID = planned_physical_system_ids()["hooke2"]
+_PBS_STAGE1_SHA256 = "52c83a78a5f65b3b6af929ff3b524fa06ccca00baf1f76ddff669d6e202acebc"
+_PBS_STAGE1_PIN_COMMIT = "8857d9ea3119b195684fa0cb69beaaebb676dd6c"
+_MISSING = object()
 
 
 class P3RenderError(ValueError):
@@ -83,6 +90,9 @@ def admit_row_and_command(
 
     try:
         validate_row(row, expected_kind=row.get("kind"))
+        config_path = Path(row["row_extension"]["rendered_config"]["path"])
+        rendered_values = yaml.safe_load(config_path.read_bytes())
+        _audit_packet_recipe(row, rendered_values, python=python, checkout_root=checkout_root)
         admitted = validate_gateway_binding(
             binding=_binding_token(row), expected_kinds={row["kind"]},
         )
@@ -112,6 +122,14 @@ def render_r2_train_packet(
         )
         for profile in profiles
     }
+    for profile in profiles:
+        composed = packet[profile.name]
+        _audit_packet_recipe(
+            composed.row,
+            composed.rendered.values,
+            python=sys.executable,
+            checkout_root=str(Path(__file__).resolve().parents[3]),
+        )
     rows = [entry.row for entry in packet.values()]
     if len({row["run_id"] for row in rows}) != len(rows):
         raise P3RenderError("R2 packet run identities are not singleton")
@@ -146,8 +164,12 @@ def finalize_eval_row(
     directory, and their identities must agree with the publication evidence.
     """
 
-    if publication.step != template.checkpoint_step:
-        raise P3RenderError("SOAP publication is not checkpoint-100")
+    if not _is_approved_soap100_row(train_row):
+        raise P3RenderError("SOAP100 eval requires the approved SOAP optimizer family and recipe")
+    try:
+        publication.validate(expected_step=template.checkpoint_step)
+    except RowContractError as exc:
+        raise P3RenderError(f"SOAP publication evidence is invalid: {exc}") from exc
     if not publication.publication_id or publication.publication_id in {"zero", "duplicate", "missing"}:
         raise P3RenderError("SOAP100 publication identity is missing or non-unique")
     checkpoint_root = Path(checkpoint_dir).resolve()
@@ -155,11 +177,26 @@ def finalize_eval_row(
     complete = checkpoint_root / "COMPLETE"
     if not model.is_file() or not complete.is_file():
         raise P3RenderError("SOAP100 publication is not COMPLETE with model.pt")
-    model_sha = hashlib.sha256(model.read_bytes()).hexdigest()
+    named_model = Path(publication.files["model.pt"]).resolve()
+    named_complete = Path(publication.files["COMPLETE"]).resolve()
+    if named_model != model or named_complete != complete:
+        raise P3RenderError("publication named files do not match checkpoint directory")
+    model_bytes = model.read_bytes()
+    complete_bytes = complete.read_bytes()
+    if not complete_bytes:
+        raise P3RenderError("SOAP100 COMPLETE publication marker is empty")
+    model_sha = hashlib.sha256(model_bytes).hexdigest()
     if model_sha != publication.model_sha256:
         raise P3RenderError("SOAP100 model.pt hash disagrees with publication")
     if not publication.complete:
         raise P3RenderError("SOAP100 publication is not COMPLETE")
+    if publication.parent_run_id is not None and publication.parent_run_id != train_row.get("run_id"):
+        raise P3RenderError("SOAP100 publication parent run identity does not match train row")
+    if publication.parent_output_dir is not None:
+        try:
+            checkpoint_root.relative_to(Path(publication.parent_output_dir).resolve())
+        except ValueError as exc:
+            raise P3RenderError("SOAP100 checkpoint is outside the parent's output location") from exc
     if parent.row_id != train_row.get("row_id"):
         raise P3RenderError("SOAP100 publication parent does not match train row")
     try:
@@ -192,6 +229,12 @@ def render_pbs_audit() -> dict[str, Any]:
 
     wrapper = Path(__file__).resolve().parents[1] / "stage1" / "polaris" / "pbs_stage1.sh"
     text = wrapper.read_text(encoding="utf-8")
+    actual_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if actual_sha != _PBS_STAGE1_SHA256:
+        raise P3RenderError(
+            "PBS wrapper digest drift: "
+            f"expected {_PBS_STAGE1_SHA256} from {_PBS_STAGE1_PIN_COMMIT}, got {actual_sha}"
+        )
     lines = text.splitlines()
 
     def source_lines(function: str) -> tuple[tuple[int, str], ...]:
@@ -270,6 +313,8 @@ def render_pbs_audit() -> dict[str, Any]:
     evidence = {**guards, "admit_selected_row": admission, "run_command_for_row": command, "run_mode": output}
     return {
         "wrapper": str(wrapper),
+        "wrapper_sha256": _PBS_STAGE1_SHA256,
+        "wrapper_pin_commit": _PBS_STAGE1_PIN_COMMIT,
         "env": expected_env,
         "env_evidence": env_evidence,
         "outputs": (output["checks"][0], output["checks"][1]),
@@ -290,13 +335,17 @@ def recipe_diff(expected: Mapping[str, Any], actual: Mapping[str, Any], *, allow
     def visit(left: Any, right: Any, path: str) -> None:
         if isinstance(left, Mapping) and isinstance(right, Mapping):
             for key in sorted(set(left) | set(right)):
-                visit(left.get(key), right.get(key), f"{path}.{key}" if path else str(key))
+                child = f"{path}.{key}" if path else str(key)
+                visit(left[key] if key in left else _MISSING, right[key] if key in right else _MISSING, child)
+            return
+        if left is _MISSING or right is _MISSING:
+            changes[path] = (left, right)
             return
         if isinstance(left, list) and isinstance(right, list):
             if left != right:
                 changes[path] = (left, right)
             return
-        if left != right:
+        if type(left) is not type(right) or left != right:
             changes[path] = (left, right)
 
     visit(expected, actual, "")
@@ -309,6 +358,113 @@ def fail_closed_recipe_diff(expected: Mapping[str, Any], actual: Mapping[str, An
     changes = recipe_diff(expected, actual, allowed_paths=allowed_paths)
     if changes:
         raise P3RenderError(f"unenumerated recipe diff: {sorted(changes)}")
+
+
+def _normalise_recipe(value: Any, *, results_root: str, run_id: str) -> Any:
+    """Normalize only declared packet destinations before recipe comparison."""
+
+    if isinstance(value, Mapping):
+        return {key: _normalise_recipe(child, results_root=results_root, run_id=run_id) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_normalise_recipe(child, results_root=results_root, run_id=run_id) for child in value]
+    if isinstance(value, str):
+        return value.replace(results_root, "<RESULTS_ROOT>").replace(run_id, "<RUN_ID>")
+    return value
+
+
+def _frozen_recipe(profile: PilotProfile) -> Mapping[str, Any]:
+    """Capture the approved full mapping before callers can alter the composer."""
+
+    config, _ = _materialize_train(
+        profile,
+        results_root="/__P3_APPROVED_RESULTS__",
+        run_id="__P3_APPROVED_RUN__",
+        source_sha="0" * 40,
+        device="cpu",
+    )
+    return _normalise_recipe(config, results_root="/__P3_APPROVED_RESULTS__", run_id="__P3_APPROVED_RUN__")
+
+
+# These snapshots are the independently frozen P3 admission recipes.  They are
+# made once at module load, before a packet caller can monkeypatch the composer.
+_FROZEN_RECIPES = {profile.name: _frozen_recipe(profile) for profile in (*R2_PROFILES, *TARGET_PROFILES)}
+
+
+def _profile_for_row(row: Mapping[str, Any], config: Mapping[str, Any]) -> PilotProfile | None:
+    """Return the unique approved profile matching a row's declared shape."""
+
+    optimizer = config.get("optimizer")
+    if not isinstance(optimizer, Mapping):
+        return None
+    target = optimizer.get("_target_")
+    family = {"torch.optim.Adam": "adam", "tpen.training.SOAP": "soap", "torch.optim.SGD": "minsr64"}.get(target)
+    candidates = [profile for profile in (*R2_PROFILES, *TARGET_PROFILES) if profile.family == family and profile.updates == row.get("updates") and profile.walkers == row.get("walkers") and list(profile.checkpoint_steps) == row.get("checkpoint_steps")]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _runner_bindings(row: Mapping[str, Any], *, command: str) -> Mapping[str, Any]:
+    """Return the concrete env/argv/output binding audited for one row."""
+
+    run_dir = Path(row["results_root"]) / row["experiment_name"] / row["sector"] / row["run_id"]
+    return {
+        "env": {
+            "MODE": "train",
+            "SOURCE_SHA": row["source_sha"],
+            "CHECKOUT_ROOT": "<CHECKOUT_ROOT>",
+            "UV_CACHE_DIR": "<UV_CACHE_DIR>",
+            "RESULTS_ROOT": row["results_root"],
+            "SELECTED_ROW": row["row_id"],
+            "APPROVAL_ID": "<APPROVAL_ID>",
+            "EXPECTED_QUEUE": "test",
+        },
+        "argv": command,
+        "output": {
+            "run_dir": str(run_dir),
+            "inputs": str(Path(row["results_root"]) / "inputs"),
+            "checkpoint_dir": str(run_dir / "checkpoints"),
+            "log": str(Path(row["results_root"]) / "logs" / f"row-{row['row_id']}-${{PBS_JOBID}}.log"),
+            "status": str(Path(row["results_root"]) / "logs" / f"row-{row['row_id']}-${{PBS_JOBID}}.status"),
+        },
+    }
+
+
+def _audit_packet_recipe(row: Mapping[str, Any], config: Mapping[str, Any], *, python: str, checkout_root: str) -> Mapping[str, Any]:
+    """Gate a rendered packet against the frozen recipe and concrete bindings."""
+
+    profile = _profile_for_row(row, config)
+    if profile is None or profile.name not in _FROZEN_RECIPES:
+        raise P3RenderError("rendered packet does not match an approved R2 recipe")
+    normalized = _normalise_recipe(config, results_root=row["results_root"], run_id=row["run_id"])
+    expected = _FROZEN_RECIPES[profile.name]
+    # Only destinations, run identity and the declared runtime device vary by row.
+    fail_closed_recipe_diff(
+        expected,
+        normalized,
+        allowed_paths={"run.root", "run.run_id", "run.dir", "runtime.device"},
+    )
+    command = command_for_row(row, python=python, checkout_root=checkout_root)
+    bindings = _runner_bindings(row, command=command)
+    if row["row_extension"]["rendered_config"]["path"] != str(Path(config["run"]["root"]) / "inputs" / f"{profile.name}.yaml"):
+        raise P3RenderError("rendered packet input destination is not the approved row output")
+    if _binding_token(row) not in command:
+        raise P3RenderError("runner argv is not bound to the admitted row")
+    if bindings["env"]["MODE"] != "train" or not bindings["output"]["log"].endswith(".log") or not bindings["output"]["status"].endswith(".status"):
+        raise P3RenderError("concrete packet env/argv/output binding is incomplete")
+    return bindings
+
+
+def _is_approved_soap100_row(row: Mapping[str, Any]) -> bool:
+    """Check the actual rendered row, not a caller-supplied family label."""
+
+    if row.get("kind") != "train" or row.get("updates") != 100 or row.get("walkers") != 512 or row.get("checkpoint_steps") != [0, 100]:
+        return False
+    path = Path(row["row_extension"]["rendered_config"]["path"])
+    try:
+        values = yaml.safe_load(path.read_bytes())
+    except (OSError, yaml.YAMLError):
+        return False
+    optimizer = values.get("optimizer") if isinstance(values, Mapping) else None
+    return isinstance(optimizer, Mapping) and optimizer.get("_target_") == "tpen.training.SOAP" and optimizer.get("lr") == 0.005 and optimizer.get("betas") == [0.95, 0.95] and optimizer.get("precondition_frequency") == 10 and optimizer.get("max_precond_dim") == 128 and optimizer.get("precondition_1d") is False and optimizer.get("correct_bias") is True
 
 
 __all__ = [
