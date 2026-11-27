@@ -974,6 +974,20 @@ def _iter_mapping_leaves(value: Mapping[str, Any], prefix: str) -> Iterator[tupl
             yield dotted, nested
 
 
+def _select_resolved_path(resolved: Mapping[str, Any], path: str) -> Any:
+    """Select a resolved config path through mappings and list indices."""
+
+    value: Any = resolved
+    for part in path.split("."):
+        if isinstance(value, Mapping) and part in value:
+            value = value[part]
+        elif isinstance(value, list) and part.isdigit() and int(part) < len(value):
+            value = value[int(part)]
+        else:
+            raise ProtocolError(f"resolved train config is missing {path}")
+    return value
+
+
 def _act50_overlay_adjustments(cfg: Any, science_profile: str | None) -> None:
     """Apply the finite ACT50 train overlay delta after byte validation."""
 
@@ -2123,27 +2137,20 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
     if not isinstance(resolved, Mapping):
         raise ProtocolError("resolved train config is not a mapping")
 
-    def select(path: str) -> Any:
-        value: Any = resolved
-        for part in path.split("."):
-            if isinstance(value, Mapping) and part in value:
-                value = value[part]
-            elif isinstance(value, list) and part.isdigit() and int(part) < len(value):
-                value = value[int(part)]
-            else:
-                raise ProtocolError(f"resolved train config is missing {path}")
-        return value
-
-    if select("stage1_overlay.path") != relative or select("stage1_overlay.sha256") != digest:
+    if _select_resolved_path(resolved, "stage1_overlay.path") != relative or _select_resolved_path(
+        resolved, "stage1_overlay.sha256"
+    ) != digest:
         raise ProtocolError("resolved train config overlay provenance does not match binding")
     overlay_profile = str(row.get("overlay_profile", OVERLAY_PROFILE_V1))
     expected_order = (
         OVERLAY_COMPOSITION_ORDER if overlay_profile != OVERLAY_PROFILE_V2
         else OVERLAY_V2_COMPOSITION_ORDER
     )
-    if select("stage1_overlay.composition_order") != expected_order:
+    if _select_resolved_path(resolved, "stage1_overlay.composition_order") != expected_order:
         raise ProtocolError("resolved train config composition order is not canonical")
-    if overlay_profile != OVERLAY_PROFILE_V1 and select("stage1_overlay.profile") != overlay_profile:
+    if overlay_profile != OVERLAY_PROFILE_V1 and _select_resolved_path(
+        resolved, "stage1_overlay.profile"
+    ) != overlay_profile:
         raise ProtocolError("resolved train config overlay profile does not match binding")
 
     if _is_he_sigmoid_row(row):
@@ -2154,7 +2161,7 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
             "model.layers.0.mixing.activation._target_",
             "model.layers.0.path_aggregation.activation._target_",
         ):
-            if select(path) != expected_activation:
+            if _select_resolved_path(resolved, path) != expected_activation:
                 raise ProtocolError(f"resolved He sigmoid config mismatch at {path}")
 
     unresolved = OmegaConf.to_container(cfg, resolve=False)

@@ -20,6 +20,7 @@ from experiments.atomistic.stage1.protocol import (
     HE_SIGMOID_PROFILE,
     ProtocolError,
     STAGE1_PROTOCOL,
+    _select_resolved_path,
     bind_evaluation_manifest,
     build_manifest,
     config_identities,
@@ -118,6 +119,19 @@ def _model(cfg: Any) -> dict[str, Any]:
     value = OmegaConf.to_container(cfg.model, resolve=True)
     assert isinstance(value, dict)
     return value
+
+
+def test_resolved_path_selector_supports_lists_and_rejects_missing_paths() -> None:
+    """The resolved-config guard must understand model layer list indices."""
+
+    resolved = {
+        "model": {"layers": [{"mixing": {"activation": {"_target_": "torch.nn.Sigmoid"}}}]},
+    }
+    assert _select_resolved_path(
+        resolved, "model.layers.0.mixing.activation._target_"
+    ) == "torch.nn.Sigmoid"
+    with pytest.raises(ProtocolError, match="resolved train config is missing"):
+        _select_resolved_path(resolved, "model.layers.0.path_aggregation.activation._target_")
 
 
 def test_he_sigmoid_rendered_train_and_eval_diff_only_activation_leaves() -> None:
