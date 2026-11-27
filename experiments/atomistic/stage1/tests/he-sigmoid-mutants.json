@@ -41,6 +41,13 @@
       "old": "if is_he_profile_row:\n            raise EvalRunRefusal(\n                f\"He checkpoint compatibility manifest is missing before eval writes: \"\n                f\"{manifest_path}\"\n            )",
       "new": "if is_he_profile_row and False:\n            raise EvalRunRefusal(\n                f\"He checkpoint compatibility manifest is missing before eval writes: \"\n                f\"{manifest_path}\"\n            )",
       "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_eval_refuses_missing_manifest_before_writes"
+    },
+    {
+      "id": "he-collect-missing-manifest-allowed",
+      "target": "experiments/atomistic/stage1/collect.py",
+      "old": "if row.get(\"science_profile\") in {None, HE_SIGMOID_PROFILE}:\n                raise CollectionError(\n                    \"He checkpoint compatibility manifest is missing before collection \"\n                    f\"writes: {manifest_path}\"\n                )",
+      "new": "if row.get(\"science_profile\") in {None, HE_SIGMOID_PROFILE} and False:\n                raise CollectionError(\n                    \"He checkpoint compatibility manifest is missing before collection \"\n                    f\"writes: {manifest_path}\"\n                )",
+      "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_collect_refuses_missing_manifest_before_writes"
     }
   ]
 }
