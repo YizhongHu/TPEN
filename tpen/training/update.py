@@ -19,8 +19,12 @@ from tpen.data.batch import (
 from tpen.dependencies import require_torch
 from tpen.physics.hamiltonian import local_energy
 from tpen.training.vmc import (
+    DEFAULT_ENERGY_CLIPPING_K,
+    DEFAULT_ENERGY_CLIPPING_MODE,
     DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY,
     compute_vmc_objective,
+    resolve_energy_clipping_k,
+    resolve_energy_clipping_mode,
     resolve_nonfinite_local_energy_policy,
 )
 
@@ -401,6 +405,8 @@ def vmc_objective_reevaluation(
     batch: ElectronBatch,
     primary_local_energy: torch.Tensor,
     nonfinite_policy: str = DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY,
+    energy_clipping_mode: str = DEFAULT_ENERGY_CLIPPING_MODE,
+    energy_clipping_k: float = DEFAULT_ENERGY_CLIPPING_K,
 ) -> ObjectiveReevaluation:
     """Build the canonical VMC re-evaluation for one step's fixed sample.
 
@@ -443,6 +449,8 @@ def vmc_objective_reevaluation(
     if not isinstance(primary_local_energy, torch.Tensor):
         raise TypeError("vmc_objective_reevaluation requires a primary_local_energy tensor")
     resolved_policy = resolve_nonfinite_local_energy_policy(nonfinite_policy)
+    resolved_clipping_mode = resolve_energy_clipping_mode(energy_clipping_mode)
+    resolved_clipping_k = resolve_energy_clipping_k(energy_clipping_k)
     # No ``.detach().clone()``: ``torch.isfinite`` returns a FRESH bool tensor
     # (measured ``_base is None``), and a bool tensor can never require grad --
     # even from a grad-requiring input.  Both calls were provable no-ops.  The
@@ -480,6 +488,8 @@ def vmc_objective_reevaluation(
             logabs,
             total_local_energy,
             nonfinite_policy=resolved_policy,
+            energy_clipping_mode=resolved_clipping_mode,
+            energy_clipping_k=resolved_clipping_k,
         ).loss
 
     return ObjectiveReevaluation(
