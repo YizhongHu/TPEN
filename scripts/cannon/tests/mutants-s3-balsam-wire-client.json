@@ -3,8 +3,8 @@
     {
       "id": "wire-rejects-foreign-job-handle",
       "target": "executor/src/tpen_executor/lifecycle/balsam_wire.py",
-      "old": "BackendJobId.from_mapping(backend)",
-      "new": "BatchJobId.from_mapping(backend)",
+      "old": "None if backend is None else BackendJobId.from_mapping(backend)",
+      "new": "None if backend is None else BatchJobId.from_mapping(backend)",
       "killer": "executor/tests/test_s3_balsam_wire_client.py::test_closed_results_interoperate_and_reject_foreign_handles"
     },
     {
