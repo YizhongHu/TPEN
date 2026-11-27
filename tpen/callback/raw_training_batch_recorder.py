@@ -1526,9 +1526,14 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
         counters = (ref.next_iteration, ref.completed_updates)
         if counters != (progress["next_iteration"], progress["completed_updates"]):
             raise ValueError("v3 restored counters disagree with checkpoint")
-        relative = self.path.resolve().relative_to(Path(context.metadata.run_dir).resolve())
-        if not relative.parts:
-            raise ValueError("v3 history must be a child of the run directory")
+        run_dir = Path(context.metadata.run_dir).resolve()
+        resolved_path = self.path.resolve()
+        if resolved_path.is_relative_to(run_dir):
+            relative = resolved_path.relative_to(run_dir)
+            if not relative.parts:
+                raise ValueError("v3 history must be a child of the run directory")
+        else:
+            relative = Path(resolved_path.name)
         source = ref.provenance.get("run_dir")
         if not isinstance(source, str) or not Path(source).is_absolute():
             raise ValueError("v3 checkpoint lacks source run directory")
