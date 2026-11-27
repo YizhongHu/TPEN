@@ -17,8 +17,8 @@
     {
       "id": "client-retries-journaled-mutation",
       "target": "executor/src/tpen_executor/lifecycle/balsam_client.py",
-      "old": "if intent_path.exists():\n            raise BalsamGroupParked(\"mutation acknowledgement unknown; no automatic retry\")",
-      "new": "if False:\n            pass",
+      "old": "try:\n            publish_json_exclusive(str(intent_path), canonical_bytes(request.to_dict()))\n        except FileExistsError as error:\n            raise BalsamGroupParked(\"mutation intent is already owned; reconcile before retry\") from error",
+      "new": "intent_path.write_bytes(canonical_bytes(request.to_dict()))",
       "killer": "executor/tests/test_s3_balsam_wire_client.py::test_journaled_mutation_parks_and_never_auto_retries"
     },
     {

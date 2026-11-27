@@ -205,8 +205,6 @@ class BalsamProcessClient:
         result_path = prefix / "result.json"
         if result_path.exists():
             return self._require_ack(request, decode_result(result_path.read_bytes()))
-        if intent_path.exists():
-            raise BalsamGroupParked("mutation acknowledgement unknown; no automatic retry")
         try:
             publish_json_exclusive(str(intent_path), canonical_bytes(request.to_dict()))
         except FileExistsError as error:
