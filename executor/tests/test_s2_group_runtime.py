@@ -1,5 +1,6 @@
 """S2-L3 generic group-runtime composition tests."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -152,6 +153,47 @@ def test_dispatcher_uses_admitted_controller_and_configured_deadlines(tmp_path):
                                         timeout=7, core_timeout=11)
     assert dispatcher.run(PackedGroupRequest(prepared)) == "called"
     assert observed == {"capacity": 1, "timeout": 7, "closed": True}
+
+
+@pytest.mark.parametrize("root_kind", ["regular-file", "symlink"])
+@pytest.mark.parametrize("reentry", [False, True])
+def test_invalid_preflight_store_root_is_typed_refusal_without_launch(
+    tmp_path, root_kind, reentry,
+):
+    """Invalid existing roots refuse before controller or leaf admission."""
+    from dataclasses import replace
+    from tpen_executor.lifecycle.group_store import GroupStoreRefused
+    from tpen_executor.tasks import ConfiguredRun
+
+    prepared = replace(
+        _prepared(tmp_path),
+        runs={"task": ConfiguredRun("task", str(tmp_path / "science.yaml"))},
+    )
+    root = Path(prepared.store_root)
+    if root_kind == "regular-file":
+        root.write_bytes(b"store-root-file")
+        before = root.read_bytes()
+    else:
+        target = tmp_path / "store-target"
+        target.mkdir()
+        (target / "marker").write_bytes(b"store-target")
+        root.symlink_to(target, target_is_directory=True)
+        before = os.readlink(root)
+
+    def no_controller_or_leaf(*_args, **_kwargs):
+        pytest.fail("invalid store root reached controller or leaf")
+
+    with pytest.raises(GroupStoreRefused):
+        GroupRuntimeDispatcher(
+            controller_runner=no_controller_or_leaf,
+            local_executor_factory=no_controller_or_leaf,
+        ).run(PackedGroupRequest(prepared, reentry=reentry))
+
+    if root_kind == "regular-file":
+        assert root.read_bytes() == before
+    else:
+        assert os.readlink(root) == before
+        assert (root / "marker").read_bytes() == b"store-target"
 
 
 @pytest.mark.parametrize("field", ["execution_bundle_digest", "deployment_lineage"])

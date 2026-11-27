@@ -311,7 +311,12 @@ class GroupRuntimeDispatcher:
             raise GroupStoreRefused("allocation materialization lacks dispatcher")
         if not callable(getattr(allocation_program.dispatcher, "run", None)):
             raise GroupStoreRefused("allocation materialization dispatcher is not runnable")
-        store = DirectoryStore(prepared.store_root)
+        try:
+            store = DirectoryStore(prepared.store_root)
+        except (FenceRejected, OSError, ValueError, TypeError) as error:
+            # Keep preflight constructor failures in the typed clean-refusal
+            # channel used by both initial() and reentry().
+            raise GroupStoreRefused("store root is invalid") from error
         # Preflight read-only successor evidence before reentry can publish a
         # new controller generation or invocation directory.
         successor_requests = _build_successor_requests(store, prepared)
