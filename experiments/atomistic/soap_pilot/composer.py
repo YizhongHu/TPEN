@@ -198,7 +198,7 @@ def _materialize_train(profile: PilotProfile, *, results_root: str, run_id: str,
     # profile.  The renderer only changes the explicitly declared pilot knobs;
     # it does not invent a second smoke callback set.
     _set(config, "callbacks", _callbacks(config.get("callbacks", []) + diagnostics.get("callbacks", []), profile.family, profile.diagnostics_profile, synchronize=profile.train_timing_synchronize))
-    _set(config, "stage1_overlay", {"path": str(_OVERLAY_BASE), "sha256": sha256_file(_OVERLAY_BASE), "profile": profile.diagnostics_profile})
+    _set(config, "stage1_overlay", {"path": "configs/overlays/hooke-diagnostics-v2.yaml", "sha256": sha256_file(_OVERLAY_BASE), "profile": profile.diagnostics_profile})
     config = _resolve_document(config)
     if any("${" in repr(value) or value == "???" for value in config.values()):
         raise ValueError("rendered train config retains unresolved values")

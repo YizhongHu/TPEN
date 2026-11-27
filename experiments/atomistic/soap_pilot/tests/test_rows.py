@@ -187,6 +187,7 @@ def test_rendered_rows_pass_stage1_admission_and_registry_tamper_refuses(tmp_pat
     with pytest.raises(Exception, match="config path|known system|identity|row_id"):
         validate_gateway_binding(binding=_binding_token(bad_registry), expected_kinds={"train"})
     bad_digest = dict(train_rows[0], config_sha256="0" * 64)
+    bad_digest["row_id"] = row_id(bad_digest)
     with pytest.raises(Exception, match="identity"):
         validate_gateway_binding(binding=_binding_token(bad_digest), expected_kinds={"train"})
 
