@@ -1,0 +1,25 @@
+{
+  "mutants": [
+    {
+      "id": "walkers-to-skip-aux",
+      "target": "tpen/data/batch/walkers.py",
+      "old": "            aux=_move_aux_value(self.aux, device=device, dtype=dtype),",
+      "new": "            aux=dict(self.aux),",
+      "killer": "tests/unit/data/test_walkers_to_aux.py::test_walkers_to_moves_nested_aux_tensors_without_mutating_source"
+    },
+    {
+      "id": "walkers-to-cast-all-aux",
+      "target": "tpen/data/batch/walkers.py",
+      "old": "        tensor_dtype = dtype if value.is_floating_point() or value.is_complex() else None",
+      "new": "        tensor_dtype = dtype",
+      "killer": "tests/unit/data/test_walkers_to_aux.py::test_walkers_to_moves_nested_aux_tensors_without_mutating_source"
+    },
+    {
+      "id": "walkers-to-mutate-aux",
+      "target": "tpen/data/batch/walkers.py",
+      "old": "        return {key: _move_aux_value(item, device=device, dtype=dtype) for key, item in value.items()}",
+      "new": "        value.update({key: _move_aux_value(item, device=device, dtype=dtype) for key, item in value.items()})\n        return value",
+      "killer": "tests/unit/data/test_walkers_to_aux.py::test_walkers_to_moves_nested_aux_tensors_without_mutating_source"
+    }
+  ]
+}

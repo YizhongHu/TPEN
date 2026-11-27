@@ -13,6 +13,21 @@ from tpen.data.batch.electron_batch import ElectronBatch
 from tpen.data.batch.wavefunction_output import WavefunctionOutput
 
 
+def _move_aux_value(value: Any, *, device: torch.device | str | None, dtype: torch.dtype | None) -> Any:
+    """Move tensor leaves in auxiliary state without changing metadata."""
+
+    if isinstance(value, torch.Tensor):
+        tensor_dtype = dtype if value.is_floating_point() or value.is_complex() else None
+        return value.to(device=device, dtype=tensor_dtype)
+    if isinstance(value, dict):
+        return {key: _move_aux_value(item, device=device, dtype=dtype) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_move_aux_value(item, device=device, dtype=dtype) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_aux_value(item, device=device, dtype=dtype) for item in value)
+    return value
+
+
 @dataclass
 class Walkers:
     """Store Monte Carlo walker state and cached model values.
@@ -148,6 +163,7 @@ class Walkers:
             sign=None if self.sign is None else self.sign.to(device=device, dtype=dtype),
             spins=None if self.spins is None else self.spins.to(device=device, dtype=dtype),
             atomic_configuration=None if self.atomic_configuration is None else self.atomic_configuration.to(device=device, dtype=dtype),
+            aux=_move_aux_value(self.aux, device=device, dtype=dtype),
         )
 
     def clone(self) -> "Walkers":
