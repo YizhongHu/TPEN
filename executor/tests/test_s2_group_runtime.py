@@ -423,3 +423,134 @@ def test_successor_publishes_launches_once_and_replay_does_not_relaunch(tmp_path
     with pytest.raises(runtime.GroupStoreRefused, match="stale"):
         dispatcher.run(PackedGroupRequest(prepared, reentry=True))
     assert len(launched) == 1
+
+
+def _real_reentry_successor_fixture(tmp_path):
+    """Build generation-one predecessor evidence for real group-store reopen tests."""
+    from dataclasses import replace
+    from tpen_executor.allocations import AllocationAttemptV2, MemberInvocationV2
+    from tpen_executor.contracts import AllocationAttemptId, AttemptId, InvocationId
+    from tpen_executor.lifecycle.group_runtime import PreparedSuccessor
+    from tpen_executor.lifecycle.group_store import InitialGroupStoreRequest, initial
+    from tpen_executor.results import OutcomeReceipt, StartReceipt
+    from tpen_executor.storage import DirectoryStore
+    from tpen_executor.tasks import ConfiguredRun
+    from test_b1a_reconciliation import _group
+    from test_core_evidence_v3 import _planned_evidence
+
+    group = _group(("successor",))
+    prepared = _prepared(tmp_path)
+    identity = replace(prepared.identity, group_digest=group.identity)
+    allocation_one = ConfiguredAllocation(AllocationId("allocation-1"), BackendJobId("job-1"), {})
+    controller_one = ControllerGenerationV1(
+        group.group_id, 1, allocation_one.allocation_id, allocation_one.backend_job_id,
+        "b" * 64, "nonce-1", None,
+    )
+    root = tmp_path / "store"
+    initial(InitialGroupStoreRequest(group, identity.bundle_digest, identity.deployment.content_digest, controller_one), root)
+    store = DirectoryStore(root)
+    lease_one = AllocationAttemptV2(
+        group.group_id, AllocationAttemptId("lease-1"), allocation_one.allocation_id,
+        allocation_one.backend_job_id, "controller-1", "utc-1",
+    )
+    fence = store.begin_attempt(
+        group, "successor", allocation_one, "utc-1", "local",
+        allocation_attempt=lease_one, invocation_id=InvocationId("invocation-successor"),
+    )
+    store.finish_attempt(fence, "failed", "utc-2")
+    core_dir = Path(fence.output_dir) / "core"
+    core_dir.mkdir()
+    store.record_core_outcome(fence, _planned_evidence(core_dir))
+
+    allocation_two = ConfiguredAllocation(AllocationId("allocation-2"), BackendJobId("job-2"), {})
+    controller_two = ControllerGenerationV1(
+        group.group_id, 2, allocation_two.allocation_id, allocation_two.backend_job_id,
+        "b" * 64, "nonce-2", controller_one.record_digest,
+    )
+    invocation = MemberInvocationV2(
+        AllocationAttemptV2(
+            group.group_id, AllocationAttemptId("lease-2"), allocation_two.allocation_id,
+            allocation_two.backend_job_id, "controller-2", "utc-3",
+        ), group.identity, "successor", group.members[0].lineage_id,
+        AttemptId("successor-1"), InvocationId("invocation-successor-1"),
+    )
+    wire = store.build_successor_admission_request(
+        fence, invocation.attempt_id, group.members[0].science_digest, group.members[0].target_horizon,
+    )
+    start = StartReceipt.decode(Path(fence.output_dir, "start.json").read_bytes())
+    outcome = OutcomeReceipt.decode(Path(fence.output_dir, "outcome.json").read_bytes())
+    prepared = replace(
+        prepared, group=group, allocation=allocation_two, controller=controller_two,
+        member_inputs=(MemberRecoveryInputV2("successor", group.members[0].lineage_id, fence.attempt_id,
+                                             start, outcome, None),),
+        registration_receipt_digest="b" * 64, claimant_nonce="nonce-2",
+        predecessor_record_digest=controller_one.record_digest,
+        identity=identity, execution_bundle_digest=identity.bundle_digest,
+        runs={"successor": ConfiguredRun("successor", str(tmp_path / "successor.yaml"))},
+        successors=(PreparedSuccessor(fence, invocation, "d" * 64, digest(wire)),),
+    )
+    return prepared, store, fence, wire
+
+
+@pytest.mark.parametrize("damage", ["mismatched-digest", "missing-predecessor"])
+def test_successor_preflight_refuses_before_generation_two_publication(tmp_path, damage):
+    """Invalid successor evidence cannot publish authority or an invocation."""
+    from dataclasses import replace
+    from tpen_executor.lifecycle.group_store import GroupStoreRefused
+
+    prepared, store, fence, wire = _real_reentry_successor_fixture(tmp_path)
+    proposal = prepared.successors[0]
+    if damage == "mismatched-digest":
+        proposal = replace(proposal, request_digest=digest({**wire, "target_iterations": 11}))
+    else:
+        Path(fence.output_dir, "core-outcome.json").unlink()
+    prepared = replace(prepared, successors=(proposal,))
+    with pytest.raises(GroupStoreRefused):
+        GroupRuntimeDispatcher(controller_runner=lambda *_args: pytest.fail("child launch")).run(
+            PackedGroupRequest(prepared, reentry=True)
+        )
+    ledger = next(Path(store.root).rglob("controller.lock")).parent
+    assert not (ledger / "generation-2.json").exists()
+    assert not (Path(store.root) / "invocations").exists()
+
+
+def test_successor_real_reentry_publishes_once_and_replay_is_fenced(tmp_path):
+    """A valid successor reopens generation two; replay adds no authority."""
+    prepared, store, _fence, _wire = _real_reentry_successor_fixture(tmp_path)
+    launches = []
+
+    def controller(*_args):
+        launches.append(True)
+        return "admitted"
+
+    dispatcher = GroupRuntimeDispatcher(controller_runner=controller)
+    assert dispatcher.run(PackedGroupRequest(prepared, reentry=True)) == "admitted"
+    assert len(launches) == 1
+    assert next(Path(store.root).rglob("generation-2.json")).is_file()
+    assert dispatcher.run(PackedGroupRequest(prepared, reentry=True)) == "admitted"
+    assert len(launches) == 2
+    assert len(list(Path(store.root).rglob("generation-2.json"))) == 1
+
+
+def test_successor_point_of_use_failure_reports_published_authority(tmp_path, monkeypatch):
+    """A predecessor race after acquisition is reconciliation-required."""
+    from tpen_executor.lifecycle.group_store import GroupStoreAuthorityPublished
+    from tpen_executor.storage import DirectoryStore
+
+    prepared, store, fence, _wire = _real_reentry_successor_fixture(tmp_path)
+    original = DirectoryStore.build_successor_admission_request
+    calls = 0
+
+    def remove_predecessor_on_point_of_use(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            Path(fence.output_dir, "core-outcome.json").unlink()
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DirectoryStore, "build_successor_admission_request", remove_predecessor_on_point_of_use)
+    with pytest.raises(GroupStoreAuthorityPublished):
+        GroupRuntimeDispatcher(controller_runner=lambda *_args: pytest.fail("child launch")).run(
+            PackedGroupRequest(prepared, reentry=True)
+        )
+    assert (next(Path(store.root).rglob("generation-2.json"))).is_file()

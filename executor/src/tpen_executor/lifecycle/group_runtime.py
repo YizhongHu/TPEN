@@ -206,6 +206,31 @@ class _ControllerBinding:
     backend_job_id: BackendJobId
 
 
+def _build_successor_requests(
+    store: DirectoryStore,
+    prepared: PreparedGroupInput,
+) -> dict[str, tuple[Mapping[str, Any], str, MemberInvocationV2]]:
+    """Build and fence successor requests against the durable predecessor.
+
+    The first pass runs before store acquisition; the second pass is the
+    point-of-use fence for a concurrent predecessor change.
+    """
+    successor_requests: dict[str, tuple[Mapping[str, Any], str, MemberInvocationV2]] = {}
+    for proposal in prepared.successors:
+        fence, invocation = proposal.predecessor, proposal.invocation
+        task = next(item for item in prepared.group.members if item.task_id == fence.task_id)
+        try:
+            wire = store.build_successor_admission_request(
+                fence, invocation.attempt_id, task.science_digest, task.target_horizon,
+            )
+        except (FenceRejected, OSError, TypeError, ValueError) as error:
+            raise GroupStoreRefused("successor predecessor evidence is unavailable or stale") from error
+        if digest(wire) != proposal.request_digest:
+            raise GroupStoreRefused("successor acceptance binds a different request")
+        successor_requests[task.task_id] = (wire, proposal.acceptance_digest, invocation)
+    return successor_requests
+
+
 class _BoundCorePort(CoreAdmissionPort):
     """Bind immutable task/group facts before entering the science process."""
 
@@ -286,6 +311,10 @@ class GroupRuntimeDispatcher:
             raise GroupStoreRefused("allocation materialization lacks dispatcher")
         if not callable(getattr(allocation_program.dispatcher, "run", None)):
             raise GroupStoreRefused("allocation materialization dispatcher is not runnable")
+        store = DirectoryStore(prepared.store_root)
+        # Preflight read-only successor evidence before reentry can publish a
+        # new controller generation or invocation directory.
+        successor_requests = _build_successor_requests(store, prepared)
         store_result = reentry(
             ReentryGroupStoreRequest(prepared.group, prepared.execution_bundle_digest,
                                      prepared.deployment_lineage, prepared.controller),
@@ -295,19 +324,13 @@ class GroupRuntimeDispatcher:
                                      prepared.deployment_lineage, prepared.controller),
             prepared.store_root,
         )
-        store = DirectoryStore(prepared.store_root)
-        successor_requests = {}
-        for proposal in prepared.successors:
-            fence, invocation = proposal.predecessor, proposal.invocation
-            task = next(item for item in prepared.group.members if item.task_id == fence.task_id)
-            try:
-                wire = store.build_successor_admission_request(
-                    fence, invocation.attempt_id, task.science_digest, task.target_horizon)
-            except (FenceRejected, OSError, TypeError, ValueError) as error:
-                raise GroupStoreRefused("successor predecessor evidence is unavailable or stale") from error
-            if digest(wire) != proposal.request_digest:
-                raise GroupStoreRefused("successor acceptance binds a different request")
-            successor_requests[task.task_id] = (wire, proposal.acceptance_digest, invocation)
+        try:
+            # Retain the point-of-use fence after acquisition.  A concurrent
+            # predecessor mutation here means authority was already published
+            # and must be reconciled, not reported as a clean refusal.
+            successor_requests = _build_successor_requests(store, prepared)
+        except GroupStoreRefused as error:
+            raise GroupStoreAuthorityPublished(str(error)) from error
         output_root = Path(store_result.invocation_result_path or prepared.store_root) / "core-admission"
         facts = GroupControllerFactsV1(
             prepared.group, prepared.allocation, prepared.controller.registration_receipt_digest,
