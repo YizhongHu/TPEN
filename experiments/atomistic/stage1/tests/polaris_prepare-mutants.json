@@ -1,0 +1,32 @@
+{
+  "mutants": [
+    {
+      "id": "prep-debug-queue-dropped",
+      "target": "experiments/atomistic/stage1/polaris/pbs_prepare.sh",
+      "old": "#PBS -q debug",
+      "new": "#PBS -q capacity",
+      "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_prepare_job_is_short_debug_cpu_allocation"
+    },
+    {
+      "id": "prep-short-walltime-dropped",
+      "target": "experiments/atomistic/stage1/polaris/pbs_prepare.sh",
+      "old": "#PBS -l walltime=00:20:00",
+      "new": "#PBS -l walltime=01:00:00",
+      "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_prepare_job_is_short_debug_cpu_allocation"
+    },
+    {
+      "id": "prep-full-clone-dropped",
+      "target": "experiments/atomistic/stage1/polaris/pbs_prepare.sh",
+      "old": "git clone \"$SOURCE_REPO\" \"$CHECKOUT_ROOT\"",
+      "new": "git clone --filter=blob:none \"$SOURCE_REPO\" \"$CHECKOUT_ROOT\"",
+      "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_prepare_job_owns_clone_uv_prime_and_row_rendering"
+    },
+    {
+      "id": "prep-eagle-root-dropped",
+      "target": "experiments/atomistic/stage1/polaris/pbs_prepare.sh",
+      "old": "RESULTS_PREFIX=\"/eagle/HetRxnEnergy/rhu/\"",
+      "new": "RESULTS_PREFIX=\"/tmp/\"",
+      "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_prepare_job_never_submits_or_transfers_from_the_allocation"
+    }
+  ]
+}

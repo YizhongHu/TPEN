@@ -2,9 +2,11 @@
 
 This is the optional direct PBS route for the He and H2 Stage-1 rows.  It is
 independent of the Cannon runbooks and does not authorize a science
-allocation.  The implementation is
-`experiments/atomistic/stage1/polaris/pbs_stage1.sh`; every submission below
-uses that one complete wrapper with an explicit mode.
+allocation.  The implementation is the pair
+`experiments/atomistic/stage1/polaris/pbs_prepare.sh` and
+`experiments/atomistic/stage1/polaris/pbs_stage1.sh`.  One short debug
+preparation job owns source checkout, uv cache priming, and row rendering;
+later submissions use the complete execution wrapper with an explicit mode.
 
 ## Scope and approval boundary
 
@@ -16,7 +18,8 @@ out to successor lineages, or use a first-class PBS path in `launch.py`.
 
 - `debug` and `debug-scaling` are free queues for bounded smoke, guard, plan,
   evaluation, and collection work.  The PBS queue name is `debug-scaling`,
-  with a hyphen.
+  with a hyphen.  The preparation job uses only `debug`, one node, four CPUs,
+  and a 20-minute walltime.
 - `capacity` is required for the 50,000-update training allocation and needs
   fresh operator approval relayed by the manager.  Do not submit it from this
   document without that approval.
@@ -35,6 +38,8 @@ out to successor lineages, or use a first-class PBS path in `launch.py`.
 Before any Polaris action, read the `cluster-access` skill and the current TO
 chain: Clusters `cluster-access-read-first`, `00-orientation`,
 `free-submit-queues`, ALCF `provider-and-hpss-orientation-2026-08-07`, and
+root `cluster-rule-no-reductions-on-login-nodes-20261127`, plus ALCF's current
+`operator-notice-alcf-in-node-proxy-change-20261124`, and
 Polaris `00-read-first-polaris`, `usage-conventions`,
 `polaris-facility-toolchain-and-gotchas-2026-08-12`,
 `polaris-node-shape-gpu-binding-guardrails-2026-08-12`,
@@ -54,10 +59,11 @@ Set these once for one retained run root.  `SOURCE_SHA` is a full released
 
 ```bash
 SOURCE_SHA=<released-main-sha>
-SOURCE_REPO=https://github.com/YizhongHu/TPEN.git   # staging only; never passed to qsub
+SOURCE_REPO=https://github.com/YizhongHu/TPEN.git   # passed only to the prep job
 SYSTEM=he                         # repeat the complete sequence with h2
 RESULTS_ROOT=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>
 WRAPPER=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/inputs/pbs_stage1.sh
+PREP_SCRIPT=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/inputs/pbs_prepare.sh
 CHECKOUT_ROOT=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/checkout
 UV_CACHE_DIR=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/uv-cache
 PYBIN=/soft/applications/conda/2025-09-25/mconda3/bin/python
@@ -65,44 +71,39 @@ PYBIN=/soft/applications/conda/2025-09-25/mconda3/bin/python
 
 The run root must be created before any `qsub` so PBS can open its `-o` and
 `-e` files.  Assert it is below `/eagle/HetRxnEnergy/rhu/`, create `logs/`,
-`plan/`, `launch/`, and `inputs/`, copy the wrapper there, and record its
-SHA-256.  Do not copy a git tree with `cp -a` from `/home` to Eagle; the
-current Polaris note records that this fails while preserving ownership.
+`plan/`, `launch/`, and `inputs/`, copy both scripts there, and record both
+SHA-256 values.  Do not copy a git tree with `cp -a` from `/home` to Eagle;
+the current Polaris note records that this fails while preserving ownership.
 
-Stage the source and prime the cache on the login side, before any qsub. The
-clone is deliberately full (no `--filter`), detached at the exact SHA, and
-must be clean with no promisor or partial-clone configuration:
+The login node does not clone, run Python, or invoke uv.  Submit exactly one
+short debug preparation job.  Inside that allocation the script performs a
+full clone (no `--filter`), detaches at the exact SHA, verifies a clean
+non-promisor/non-partial checkout, primes the cache with the facility
+`$PYBIN -m uv` binary, and renders the phase-1 rows and command receipts under
+the Eagle results root:
 
 ```bash
 mkdir -p "$RESULTS_ROOT"/{inputs,logs,plan}
-git clone "$SOURCE_REPO" "$CHECKOUT_ROOT"
-git -C "$CHECKOUT_ROOT" checkout --detach "$SOURCE_SHA"
-test "$(git -C "$CHECKOUT_ROOT" rev-parse HEAD)" = "$SOURCE_SHA"
-test -z "$(git -C "$CHECKOUT_ROOT" status --porcelain)"
-test "$(git -C "$CHECKOUT_ROOT" rev-parse --is-shallow-repository)" = false
-test -z "$(git -C "$CHECKOUT_ROOT" config --local --get-regexp '^remote\..*\.promisor$' || true)"
-test -z "$(git -C "$CHECKOUT_ROOT" config --local --get extensions.partialclone || true)"
-cp experiments/atomistic/stage1/polaris/pbs_stage1.sh "$WRAPPER"
-chmod 750 "$WRAPPER"
-sha256sum "$WRAPPER" > "$WRAPPER.sha256"
-mkdir -p "$UV_CACHE_DIR"
-export UV_CACHE_DIR
-export UV_PYTHON="$PYBIN" UV_NO_MANAGED_PYTHON=1
-export UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy
-"$PYBIN" -m uv lock --check --project "$CHECKOUT_ROOT"
-UV_PROJECT_ENVIRONMENT="$RESULTS_ROOT/prime-env" \
-  "$PYBIN" -m uv sync --project "$CHECKOUT_ROOT" --extra cu128 --locked
+scp -p experiments/atomistic/stage1/polaris/pbs_stage1.sh "$WRAPPER"
+scp -p experiments/atomistic/stage1/polaris/pbs_prepare.sh "$PREP_SCRIPT"
+PREP_JOB_ID="$(qsub -N "stage1-prep-${SYSTEM}-${SOURCE_SHA:0:8}" \
+  -A HetRxnEnergy -q debug \
+  -l select=1:system=polaris:ncpus=4,walltime=00:20:00,filesystems=home:eagle,place=scatter \
+  -o "$RESULTS_ROOT/logs/prep.pbs.out" -e "$RESULTS_ROOT/logs/prep.pbs.err" \
+  -v SOURCE_REPO="$SOURCE_REPO",SOURCE_SHA="$SOURCE_SHA",RESULTS_ROOT="$RESULTS_ROOT",SYSTEM="$SYSTEM",LINEAGE_SEEDS="1:2:3",PYBIN="$PYBIN",WRAPPER_PATH="$WRAPPER" \
+  "$PREP_SCRIPT")"
+printf 'submitted prep job %s\n' "$PREP_JOB_ID"
+qstat -xf "$PREP_JOB_ID"
 ```
 
-The wrapper takes `CHECKOUT_ROOT` and `UV_CACHE_DIR` as required inputs; it
-does not clone, fetch, or otherwise use network Git on a compute node. Before
-the lock/sync it sets `UV_PYTHON=$PYBIN`, `UV_NO_MANAGED_PYTHON=1`,
-`UV_PYTHON_DOWNLOADS=never`, and `UV_LINK_MODE=copy`. The cache is external
-to the disposable job root and must already exist. The P1 R2 receipt measured
-the same lock-bound operation at 25 seconds and proved
-Torch `2.11.0+cu128`, four `NVIDIA A100-SXM4-40GB` devices, 40,960 MiB, and
-MIG `Disabled`.  Prime the cache in the same login session with the same
-`$PYBIN -m uv` binary before a real submission; never use bare `uv`.
+After PBS reaches a terminal state, inspect only the named `qstat` record and
+the named preparation outputs.  A nonzero job or missing output is
+`HARNESS_INVALID`/`UNMEASURED`; preserve it and stop.  Do not resubmit without
+a new approval.  The preparation job's `$PYBIN -m uv` invocation sets
+`UV_PYTHON=$PYBIN`, `UV_NO_MANAGED_PYTHON=1`, `UV_PYTHON_DOWNLOADS=never`, and
+`UV_LINK_MODE=copy`; it primes `UV_CACHE_DIR` and writes `prime-env` only as a
+reproducible preparation artifact.  The run wrapper later creates its own
+job-local environment from that cache.  Never use bare `uv`.
 
 ## Wrapper boundary
 
@@ -114,6 +115,9 @@ strict restore, and `load.mode=model_only`.
 
 The PBS wrapper replaces only the Slurm execution shell around that contract:
 
+- `pbs_prepare.sh` owns the one short debug allocation that clones the exact
+  source, primes the facility uv cache, runs phase-1 planning, and emits the
+  immutable row/command receipts;
 - `launch.py:193-277` remains the Cannon renderer and its Slurm/Netscratch
   `FACILITY_RESULTS_PREFIX` and A7 80-GB guard are untouched;
 - `pbs_stage1.sh:54-110` supplies the PBS queue/job/GPU guards for Polaris;
@@ -137,28 +141,20 @@ submission, and monitoring only.  `qstat -xf <jobid>` is the authoritative
 terminal scheduler observation.  Preserve qsub stdout/stderr, qstat output,
 wrapper logs, row status files, rendered command receipts, and every failure.
 
-### 1. Select one frozen row on the login side
+### 1. Consume the prep job's frozen rows
 
-Planning and full roster/grid reconciliation remain S0-B/S1-RC-owned.  After
-those owners publish the approved manifest, materialize exactly one row object
-without adding or changing fields.  The same row shape is used for an
-unbounded route and for a bounded qualification; only the latter adds the
+Planning and full roster/grid reconciliation remain S0-B/S1-RC-owned.  The
+preparation job writes `plan/phase1-manifest.json`, the exact first
+`plan/selected-train.json`, one JSON file per train row under `launch/`, and a
+`launch/render-receipt.json`.  Inspect those named files only; do not recreate
+or edit rows on the login node.  The same row shape is used for an unbounded
+route and for a bounded qualification; only the latter adds the
 already-approved `execution.stop_at` datum in its separate request file.
 
 ```bash
 mkdir -p "$RESULTS_ROOT"/{inputs,logs,plan,launch}
-cp experiments/atomistic/stage1/polaris/pbs_stage1.sh "$RESULTS_ROOT/inputs/pbs_stage1.sh"
-chmod 750 "$RESULTS_ROOT/inputs/pbs_stage1.sh"
-sha256sum "$RESULTS_ROOT/inputs/pbs_stage1.sh" > "$RESULTS_ROOT/inputs/pbs_stage1.sh.sha256"
-"$PYBIN" - "$RESULTS_ROOT/plan/phase1-manifest.json" "$RESULTS_ROOT/plan/selected-train.json" <<'PY'
-import json, sys
-from pathlib import Path
-source, target = map(Path, sys.argv[1:])
-rows = [row for row in json.loads(source.read_text())['rows'] if row['kind'] == 'train']
-if len(rows) != 3:
-    raise SystemExit(f"expected the published three-row train population, got {len(rows)}")
-target.write_text(json.dumps(rows[0], sort_keys=True, indent=2) + "\n")
-PY
+ls -l "$RESULTS_ROOT/plan/phase1-manifest.json" "$RESULTS_ROOT/plan/selected-train.json"
+ls -l "$RESULTS_ROOT/launch/render-receipt.json"
 ```
 
 The selected file is immutable evidence: record its SHA-256, source/config/
