@@ -1026,22 +1026,15 @@ def compose_model_profile(cfg: Any, science_profile: str | None) -> Any:
                 OmegaConf.update(cfg, path, activation, merge=False)
     elif is_he_sigmoid_profile(science_profile):
         activation = _HE_MODEL_PROFILE_DATA[HE_SIGMOID_PROFILE]["activation"]
-        model = OmegaConf.to_container(cfg.model, resolve=False)
-        if not isinstance(model, dict) or not isinstance(model.get("embedding"), dict):
-            raise ProtocolError("He sigmoid profile requires a mapping model embedding")
-        layers = model.get("layers")
-        if not isinstance(layers, list) or not layers or not isinstance(layers[0], dict):
-            raise ProtocolError("He sigmoid profile requires one model layer")
-        mixing = layers[0].get("mixing")
-        path_aggregation = layers[0].get("path_aggregation")
-        if not isinstance(mixing, dict) or not isinstance(path_aggregation, dict):
-            raise ProtocolError("He sigmoid profile requires mixing and path aggregation")
-        # Rebuild the owned model mapping so ListConfig nodes cannot swallow a
-        # dotted update while the gateway later merges row-owned values.
-        model["embedding"]["activation"] = {"_target_": activation}
-        mixing["activation"] = {"_target_": activation}
-        path_aggregation["activation"] = {"_target_": activation}
-        cfg.model = model
+        OmegaConf.update(
+            cfg, "model.embedding.activation", {"_target_": activation},
+            merge=False, force_add=True,
+        )
+        for path in (
+            "model.layers.0.mixing.activation._target_",
+            "model.layers.0.path_aggregation.activation._target_",
+        ):
+            OmegaConf.update(cfg, path, activation, merge=False)
     else:
         raise ProtocolError(f"unknown science profile {science_profile!r}")
     OmegaConf.update(cfg, "stage1_science_profile", str(science_profile), merge=False, force_add=True)
@@ -2133,9 +2126,12 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
     def select(path: str) -> Any:
         value: Any = resolved
         for part in path.split("."):
-            if not isinstance(value, Mapping) or part not in value:
+            if isinstance(value, Mapping) and part in value:
+                value = value[part]
+            elif isinstance(value, list) and part.isdigit() and int(part) < len(value):
+                value = value[int(part)]
+            else:
                 raise ProtocolError(f"resolved train config is missing {path}")
-            value = value[part]
         return value
 
     if select("stage1_overlay.path") != relative or select("stage1_overlay.sha256") != digest:
