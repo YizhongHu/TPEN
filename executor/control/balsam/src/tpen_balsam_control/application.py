@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar, Protocol
+from typing import Any, Callable, ClassVar, Protocol
 
 from tpen_executor._codec import sha256_text, text
 
@@ -129,3 +129,102 @@ class InjectedSDKOperations(Protocol):
     def readback(self, group_id: str, backend_job_id: str) -> str:
         """Read back one bound job and return its primitive state."""
         ...
+
+
+def make_application_definition(
+    api: Any,
+    *,
+    invoke_group: Callable[[Any], Any],
+    exit_code: Callable[[Any, Any], int],
+    contract: Any,
+    record_failure: Callable[[Any, BaseException], None],
+    record_observation: Callable[[Any, object], None],
+    site_name: str,
+    application_name: str,
+    deployment_digest: str,
+    source_digest: str,
+    policy_overrides: Mapping[str, Any],
+) -> type:
+    """Build the generated application policy around an injected API.
+
+    Parameters
+    ----------
+    api : object
+        Control-side API object exposing ``ApplicationDefinition``.
+    invoke_group : callable
+        Generic executor group entrypoint.  It owns scientific completion.
+    exit_code : callable
+        Existing typed group-exit policy, injected to avoid a second classifier.
+    contract : object
+        Explicit qualified exit contract consumed by ``exit_code``.
+    record_failure, record_observation : callable
+        Durable control observation hooks; neither may authorize reentry.
+    site_name, application_name, deployment_digest, source_digest : str
+        Immutable generated identities attached to the application class.
+    policy_overrides : mapping
+        Explicit deployment policy values recorded on the generated class.  The
+        lifecycle hooks remain fail-closed and never inherit retry behavior.
+
+    Returns
+    -------
+    type
+        An ``ApplicationDefinition`` subclass with explicit non-retry hooks.
+    """
+    base = getattr(api, "ApplicationDefinition", None)
+    if not isinstance(base, type) or not all(callable(value) for value in
+                                              (invoke_group, exit_code, record_failure, record_observation)):
+        raise BalsamControlRefusal("application requires a typed API and control callbacks")
+    for name, value in (("site_name", site_name), ("application_name", application_name)):
+        if not isinstance(value, str) or not value.strip():
+            raise BalsamControlRefusal(f"{name} must be non-empty")
+    for name, value in (("deployment_digest", deployment_digest), ("source_digest", source_digest)):
+        try:
+            sha256_text(value, name)
+        except (TypeError, ValueError) as error:
+            raise BalsamControlRefusal(f"{name} must be a SHA-256 identity") from error
+    if not isinstance(policy_overrides, Mapping) or any(type(key) is not str for key in policy_overrides):
+        raise BalsamControlRefusal("policy_overrides must be a string-keyed mapping")
+
+    class GeneratedApplication(base):
+        """Generated app whose hooks never inherit automatic reentry."""
+
+        tpen_site_name = site_name
+        tpen_application_name = application_name
+        tpen_deployment_digest = deployment_digest
+        tpen_source_digest = source_digest
+        tpen_policy_overrides = dict(policy_overrides)
+
+        def run(self) -> int:
+            """Invoke the group and turn only typed reconciliation into success."""
+            job = getattr(self, "job", None)
+            try:
+                code = exit_code(invoke_group(job), contract)
+            except BaseException as error:
+                try:
+                    record_failure(job, error)
+                finally:
+                    raise SystemExit(2) from error
+            if code:
+                raise SystemExit(code)
+            return 0
+
+        def handle_timeout(self) -> None:
+            """Leave a timed-out job non-runnable for explicit reentry."""
+            job = getattr(self, "job", None)
+            if job is not None and hasattr(job, "state"):
+                job.state = "failed"
+            record_observation(job, "timeout-awaiting-explicit-reentry")
+
+        def handle_error(self, error: BaseException | None = None) -> None:
+            """Leave an errored job non-runnable without an inherited retry."""
+            job = getattr(self, "job", None)
+            if job is not None and hasattr(job, "state"):
+                job.state = "failed"
+            record_observation(job, "error-awaiting-explicit-reentry" if error is None else error)
+
+        def request_rearm(self, *args: Any, **kwargs: Any) -> None:
+            """Refuse implicit rearm until the explicit recovery slice exists."""
+            del args, kwargs
+            raise BalsamControlRefusal("rearm requires an explicit grant-bound transaction")
+
+    return GeneratedApplication

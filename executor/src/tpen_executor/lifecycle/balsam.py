@@ -265,6 +265,8 @@ def make_group_application(
     controller: Callable[[Any], GroupReconciliationV2 | GroupFailure],
     contract: GroupExitContract,
     record_failure: Callable[[Any, BaseException], None],
+    timeout_handler: Callable[[Any], None] | None = None,
+    error_handler: Callable[[Any, BaseException | None], None] | None = None,
 ) -> type:
     """Build an optional ApplicationDefinition around an injected controller.
 
@@ -281,6 +283,9 @@ def make_group_application(
         Writes a durable pre-start/controller failure receipt using the Job
         and exception. A recorder failure still exits 2 and is attached to the
         original exception; durable storage failure cannot promise a receipt.
+    timeout_handler, error_handler : callable, optional
+        Explicit non-retry observation hooks.  The generated application calls
+        these after marking the Job non-runnable; neither hook may rearm it.
 
     Notes
     -----
@@ -288,7 +293,10 @@ def make_group_application(
     Environment preparation and its durable readback belong to the injected
     controller. This factory neither discovers allocations nor registers Jobs.
     """
-    if not isinstance(contract, GroupExitContract) or not callable(controller) or not callable(record_failure):
+    if (not isinstance(contract, GroupExitContract) or not callable(controller)
+            or not callable(record_failure)
+            or (timeout_handler is not None and not callable(timeout_handler))
+            or (error_handler is not None and not callable(error_handler))):
         raise BalsamGroupRefusal("application requires controller, failure recorder and exit contract")
     if api is None:
         try:
@@ -326,5 +334,26 @@ def make_group_application(
                 # exit zero. Non-success must be an actual process exit.
                 raise SystemExit(code)
             return 0
+
+        def handle_timeout(self) -> None:
+            """Mark timeout non-runnable and wait for explicit reentry."""
+            job = getattr(self, "job", None)
+            if job is not None and hasattr(job, "state"):
+                job.state = "failed"
+            if timeout_handler is not None:
+                timeout_handler(job)
+
+        def handle_error(self, error: BaseException | None = None) -> None:
+            """Mark an application error non-runnable without inherited retry."""
+            job = getattr(self, "job", None)
+            if job is not None and hasattr(job, "state"):
+                job.state = "failed"
+            if error_handler is not None:
+                error_handler(job, error)
+
+        def request_rearm(self, *args: Any, **kwargs: Any) -> None:
+            """Refuse implicit rearm; S8 supplies the explicit typed path."""
+            del args, kwargs
+            raise BalsamGroupRefusal("rearm requires an explicit grant-bound transaction")
 
     return GroupApplication
