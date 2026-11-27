@@ -62,6 +62,30 @@ def test_writer_round_trip_and_exact_write_set(tmp_path: Path) -> None:
     }
 
 
+def test_writer_accepts_symlinked_caller_root_and_uses_canonical_root(tmp_path: Path) -> None:
+    real_root = tmp_path / "real" / "history"
+    alias_parent = tmp_path / "alias"
+    alias_parent.symlink_to(real_root.parent, target_is_directory=True)
+
+    writer = _writer(alias_parent / "history")
+
+    assert writer.root == real_root
+    writer.append_capture(_record(0))
+    writer.complete(next_iteration=1, completed_updates=1)
+    TrainingBatchReader(alias_parent / "history").validate(require_complete=True)
+
+
+def test_writer_refuses_symlink_below_canonical_root(tmp_path: Path) -> None:
+    root = tmp_path / "history"
+    root.mkdir()
+    target = tmp_path / "outside-events.jsonl"
+    target.write_bytes(b"")
+    (root / EVENTS_FILENAME).symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlink"):
+        _writer(root)
+
+
 def test_writer_matches_r1_fixture_bytes_for_shared_scenario(tmp_path: Path) -> None:
     stream_id = "32323232-3232-4232-8232-323232323232"
     fixture = tmp_path / "fixture"

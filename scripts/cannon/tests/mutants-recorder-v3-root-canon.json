@@ -1,0 +1,23 @@
+[
+  {
+    "id": "writer-keeps-raw-root",
+    "target": "tpen/callback/training_history_v3_writer.py",
+    "old": "self.root = Path(root).resolve()",
+    "new": "self.root = Path(root)",
+    "killer": "tests/unit/callback/test_training_history_v3_writer.py::test_writer_accepts_symlinked_caller_root_and_uses_canonical_root"
+  },
+  {
+    "id": "recorder-keeps-raw-v3-root",
+    "target": "tpen/callback/raw_training_batch_recorder.py",
+    "old": "self.path = Path(path).resolve() if format_version == 3 else Path(path)",
+    "new": "self.path = Path(path)",
+    "killer": "tests/unit/callback/test_raw_training_batch_recorder.py::test_v3_recorder_canonicalizes_symlinked_root"
+  },
+  {
+    "id": "below-root-symlink-accepted",
+    "target": "tpen/callback/training_history_v3_writer.py",
+    "old": "if any((Path(directory) / name).is_symlink() for name in (*directories, *files)):",
+    "new": "if False:",
+    "killer": "tests/unit/callback/test_training_history_v3_writer.py::test_writer_refuses_symlink_below_canonical_root"
+  }
+]

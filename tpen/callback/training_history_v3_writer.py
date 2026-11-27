@@ -35,13 +35,17 @@ _ZERO_HASH = "0" * 64
 
 
 def _reject_symlinked_root(path: Path) -> None:
-    """Reject an existing symlink in the root path before creating children."""
+    """Reject symlinks in or below the canonicalized root."""
 
     current = Path(path.anchor) if path.is_absolute() else Path()
     for component in path.parts[1:] if path.is_absolute() else path.parts:
         current = current / component
         if current.exists() and current.is_symlink():
             raise ValueError("v3 history root or root component is a symlink")
+    if path.is_dir():
+        for directory, directories, files in os.walk(path, followlinks=False):
+            if any((Path(directory) / name).is_symlink() for name in (*directories, *files)):
+                raise ValueError("v3 history root or root component is a symlink")
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -173,7 +177,8 @@ class TrainingHistoryV3Writer:
         inherited_seal_frontier: int = 0,
         inherited_seals: Mapping[int, tuple[int, int]] | None = None,
     ) -> None:
-        self.root = Path(root)
+        # Resolve caller-owned aliases once; descendants remain subject to the guard.
+        self.root = Path(root).resolve()
         self.fragments = self.root / "fragments"
         self._poisoned = False
         self._last_step: int | None = None
