@@ -106,8 +106,8 @@ def test_render_is_deterministic_and_effect_free(tmp_path: Path) -> None:
     second = render_deployment(spec, resources)
     assert first == second
     assert "token" not in first.settings.lower()
-    assert "handle_timeout" in first.application
-    assert "handle_error" in first.application
+    assert "make_application_definition(" in first.application
+    assert "POLICY_OVERRIDES" in first.application
 
 
 def test_deploy_preserves_existing_identity_and_returns_effective_digests(tmp_path: Path) -> None:
@@ -140,6 +140,9 @@ def test_deploy_refuses_crossed_application_site_name(tmp_path: Path) -> None:
     spec = _spec(tmp_path)
     rendered = render_deployment(spec)
     backend = _Backend(spec, rendered)
+    # Both records exist already: the crossed application must be refused
+    # before deployment considers any mutating operation.
+    backend.sites[spec.site_name] = dict(backend.site_record)
     backend.apps[(spec.site_name, rendered.application_name)] = {
         **backend.app_record,
         "site_name": "foreign-site",
@@ -203,6 +206,9 @@ def test_deploy_requires_post_mutation_readback(tmp_path: Path, kind: str) -> No
             return None
 
         backend.read_site = read_site_absent
+        # Keep an existing valid application so a mutant that trusts the
+        # create acknowledgement cannot fail later for an unrelated reason.
+        backend.apps[(spec.site_name, rendered.application_name)] = dict(backend.app_record)
         with pytest.raises(BalsamDeploymentRefusal, match="site readback"):
             deploy_owned_site(spec, backend)
         assert backend.calls == ["create-site"]
