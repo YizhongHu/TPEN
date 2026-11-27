@@ -101,12 +101,13 @@ def _validate_he_profile_checkpoint(row: Mapping[str, Any]) -> None:
         return
     checkpoint_dir = Path(str(row.get("checkpoint_dir", "")))
     manifest_path = checkpoint_dir / "manifest.json"
-    # Legacy synthetic collector fixtures do not carry checkpoint manifests;
-    # live Stage-1 rows do, and those must prove model-profile compatibility.
     if not manifest_path.is_file():
-        if row.get("science_profile") == HE_SIGMOID_PROFILE:
+        # Activations are parameter-free, so a missing manifest removes the
+        # only durable discriminator between native SiLU and He sigmoid.
+        if row.get("science_profile") in {None, HE_SIGMOID_PROFILE}:
             raise CollectionError(
-                f"He profile checkpoint compatibility manifest is missing: {manifest_path}"
+                "He checkpoint compatibility manifest is missing before collection "
+                f"writes: {manifest_path}"
             )
         return
     from experiments.atomistic.stage1.eval import build_eval_config

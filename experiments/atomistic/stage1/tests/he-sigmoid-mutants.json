@@ -34,6 +34,13 @@
       "old": "if expected is None or actual is None or expected != actual:",
       "new": "if False:",
       "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_collect_refuses_cross_profile_checkpoint"
+    },
+    {
+      "id": "he-eval-missing-manifest-allowed",
+      "target": "experiments/atomistic/stage1/eval.py",
+      "old": "if is_he_profile_row:\n            raise EvalRunRefusal(\n                f\"He checkpoint compatibility manifest is missing before eval writes: \"\n                f\"{manifest_path}\"\n            )",
+      "new": "if is_he_profile_row and False:\n            raise EvalRunRefusal(\n                f\"He checkpoint compatibility manifest is missing before eval writes: \"\n                f\"{manifest_path}\"\n            )",
+      "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_eval_refuses_missing_manifest_before_writes"
     }
   ]
 }

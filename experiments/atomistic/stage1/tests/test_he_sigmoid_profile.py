@@ -121,6 +121,26 @@ def _model(cfg: Any) -> dict[str, Any]:
     return value
 
 
+def _checkpoint_for_profile(tmp_path: Path, profile: str | None) -> Path:
+    """Write one real model-only checkpoint fixture for a He profile."""
+
+    from tpen.checkpoint import save_checkpoint
+
+    row = next(row for row in _rows(profile) if row["kind"] == "train")
+    cfg = build_train_config(row)
+    model = instantiate(cfg.model).to(dtype=torch.float64)
+    context = SimpleNamespace(
+        cfg=cfg,
+        run_dir=tmp_path / "source-run",
+        metadata=SimpleNamespace(device="cpu", dtype="float64"),
+    )
+    return save_checkpoint(
+        output_dir=tmp_path / "source-checkpoints", next_iteration=1,
+        completed_updates=1, model=model, context=context,
+        save_optimizer=False, save_trainer=False, save_sampler=False, save_rng=False,
+    )
+
+
 def _full_snapshot(cfg: Any) -> dict[str, Any]:
     """Return the complete unresolved config, not only the model subtree."""
 
@@ -341,4 +361,47 @@ def test_he_collect_refuses_cross_profile_checkpoint(
         "checkpoint_file": str(checkpoint_dir / "model.pt"),
     })
     with pytest.raises(stage1_collect.CollectionError, match="does not match binding"):
+        stage1_collect._validate_he_profile_checkpoint(row)
+
+
+@pytest.mark.parametrize("target_profile", (None, HE_SIGMOID_PROFILE))
+def test_he_eval_refuses_missing_manifest_before_writes(
+    target_profile: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Eval refuses an unverifiable native or sigmoid He checkpoint."""
+
+    source_profile = HE_SIGMOID_PROFILE if target_profile is None else None
+    checkpoint_dir = _checkpoint_for_profile(tmp_path, source_profile)
+    (checkpoint_dir / "manifest.json").unlink()
+    row = dict(next(row for row in _rows(target_profile, phase=2) if row["kind"] == "eval"))
+    row.update({
+        "checkpoint_dir": str(checkpoint_dir),
+        "checkpoint_file": str(checkpoint_dir / "model.pt"),
+        "results_root": str(tmp_path / "eval-results"),
+    })
+    monkeypatch.setattr(stage1_eval, "validate_gateway_binding", lambda **_: row)
+    monkeypatch.setattr(stage1_eval, "run_from_config", lambda *_a, **_k: pytest.fail("eval ran"))
+    monkeypatch.setattr(sys, "argv", ["eval.py", "--binding", "unused"])
+    with pytest.raises(stage1_eval.EvalRunRefusal, match="missing before eval writes"):
+        stage1_eval.main()
+    assert not Path(row["results_root"]).exists()
+
+
+@pytest.mark.parametrize("target_profile", (None, HE_SIGMOID_PROFILE))
+def test_he_collect_refuses_missing_manifest_before_writes(
+    target_profile: str | None, tmp_path: Path,
+) -> None:
+    """Collection refuses an unverifiable native or sigmoid He checkpoint."""
+
+    from experiments.atomistic.stage1 import collect as stage1_collect
+
+    source_profile = HE_SIGMOID_PROFILE if target_profile is None else None
+    checkpoint_dir = _checkpoint_for_profile(tmp_path, source_profile)
+    (checkpoint_dir / "manifest.json").unlink()
+    row = dict(next(row for row in _rows(target_profile, phase=2) if row["kind"] == "eval"))
+    row.update({
+        "checkpoint_dir": str(checkpoint_dir),
+        "checkpoint_file": str(checkpoint_dir / "model.pt"),
+    })
+    with pytest.raises(stage1_collect.CollectionError, match="missing before collection writes"):
         stage1_collect._validate_he_profile_checkpoint(row)

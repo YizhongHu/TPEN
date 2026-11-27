@@ -129,12 +129,12 @@ def _refuse_cross_variant_checkpoint(cfg: DictConfig, row: Mapping[str, object])
     checkpoint_dir = Path(str(row["checkpoint_dir"]))
     manifest_path = checkpoint_dir / "manifest.json"
     if not manifest_path.is_file():
-        # Legacy native-He fixtures predate checkpoint model manifests.  A
-        # sigmoid binding cannot use that unverifiable checkpoint, while the
-        # native path remains compatible with those historical rows.
-        if is_he_sigmoid_profile(profile):
+        # Activations are parameter-free, so a missing manifest removes the
+        # only durable discriminator between native SiLU and He sigmoid.
+        if is_he_profile_row:
             raise EvalRunRefusal(
-                f"profile checkpoint compatibility manifest is missing: {manifest_path}"
+                f"He checkpoint compatibility manifest is missing before eval writes: "
+                f"{manifest_path}"
             )
         return
     # Keep checkpoint internals lazy for the outside-checkout driver probe.
