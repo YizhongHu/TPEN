@@ -3,15 +3,15 @@
 # This profile uses TPEN's existing linear interaction producer with the shared
 # linear PathLayout (max_order=2, coordinate_neighbor support order 3).  For
 # N=2, virtual-order-3 supports are empty (the no_repeated_particle_mask
-# removes them), so a 2e run tests product removal with nonlinear pair-self
-# depth, not third-particle messaging.  This file is descriptive and is not a
-# default or hybrid Hooke configuration; the Stage-1 protocol composes it only
-# when the profile is explicitly selected.
-# In the N=2 finite-gradient probe, the only structurally inactive parameters
-# are stack.layers.0.mixing.producers.0.weights.3 and .weights.4, the two
-# order-3-only replacement paths. Every other parameter must receive a finite
-# gradient. ModuleNorms and OptimizerState keep the full layer groups and count
-# absent gradients/state; ParameterActivity records the two as absent, while the
+# removes them). Under the Pfaffian readout, the order-1 branch and those
+# order-3 paths are disconnected from the output, so a 2e run trains only
+# pair-feature (order-2) linear processing. It tests product removal with
+# nonlinear pair-self depth, NOT third-particle messaging or order-1 features.
+# This file is descriptive and is not a default or hybrid Hooke configuration;
+# the Stage-1 protocol composes it only when the profile is explicitly selected.
+# The finite-gradient probe asserts the exact nine-name dead set in the test.
+# ModuleNorms and OptimizerState keep the full layer groups and count absent
+# gradients/state; ParameterActivity records them as absent, while the
 # RawTrainingBatchRecorder is unaffected.
 science_profile: hooke2-linear50k-v1
 interaction_mode: linear

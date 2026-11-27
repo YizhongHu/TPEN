@@ -29,8 +29,15 @@ CONFIG_ROOT = Path(__file__).parents[1] / "configs"
 LINEAR_CONFIG = CONFIG_ROOT / "hooke2" / "linear.yaml"
 NATIVE_HOOKE2_CONFIG_SHA256 = "a7296e0c52a082ab1949557b00732cf88468a7489e854e430182dcb02f8a698c"
 N2_LINEAR_GRADIENT_FREE_PARAMETER_NAMES = frozenset({
+    "embedding.order_mlps.1.layers.0.weight",
+    "embedding.order_mlps.1.layers.0.bias",
+    "embedding.order_mlps.1.layers.2.weight",
+    "embedding.order_mlps.1.layers.2.bias",
+    "stack.layers.0.mixing.producers.0.weights.0",
+    "stack.layers.0.mixing.producers.0.weights.1",
     "stack.layers.0.mixing.producers.0.weights.3",
     "stack.layers.0.mixing.producers.0.weights.4",
+    "stack.layers.0.path_aggregation.weights.o1",
 })
 
 
@@ -83,15 +90,7 @@ def test_linear_profile_n2_empty_support_order3_and_finite_forward() -> None:
     row = _rows(HOOKE2_LINEAR_PROFILE)[0]
     cfg = build_train_config(row)
     model = instantiate(cfg.model).to(dtype=torch.float64)
-    positions = torch.tensor(
-        [[[0.3, -0.2, 0.8], [-0.1, 0.5, 0.3]],
-         [[1.0, 0.0, 0.5], [0.0, -0.5, 1.5]]],
-        dtype=torch.float64,
-    )
-    batch = ElectronBatch(
-        positions=positions,
-        spins=torch.tensor([[1.0, -1.0], [1.0, -1.0]], dtype=torch.float64),
-    )
+    batch = _n2_batch()
     layer = model.stack.layers[0]
     feature = model.embedding(batch)
     interaction = layer.mixing(feature)
@@ -113,6 +112,36 @@ def test_linear_profile_n2_empty_support_order3_and_finite_forward() -> None:
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
         for name, parameter in model.named_parameters()
         if name not in N2_LINEAR_GRADIENT_FREE_PARAMETER_NAMES
+    )
+
+
+def test_default_hooke2_gradient_inventory_is_informational(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Print the default tensor-product N=2 inventory without asserting it."""
+
+    cfg = build_train_config(_rows(None)[0])
+    model = instantiate(cfg.model).to(dtype=torch.float64)
+    output = model(_n2_batch())
+    output.logabs.square().mean().backward()
+    gradient_free = sorted(
+        name for name, parameter in model.named_parameters()
+        if parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
+    )
+    with capsys.disabled():
+        print(f"DEFAULT_HOOKE2_GRADIENT_FREE={gradient_free}", flush=True)
+
+
+def _n2_batch() -> ElectronBatch:
+    """Return the fixed two-electron batch shared by gradient probes."""
+
+    return ElectronBatch(
+        positions=torch.tensor(
+            [[[0.3, -0.2, 0.8], [-0.1, 0.5, 0.3]],
+             [[1.0, 0.0, 0.5], [0.0, -0.5, 1.5]]],
+            dtype=torch.float64,
+        ),
+        spins=torch.tensor([[1.0, -1.0], [1.0, -1.0]], dtype=torch.float64),
     )
 
 
