@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar, Protocol
+from typing import Any, Callable, ClassVar, Protocol
 
 from tpen_executor._codec import sha256_text, text
 
@@ -129,3 +129,87 @@ class InjectedSDKOperations(Protocol):
     def readback(self, group_id: str, backend_job_id: str) -> str:
         """Read back one bound job and return its primitive state."""
         ...
+
+
+def make_application_definition(
+    api: Any,
+    *,
+    invoke_group: Callable[[Any], Any],
+    exit_code: Callable[[Any, Any], int],
+    contract: Any,
+    record_failure: Callable[[Any, BaseException], None],
+    record_observation: Callable[[Any, object], None],
+    application_name: str,
+    deployment_digest: str,
+) -> type:
+    """Build the generated application policy around an injected API.
+
+    Parameters
+    ----------
+    api : object
+        Control-side API object exposing ``ApplicationDefinition``.
+    invoke_group : callable
+        Generic executor group entrypoint.  It owns scientific completion.
+    exit_code : callable
+        Existing typed group-exit policy, injected to avoid a second classifier.
+    contract : object
+        Explicit qualified exit contract consumed by ``exit_code``.
+    record_failure, record_observation : callable
+        Durable control observation hooks; neither may authorize reentry.
+    application_name, deployment_digest : str
+        Immutable generated identities attached to the application class.
+
+    Returns
+    -------
+    type
+        An ``ApplicationDefinition`` subclass with explicit non-retry hooks.
+    """
+    base = getattr(api, "ApplicationDefinition", None)
+    if not isinstance(base, type) or not all(callable(value) for value in
+                                              (invoke_group, exit_code, record_failure, record_observation)):
+        raise BalsamControlRefusal("application requires a typed API and control callbacks")
+    if not isinstance(application_name, str) or not application_name.strip():
+        raise BalsamControlRefusal("application_name must be non-empty")
+    if not isinstance(deployment_digest, str) or len(deployment_digest) != 64:
+        raise BalsamControlRefusal("deployment_digest must be a SHA-256 identity")
+
+    class GeneratedApplication(base):
+        """Generated app whose hooks never inherit automatic reentry."""
+
+        tpen_application_name = application_name
+        tpen_deployment_digest = deployment_digest
+
+        def run(self) -> int:
+            """Invoke the group and turn only typed reconciliation into success."""
+            job = getattr(self, "job", None)
+            try:
+                code = exit_code(invoke_group(job), contract)
+            except BaseException as error:
+                try:
+                    record_failure(job, error)
+                finally:
+                    raise SystemExit(2) from error
+            if code:
+                raise SystemExit(code)
+            return 0
+
+        def handle_timeout(self) -> None:
+            """Leave a timed-out job non-runnable for explicit reentry."""
+            job = getattr(self, "job", None)
+            if job is not None and hasattr(job, "state"):
+                job.state = "failed"
+            record_observation(job, "timeout-awaiting-explicit-reentry")
+
+        def handle_error(self, error: BaseException | None = None) -> None:
+            """Leave an errored job non-runnable without an inherited retry."""
+            job = getattr(self, "job", None)
+            if job is not None and hasattr(job, "state"):
+                job.state = "failed"
+            record_observation(job, "error-awaiting-explicit-reentry" if error is None else error)
+
+        def request_rearm(self, *args: Any, **kwargs: Any) -> None:
+            """Refuse implicit rearm until the explicit recovery slice exists."""
+            del args, kwargs
+            raise BalsamControlRefusal("rearm requires an explicit grant-bound transaction")
+
+    return GeneratedApplication
