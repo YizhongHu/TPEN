@@ -234,7 +234,7 @@ def test_cached_mutation_evidence_is_bound_before_replay(
     state.mkdir(parents=True)
     if foreign != "orphan":
         (state / "intent.json").write_bytes(canonical_bytes(request.to_dict()))
-        (state / "result.json").write_bytes(canonical_bytes(evidence))
+    (state / "result.json").write_bytes(canonical_bytes(evidence))
     bridge = FakeBridge(lambda _: pytest.fail("cached evidence must not call bridge"))
     client = BalsamProcessClient("/bin/sh", client_path=_client_file(tmp_path), state_dir=tmp_path / "state", bridge=bridge)
     with pytest.raises(BalsamBridgeFailure):
