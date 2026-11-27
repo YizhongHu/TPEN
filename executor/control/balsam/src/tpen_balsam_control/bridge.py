@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 
+from tpen_executor.lifecycle.balsam import BalsamGroupRefusal
 from tpen_executor.lifecycle.balsam_client import select_balsam_client_path
 from tpen_executor.lifecycle.balsam_wire import (
     BalsamWireRequest,
@@ -83,7 +84,11 @@ def load_sdk_operations(client_path: str) -> InjectedSDKOperations:
     bridge's process contract is testable with an injected finite adapter.
     """
 
-    os.environ["BALSAM_CLIENT_PATH"] = str(select_balsam_client_path(client_path))
+    try:
+        validated_path = select_balsam_client_path(client_path)
+    except BalsamGroupRefusal as error:
+        raise BalsamControlRefusal(str(error)) from error
+    os.environ["BALSAM_CLIENT_PATH"] = str(validated_path)
     from .sdk_adapter import DocumentedSDKOperations
 
     return DocumentedSDKOperations.from_imported_sdk()
