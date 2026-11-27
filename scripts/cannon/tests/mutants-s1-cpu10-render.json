@@ -17,7 +17,7 @@
     {
       "id": "gpu-omp-export-dropped",
       "target": "experiments/atomistic/stage1/launch.py",
-      "old": "f\"export OMP_NUM_THREADS={cpus_per_task}\\n\"",
+      "old": "f\"export OMP_NUM_THREADS={cpus_per_task}\"",
       "new": "\"\"",
       "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_gpu_render_defaults_to_measured_shape_and_cuda_binding"
     },

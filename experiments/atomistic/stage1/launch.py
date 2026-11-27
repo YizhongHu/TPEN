@@ -291,8 +291,10 @@ def render(*, row: Mapping[str, Any], checkout_root: str, python: str,
         )
         template = template.replace(
             "__GPU_THREAD_EXPORTS__",
-            f"export OMP_NUM_THREADS={cpus_per_task}\n"
-            f"export MKL_NUM_THREADS={cpus_per_task}",
+            "\n".join([
+                f"export OMP_NUM_THREADS={cpus_per_task}",
+                f"export MKL_NUM_THREADS={cpus_per_task}",
+            ]),
         )
         template = template.replace(
             'REQUESTED_PARTITION="__PARTITION__"\n'
