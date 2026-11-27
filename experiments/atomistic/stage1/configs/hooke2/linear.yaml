@@ -7,6 +7,12 @@
 # depth, not third-particle messaging.  This file is descriptive and is not a
 # default or hybrid Hooke configuration; the Stage-1 protocol composes it only
 # when the profile is explicitly selected.
+# In the N=2 finite-gradient probe, the only structurally inactive parameters
+# are stack.layers.0.mixing.producers.0.weights.3 and .weights.4, the two
+# order-3-only replacement paths. Every other parameter must receive a finite
+# gradient. ModuleNorms and OptimizerState keep the full layer groups and count
+# absent gradients/state; ParameterActivity records the two as absent, while the
+# RawTrainingBatchRecorder is unaffected.
 science_profile: hooke2-linear50k-v1
 interaction_mode: linear
 max_order: 2

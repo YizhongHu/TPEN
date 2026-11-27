@@ -28,6 +28,10 @@ from tpen.run import run_from_config
 CONFIG_ROOT = Path(__file__).parents[1] / "configs"
 LINEAR_CONFIG = CONFIG_ROOT / "hooke2" / "linear.yaml"
 NATIVE_HOOKE2_CONFIG_SHA256 = "a7296e0c52a082ab1949557b00732cf88468a7489e854e430182dcb02f8a698c"
+N2_LINEAR_GRADIENT_FREE_PARAMETER_NAMES = frozenset({
+    "stack.layers.0.mixing.producers.0.weights.3",
+    "stack.layers.0.mixing.producers.0.weights.4",
+})
 
 
 def test_linear_profile_is_opt_in_and_native_hooke_configs_are_unchanged() -> None:
@@ -58,11 +62,12 @@ def test_linear_profile_resolves_one_linear_producer_and_shared_layout() -> None
     assert cfg.stage1_linear_profile.interaction_mode == "linear"
     assert cfg.stage1_linear_profile.max_order == HOOKE2_LINEAR_MAX_ORDER
     assert cfg.stage1_linear_profile.max_virtual_order == HOOKE2_LINEAR_MAX_VIRTUAL_ORDER
+    assert cfg.stage1_linear_profile.max_virtual_order == 3
     assert cfg.stage1_linear_profile.path_policy == HOOKE2_LINEAR_PATH_POLICY
     assert layer_cfg.mixing._target_ == "tpen.nn.CompositeMixing"
     assert layer_cfg.mixing.producers[0]._target_ == "tpen.nn.LinearEquivariantMixing"
-    assert "EquivariantMixing" not in str(layer_cfg.mixing.producers[0]._target_)
     assert layer_cfg.layout.max_virtual_order == HOOKE2_LINEAR_MAX_VIRTUAL_ORDER
+    assert layer_cfg.layout.max_virtual_order == 3
 
     model = instantiate(cfg.model).to(dtype=torch.float64)
     layer = model.stack.layers[0]
@@ -99,10 +104,29 @@ def test_linear_profile_n2_empty_support_order3_and_finite_forward() -> None:
     output = model(batch)
     assert torch.isfinite(output.logabs).all()
     output.logabs.square().mean().backward()
+    gradient_free = {
+        name for name, parameter in model.named_parameters()
+        if parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
+    }
+    assert gradient_free == N2_LINEAR_GRADIENT_FREE_PARAMETER_NAMES
     assert all(
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
-        for parameter in model.parameters() if parameter.requires_grad
+        for name, parameter in model.named_parameters()
+        if name not in N2_LINEAR_GRADIENT_FREE_PARAMETER_NAMES
     )
+
+
+def test_linear_profile_stage1_diagnostics_cover_inactive_paths() -> None:
+    """Missing N=2 path gradients remain observable, not silently ungrouped."""
+
+    cfg = build_train_config(_rows(HOOKE2_LINEAR_PROFILE)[0])
+    callback_by_target = {entry._target_: entry for entry in cfg.callbacks}
+    for target in ("tpen.callback.ModuleNorms", "tpen.callback.OptimizerState"):
+        groups = callback_by_target[target].groups
+        assert groups.layer_0_mixing == ["stack.layers.0.mixing"]
+        assert groups.layer_0_path_aggregation == ["stack.layers.0.path_aggregation"]
+    assert "tpen.callback.ParameterActivity" in callback_by_target
+    assert "tpen.callback.RawTrainingBatchRecorder" in callback_by_target
 
 
 def test_linear_profile_runs_one_tiny_cpu_vmc_step(tmp_path: Path) -> None:
