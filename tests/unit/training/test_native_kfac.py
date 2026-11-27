@@ -1551,6 +1551,47 @@ def test_step_request_protocol_and_plain_sgd_guards() -> None:
         (StructuredCurvatureStepProducer, VMCStepProducer),
     )
 
+
+def test_kfac_route_receives_the_psiformer_clipped_energy(monkeypatch) -> None:
+    """Native KFAC consumes the same clipped score residual as other score routes."""
+
+    model = _LinearMLPWavefunction(in_features=4, hidden_features=3, bias=True)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.03)
+    method = NativeKFACUpdate(
+        optimizer,
+        model_parameters=_model_binding_for(model),
+        policy=KFACPolicy(learning_rate=0.03),
+    )
+    batch = _make_batch(batch_size=4, n_electrons=2, spatial_dim=2, seed=733)
+    raw_energy = torch.tensor([0.0, 1.0, 2.0, 100.0], dtype=torch.float64)
+    monkeypatch.setattr(
+        trainer_module,
+        "local_energy",
+        lambda *args, **kwargs: raw_energy.clone(),
+    )
+    trainer = VMCTrainer(
+        max_steps=1,
+        update_method=method,
+        energy_clipping_mode="psiformer",
+        energy_clipping_k=1.0,
+    )
+    state = TrainerState(model=model, optimizer=optimizer, trainer=trainer)
+    producer = _TrainerStepProducer(
+        trainer=trainer,
+        model=model,
+        hamiltonian_terms={},
+        batch=batch,
+        step=0,
+        context=_StubContext(),
+        state=state,
+    )
+
+    produced = producer.produce_structured_curvature_step(resolve_step_request(method))
+    assert torch.equal(
+        produced.update_input.local_energy,
+        torch.tensor([0.0, 1.0, 2.0, 26.75], dtype=torch.float64),
+    )
+
     # Post-init / post-restore optimizer mutation must be refused inside update()
     # before mutating EMA, counters, or parameters.
     batch_sgd = _make_batch(batch_size=4, n_electrons=2, spatial_dim=2, seed=621)
