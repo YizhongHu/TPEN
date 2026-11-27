@@ -198,7 +198,19 @@ def _materialize_train(profile: PilotProfile, *, results_root: str, run_id: str,
     # profile.  The renderer only changes the explicitly declared pilot knobs;
     # it does not invent a second smoke callback set.
     _set(config, "callbacks", _callbacks(config.get("callbacks", []) + diagnostics.get("callbacks", []), profile.family, profile.diagnostics_profile, synchronize=profile.train_timing_synchronize))
-    _set(config, "stage1_overlay", {"path": "configs/overlays/hooke-diagnostics-v2.yaml", "sha256": sha256_file(_OVERLAY_BASE), "profile": profile.diagnostics_profile})
+    # Materialized admission compares this provenance object byte-for-byte
+    # with the row-owned overlay basis.  Keep the rendered YAML self-contained
+    # while preserving the v2 recorder-before-checkpoint composition contract.
+    _set(config, "stage1_overlay", {
+        "schema": "stage1-overlay/v2",
+        "path": "configs/overlays/hooke-diagnostics-v2.yaml",
+        "sha256": sha256_file(_OVERLAY_BASE),
+        "composition_order": (
+            "base-config -> recorder-before-checkpoint diagnostics-v2 overlay -> manifest overrides"
+        ),
+        "stream": "train",
+        "profile": profile.diagnostics_profile,
+    })
     config = _resolve_document(config)
     if any("${" in repr(value) or value == "???" for value in config.values()):
         raise ValueError("rendered train config retains unresolved values")
