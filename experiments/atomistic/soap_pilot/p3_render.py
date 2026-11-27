@@ -27,12 +27,12 @@ from experiments.atomistic.stage1.protocol import (
     validate_materialized_admission,
 )
 
+from .approved_recipes import APPROVED_RECIPES
 from .composer import (
     ComposedRow,
     PilotProfile,
     R2_PROFILES,
     TARGET_PROFILES,
-    _materialize_train,
     _materialize_eval,
     _write_yaml,
     render_profile,
@@ -176,6 +176,28 @@ def finalize_eval_row(
     except RowContractError as exc:
         raise P3RenderError(f"SOAP publication evidence is invalid: {exc}") from exc
     checkpoint_root = Path(checkpoint_dir).resolve()
+    try:
+        train_config = yaml.safe_load(
+            Path(train_row["row_extension"]["rendered_config"]["path"]).read_bytes()
+        )
+        run = train_config["run"]
+        parent_run_dir = (
+            Path(train_row["results_root"])
+            / train_row["experiment_name"]
+            / train_row["sector"]
+            / train_row["run_id"]
+        ).resolve()
+        if (
+            run.get("root") != train_row["results_root"]
+            or run.get("run_id") != train_row["run_id"]
+            or Path(run.get("dir", "")).resolve() != parent_run_dir
+        ):
+            raise P3RenderError("SOAP100 parent config is not bound to the admitted train row")
+    except (KeyError, OSError, TypeError, yaml.YAMLError) as exc:
+        raise P3RenderError("SOAP100 parent train config cannot be admitted") from exc
+    expected_checkpoint_root = parent_run_dir / "checkpoints" / f"step_{template.checkpoint_step:06d}"
+    if checkpoint_root != expected_checkpoint_root:
+        raise P3RenderError("SOAP100 checkpoint is not the admitted parent step directory")
     model = checkpoint_root / "model.pt"
     complete = checkpoint_root / "COMPLETE"
     if not model.is_file() or not complete.is_file():
@@ -196,10 +218,8 @@ def finalize_eval_row(
     if publication.parent_run_id is not None and publication.parent_run_id != train_row.get("run_id"):
         raise P3RenderError("SOAP100 publication parent run identity does not match train row")
     if publication.parent_output_dir is not None:
-        try:
-            checkpoint_root.relative_to(Path(publication.parent_output_dir).resolve())
-        except ValueError as exc:
-            raise P3RenderError("SOAP100 checkpoint is outside the parent's output location") from exc
+        if Path(publication.parent_output_dir).resolve() != parent_run_dir:
+            raise P3RenderError("SOAP100 parent output metadata disagrees with the admitted parent")
     if parent.row_id != train_row.get("row_id"):
         raise P3RenderError("SOAP100 publication parent does not match train row")
     try:
@@ -363,45 +383,62 @@ def fail_closed_recipe_diff(expected: Mapping[str, Any], actual: Mapping[str, An
         raise P3RenderError(f"unenumerated recipe diff: {sorted(changes)}")
 
 
-def _normalise_recipe(value: Any, *, results_root: str, run_id: str) -> Any:
+def _normalise_recipe(value: Any, *, results_root: str, run_id: str, parent_run_dir: str | None = None) -> Any:
     """Normalize only declared packet destinations before recipe comparison."""
 
     if isinstance(value, Mapping):
-        return {key: _normalise_recipe(child, results_root=results_root, run_id=run_id) for key, child in value.items()}
+        return {
+            key: _normalise_recipe(
+                child, results_root=results_root, run_id=run_id, parent_run_dir=parent_run_dir
+            )
+            for key, child in value.items()
+        }
     if isinstance(value, list):
-        return [_normalise_recipe(child, results_root=results_root, run_id=run_id) for child in value]
+        return [
+            _normalise_recipe(
+                child, results_root=results_root, run_id=run_id, parent_run_dir=parent_run_dir
+            )
+            for child in value
+        ]
     if isinstance(value, str):
-        return value.replace(results_root, "<RESULTS_ROOT>").replace(run_id, "<RUN_ID>")
+        normalized = value
+        if parent_run_dir is not None:
+            normalized = normalized.replace(parent_run_dir, "/__P3_PARENT__")
+        return normalized.replace(results_root, "<RESULTS_ROOT>").replace(run_id, "<RUN_ID>")
     return value
 
 
-def _frozen_recipe(profile: PilotProfile) -> Mapping[str, Any]:
-    """Capture the approved full mapping before callers can alter the composer."""
+def _profile_for_row(row: Mapping[str, Any], config: Mapping[str, Any]) -> str | None:
+    """Return the independently reviewed recipe matching the supplied row."""
 
-    config, _ = _materialize_train(
-        profile,
-        results_root="/__P3_APPROVED_RESULTS__",
-        run_id="__P3_APPROVED_RUN__",
-        source_sha="0" * 40,
-        device="cpu",
-    )
-    return _normalise_recipe(config, results_root="/__P3_APPROVED_RESULTS__", run_id="__P3_APPROVED_RUN__")
-
-
-# These snapshots are the independently frozen P3 admission recipes.  They are
-# made once at module load, before a packet caller can monkeypatch the composer.
-_FROZEN_RECIPES = {profile.name: _frozen_recipe(profile) for profile in (*R2_PROFILES, *TARGET_PROFILES)}
-
-
-def _profile_for_row(row: Mapping[str, Any], config: Mapping[str, Any]) -> PilotProfile | None:
-    """Return the unique approved profile matching a row's declared shape."""
-
+    if row.get("kind") == "eval":
+        recipe = APPROVED_RECIPES["eval-soap-100"]
+        profile = recipe["profile"]
+        if (
+            row.get("checkpoint") != profile["checkpoint"]
+            or row.get("walkers") != profile["walkers"]
+            or row.get("draws") != profile["draws"]
+        ):
+            return None
+        return "eval-soap-100"
+    if row.get("kind") != "train":
+        return None
     optimizer = config.get("optimizer")
     if not isinstance(optimizer, Mapping):
         return None
-    target = optimizer.get("_target_")
-    family = {"torch.optim.Adam": "adam", "tpen.training.SOAP": "soap", "torch.optim.SGD": "minsr64"}.get(target)
-    candidates = [profile for profile in (*R2_PROFILES, *TARGET_PROFILES) if profile.family == family and profile.updates == row.get("updates") and profile.walkers == row.get("walkers") and list(profile.checkpoint_steps) == row.get("checkpoint_steps")]
+    candidates = []
+    for name, recipe in APPROVED_RECIPES.items():
+        if recipe["kind"] != "train":
+            continue
+        profile = recipe["profile"]
+        expected_optimizer = recipe["config"].get("optimizer", {})
+        if (
+            optimizer.get("_target_") == expected_optimizer.get("_target_")
+            and profile["updates"] == row.get("updates")
+            and profile["walkers"] == row.get("walkers")
+            and profile["checkpoint_steps"] == row.get("checkpoint_steps")
+        ):
+            candidates.append(name)
     return candidates[0] if len(candidates) == 1 else None
 
 
@@ -411,7 +448,7 @@ def _runner_bindings(row: Mapping[str, Any], *, command: str) -> Mapping[str, An
     run_dir = Path(row["results_root"]) / row["experiment_name"] / row["sector"] / row["run_id"]
     return {
         "env": {
-            "MODE": "train",
+            "MODE": row["kind"],
             "SOURCE_SHA": row["source_sha"],
             "CHECKOUT_ROOT": "<CHECKOUT_ROOT>",
             "UV_CACHE_DIR": "<UV_CACHE_DIR>",
@@ -434,24 +471,33 @@ def _runner_bindings(row: Mapping[str, Any], *, command: str) -> Mapping[str, An
 def _audit_packet_recipe(row: Mapping[str, Any], config: Mapping[str, Any], *, python: str, checkout_root: str) -> Mapping[str, Any]:
     """Gate a rendered packet against the frozen recipe and concrete bindings."""
 
-    profile = _profile_for_row(row, config)
-    if profile is None or profile.name not in _FROZEN_RECIPES:
-        raise P3RenderError("rendered packet does not match an approved R2 recipe")
-    normalized = _normalise_recipe(config, results_root=row["results_root"], run_id=row["run_id"])
-    expected = _FROZEN_RECIPES[profile.name]
-    # Only destinations, run identity and the declared runtime device vary by row.
+    recipe_name = _profile_for_row(row, config)
+    if recipe_name is None:
+        raise P3RenderError("rendered packet does not match an approved recipe for its row kind")
+    recipe = APPROVED_RECIPES[recipe_name]
+    parent_run_dir = None
+    if row["kind"] == "eval":
+        parent_run_dir = str(Path(row["checkpoint_dir"]).resolve().parents[1])
+    normalized = _normalise_recipe(
+        config, results_root=row["results_root"], run_id=row["run_id"], parent_run_dir=parent_run_dir
+    )
+    expected = recipe["config"]
     fail_closed_recipe_diff(
         expected,
         normalized,
-        allowed_paths={"run.root", "run.run_id", "run.dir", "runtime.device"},
+        allowed_paths=set(recipe["allowed_paths"]),
     )
     command = command_for_row(row, python=python, checkout_root=checkout_root)
     bindings = _runner_bindings(row, command=command)
-    if row["row_extension"]["rendered_config"]["path"] != str(Path(config["run"]["root"]) / "inputs" / f"{profile.name}.yaml"):
+    binding = recipe["binding"]
+    if Path(row["row_extension"]["rendered_config"]["path"]).name != binding["input_name"]:
         raise P3RenderError("rendered packet input destination is not the approved row output")
     if _binding_token(row) not in command:
         raise P3RenderError("runner argv is not bound to the admitted row")
-    if bindings["env"]["MODE"] != "train" or not bindings["output"]["log"].endswith(".log") or not bindings["output"]["status"].endswith(".status"):
+    expected_script = f"experiments/atomistic/stage1/{binding['script']}"
+    if bindings["env"]["MODE"] != binding["mode"] or expected_script not in command:
+        raise P3RenderError("concrete packet env/argv binding disagrees with the approved recipe")
+    if not bindings["output"]["log"].endswith(".log") or not bindings["output"]["status"].endswith(".status"):
         raise P3RenderError("concrete packet env/argv/output binding is incomplete")
     return bindings
 
