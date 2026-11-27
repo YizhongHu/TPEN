@@ -123,9 +123,15 @@ def test_he_sigmoid_rendered_train_and_eval_diff_only_activation_leaves() -> Non
 def test_he_sigmoid_manifest_identity_and_admission_are_he_only() -> None:
     rows = _rows(HE_SIGMOID_PROFILE)
     train_rows = [row for row in rows if row["kind"] == "train"]
+    native_eval_rows = [row for row in _rows(None, phase=2) if row["kind"] == "eval"]
+    sigmoid_eval_rows = [row for row in _rows(HE_SIGMOID_PROFILE, phase=2)
+                         if row["kind"] == "eval"]
     assert {row["science_profile"] for row in train_rows} == {HE_SIGMOID_PROFILE}
     assert {row["evaluation_selection"] for row in train_rows} == {"B"}
     assert {row["evaluation_selection_id"] for row in train_rows} == {"he-h2-b-v1"}
+    assert {row["evaluation_selection"] for row in native_eval_rows} == {
+        row["evaluation_selection"] for row in sigmoid_eval_rows
+    } == {"B"}
     assert {row["seed"] for row in train_rows} == {row["seed"] for row in _rows(None)
                                                     if row["kind"] == "train"}
     assert config_identities(config_root=CONFIG_ROOT, systems=("he",))["he"] != rows[0]["config_sha256"]
