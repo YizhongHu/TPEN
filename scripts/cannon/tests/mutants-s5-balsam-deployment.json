@@ -24,8 +24,8 @@
     {
       "id": "timeout-restart-hook",
       "target": "executor/src/tpen_executor/lifecycle/balsam.py",
-      "old": "job.state = \"failed\"",
-      "new": "job.state = \"restart-ready\"  # mutant: inherited restart policy",
+      "old": "job.state = \"failed\"\n            if timeout_handler is not None:",
+      "new": "job.state = \"restart-ready\"  # mutant: inherited restart policy\n            if timeout_handler is not None:",
       "killer": "executor/tests/test_s5_balsam_deployment.py::test_application_hooks_mark_failure_and_refuse_rearm"
     },
     {
