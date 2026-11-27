@@ -1,0 +1,30 @@
+[
+  {
+    "id": "derived-dir-canonicalization-removed",
+    "target": "experiments/atomistic/stage1/protocol.py",
+    "old": "checkpoint_dir = (resolve_run_dir(train_row) / \"checkpoints\" / f\"step_{checkpoint:06d}\").resolve()",
+    "new": "checkpoint_dir = resolve_run_dir(train_row) / \"checkpoints\" / f\"step_{checkpoint:06d}\"",
+    "killer": "experiments/atomistic/stage1/tests/test_eval_cli.py::test_production_cli_roundtrip"
+  },
+  {
+    "id": "caller-canonical-check-removed",
+    "target": "experiments/atomistic/stage1/protocol.py",
+    "old": "if Path(checkpoint_dir) != canonical_dir or Path(checkpoint_file) != canonical_file:",
+    "new": "if False:  # fault: accept caller aliases",
+    "killer": "experiments/atomistic/stage1/tests/test_eval_cli.py::test_caller_checkpoint_binding_remains_strict"
+  },
+  {
+    "id": "checkpoint-containment-removed",
+    "target": "experiments/atomistic/stage1/protocol.py",
+    "old": "if canonical_file != canonical_dir / \"model.pt\":",
+    "new": "if False:  # fault: accept a model outside its directory",
+    "killer": "experiments/atomistic/stage1/tests/test_eval_cli.py::test_caller_checkpoint_binding_remains_strict"
+  },
+  {
+    "id": "derived-checkpoint-containment-removed",
+    "target": "experiments/atomistic/stage1/protocol.py",
+    "old": "if not (checkpoint_dir.is_relative_to(results_root)\n                    and checkpoint_file.is_relative_to(results_root)):",
+    "new": "if False:  # fault: accept derived checkpoint paths outside the root",
+    "killer": "experiments/atomistic/stage1/tests/test_eval_cli.py::test_derived_checkpoint_escape_refused"
+  }
+]
