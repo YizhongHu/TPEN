@@ -218,6 +218,8 @@ def test_deploy_requires_post_mutation_readback(tmp_path: Path, kind: str) -> No
 
         def read_application_conflict(site_name, application_name):
             backend.reads.append("read-application")
+            if "sync-application" not in backend.calls:
+                return None
             return {**backend.app_record, "deployment_digest": "0" * 64}
 
         backend.read_application = read_application_conflict
