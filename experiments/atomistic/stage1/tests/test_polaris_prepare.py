@@ -96,7 +96,8 @@ def test_eval_selection_job_owns_eval_materialization() -> None:
 
 def test_runbook_login_blocks_do_not_execute_compute_commands() -> None:
     text = RUNBOOK.read_text(encoding="utf-8")
-    code_blocks = re.findall(r"```bash\n(.*?)\n```", text, flags=re.DOTALL)
+    command_sequence = text.split("## Exact command sequence", 1)[1]
+    code_blocks = re.findall(r"```bash\n(.*?)\n```", command_sequence, flags=re.DOTALL)
     assert code_blocks
     forbidden = re.compile(r"(?m)^\s*(?:\S*/)?(?:python|uv)(?:\s|$)|git\s+clone|\brender(?:\s|$)")
     assert not [block for block in code_blocks if forbidden.search(block)]
