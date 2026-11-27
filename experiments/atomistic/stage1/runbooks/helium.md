@@ -135,14 +135,15 @@ after the jobs start.  Queue wait dominates: earlier `sbatch --test-only`
 start estimates on these partitions were days out, so submit the train jobs
 as soon as the source and approval gates pass.
 
-Resources per GPU job: `--cpus-per-task=1 --mem=4G` by default.  The
+Resources per GPU job: `--cpus-per-task=10 --mem=40G` by default.  The
 2026-11-25 Cannon `jobstats` sweeps measured one effective CPU and at most
 1.2 GB host memory for the ten flagged evaluation jobs, and 1.5 GB for nine
 representative 100,000-update Hooke-1e/Hooke-2e/QHO-2e training lineages
-including checkpoint-completion phases.  The 4G default therefore retains a
-2.5 GB margin over the observed training maximum (and 2.8 GB over evaluation).
-The same 4G default applies to train and eval rows; provide a larger request
-only when a measured workload requires it.
+including checkpoint-completion phases.  The accepted 40G default is
+deliberately sized for the ten-thread GPU shape; those earlier low-memory
+measurements do not establish a thread-scaled minimum.  The same 40G default
+applies to train and eval rows; provide an explicit override only when a
+separately measured workload requires a different shape.
 
 Eval batching.  Default: one eval job runs the 12 rendered stream scripts
 sequentially (about 4 min each), stopping at the first failure.  Alternative
@@ -232,7 +233,7 @@ job, and the train rows run the same config, launch path and guard.  Then:
 - render each train row once here (the step-2 command with this job's
   `BOOT_ROOT`) and record the `#SBATCH` block; it must be exactly
   `--partition=seas_gpu,kozinsky_gpu,gpu --nodes=1 --ntasks=1
-  --cpus-per-task=1 --mem=4G --time=12:00:00 --gres=gpu:1 --constraint=a100
+  --cpus-per-task=10 --mem=40G --time=12:00:00 --gres=gpu:1 --constraint=a100
   --no-requeue`;
 - dry-execute the full train wrapper body (step 2) with only the GPU guard
   and driver run stubbed, so a literal `\${VAR}` or a wrong path fails here
@@ -260,16 +261,15 @@ block is the rendered block recorded in step 1 plus only `--job-name`,
    "$PY" -m experiments.atomistic.stage1.launch \
      --output "$BOOT_ROOT/train.sbatch" \
      --row "$RESULTS_ROOT/plan/rows/<row_id>.json" \
-     --driver experiments/atomistic/stage1/train.py \
      --checkout-root "$BOOT_ROOT/checkout" --python "$PY" \
-     --head-sha "$SOURCE_SHA" --results-root "$RESULTS_ROOT" \
      --partition seas_gpu,kozinsky_gpu,gpu \
-     --cpus-per-task 1 --mem 4G --time 12:00:00
+     --cpus-per-task 10 --mem 40G --time 12:00:00
    ```
 
    Like `plan.py`, `launch.py` has no `sys.path` self-fix: run it as a module
-   with cwd at `$BOOT_ROOT/checkout` (`--driver` stays a path string, embedded
-   verbatim into the rendered sbatch, not executed here).
+   with cwd at `$BOOT_ROOT/checkout`.  The row selects the driver, source SHA,
+   and results root; `launch.py` resolves the driver from that checkout rather
+   than accepting those values as CLI options.
 
 4. assert the rendered `#SBATCH` lines equal this wrapper's own (read `$0`,
    ignoring `--job-name/--output/--error`), assert no `PYTHONPATH=` in it,
@@ -335,9 +335,9 @@ checkpoints/step_050000`, and `device == "cuda"`.  Write each eval row to
 
 ### Step 5: launch eval rows
 
-Same wrapper pattern as step 2 with `--driver experiments/atomistic/stage1/
-eval.py`, `--time` set to the approved per-job cap, and a loop over the
-stream rows in the job: render each to `$BOOT_ROOT/eval-<row_id>.sbatch`,
+Same wrapper pattern as step 2 with `--time` set to the approved per-job cap
+and a loop over the eval rows (whose row kind selects `eval.py`) in the job:
+render each to `$BOOT_ROOT/eval-<row_id>.sbatch`,
 copy it to `launch/`, run it with `bash`, and stop at the first nonzero exit.
 Each rendered script creates and removes `/scratch/$USER/$SLURM_JOB_ID` in
 turn, so sequential streams in one job do not collide.  The eval driver
