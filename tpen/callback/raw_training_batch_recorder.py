@@ -737,15 +737,18 @@ def _segment_entries(root: Path) -> list[tuple[int, Path]]:
     """Return sorted ``(segment_index, path)`` pairs under ``root / 'segments'``."""
 
     segments_dir = root / "segments"
-    if not segments_dir.is_dir() or segments_dir.is_symlink():
+    if not segments_dir.exists() and not segments_dir.is_symlink():
         return []
+    if segments_dir.is_symlink() or not segments_dir.is_dir():
+        raise ValueError("v3 segments directory must be a non-symlink directory")
     entries: list[tuple[int, Path]] = []
     for child in segments_dir.iterdir():
-        if not child.is_dir() or child.is_symlink():
-            continue
         match = _SEGMENT_DIR_RE.fullmatch(child.name)
-        if match is not None:
-            entries.append((int(match.group(1)), child))
+        if child.is_symlink() or not child.is_dir():
+            raise ValueError(f"v3 segment entry {child.name!r} must be a non-symlink directory")
+        if match is None:
+            raise ValueError(f"v3 segment entry {child.name!r} has invalid segment directory name")
+        entries.append((int(match.group(1)), child))
     entries.sort(key=lambda item: (item[0], item[1].name))
     return entries
 
@@ -1475,7 +1478,7 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
             local_energy=local_energy,
             term_energies={
                 name: state.local_energy_terms[name].detach().cpu().numpy().reshape(-1)
-                for name in sorted(state.local_energy_terms)
+                for name in (sorted(state.local_energy_terms) if self.format_version == 3 else state.local_energy_terms)
             },
             logabs=output.logabs.detach().cpu().numpy().reshape(-1),
             sign=output.sign.detach().cpu().numpy().reshape(-1),

@@ -147,3 +147,106 @@ def test_v3_unscheduled_step_skips_host_transfer(tmp_path: Path) -> None:
     assert recorder._v3_counters == (2, 2)
     reader = TrainingHistoryReader(root)
     assert set(reader.read()["iteration_step"].tolist()) == {0}
+
+
+def test_invalid_segments_path_refused(tmp_path: Path) -> None:
+    """Symlinked or non-directory segments paths must fail closed, never drop successor rows."""
+    import shutil
+
+    _, source, checkpoint = _source(tmp_path)
+    recorder = RawTrainingBatchRecorder(source, format_version=3, partition_size_steps=4)
+    context = _run_context(tmp_path / "source")
+    recorder._restore_report = RestoreReport(mode="train_resume", checkpoint_dir=checkpoint)
+    recorder._resume_v3(context, {"next_iteration": 3, "completed_updates": 3})
+    recorder._capture_v3(_record(3), context, TrainerState(trainer=_trainer(4)), scheduled=True)
+    recorder.handle_stateless_occurrence_impl(
+        Occurrence(RunCompleted(status="completed", result=RunResult(
+            status="completed", next_iteration=4, completed_updates=4, target_iterations=4,
+        )), 1), context,
+    )
+    seg_dir = source / "segments"
+    preserved = tmp_path / "preserved_segments"
+    shutil.move(str(seg_dir), str(preserved))
+
+    # Symlinked segments directory (valid and dangling) must be refused.
+    seg_dir.symlink_to(preserved, target_is_directory=True)
+    with pytest.raises(ValueError, match="segments directory"):
+        TrainingHistoryReader(source).read()
+    with pytest.raises(ValueError, match="segments directory"):
+        TrainingHistoryReader(source).validate(require_complete=True)
+    seg_dir.unlink()
+
+    seg_dir.symlink_to(tmp_path / "missing_target", target_is_directory=True)
+    with pytest.raises(ValueError, match="segments directory"):
+        TrainingHistoryReader(source).read()
+    seg_dir.unlink()
+
+    # Non-directory segments path must be refused.
+    seg_dir.write_text("not a dir", encoding="utf-8")
+    with pytest.raises(ValueError, match="segments directory"):
+        TrainingHistoryReader(source).read()
+    seg_dir.unlink()
+
+    # Symlinked segment child must be refused rather than falling back to parent.
+    seg_dir.mkdir()
+    child_target = next(preserved.iterdir())
+    (seg_dir / child_target.name).symlink_to(child_target, target_is_directory=True)
+    with pytest.raises(ValueError, match="segment entry"):
+        TrainingHistoryReader(source).read()
+
+
+def test_v2_preserves_term_insertion_order_while_v3_sorts(tmp_path: Path) -> None:
+    """Default v2 keeps insertion order for term names; opt-in v3 canonicalizes sorted order."""
+    import json
+    from types import SimpleNamespace
+    import numpy as np
+    from tpen.training.events import TrainingIteration, TrainingIterationCompleted
+
+    class _FakeTensor:
+        def __init__(self, array: np.ndarray) -> None:
+            self._array = array
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self) -> np.ndarray:
+            return self._array
+
+    state = TrainerState(
+        trainer=_trainer(1),
+        batch=SimpleNamespace(positions=_FakeTensor(np.zeros((2, 2, 3), dtype=np.float64)), n_electrons=2, spatial_dim=3),
+        local_energy=_FakeTensor(np.zeros((2,), dtype=np.float64)),
+        local_energy_terms={
+            "potential": _FakeTensor(np.ones((2,), dtype=np.float64)),
+            "kinetic": _FakeTensor(np.full((2,), 2.0, dtype=np.float64)),
+        },
+        wavefunction_output=SimpleNamespace(
+            logabs=_FakeTensor(np.zeros((2,), dtype=np.float64)),
+            sign=_FakeTensor(np.ones((2,), dtype=np.float64)),
+        ),
+    )
+
+    v2_ctx = _run_context(tmp_path / "v2")
+    v2_root = Path(v2_ctx.metadata.run_dir) / "training_history"
+    v2_rec = RawTrainingBatchRecorder(v2_root)
+    v2_rec.handle_occurrence_impl(Occurrence(TrainingIterationCompleted(TrainingIteration(step=0)), 1), v2_ctx, state)
+    v2_rec.close(v2_ctx)
+    v2_manifest = json.loads((v2_root / "manifest.json").read_text(encoding="utf-8"))
+    v2_sidecar = json.loads((v2_root / v2_manifest["partitions"][0]["sidecar"]).read_text(encoding="utf-8"))
+    assert v2_sidecar["term_names"] == ["potential", "kinetic"]
+
+    v3_ctx = _run_context(tmp_path / "v3")
+    v3_root = Path(v3_ctx.metadata.run_dir) / "training_history"
+    v3_rec = RawTrainingBatchRecorder(v3_root, format_version=3)
+    v3_rec.handle_occurrence_impl(Occurrence(TrainingIterationCompleted(TrainingIteration(step=0)), 1), v3_ctx, state)
+    v3_rec.handle_stateless_occurrence_impl(
+        Occurrence(RunCompleted(status="completed", result=RunResult(
+            status="completed", next_iteration=1, completed_updates=1, target_iterations=1,
+        )), 1), v3_ctx,
+    )
+    v3_header = json.loads((v3_root / "history.json").read_text(encoding="utf-8"))
+    assert v3_header["contract"]["term_names"] == ["kinetic", "potential"]
+    assert set(TrainingHistoryReader(v3_root).read()["iteration_step"].tolist()) == {0}
