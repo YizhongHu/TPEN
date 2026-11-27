@@ -987,3 +987,67 @@ def test_v3_recorder_resume_is_admitted(tmp_path: Path) -> None:
         "format_version": 3,
     })
     restart._refuse_unsupported_resume_callbacks(cfg, None)
+
+
+def test_stage1_execute_train_v3_recorder_same_run_dir_continuation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production Stage-1 continuation reuses run_dir and stitches v3 segments exactly once."""
+    import numpy as np
+    from tpen.callback.raw_training_batch_recorder import TrainingHistoryReader
+    from tests.integration.test_s4_planned_yield_public_entry import _cfg as _public_cfg
+
+    monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
+
+    def _stage1_v3_cfg(row: dict[str, object]):
+        run_dir = resolve_run_dir(row)
+        cfg = _public_cfg(run_dir.parent, run_dir.name, max_steps=4)
+        cfg.run.layout = "flat"
+        cfg.trainer.return_terms = True
+        cfg.callbacks.append({
+            "_target_": "tpen.callback.RawTrainingBatchRecorder",
+            "path": "${run.dir}/training_history",
+            "format_version": 3,
+            "partition_size_steps": 2,
+            "every_n_steps": 1,
+        })
+        return cfg
+
+    whole_row: dict[str, object] = {
+        "row_id": "whole",
+        "run_id": "whole",
+        "results_root": str(tmp_path / "whole-root"),
+        "target_iterations": 4,
+    }
+    whole_cfg = _stage1_v3_cfg(whole_row)
+    config_path = tmp_path / "train.yaml"
+    config_path.write_text("defaults: []\n", encoding="utf-8")
+    assert restart.execute_train(cfg=whole_cfg, row=whole_row, config_path=config_path) == 0
+
+    seg_root = tmp_path / "seg-root"
+    seg_row: dict[str, object] = {
+        "row_id": "seg",
+        "run_id": "seg",
+        "results_root": str(seg_root),
+        "target_iterations": 4,
+        "stop_at": 2,
+    }
+    seg_cfg_1 = _stage1_v3_cfg(seg_row)
+    assert restart.execute_train(cfg=seg_cfg_1, row=seg_row, config_path=config_path) == 2
+
+    seg_row_2: dict[str, object] = {**seg_row, "stop_at": None}
+    seg_cfg_2 = _stage1_v3_cfg(seg_row_2)
+    assert restart.execute_train(cfg=seg_cfg_2, row=seg_row_2, config_path=config_path) == 0
+
+    run_dir = resolve_run_dir(seg_row)
+    assert (run_dir / "training_history" / "segments").is_dir()
+    reader = TrainingHistoryReader(run_dir / "training_history")
+    reader.validate(require_complete=True)
+    actual = reader.read()
+    expected = TrainingHistoryReader(resolve_run_dir(whole_row) / "training_history").read()
+    assert actual.keys() == expected.keys()
+    for column in expected:
+        np.testing.assert_array_equal(actual[column], expected[column], err_msg=column)
+    identities = list(zip(actual["iteration_step"], actual["walker_index"]))
+    assert len(identities) == len(set(identities))
+    assert set(actual["iteration_step"]) == {0, 1, 2, 3}

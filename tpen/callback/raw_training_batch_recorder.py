@@ -730,6 +730,47 @@ def _validate_v3_sidecar(
     return arrays, dict(sidecar)
 
 
+_SEGMENT_DIR_RE = re.compile(r"^seg_(\d{4,})_step_(\d{12,})$")
+
+
+def _segment_entries(root: Path) -> list[tuple[int, Path]]:
+    """Return sorted ``(segment_index, path)`` pairs under ``root / 'segments'``."""
+
+    segments_dir = root / "segments"
+    if not segments_dir.is_dir() or segments_dir.is_symlink():
+        return []
+    entries: list[tuple[int, Path]] = []
+    for child in segments_dir.iterdir():
+        if not child.is_dir() or child.is_symlink():
+            continue
+        match = _SEGMENT_DIR_RE.fullmatch(child.name)
+        if match is not None:
+            entries.append((int(match.group(1)), child))
+    entries.sort(key=lambda item: (item[0], item[1].name))
+    return entries
+
+
+def _resolve_v3_tip(root: Path) -> Path:
+    """Resolve the active tip segment directory for ``root``."""
+
+    entries = _segment_entries(root)
+    return entries[-1][1] if entries else root
+
+
+def _allocate_v3_segment_root(root: Path, next_iteration: int) -> Path:
+    """Allocate a fresh, empty segment subdirectory under ``root / 'segments'``."""
+
+    if not root.is_dir() or root.is_symlink() or not (root / HISTORY_FILENAME).is_file():
+        raise FileExistsError("v3 history root must be a fresh, empty, non-symlink directory")
+    segments_dir = root / "segments"
+    segments_dir.mkdir(exist_ok=True)
+    if segments_dir.is_symlink():
+        raise ValueError("v3 segments directory must not be a symlink")
+    entries = _segment_entries(root)
+    next_index = max((idx for idx, _ in entries), default=1) + 1
+    return segments_dir / f"seg_{next_index:04d}_step_{next_iteration:012d}"
+
+
 class TrainingBatchReader:
     """Read v1/v2 manifests or a strict v3 lineage rooted at ``root``."""
 
@@ -739,16 +780,23 @@ class TrainingBatchReader:
         self._v3_completion: dict[str, int] | None = None
         self._has_read_view = False
 
+    def _v3_tip_root(self) -> Path | None:
+        tip = _resolve_v3_tip(self.root)
+        history_path = tip / HISTORY_FILENAME
+        if history_path.is_file():
+            raw = history_path.read_bytes()
+            header = _strict_json_loads(raw)
+            if isinstance(header, Mapping) and header.get("schema") == V3_SCHEMA:
+                return tip
+        return None
+
     def read(self, *, start_step: int | None = None, end_step: int | None = None) -> dict[str, np.ndarray]:
         """Validate the complete selected graph, then return an inclusive step range."""
 
-        if (self.root / HISTORY_FILENAME).is_file():
-            raw = (self.root / HISTORY_FILENAME).read_bytes()
-            header = _strict_json_loads(raw)
-            if isinstance(header, Mapping) and header.get("schema") == V3_SCHEMA:
-                result = self._read_v3(start_step=start_step, end_step=end_step, publish_provenance=True)
-                self._has_read_view = True
-                return result
+        if self._v3_tip_root() is not None:
+            result = self._read_v3(start_step=start_step, end_step=end_step, publish_provenance=True)
+            self._has_read_view = True
+            return result
         self._v3_completion = None
         result = self._read_legacy(start_step=start_step, end_step=end_step, publish_provenance=True)
         self._has_read_view = True
@@ -757,16 +805,13 @@ class TrainingBatchReader:
     def validate(self, *, require_complete: bool = False) -> None:
         """Validate every committed object; optionally require a v3 completion event."""
 
-        if (self.root / HISTORY_FILENAME).is_file():
-            raw = (self.root / HISTORY_FILENAME).read_bytes()
-            header = _strict_json_loads(raw)
-            if isinstance(header, Mapping) and header.get("schema") == V3_SCHEMA:
-                self._read_v3(
-                    require_complete=require_complete,
-                    retain_rows=False,
-                    publish_provenance=not self._has_read_view,
-                )
-                return
+        if self._v3_tip_root() is not None:
+            self._read_v3(
+                require_complete=require_complete,
+                retain_rows=False,
+                publish_provenance=not self._has_read_view,
+            )
+            return
         if require_complete:
             raise ValueError("require_complete is unavailable for legacy training histories")
         # Legacy validation deliberately republishes the current manifest view.
@@ -777,7 +822,7 @@ class TrainingBatchReader:
     def completion(self) -> dict[str, int] | None:
         """Return v3 completion counters, or ``None`` for open/legacy histories."""
 
-        if (self.root / HISTORY_FILENAME).is_file():
+        if self._v3_tip_root() is not None:
             self._read_v3(retain_rows=False, publish_provenance=False)
             return dict(self._v3_completion) if self._v3_completion is not None else None
         return None
@@ -841,8 +886,11 @@ class TrainingBatchReader:
         retain_rows: bool = True,
         publish_provenance: bool = True,
     ) -> dict[str, np.ndarray]:
+        tip_root = self._v3_tip_root()
+        if tip_root is None:
+            raise ValueError("v3 history is missing history.json or events.jsonl")
         node = self._load_v3_node(
-            self.root.resolve(),
+            tip_root.resolve(),
             stack=(),
             seen_streams=set(),
             limit=None,
@@ -1481,11 +1529,23 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
         source = ref.provenance.get("run_dir")
         if not isinstance(source, str) or not Path(source).is_absolute():
             raise ValueError("v3 checkpoint lacks source run directory")
-        parent_root = Path(source) / relative
+        parent_base = Path(source) / relative
+        parent_root = _resolve_v3_tip(parent_base)
         reader = TrainingBatchReader(parent_root)
         node = reader._load_v3_node(
             parent_root.resolve(), stack=(), seen_streams=set(), limit=None, retain_rows=False,
         )
+        if node.completion is None and parent_root != parent_base:
+            # If the latest segment crashed before completion, fall back to the newest complete predecessor.
+            candidates = [parent_base, *(path for _, path in _segment_entries(parent_base) if path != parent_root)]
+            for candidate in reversed(candidates):
+                candidate_node = reader._load_v3_node(
+                    candidate.resolve(), stack=(), seen_streams=set(), limit=None, retain_rows=False,
+                )
+                if candidate_node.completion is not None and candidate_node.completion["next_iteration"] >= ref.next_iteration:
+                    parent_root = candidate
+                    node = candidate_node
+                    break
         contract = node.header["contract"]
         if (contract["start_step"], contract["every_n_steps"], contract["partition_size_steps"]) != (
             self._steps.cadence.start, self._steps.cadence.every_n, self.partition_size_steps,
@@ -1509,8 +1569,9 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
         )
         if frontier != ref.next_iteration // self.partition_size_steps:
             raise ValueError("v3 parent lacks full window seals")
+        dest_root = _allocate_v3_segment_root(self.path, ref.next_iteration) if self.path.exists() else self.path
         self._v3_writer = TrainingHistoryV3Writer(
-            self.path, run_id=context.metadata.run_id, contract=contract,
+            dest_root, run_id=context.metadata.run_id, contract=contract,
             origin="train_resume", parent=parent, checkpoint=binding,
             supersede_from_step=ref.next_iteration, inherited_seal_frontier=frontier,
             provenance=_context_provenance(context, None),
