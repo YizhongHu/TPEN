@@ -74,7 +74,7 @@ def test_p3_real_train_eval_mains_core_stub_use_admitted_bytes_once(tmp_path: Pa
         monkeypatch.setattr(stage1_train, "run_from_config", lambda cfg, **kwargs: train_calls.append({"cfg": OmegaConf.to_container(cfg, resolve=True), **kwargs}) or 0)
         train_argv = shlex.split(command_for_row(train.row, python=sys.executable, checkout_root=str(root)))
         monkeypatch.setattr(sys, "argv", train_argv)
-        assert stage1_train.main(train_argv[2:]) == 0
+        assert stage1_train.main() == 0
     finally:
         monkeypatch.undo()
     assert len(train_calls) == 1
@@ -99,7 +99,7 @@ def test_p3_real_train_eval_mains_core_stub_use_admitted_bytes_once(tmp_path: Pa
         eval_argv = shlex.split(command_for_row(eval_row, python=sys.executable, checkout_root=str(root)))
         assert eval_argv[-2] == "--binding"
         monkeypatch.setattr(sys, "argv", eval_argv)
-        assert stage1_eval.main(eval_argv[2:]) == 0
+        assert stage1_eval.main() == 0
     finally:
         monkeypatch.undo()
     assert len(eval_calls) == 1

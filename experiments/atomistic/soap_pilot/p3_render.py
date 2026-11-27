@@ -157,7 +157,7 @@ def finalize_eval_row(
     if not publication.complete:
         raise P3RenderError("SOAP100 publication is not COMPLETE")
     if parent.row_id != train_row.get("row_id"):
-        raise P3RenderError("SOAP100 publication parent is not the named train row")
+        raise P3RenderError("SOAP100 publication parent does not match train row")
     try:
         final_path = Path(template.output_dir) / "r2-soap-eval-100.yaml"
         if final_path.exists():
