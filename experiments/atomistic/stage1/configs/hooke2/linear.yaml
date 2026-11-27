@@ -1,0 +1,14 @@
+# Opt-in profile metadata for ``hooke2-linear50k-v1``.
+#
+# This profile uses TPEN's existing linear interaction producer with the shared
+# linear PathLayout (max_order=2, coordinate_neighbor support order 3).  For
+# N=2, virtual-order-3 supports are empty (the no_repeated_particle_mask
+# removes them), so a 2e run tests product removal with nonlinear pair-self
+# depth, not third-particle messaging.  This file is descriptive and is not a
+# default or hybrid Hooke configuration; the Stage-1 protocol composes it only
+# when the profile is explicitly selected.
+science_profile: hooke2-linear50k-v1
+interaction_mode: linear
+max_order: 2
+max_virtual_order: 3
+path_policy: coordinate_neighbor

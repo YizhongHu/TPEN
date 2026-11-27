@@ -53,6 +53,11 @@ HOOKE2_ACT50_HORIZON = 50_000
 HOOKE2_ACT50_EVAL_SELECTION = "A27"
 HOOKE2_ACT50_EVAL_SELECTION_ID = "hooke2-act50-a27-v1"
 HOOKE2_ACT50_A27 = tuple(range(0, 21_000, 1_000)) + tuple(range(25_000, 50_001, 5_000))
+HOOKE2_LINEAR_PROFILE = "hooke2-linear50k-v1"
+HOOKE2_LINEAR_CONFIG = "configs/hooke2/linear.yaml"
+HOOKE2_LINEAR_MAX_ORDER = 2
+HOOKE2_LINEAR_MAX_VIRTUAL_ORDER = 3
+HOOKE2_LINEAR_PATH_POLICY = "coordinate_neighbor"
 _HOOKEE2_ACT50_PROFILE_DATA = {
     HOOKE2_ACT50_SIGMOID_PROFILE: {
         "variant": "sigmoid", "activation": "torch.nn.Sigmoid", "layers": "original",
@@ -69,6 +74,20 @@ _HOOKEE2_ACT50_PROFILE_DATA.update({
     segmented: dict(_HOOKEE2_ACT50_PROFILE_DATA[original])
     for original, segmented in zip(HOOKE2_ACT50_PROFILES, HOOKE2_ACT50_SEGMENTED_PROFILES)
 })
+# The linear profile shares the finite ACT50 manifest contract (50k/A27) but
+# has its own model composition.  Keeping it in the finite profile registry
+# makes planner, gateway, and collector admission identical to the existing
+# opt-in profiles without changing any default config.
+HOOKE2_ACT50_ALL_PROFILES = HOOKE2_ACT50_ALL_PROFILES + (HOOKE2_LINEAR_PROFILE,)
+_HOOKEE2_ACT50_PROFILE_DATA[HOOKE2_LINEAR_PROFILE] = {
+    "variant": "linear",
+    "activation": "torch.nn.SiLU",
+    "layers": "linear",
+    "max_order": HOOKE2_LINEAR_MAX_ORDER,
+    "max_virtual_order": HOOKE2_LINEAR_MAX_VIRTUAL_ORDER,
+    "path_policy": HOOKE2_LINEAR_PATH_POLICY,
+    "config": HOOKE2_LINEAR_CONFIG,
+}
 QHO_EVAL_SELECTION = "Q21"
 QHO_EVAL_SELECTION_ID = "qho2e-q21-v1"
 QHO_Q21 = (0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000,
@@ -988,6 +1007,77 @@ def compose_model_profile(cfg: Any, science_profile: str | None) -> Any:
     profile = hooke2_act50_profile(str(science_profile))
     if profile["layers"] == "empty":
         OmegaConf.update(cfg, "model.layers", [], merge=False)
+    elif profile["layers"] == "linear":
+        # This profile is intentionally assembled from one shared PathLayout:
+        # the same immutable layout reaches the linear producer, CompositeMixing,
+        # PathAggregation, and TPENLayer.  The explicit support order is 3 for
+        # order-2 coordinate replacements, although N=2 has no such completions.
+        linear_metadata = {
+            "_target_": "tpen.data.paths.LinearPathMetadata.generate",
+            "max_order": HOOKE2_LINEAR_MAX_ORDER,
+            "policy": HOOKE2_LINEAR_PATH_POLICY,
+        }
+        layout = {
+            "_target_": "tpen.data.paths.compose_path_layout",
+            "linear": "${stage1_linear_profile.linear_metadata}",
+            "tensor_product": None,
+            "input_orders": {
+                "_target_": "tpen.data.paths.NormalizedOrders",
+                "values": [1, 2],
+            },
+            "output_orders": {
+                "_target_": "tpen.data.paths.NormalizedOrders",
+                "values": [1, 2],
+            },
+            "input_channels": {
+                "_target_": "tpen.data.paths.NormalizedChannels",
+                "values": [[1, 32], [2, 32]],
+            },
+            "output_channels": {
+                "_target_": "tpen.data.paths.NormalizedChannels",
+                "values": [[1, 32], [2, 32]],
+            },
+            "max_virtual_order": HOOKE2_LINEAR_MAX_VIRTUAL_ORDER,
+        }
+        OmegaConf.update(cfg, "stage1_linear_profile", {
+            "interaction_mode": "linear",
+            "max_order": HOOKE2_LINEAR_MAX_ORDER,
+            "max_virtual_order": HOOKE2_LINEAR_MAX_VIRTUAL_ORDER,
+            "path_policy": HOOKE2_LINEAR_PATH_POLICY,
+            "config": HOOKE2_LINEAR_CONFIG,
+            "n2_support_order_3": "empty",
+            "linear_metadata": linear_metadata,
+            "layout": layout,
+        }, merge=False, force_add=True)
+        OmegaConf.update(cfg, "model.embedding.activation", {"_target_": profile["activation"]},
+                         merge=False, force_add=True)
+        OmegaConf.update(cfg, "model.layers.0.mixing", {
+            "_target_": "tpen.nn.CompositeMixing",
+            "layout": "${stage1_linear_profile.layout}",
+            "producers": [{
+                "_target_": "tpen.nn.LinearEquivariantMixing",
+                "max_order": HOOKE2_LINEAR_MAX_ORDER,
+                "channels": 32,
+                "metadata": "${stage1_linear_profile.linear_metadata}",
+                "aggregation": "completion_mean",
+                "implementation": "vectorized",
+                "initial_weight": 0.5,
+            }],
+            "activation": {"_target_": profile["activation"]},
+        }, merge=False, force_add=True)
+        OmegaConf.update(cfg, "model.layers.0.path_aggregation", {
+            "_target_": "tpen.nn.PathAggregation",
+            "max_order": HOOKE2_LINEAR_MAX_ORDER,
+            "max_virtual_order": HOOKE2_LINEAR_MAX_VIRTUAL_ORDER,
+            "channels": 32,
+            "layout": "${stage1_linear_profile.layout}",
+            "activation": {"_target_": profile["activation"]},
+        }, merge=False, force_add=True)
+        OmegaConf.update(cfg, "model.layers.0._target_", "tpen.nn.TPENLayer", merge=False)
+        OmegaConf.update(cfg, "model.layers.0.update", {
+            "_target_": "tpen.nn.ResidualUpdater",
+        }, merge=False, force_add=True)
+        OmegaConf.update(cfg, "model.layers.0.layout", "${stage1_linear_profile.layout}", merge=False)
     else:
         activation = str(profile["activation"])
         OmegaConf.update(
