@@ -1040,13 +1040,14 @@ def compose_model_profile(cfg: Any, science_profile: str | None) -> Any:
                 OmegaConf.update(cfg, path, activation, merge=False)
     elif is_he_sigmoid_profile(science_profile):
         activation = _HE_MODEL_PROFILE_DATA[HE_SIGMOID_PROFILE]["activation"]
+        model_root = "stage1_he_model" if "stage1_he_model" in cfg else "model"
         OmegaConf.update(
-            cfg, "model.embedding.activation", {"_target_": activation},
+            cfg, f"{model_root}.embedding.activation", {"_target_": activation},
             merge=False, force_add=True,
         )
         for path in (
-            "model.layers.0.mixing.activation._target_",
-            "model.layers.0.path_aggregation.activation._target_",
+            f"{model_root}.layers.0.mixing.activation._target_",
+            f"{model_root}.layers.0.path_aggregation.activation._target_",
         ):
             OmegaConf.update(cfg, path, activation, merge=False)
     else:
