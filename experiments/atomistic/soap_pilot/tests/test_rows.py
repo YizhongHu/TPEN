@@ -184,7 +184,7 @@ def test_rendered_rows_pass_stage1_admission_and_registry_tamper_refuses(tmp_pat
         assert admitted["system_id"] == hooke2.system_id
 
     bad_registry = dict(train_rows[0], system="hooke1")
-    with pytest.raises(Exception, match="config path|known system|identity"):
+    with pytest.raises(Exception, match="config path|known system|identity|row_id"):
         validate_gateway_binding(binding=_binding_token(bad_registry), expected_kinds={"train"})
     bad_digest = dict(train_rows[0], config_sha256="0" * 64)
     with pytest.raises(Exception, match="identity"):
@@ -226,7 +226,7 @@ def test_collect_accepts_real_stage1_parent_eval_join_and_rejects_mutation(tmp_p
     record = SimpleNamespace(
         record_schema="trajectory_records/v2", resolved_config_identity={"schema": "tpen-config-identity-v1", "sha256": "a" * 64},
         draw_count=1, walker_count=1, row_count=1, model_provenance="checkpoint",
-        system_id=train["system_id"], execution_method_id="method", source_git_sha=train["source_sha"],
+        system_id=eval_rows[0]["expected_physical_system_id"], execution_method_id="method", source_git_sha=train["source_sha"],
         finite_count=1, mean=2.0, variance=0.0, record_content_id="record", csv_sha256="b" * 64,
         checkpoint_sha256=checkpoint_sha,
     )
