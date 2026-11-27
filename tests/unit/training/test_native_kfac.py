@@ -1631,6 +1631,53 @@ def test_kfac_route_receives_the_psiformer_clipped_energy(monkeypatch) -> None:
         torch.tensor([0.0, 1.0, 2.0, 26.75], dtype=torch.float64),
     )
 
+
+@pytest.mark.parametrize("masked", [False, True])
+def test_kfac_clipped_half_gradient_and_raw_record(
+    monkeypatch: pytest.MonkeyPatch, masked: bool
+) -> None:
+    """KFAC uses the clipped half-gradient while retaining raw local energy."""
+
+    model = _LinearMLPWavefunction(in_features=4, hidden_features=3, bias=True)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.03)
+    batch = _make_batch(
+        batch_size=5 if masked else 4,
+        n_electrons=2,
+        spatial_dim=2,
+        seed=733,
+    )
+    raw = torch.tensor(
+        [0.0, 1.0, 2.0, 100.0] + ([float("nan")] if masked else []),
+        dtype=torch.float64,
+    )
+    monkeypatch.setattr(trainer_module, "local_energy", lambda *args, **kwargs: raw.clone())
+    trainer = VMCTrainer(max_steps=1, energy_clipping_mode="psiformer", energy_clipping_k=1.0)
+    state = TrainerState(model=model, optimizer=optimizer, trainer=trainer)
+    producer = _TrainerStepProducer(
+        trainer=trainer,
+        model=model,
+        hamiltonian_terms={},
+        batch=batch,
+        step=0,
+        context=_StubContext(),
+        state=state,
+    )
+
+    produced = producer.produce_structured_curvature_step(StructuredCurvatureStepRequest())
+    clipped = torch.tensor([0.0, 1.0, 2.0, 26.75], dtype=torch.float64)
+    # Independent ordinary autograd, not another structured-curvature call.
+    oracle = torch.autograd.grad(
+        ((clipped - clipped.mean()) * model(batch).logabs[:4]).mean(),
+        tuple(model.parameters()),
+    )
+    for actual, expected in zip(
+        produced.update_input.energy_half_gradient, oracle, strict=True
+    ):
+        torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(produced.local_energy, raw, equal_nan=True)
+    assert produced.objective.metrics["energy"] == 25.75
+
+
 def test_structured_curvature_update_input_validates_block_dims_and_device() -> None:
     """StructuredCurvatureUpdateInput.validate() enforces block dims and uniform parameter device."""
 

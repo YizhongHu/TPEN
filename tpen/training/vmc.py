@@ -178,6 +178,12 @@ def clip_local_energy_for_score(
         A detached tensor with non-finite rows unchanged, and numeric
         diagnostics suitable for raw training metrics.  The transform never
         changes the raw tensor held by the training record or evaluation path.
+
+    Notes
+    -----
+    The clipping window and diagnostics are computed from this input tensor
+    only. Under distributed data parallelism, they are therefore rank-local,
+    not global or reduced across ranks.
     """
 
     resolved_mode = resolve_energy_clipping_mode(mode)
@@ -200,6 +206,8 @@ def clip_local_energy_for_score(
         transformed = local_energy.detach()
         n_clipped = 0
     else:
+        # The window and diagnostics are intentionally input-local (rank-local
+        # under DDP), rather than statistics reduced across all workers.
         median = _even_median(finite)
         mean_abs_deviation = torch.mean(torch.abs(finite - median))
         lower_tensor = median - resolved_k * mean_abs_deviation

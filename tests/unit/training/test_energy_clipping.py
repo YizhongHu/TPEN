@@ -7,6 +7,7 @@ import torch
 
 from tpen.training.trainer import VMCTrainer
 from tpen.training.vmc import (
+    clip_local_energy_for_score,
     compute_vmc_objective,
     resolve_energy_clipping_k,
     resolve_energy_clipping_mode,
@@ -35,8 +36,30 @@ def test_none_is_bit_identical_to_the_historical_score_objective() -> None:
     assert baseline.metrics == explicit_none.metrics
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_default_gradient_matches_frozen_raw_mean_centered_reference(
+    dtype: torch.dtype,
+) -> None:
+    """The default gradient remains the inline, unclipped score estimator."""
+
+    energy = torch.tensor([0.0] * 15 + [100.0], dtype=dtype)
+    logabs = torch.linspace(-1.0, 1.0, 16, dtype=dtype, requires_grad=True)
+    reference_logabs = logabs.detach().clone().requires_grad_()
+
+    result = compute_vmc_objective(logabs, energy)
+    # Frozen raw mean-centering reference: this deliberately does not call the
+    # clipping implementation, so a default->psiformer mutant changes the
+    # gradient assertion below before any diagnostic assertion can pass.
+    reference_loss = 2.0 * torch.mean((energy - energy.mean()) * reference_logabs)
+    reference_loss.backward()
+    result.loss.backward()
+
+    assert torch.equal(logabs.grad, reference_logabs.grad)
+    assert torch.equal(result.loss, reference_loss)
+
+
 def test_psiformer_uses_even_median_mean_ad_and_clipped_recentering() -> None:
-    """The hand calculation pins ties/even counts and the second centering."""
+    """The hand calculation pins the even-count median and second centering."""
 
     logabs = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64, requires_grad=True)
     energy = torch.tensor([0.0, 1.0, 2.0, 100.0], dtype=torch.float64)
@@ -57,6 +80,38 @@ def test_psiformer_uses_even_median_mean_ad_and_clipped_recentering() -> None:
     assert result.metrics["local_energy_clip_fraction"] == 0.25
     assert result.metrics["local_energy_clip_lower"] == -23.75
     assert result.metrics["local_energy_clip_upper"] == 26.75
+
+
+@pytest.mark.parametrize(
+    "values, expected, bounds, fraction",
+    [
+        ([0.0, 0.0, 0.0, 100.0], [0.0, 0.0, 0.0, 25.0], (-25.0, 25.0), 0.25),
+        ([2.0, 2.0, 2.0, 2.0], [2.0, 2.0, 2.0, 2.0], (2.0, 2.0), 0.0),
+        (
+            [0.0, 1.0, 100.0],
+            [0.0, 1.0, 103.0 / 3.0],
+            (-97.0 / 3.0, 103.0 / 3.0),
+            1.0 / 3.0,
+        ),
+    ],
+)
+def test_psiformer_handles_ties_all_equal_and_odd_count(
+    values: list[float],
+    expected: list[float],
+    bounds: tuple[float, float],
+    fraction: float,
+) -> None:
+    """Tie, zero-deviation, and odd-count inputs use the stated median rule."""
+
+    energy = torch.tensor(values, dtype=torch.float64)
+    before = energy.clone()
+    clipped, metrics = clip_local_energy_for_score(energy, mode="psiformer", k=1.0)
+
+    torch.testing.assert_close(clipped, torch.tensor(expected, dtype=torch.float64))
+    assert torch.equal(energy, before)
+    assert metrics["local_energy_clip_lower"] == pytest.approx(bounds[0])
+    assert metrics["local_energy_clip_upper"] == pytest.approx(bounds[1])
+    assert metrics["local_energy_clip_fraction"] == fraction
 
 
 def test_clipping_changes_only_the_surrogate_and_logs_raw_metrics() -> None:
