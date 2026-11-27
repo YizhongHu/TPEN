@@ -126,6 +126,7 @@ def test_strict_fresh_eval_golden_join(tmp_path: Path) -> None:
             "seed": evaluation.row["seed"],
             "walkers": evaluation.row["walkers"],
             "checkpoint_dir": evaluation.row["checkpoint_dir"],
+            "expected_physical_system_id": evaluation.row["expected_physical_system_id"],
         },
     )
     assert joined["depends_on"] == train.row["row_id"]

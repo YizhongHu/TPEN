@@ -19,6 +19,7 @@ from experiments.atomistic.stage1.launch import command_for_row
 from experiments.atomistic.stage1.launch import _binding_token
 from experiments.atomistic.stage1.protocol import (
     load_materialized_config,
+    planned_physical_system_ids,
     validate_gateway_binding,
     validate_materialized_admission,
 )
@@ -40,6 +41,9 @@ from .rows import (
     make_parent_join,
     validate_row,
 )
+
+
+_HOOKE2_PHYSICAL_SYSTEM_ID = planned_physical_system_ids()["hooke2"]
 
 
 class P3RenderError(ValueError):
@@ -176,6 +180,7 @@ def finalize_eval_row(
                 "config": "configs/hooke2/eval.yaml",
                 "seed": 6348702091350892190, "walkers": 4096,
                 "checkpoint_dir": str(checkpoint_root),
+                "expected_physical_system_id": _HOOKE2_PHYSICAL_SYSTEM_ID,
             },
         )
     except (RowContractError, KeyError, TypeError) as exc:

@@ -323,6 +323,10 @@ def make_eval_row(*, train_row: Mapping[str, Any], parent: ParentJoin, checkpoin
         raise RowContractError("parent hashes do not match the actual singleton row")
     if parent.source_sha != train_row.get("source_sha") or parent.rendered_config_sha256 != train_row["row_extension"]["rendered_config"]["sha256"]:
         raise RowContractError("parent provenance does not match the actual train row")
+    physical_id = row_base.get("expected_physical_system_id")
+    if (not isinstance(physical_id, str) or len(physical_id) != 64
+            or any(char not in "0123456789abcdef" for char in physical_id)):
+        raise RowContractError("expected_physical_system_id must be the physical content SHA-256")
     result = dict(row_base)
     result.update({
         "kind": "eval", "system": train_row["system"], "system_id": train_row["system_id"],
@@ -335,7 +339,7 @@ def make_eval_row(*, train_row: Mapping[str, Any], parent: ParentJoin, checkpoin
         "checkpoint_sha256": checkpoint.model_sha256,
         "depends_on": train_row["row_id"], "phase1_manifest_hash": parent.manifest_hash,
         "phase1_train_row_hash": parent.train_row_hash,
-        "expected_physical_system_id": train_row["system_id"],
+        "expected_physical_system_id": physical_id,
         "row_extension": {"version": "stage1-rendered-config/v1", "rendered_config": {"path": rendered.path, "sha256": rendered.sha256}, "diagnostics_profile": rendered.profile},
     })
     result["row_id"] = row_id(result)
