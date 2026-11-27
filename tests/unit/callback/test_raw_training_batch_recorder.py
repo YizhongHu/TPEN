@@ -368,6 +368,36 @@ def test_partition_provenance_is_written_and_exposed_by_reader(tmp_path: Path) -
     assert reader.provenance[0]["source_revision"] == "source-sha"
 
 
+def test_legacy_validate_republishes_provenance_after_manifest_append(tmp_path: Path) -> None:
+    """A reused v2 reader sees provenance for partitions appended after read()."""
+
+    provenance = {
+        "run_id": "run-append",
+        "config_hash": "config-sha",
+        "source_revision": "source-sha",
+        "sampler_settings": {},
+    }
+    first = TrainingBatchPartitionWriter(
+        tmp_path, partition_index=0, planned_steps=[0], provenance=provenance
+    )
+    first.append(_record(0))
+    first.publish()
+
+    reader = TrainingBatchReader(tmp_path)
+    reader.read()
+    assert set(reader.provenance) == {0}
+
+    second = TrainingBatchPartitionWriter(
+        tmp_path, partition_index=1, planned_steps=[1], provenance=provenance
+    )
+    second.append(_record(1))
+    second.publish()
+
+    reader.validate()
+    assert set(reader.provenance) == {0, 1}
+    assert reader.provenance[1]["source_revision"] == "source-sha"
+
+
 def test_callback_captures_pre_update_forward_and_records_skipped_update(tmp_path: Path) -> None:
     callback = RawTrainingBatchRecorder(tmp_path, partition_size_steps=10, every_n_steps=1)
     context = _run_context(tmp_path)

@@ -260,15 +260,10 @@ approved eval row in the same way.  This is a subset consumer only; it does not
 replace the full roster/grid reconciliation.
 
 ```bash
-"$PYBIN" - "$RESULTS_ROOT/plan/phase2-manifest.json" "$RESULTS_ROOT/plan/selected-eval.json" <<'PY'
-import json, sys
-from pathlib import Path
-source, target = map(Path, sys.argv[1:])
-rows = [row for row in json.loads(source.read_text())['rows'] if row['kind'] == 'eval']
-if not rows:
-    raise SystemExit("no admitted eval row")
-target.write_text(json.dumps(rows[0], sort_keys=True, indent=2) + "\n")
-PY
+"$PYBIN" -m experiments.atomistic.stage1.select_eval \
+  --manifest "$RESULTS_ROOT/plan/phase2-manifest.json" \
+  --system he --lineage 0 --checkpoint 100000 --stream 0 \
+  --output "$RESULTS_ROOT/plan/selected-eval.json" || exit 1
 qsub -A HetRxnEnergy -q debug \
   -l select=1:system=polaris:ngpus=4:ncpus=64,walltime=00:55:00,filesystems=home:eagle,place=scatter \
   -o "$RESULTS_ROOT/logs/eval.pbs.out" -e "$RESULTS_ROOT/logs/eval.pbs.err" \

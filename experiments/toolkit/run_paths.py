@@ -35,4 +35,24 @@ def resolve_checkpoint_dir(path: str | Path) -> Path:
     return resolve(path)
 
 
-__all__ = ["RunPathError", "resolve_checkpoint_dir", "resolve_run_dir"]
+def require_complete_checkpoint_dir(path: str | Path) -> Path:
+    """Require one named complete checkpoint without following latest pointers.
+
+    Parameters
+    ----------
+    path
+        Exact checkpoint directory selected by the study protocol.
+
+    Returns
+    -------
+    pathlib.Path
+        Complete checkpoint directory validated by the core artifact owner.
+    """
+    from tpen.checkpoint.artifact import require_complete_checkpoint_dir as require
+
+    return require(path)
+
+
+__all__ = [
+    "RunPathError", "require_complete_checkpoint_dir", "resolve_checkpoint_dir", "resolve_run_dir",
+]

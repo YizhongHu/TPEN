@@ -81,7 +81,7 @@ MUTANTS = (
     (
         "submit-ignores-capacity",
         MODULE_NAME,
-        "if self._active >= self.capacity:",
+        "if self._active >= self.capacity or (self._slots and not self._free_slots):",
         "if False:",
         "test_capacity_refuses_without_launch",
     ),

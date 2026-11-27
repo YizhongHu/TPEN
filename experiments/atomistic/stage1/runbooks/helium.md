@@ -299,41 +299,15 @@ After all three train jobs end, a 1-CPU `test` job with the same checkout and
 overlay builds `plan/checkpoint-evidence.json`.  It reads only the three
 named run directories (no recursive walk of Netscratch):
 
-```python
-import hashlib, json, sys
-from pathlib import Path
-from experiments.atomistic.stage1.protocol import CHECKPOINT_EVIDENCE_SCHEMA, manifest_hash
-from experiments.toolkit.run_paths import resolve_run_dir
-from tpen.checkpoint.artifact import require_complete_checkpoint_dir
-
-phase1 = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-assert phase1["phase"] == 1 and phase1["manifest_hash"] == manifest_hash(phase1["rows"])
-train = [row for row in phase1["rows"] if row["kind"] == "train"]
-assert sorted(row["lineage"] for row in train) == [0, 1, 2]
-checkpoints = {}
-for row in train:
-    run_dir = resolve_run_dir(row)
-    status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
-    assert status["status"] == "completed", (run_dir, status["status"])
-    step_dir = require_complete_checkpoint_dir(run_dir / "checkpoints" / "step_050000")
-    digest = hashlib.sha256((step_dir / "model.pt").read_bytes()).hexdigest()
-    checkpoints[f"{row['system']}:{row['lineage']}:50000"] = digest
-evidence = {
-    "schema": CHECKPOINT_EVIDENCE_SCHEMA,  # "stage1-checkpoint-evidence/v1"
-    "phase1_manifest_hash": phase1["manifest_hash"],
-    "phase1_train_row_hashes": {
-        f"{row['system']}:{row['lineage']}": manifest_hash([row]) for row in train
-    },
-    "checkpoints": checkpoints,
-}
-Path(sys.argv[2]).write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+```bash
+"$PY" -m experiments.atomistic.stage1.evidence \
+  --phase1-manifest "$RESULTS_ROOT/plan/phase1-manifest.json" \
+  --output "$RESULTS_ROOT/plan/checkpoint-evidence.json"
 ```
 
-Run it as `"$PY" build_evidence.py "$RESULTS_ROOT/plan/phase1-manifest.json"
-"$RESULTS_ROOT/plan/checkpoint-evidence.json"` with the script staged under
-`$RESULTS_ROOT/plan/`.  If `status.json` is not at the top of a run directory,
-stop and report; do not search for it.  A lineage that fails this step is not
-selected, and this runbook then has no complete science grid: stop.
+The CLI checks the manifest identity, complete lineage roster, run status,
+and every protocol-selected checkpoint. A refusal leaves no complete science
+grid: stop and report it. It does not search for alternative run directories.
 
 ### Step 4: phase-2 plan (same staging job as step 3, cwd at the checkout root)
 
