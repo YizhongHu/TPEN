@@ -132,6 +132,8 @@ def test_resolved_path_selector_supports_lists_and_rejects_missing_paths() -> No
     ) == "torch.nn.Sigmoid"
     with pytest.raises(ProtocolError, match="resolved train config is missing"):
         _select_resolved_path(resolved, "model.layers.0.path_aggregation.activation._target_")
+    with pytest.raises(ProtocolError, match="resolved train config is missing"):
+        _select_resolved_path(resolved, "model.layers.1.mixing.activation._target_")
 
 
 def test_he_sigmoid_rendered_train_and_eval_diff_only_activation_leaves() -> None:

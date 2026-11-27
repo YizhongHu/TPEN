@@ -2133,6 +2133,8 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
         # The final guard is also a public boundary: callers can bypass the
         # manifest planner and present a forged science row directly here.
         _validate_hooke_science_train_row(row)
+    # ``to_container`` returns plain dict/list containers, so list indices are
+    # traversed explicitly by ``_select_resolved_path`` below.
     resolved = OmegaConf.to_container(cfg, resolve=True)
     if not isinstance(resolved, Mapping):
         raise ProtocolError("resolved train config is not a mapping")
