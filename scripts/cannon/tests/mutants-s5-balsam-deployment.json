@@ -73,8 +73,8 @@
     {
       "id": "site-post-mutation-readback-skipped",
       "target": "executor/src/tpen_executor/deployment/balsam.py",
-      "old": "        site = backend.read_site(spec.site_name)\n    if site is None:\n        raise BalsamDeploymentRefusal(\"site readback is absent after creation\")",
-      "new": "        site = site\n    if site is None:\n        raise BalsamDeploymentRefusal(\"site readback is absent after creation\")  # mutant: trust create acknowledgement",
+      "old": "        backend.create_site(spec.site_name, spec.site_template, spec.site_directory)\n        site = backend.read_site(spec.site_name)",
+      "new": "        site = backend.create_site(spec.site_name, spec.site_template, spec.site_directory)  # mutant: trust create acknowledgement",
       "killer": "executor/tests/test_s5_balsam_deployment.py::test_deploy_requires_post_mutation_readback"
     },
     {
