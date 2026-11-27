@@ -56,10 +56,14 @@ def test_linear_profile_is_opt_in_and_native_hooke_configs_are_unchanged() -> No
 
 def test_linear_profile_header_records_the_n2_virtual3_caveat() -> None:
     header = LINEAR_CONFIG.read_text(encoding="utf-8")
+    assert "N=2" in header
     assert "max_order=2" in header
     assert "virtual-order-3 supports are empty" in header
-    assert "product removal with nonlinear pair-self" in header
-    assert "not third-particle messaging" in header
+    assert "order-1 branch" in header
+    assert "order-3 paths" in header
+    assert "pair-feature (order-2) linear processing" in header
+    assert "product removal" in header
+    assert "NOT third-particle messaging or order-1 features" in header
 
 
 def test_linear_profile_resolves_one_linear_producer_and_shared_layout() -> None:
@@ -113,23 +117,6 @@ def test_linear_profile_n2_empty_support_order3_and_finite_forward() -> None:
         for name, parameter in model.named_parameters()
         if name not in N2_LINEAR_GRADIENT_FREE_PARAMETER_NAMES
     )
-
-
-def test_default_hooke2_gradient_inventory_is_informational(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Print the default tensor-product N=2 inventory without asserting it."""
-
-    cfg = build_train_config(_rows(None)[0])
-    model = instantiate(cfg.model).to(dtype=torch.float64)
-    output = model(_n2_batch())
-    output.logabs.square().mean().backward()
-    gradient_free = sorted(
-        name for name, parameter in model.named_parameters()
-        if parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
-    )
-    with capsys.disabled():
-        print(f"DEFAULT_HOOKE2_GRADIENT_FREE={gradient_free}", flush=True)
 
 
 def _n2_batch() -> ElectronBatch:
