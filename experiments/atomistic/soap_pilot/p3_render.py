@@ -32,6 +32,7 @@ from .composer import (
     PilotProfile,
     R2_PROFILES,
     TARGET_PROFILES,
+    _materialize_train,
     _materialize_eval,
     _write_yaml,
     render_profile,
