@@ -2530,7 +2530,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
             raise ProtocolError(
                 f"Hooke science phase 2 requires the exact {evaluation_selection} roster"
             )
-    elif evaluation_selection is not None:
+    elif not he_sigmoid_profile and evaluation_selection is not None:
         raise ProtocolError("evaluation_selection requires the Hooke science profile")
     he_h2_selection = (
         phase == 2 and set(selected).issubset(HE_H2_SYSTEMS)
