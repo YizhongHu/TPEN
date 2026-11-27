@@ -155,13 +155,14 @@ def test_gpu_render_defaults_to_measured_shape_and_cuda_binding(
         "set -euo pipefail", 1)[0]
     assert resource_block == (
         "#SBATCH --ntasks=1\n"
-        "#SBATCH --cpus-per-task=1\n"
-        "#SBATCH --mem=4G\n"
+        "#SBATCH --cpus-per-task=10\n"
+        "#SBATCH --mem=40G\n"
         "#SBATCH --time=12:00:00\n"
         "#SBATCH --gres=gpu:1\n"
         "#SBATCH --constraint=a100\n"
         "#SBATCH --no-requeue\n"
     )
+    assert "export OMP_NUM_THREADS=10\nexport MKL_NUM_THREADS=10" in script
 
     script = render(
         row=gpu_row, driver="driver.py", python="/usr/bin/python3", head_sha="c" * 40,
@@ -173,9 +174,20 @@ def test_gpu_render_defaults_to_measured_shape_and_cuda_binding(
     assert "#SBATCH --cpus-per-task=8" in script
     assert "#SBATCH --mem=64G" in script
     assert "#SBATCH --time=08:00:00" in script
+    assert "export OMP_NUM_THREADS=8\nexport MKL_NUM_THREADS=8" in script
     assert "--binding" in script
     assert "runtime.device=cuda" not in script
     assert "expected exactly one management GPU" in script
+
+
+def test_cpu_render_keeps_template_cpu_shape_without_gpu_thread_exports() -> None:
+    script = render(row=ROW, driver="driver.py", python="/usr/bin/python3",
+                    head_sha="c" * 40, results_root=ROW["results_root"],
+                    partition="test")
+    assert "#SBATCH --cpus-per-task=1" in script
+    assert "#SBATCH --mem=" not in script
+    assert "OMP_NUM_THREADS" not in script
+    assert "MKL_NUM_THREADS" not in script
 
 
 def test_gpu_render_rejects_cpu_binding_and_invalid_resources() -> None:

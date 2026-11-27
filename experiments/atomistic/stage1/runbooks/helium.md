@@ -135,7 +135,7 @@ after the jobs start.  Queue wait dominates: earlier `sbatch --test-only`
 start estimates on these partitions were days out, so submit the train jobs
 as soon as the source and approval gates pass.
 
-Resources per GPU job: `--cpus-per-task=1 --mem=4G` by default.  The
+Resources per GPU job: `--cpus-per-task=10 --mem=40G` by default.  The
 2026-11-25 Cannon `jobstats` sweeps measured one effective CPU and at most
 1.2 GB host memory for the ten flagged evaluation jobs, and 1.5 GB for nine
 representative 100,000-update Hooke-1e/Hooke-2e/QHO-2e training lineages
@@ -232,7 +232,7 @@ job, and the train rows run the same config, launch path and guard.  Then:
 - render each train row once here (the step-2 command with this job's
   `BOOT_ROOT`) and record the `#SBATCH` block; it must be exactly
   `--partition=seas_gpu,kozinsky_gpu,gpu --nodes=1 --ntasks=1
-  --cpus-per-task=1 --mem=4G --time=12:00:00 --gres=gpu:1 --constraint=a100
+  --cpus-per-task=10 --mem=40G --time=12:00:00 --gres=gpu:1 --constraint=a100
   --no-requeue`;
 - dry-execute the full train wrapper body (step 2) with only the GPU guard
   and driver run stubbed, so a literal `\${VAR}` or a wrong path fails here
@@ -264,7 +264,7 @@ block is the rendered block recorded in step 1 plus only `--job-name`,
      --checkout-root "$BOOT_ROOT/checkout" --python "$PY" \
      --head-sha "$SOURCE_SHA" --results-root "$RESULTS_ROOT" \
      --partition seas_gpu,kozinsky_gpu,gpu \
-     --cpus-per-task 1 --mem 4G --time 12:00:00
+     --cpus-per-task 10 --mem 40G --time 12:00:00
    ```
 
    Like `plan.py`, `launch.py` has no `sys.path` self-fix: run it as a module
