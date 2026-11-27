@@ -135,7 +135,7 @@ def _append_log_line(path: Path, line: bytes) -> None:
         path,
         line[:-1].decode("ascii"),
         fsync=_fsync_log,
-        open_flags=os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        no_follow=True,
     )
 
 

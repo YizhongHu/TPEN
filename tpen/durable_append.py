@@ -146,7 +146,7 @@ def append_record(
     record: str,
     *,
     fsync: Callable[[int], None] | None = None,
-    open_flags: int | None = None,
+    no_follow: bool = False,
 ) -> None:
     """Append `record` as one newline-terminated line using a single write.
 
@@ -190,10 +190,10 @@ def append_record(
     fsync : callable, optional
         Callback receiving the open file descriptor after a complete write and
         before the handle is closed.
-    open_flags : int, optional
-        Low-level flags for the append handle.  When supplied, the file is
-        opened with ``os.open`` and wrapped as an unbuffered binary handle;
-        callers may use this to retain protections such as ``O_NOFOLLOW``.
+    no_follow : bool, default=False
+        Open the append handle with ``O_NOFOLLOW`` in addition to the required
+        append flags.  The low-level flags remain owned by this primitive so
+        one-record writers do not construct their own append handles.
     """
 
     # Derived from the widest production reader, not from a character list:
@@ -220,9 +220,11 @@ def append_record(
 
     # buffering=0 yields a raw FileIO: one write call in, one write syscall out,
     # with no BufferedWriter chunking the payload or retrying a short write.
-    if open_flags is None:
+    if not no_follow:
         handle_context = target.open("ab", buffering=0)
     else:
+        open_flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        open_flags |= getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(target, open_flags, 0o644)
         handle_context = os.fdopen(fd, "ab", buffering=0)
     with handle_context as handle:
