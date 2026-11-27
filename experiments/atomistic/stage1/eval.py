@@ -19,6 +19,7 @@ from tpen.run import run_from_config
 from experiments.atomistic.stage1.protocol import (
     MaterializedConfigAdmission,
     compose_model_profile,
+    is_he_sigmoid_profile,
     is_hooke2_act50_profile,
     load_materialized_config,
     resolve_config_path,
@@ -117,17 +118,25 @@ def _refuse_existing_eval_run(cfg: DictConfig) -> None:
 
 
 def _refuse_cross_variant_checkpoint(cfg: DictConfig, row: Mapping[str, object]) -> None:
-    """Refuse a checkpoint from another ACT50 model before creating eval output."""
+    """Refuse a checkpoint from another admitted model profile before eval."""
 
     profile = row.get("science_profile")
-    if not is_hooke2_act50_profile(profile):
+    is_he_profile_row = row.get("system") == "he" and (
+        profile is None or is_he_sigmoid_profile(profile)
+    )
+    if not is_hooke2_act50_profile(profile) and not is_he_profile_row:
         return
     checkpoint_dir = Path(str(row["checkpoint_dir"]))
     manifest_path = checkpoint_dir / "manifest.json"
     if not manifest_path.is_file():
-        raise EvalRunRefusal(
-            f"ACT50 checkpoint compatibility manifest is missing: {manifest_path}"
-        )
+        # Legacy native-He fixtures predate checkpoint model manifests.  A
+        # sigmoid binding cannot use that unverifiable checkpoint, while the
+        # native path remains compatible with those historical rows.
+        if is_he_sigmoid_profile(profile):
+            raise EvalRunRefusal(
+                f"profile checkpoint compatibility manifest is missing: {manifest_path}"
+            )
+        return
     # Keep checkpoint internals lazy for the outside-checkout driver probe.
     from experiments.toolkit.checkpoint_compat import (
         checkpoint_model_config_hash,
@@ -137,7 +146,7 @@ def _refuse_cross_variant_checkpoint(cfg: DictConfig, row: Mapping[str, object])
     actual = checkpoint_model_config_hash(checkpoint_dir)
     if expected is None or actual is None or expected != actual:
         raise EvalRunRefusal(
-            "ACT50 refuses a checkpoint from a different model profile before eval writes"
+            "profile refuses a checkpoint from a different model profile before eval writes"
         )
 
 

@@ -1,0 +1,32 @@
+{
+  "mutants": [
+    {
+      "id": "he-sigmoid-system-admission-dropped",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "if set(selected) != {\"he\"}:\n            raise ProtocolError(\"He sigmoid profile only admits the he system\")",
+      "new": "if False:\n            raise ProtocolError(\"mutated He system admission\")",
+      "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_sigmoid_manifest_identity_and_admission_are_he_only"
+    },
+    {
+      "id": "he-sigmoid-activation-replaced-with-native",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "activation = _HE_MODEL_PROFILE_DATA[HE_SIGMOID_PROFILE][\"activation\"]",
+      "new": "activation = \"torch.nn.SiLU\"",
+      "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_sigmoid_rendered_train_and_eval_diff_only_activation_leaves"
+    },
+    {
+      "id": "he-eval-cross-profile-check-dropped",
+      "target": "experiments/atomistic/stage1/eval.py",
+      "old": "if not is_hooke2_act50_profile(profile) and not is_he_profile_row:",
+      "new": "if not is_hooke2_act50_profile(profile):",
+      "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_eval_refuses_cross_profile_checkpoint_before_writes"
+    },
+    {
+      "id": "he-collect-cross-profile-check-dropped",
+      "target": "experiments/atomistic/stage1/collect.py",
+      "old": "if expected is None or actual is None or expected != actual:",
+      "new": "if False:",
+      "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_collect_refuses_cross_profile_checkpoint"
+    }
+  ]
+}
