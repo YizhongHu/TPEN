@@ -2230,13 +2230,13 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
         "optimizer.lr": 0.005,
     }
     for path, expected in expected_values.items():
-        if select(path) != expected:
+        if _select_resolved_path(resolved, path) != expected:
             raise ProtocolError(f"resolved Hooke science config mismatch at {path}")
-    checkpoint_steps = list(select("checkpoint_steps"))
+    checkpoint_steps = list(_select_resolved_path(resolved, "checkpoint_steps"))
     expected_steps = [step for step in row.get("checkpoint_steps", ()) if step > 0]
     if checkpoint_steps != expected_steps:
         raise ProtocolError("resolved Hooke checkpoint schedule does not match the manifest")
-    callbacks = select("callbacks")
+    callbacks = _select_resolved_path(resolved, "callbacks")
     targets = [entry.get("_target_") for entry in callbacks if isinstance(entry, Mapping)]
     if targets.count("tpen.callback.AmplitudeRiskFraction") != 1:
         raise ProtocolError("resolved Hooke config must contain one amplitude-risk callback")
@@ -2273,7 +2273,7 @@ def validate_resolved_train_config(cfg: Any, row: Mapping[str, Any], *,
                 if not isinstance(base_section, Mapping) or not isinstance(resolved_section, Mapping):
                     raise ProtocolError(f"resolved train config is missing runner {section} wiring")
                 for field in fields:
-                    root_value = select(f"{section}.{field}")
+                    root_value = _select_resolved_path(resolved, f"{section}.{field}")
                     if (field not in base_section or field not in resolved_section
                             or resolved_section[field] != root_value):
                         raise ProtocolError(
