@@ -1,0 +1,8 @@
+# Generic trainer configuration merge fragment for E1 score-gradient clipping.
+# Merge this opt-in fragment into a training configuration to enable PsiFormer
+# Appendix A.1 Eq. 13 clipping only in score updates; it is not a Stage-1
+# `--overlay` by itself.
+
+trainer:
+  energy_clipping_mode: psiformer
+  energy_clipping_k: 5.0

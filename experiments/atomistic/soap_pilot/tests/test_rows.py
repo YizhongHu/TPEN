@@ -5,10 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 import hashlib
-
 import pytest
 
 from experiments.atomistic.soap_pilot.composer import R2_PROFILES, TARGET_PROFILES, render_eval, render_profile
+from experiments.atomistic.soap_pilot.p3_render import finalize_eval_row, render_eval_template
 from experiments.atomistic.soap_pilot.rows import (
     CampaignMember,
     ComparisonGroup,
@@ -23,7 +23,37 @@ from experiments.atomistic.soap_pilot.rows import (
 )
 from experiments.atomistic.stage1.collect import CollectionError, collect
 from experiments.atomistic.stage1.launch import _binding_token
-from experiments.atomistic.stage1.protocol import SYSTEM_SPECS, manifest_hash as stage1_manifest_hash, validate_gateway_binding
+from experiments.atomistic.stage1.protocol import (
+    SYSTEM_SPECS,
+    manifest_hash as stage1_manifest_hash,
+    planned_physical_system_ids,
+    validate_gateway_binding,
+)
+
+
+def _finalized_eval(tmp_path: Path, train: dict) -> dict:
+    """Build the supported concrete eval row from named publication evidence."""
+
+    checkpoint_dir = (
+        tmp_path / train["experiment_name"] / train["sector"] / train["run_id"]
+        / "checkpoints" / "step_000100"
+    )
+    checkpoint_dir.mkdir(parents=True)
+    model = checkpoint_dir / "model.pt"
+    model.write_bytes(b"soap100-model")
+    complete = checkpoint_dir / "COMPLETE"
+    complete.write_text("published\n", encoding="utf-8")
+    publication = CheckpointEvidence(
+        100, "soap100-test-publication", hashlib.sha256(model.read_bytes()).hexdigest(),
+        True, {"model.pt": str(model), "COMPLETE": str(complete)},
+    )
+    return finalize_eval_row(
+        render_eval_template(output_dir=tmp_path / "inputs", results_root=str(tmp_path), source_sha=train["source_sha"], device="cpu"),
+        train_row=train,
+        parent=make_parent_join(campaign_id="soap-r2", invocation_id="soap-100", row=train),
+        publication=publication,
+        checkpoint_dir=checkpoint_dir,
+    )
 
 
 def test_golden_train_render_and_row_identity(tmp_path: Path) -> None:
@@ -102,34 +132,28 @@ def test_r2_20_is_distinct_unsynchronized_cross_check(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("parent_row", [None, {"row_id": "synthetic"}])
+def test_composer_eval_refuses_without_publication_parent(tmp_path: Path, parent_row) -> None:
+    """Concrete eval composition is reserved for the gated P3 finalizer."""
+
+    with pytest.raises(ValueError, match="p3_render|SOAP100 publication"):
+        render_eval(
+            output_dir=tmp_path / "inputs", results_root=str(tmp_path),
+            source_sha="7b88f833babcb82148c8f975a08b53970838be6a",
+            checkpoint_dir=str(tmp_path / "checkpoint"), checkpoint_sha256="a" * 64,
+            parent_row=parent_row, device="cpu",
+        )
+
+
 def test_strict_fresh_eval_golden_join(tmp_path: Path) -> None:
     results = tmp_path / "results"
-    train = render_profile(R2_PROFILES[1], output_dir=results / "inputs", results_root=str(results), source_sha="7b88f833babcb82148c8f975a08b53970838be6a", device="cpu")
-    parent = make_parent_join(campaign_id="soap-r2", invocation_id="soap-100", row=train.row)
-    checkpoint = CheckpointEvidence(100, "soap-100-step-100", "a" * 64, True, {"model.pt": "/tmp/model.pt", "COMPLETE": "/tmp/COMPLETE"})
-    evaluation = render_eval(output_dir=results / "inputs", results_root=str(results), source_sha=train.row["source_sha"], checkpoint_dir=str(results / "soap" / "checkpoints" / "step_000100"), checkpoint_sha256="a" * 64, parent_row=train.row, device="cpu")
-    assert evaluation.rendered.values["load"] == {"path": str(results / "soap" / "checkpoints" / "step_000100"), "mode": "model_only", "strict": True, "allow_protocol_mismatch": False}
-    assert evaluation.row["checkpoint_file"] == str((results / "soap" / "checkpoints" / "step_000100" / "model.pt").resolve())
-    assert evaluation.rendered.values["trajectory_identity"]["checkpoint_file"] == evaluation.row["checkpoint_file"]
-    assert evaluation.row["walkers"] == evaluation.rendered.values["evaluation_sampler"]["n_walkers"] == 4096
-    assert evaluation.row["draws"] == evaluation.rendered.values["evaluation_tasks"]["mcmc_energy"]["generator"]["n_draws"] == 256
-    joined = make_eval_row(
-        train_row=train.row,
-        parent=parent,
-        checkpoint=checkpoint,
-        rendered=evaluation.rendered,
-        row_base={
-            "run_id": "joined-eval",
-            "stream": 0,
-            "draws": 256,
-            "config": evaluation.row["config"],
-            "seed": evaluation.row["seed"],
-            "walkers": evaluation.row["walkers"],
-            "checkpoint_dir": evaluation.row["checkpoint_dir"],
-        },
-    )
-    assert joined["depends_on"] == train.row["row_id"]
-    assert joined["phase1_manifest_hash"] == parent.manifest_hash
+    train = render_profile(R2_PROFILES[1], output_dir=results / "inputs", results_root=str(results), source_sha="7b88f833babcb82148c8f975a08b53970838be6a", device="cpu").row
+    evaluation = _finalized_eval(results, train)
+    assert evaluation["checkpoint_file"] == str((results / train["experiment_name"] / train["sector"] / train["run_id"] / "checkpoints" / "step_000100" / "model.pt").resolve())
+    assert evaluation["walkers"] == 4096
+    assert evaluation["draws"] == 256
+    assert evaluation["depends_on"] == train["row_id"]
+    assert evaluation["phase1_manifest_hash"] == make_parent_join(campaign_id="soap-r2", invocation_id="soap-100", row=train).manifest_hash
 
 
 def test_parent_checkpoint_profile_and_path_refusals(tmp_path: Path) -> None:
@@ -155,7 +179,7 @@ def test_seed_domain_rejects_undeclared_collision() -> None:
 
 
 def test_rendered_rows_pass_stage1_admission_and_registry_tamper_refuses(tmp_path: Path) -> None:
-    """Exercise the real Stage-1 gateway for every rendered train/eval row."""
+    """Exercise gateway admission for all train rows and a gated eval row."""
 
     results = tmp_path / "results"
     train_profiles = [*R2_PROFILES, *TARGET_PROFILES]
@@ -164,71 +188,42 @@ def test_rendered_rows_pass_stage1_admission_and_registry_tamper_refuses(tmp_pat
                        source_sha="7b88f833babcb82148c8f975a08b53970838be6a", device="cpu").row
         for profile in train_profiles
     ]
-    checkpoint_dir = results / "checkpoint" / "step_000100"
-    checkpoint_dir.mkdir(parents=True)
-    checkpoint = checkpoint_dir / "model.pt"
-    checkpoint.write_bytes(b"checkpoint")
-    evaluation = render_eval(
-        output_dir=results / "inputs", results_root=str(results),
-        source_sha=train_rows[1]["source_sha"], checkpoint_dir=str(checkpoint_dir),
-        checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
-        parent_row=train_rows[1], device="cpu",
-    ).row
-
+    evaluation = _finalized_eval(results, train_rows[1])
     hooke2 = next(spec for spec in SYSTEM_SPECS if spec.name == "hooke2")
     for row in [*train_rows, evaluation]:
-        admitted = validate_gateway_binding(
-            binding=_binding_token(row), expected_kinds={row["kind"]}
-        )
+        admitted = validate_gateway_binding(binding=_binding_token(row), expected_kinds={row["kind"]})
         assert admitted["system"] == hooke2.name
         assert admitted["system_id"] == hooke2.system_id
-
     bad_registry = dict(train_rows[0], system="hooke1")
-    with pytest.raises(Exception, match="config path|known system|identity"):
+    with pytest.raises(Exception, match="config path|known system|identity|row_id"):
         validate_gateway_binding(binding=_binding_token(bad_registry), expected_kinds={"train"})
     bad_digest = dict(train_rows[0], config_sha256="0" * 64)
+    bad_digest["row_id"] = row_id(bad_digest)
     with pytest.raises(Exception, match="identity"):
         validate_gateway_binding(binding=_binding_token(bad_digest), expected_kinds={"train"})
 
 
 def test_collect_accepts_real_stage1_parent_eval_join_and_rejects_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Use the real Stage-1 collector and prove its parent hash boundary."""
+    """Use the real collector and preserve parent and physical-id boundaries."""
 
     results = tmp_path / "results"
-    train = render_profile(
-        R2_PROFILES[1], output_dir=results / "inputs", results_root=str(results),
-        source_sha="7b88f833babcb82148c8f975a08b53970838be6a", device="cpu",
-    ).row
-    parent = make_parent_join(campaign_id="soap-r2", invocation_id="soap-100", row=train)
-    checkpoint_dir = results / "checkpoint" / "step_000100"
-    checkpoint_dir.mkdir(parents=True)
-    checkpoint = checkpoint_dir / "model.pt"
-    checkpoint.write_bytes(b"checkpoint")
-    checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
-    eval_composed = render_eval(
-        output_dir=results / "inputs", results_root=str(results), source_sha=train["source_sha"],
-        checkpoint_dir=str(checkpoint_dir), checkpoint_sha256=checkpoint_sha,
-        parent_row=train, device="cpu",
-    )
+    train = render_profile(R2_PROFILES[1], output_dir=results / "inputs", results_root=str(results), source_sha="7b88f833babcb82148c8f975a08b53970838be6a", device="cpu").row
+    evaluation = _finalized_eval(results, train)
+    expected_physical_id = planned_physical_system_ids()["hooke2"]
     eval_rows = []
     for stream in range(4):
-        row = dict(eval_composed.row)
-        row["stream"] = stream
-        row["walkers"] = 1
-        row["draws"] = 1
+        row = dict(evaluation, stream=stream, walkers=1, draws=1)
         row["row_id"] = row_id(row)
         validate_row(row, expected_kind="eval")
         eval_rows.append(row)
         run_dir = results / row["experiment_name"] / row["sector"] / row["run_id"]
         (run_dir / "mcmc_energy").mkdir(parents=True, exist_ok=True)
         (run_dir / "mcmc_energy" / "sampled_eval_table.metadata.json").write_text("{}\n", encoding="utf-8")
-
     record = SimpleNamespace(
         record_schema="trajectory_records/v2", resolved_config_identity={"schema": "tpen-config-identity-v1", "sha256": "a" * 64},
-        draw_count=1, walker_count=1, row_count=1, model_provenance="checkpoint",
-        system_id=train["system_id"], execution_method_id="method", source_git_sha=train["source_sha"],
-        finite_count=1, mean=2.0, variance=0.0, record_content_id="record", csv_sha256="b" * 64,
-        checkpoint_sha256=checkpoint_sha,
+        draw_count=1, walker_count=1, row_count=1, model_provenance="checkpoint", system_id=expected_physical_id,
+        execution_method_id="method", source_git_sha=train["source_sha"], finite_count=1, mean=2.0, variance=0.0,
+        record_content_id="record", csv_sha256="b" * 64, checkpoint_sha256=evaluation["checkpoint_sha256"],
     )
     monkeypatch.setattr("experiments.atomistic.stage1.collect.inspect_eval_run", lambda run_dir: {"verdict": "completed", "resolved_config_identity": record.resolved_config_identity, "source_git_sha": train["source_sha"]})
     monkeypatch.setattr("experiments.atomistic.stage1.collect.inspect_trajectory_record", lambda *args, **kwargs: record)
@@ -237,16 +232,22 @@ def test_collect_accepts_real_stage1_parent_eval_join_and_rejects_mutation(tmp_p
     document["manifest_hash"] = stage1_manifest_hash(document["rows"])
     collected = collect(document)
     assert len(collected["records"]) == 4
+    parent = make_parent_join(campaign_id="soap-r2", invocation_id="soap-100", row=train)
     assert parent.train_row_hash == manifest_hash([train])
-
+    for invalid_physical_id in (train["system_id"], "0" * 64):
+        invalid_rows = [dict(row) for row in eval_rows]
+        invalid_rows[0]["expected_physical_system_id"] = invalid_physical_id
+        invalid_rows[0]["row_id"] = row_id(invalid_rows[0])
+        invalid_document = {"schema": "stage1/v4", "rows": [train, *invalid_rows]}
+        invalid_document["manifest_hash"] = stage1_manifest_hash(invalid_document["rows"])
+        with pytest.raises(CollectionError, match="physical system identity"):
+            collect(invalid_document)
     mutated_train = dict(train, run_id="mutated")
     mutated_train["row_id"] = row_id(mutated_train)
-    assert stage1_manifest_hash([mutated_train]) != parent.manifest_hash
-    mutated_eval = dict(eval_rows[0], depends_on=mutated_train["row_id"])
-    mutated_eval["phase1_train_row_hash"] = manifest_hash([mutated_train])
+    mutated_eval = dict(eval_rows[0], depends_on=mutated_train["row_id"], phase1_train_row_hash=manifest_hash([mutated_train]))
     mutated_eval["row_id"] = row_id(mutated_eval)
-    assert mutated_eval["row_id"] != eval_rows[0]["row_id"]
     bad_document = {"schema": "stage1/v4", "rows": [mutated_train, *eval_rows]}
     bad_document["manifest_hash"] = stage1_manifest_hash(bad_document["rows"])
     with pytest.raises(CollectionError, match="phase-2 row|manifest"):
         collect(bad_document)
+

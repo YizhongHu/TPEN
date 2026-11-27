@@ -7,6 +7,7 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --no-requeue
 set -euo pipefail
+__GPU_THREAD_EXPORTS__
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
   echo "STAGE1_GUARD missing SLURM_JOB_ID" >&2
   exit 2

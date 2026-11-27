@@ -1,0 +1,53 @@
+{
+  "mutants": [
+    {
+      "id": "he-sigmoid-system-admission-dropped",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "if set(selected) != {\"he\"}:\n            raise ProtocolError(\"He sigmoid profile only admits the he system\")",
+      "new": "if False:\n            raise ProtocolError(\"mutated He system admission\")",
+      "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_sigmoid_manifest_identity_and_admission_are_he_only"
+    },
+    {
+      "id": "he-sigmoid-activation-replaced-with-native",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "elif is_he_sigmoid_profile(science_profile):\n        activation = _HE_MODEL_PROFILE_DATA[HE_SIGMOID_PROFILE][\"activation\"]",
+      "new": "elif is_he_sigmoid_profile(science_profile):\n        activation = \"torch.nn.SiLU\"",
+      "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_sigmoid_rendered_train_and_eval_diff_only_activation_leaves"
+    },
+    {
+      "id": "he-sigmoid-path-aggregation-leaf-dropped",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "for path in (\n            f\"{model_root}.layers.0.mixing.activation._target_\",\n            f\"{model_root}.layers.0.path_aggregation.activation._target_\",\n        ):\n            OmegaConf.update(cfg, path, activation, merge=False)",
+      "new": "for path in (\n            f\"{model_root}.layers.0.mixing.activation._target_\",\n        ):\n            OmegaConf.update(cfg, path, activation, merge=False)",
+      "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_sigmoid_rendered_train_and_eval_diff_only_activation_leaves"
+    },
+    {
+      "id": "he-eval-cross-profile-check-dropped",
+      "target": "experiments/atomistic/stage1/eval.py",
+      "old": "if not is_hooke2_act50_profile(profile) and not is_he_profile_row:",
+      "new": "if not is_hooke2_act50_profile(profile):",
+      "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_eval_refuses_cross_profile_checkpoint_before_writes"
+    },
+    {
+      "id": "he-collect-cross-profile-check-dropped",
+      "target": "experiments/atomistic/stage1/collect.py",
+      "old": "if expected is None or actual is None or expected != actual:",
+      "new": "if False:",
+      "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_collect_refuses_cross_profile_checkpoint"
+    },
+    {
+      "id": "he-eval-missing-manifest-allowed",
+      "target": "experiments/atomistic/stage1/eval.py",
+      "old": "if is_he_profile_row:\n            raise EvalRunRefusal(\n                f\"He checkpoint compatibility manifest is missing before eval writes: \"\n                f\"{manifest_path}\"\n            )",
+      "new": "if is_he_profile_row and False:\n            raise EvalRunRefusal(\n                f\"He checkpoint compatibility manifest is missing before eval writes: \"\n                f\"{manifest_path}\"\n            )",
+      "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_eval_refuses_missing_manifest_before_writes"
+    },
+    {
+      "id": "he-collect-missing-manifest-allowed",
+      "target": "experiments/atomistic/stage1/collect.py",
+      "old": "if row.get(\"science_profile\") in {None, HE_SIGMOID_PROFILE}:\n            raise CollectionError(\n                \"He checkpoint compatibility manifest is missing before collection \"\n                f\"writes: {manifest_path}\"\n            )",
+      "new": "if row.get(\"science_profile\") in {None, HE_SIGMOID_PROFILE} and False:\n            raise CollectionError(\n                \"He checkpoint compatibility manifest is missing before collection \"\n                f\"writes: {manifest_path}\"\n            )",
+      "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_collect_refuses_missing_manifest_before_writes"
+    }
+  ]
+}

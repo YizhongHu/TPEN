@@ -153,3 +153,17 @@ verification must include it explicitly, for example:
 ```text
 pytest -q experiments/atomistic/stage1/tests/test_real_producer_e2e.py
 ```
+
+### Opt-in raw-history continuation
+
+For a new segmented run, set `format_version: 3` on the
+`tpen.callback.RawTrainingBatchRecorder` callback before its first segment.
+Keep `path` at the same location relative to each segment's run directory
+(for example, `${run.dir}/training_history`) and keep the capture cadence and
+partition size unchanged. Stage-1 redirects that path into the new attempt.
+A `planned_yield` segment durably closes its history; `train_resume` validates
+the checkpoint provenance and parent history before writing a fresh segment.
+`TrainingHistoryReader` on the final segment reads the complete lineage.
+
+The default remains v2 and fresh-only. Existing v2 histories cannot be
+converted into resumable histories by changing the option at restart.

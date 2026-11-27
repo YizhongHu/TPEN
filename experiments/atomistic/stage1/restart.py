@@ -123,21 +123,21 @@ def _configured_recorder_overlay(cfg: Any, overlay: str | None) -> str | None:
     callbacks = OmegaConf.select(cfg, "callbacks", default=())
     for callback in callbacks or ():
         target = callback.get("_target_") if isinstance(callback, Mapping) else None
-        if target == "tpen.callback.RawTrainingBatchRecorder":
+        if target == "tpen.callback.RawTrainingBatchRecorder" and callback.get("format_version", 2) != 3:
             configured_overlay = OmegaConf.select(cfg, "stage1_overlay.path", default=None)
             return str(configured_overlay or overlay or "<unspecified overlay>")
     return None
 
 
 def _refuse_unsupported_resume_callbacks(cfg: Any, overlay: str | None) -> None:
-    """Refuse the deferred recorder contract before checkpoint inspection or launch."""
+    """Require opt-in v3 history before checkpoint inspection or launch."""
 
     configured_overlay = _configured_recorder_overlay(cfg, overlay)
     if configured_overlay is not None:
         raise RestartRefusal(
-            "RawTrainingBatchRecorder cannot be resumed by Stage-1; "
-            "core item 7eaf9e0c (Executor lane ea7125c1) owns deferred recorder "
-            f"resume semantics; refusing overlay {configured_overlay}",
+            "RawTrainingBatchRecorder v2 cannot be resumed by Stage-1; "
+            "select format_version=3 from the first segment (7eaf9e0c); "
+            f"refusing overlay {configured_overlay}",
             cause=RestartCause.INVALID_RESUME,
         )
 

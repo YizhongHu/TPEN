@@ -41,6 +41,28 @@ BASE_ROW = {
 }
 
 
+def _write_model_only_manifest(row: dict[str, object], checkpoint_dir: Path) -> None:
+    """Give synthetic eval checkpoints the same identity proof as production."""
+
+    from tpen.checkpoint.hashing import checkpoint_hashes
+    from tpen.checkpoint.manifest import (
+        CHECKPOINT_KIND, CHECKPOINT_SCHEMA_VERSION, CheckpointManifest,
+    )
+
+    hashes = checkpoint_hashes(stage1_eval.build_eval_config(row))
+    CheckpointManifest(
+        schema_version=CHECKPOINT_SCHEMA_VERSION,
+        kind=CHECKPOINT_KIND,
+        next_iteration=1,
+        completed_updates=1,
+        created_at_unix=0.0,
+        files={"model": "model.pt"},
+        hashes={"model_config": hashes["model_config"]},
+        runtime={},
+        provenance={},
+    ).write(checkpoint_dir / "manifest.json")
+
+
 @pytest.mark.parametrize("script", ["plan.py", "launch.py"])
 def test_stage1_planning_scripts_import_by_path_outside_checkout(
     script: str, tmp_path: Path,
@@ -89,6 +111,8 @@ def _row(kind: str, checkpoint_root: Path | None = None) -> dict[str, object]:
             draws=2, checkpoint_dir=str(checkpoint_dir),
             checkpoint_file=str(checkpoint_file), checkpoint_sha256=checkpoint_digest,
         )
+        if checkpoint_root is not None:
+            _write_model_only_manifest(row, checkpoint_dir)
     else:
         row["checkpoint_steps"] = [5]
     return row
@@ -145,6 +169,8 @@ def _production_eval_row(system: str, root: Path) -> dict[str, object]:
         checkpoint_file=str(checkpoint_file),
         checkpoint_sha256=hashlib.sha256(payload).hexdigest(),
     )
+    if system == "he":
+        _write_model_only_manifest(row, checkpoint_dir)
     for key in ("checkpoint_steps", "overlay", "overlay_sha256"):
         row.pop(key, None)
     return row

@@ -1,0 +1,39 @@
+{
+  "mutants": [
+    {
+      "id": "gpu-default-cpus-reverted-to-one",
+      "target": "experiments/atomistic/stage1/launch.py",
+      "old": "_DEFAULT_GPU_CPUS = 10",
+      "new": "_DEFAULT_GPU_CPUS = 1",
+      "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_gpu_render_defaults_to_measured_shape_and_cuda_binding"
+    },
+    {
+      "id": "gpu-default-memory-reverted-to-four-gib",
+      "target": "experiments/atomistic/stage1/launch.py",
+      "old": "_DEFAULT_GPU_MEMORY = \"40G\"",
+      "new": "_DEFAULT_GPU_MEMORY = \"4G\"",
+      "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_gpu_render_defaults_to_measured_shape_and_cuda_binding"
+    },
+    {
+      "id": "gpu-omp-export-dropped",
+      "target": "experiments/atomistic/stage1/launch.py",
+      "old": "f\"export OMP_NUM_THREADS={cpus_per_task}\"",
+      "new": "\"\"",
+      "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_gpu_render_defaults_to_measured_shape_and_cuda_binding"
+    },
+    {
+      "id": "gpu-mkl-export-desynchronized",
+      "target": "experiments/atomistic/stage1/launch.py",
+      "old": "f\"export MKL_NUM_THREADS={cpus_per_task}\"",
+      "new": "\"export MKL_NUM_THREADS=1\"",
+      "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_gpu_render_defaults_to_measured_shape_and_cuda_binding"
+    },
+    {
+      "id": "gpu-thread-exports-after-command",
+      "target": "experiments/atomistic/stage1/templates/cannon.sbatch",
+      "old": "__GPU_THREAD_EXPORTS__",
+      "new": "__COMMAND__\n__GPU_THREAD_EXPORTS__",
+      "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_gpu_driver_inherits_effective_thread_exports"
+    }
+  ]
+}

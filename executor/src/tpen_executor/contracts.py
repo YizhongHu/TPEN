@@ -65,6 +65,13 @@ class BackendJobId(_Identity):
 
 
 @frozen_record
+class BatchJobId(_Identity):
+    """Identity assigned to one outer backend batch submission."""
+
+    schema: ClassVar[str] = "tpen-executor/batch-job-id-v1"
+
+
+@frozen_record
 class GroupId(_Identity):
     """Opaque identity of one immutable logical execution group."""
 

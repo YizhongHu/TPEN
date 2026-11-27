@@ -194,6 +194,24 @@ def _phase2_eval_row(
         row["checkpoint_dir"] = str(checkpoint_dir.resolve())
         row["checkpoint_file"] = str(checkpoint_file.resolve())
         row["checkpoint_sha256"] = hashlib.sha256(payload).hexdigest()
+        from tpen.checkpoint.hashing import checkpoint_hashes
+        from tpen.checkpoint.manifest import (
+            CHECKPOINT_KIND, CHECKPOINT_SCHEMA_VERSION, CheckpointManifest,
+        )
+
+        hashes = checkpoint_hashes(stage1_eval.build_eval_config(row))
+        CheckpointManifest(
+            schema_version=CHECKPOINT_SCHEMA_VERSION,
+            kind=CHECKPOINT_KIND,
+            next_iteration=0,
+            completed_updates=0,
+            created_at_unix=0.0,
+            files={"model": "model.pt"},
+            hashes={"model": hashlib.sha256(payload).hexdigest(),
+                    "model_config": hashes["model_config"]},
+            runtime={},
+            provenance={},
+        ).write(checkpoint_dir / "manifest.json")
     return row
 
 

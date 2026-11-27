@@ -19,6 +19,8 @@ from experiments.atomistic.stage1.launch import _binding_token
 from experiments.atomistic.stage1.protocol import (
     CHECKPOINT_EVIDENCE_SCHEMA,
     HOOKE2_ACT50_A27,
+    HOOKE2_ACT50_ALL_PROFILES,
+    HOOKE2_ACT50_SEGMENTED_PROFILES,
     HOOKE2_ACT50_PROFILES,
     HOOKE2_ACT50_SIGMOID_PROFILE,
     HOOKE2_ACT50_TANH_PROFILE,
@@ -127,6 +129,46 @@ def test_phase2_act50_infers_a27_from_phase1_profile(
     assert {row["evaluation_selection"] for row in eval_rows} == {"A27"}
 
 
+@pytest.mark.parametrize("profile", HOOKE2_ACT50_SEGMENTED_PROFILES)
+def test_phase2_segmented_manifest_preserves_a27_and_bound_identity(
+    profile: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The explicit segmented CLI profile preserves its phase-1 authority."""
+
+    phase1, bindings = _write_act50_phase1(tmp_path, profile)
+    phase1_document = json.loads(phase1.read_text(encoding="utf-8"))
+    output = tmp_path / "phase2.json"
+    monkeypatch.setattr(sys, "argv", [
+        "stage1-plan", "--output", str(output), "--source-sha", "a" * 40,
+        "--results-root", str(tmp_path / "results"), "--phase", "2",
+        "--phase1-manifest", str(phase1), "--checkpoint-bindings", str(bindings),
+        "--science-profile", profile,
+    ])
+    assert stage1_plan.main() == 0
+    document = json.loads(output.read_text(encoding="utf-8"))
+    train_rows = [row for row in document["rows"] if row["kind"] == "train"]
+    assert train_rows == phase1_document["rows"]
+    assert document["manifest_hash"] == manifest_hash(document["rows"])
+    eval_rows = [row for row in document["rows"] if row["kind"] == "eval"]
+    expected_roster = {
+        (lineage, checkpoint, stream)
+        for lineage in range(STAGE1_PROTOCOL.lineages)
+        for checkpoint in HOOKE2_ACT50_A27
+        for stream in range(STAGE1_PROTOCOL.eval_streams)
+    }
+    assert len(eval_rows) == len(expected_roster) == 324
+    assert {(row["lineage"], row["checkpoint"], row["stream"])
+            for row in eval_rows} == expected_roster
+    for row in eval_rows:
+        parent = next(train for train in train_rows if train["lineage"] == row["lineage"])
+        assert row["science_profile"] == profile
+        assert row["evaluation_selection"] == "A27"
+        assert row["config_sha256"] == parent["config_sha256"]
+        assert row["phase1_manifest_hash"] == phase1_document["manifest_hash"]
+        assert row["phase1_train_row_hash"] == manifest_hash([parent])
+        assert row["depends_on"] == parent["row_id"]
+
+
 def test_phase2_act50_refuses_conflicting_explicit_profile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -213,11 +255,11 @@ def test_same_act50_profile_checkpoint_is_accepted(tmp_path: Path) -> None:
     stage1_eval._refuse_cross_variant_checkpoint(eval_cfg, eval_row)
 
 
-@pytest.mark.parametrize("profile", HOOKE2_ACT50_PROFILES)
+@pytest.mark.parametrize("profile", HOOKE2_ACT50_ALL_PROFILES)
 def test_act50_synthetic_producer_to_collector_requires_complete_a27(
     profile: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """Exercise all three finite profiles through a bounded synthetic collector."""
+    """Exercise all six finite profiles through a bounded synthetic collector."""
 
     phase1_rows = _act50_phase1(profile)
     phase1_hash = manifest_hash(phase1_rows)

@@ -28,8 +28,8 @@ GPU_PARTITIONS = frozenset(ALLOWED_PARTITIONS[1:])
 _MAX_CPUS = 256
 _MAX_MEMORY_GIB = 2048
 _MAX_TIME_SECONDS = 7 * 24 * 60 * 60
-_DEFAULT_GPU_CPUS = 1
-_DEFAULT_GPU_MEMORY = "4G"
+_DEFAULT_GPU_CPUS = 10
+_DEFAULT_GPU_MEMORY = "40G"
 FACILITY_RESULTS_PREFIX = "/n/netscratch/kozinsky_lab/Lab/rhu/"
 _SAFE_RENDERED_VALUE = re.compile(r"[A-Za-z0-9_./:+,@=\[\]-]+\Z")
 
@@ -107,11 +107,11 @@ def _validate_gpu_resources(*, cpus_per_task: int | None, mem: str | None,
                             time: str | None) -> tuple[int, str, str]:
     """Validate GPU resources, applying the measured Stage-1 defaults.
 
-    The default one CPU and 4 GiB request is based on the 2026-11-25 Cannon
-    ``jobstats`` sweeps: the flagged evaluation jobs used one effective CPU
-    and at most 1.2 GiB host memory, while nine representative Stage 1
-    training jobs reached 1.5 GiB.  Callers may still provide a larger
-    measured shape.
+    The GPU default is ten CPUs and 40 GiB, matching the measured Polaris
+    wrapper's ten-thread CPU shape and the Stage-1 Cannon acceptance contract.
+    The memory request intentionally follows that ten-thread shape with ample
+    headroom; callers may still provide a larger measured shape. CPU-only
+    renders do not call this helper and retain the template's existing shape.
     """
 
     if cpus_per_task is None:
@@ -290,6 +290,13 @@ def render(*, row: Mapping[str, Any], checkout_root: str, python: str,
             "#SBATCH --gres=gpu:1\n#SBATCH --constraint=a100\n#SBATCH --no-requeue",
         )
         template = template.replace(
+            "__GPU_THREAD_EXPORTS__",
+            "\n".join([
+                f"export OMP_NUM_THREADS={cpus_per_task}",
+                f"export MKL_NUM_THREADS={cpus_per_task}",
+            ]),
+        )
+        template = template.replace(
             'REQUESTED_PARTITION="__PARTITION__"\n'
             'if [[ "$SLURM_JOB_PARTITION" != "$REQUESTED_PARTITION" ]]; then\n'
             '  echo "STAGE1_GUARD partition delivered=$SLURM_JOB_PARTITION requested=$REQUESTED_PARTITION" >&2\n'
@@ -305,6 +312,7 @@ def render(*, row: Mapping[str, Any], checkout_root: str, python: str,
             '  exit 2\nfi\n',
         )
         template = template.replace('SCRATCH_BASE=', _gpu_guard(python) + 'SCRATCH_BASE=', 1)
+    template = template.replace("__GPU_THREAD_EXPORTS__", "")
     for marker, value in {
         "__PARTITION__": partition,
         "__RESULTS_ROOT__": results_root,

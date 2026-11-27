@@ -22,7 +22,8 @@ from experiments.atomistic.stage1.protocol import (
     STAGE1_PROTOCOL,
     _validate_config_identity_for_row,
     HOOKE_SCIENCE_PROFILE,
-    HOOKE2_ACT50_PROFILES,
+    HOOKE2_ACT50_ALL_PROFILES,
+    HE_SIGMOID_PROFILE,
     HOOKE_SYSTEMS,
     _is_he_h2_production_phase,
     manifest_hash,
@@ -91,6 +92,35 @@ def _reference(system_id: str, registry_path: Path | None) -> tuple[float, str]:
                 raise CollectionError(f"reference confidence missing for system {system_id}")
             return float(entry["reference_energy_hartree"]), entry["confidence"]
     raise CollectionError(f"unknown reference system id {system_id}")
+
+
+def _validate_he_profile_checkpoint(row: Mapping[str, Any]) -> None:
+    """Reject a He checkpoint whose model hash disagrees with its binding."""
+
+    if row.get("system") != "he":
+        return
+    checkpoint_dir = Path(str(row.get("checkpoint_dir", "")))
+    manifest_path = checkpoint_dir / "manifest.json"
+    if not manifest_path.is_file():
+        # Activations are parameter-free, so a missing manifest removes the
+        # only durable discriminator between native SiLU and He sigmoid.
+        if row.get("science_profile") in {None, HE_SIGMOID_PROFILE}:
+            raise CollectionError(
+                "He checkpoint compatibility manifest is missing before collection "
+                f"writes: {manifest_path}"
+            )
+        return
+    from experiments.atomistic.stage1.eval import build_eval_config
+    from experiments.toolkit.checkpoint_compat import (
+        checkpoint_model_config_hash, config_model_config_hash,
+    )
+
+    expected = config_model_config_hash(build_eval_config(row))
+    actual = checkpoint_model_config_hash(checkpoint_dir)
+    if expected is None or actual is None or expected != actual:
+        raise CollectionError(
+            f"row {row.get('row_id')}: checkpoint model profile does not match binding"
+        )
 
 
 def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | None = None,
@@ -162,7 +192,7 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
         row.get("science_profile") for row in phase1_hooke_train_rows
         if row.get("science_profile") is not None
     }
-    admitted_hooke_profiles = {HOOKE_SCIENCE_PROFILE, *HOOKE2_ACT50_PROFILES}
+    admitted_hooke_profiles = {HOOKE_SCIENCE_PROFILE, *HOOKE2_ACT50_ALL_PROFILES}
     hooke_science = bool(phase1_train_profiles & admitted_hooke_profiles)
     if hooke_science:
         # Train rows are the science authority.  A missing/null profile on a
@@ -175,6 +205,28 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
             raise CollectionError("Hooke phase-1 rows mix science and legacy profiles")
     elif phase1_train_profiles:
         raise CollectionError("Hooke phase-1 rows use an unsupported science profile")
+    phase1_he_train_rows = [
+        row for row in phase1_rows
+        if row.get("kind") == "train" and row.get("system") in {"he", "h2"}
+    ]
+    phase1_he_profiles = {
+        row.get("science_profile") for row in phase1_he_train_rows
+        if row.get("science_profile") is not None
+    }
+    he_sigmoid_science = bool(phase1_he_profiles)
+    if he_sigmoid_science:
+        if phase1_he_profiles != {HE_SIGMOID_PROFILE} or {
+            row.get("system") for row in phase1_he_train_rows
+        } != {"he"}:
+            raise CollectionError("He phase-1 rows use an unsupported or mixed science profile")
+        if any(row.get("science_profile") != HE_SIGMOID_PROFILE for row in eval_rows
+               if row.get("system") == "he"):
+            raise CollectionError("He evaluation rows do not match the train profile")
+    elif any(
+        row.get("science_profile") is not None
+        for row in eval_rows if row.get("system") in {"he", "h2"}
+    ):
+        raise CollectionError("He evaluation rows carry a profile without train authority")
     # Science collection derives its required systems from the frozen phase-1
     # train rows.  The explicit no-profile path preserves genuinely legacy manifests.
     hooke_profile = next(iter(phase1_train_profiles), None) if hooke_science else None
@@ -221,6 +273,7 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
     registry_to_physical: dict[str, str] = {}
     physical_to_registry: dict[str, str] = {}
     for row in eval_rows:
+        _validate_he_profile_checkpoint(row)
         if row.get("config_identity_rule") not in {
             None, CONFIG_IDENTITY_RULE, LEGACY_CONFIG_IDENTITY_RULE,
         }:

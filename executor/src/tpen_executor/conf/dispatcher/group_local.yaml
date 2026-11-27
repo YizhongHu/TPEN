@@ -1,0 +1,4 @@
+_target_: tpen_executor.lifecycle.GroupRuntimeDispatcher
+_recursive_: false
+timeout: 30.0
+core_timeout: 30.0

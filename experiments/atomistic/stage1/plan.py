@@ -20,7 +20,7 @@ from experiments.atomistic.stage1.protocol import (
     bind_evaluation_manifest, build_manifest, config_identities, derive_smoke_eval_roster,
     manifest_hash,
     overlay_sha256, resolve_overlay_path, protocol_for_science_profile,
-    HOOKE2_ACT50_PROFILES, HOOKE_SCIENCE_PROFILE,
+    HOOKE2_ACT50_ALL_PROFILES, HOOKE_SCIENCE_PROFILE, HE_SIGMOID_PROFILE,
 )
 
 
@@ -110,7 +110,7 @@ def main() -> int:
             args.checkpoints = list(QHO_Q21)
         elif args.science_profile == "hooke-hv2-v1":
             args.checkpoints = list(HOOKE_A37)
-        elif args.science_profile in HOOKE2_ACT50_PROFILES:
+        elif args.science_profile in HOOKE2_ACT50_ALL_PROFILES:
             from experiments.atomistic.stage1.protocol import HOOKE2_ACT50_A27
             args.checkpoints = list(HOOKE2_ACT50_A27)
         elif selected_for_profile.issubset({"he", "h2"}):
@@ -129,7 +129,9 @@ def main() -> int:
     )
     config_root = Path(__file__).resolve().parent / "configs"
     identity_profile = (
-        args.science_profile if args.science_profile in HOOKE2_ACT50_PROFILES else None
+        args.science_profile
+        if args.science_profile in {*HOOKE2_ACT50_ALL_PROFILES, HE_SIGMOID_PROFILE}
+        else None
     )
     config_sha256: str | dict[str, str]
     if args.phase == 1:
@@ -197,7 +199,7 @@ def main() -> int:
             phase1_science_profiles = {
                 row.get("science_profile") for row in phase1_train_rows
                 if row.get("science_profile") in {
-                    HOOKE_SCIENCE_PROFILE, *HOOKE2_ACT50_PROFILES,
+                    HOOKE_SCIENCE_PROFILE, HE_SIGMOID_PROFILE, *HOOKE2_ACT50_ALL_PROFILES,
                 }
             }
             if len(phase1_science_profiles) > 1:
@@ -210,7 +212,9 @@ def main() -> int:
             config_sha256 = config_identities(
                 config_root=config_root, systems=phase1_systems,
                 science_profile=(phase1_science_profile
-                                 if phase1_science_profile in HOOKE2_ACT50_PROFILES else None),
+                                 if phase1_science_profile in {
+                                     *HOOKE2_ACT50_ALL_PROFILES, HE_SIGMOID_PROFILE,
+                                 } else None),
             )
             _compare_legacy_config_sha256(args.config_sha256, config_sha256)
             eval_rows = bind_evaluation_manifest(

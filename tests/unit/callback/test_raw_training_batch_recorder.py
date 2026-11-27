@@ -132,6 +132,16 @@ def test_refuses_restored_lineage_before_capture_or_file_write(tmp_path: Path) -
     assert not history_root.exists()
 
 
+def test_v3_recorder_canonicalizes_symlinked_root(tmp_path: Path) -> None:
+    real_root = tmp_path / "real" / "history"
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_root.parent, target_is_directory=True)
+
+    recorder = RawTrainingBatchRecorder(alias / "history", format_version=3, partition_size_steps=1)
+
+    assert recorder.path == real_root
+
+
 def test_first_nonzero_iteration_refuses_bypassed_restore_but_fresh_steps_continue(
     tmp_path: Path,
 ) -> None:

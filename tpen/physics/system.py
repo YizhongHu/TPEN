@@ -67,6 +67,7 @@ JsonScalar = bool | int | float | str
 #: ``{"a": "bs", "b": ""}`` and ``{"a": "", "b": "bs"}`` both encoded to
 #: ``b"asbsbs"`` and therefore hashed to the same `system_id`.
 _DESCRIPTOR_SCHEMA_VERSION = 2
+_CHECKPOINT_SCHEMA_VERSION = 1
 
 
 def _encode_length_prefixed(data: bytes) -> bytes:
@@ -466,6 +467,121 @@ class SystemDescriptor:
         for term in canonical_terms:
             digest.update(term.canonical_bytes())
         return digest.hexdigest()
+
+    def to_checkpoint(self) -> dict[str, Any]:
+        """Return a torch-pickle-safe representation of this descriptor.
+
+        `HamiltonianTermDescriptor.parameters` is intentionally a
+        ``MappingProxyType`` in the live object.  That is the right immutable
+        representation for physics code, but it is not picklable by
+        ``torch.save``.  The checkpoint boundary therefore owns a plain,
+        versioned mapping and reconstructs the typed descriptor on load.
+        Keeping this conversion beside the descriptor prevents sampler and
+        checkpoint code from reimplementing the physical identity contract.
+        """
+
+        terms: list[dict[str, Any]] = []
+        for term in self.terms:
+            resource = term.resource
+            terms.append(
+                {
+                    "operator_id": {
+                        "namespace": term.operator_id.namespace,
+                        "name": term.operator_id.name,
+                    },
+                    "slot": term.slot,
+                    "parameters": dict(term.parameters),
+                    "resource_id": term.resource_id,
+                    "version": term.version,
+                    "resource": (
+                        None
+                        if resource is None
+                        else {
+                            "positions": resource.positions,
+                            "charges": resource.charges,
+                        }
+                    ),
+                }
+            )
+        return {
+            "schema_version": _CHECKPOINT_SCHEMA_VERSION,
+            "particle": {
+                "n_electrons": self.particle.n_electrons,
+                "n_spin_up": self.particle.n_spin_up,
+                "n_spin_down": self.particle.n_spin_down,
+                "spatial_dim": self.particle.spatial_dim,
+            },
+            "units": self.units,
+            "terms": terms,
+        }
+
+    @classmethod
+    def from_checkpoint(cls, payload: Mapping[str, Any]) -> "SystemDescriptor":
+        """Rebuild and validate a descriptor from ``to_checkpoint`` output."""
+
+        if not isinstance(payload, Mapping):
+            raise TypeError("SystemDescriptor checkpoint payload must be a mapping")
+        if payload.get("schema_version") != _CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError(
+                "unsupported SystemDescriptor checkpoint schema version: "
+                f"{payload.get('schema_version')!r}"
+            )
+        particle_payload = payload.get("particle")
+        if not isinstance(particle_payload, Mapping):
+            raise ValueError("SystemDescriptor checkpoint is missing particle metadata")
+        particle = ParticleSpec(
+            n_electrons=particle_payload["n_electrons"],
+            n_spin_up=particle_payload["n_spin_up"],
+            n_spin_down=particle_payload["n_spin_down"],
+            spatial_dim=particle_payload["spatial_dim"],
+        )
+        term_payloads = payload.get("terms")
+        if not isinstance(term_payloads, (list, tuple)):
+            raise ValueError("SystemDescriptor checkpoint terms must be a sequence")
+        terms: list[HamiltonianTermDescriptor] = []
+        for term_payload in term_payloads:
+            if not isinstance(term_payload, Mapping):
+                raise ValueError("SystemDescriptor checkpoint term must be a mapping")
+            operator_payload = term_payload.get("operator_id")
+            if not isinstance(operator_payload, Mapping):
+                raise ValueError("SystemDescriptor checkpoint term is missing operator_id")
+            resource_payload = term_payload.get("resource")
+            resource = None
+            if resource_payload is not None:
+                if not isinstance(resource_payload, Mapping):
+                    raise ValueError("SystemDescriptor checkpoint resource must be a mapping")
+                resource = AtomicConfiguration(
+                    positions=resource_payload["positions"],
+                    charges=resource_payload["charges"],
+                )
+            terms.append(
+                HamiltonianTermDescriptor(
+                    operator_id=OperatorId(
+                        namespace=operator_payload["namespace"],
+                        name=operator_payload["name"],
+                    ),
+                    slot=term_payload["slot"],
+                    parameters=term_payload.get("parameters", {}),
+                    resource_id=term_payload.get("resource_id"),
+                    version=term_payload.get("version", 1),
+                    resource=resource,
+                )
+            )
+        return cls(particle=particle, units=payload["units"], terms=tuple(terms))
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Use the explicit wire form when a descriptor crosses a checkpoint."""
+
+        return self.to_checkpoint()
+
+    def __setstate__(self, payload: Mapping[str, Any]) -> None:
+        """Restore a validated descriptor from its checkpoint wire form."""
+
+        restored = type(self).from_checkpoint(payload)
+        object.__setattr__(self, "particle", restored.particle)
+        object.__setattr__(self, "units", restored.units)
+        object.__setattr__(self, "terms", restored.terms)
+        object.__setattr__(self, "_resources", restored._resources)
 
 
 def build_system_descriptor(

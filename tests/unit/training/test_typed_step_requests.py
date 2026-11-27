@@ -37,6 +37,11 @@ from tpen.physics.hamiltonian import LocalEnergyResult, local_energy
 from tpen.physics.kinetic import KineticEnergy
 from tpen.physics.potential import HarmonicTrap
 from tpen.training.events import Forward, LocalEnergy, Objective
+from tpen.training.block_ng import BlockDiagonalNaturalGradientUpdate, BlockNGPolicy
+from tpen.training.qgt import DampingPolicy
+from tpen.training.score_geometry import ScoreConventions
+from tpen.training.spring import SPRINGPolicy, SPRINGUpdate
+from tpen.training.sr import SRPolicy, StochasticReconfigurationUpdate
 from tpen.training.state import TrainerState
 from tpen.training.step_requests import (
     AutogradStepProducer,
@@ -57,6 +62,7 @@ from tpen.training.step_requests import (
 from tpen.training.trainer import VMCTrainer, _TrainerStepProducer
 from tpen.training.update import (
     AutogradUpdateInput,
+    ModelParameterBinding,
     ScoreUpdateInput,
     VMCUpdateMethod,
     VMCUpdateResult,
@@ -498,6 +504,108 @@ def test_parameter_score_step_request_detaches_all_tensors_and_preserves_parity(
     ok, _ = received.parameter_scores.compare(ref_packet.parameter_scores, atol=0.0, rtol=0.0)
     assert ok
     assert torch.equal(received.wavefunction.logabs, ref_packet.as_output().logabs)
+
+
+@pytest.mark.parametrize("route", ["sr", "spring", "block_ng"])
+def test_parameter_score_routes_receive_the_psiformer_clipped_energy(
+    route: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SR-family routes all consume the trainer's one transformed score payload.
+
+    SR, SPRING, and block-NG intentionally share ``ParameterScoreStepRequest``.
+    Exercising each concrete method's request keeps that ownership boundary
+    explicit: a route cannot silently fall back to the raw local energy.
+    """
+
+    model = _SoftplusWavefunction()
+    parameters = tuple(model.parameters())
+    binding = ModelParameterBinding.from_parameters(parameters)
+    optimizer = torch.optim.SGD(parameters, lr=0.05)
+    if route == "sr":
+        method = StochasticReconfigurationUpdate(
+            optimizer,
+            model_parameters=binding,
+            policy=SRPolicy(
+                solve_space="parameter",
+                damping=DampingPolicy(absolute=0.0, relative=1.0e-2),
+                learning_rate=0.05,
+            ),
+            conventions=ScoreConventions(solve_dtype=torch.float64),
+        )
+    elif route == "spring":
+        method = SPRINGUpdate(
+            optimizer,
+            model_parameters=binding,
+            policy=SPRINGPolicy(
+                base=SRPolicy(
+                    solve_space="sample",
+                    damping=DampingPolicy(absolute=0.0, relative=1.0e-2),
+                    learning_rate=0.05,
+                ),
+                history_decay=0.5,
+            ),
+            conventions=ScoreConventions(solve_dtype=torch.float64),
+        )
+    else:
+        method = BlockDiagonalNaturalGradientUpdate(
+            optimizer,
+            model_parameters=binding,
+            policy=BlockNGPolicy(damping=1.0e-2, learning_rate=0.05),
+        )
+
+    batch = _sample_batch(sample_shape=(4,), seed=73)
+    raw_energy = torch.tensor([0.0, 1.0, 2.0, 100.0], dtype=torch.float64)
+    monkeypatch.setattr(
+        trainer_module,
+        "local_energy",
+        lambda *args, **kwargs: raw_energy.clone(),
+    )
+    trainer = VMCTrainer(
+        max_steps=1,
+        update_method=method,
+        energy_clipping_mode="psiformer",
+        energy_clipping_k=1.0,
+    )
+    state = TrainerState(model=model, optimizer=optimizer, trainer=trainer)
+    producer = _TrainerStepProducer(
+        trainer=trainer,
+        model=model,
+        hamiltonian_terms=[],
+        batch=batch,
+        step=0,
+        context=_StubContext(),
+        state=state,
+    )
+
+    produced = producer.produce_parameter_score_step(resolve_step_request(method))
+    assert torch.equal(
+        produced.update_input.local_energy,
+        torch.tensor([0.0, 1.0, 2.0, 26.75], dtype=torch.float64),
+    )
+
+
+def test_linear_method_route_refuses_opt_in_energy_clipping() -> None:
+    """The Hamiltonian-tangent route rejects clipping before it can diverge."""
+
+    model = _SoftplusWavefunction()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    trainer = VMCTrainer(max_steps=1, energy_clipping_mode="psiformer")
+    state = TrainerState(model=model, optimizer=optimizer, trainer=trainer)
+    producer = _TrainerStepProducer(
+        trainer=trainer,
+        model=model,
+        hamiltonian_terms=[],
+        batch=_sample_batch(sample_shape=(2,), seed=79),
+        step=0,
+        context=_StubContext(),
+        state=state,
+    )
+
+    with pytest.raises(ValueError, match="energy clipping is unsupported for the Linear Method"):
+        producer.produce_materialized_hamiltonian_tangent_step(
+            MaterializedHamiltonianTangentStepRequest()
+        )
 
 
 def test_tangent_flattened_1d_shapes_chunking_return_terms_and_edge_batches() -> None:
