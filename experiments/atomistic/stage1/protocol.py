@@ -1026,9 +1026,18 @@ def compose_model_profile(cfg: Any, science_profile: str | None) -> Any:
                 OmegaConf.update(cfg, path, activation, merge=False)
     elif is_he_sigmoid_profile(science_profile):
         activation = _HE_MODEL_PROFILE_DATA[HE_SIGMOID_PROFILE]["activation"]
-        cfg.model.embedding.activation = {"_target_": activation}
-        cfg.model.layers[0].mixing.activation = {"_target_": activation}
-        cfg.model.layers[0].path_aggregation.activation = {"_target_": activation}
+        OmegaConf.update(
+            cfg.model.embedding.activation, "_target_", activation,
+            merge=False, force_add=True,
+        )
+        OmegaConf.update(
+            cfg.model.layers[0].mixing.activation, "_target_", activation,
+            merge=False, force_add=True,
+        )
+        OmegaConf.update(
+            cfg.model.layers[0].path_aggregation.activation, "_target_", activation,
+            merge=False, force_add=True,
+        )
     else:
         raise ProtocolError(f"unknown science profile {science_profile!r}")
     OmegaConf.update(cfg, "stage1_science_profile", str(science_profile), merge=False, force_add=True)
