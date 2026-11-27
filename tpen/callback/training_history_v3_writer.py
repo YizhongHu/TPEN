@@ -16,6 +16,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from tpen.durable_append import append_record
+
 from .raw_training_batch_recorder import (
     EVENTS_FILENAME,
     HISTORY_FILENAME,
@@ -111,12 +113,9 @@ def _publish_exclusive(temp: Path, final: Path) -> None:
 def _append_log_line(path: Path, line: bytes) -> None:
     """Append one complete event line and fsync the log file."""
 
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND)
-    try:
-        _write_all(fd, line)
-        _fsync_log(fd)
-    finally:
-        os.close(fd)
+    if not line.endswith(b"\n"):
+        raise ValueError("v3 event line must be newline-terminated")
+    append_record(path, line[:-1].decode("ascii"), fsync=_fsync_log)
 
 
 def _npz_bytes(record: TrainingBatchRecord) -> bytes:

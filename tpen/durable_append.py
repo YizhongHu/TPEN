@@ -82,6 +82,7 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+from typing import Callable
 
 __all__ = ["PartialAppendError", "append_record", "ends_without_newline"]
 
@@ -139,7 +140,12 @@ def ends_without_newline(path: Path) -> bool:
         return False
 
 
-def append_record(path: str | Path, record: str) -> None:
+def append_record(
+    path: str | Path,
+    record: str,
+    *,
+    fsync: Callable[[int], None] | None = None,
+) -> None:
     """Append `record` as one newline-terminated line using a single write.
 
     Parameters
@@ -179,6 +185,9 @@ def append_record(path: str | Path, record: str) -> None:
         If the write stored fewer bytes than the encoded record.  The requested
         record was NOT committed; see that exception's note on what the file's
         final state may be.
+    fsync : callable, optional
+        Callback receiving the open file descriptor after a complete write and
+        before the handle is closed.
     """
 
     # Derived from the widest production reader, not from a character list:
@@ -207,13 +216,14 @@ def append_record(path: str | Path, record: str) -> None:
     # with no BufferedWriter chunking the payload or retrying a short write.
     with target.open("ab", buffering=0) as handle:
         written = handle.write(encoded)
-
-    if written != len(encoded):
-        raise PartialAppendError(
-            f"partial append to {target}: stored {written} of {len(encoded)} bytes. "
-            "The requested record was NOT committed. Inspect the file before "
-            "assuming its final state: this does NOT necessarily leave an "
-            "unterminated last line. If a torn predecessor was being repaired, "
-            "the only stored byte may be the repair newline, in which case the "
-            "file ends in a newline and contains nothing of the new record."
-        )
+        if written != len(encoded):
+            raise PartialAppendError(
+                f"partial append to {target}: stored {written} of {len(encoded)} bytes. "
+                "The requested record was NOT committed. Inspect the file before "
+                "assuming its final state: this does NOT necessarily leave an "
+                "unterminated last line. If a torn predecessor was being repaired, "
+                "the only stored byte may be the repair newline, in which case the "
+                "file ends in a newline and contains nothing of the new record."
+            )
+        if fsync is not None:
+            fsync(handle.fileno())
