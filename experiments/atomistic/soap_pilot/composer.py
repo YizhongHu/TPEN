@@ -270,32 +270,20 @@ def render_profile(profile: PilotProfile, *, output_dir: str | Path, results_roo
 
 
 def render_eval(*, output_dir: str | Path, results_root: str, source_sha: str, checkpoint_dir: str, checkpoint_sha256: str, run_id: str = "soap_eval_100", device: str = "cuda", parent_row: Mapping[str, Any] | None = None) -> ComposedRow:
-    """Render the strict fresh SOAP checkpoint-100 evaluation row."""
+    """Reject the legacy concrete-eval composer path.
 
-    canonical_checkpoint_dir = str(Path(checkpoint_dir).resolve())
-    canonical_checkpoint_file = str((Path(canonical_checkpoint_dir) / "model.pt").resolve())
-    config, _ = _materialize_eval(
-        results_root=results_root, run_id=run_id,
-        checkpoint_dir=canonical_checkpoint_dir, checkpoint_file=canonical_checkpoint_file,
-        source_sha=source_sha, device=device,
+    A train row is not publication evidence: it may be a freshly rendered
+    synthetic row and carries no proof that a SOAP100 checkpoint was
+    published.  ``p3_render.finalize_eval_row`` is the sole supported path for
+    producing a concrete eval row because it joins a real parent and named
+    publication before writing output.
+    """
+
+    raise ValueError(
+        "composer.render_eval cannot create a concrete eval row; use "
+        "p3_render.render_eval_template and finalize_eval_row with a named "
+        "complete SOAP100 publication"
     )
-    rendered = _write_yaml(Path(output_dir) / "r2-soap-eval-100.yaml", config)
-    parent = parent_row or {"row_id": "parent", "system": _HOOKE2.name, "system_id": _HOOKE2.system_id, "seed": 2435329684536531677, "source_sha": source_sha, "config_sha256": _HOOKE2_CONFIG_SHA256, "results_root": results_root, "experiment_name": "stage1_hooke2", "sector": "atomistic", "device": device, "lineage": 0}
-    evaluation_sampler = config["evaluation_sampler"]
-    task = config["evaluation_tasks"]["mcmc_energy"]
-    generator = task["generator"]
-    row = {
-        "system": parent["system"], "system_id": parent["system_id"], "kind": "eval", "seed": 6348702091350892190,
-        "source_sha": source_sha, "config_sha256": _HOOKE2_CONFIG_SHA256, "config_identity_rule": "stage1-config-v1",
-        "config": "configs/hooke2/eval.yaml", "results_root": results_root, "experiment_name": "stage1_hooke2", "sector": "atomistic",
-        "run_id": run_id, "updates": int(parent.get("updates", 100)), "walkers": int(evaluation_sampler["n_walkers"]), "device": device, "row_extension": {"version": "stage1-rendered-config/v1", "rendered_config": {"path": rendered.path, "sha256": rendered.sha256}, "diagnostics_profile": "diagnostics-v2"},
-        "lineage": parent.get("lineage", 0), "checkpoint": int(parent.get("updates", 100)), "stream": 0, "draws": int(generator["n_draws"]), "expected_physical_system_id": _HOOKE2_PHYSICAL_SYSTEM_ID,
-        "checkpoint_dir": canonical_checkpoint_dir, "checkpoint_file": canonical_checkpoint_file, "checkpoint_sha256": checkpoint_sha256,
-        "depends_on": parent["row_id"], "phase1_manifest_hash": manifest_hash([dict(parent)]), "phase1_train_row_hash": manifest_hash([dict(parent)]),
-    }
-    row["row_id"] = row_id(row)
-    validate_row(row, expected_kind="eval")
-    return ComposedRow(row, rendered)
 
 
 def render_profiles(*, output_dir: str | Path, results_root: str, source_sha: str, profiles: Iterable[PilotProfile] = R2_PROFILES, device: str = "cuda") -> dict[str, ComposedRow]:
