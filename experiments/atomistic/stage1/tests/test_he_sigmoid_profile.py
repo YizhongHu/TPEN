@@ -121,6 +121,27 @@ def _model(cfg: Any) -> dict[str, Any]:
     return value
 
 
+def _full_snapshot(cfg: Any) -> dict[str, Any]:
+    """Return the complete unresolved config, not only the model subtree."""
+
+    value = OmegaConf.to_container(cfg, resolve=False)
+    assert isinstance(value, dict)
+    return value
+
+
+def _drop_snapshot_paths(snapshot: dict[str, Any], paths: set[str]) -> None:
+    """Remove only explicitly row-owned paths before full snapshot comparison."""
+
+    for path in paths:
+        cursor: Any = snapshot
+        parts = path.split(".")
+        for part in parts[:-1]:
+            assert isinstance(cursor, dict), path
+            cursor = cursor[part]
+        assert isinstance(cursor, dict), path
+        cursor.pop(parts[-1])
+
+
 def test_resolved_path_selector_supports_lists_and_rejects_missing_paths() -> None:
     """The resolved-config guard must understand model layer list indices."""
 
@@ -161,6 +182,59 @@ def test_he_sigmoid_rendered_train_and_eval_diff_only_activation_leaves() -> Non
     assert _model(native_train)["layers"][0]["mixing"]["activation"]["_target_"] == "torch.nn.SiLU"
     assert _model(native_train)["layers"][0]["path_aggregation"]["activation"]["_target_"] == "torch.nn.SiLU"
     assert _model(sigmoid_train)["embedding"]["activation"]["_target_"] == "torch.nn.Sigmoid"
+
+
+def test_native_he_build_preserves_full_config_outside_row_owned_setup() -> None:
+    """Native composition is a full-config no-op beyond gateway-owned setup."""
+
+    train_row = dict(next(row for row in _rows(None) if row["kind"] == "train"))
+    # The manifest helper opts into diagnostics by default.  Remove that
+    # independent row-owned overlay so this test isolates native model/config
+    # composition from the overlay's expected callback and logger additions.
+    for key in ("overlay", "overlay_sha256", "overlay_profile"):
+        train_row.pop(key, None)
+    native_train = build_train_config(train_row)
+    raw_train = load_config(str(CONFIG_ROOT / "he" / "train.yaml"))
+    raw_train_snapshot = _full_snapshot(raw_train)
+    built_train_snapshot = _full_snapshot(native_train)
+
+    # The builder intentionally owns these fields.  Check the one structural
+    # train setup change explicitly, then remove only those paths from the
+    # otherwise complete snapshots.
+    assert built_train_snapshot["checkpoint_steps"] == raw_train_snapshot["checkpoint_steps"][1:]
+    assert built_train_snapshot["callbacks"] == raw_train_snapshot["callbacks"] + [
+        {
+            "_target_": "tpen.callback.InitialCheckpoint",
+            "output_dir": "${run.dir}/checkpoints",
+        }
+    ]
+    train_owned_paths = {
+        "runtime.seed", "runtime.device", "run.root", "run.run_id", "run.layout",
+        "experiment.name", "experiment.sector", "sampler.n_walkers",
+        "sampler.seed", "trainer.max_steps", "checkpoint_steps", "callbacks",
+    }
+    _drop_snapshot_paths(raw_train_snapshot, train_owned_paths)
+    _drop_snapshot_paths(built_train_snapshot, train_owned_paths)
+    assert OmegaConf.to_yaml(OmegaConf.create(raw_train_snapshot), resolve=False) == OmegaConf.to_yaml(
+        OmegaConf.create(built_train_snapshot), resolve=False,
+    )
+
+    eval_row = next(row for row in _rows(None, phase=2) if row["kind"] == "eval")
+    native_eval = stage1_eval.build_eval_config(eval_row)
+    raw_eval = load_config(str(CONFIG_ROOT / "he" / "eval.yaml"))
+    raw_eval_snapshot = _full_snapshot(raw_eval)
+    built_eval_snapshot = _full_snapshot(native_eval)
+    eval_owned_paths = {
+        "runtime.seed", "runtime.device", "run.root", "run.run_id", "run.layout",
+        "experiment.name", "experiment.sector", "evaluation_sampler.n_walkers",
+        "evaluation_tasks.mcmc_energy.generator.n_draws", "load.path",
+        "trajectory_identity.checkpoint_file",
+    }
+    _drop_snapshot_paths(raw_eval_snapshot, eval_owned_paths)
+    _drop_snapshot_paths(built_eval_snapshot, eval_owned_paths)
+    assert OmegaConf.to_yaml(OmegaConf.create(raw_eval_snapshot), resolve=False) == OmegaConf.to_yaml(
+        OmegaConf.create(built_eval_snapshot), resolve=False,
+    )
 
 
 def test_he_sigmoid_manifest_identity_and_admission_are_he_only() -> None:
