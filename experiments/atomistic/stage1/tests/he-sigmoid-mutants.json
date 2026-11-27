@@ -17,8 +17,8 @@
     {
       "id": "he-sigmoid-path-aggregation-leaf-dropped",
       "target": "experiments/atomistic/stage1/protocol.py",
-      "old": "OmegaConf.update(\n            cfg.model.layers[0].mixing.activation, \"_target_\", activation,\n            merge=False, force_add=True,\n        )\n        OmegaConf.update(\n            cfg.model.layers[0].path_aggregation.activation, \"_target_\", activation,\n            merge=False, force_add=True,\n        )",
-      "new": "OmegaConf.update(\n            cfg.model.layers[0].mixing.activation, \"_target_\", activation,\n            merge=False, force_add=True,\n        )",
+      "old": "mixing[\"activation\"] = {\"_target_\": activation}\n        path_aggregation[\"activation\"] = {\"_target_\": activation}",
+      "new": "mixing[\"activation\"] = {\"_target_\": activation}",
       "killer": "experiments/atomistic/stage1/tests/test_he_sigmoid_profile.py::test_he_sigmoid_rendered_train_and_eval_diff_only_activation_leaves"
     },
     {
