@@ -604,8 +604,11 @@ class VMCTrainer:
         update_method: UpdateMethodSpec = None,
         nonfinite_local_energy_policy: str = DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY,
         local_energy_chunk_size: int | None = None,
-        energy_clipping_mode: str = DEFAULT_ENERGY_CLIPPING_MODE,
-        energy_clipping_k: float = DEFAULT_ENERGY_CLIPPING_K,
+        # Keep these inputs object-typed so invalid config values reach the
+        # resolver and produce the public ValueError rather than a typeguard
+        # error before construction can validate them.
+        energy_clipping_mode: object = DEFAULT_ENERGY_CLIPPING_MODE,
+        energy_clipping_k: object = DEFAULT_ENERGY_CLIPPING_K,
     ) -> None:
         self.max_steps = int(max_steps)
         # Validated at construction so an invalid bound refuses before any
