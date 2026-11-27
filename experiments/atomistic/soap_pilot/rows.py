@@ -118,6 +118,8 @@ class CheckpointEvidence:
     model_sha256: str
     complete: bool
     files: Mapping[str, str]
+    parent_run_id: str | None = None
+    parent_output_dir: str | None = None
 
     def validate(self, *, expected_step: int | None = None) -> None:
         """Validate the named publication without discovering sibling files."""
@@ -133,6 +135,10 @@ class CheckpointEvidence:
             raise RowContractError("checkpoint publication is not COMPLETE")
         if not isinstance(self.files, Mapping) or "model.pt" not in self.files or "COMPLETE" not in self.files:
             raise RowContractError("checkpoint publication must name model.pt and COMPLETE")
+        if self.parent_run_id is not None and (not isinstance(self.parent_run_id, str) or not self.parent_run_id):
+            raise RowContractError("checkpoint publication parent run identity is invalid")
+        if self.parent_output_dir is not None:
+            _path(self.parent_output_dir, "checkpoint publication parent output directory")
 
 
 @dataclass(frozen=True)
@@ -252,10 +258,18 @@ def validate_row(row: Mapping[str, Any], *, expected_kind: str | None = None) ->
     if kind == "train":
         _int(row.get("sampler_seed"), "sampler_seed")
         checkpoints = row.get("checkpoint_steps")
-        if not isinstance(checkpoints, list) or not checkpoints or any(type(x) is not int or x <= 0 for x in checkpoints):
-            raise RowContractError("checkpoint_steps must be positive integers")
-        if checkpoints != sorted(checkpoints) or len(set(checkpoints)) != len(checkpoints) or row["updates"] not in checkpoints:
-            raise RowContractError("checkpoint_steps must be unique and include updates")
+        if (
+            not isinstance(checkpoints, list)
+            or not checkpoints
+            or any(type(x) is not int or x < 0 for x in checkpoints)
+            or checkpoints != sorted(set(checkpoints))
+            or checkpoints[0] != 0
+            or checkpoints[-1] != row["updates"]
+        ):
+            # Stage-1 owns this materialized train-row contract.  Zero is the
+            # initial boundary; the rendered YAML intentionally strips it
+            # before ExplicitUpdates consumes the positive schedule.
+            raise RowContractError("checkpoint_steps must be sorted, unique, 0..H")
         if "overlay_profile" in row and row["overlay_profile"] != ext["diagnostics_profile"]:
             raise RowContractError("overlay_profile must match diagnostics_profile")
     else:
@@ -315,6 +329,10 @@ def make_eval_row(*, train_row: Mapping[str, Any], parent: ParentJoin, checkpoin
         raise RowContractError("parent hashes do not match the actual singleton row")
     if parent.source_sha != train_row.get("source_sha") or parent.rendered_config_sha256 != train_row["row_extension"]["rendered_config"]["sha256"]:
         raise RowContractError("parent provenance does not match the actual train row")
+    physical_id = row_base.get("expected_physical_system_id")
+    if (not isinstance(physical_id, str) or len(physical_id) != 64
+            or any(char not in "0123456789abcdef" for char in physical_id)):
+        raise RowContractError("expected_physical_system_id must be the physical content SHA-256")
     result = dict(row_base)
     result.update({
         "kind": "eval", "system": train_row["system"], "system_id": train_row["system_id"],
@@ -327,7 +345,7 @@ def make_eval_row(*, train_row: Mapping[str, Any], parent: ParentJoin, checkpoin
         "checkpoint_sha256": checkpoint.model_sha256,
         "depends_on": train_row["row_id"], "phase1_manifest_hash": parent.manifest_hash,
         "phase1_train_row_hash": parent.train_row_hash,
-        "expected_physical_system_id": train_row["system_id"],
+        "expected_physical_system_id": physical_id,
         "row_extension": {"version": "stage1-rendered-config/v1", "rendered_config": {"path": rendered.path, "sha256": rendered.sha256}, "diagnostics_profile": rendered.profile},
     })
     result["row_id"] = row_id(result)

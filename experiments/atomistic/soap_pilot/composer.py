@@ -17,7 +17,7 @@ from typing import Any, Iterable, Mapping
 
 import yaml
 
-from experiments.atomistic.stage1.protocol import SYSTEM_SPECS, config_identity
+from experiments.atomistic.stage1.protocol import SYSTEM_SPECS, config_identity, planned_physical_system_ids
 
 from .rows import RenderedConfig, manifest_hash, row_id, sha256_file, validate_row
 
@@ -31,6 +31,7 @@ _HOOKE2 = next(spec for spec in SYSTEM_SPECS if spec.name == "hooke2")
 _HOOKE2_CONFIG_SHA256 = config_identity(
     config_root=_STAGE1_CONFIG_ROOT, systems=("hooke2",)
 )["sha256"]
+_HOOKE2_PHYSICAL_SYSTEM_ID = planned_physical_system_ids()["hooke2"]
 _INTERPOLATION = re.compile(r"\$\{([^{}]+)\}")
 
 
@@ -59,15 +60,15 @@ class ComposedRow:
 
 
 R2_PROFILES = (
-    PilotProfile("r2-adam-100", "adam", 100, 512, (100,), "diagnostics-v2", train_timing_synchronize=True),
-    PilotProfile("r2-soap-100", "soap", 100, 512, (100,), "diagnostics-v2", train_timing_synchronize=True),
-    PilotProfile("r2-minsr64-100", "minsr64", 100, 512, (100,), "diagnostics-v2", 64, train_timing_synchronize=True),
-    PilotProfile("r2-minsr64-20", "minsr64", 20, 512, (20,), "diagnostics-v2", 64),
+    PilotProfile("r2-adam-100", "adam", 100, 512, (0, 100), "diagnostics-v2", train_timing_synchronize=True),
+    PilotProfile("r2-soap-100", "soap", 100, 512, (0, 100), "diagnostics-v2", train_timing_synchronize=True),
+    PilotProfile("r2-minsr64-100", "minsr64", 100, 512, (0, 100), "diagnostics-v2", 64, train_timing_synchronize=True),
+    PilotProfile("r2-minsr64-20", "minsr64", 20, 512, (0, 20), "diagnostics-v2", 64),
 )
 TARGET_PROFILES = (
-    PilotProfile("target-adam-5000", "adam", 5000, 512, (1000, 5000), "diagnostics-v2"),
-    PilotProfile("target-soap-5000", "soap", 5000, 512, (1000, 5000), "diagnostics-v2"),
-    PilotProfile("target-minsr64-5000", "minsr64", 5000, 512, (1000, 5000), "diagnostics-v2", 64),
+    PilotProfile("target-adam-5000", "adam", 5000, 512, (0, 1000, 5000), "diagnostics-v2"),
+    PilotProfile("target-soap-5000", "soap", 5000, 512, (0, 1000, 5000), "diagnostics-v2"),
+    PilotProfile("target-minsr64-5000", "minsr64", 5000, 512, (0, 1000, 5000), "diagnostics-v2", 64),
 )
 
 
@@ -191,12 +192,25 @@ def _materialize_train(profile: PilotProfile, *, results_root: str, run_id: str,
     _set(config, "sampler.seed", 7066630035130326805)
     _set(config, "trainer", trainer)
     _set(config, "optimizer", optimizer)
-    _set(config, "checkpoint_steps", list(profile.checkpoint_steps))
+    # Stage-1 rows include the zero origin; materialized YAML uses positive steps.
+    _set(config, "checkpoint_steps", list(profile.checkpoint_steps[1:]))
     # Compose the committed base callbacks with the committed diagnostic
     # profile.  The renderer only changes the explicitly declared pilot knobs;
     # it does not invent a second smoke callback set.
     _set(config, "callbacks", _callbacks(config.get("callbacks", []) + diagnostics.get("callbacks", []), profile.family, profile.diagnostics_profile, synchronize=profile.train_timing_synchronize))
-    _set(config, "stage1_overlay", {"path": str(_OVERLAY_BASE), "sha256": sha256_file(_OVERLAY_BASE), "profile": profile.diagnostics_profile})
+    # Materialized admission compares this provenance object byte-for-byte
+    # with the row-owned overlay basis.  Keep the rendered YAML self-contained
+    # while preserving the v2 recorder-before-checkpoint composition contract.
+    _set(config, "stage1_overlay", {
+        "schema": "stage1-overlay/v2",
+        "path": "configs/overlays/hooke-diagnostics-v2.yaml",
+        "sha256": sha256_file(_OVERLAY_BASE),
+        "composition_order": (
+            "base-config -> recorder-before-checkpoint diagnostics-v2 overlay -> manifest overrides"
+        ),
+        "stream": "train",
+        "profile": profile.diagnostics_profile,
+    })
     config = _resolve_document(config)
     if any("${" in repr(value) or value == "???" for value in config.values()):
         raise ValueError("rendered train config retains unresolved values")
@@ -275,7 +289,7 @@ def render_eval(*, output_dir: str | Path, results_root: str, source_sha: str, c
         "source_sha": source_sha, "config_sha256": _HOOKE2_CONFIG_SHA256, "config_identity_rule": "stage1-config-v1",
         "config": "configs/hooke2/eval.yaml", "results_root": results_root, "experiment_name": "stage1_hooke2", "sector": "atomistic",
         "run_id": run_id, "updates": int(parent.get("updates", 100)), "walkers": int(evaluation_sampler["n_walkers"]), "device": device, "row_extension": {"version": "stage1-rendered-config/v1", "rendered_config": {"path": rendered.path, "sha256": rendered.sha256}, "diagnostics_profile": "diagnostics-v2"},
-        "lineage": parent.get("lineage", 0), "checkpoint": int(parent.get("updates", 100)), "stream": 0, "draws": int(generator["n_draws"]), "expected_physical_system_id": parent["system_id"],
+        "lineage": parent.get("lineage", 0), "checkpoint": int(parent.get("updates", 100)), "stream": 0, "draws": int(generator["n_draws"]), "expected_physical_system_id": _HOOKE2_PHYSICAL_SYSTEM_ID,
         "checkpoint_dir": canonical_checkpoint_dir, "checkpoint_file": canonical_checkpoint_file, "checkpoint_sha256": checkpoint_sha256,
         "depends_on": parent["row_id"], "phase1_manifest_hash": manifest_hash([dict(parent)]), "phase1_train_row_hash": manifest_hash([dict(parent)]),
     }

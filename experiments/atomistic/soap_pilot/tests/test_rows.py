@@ -23,7 +23,12 @@ from experiments.atomistic.soap_pilot.rows import (
 )
 from experiments.atomistic.stage1.collect import CollectionError, collect
 from experiments.atomistic.stage1.launch import _binding_token
-from experiments.atomistic.stage1.protocol import SYSTEM_SPECS, manifest_hash as stage1_manifest_hash, validate_gateway_binding
+from experiments.atomistic.stage1.protocol import (
+    SYSTEM_SPECS,
+    manifest_hash as stage1_manifest_hash,
+    planned_physical_system_ids,
+    validate_gateway_binding,
+)
 
 
 def test_golden_train_render_and_row_identity(tmp_path: Path) -> None:
@@ -126,6 +131,7 @@ def test_strict_fresh_eval_golden_join(tmp_path: Path) -> None:
             "seed": evaluation.row["seed"],
             "walkers": evaluation.row["walkers"],
             "checkpoint_dir": evaluation.row["checkpoint_dir"],
+            "expected_physical_system_id": evaluation.row["expected_physical_system_id"],
         },
     )
     assert joined["depends_on"] == train.row["row_id"]
@@ -184,9 +190,10 @@ def test_rendered_rows_pass_stage1_admission_and_registry_tamper_refuses(tmp_pat
         assert admitted["system_id"] == hooke2.system_id
 
     bad_registry = dict(train_rows[0], system="hooke1")
-    with pytest.raises(Exception, match="config path|known system|identity"):
+    with pytest.raises(Exception, match="config path|known system|identity|row_id"):
         validate_gateway_binding(binding=_binding_token(bad_registry), expected_kinds={"train"})
     bad_digest = dict(train_rows[0], config_sha256="0" * 64)
+    bad_digest["row_id"] = row_id(bad_digest)
     with pytest.raises(Exception, match="identity"):
         validate_gateway_binding(binding=_binding_token(bad_digest), expected_kinds={"train"})
 
@@ -205,11 +212,33 @@ def test_collect_accepts_real_stage1_parent_eval_join_and_rejects_mutation(tmp_p
     checkpoint = checkpoint_dir / "model.pt"
     checkpoint.write_bytes(b"checkpoint")
     checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    expected_physical_id = planned_physical_system_ids()["hooke2"]
+    assert expected_physical_id != train["system_id"]
     eval_composed = render_eval(
         output_dir=results / "inputs", results_root=str(results), source_sha=train["source_sha"],
         checkpoint_dir=str(checkpoint_dir), checkpoint_sha256=checkpoint_sha,
         parent_row=train, device="cpu",
     )
+    joined = make_eval_row(
+        train_row=train,
+        parent=parent,
+        checkpoint=CheckpointEvidence(
+            100, "soap-100-step-100", checkpoint_sha, True,
+            {"model.pt": str(checkpoint), "COMPLETE": str(results / "COMPLETE")},
+        ),
+        rendered=eval_composed.rendered,
+        row_base={
+            "run_id": "joined-eval",
+            "stream": 0,
+            "draws": 1,
+            "config": eval_composed.row["config"],
+            "seed": eval_composed.row["seed"],
+            "walkers": 1,
+            "checkpoint_dir": str(checkpoint_dir),
+            "expected_physical_system_id": expected_physical_id,
+        },
+    )
+    assert joined["expected_physical_system_id"] == expected_physical_id
     eval_rows = []
     for stream in range(4):
         row = dict(eval_composed.row)
@@ -226,7 +255,7 @@ def test_collect_accepts_real_stage1_parent_eval_join_and_rejects_mutation(tmp_p
     record = SimpleNamespace(
         record_schema="trajectory_records/v2", resolved_config_identity={"schema": "tpen-config-identity-v1", "sha256": "a" * 64},
         draw_count=1, walker_count=1, row_count=1, model_provenance="checkpoint",
-        system_id=train["system_id"], execution_method_id="method", source_git_sha=train["source_sha"],
+        system_id=expected_physical_id, execution_method_id="method", source_git_sha=train["source_sha"],
         finite_count=1, mean=2.0, variance=0.0, record_content_id="record", csv_sha256="b" * 64,
         checkpoint_sha256=checkpoint_sha,
     )
@@ -238,6 +267,15 @@ def test_collect_accepts_real_stage1_parent_eval_join_and_rejects_mutation(tmp_p
     collected = collect(document)
     assert len(collected["records"]) == 4
     assert parent.train_row_hash == manifest_hash([train])
+
+    for invalid_physical_id in (train["system_id"], "0" * 64):
+        invalid_rows = [dict(row) for row in eval_rows]
+        invalid_rows[0]["expected_physical_system_id"] = invalid_physical_id
+        invalid_rows[0]["row_id"] = row_id(invalid_rows[0])
+        invalid_document = {"schema": "stage1/v4", "rows": [train, *invalid_rows]}
+        invalid_document["manifest_hash"] = stage1_manifest_hash(invalid_document["rows"])
+        with pytest.raises(CollectionError, match="physical system identity"):
+            collect(invalid_document)
 
     mutated_train = dict(train, run_id="mutated")
     mutated_train["row_id"] = row_id(mutated_train)
