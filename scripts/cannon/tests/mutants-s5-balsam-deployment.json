@@ -10,8 +10,8 @@
     {
       "id": "crossed-site-readback-accepted",
       "target": "executor/src/tpen_executor/deployment/balsam.py",
-      "old": "if site_name != spec.site_name:",
-      "new": "if False and site_name != spec.site_name:  # mutant: accept crossed site",
+      "old": "_require_identity(site, expected_identity, \"site\")",
+      "new": "_require_identity(site, {key: value for key, value in expected_identity.items() if key != \"site_name\"}, \"site\")  # mutant: accept crossed site",
       "killer": "executor/tests/test_s5_balsam_deployment.py::test_deploy_refuses_crossed_site_and_credential_readback"
     },
     {
@@ -48,6 +48,41 @@
       "old": "if resources.walltime_minutes > queue.max_walltime_minutes:",
       "new": "if False and resources.walltime_minutes > queue.max_walltime_minutes:  # mutant: walltime ceiling removed",
       "killer": "executor/tests/test_s5_balsam_deployment.py::test_scheduler_records_refuse_overlapping_slots_and_queue_overflow"
+    },
+    {
+      "id": "rendered-application-consumer-disconnected",
+      "target": "executor/src/tpen_executor/deployment/balsam.py",
+      "old": "        \"ApplicationDefinition = make_application_definition(\\n\"",
+      "new": "        \"ApplicationDefinition = _PinnedApplicationDefinition  # mutant: bypass concrete policy factory\\n\"",
+      "killer": "executor/tests/test_s5_balsam_deployment.py::test_rendered_application_is_a_concrete_pinned_consumer"
+    },
+    {
+      "id": "crossed-application-site-identity-accepted",
+      "target": "executor/src/tpen_executor/deployment/balsam.py",
+      "old": "_require_identity(app, {**expected_identity, \"application_name\": rendered.application_name}, \"application\")",
+      "new": "_require_identity(app, {key: value for key, value in expected_identity.items() if key != \"site_name\"} | {\"application_name\": rendered.application_name}, \"application\")  # mutant: omit app site binding",
+      "killer": "executor/tests/test_s5_balsam_deployment.py::test_deploy_refuses_crossed_application_site_name"
+    },
+    {
+      "id": "missing-readback-identity-accepted",
+      "target": "executor/src/tpen_executor/deployment/balsam.py",
+      "old": "if key not in record:",
+      "new": "if False and key not in record:  # mutant: accept incomplete identity",
+      "killer": "executor/tests/test_s5_balsam_deployment.py::test_deploy_requires_complete_site_identity"
+    },
+    {
+      "id": "site-post-mutation-readback-skipped",
+      "target": "executor/src/tpen_executor/deployment/balsam.py",
+      "old": "        site = backend.read_site(spec.site_name)\n    if site is None:\n        raise BalsamDeploymentRefusal(\"site readback is absent after creation\")",
+      "new": "        site = site\n    if site is None:\n        raise BalsamDeploymentRefusal(\"site readback is absent after creation\")  # mutant: trust create acknowledgement",
+      "killer": "executor/tests/test_s5_balsam_deployment.py::test_deploy_requires_post_mutation_readback"
+    },
+    {
+      "id": "application-post-mutation-readback-skipped",
+      "target": "executor/src/tpen_executor/deployment/balsam.py",
+      "old": "        app = backend.read_application(spec.site_name, rendered.application_name)\n    if app is None:\n        raise BalsamDeploymentRefusal(\"application readback is absent after synchronization\")",
+      "new": "        app = app\n    if app is None:\n        raise BalsamDeploymentRefusal(\"application readback is absent after synchronization\")  # mutant: trust sync acknowledgement",
+      "killer": "executor/tests/test_s5_balsam_deployment.py::test_deploy_requires_post_mutation_readback"
     }
   ]
 }

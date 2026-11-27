@@ -245,46 +245,82 @@ def _record_digest(record: Mapping[str, Any], name: str) -> str:
     return digest(data)
 
 
-def _check_optional_identity(record: Mapping[str, Any], expected: Mapping[str, Any], name: str) -> None:
-    """Reject a readback that exposes a conflicting known identity field."""
+def _require_identity(record: Mapping[str, Any], expected: Mapping[str, Any], name: str) -> None:
+    """Require every deployment identity field and reject crossed values."""
     for key, value in expected.items():
-        if key in record and record[key] != value:
+        if key not in record:
+            raise BalsamDeploymentRefusal(f"{name} readback omits required {key}")
+        if record[key] != value:
             raise BalsamDeploymentRefusal(f"{name} readback conflicts on {key}")
 
 
+_SOURCE_DIGEST_TOKEN = "__TPEN_APPLICATION_SOURCE_DIGEST__"
+_SOURCE_DIGEST_LINE = re.compile(r"^SOURCE_DIGEST = ('[0-9a-f]{64}')$", re.MULTILINE)
+
+
+def _application_source_digest(source: str) -> str:
+    """Return the digest of the source before its explicit digest binding."""
+    match = _SOURCE_DIGEST_LINE.search(source)
+    if match is None:
+        raise BalsamDeploymentRefusal("generated application omits its source digest binding")
+    canonical = source[:match.start(1)] + repr(_SOURCE_DIGEST_TOKEN) + source[match.end(1):]
+    return digest(canonical)
+
+
 def _render_application(spec: BalsamDeployment, application_name: str) -> str:
-    """Render the fixed application policy source."""
-    return (
+    """Render the concrete control-side application policy source."""
+    source = (
         '"""Generated application; identity and lifecycle policy are fixed."""\n'
-        "from tpen_executor.lifecycle.balsam import group_exit_code\n\n"
+        "from balsam.api import ApplicationDefinition as _PinnedApplicationDefinition\n"
+        "from tpen_balsam_control.application import make_application_definition\n"
+        "from tpen_executor.lifecycle.balsam import GroupExitContract, group_exit_code\n\n"
+        "class _PinnedAPI:\n"
+        "    ApplicationDefinition = _PinnedApplicationDefinition\n\n"
+        f"SITE_NAME = {spec.site_name!r}\n"
         f"APPLICATION_NAME = {application_name!r}\n"
         f"DEPLOYMENT_DIGEST = {spec.deployment_digest!r}\n"
+        f"SOURCE_DIGEST = {_SOURCE_DIGEST_TOKEN!r}\n"
         f"CONTROL_PYTHON = {spec.control_environment.environment.python!r}\n"
+        "POLICY_OVERRIDES = {\n"
+        "    'backend_retry_codes': (1,),\n"
+        "    'no_retry_code': 2,\n"
+        "    'timeout_state': 'failed',\n"
+        "    'error_state': 'failed',\n"
+        "    'rearm': 'refuse',\n"
+        "}\n\n"
+        "def _invoke_group(job):\n"
+        "    callback = getattr(job, 'tpen_run_group_controller', None)\n"
+        "    if not callable(callback):\n"
+        "        raise RuntimeError('generated application has no bound group controller')\n"
+        "    return callback()\n\n"
+        "def _record_failure(job, error):\n"
+        "    callback = getattr(job, 'tpen_record_failure', None)\n"
+        "    if not callable(callback):\n"
+        "        raise RuntimeError('generated application has no failure recorder')\n"
+        "    callback(error)\n\n"
+        "def _record_observation(job, value):\n"
+        "    callback = getattr(job, 'tpen_record_observation', None)\n"
+        "    if not callable(callback):\n"
+        "        raise RuntimeError('generated application has no observation recorder')\n"
+        "    callback(value)\n\n"
+        "ApplicationDefinition = make_application_definition(\n"
+        "    _PinnedAPI,\n"
+        "    invoke_group=_invoke_group,\n"
+        "    exit_code=group_exit_code,\n"
+        "    contract=GroupExitContract(tuple(POLICY_OVERRIDES['backend_retry_codes']),\n"
+        "                                POLICY_OVERRIDES['no_retry_code']),\n"
+        "    record_failure=_record_failure,\n"
+        "    record_observation=_record_observation,\n"
+        "    site_name=SITE_NAME,\n"
+        "    application_name=APPLICATION_NAME,\n"
+        "    deployment_digest=DEPLOYMENT_DIGEST,\n"
+        "    source_digest=SOURCE_DIGEST,\n"
+        "    policy_overrides=POLICY_OVERRIDES,\n"
+        ")\n"
         "\n"
-        "def run(job, invoke_group, contract, record_failure):\n"
-        "    \"\"\"Run one bound group; a serialized zero is never authoritative.\"\"\"\n"
-        "    try:\n"
-        "        outcome = invoke_group(job)\n"
-        "        code = group_exit_code(outcome, contract)\n"
-        "    except BaseException as error:\n"
-        "        try:\n"
-        "            record_failure(job, error)\n"
-        "        finally:\n"
-        "            raise SystemExit(2) from error\n"
-        "    if code:\n"
-        "        raise SystemExit(code)\n"
-        "    return 0\n"
-        "\n"
-        "def handle_timeout(job, record_observation):\n"
-        "    \"\"\"Leave a timed-out job non-runnable for explicit reentry.\"\"\"\n"
-        "    job.state = \"failed\"\n"
-        "    record_observation(job, \"timeout-awaiting-explicit-reentry\")\n"
-        "\n"
-        "def handle_error(job, record_observation):\n"
-        "    \"\"\"Leave an errored job non-runnable; never invoke inherited restart.\"\"\"\n"
-        "    job.state = \"failed\"\n"
-        "    record_observation(job, \"error-awaiting-explicit-reentry\")\n"
     )
+    source_digest = digest(source)
+    return source.replace(repr(_SOURCE_DIGEST_TOKEN), repr(source_digest), 1)
 
 
 def _render_job_template(spec: BalsamDeployment) -> str:
@@ -337,27 +373,31 @@ def deploy_owned_site(spec: BalsamDeployment, backend: DeploymentBackend,
                ("read_site", "create_site", "read_application", "sync_application")):
         raise TypeError("backend does not implement the finite deployment API")
     rendered = render_deployment(spec, resources)
+    source_digest = _application_source_digest(rendered.application)
+    expected_identity = {
+        "site_name": spec.site_name,
+        "site_directory": spec.site_directory,
+        "site_template": spec.site_template,
+        "source_digest": source_digest,
+        "deployment_digest": spec.deployment_digest,
+    }
     site = backend.read_site(spec.site_name)
     if site is None:
-        site = backend.create_site(spec.site_name, spec.site_template, spec.site_directory)
+        backend.create_site(spec.site_name, spec.site_template, spec.site_directory)
+        site = backend.read_site(spec.site_name)
+    if site is None:
+        raise BalsamDeploymentRefusal("site readback is absent after creation")
     site = _mapping(site, "site readback")
-    site_name = site.get("site_name", site.get("name"))
-    if site_name != spec.site_name:
-        raise BalsamDeploymentRefusal("site readback is not the exact owned site")
-    _check_optional_identity(site, {"template": spec.site_template, "directory": spec.site_directory}, "site")
+    _require_identity(site, expected_identity, "site")
     site_digest = _record_digest(site, "site readback")
     app = backend.read_application(spec.site_name, rendered.application_name)
     if app is None:
-        app = backend.sync_application(spec.site_name, rendered.application_name, rendered.application)
+        backend.sync_application(spec.site_name, rendered.application_name, rendered.application)
+        app = backend.read_application(spec.site_name, rendered.application_name)
+    if app is None:
+        raise BalsamDeploymentRefusal("application readback is absent after synchronization")
     app = _mapping(app, "application readback")
-    app_name = app.get("application_name", app.get("name"))
-    if app_name != rendered.application_name:
-        raise BalsamDeploymentRefusal("application readback is not the generated application")
-    _check_optional_identity(
-        app,
-        {"deployment_digest": spec.deployment_digest, "source_digest": digest(rendered.application)},
-        "application",
-    )
+    _require_identity(app, {**expected_identity, "application_name": rendered.application_name}, "application")
     app_digest = _record_digest(app, "application readback")
     return rendered, DeploymentReadback(spec.site_name, site_digest, rendered.application_name,
                                         app_digest, spec.deployment_digest)

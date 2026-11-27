@@ -139,8 +139,11 @@ def make_application_definition(
     contract: Any,
     record_failure: Callable[[Any, BaseException], None],
     record_observation: Callable[[Any, object], None],
+    site_name: str,
     application_name: str,
     deployment_digest: str,
+    source_digest: str,
+    policy_overrides: Mapping[str, Any],
 ) -> type:
     """Build the generated application policy around an injected API.
 
@@ -156,8 +159,11 @@ def make_application_definition(
         Explicit qualified exit contract consumed by ``exit_code``.
     record_failure, record_observation : callable
         Durable control observation hooks; neither may authorize reentry.
-    application_name, deployment_digest : str
+    site_name, application_name, deployment_digest, source_digest : str
         Immutable generated identities attached to the application class.
+    policy_overrides : mapping
+        Explicit deployment policy values recorded on the generated class.  The
+        lifecycle hooks remain fail-closed and never inherit retry behavior.
 
     Returns
     -------
@@ -168,16 +174,25 @@ def make_application_definition(
     if not isinstance(base, type) or not all(callable(value) for value in
                                               (invoke_group, exit_code, record_failure, record_observation)):
         raise BalsamControlRefusal("application requires a typed API and control callbacks")
-    if not isinstance(application_name, str) or not application_name.strip():
-        raise BalsamControlRefusal("application_name must be non-empty")
-    if not isinstance(deployment_digest, str) or len(deployment_digest) != 64:
-        raise BalsamControlRefusal("deployment_digest must be a SHA-256 identity")
+    for name, value in (("site_name", site_name), ("application_name", application_name)):
+        if not isinstance(value, str) or not value.strip():
+            raise BalsamControlRefusal(f"{name} must be non-empty")
+    for name, value in (("deployment_digest", deployment_digest), ("source_digest", source_digest)):
+        try:
+            sha256_text(value, name)
+        except (TypeError, ValueError) as error:
+            raise BalsamControlRefusal(f"{name} must be a SHA-256 identity") from error
+    if not isinstance(policy_overrides, Mapping) or any(type(key) is not str for key in policy_overrides):
+        raise BalsamControlRefusal("policy_overrides must be a string-keyed mapping")
 
     class GeneratedApplication(base):
         """Generated app whose hooks never inherit automatic reentry."""
 
+        tpen_site_name = site_name
         tpen_application_name = application_name
         tpen_deployment_digest = deployment_digest
+        tpen_source_digest = source_digest
+        tpen_policy_overrides = dict(policy_overrides)
 
         def run(self) -> int:
             """Invoke the group and turn only typed reconciliation into success."""
