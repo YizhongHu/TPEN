@@ -19,5 +19,12 @@
     "old": "if canonical_file != canonical_dir / \"model.pt\":",
     "new": "if False:  # fault: accept a model outside its directory",
     "killer": "experiments/atomistic/stage1/tests/test_eval_cli.py::test_caller_checkpoint_binding_remains_strict"
+  },
+  {
+    "id": "derived-checkpoint-containment-removed",
+    "target": "experiments/atomistic/stage1/protocol.py",
+    "old": "if not (checkpoint_dir.is_relative_to(results_root)\n                    and checkpoint_file.is_relative_to(results_root)):",
+    "new": "if False:  # fault: accept derived checkpoint paths outside the root",
+    "killer": "experiments/atomistic/stage1/tests/test_eval_cli.py::test_derived_checkpoint_escape_refused"
   }
 ]

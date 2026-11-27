@@ -143,6 +143,26 @@ def test_production_cli_roundtrip(phase1, tmp_path, symlink_root, monkeypatch):
     assert seen == [first["checkpoint_dir"]]
 
 
+@pytest.mark.parametrize("symlink_root", [False, True], ids=["direct", "alias"])
+def test_derived_checkpoint_escape_refused(phase1, tmp_path, symlink_root):
+    """Refuse a complete selected checkpoint symlinked outside the results root."""
+    if symlink_root:
+        alias = tmp_path / "results-alias"
+        os.symlink(phase1["rows"][0]["results_root"], alias, target_is_directory=True)
+        for row in phase1["rows"]:
+            row["results_root"] = str(alias)
+        phase1 = _document(phase1["rows"])
+    # Establish valid evidence before moving the complete checkpoint unchanged.
+    evidence = build_evidence(phase1)
+    step = min(int(key.split(":")[-1]) for key in evidence["checkpoints"])
+    directory = resolve_run_dir(phase1["rows"][0]) / "checkpoints" / f"step_{step:06d}"
+    outside = tmp_path / "outside-checkpoint"
+    directory.rename(outside)
+    directory.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ProtocolError, match="derived checkpoint paths must be inside"):
+        build_evidence(phase1)
+
+
 @pytest.mark.parametrize("bad_binding", ["alias", "foreign-file"])
 def test_caller_checkpoint_binding_remains_strict(phase1, tmp_path, bad_binding):
     """Reject caller aliases and a canonical model outside its bound directory."""
