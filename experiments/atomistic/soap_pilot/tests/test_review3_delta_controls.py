@@ -46,3 +46,46 @@ def test_concrete_binding_handoff_accepts_valid_supplied_packet(tmp_path):
         train.row, python='/usr/bin/python3', checkout_root=str(ROOT), packet=supplied
     )
     assert admitted.packet == supplied
+
+
+def test_packet_audit_uses_literal_driver_expectation_not_rendered_argv(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """A rendered train argv cannot redefine the literal driver policy."""
+
+    train = p3.render_r2_train_packet(
+        output_dir=tmp_path / "inputs", results_root=str(tmp_path), source_sha=SOURCE, device="cpu"
+    )["r2-soap-100"]
+    rendered = p3.render_row_packet(train.row, python="/usr/bin/python3", checkout_root=str(ROOT))
+    monkeypatch.setitem(p3.PACKET_EXPECTATIONS["argv"]["driver_by_kind"], "train", "foreign.py")
+
+    with pytest.raises(p3.P3RenderError, match="packet|argv|recipe|enumerated"):
+        p3.admit_row_and_command(
+            train.row,
+            python="/usr/bin/python3",
+            checkout_root=str(ROOT),
+            packet=rendered,
+        )
+
+
+def test_admission_without_packet_audits_the_rendered_packet(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """The implicit render path is audited even when callers omit ``packet``."""
+
+    train = p3.render_r2_train_packet(
+        output_dir=tmp_path / "inputs", results_root=str(tmp_path), source_sha=SOURCE, device="cpu"
+    )["r2-soap-100"]
+    original_render = p3.render_row_packet
+
+    def drifted_render(*args, **kwargs):
+        packet = original_render(*args, **kwargs)
+        packet["env"]["EXPECTED_QUEUE"] = "foreign-queue"
+        return packet
+
+    monkeypatch.setattr(p3, "render_row_packet", drifted_render)
+
+    with pytest.raises(p3.P3RenderError, match="packet|EXPECTED_QUEUE|recipe|enumerated"):
+        p3.admit_row_and_command(
+            train.row, python="/usr/bin/python3", checkout_root=str(ROOT)
+        )
