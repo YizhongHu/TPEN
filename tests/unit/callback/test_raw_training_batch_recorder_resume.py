@@ -146,4 +146,4 @@ def test_v3_unscheduled_step_skips_host_transfer(tmp_path: Path) -> None:
     )
     assert recorder._v3_counters == (2, 2)
     reader = TrainingHistoryReader(root)
-    assert np.array_equal(reader.read_all()["iteration_step"], np.array([0]))
+    assert np.array_equal(reader.read()["iteration_step"], np.array([0]))
