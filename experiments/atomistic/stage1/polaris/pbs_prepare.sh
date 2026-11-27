@@ -11,11 +11,15 @@
 set -Eeuo pipefail
 
 RESULTS_PREFIX="/eagle/HetRxnEnergy/rhu/"
+RESULTS_PREFIX_CANONICAL=""
 SOURCE_REPO="${SOURCE_REPO:-}"
 SOURCE_SHA="${SOURCE_SHA:-}"
 RESULTS_ROOT="${RESULTS_ROOT:-}"
 SYSTEM="${SYSTEM:-}"
 LINEAGE_SEEDS="${LINEAGE_SEEDS:-}"
+SMOKE_RESULTS_ROOT="${SMOKE_RESULTS_ROOT:-}"
+SMOKE_SELECTED_ROW="${SMOKE_SELECTED_ROW:-}"
+EVAL_PREP_PATH="${EVAL_PREP_PATH:-}"
 PYBIN="${PYBIN:-/soft/applications/conda/2025-09-25/mconda3/bin/python}"
 CHECKOUT_ROOT="${CHECKOUT_ROOT:-${RESULTS_ROOT}/checkout}"
 UV_CACHE_DIR="${UV_CACHE_DIR:-${RESULTS_ROOT}/uv-cache}"
@@ -37,10 +41,12 @@ require_value() {
 
 assert_results_path() {
   local path="$1" label="$2"
-  [[ "$path" == "$RESULTS_PREFIX"* ]] || die "$label is outside $RESULTS_PREFIX: $path"
-  [[ "$path" != "$RESULTS_PREFIX" ]] || die "$label must name a child path"
-  [[ "$path" != */../* && "$path" != ../* && "$path" != */.. ]] ||
-    die "$label contains a parent traversal: $path"
+  local canonical
+  canonical="$(realpath -m -- "$path")" || die "could not canonicalize $label: $path"
+  [[ "$canonical" != "$RESULTS_PREFIX_CANONICAL" ]] ||
+    die "$label must name a child path"
+  [[ "$canonical" == "$RESULTS_PREFIX_CANONICAL"/* ]] ||
+    die "$label is outside $RESULTS_PREFIX: $path"
 }
 
 require_value SOURCE_REPO
@@ -52,6 +58,8 @@ require_value LINEAGE_SEEDS
 [[ -z "${PBS_QUEUE:-}" || "$PBS_QUEUE" == debug ]] || die "delivered queue is not debug: ${PBS_QUEUE}"
 [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || die "SOURCE_SHA must be a full lowercase SHA"
 [[ "$SYSTEM" == he || "$SYSTEM" == h2 ]] || die "SYSTEM must be he or h2"
+RESULTS_PREFIX_CANONICAL="$(realpath -m -- "$RESULTS_PREFIX")" ||
+  die "could not canonicalize results prefix: $RESULTS_PREFIX"
 assert_results_path "$RESULTS_ROOT" RESULTS_ROOT
 assert_results_path "$CHECKOUT_ROOT" CHECKOUT_ROOT
 assert_results_path "$UV_CACHE_DIR" UV_CACHE_DIR
@@ -60,6 +68,15 @@ assert_results_path "$PHASE1_MANIFEST" PHASE1_MANIFEST
 assert_results_path "$SELECTED_ROW" SELECTED_ROW
 assert_results_path "$LAUNCH_ROOT" LAUNCH_ROOT
 assert_results_path "$WRAPPER_PATH" WRAPPER_PATH
+if [[ -n "$SMOKE_RESULTS_ROOT" || -n "$SMOKE_SELECTED_ROW" ]]; then
+  [[ -n "$SMOKE_RESULTS_ROOT" && -n "$SMOKE_SELECTED_ROW" ]] ||
+    die "SMOKE_RESULTS_ROOT and SMOKE_SELECTED_ROW must be supplied together"
+  assert_results_path "$SMOKE_RESULTS_ROOT" SMOKE_RESULTS_ROOT
+  assert_results_path "$SMOKE_SELECTED_ROW" SMOKE_SELECTED_ROW
+fi
+if [[ -n "$EVAL_PREP_PATH" ]]; then
+  assert_results_path "$EVAL_PREP_PATH" EVAL_PREP_PATH
+fi
 
 [[ ! -e "$CHECKOUT_ROOT" && ! -L "$CHECKOUT_ROOT" ]] || die "CHECKOUT_ROOT already exists: $CHECKOUT_ROOT"
 [[ ! -e "$PRIME_ENV" && ! -L "$PRIME_ENV" ]] || die "PRIME_ENV already exists: $PRIME_ENV"
@@ -67,6 +84,10 @@ mkdir -p -- "$RESULTS_ROOT"/inputs "$RESULTS_ROOT"/logs "$RESULTS_ROOT"/plan "$L
 [[ -f "$WRAPPER_PATH" ]] || die "execution wrapper is missing: $WRAPPER_PATH"
 sha256sum "$0" > "$RESULTS_ROOT/inputs/pbs_prepare.sh.sha256"
 sha256sum "$WRAPPER_PATH" > "$RESULTS_ROOT/inputs/pbs_stage1.sh.sha256"
+if [[ -n "$EVAL_PREP_PATH" ]]; then
+  [[ -f "$EVAL_PREP_PATH" ]] || die "evaluation preparation script is missing: $EVAL_PREP_PATH"
+  sha256sum "$EVAL_PREP_PATH" > "$RESULTS_ROOT/inputs/pbs_select_eval.sh.sha256"
+fi
 
 printf 'POLARIS_PREP PBS_JOBID=%s PBS_QUEUE=%s HOST=%s UTC=%s\n' \
   "${PBS_JOBID:-}" "${PBS_QUEUE:-}" "$(hostname -f 2>/dev/null || hostname)" "$(date -u +%FT%TZ)"
@@ -96,7 +117,8 @@ read -r -a lineage_seeds <<< "$LINEAGE_SEEDS"
   --lineage-seeds "${lineage_seeds[@]}"
 
 "$PYBIN" - "$PHASE1_MANIFEST" "$SELECTED_ROW" "$LAUNCH_ROOT" \
-  "$CHECKOUT_ROOT" "$PRIME_ENV/bin/python" "$SOURCE_SHA" <<'PY'
+  "$CHECKOUT_ROOT" "$PRIME_ENV/bin/python" "$SOURCE_SHA" \
+  "$SMOKE_RESULTS_ROOT" "$SMOKE_SELECTED_ROW" <<'PY'
 import hashlib
 import json
 import re
@@ -106,9 +128,12 @@ from pathlib import Path
 
 from experiments.atomistic.stage1.launch import command_for_row
 
-manifest_path, selected_path, launch_root, checkout_root, python, source_sha = map(Path, sys.argv[1:])
+manifest_path, selected_path, launch_root, checkout_root, python, source_sha = map(Path, sys.argv[1:7])
+smoke_results_root_arg, smoke_selected_arg = sys.argv[7:9]
 python = str(python)
 source_sha = str(source_sha)
+if bool(smoke_results_root_arg) != bool(smoke_selected_arg):
+    raise SystemExit("SMOKE_RESULTS_ROOT and SMOKE_SELECTED_ROW must be supplied together")
 document = json.loads(manifest_path.read_text(encoding="utf-8"))
 rows = document.get("rows")
 if not isinstance(rows, list):
@@ -120,6 +145,21 @@ if any(row.get("source_sha") != source_sha for row in train_rows):
     raise SystemExit("phase-1 row source_sha does not match SOURCE_SHA")
 launch_root.mkdir(parents=True, exist_ok=True)
 selected_path.write_text(json.dumps(train_rows[0], sort_keys=True, indent=2) + "\n", encoding="utf-8")
+if smoke_results_root_arg:
+    from experiments.atomistic.stage1.protocol import derive_smoke_request
+
+    smoke_results_root = Path(smoke_results_root_arg)
+    smoke_selected_path = Path(smoke_selected_arg)
+    smoke_request = derive_smoke_request(
+        train_rows[0], results_root=str(smoke_results_root), stop_at=50_000
+    )
+    smoke_bytes = json.dumps(smoke_request, sort_keys=True, indent=2).encode() + b"\n"
+    smoke_selected_path.parent.mkdir(parents=True, exist_ok=True)
+    smoke_selected_path.write_bytes(smoke_bytes)
+    (smoke_selected_path.parent / (smoke_selected_path.name + ".sha256")).write_text(
+        f"{hashlib.sha256(smoke_bytes).hexdigest()}  {smoke_selected_path.name}\n",
+        encoding="utf-8",
+    )
 receipt_rows = []
 for row in train_rows:
     row_id = row.get("row_id")

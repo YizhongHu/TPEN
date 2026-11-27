@@ -2,8 +2,9 @@
 
 This is the optional direct PBS route for the He and H2 Stage-1 rows.  It is
 independent of the Cannon runbooks and does not authorize a science
-allocation.  The implementation is the pair
+allocation.  The implementation is the three scripts
 `experiments/atomistic/stage1/polaris/pbs_prepare.sh` and
+`experiments/atomistic/stage1/polaris/pbs_select_eval.sh` and
 `experiments/atomistic/stage1/polaris/pbs_stage1.sh`.  One short debug
 preparation job owns source checkout, uv cache priming, and row rendering;
 later submissions use the complete execution wrapper with an explicit mode.
@@ -64,15 +65,17 @@ SYSTEM=he                         # repeat the complete sequence with h2
 RESULTS_ROOT=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>
 WRAPPER=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/inputs/pbs_stage1.sh
 PREP_SCRIPT=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/inputs/pbs_prepare.sh
+EVAL_PREP_SCRIPT=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/inputs/pbs_select_eval.sh
 CHECKOUT_ROOT=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/checkout
 UV_CACHE_DIR=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/uv-cache
+PRIME_ENV=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/prime-env
 PYBIN=/soft/applications/conda/2025-09-25/mconda3/bin/python
 ```
 
 The run root must be created before any `qsub` so PBS can open its `-o` and
 `-e` files.  Assert it is below `/eagle/HetRxnEnergy/rhu/`, create `logs/`,
-`plan/`, `launch/`, and `inputs/`, copy both scripts there, and record both
-SHA-256 values.  Do not copy a git tree with `cp -a` from `/home` to Eagle;
+`plan/`, `launch/`, and `inputs/`, copy the three scripts there, and record
+their SHA-256 values.  Do not copy a git tree with `cp -a` from `/home` to Eagle;
 the current Polaris note records that this fails while preserving ownership.
 
 The login node does not clone, run Python, or invoke uv.  Submit exactly one
@@ -86,11 +89,12 @@ the Eagle results root:
 mkdir -p "$RESULTS_ROOT"/{inputs,logs,plan}
 scp -p experiments/atomistic/stage1/polaris/pbs_stage1.sh "$WRAPPER"
 scp -p experiments/atomistic/stage1/polaris/pbs_prepare.sh "$PREP_SCRIPT"
+scp -p experiments/atomistic/stage1/polaris/pbs_select_eval.sh "$EVAL_PREP_SCRIPT"
 PREP_JOB_ID="$(qsub -N "stage1-prep-${SYSTEM}-${SOURCE_SHA:0:8}" \
   -A HetRxnEnergy -q debug \
   -l select=1:system=polaris:ncpus=4,walltime=00:20:00,filesystems=home:eagle,place=scatter \
   -o "$RESULTS_ROOT/logs/prep.pbs.out" -e "$RESULTS_ROOT/logs/prep.pbs.err" \
-  -v SOURCE_REPO="$SOURCE_REPO",SOURCE_SHA="$SOURCE_SHA",RESULTS_ROOT="$RESULTS_ROOT",SYSTEM="$SYSTEM",LINEAGE_SEEDS="1:2:3",PYBIN="$PYBIN",WRAPPER_PATH="$WRAPPER" \
+  -v SOURCE_REPO="$SOURCE_REPO",SOURCE_SHA="$SOURCE_SHA",RESULTS_ROOT="$RESULTS_ROOT",SYSTEM="$SYSTEM",LINEAGE_SEEDS="1:2:3",PYBIN="$PYBIN",WRAPPER_PATH="$WRAPPER",EVAL_PREP_PATH="$EVAL_PREP_SCRIPT",SMOKE_RESULTS_ROOT="$RESULTS_ROOT/ramp-up-r1",SMOKE_SELECTED_ROW="$RESULTS_ROOT/ramp-up-r1/plan/selected-train.json" \
   "$PREP_SCRIPT")"
 printf 'submitted prep job %s\n' "$PREP_JOB_ID"
 qstat -xf "$PREP_JOB_ID"
@@ -145,8 +149,9 @@ wrapper logs, row status files, rendered command receipts, and every failure.
 
 Planning and full roster/grid reconciliation remain S0-B/S1-RC-owned.  The
 preparation job writes `plan/phase1-manifest.json`, the exact first
-`plan/selected-train.json`, one JSON file per train row under `launch/`, and a
-`launch/render-receipt.json`.  Inspect those named files only; do not recreate
+`plan/selected-train.json`, the bounded `ramp-up-r1/plan/selected-train.json`
+and its hash, one JSON file per train row under `launch/`, and a
+`launch/render-receipt.json`, and the three input-script hashes.  Inspect those named files only; do not recreate
 or edit rows on the login node.  The same row shape is used for an unbounded
 route and for a bounded qualification; only the latter adds the
 already-approved `execution.stop_at` datum in its separate request file.
@@ -174,24 +179,7 @@ only to the approved selected row and run root.
 ```bash
 SMOKE_RESULTS_ROOT="$RESULTS_ROOT/ramp-up-r1"
 SMOKE_SELECTED_ROW="$SMOKE_RESULTS_ROOT/plan/selected-train.json"
-mkdir -p "$SMOKE_RESULTS_ROOT"/plan "$SMOKE_RESULTS_ROOT"/logs
-test -d "$SMOKE_RESULTS_ROOT/plan" -a -d "$SMOKE_RESULTS_ROOT/logs" || {
-  echo "bounded PBS output directories are not ready" >&2
-  exit 2
-}
-"$PYBIN" - "$RESULTS_ROOT/plan/selected-train.json" "$SMOKE_SELECTED_ROW" "$SMOKE_RESULTS_ROOT" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-from experiments.atomistic.stage1.protocol import derive_smoke_request
-
-source, target, results_root = map(Path, sys.argv[1:])
-row = json.loads(source.read_text(encoding="utf-8"))
-request = derive_smoke_request(row, results_root=str(results_root), stop_at=50_000)
-target.write_text(json.dumps(request, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-PY
-sha256sum "$SMOKE_SELECTED_ROW" > "$SMOKE_SELECTED_ROW.sha256"
+ls -l "$SMOKE_SELECTED_ROW" "$SMOKE_SELECTED_ROW.sha256"
 APPROVAL_ID="${MANAGER_RELAYED_APPROVAL_ID:-}"
 : "${APPROVAL_ID:?APPROVAL_ID must be set from the explicit manager-relayed value}"
 qsub -A HetRxnEnergy -q debug-scaling \
@@ -256,14 +244,27 @@ approved eval row in the same way.  This is a subset consumer only; it does not
 replace the full roster/grid reconciliation.
 
 ```bash
-"$PYBIN" -m experiments.atomistic.stage1.select_eval \
-  --manifest "$RESULTS_ROOT/plan/phase2-manifest.json" \
-  --system he --lineage 0 --checkpoint 100000 --stream 0 \
-  --output "$RESULTS_ROOT/plan/selected-eval.json" || exit 1
+EVAL_SELECTED_ROW="$RESULTS_ROOT/plan/selected-eval.json"
+EVAL_JOB_ID="$(qsub -N "stage1-eval-prep-${SYSTEM}-${SOURCE_SHA:0:8}" \
+  -A HetRxnEnergy -q debug \
+  -l select=1:system=polaris:ncpus=4,walltime=00:10:00,filesystems=home:eagle,place=scatter \
+  -o "$RESULTS_ROOT/logs/eval-prep.pbs.out" -e "$RESULTS_ROOT/logs/eval-prep.pbs.err" \
+  -v SOURCE_SHA="$SOURCE_SHA",RESULTS_ROOT="$RESULTS_ROOT",SYSTEM="$SYSTEM",CHECKOUT_ROOT="$CHECKOUT_ROOT",PRIME_ENV="$PRIME_ENV",PHASE2_MANIFEST="$RESULTS_ROOT/plan/phase2-manifest.json",SELECTED_EVAL="$EVAL_SELECTED_ROW" \
+  "$EVAL_PREP_SCRIPT")"
+printf 'submitted eval-prep job %s\n' "$EVAL_JOB_ID"
+qstat -xf "$EVAL_JOB_ID"
+ls -l "$EVAL_SELECTED_ROW" "$EVAL_SELECTED_ROW.sha256"
+```
+
+The eval-prep allocation runs the selection command against the frozen phase-2
+manifest and records the selected-row hash.  The login node only submits and
+inspects its named outputs.
+
+```bash
 qsub -A HetRxnEnergy -q debug \
   -l select=1:system=polaris:ngpus=4:ncpus=64,walltime=00:55:00,filesystems=home:eagle,place=scatter \
   -o "$RESULTS_ROOT/logs/eval.pbs.out" -e "$RESULTS_ROOT/logs/eval.pbs.err" \
-  -v MODE=eval,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",SELECTED_ROW="$RESULTS_ROOT/plan/selected-eval.json",APPROVAL_ID="$APPROVAL_ID" \
+  -v MODE=eval,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",SELECTED_ROW="$EVAL_SELECTED_ROW",APPROVAL_ID="$APPROVAL_ID" \
   "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 ```
 
