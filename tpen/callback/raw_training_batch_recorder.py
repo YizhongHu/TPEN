@@ -1473,7 +1473,10 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
             walker_index=np.arange(len(local_energy), dtype=np.int64),
             positions=positions,
             local_energy=local_energy,
-            term_energies={name: value.detach().cpu().numpy().reshape(-1) for name, value in state.local_energy_terms.items()},
+            term_energies={
+                name: state.local_energy_terms[name].detach().cpu().numpy().reshape(-1)
+                for name in sorted(state.local_energy_terms)
+            },
             logabs=output.logabs.detach().cpu().numpy().reshape(-1),
             sign=output.sign.detach().cpu().numpy().reshape(-1),
             finite=(

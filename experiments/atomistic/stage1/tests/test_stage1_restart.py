@@ -1000,9 +1000,10 @@ def test_stage1_execute_train_v3_recorder_same_run_dir_continuation(
     monkeypatch.setattr(restart, "validate_resolved_train_config", lambda *_a, **_k: None)
 
     def _stage1_v3_cfg(row: dict[str, object]):
-        run_dir = resolve_run_dir(row)
-        cfg = _public_cfg(run_dir.parent, run_dir.name, max_steps=4)
-        cfg.run.layout = "flat"
+        cfg = _public_cfg(Path(str(row["results_root"])), str(row["run_id"]), max_steps=4)
+        cfg.run.layout = "nested"
+        cfg.run.experiment_name = str(row["experiment_name"])
+        cfg.run.sector = str(row["sector"])
         cfg.trainer.return_terms = True
         cfg.callbacks.append({
             "_target_": "tpen.callback.RawTrainingBatchRecorder",
@@ -1016,6 +1017,8 @@ def test_stage1_execute_train_v3_recorder_same_run_dir_continuation(
     whole_row: dict[str, object] = {
         "row_id": "whole",
         "run_id": "whole",
+        "experiment_name": "stage1-v3",
+        "sector": "test",
         "results_root": str(tmp_path / "whole-root"),
         "target_iterations": 4,
     }
@@ -1028,6 +1031,8 @@ def test_stage1_execute_train_v3_recorder_same_run_dir_continuation(
     seg_row: dict[str, object] = {
         "row_id": "seg",
         "run_id": "seg",
+        "experiment_name": "stage1-v3",
+        "sector": "test",
         "results_root": str(seg_root),
         "target_iterations": 4,
         "stop_at": 2,
