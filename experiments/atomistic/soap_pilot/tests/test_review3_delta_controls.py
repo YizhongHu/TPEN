@@ -1,12 +1,59 @@
 """Independent literal-recipe and concrete-binding delta probes."""
 from copy import deepcopy
+import hashlib
+import json
 from pathlib import Path
+import subprocess
+import sys
 import pytest
 from experiments.atomistic.soap_pilot import composer, p3_render as p3
 from experiments.atomistic.soap_pilot.approved_recipes import APPROVED_RECIPES
+from experiments.atomistic.stage1.launch import command_for_row
 
 SOURCE = '7b88f833babcb82148c8f975a08b53970838be6a'
 ROOT = Path(__file__).resolve().parents[4]
+
+
+def _execution_state(tmp_path: Path, *, kind: str = "train") -> dict[str, str]:
+    cache = tmp_path / "uv-cache"
+    cache.mkdir(exist_ok=True)
+    return {
+        "UV_CACHE_DIR": str(cache),
+        "APPROVAL_ID": "soap-review-approval",
+        "EXPECTED_QUEUE": "capacity" if kind == "train" else "debug",
+    }
+
+
+def _caller_packet(row, *, state: dict[str, str], python: str) -> dict[str, object]:
+    """Build a concrete packet as a caller, not by copying P3's result."""
+
+    root = Path(row["results_root"]).resolve()
+    run_dir = root / row["experiment_name"] / row["sector"] / row["run_id"]
+    snapshot = root / "inputs" / f"row-{row['row_id']}.json"
+    payload = json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    snapshot.write_bytes(payload)
+    return {
+        "env": {
+            "MODE": row["kind"],
+            "SOURCE_SHA": row["source_sha"],
+            "CHECKOUT_ROOT": str(ROOT.resolve()),
+            "UV_CACHE_DIR": state["UV_CACHE_DIR"],
+            "RESULTS_ROOT": str(root),
+            "SELECTED_ROW": str(snapshot),
+            "APPROVAL_ID": state["APPROVAL_ID"],
+            "EXPECTED_QUEUE": state["EXPECTED_QUEUE"],
+        },
+        "argv": command_for_row(row, python=python, checkout_root=str(ROOT)),
+        "selected_row_sha256": hashlib.sha256(payload).hexdigest(),
+        "output": {
+            "run_dir": str(run_dir),
+            "inputs": str(root / "inputs"),
+            "checkpoint_dir": str(run_dir / "checkpoints"),
+            "log": str(root / "logs" / f"row-{row['row_id']}-${{PBS_JOBID}}.log"),
+            "status": str(root / "logs" / f"row-{row['row_id']}-${{PBS_JOBID}}.status"),
+        },
+    }
 
 @pytest.mark.parametrize('profile', (*composer.R2_PROFILES, *composer.TARGET_PROFILES), ids=lambda p: p.name)
 def test_literal_train_matches_composer(profile):
@@ -21,31 +68,74 @@ def test_literal_eval_matches_composer():
     assert p3.recipe_diff(APPROVED_RECIPES['eval-soap-100']['config'], actual) == {}
 
 
-@pytest.mark.parametrize('field', ['env', 'argv', 'destination'])
+@pytest.mark.parametrize('field', ['row_file', 'env', 'argv', 'destination', 'placeholder'])
 def test_concrete_binding_handoff_refuses_foreign_state(tmp_path, field):
     """A supplied packet must match independent row-bound expectations."""
     train = p3.render_r2_train_packet(output_dir=tmp_path/'inputs', results_root=str(tmp_path), source_sha=SOURCE, device='cpu')['r2-soap-100']
-    admitted = p3.admit_row_and_command(train.row, python='/usr/bin/python3', checkout_root=str(ROOT))
+    state = _execution_state(tmp_path)
+    admitted = p3.admit_row_and_command(
+        train.row, python='/usr/bin/python3', checkout_root=str(ROOT),
+        execution_state=state,
+    )
     supplied = deepcopy(admitted.packet)
-    if field == 'env':
+    if field == 'row_file':
+        supplied['env']['SELECTED_ROW'] = str(tmp_path / 'inputs' / 'foreign-row.json')
+    elif field == 'env':
         supplied['env']['SOURCE_SHA'] = '0' * 40
     elif field == 'argv':
         supplied['argv'] = '/usr/bin/python3 /foreign/driver.py --unapproved'
-    else:
+    elif field == 'destination':
         supplied['output']['run_dir'] = str(tmp_path/'foreign')
+    else:
+        supplied['env']['UV_CACHE_DIR'] = '<UV_CACHE_DIR>'
     with pytest.raises(p3.P3RenderError, match='binding|packet|argv|env|output'):
-        p3.admit_row_and_command(train.row, python='/usr/bin/python3', checkout_root=str(ROOT), packet=supplied)
+        p3.admit_row_and_command(
+            train.row, python='/usr/bin/python3', checkout_root=str(ROOT),
+            packet=supplied, execution_state=state,
+        )
 
 
 def test_concrete_binding_handoff_accepts_valid_supplied_packet(tmp_path):
-    """A valid caller-supplied packet is audited and returned to the caller."""
+    """A concrete caller packet with real PBS values is admitted."""
     train = p3.render_r2_train_packet(output_dir=tmp_path/'inputs', results_root=str(tmp_path), source_sha=SOURCE, device='cpu')['r2-soap-100']
-    rendered = p3.admit_row_and_command(train.row, python='/usr/bin/python3', checkout_root=str(ROOT))
-    supplied = deepcopy(rendered.packet)
+    state = _execution_state(tmp_path)
+    supplied = _caller_packet(train.row, state=state, python='/usr/bin/python3')
     admitted = p3.admit_row_and_command(
-        train.row, python='/usr/bin/python3', checkout_root=str(ROOT), packet=supplied
+        train.row, python='/usr/bin/python3', checkout_root=str(ROOT), packet=supplied,
+        execution_state=state,
     )
     assert admitted.packet == supplied
+
+
+def test_concrete_packet_passes_wrapper_selected_row_and_approval_predicates(tmp_path):
+    """The same concrete packet passes the wrapper's read-only shell checks."""
+    train = p3.render_r2_train_packet(
+        output_dir=tmp_path / "inputs", results_root=str(tmp_path),
+        source_sha=SOURCE, device="cuda",
+    )["r2-soap-100"]
+    state = _execution_state(tmp_path)
+    supplied = _caller_packet(train.row, state=state, python=sys.executable)
+    admitted = p3.admit_row_and_command(
+        train.row, python=sys.executable, checkout_root=str(ROOT),
+        packet=supplied, execution_state=state,
+    )
+    assert admitted.packet == supplied
+    wrapper = ROOT / "experiments/atomistic/stage1/polaris/pbs_stage1.sh"
+    functions = "\n".join(wrapper.read_text(encoding="utf-8").splitlines()[37:232])
+    env = {
+        "USER": "p3-test",
+        "PYBIN": sys.executable,
+        "MODE": "train",
+        "SOURCE_SHA": train.row["source_sha"],
+        "RESULTS_ROOT": train.row["results_root"],
+        "SELECTED_ROW": supplied["env"]["SELECTED_ROW"],
+        "APPROVAL_ID": state["APPROVAL_ID"],
+    }
+    result = subprocess.run(
+        ["bash", "-c", "source /dev/stdin; validate_selected_row \"$SELECTED_ROW\" \"$MODE\"; require_approval_or_die"],
+        input=functions, text=True, capture_output=True, env=env, check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_packet_audit_uses_literal_mode_expectation_not_rendered_packet(
@@ -56,7 +146,10 @@ def test_packet_audit_uses_literal_mode_expectation_not_rendered_packet(
     train = p3.render_r2_train_packet(
         output_dir=tmp_path / "inputs", results_root=str(tmp_path), source_sha=SOURCE, device="cpu"
     )["r2-soap-100"]
-    rendered = p3.render_row_packet(train.row, python="/usr/bin/python3", checkout_root=str(ROOT))
+    rendered = p3.render_row_packet(
+        train.row, python="/usr/bin/python3", checkout_root=str(ROOT),
+        execution_state=_execution_state(tmp_path),
+    )
     monkeypatch.setitem(p3.PACKET_EXPECTATIONS["env"]["MODE_BY_KIND"], "train", "foreign-mode")
 
     with pytest.raises(p3.P3RenderError, match="packet|argv|recipe|enumerated"):
@@ -64,7 +157,7 @@ def test_packet_audit_uses_literal_mode_expectation_not_rendered_packet(
             train.row,
             python="/usr/bin/python3",
             checkout_root=str(ROOT),
-            packet=rendered,
+            packet=rendered, execution_state=_execution_state(tmp_path),
         )
 
 
@@ -76,6 +169,7 @@ def test_admission_without_packet_audits_the_rendered_packet(
     train = p3.render_r2_train_packet(
         output_dir=tmp_path / "inputs", results_root=str(tmp_path), source_sha=SOURCE, device="cpu"
     )["r2-soap-100"]
+    state = _execution_state(tmp_path)
     original_render = p3.render_row_packet
 
     def drifted_render(*args, **kwargs):
@@ -87,5 +181,6 @@ def test_admission_without_packet_audits_the_rendered_packet(
 
     with pytest.raises(p3.P3RenderError, match="packet|EXPECTED_QUEUE|recipe|enumerated"):
         p3.admit_row_and_command(
-            train.row, python="/usr/bin/python3", checkout_root=str(ROOT)
+            train.row, python="/usr/bin/python3", checkout_root=str(ROOT),
+            execution_state=state,
         )

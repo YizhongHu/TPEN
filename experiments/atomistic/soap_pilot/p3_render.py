@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 from pathlib import Path
 import re
 import sys
@@ -44,6 +45,7 @@ from .rows import (
     RowContractError,
     make_eval_row,
     make_parent_join,
+    row_id,
     validate_row,
 )
 
@@ -52,6 +54,10 @@ _HOOKE2_PHYSICAL_SYSTEM_ID = planned_physical_system_ids()["hooke2"]
 _PBS_STAGE1_SHA256 = "52c83a78a5f65b3b6af929ff3b524fa06ccca00baf1f76ddff669d6e202acebc"
 _PBS_STAGE1_PIN_COMMIT = "8857d9ea3119b195684fa0cb69beaaebb676dd6c"
 _MISSING = object()
+_EXECUTION_STATE_KEYS = frozenset({"UV_CACHE_DIR", "APPROVAL_ID", "EXPECTED_QUEUE"})
+_SAFE_APPROVAL = re.compile(r"^[A-Za-z0-9._:/-]+$")
+_SAFE_QUEUE = re.compile(r"^[A-Za-z0-9._-]+$")
+_PLACEHOLDER = re.compile(r"<[^>]+>")
 
 
 class P3RenderError(ValueError):
@@ -84,6 +90,7 @@ class EvalTemplate:
 def admit_row_and_command(
     row: Mapping[str, Any], *, python: str, checkout_root: str,
     packet: Mapping[str, Any] | None = None,
+    execution_state: Mapping[str, str] | None = None,
 ) -> AdmittedCommand:
     """Admit one materialized row through the real Stage-1 gateway.
 
@@ -96,12 +103,16 @@ def admit_row_and_command(
         config_path = Path(row["row_extension"]["rendered_config"]["path"])
         rendered_values = yaml.safe_load(config_path.read_bytes())
         supplied_packet = (
-            render_row_packet(row, python=python, checkout_root=checkout_root)
+            render_row_packet(
+                row, python=python, checkout_root=checkout_root,
+                execution_state=execution_state,
+            )
             if packet is None else packet
         )
         _audit_packet_recipe(
             row, rendered_values, packet=supplied_packet,
             python=python, checkout_root=checkout_root,
+            execution_state=execution_state,
         )
         admitted = validate_gateway_binding(
             binding=_binding_token(row), expected_kinds={row["kind"]},
@@ -118,22 +129,28 @@ def admit_row_and_command(
 
 def render_row_packet(
     row: Mapping[str, Any], *, python: str, checkout_root: str,
+    execution_state: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Render the concrete packet handed to the P3 admission boundary.
+    """Render a concrete packet, or an explicitly non-admissible template.
 
     The command portion is owned by Stage-1 ``command_for_row``.  The packet
     remains a concrete returned object so callers can supply it to admission
     and receive the audited object back, rather than relying on a discarded
-    private binding local.
+    private binding local.  Omit ``execution_state`` only to obtain a template;
+    its unresolved markers cannot pass admission.
     """
 
     command = command_for_row(row, python=python, checkout_root=checkout_root)
-    return dict(_runner_bindings(row, command=command, checkout_root=checkout_root))
+    return dict(_runner_bindings(
+        row, command=command, checkout_root=checkout_root,
+        execution_state=execution_state,
+    ))
 
 
 def render_r2_train_packet(
     *, output_dir: str | Path, results_root: str, source_sha: str,
     device: str = "cuda", profiles: tuple[PilotProfile, ...] = R2_PROFILES,
+    execution_state: Mapping[str, str] | None = None,
 ) -> dict[str, ComposedRow]:
     """Render the four singleton R2 train rows with unique run identities."""
 
@@ -150,15 +167,18 @@ def render_r2_train_packet(
     for profile in profiles:
         composed = packet[profile.name]
         _audit_packet_recipe(
-            composed.row,
-            composed.rendered.values,
+            composed.row, composed.rendered.values,
             packet=render_row_packet(
                 composed.row,
                 python=sys.executable,
                 checkout_root=str(Path(__file__).resolve().parents[3]),
+                execution_state=execution_state,
             ),
             python=sys.executable,
             checkout_root=str(Path(__file__).resolve().parents[3]),
+            execution_state=execution_state,
+        ) if execution_state is not None else _audit_row_recipe(
+            composed.row, composed.rendered.values,
         )
     rows = [entry.row for entry in packet.values()]
     if len({row["run_id"] for row in rows}) != len(rows):
@@ -356,11 +376,26 @@ def render_pbs_audit() -> dict[str, Any]:
         name: quote_checks(name, needles)
         for name, needles in {
             "assert_contained_path": ("if ! canonical=", "canonical.relative_to(root.resolve())"),
-            "validate_selected_row": ("if row.get(\"kind\") != kind", "if row.get(\"source_sha\") != source_sha", "row results_root is outside wrapper RESULTS_ROOT"),
+            "validate_selected_row": ("row = json.loads(selected_path.read_text", "if not isinstance(row, dict) or \"rows\" in row", "if row.get(\"kind\") != kind", "if row.get(\"source_sha\") != source_sha", "row results_root is outside wrapper RESULTS_ROOT"),
             "assert_pbs_context": ("require_value PBS_JOBID", "require_value PBS_QUEUE", "require_value EXPECTED_QUEUE", '[[ "$PBS_QUEUE" == "$EXPECTED_QUEUE" ]]'),
             "guard_gpus": ('[[ "${#gpu_lines[@]}" == 4 ]]', 'CUDA_VISIBLE_DEVICES="$i"', '[[ "$count" == 1 ]]'),
             "derive_cpu_layout": ('[[ "${#layout_lines[@]}" == 3 ]]', 'LINEAGE_CPU_SETS[$lineage]="$cpu_set"', 'LINEAGE_CORE_COUNTS[$lineage]="$core_count"'),
         }.items()
+    }
+    execution_state = {
+        "cache": quote_checks("prepare_job", (
+            "require_value UV_CACHE_DIR",
+            '[[ -d "$UV_CACHE_DIR" ]] || die',
+            "cache.relative_to(boot)",
+        )),
+        "approval": quote_checks("require_approval_or_die", (
+            "require_value APPROVAL_ID",
+            '[[ "$APPROVAL_ID" =~ [^A-Za-z0-9._:/-] ]]',
+        )),
+        "queue": quote_checks("assert_pbs_context", (
+            "require_value EXPECTED_QUEUE",
+            '[[ "$PBS_QUEUE" == "$EXPECTED_QUEUE" ]]',
+        )),
     }
     evidence = {**guards, "admit_selected_row": admission, "run_command_for_row": command, "run_mode": output}
     return {
@@ -376,6 +411,7 @@ def render_pbs_audit() -> dict[str, Any]:
         "status": output["checks"][1],
         "lr4_guards": tuple(guards),
         "guard_evidence": evidence,
+        "execution_state_evidence": execution_state,
     }
 
 
@@ -473,23 +509,51 @@ def _profile_for_row(row: Mapping[str, Any], config: Mapping[str, Any]) -> str |
 
 def _runner_bindings(
     row: Mapping[str, Any], *, command: str, checkout_root: str,
+    execution_state: Mapping[str, str] | None = None,
 ) -> Mapping[str, Any]:
     """Return the concrete env/argv/output binding audited for one row."""
 
     results_root = str(Path(row["results_root"]).resolve())
     run_dir = Path(results_root) / row["experiment_name"] / row["sector"] / row["run_id"]
+    if execution_state is None:
+        # A template is intentionally distinct from an admissible packet.  It
+        # carries unresolved markers and can never pass ``admit_row_and_command``.
+        return {
+            "packet_type": "template",
+            "env": {
+                "MODE": row["kind"],
+                "SOURCE_SHA": row["source_sha"],
+                "CHECKOUT_ROOT": str(Path(checkout_root).resolve()),
+                "UV_CACHE_DIR": "<UV_CACHE_DIR>",
+                "RESULTS_ROOT": results_root,
+                "SELECTED_ROW": "<SELECTED_ROW_SNAPSHOT>",
+                "APPROVAL_ID": "<APPROVAL_ID>",
+                "EXPECTED_QUEUE": "<EXPECTED_QUEUE>",
+            },
+            "argv": command,
+            "output": {
+                "run_dir": str(run_dir),
+                "inputs": str(Path(results_root) / "inputs"),
+                "checkpoint_dir": str(run_dir / "checkpoints"),
+                "log": str(Path(results_root) / PACKET_EXPECTATIONS["output"]["log_template"].format(row_id=row["row_id"])),
+                "status": str(Path(results_root) / PACKET_EXPECTATIONS["output"]["status_template"].format(row_id=row["row_id"])),
+            },
+        }
+    state = _validate_execution_state(row["kind"], execution_state)
+    snapshot_path, snapshot_sha256 = _materialize_selected_row_snapshot(row)
     return {
         "env": {
             "MODE": row["kind"],
             "SOURCE_SHA": row["source_sha"],
             "CHECKOUT_ROOT": str(Path(checkout_root).resolve()),
-            "UV_CACHE_DIR": PACKET_EXPECTATIONS["env"]["UV_CACHE_DIR"],
+            "UV_CACHE_DIR": state["UV_CACHE_DIR"],
             "RESULTS_ROOT": results_root,
-            "SELECTED_ROW": row["row_id"],
-            "APPROVAL_ID": PACKET_EXPECTATIONS["env"]["APPROVAL_ID"],
-            "EXPECTED_QUEUE": PACKET_EXPECTATIONS["env"]["EXPECTED_QUEUE"],
+            "SELECTED_ROW": str(snapshot_path),
+            "APPROVAL_ID": state["APPROVAL_ID"],
+            "EXPECTED_QUEUE": state["EXPECTED_QUEUE"],
         },
         "argv": command,
+        "selected_row_sha256": snapshot_sha256,
         "output": {
             "run_dir": str(run_dir),
             "inputs": str(Path(results_root) / "inputs"),
@@ -500,10 +564,15 @@ def _runner_bindings(
     }
 
 
-def _expected_packet(row: Mapping[str, Any], *, python: str, checkout_root: str) -> dict[str, Any]:
+def _expected_packet(
+    row: Mapping[str, Any], *, python: str, checkout_root: str,
+    execution_state: Mapping[str, str],
+) -> dict[str, Any]:
     """Build independent row-bound packet expectations from literal policy."""
 
     policy = PACKET_EXPECTATIONS
+    state = _validate_execution_state(row["kind"], execution_state)
+    snapshot_path, snapshot_sha256 = _materialize_selected_row_snapshot(row)
     results_root = str(Path(row["results_root"]).resolve())
     run_dir = Path(results_root) / row["experiment_name"] / row["sector"] / row["run_id"]
     kind = row.get("kind")
@@ -518,13 +587,14 @@ def _expected_packet(row: Mapping[str, Any], *, python: str, checkout_root: str)
             "MODE": mode,
             "SOURCE_SHA": row["source_sha"],
             "CHECKOUT_ROOT": str(Path(checkout_root).resolve()),
-            "UV_CACHE_DIR": policy["env"]["UV_CACHE_DIR"],
+            "UV_CACHE_DIR": state["UV_CACHE_DIR"],
             "RESULTS_ROOT": results_root,
-            "SELECTED_ROW": row["row_id"],
-            "APPROVAL_ID": policy["env"]["APPROVAL_ID"],
-            "EXPECTED_QUEUE": policy["env"]["EXPECTED_QUEUE"],
+            "SELECTED_ROW": str(snapshot_path),
+            "APPROVAL_ID": state["APPROVAL_ID"],
+            "EXPECTED_QUEUE": state["EXPECTED_QUEUE"],
         },
         "argv": expected_argv,
+        "selected_row_sha256": snapshot_sha256,
         "output": {
             "run_dir": str(run_dir),
             "inputs": str(Path(results_root) / "inputs"),
@@ -538,8 +608,31 @@ def _expected_packet(row: Mapping[str, Any], *, python: str, checkout_root: str)
 def _audit_packet_recipe(
     row: Mapping[str, Any], config: Mapping[str, Any], *, packet: Mapping[str, Any],
     python: str, checkout_root: str,
+    execution_state: Mapping[str, str] | None,
 ) -> Mapping[str, Any]:
     """Gate a rendered packet against the frozen recipe and concrete bindings."""
+
+    recipe_name, recipe = _audit_row_recipe(row, config)
+    if execution_state is None:
+        raise P3RenderError("concrete packet requires caller-supplied execution state")
+    _reject_placeholders(packet)
+    expected_packet = _expected_packet(
+        row, python=python, checkout_root=checkout_root,
+        execution_state=execution_state,
+    )
+    fail_closed_recipe_diff(expected_packet, packet)
+    binding = recipe["binding"]
+    if Path(row["row_extension"]["rendered_config"]["path"]).name != binding["input_name"]:
+        raise P3RenderError("rendered packet input destination is not the approved row output")
+    if binding["mode"] != expected_packet["env"]["MODE"] or binding["script"] != PACKET_EXPECTATIONS["argv"]["driver_by_kind"][row["kind"]]:
+        raise P3RenderError("literal packet binding disagrees with row kind")
+    return packet
+
+
+def _audit_row_recipe(
+    row: Mapping[str, Any], config: Mapping[str, Any],
+) -> tuple[str, Mapping[str, Any]]:
+    """Audit the immutable config recipe before checking concrete bindings."""
 
     recipe_name = _profile_for_row(row, config)
     if recipe_name is None:
@@ -551,20 +644,81 @@ def _audit_packet_recipe(
     normalized = _normalise_recipe(
         config, results_root=row["results_root"], run_id=row["run_id"], parent_run_dir=parent_run_dir
     )
-    expected = recipe["config"]
     fail_closed_recipe_diff(
-        expected,
-        normalized,
-        allowed_paths=set(recipe["allowed_paths"]),
+        recipe["config"], normalized, allowed_paths=set(recipe["allowed_paths"]),
     )
-    expected_packet = _expected_packet(row, python=python, checkout_root=checkout_root)
-    fail_closed_recipe_diff(expected_packet, packet)
-    binding = recipe["binding"]
-    if Path(row["row_extension"]["rendered_config"]["path"]).name != binding["input_name"]:
-        raise P3RenderError("rendered packet input destination is not the approved row output")
-    if binding["mode"] != expected_packet["env"]["MODE"] or binding["script"] != PACKET_EXPECTATIONS["argv"]["driver_by_kind"][row["kind"]]:
-        raise P3RenderError("literal packet binding disagrees with row kind")
-    return packet
+    return recipe_name, recipe
+
+
+def _validate_execution_state(
+    kind: str, execution_state: Mapping[str, str],
+) -> dict[str, str]:
+    """Validate caller-owned PBS values using the unchanged wrapper predicates."""
+
+    if not isinstance(execution_state, Mapping) or set(execution_state) != _EXECUTION_STATE_KEYS:
+        raise P3RenderError(
+            "execution_state must contain exactly UV_CACHE_DIR, APPROVAL_ID, EXPECTED_QUEUE"
+        )
+    state = {key: execution_state[key] for key in _EXECUTION_STATE_KEYS}
+    if any(not isinstance(value, str) or _PLACEHOLDER.search(value) for value in state.values()):
+        raise P3RenderError("concrete execution state cannot contain unresolved placeholders")
+    cache = Path(state["UV_CACHE_DIR"])
+    if not cache.is_absolute() or not cache.is_dir():
+        raise P3RenderError(
+            "UV_CACHE_DIR must be an existing absolute directory "
+            "(pbs_stage1.sh:465,477)"
+        )
+    approval = state["APPROVAL_ID"]
+    if not approval or _SAFE_APPROVAL.fullmatch(approval) is None:
+        raise P3RenderError(
+            "APPROVAL_ID must be non-empty and shell-safe "
+            "(pbs_stage1.sh:228-230)"
+        )
+    expected_queue = state["EXPECTED_QUEUE"]
+    if not expected_queue or _SAFE_QUEUE.fullmatch(expected_queue) is None:
+        raise P3RenderError(
+            "EXPECTED_QUEUE must be a non-empty declared queue name "
+            "(pbs_stage1.sh:240-242,685-686)"
+        )
+    return state
+
+
+def _materialize_selected_row_snapshot(
+    row: Mapping[str, Any],
+) -> tuple[Path, str]:
+    """Materialize one canonical row JSON document under ``results_root/inputs``."""
+
+    if row_id(row) != row.get("row_id"):
+        raise P3RenderError("selected row identity does not match its canonical row hash")
+    root = Path(row["results_root"]).resolve()
+    inputs = root / "inputs"
+    snapshot = inputs / f"row-{row['row_id']}.json"
+    payload = json.dumps(
+        dict(row), sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")
+    inputs.mkdir(parents=True, exist_ok=True)
+    if snapshot.is_symlink() or (snapshot.exists() and not snapshot.is_file()):
+        raise P3RenderError("selected-row snapshot destination is not a regular file")
+    if snapshot.exists():
+        if snapshot.read_bytes() != payload:
+            raise P3RenderError("selected-row snapshot content differs from admitted row")
+    else:
+        snapshot.write_bytes(payload)
+    actual = snapshot.read_bytes()
+    if actual != payload:
+        raise P3RenderError("selected-row snapshot bytes differ from admitted row")
+    return snapshot, hashlib.sha256(actual).hexdigest()
+
+
+def _reject_placeholders(value: Any) -> None:
+    if isinstance(value, Mapping):
+        for child in value.values():
+            _reject_placeholders(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            _reject_placeholders(child)
+    elif isinstance(value, str) and _PLACEHOLDER.search(value):
+        raise P3RenderError("concrete packet contains unresolved placeholders")
 
 
 def _is_approved_soap100_row(row: Mapping[str, Any]) -> bool:

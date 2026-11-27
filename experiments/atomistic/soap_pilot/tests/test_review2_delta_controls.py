@@ -30,6 +30,16 @@ SOURCE = "7b88f833babcb82148c8f975a08b53970838be6a"
 ROOT = Path(__file__).resolve().parents[4]
 
 
+def _execution_state(tmp_path: Path, *, kind: str = "train") -> dict[str, str]:
+    cache = tmp_path / "uv-cache"
+    cache.mkdir(exist_ok=True)
+    return {
+        "UV_CACHE_DIR": str(cache),
+        "APPROVAL_ID": "soap-review-approval",
+        "EXPECTED_QUEUE": "capacity" if kind == "train" else "debug",
+    }
+
+
 def _publication(checkpoint_dir: Path, model_bytes: bytes = b"soap100-model") -> CheckpointEvidence:
     checkpoint_dir.mkdir(parents=True)
     model = checkpoint_dir / "model.pt"
@@ -75,7 +85,10 @@ def test_finalized_soap_eval_is_admitted_through_real_row_path(tmp_path: Path) -
 
     # This is the reviewer-designed expectation.  The current generic audit
     # is train-only and is expected to make this diagnostic test red.
-    admitted = admit_row_and_command(eval_row, python="/usr/bin/python3", checkout_root=str(ROOT))
+    admitted = admit_row_and_command(
+        eval_row, python="/usr/bin/python3", checkout_root=str(ROOT),
+        execution_state=_execution_state(tmp_path, kind="eval"),
+    )
     assert "experiments/atomistic/stage1/eval.py" in admitted.command
 
 
@@ -85,7 +98,10 @@ def test_train_admission_control_remains_green(tmp_path: Path) -> None:
     train = render_r2_train_packet(
         output_dir=tmp_path / "inputs", results_root=str(tmp_path), source_sha=SOURCE, device="cpu"
     )["r2-soap-100"]
-    admitted = admit_row_and_command(train.row, python="/usr/bin/python3", checkout_root=str(ROOT))
+    admitted = admit_row_and_command(
+        train.row, python="/usr/bin/python3", checkout_root=str(ROOT),
+        execution_state=_execution_state(tmp_path),
+    )
     assert "experiments/atomistic/stage1/train.py" in admitted.command
 
 

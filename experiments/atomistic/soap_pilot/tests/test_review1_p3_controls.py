@@ -31,6 +31,16 @@ SOURCE = "7b88f833babcb82148c8f975a08b53970838be6a"
 ROOT = Path(__file__).resolve().parents[4]
 
 
+def _execution_state(tmp_path: Path, *, kind: str = "train") -> dict[str, str]:
+    cache = tmp_path / "uv-cache"
+    cache.mkdir(exist_ok=True)
+    return {
+        "UV_CACHE_DIR": str(cache),
+        "APPROVAL_ID": "soap-review-approval",
+        "EXPECTED_QUEUE": "capacity" if kind == "train" else "debug",
+    }
+
+
 def _complete_publication(tmp_path: Path, train_row) -> tuple[Path, CheckpointEvidence]:
     checkpoint_dir = (
         tmp_path / train_row["experiment_name"] / train_row["sector"]
@@ -169,7 +179,10 @@ def test_target_profiles_have_stage1_schedule_and_one_initial_checkpoint(tmp_pat
         source_sha=SOURCE,
         device="cpu",
     )
-    admitted = admit_row_and_command(rendered.row, python="/usr/bin/python3", checkout_root=str(ROOT))
+    admitted = admit_row_and_command(
+        rendered.row, python="/usr/bin/python3", checkout_root=str(ROOT),
+        execution_state=_execution_state(tmp_path),
+    )
     assert admitted.row["checkpoint_steps"] == [0, 1000, 5000]
     assert rendered.rendered.values["checkpoint_steps"] == [1000, 5000]
     assert sum(

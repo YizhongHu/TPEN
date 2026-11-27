@@ -66,8 +66,9 @@ APPROVED_RECIPES = json.loads(
 )
 
 # This is deliberately literal packet policy, rather than a projection of
-# ``command_for_row`` or the P3 renderer.  The renderer substitutes only the
-# row-bound values named here before comparing a supplied packet.
+# ``command_for_row`` or the P3 renderer.  Caller-owned PBS execution state is
+# validated by p3_render against the unchanged wrapper and substituted only at
+# admission.  These markers are template-only and are never admissible.
 PACKET_EXPECTATIONS = {
     "env": {
         "keys": (
@@ -75,9 +76,9 @@ PACKET_EXPECTATIONS = {
             "RESULTS_ROOT", "SELECTED_ROW", "APPROVAL_ID", "EXPECTED_QUEUE",
         ),
         "MODE_BY_KIND": {"train": "train", "eval": "eval"},
-        "UV_CACHE_DIR": "<UV_CACHE_DIR>",
-        "APPROVAL_ID": "<APPROVAL_ID>",
-        "EXPECTED_QUEUE": "test",
+        "UV_CACHE_DIR": "<CALLER_UV_CACHE_DIR>",
+        "APPROVAL_ID": "<CALLER_APPROVAL_ID>",
+        "EXPECTED_QUEUE": "<CALLER_EXPECTED_QUEUE>",
     },
     "argv": {
         "driver_by_kind": {"train": "train.py", "eval": "eval.py"},
