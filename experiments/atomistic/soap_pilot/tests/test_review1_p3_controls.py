@@ -31,8 +31,11 @@ SOURCE = "7b88f833babcb82148c8f975a08b53970838be6a"
 ROOT = Path(__file__).resolve().parents[4]
 
 
-def _complete_publication(tmp_path: Path) -> tuple[Path, CheckpointEvidence]:
-    checkpoint_dir = tmp_path / "published" / "checkpoints" / "step_000100"
+def _complete_publication(tmp_path: Path, train_row) -> tuple[Path, CheckpointEvidence]:
+    checkpoint_dir = (
+        tmp_path / train_row["experiment_name"] / train_row["sector"]
+        / train_row["run_id"] / "checkpoints" / "step_000100"
+    )
     checkpoint_dir.mkdir(parents=True)
     model = checkpoint_dir / "model.pt"
     model.write_bytes(b"review-publication-model")
@@ -55,7 +58,7 @@ def test_adam_train_row_cannot_be_published_as_soap100_eval(tmp_path: Path) -> N
         output_dir=tmp_path / "inputs", results_root=str(tmp_path), source_sha=SOURCE, device="cpu"
     )
     train = packet["r2-adam-100"]
-    checkpoint_dir, publication = _complete_publication(tmp_path)
+    checkpoint_dir, publication = _complete_publication(tmp_path, train.row)
     parent = make_parent_join(campaign_id="review", invocation_id="adam-100", row=train.row)
     template = render_eval_template(
         output_dir=tmp_path / "inputs", results_root=str(tmp_path), source_sha=SOURCE, device="cpu"
@@ -77,7 +80,7 @@ def test_soap100_control_accepts_real_complete_publication(tmp_path: Path) -> No
     train = render_r2_train_packet(
         output_dir=tmp_path / "inputs", results_root=str(tmp_path), source_sha=SOURCE, device="cpu"
     )["r2-soap-100"]
-    checkpoint_dir, publication = _complete_publication(tmp_path)
+    checkpoint_dir, publication = _complete_publication(tmp_path, train.row)
     row = finalize_eval_row(
         render_eval_template(output_dir=tmp_path / "inputs", results_root=str(tmp_path), source_sha=SOURCE, device="cpu"),
         train_row=train.row,
@@ -94,7 +97,7 @@ def test_publication_named_files_must_match_checkpoint_directory(tmp_path: Path)
     train = render_r2_train_packet(
         output_dir=tmp_path / "inputs", results_root=str(tmp_path), source_sha=SOURCE, device="cpu"
     )["r2-soap-100"]
-    checkpoint_dir, publication = _complete_publication(tmp_path)
+    checkpoint_dir, publication = _complete_publication(tmp_path, train.row)
     foreign = tmp_path / "foreign" / "model.pt"
     foreign.parent.mkdir()
     foreign.write_bytes(b"foreign-directory-model")

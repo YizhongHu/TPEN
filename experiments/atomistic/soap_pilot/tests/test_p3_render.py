@@ -83,7 +83,7 @@ def test_p3_real_train_eval_mains_core_stub_use_admitted_bytes_once(tmp_path: Pa
     assert train_cfg["sampler"]["n_walkers"] == 512  # type: ignore[index]
     assert sum(callback.get("_target_") == "tpen.callback.InitialCheckpoint" for callback in train_cfg["callbacks"]) == 1  # type: ignore[index]
 
-    checkpoint_dir = tmp_path / "soap100" / "checkpoints" / "step_000100"
+    checkpoint_dir = tmp_path / train.row["experiment_name"] / train.row["sector"] / train.row["run_id"] / "checkpoints" / "step_000100"
     checkpoint_dir.mkdir(parents=True)
     model = checkpoint_dir / "model.pt"
     model.write_bytes(b"model-bytes")
@@ -115,14 +115,14 @@ def test_p3_eval_template_refuses_without_complete_soap100_publication(tmp_path:
     parent = make_parent_join(campaign_id="soap-r2", invocation_id="soap100", row=train.row)
     publication = CheckpointEvidence(100, "soap100", "a" * 64, True, {"model.pt": "model.pt", "COMPLETE": "COMPLETE"})
     with pytest.raises(P3RenderError, match="COMPLETE"):
-        finalize_eval_row(template, train_row=train.row, parent=parent, publication=publication, checkpoint_dir=tmp_path / "missing")
+        finalize_eval_row(template, train_row=train.row, parent=parent, publication=publication, checkpoint_dir=tmp_path / train.row["experiment_name"] / train.row["sector"] / train.row["run_id"] / "checkpoints" / "step_000100")
 
 
 def test_p3_complete_soap100_finalizes_eval_and_uses_eval_driver(tmp_path: Path) -> None:
     """A complete publication produces an eval row and launcher-owned argv."""
 
     train = render_r2_train_packet(output_dir=tmp_path / "inputs", results_root=str(tmp_path), source_sha=SOURCE, device="cpu")["r2-soap-100"]
-    checkpoint_dir = tmp_path / "soap100" / "checkpoints" / "step_000100"
+    checkpoint_dir = tmp_path / train.row["experiment_name"] / train.row["sector"] / train.row["run_id"] / "checkpoints" / "step_000100"
     checkpoint_dir.mkdir(parents=True)
     model = checkpoint_dir / "model.pt"
     model.write_bytes(b"complete-model")
@@ -140,7 +140,7 @@ def test_p3_eval_publication_refusal_matrix_has_zero_core_calls(tmp_path: Path, 
     """Every publication/parent refusal happens before any core invocation."""
 
     train = render_r2_train_packet(output_dir=tmp_path / "inputs", results_root=str(tmp_path), source_sha=SOURCE, device="cpu")["r2-soap-100"]
-    checkpoint_dir = tmp_path / "soap100" / "checkpoints" / "step_000100"
+    checkpoint_dir = tmp_path / train.row["experiment_name"] / train.row["sector"] / train.row["run_id"] / "checkpoints" / "step_000100"
     checkpoint_dir.mkdir(parents=True)
     model = checkpoint_dir / "model.pt"
     model.write_bytes(b"model")
