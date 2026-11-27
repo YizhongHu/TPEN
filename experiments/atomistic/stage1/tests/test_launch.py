@@ -53,6 +53,7 @@ def _run(script: str, tmp_path: Path, **slurm: str) -> subprocess.CompletedProce
 
 def _fake_gpu_python(
     fake_bin: Path, device_count: str = "1", driver_sentinel: Path | None = None,
+    driver_env_sentinel: Path | None = None,
 ) -> Path:
     """Create a fake interpreter that distinguishes probes from driver calls."""
 
@@ -60,6 +61,11 @@ def _fake_gpu_python(
     record_driver = (
         f"  touch {shlex.quote(str(driver_sentinel))}\n"
         if driver_sentinel is not None else "  :\n"
+    )
+    record_driver += (
+        f"  printf 'OMP_NUM_THREADS=%s\\nMKL_NUM_THREADS=%s\\n' "
+        f'"$OMP_NUM_THREADS" "$MKL_NUM_THREADS" > {shlex.quote(str(driver_env_sentinel))}\n'
+        if driver_env_sentinel is not None else ""
     )
     python.write_text(
         "#!/bin/sh\n"
@@ -72,6 +78,20 @@ def _fake_gpu_python(
     )
     python.chmod(0o750)
     return python
+
+
+def _thread_env_row(kind: str) -> dict[str, Any]:
+    """Return a minimal valid smoke, train, or eval row for execution tests."""
+
+    if kind == "eval":
+        return {
+            **ROW, "kind": kind, "config": "configs/he/eval.yaml",
+            "draws": 256,
+            "checkpoint_dir": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010",
+            "checkpoint_file": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/stage1/he/train-lineage-0/checkpoints/step_000010/model.pt",
+            "checkpoint_sha256": "d" * 64,
+        }
+    return {**ROW, "kind": kind, "config": f"configs/he/{kind}.yaml"}
 
 
 def test_render_contains_fail_closed_identity_and_cleanup_guards(tmp_path: Path) -> None:
@@ -178,6 +198,65 @@ def test_gpu_render_defaults_to_measured_shape_and_cuda_binding(
     assert "--binding" in script
     assert "runtime.device=cuda" not in script
     assert "expected exactly one management GPU" in script
+
+
+@pytest.mark.parametrize("kind", ["smoke", "train", "eval"])
+@pytest.mark.parametrize("cpus_per_task, expected", [(None, "10"), (8, "8")])
+def test_gpu_driver_inherits_effective_thread_exports(
+    tmp_path: Path, kind: str, cpus_per_task: int | None, expected: str,
+) -> None:
+    """GPU child drivers see the effective CPU count, not stale parent state."""
+
+    gpu_row = {**_thread_env_row(kind), "device": "cuda"}
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    nvidia = fake_bin / "nvidia-smi"
+    nvidia.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in *mig.mode.current*) printf 'Disabled\\n';; "
+        "*) printf 'NVIDIA A100-SXM4-80GB, 81920\\n';; esac\n",
+        encoding="utf-8",
+    )
+    nvidia.chmod(0o750)
+    env_record = tmp_path / "driver-env"
+    python = _fake_gpu_python(fake_bin, driver_env_sentinel=env_record)
+    resource_kwargs = {} if cpus_per_task is None else {"cpus_per_task": cpus_per_task}
+    script = render(
+        row=gpu_row, driver="/bin/true", python=str(python), head_sha="c" * 40,
+        results_root=ROW["results_root"], partition="gpu", mem="64G",
+        time="08:00:00", scratch_base=str(tmp_path), **resource_kwargs,
+    )
+    result = _run(
+        script, tmp_path, PATH=f"{fake_bin}:/usr/bin:/bin",
+        SLURM_JOB_ID="123", SLURM_JOB_PARTITION="gpu",
+        OMP_NUM_THREADS="77", MKL_NUM_THREADS="88",
+    )
+    assert result.returncode == 0, result.stderr
+    assert env_record.read_text(encoding="utf-8") == (
+        f"OMP_NUM_THREADS={expected}\nMKL_NUM_THREADS={expected}\n"
+    )
+
+
+def test_cpu_driver_keeps_inherited_thread_environment(tmp_path: Path) -> None:
+    """CPU-only renders do not add GPU thread exports to their child."""
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    env_record = tmp_path / "driver-env"
+    python = _fake_gpu_python(fake_bin, driver_env_sentinel=env_record)
+    script = render(
+        row=ROW, driver="/bin/true", python=str(python), head_sha="c" * 40,
+        results_root=ROW["results_root"], partition="test", scratch_base=str(tmp_path),
+    )
+    result = _run(
+        script, tmp_path, PATH=f"{fake_bin}:/usr/bin:/bin",
+        SLURM_JOB_ID="123", SLURM_JOB_PARTITION="test",
+        OMP_NUM_THREADS="77", MKL_NUM_THREADS="88",
+    )
+    assert result.returncode == 0, result.stderr
+    assert env_record.read_text(encoding="utf-8") == (
+        "OMP_NUM_THREADS=77\nMKL_NUM_THREADS=88\n"
+    )
 
 
 def test_cpu_render_keeps_template_cpu_shape_without_gpu_thread_exports() -> None:

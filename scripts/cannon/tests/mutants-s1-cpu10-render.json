@@ -27,6 +27,13 @@
       "old": "f\"export MKL_NUM_THREADS={cpus_per_task}\"",
       "new": "\"export MKL_NUM_THREADS=1\"",
       "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_gpu_render_defaults_to_measured_shape_and_cuda_binding"
+    },
+    {
+      "id": "gpu-thread-exports-after-command",
+      "target": "experiments/atomistic/stage1/templates/cannon.sbatch",
+      "old": "__GPU_THREAD_EXPORTS__",
+      "new": "__COMMAND__\\n__GPU_THREAD_EXPORTS__",
+      "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_gpu_driver_inherits_effective_thread_exports"
     }
   ]
 }

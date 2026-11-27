@@ -261,16 +261,15 @@ block is the rendered block recorded in step 1 plus only `--job-name`,
    "$PY" -m experiments.atomistic.stage1.launch \
      --output "$BOOT_ROOT/train.sbatch" \
      --row "$RESULTS_ROOT/plan/rows/<row_id>.json" \
-     --driver experiments/atomistic/stage1/train.py \
      --checkout-root "$BOOT_ROOT/checkout" --python "$PY" \
-     --head-sha "$SOURCE_SHA" --results-root "$RESULTS_ROOT" \
      --partition seas_gpu,kozinsky_gpu,gpu \
      --cpus-per-task 10 --mem 40G --time 12:00:00
    ```
 
    Like `plan.py`, `launch.py` has no `sys.path` self-fix: run it as a module
-   with cwd at `$BOOT_ROOT/checkout` (`--driver` stays a path string, embedded
-   verbatim into the rendered sbatch, not executed here).
+   with cwd at `$BOOT_ROOT/checkout`.  The row selects the driver, source SHA,
+   and results root; `launch.py` resolves the driver from that checkout rather
+   than accepting those values as CLI options.
 
 4. assert the rendered `#SBATCH` lines equal this wrapper's own (read `$0`,
    ignoring `--job-name/--output/--error`), assert no `PYTHONPATH=` in it,
@@ -336,9 +335,9 @@ checkpoints/step_050000`, and `device == "cuda"`.  Write each eval row to
 
 ### Step 5: launch eval rows
 
-Same wrapper pattern as step 2 with `--driver experiments/atomistic/stage1/
-eval.py`, `--time` set to the approved per-job cap, and a loop over the
-stream rows in the job: render each to `$BOOT_ROOT/eval-<row_id>.sbatch`,
+Same wrapper pattern as step 2 with `--time` set to the approved per-job cap
+and a loop over the eval rows (whose row kind selects `eval.py`) in the job:
+render each to `$BOOT_ROOT/eval-<row_id>.sbatch`,
 copy it to `launch/`, run it with `bash`, and stop at the first nonzero exit.
 Each rendered script creates and removes `/scratch/$USER/$SLURM_JOB_ID` in
 turn, so sequential streams in one job do not collide.  The eval driver
