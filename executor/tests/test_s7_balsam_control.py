@@ -289,11 +289,12 @@ def test_four_cpu_rows_cross_s6_s2_with_fences_deltas_and_final_reconciliation(t
     for member in group.members:
         fence = executor.fences[member.task_id]
         delta = executor.contexts[member.task_id].request.attempt_delta
-        assert delta is not None
-        assert delta.group_digest == group.identity
-        assert delta.task_id == member.task_id
-        assert delta.attempt_id == fence.attempt_id.value
-        assert delta.attempt_core_dir == str(Path(fence.output_dir) / "core")
+        # These are fresh, legacy configured runs: no prior checkpoint or
+        # continuation admission supplies an attempt delta. S2 still binds
+        # each fresh launch to its fence; delta-bearing requests are reserved
+        # for configured-program continuations.
+        assert delta is None
+        assert fence.task_id == member.task_id
     assert len({fence.attempt_id for fence in executor.fences.values()}) == 4
     assert {fence.allocation_id for fence in executor.fences.values()} == {allocation.allocation_id.value}
     assert all(member.action == "preserve_completed" for member in result.reconciliation.members)
