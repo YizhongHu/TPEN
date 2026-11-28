@@ -25,6 +25,8 @@ CONFIG_ROOT = Path(__file__).parents[1] / "configs" / "hooke2"
 _EXCLUDED_HOOKE2_CONFIGS = {
     "train.yaml": "canonical baseline used to define the parity contract",
     "eval.yaml": "evaluation-only config, not a train arm",
+    "positive_singlet_tail_eval.yaml": "evaluation-only config paired with the tail arm",
+    "positive_singlet_comparator_eval.yaml": "evaluation-only config paired with the comparator arm",
 }
 
 

@@ -17,7 +17,8 @@ from experiments.atomistic.stage1.protocol import (
     HE_H2_EVAL_CHECKPOINTS, HOOKE_A37, HOOKE_SYSTEMS,
     MANIFEST_SCHEMA, OVERLAY_PROFILE_V1, OVERLAY_PROFILES,
     QHO_Q21, SYSTEMS, STAGE1_PROTOCOL,
-    bind_evaluation_manifest, build_manifest, config_identities, derive_smoke_eval_roster,
+    bind_evaluation_manifest, build_manifest, config_identities, config_variant_for_train_config,
+    derive_smoke_eval_roster,
     manifest_hash,
     overlay_sha256, resolve_overlay_path, protocol_for_science_profile,
     HOOKE2_ACT50_ALL_PROFILES, HOOKE_SCIENCE_PROFILE, HE_SIGMOID_PROFILE,
@@ -47,6 +48,8 @@ def main() -> int:
     parser.add_argument("--lineage-seeds", type=int, nargs="+")
     parser.add_argument("--science-profile")
     parser.add_argument("--evaluation-selection")
+    parser.add_argument("--config-variant",
+                        choices=("positive_singlet_tail", "positive_singlet_comparator"))
     args = parser.parse_args()
     systems = tuple(args.systems) if args.systems else None
     phase1_probe_rows = None
@@ -137,6 +140,7 @@ def main() -> int:
     if args.phase == 1:
         config_sha256 = config_identities(
             config_root=config_root, systems=systems, science_profile=identity_profile,
+            config_variant=args.config_variant,
         )
         _compare_legacy_config_sha256(args.config_sha256, config_sha256)
         rows = build_manifest(protocol=effective_protocol, source_sha=args.source_sha,
@@ -147,6 +151,7 @@ def main() -> int:
                               overlay_sha256=effective_overlay_sha,
                               overlay_profile=effective_overlay_profile,
                               science_profile=args.science_profile,
+                              config_variant=args.config_variant,
                               evaluation_selection=args.evaluation_selection,
                               include_smoke=False, auto_overlay=args.overlay is None)
     else:
@@ -164,6 +169,17 @@ def main() -> int:
                 str(row["system"]) for row in phase1_rows if row.get("kind") == "train"
             ))
             phase1_train_rows = [row for row in phase1_rows if row.get("kind") == "train"]
+            phase1_variants = {
+                config_variant_for_train_config(str(row.get("config")))
+                for row in phase1_train_rows
+            }
+            phase1_variants.discard(None)
+            if len(phase1_variants) > 1:
+                raise ValueError("phase-1 rows must use one config variant")
+            phase1_variant = next(iter(phase1_variants), None)
+            if args.config_variant is not None and args.config_variant != phase1_variant:
+                raise ValueError("explicit --config-variant conflicts with phase-1 manifest")
+            args.config_variant = phase1_variant
             phase1_profiles = {
                 str(row.get("overlay_profile", OVERLAY_PROFILE_V1))
                 for row in phase1_train_rows
@@ -214,7 +230,7 @@ def main() -> int:
                 science_profile=(phase1_science_profile
                                  if phase1_science_profile in {
                                      *HOOKE2_ACT50_ALL_PROFILES, HE_SIGMOID_PROFILE,
-                                 } else None),
+                                 } else None), config_variant=args.config_variant,
             )
             _compare_legacy_config_sha256(args.config_sha256, config_sha256)
             eval_rows = bind_evaluation_manifest(
@@ -233,7 +249,7 @@ def main() -> int:
             else:
                 config_sha256 = config_identities(
                     config_root=config_root, systems=systems,
-                    science_profile=identity_profile,
+                    science_profile=identity_profile, config_variant=args.config_variant,
                 )
             rows = build_manifest(protocol=effective_protocol, source_sha=args.source_sha,
                                   config_sha256=config_sha256, checkpoints=args.checkpoints,
@@ -244,6 +260,7 @@ def main() -> int:
                                   overlay_sha256=effective_overlay_sha,
                                   overlay_profile=effective_overlay_profile,
                                   science_profile=args.science_profile,
+                                  config_variant=args.config_variant,
                                   evaluation_selection=args.evaluation_selection,
                                   include_smoke=False, auto_overlay=args.overlay is None)
     args.output.parent.mkdir(parents=True, exist_ok=True)
