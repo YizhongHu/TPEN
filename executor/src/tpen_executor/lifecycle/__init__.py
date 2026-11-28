@@ -1,6 +1,9 @@
 """Executor lifecycle adapters."""
 
 from .attached import AttachedAllocation
+from .allocation_capture import (AllocationCaptureRefusal, FullNodeAssignment, SchedulerAllocationSnapshot,
+                                  assign_full_node, capture_full_node_assignment, capture_node_assignment,
+                                  capture_parent_allocation)
 from .controller import AllocationLocalExecutor, GroupControllerFactsV1, GroupControllerOutcome, MemberLaunchResult, run_group_controller
 from .core_port import CoreAdmissionProcessPort, CoreAdmissionProcessRequest, ScienceProcessCoreAdmissionPort
 from .group_store import (CanonicalGroupBinding, GroupStoreAuthorityPublished, GroupStoreError, GroupStoreRefused, GroupStoreResult,
@@ -12,7 +15,11 @@ from .balsam_wire import BalsamWireError, BalsamWireRequest, BalsamWireResult, d
 
 __all__ = [
     "AllocationLocalExecutor",
+    "AllocationCaptureRefusal",
+    "FullNodeAssignment",
+    "SchedulerAllocationSnapshot",
     "AttachedAllocation",
+    "assign_full_node",
     "BalsamBridge",
     "BalsamBridgeAmbiguous",
     "BalsamBridgeFailure",
@@ -44,6 +51,9 @@ __all__ = [
     "initial",
     "reentry",
     "run_group_controller",
+    "capture_full_node_assignment",
+    "capture_node_assignment",
+    "capture_parent_allocation",
     "select_balsam_client_path",
     "validate_balsam_client_path",
 ]

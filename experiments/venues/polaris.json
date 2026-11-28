@@ -1,0 +1,15 @@
+{
+  "schema": "tpen-executor/venue-profile-v1",
+  "venue": "polaris",
+  "scheduler": "pbs",
+  "queues": ["debug", "debug-scaling"],
+  "gpu_strata": [
+    {
+      "name": "a100-40gb",
+      "accelerator": "cuda",
+      "gpu_name_contains": ["A100"],
+      "memory_mib": 40960,
+      "mig_mode": "disabled"
+    }
+  ]
+}
