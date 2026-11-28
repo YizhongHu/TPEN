@@ -34,6 +34,13 @@
       "old": "canonical=\"$(canonicalize_path \"$path\")\"",
       "new": "canonical=\"$path\"",
       "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_prepare_path_guard_accepts_alias_and_canonical_roots_and_refuses_escapes"
+    },
+    {
+      "id": "prep-spool-relative-helper-restored",
+      "target": "experiments/atomistic/stage1/polaris/pbs_prepare.sh",
+      "old": "source \"$STAGE1_PATHS_SH\"",
+      "new": "source \"$SCRIPT_DIR/pbs_paths.sh\"",
+      "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_prepare_spooling_requires_and_uses_explicit_helper_path"
     }
   ]
 }

@@ -12,7 +12,11 @@ set -Eeuo pipefail
 
 RESULTS_PREFIX="/eagle/HetRxnEnergy/rhu/"
 RESULTS_PREFIX_CANONICAL=""
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+STAGE1_PATHS_SH="${STAGE1_PATHS_SH:-}"
+STAGE1_PATHS_SHA256="${STAGE1_PATHS_SHA256:-}"
+STAGED_PREP_PATH="${STAGED_PREP_PATH:-}"
+STAGED_WRAPPER_PATH="${STAGED_WRAPPER_PATH:-}"
+STAGED_EVAL_PREP_PATH="${STAGED_EVAL_PREP_PATH:-}"
 SOURCE_REPO="${SOURCE_REPO:-}"
 SOURCE_SHA="${SOURCE_SHA:-}"
 RESULTS_ROOT="${RESULTS_ROOT:-}"
@@ -35,7 +39,18 @@ die() {
   exit 2
 }
 
-source "$SCRIPT_DIR/pbs_paths.sh"
+[[ -n "$STAGE1_PATHS_SH" ]] ||
+  die "STAGE1_PATHS_SH is required; PBS may spool this script away from its inputs"
+[[ "$STAGE1_PATHS_SH" == /* ]] ||
+  die "STAGE1_PATHS_SH must be an absolute path: $STAGE1_PATHS_SH"
+[[ -f "$STAGE1_PATHS_SH" && ! -L "$STAGE1_PATHS_SH" ]] ||
+  die "STAGE1_PATHS_SH is not a regular file: $STAGE1_PATHS_SH"
+[[ "$STAGE1_PATHS_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+  die "STAGE1_PATHS_SHA256 must be a recorded lowercase SHA-256"
+STAGE1_PATHS_ACTUAL_SHA256="$(sha256sum "$STAGE1_PATHS_SH")"
+[[ "${STAGE1_PATHS_ACTUAL_SHA256%% *}" == "$STAGE1_PATHS_SHA256" ]] ||
+  die "STAGE1_PATHS_SH SHA-256 mismatch: $STAGE1_PATHS_SH"
+source "$STAGE1_PATHS_SH"
 
 require_value() {
   local name="$1"
@@ -74,11 +89,30 @@ fi
 [[ ! -e "$CHECKOUT_ROOT" && ! -L "$CHECKOUT_ROOT" ]] || die "CHECKOUT_ROOT already exists: $CHECKOUT_ROOT"
 [[ ! -e "$PRIME_ENV" && ! -L "$PRIME_ENV" ]] || die "PRIME_ENV already exists: $PRIME_ENV"
 mkdir -p -- "$RESULTS_ROOT"/inputs "$RESULTS_ROOT"/logs "$RESULTS_ROOT"/plan "$LAUNCH_ROOT" "$UV_CACHE_DIR"
+if [[ -n "$SMOKE_RESULTS_ROOT" ]]; then
+  mkdir -p -- "$SMOKE_RESULTS_ROOT"/logs "$SMOKE_RESULTS_ROOT"/plan
+fi
+if [[ -n "$STAGED_PREP_PATH" ]]; then
+  [[ -f "$STAGED_PREP_PATH" ]] || die "staged preparation script is missing: $STAGED_PREP_PATH"
+  cp -- "$STAGED_PREP_PATH" "$RESULTS_ROOT/inputs/pbs_prepare.sh"
+fi
+if [[ -n "$STAGED_WRAPPER_PATH" ]]; then
+  [[ -f "$STAGED_WRAPPER_PATH" ]] || die "staged execution wrapper is missing: $STAGED_WRAPPER_PATH"
+  cp -- "$STAGED_WRAPPER_PATH" "$WRAPPER_PATH"
+fi
+if [[ "$STAGE1_PATHS_SH" != "$RESULTS_ROOT/inputs/pbs_paths.sh" ]]; then
+  cp -- "$STAGE1_PATHS_SH" "$RESULTS_ROOT/inputs/pbs_paths.sh"
+fi
 [[ -f "$WRAPPER_PATH" ]] || die "execution wrapper is missing: $WRAPPER_PATH"
 sha256sum "$0" > "$RESULTS_ROOT/inputs/pbs_prepare.sh.sha256"
-sha256sum "$SCRIPT_DIR/pbs_paths.sh" > "$RESULTS_ROOT/inputs/pbs_paths.sh.sha256"
+sha256sum "$STAGE1_PATHS_SH" > "$RESULTS_ROOT/inputs/pbs_paths.sh.sha256"
 sha256sum "$WRAPPER_PATH" > "$RESULTS_ROOT/inputs/pbs_stage1.sh.sha256"
 if [[ -n "$EVAL_PREP_PATH" ]]; then
+  if [[ -n "$STAGED_EVAL_PREP_PATH" ]]; then
+    [[ -f "$STAGED_EVAL_PREP_PATH" ]] ||
+      die "staged evaluation preparation script is missing: $STAGED_EVAL_PREP_PATH"
+    cp -- "$STAGED_EVAL_PREP_PATH" "$EVAL_PREP_PATH"
+  fi
   [[ -f "$EVAL_PREP_PATH" ]] || die "evaluation preparation script is missing: $EVAL_PREP_PATH"
   sha256sum "$EVAL_PREP_PATH" > "$RESULTS_ROOT/inputs/pbs_select_eval.sh.sha256"
 fi

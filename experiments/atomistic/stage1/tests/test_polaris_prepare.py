@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shlex
 import subprocess
@@ -45,14 +46,50 @@ def test_prepare_job_never_submits_or_transfers_from_the_allocation() -> None:
     assert "qsub" not in text
     assert "scp" not in text
     assert 'RESULTS_PREFIX="/eagle/HetRxnEnergy/rhu/"' in text
-    assert 'source "$SCRIPT_DIR/pbs_paths.sh"' in text
+    assert 'source "$STAGE1_PATHS_SH"' in text
+    assert 'STAGE1_PATHS_SHA256' in text
     assert 'realpath -m -- "$1"' in PATHS_SCRIPT.read_text(encoding="utf-8")
+
+
+def _run_spooled_preamble(script: Path, environ: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    text = script.read_text(encoding="utf-8")
+    prefix = text.split("require_value SOURCE_REPO", 1)[0]
+    env = {"PATH": "/usr/bin:/bin", **environ}
+    return subprocess.run(
+        ["bash", "-c", prefix],
+        cwd=script.parent,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_prepare_spooling_requires_and_uses_explicit_helper_path(tmp_path: Path) -> None:
+    """PBS spooling must not make a sibling lookup the implicit dependency."""
+    spooled = tmp_path / "pbs-spool"
+    spooled.mkdir()
+    spooled_script = spooled / "pbs_prepare.sh"
+    spooled_script.write_text(SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+
+    missing = _run_spooled_preamble(spooled_script, {})
+    assert missing.returncode != 0
+    assert "STAGE1_PATHS_SH is required" in missing.stderr
+
+    helper = tmp_path / "inputs" / "pbs_paths.sh"
+    helper.parent.mkdir()
+    helper.write_text(PATHS_SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    helper_sha = hashlib.sha256(helper.read_bytes()).hexdigest()
+    supplied = _run_spooled_preamble(
+        spooled_script,
+        {"STAGE1_PATHS_SH": str(helper), "STAGE1_PATHS_SHA256": helper_sha},
+    )
+    assert supplied.returncode == 0, supplied.stderr
 
 
 def _run_guard(path: Path, allowed_root: Path) -> subprocess.CompletedProcess[str]:
     text = SCRIPT.read_text(encoding="utf-8")
     prefix = text.split("require_value SOURCE_REPO", 1)[0]
-    prefix = prefix.replace('source "$SCRIPT_DIR/pbs_paths.sh"', PATHS_SCRIPT.read_text(encoding="utf-8"))
     prefix = prefix.replace(
         'RESULTS_PREFIX="/eagle/HetRxnEnergy/rhu/"',
         f"RESULTS_PREFIX={shlex.quote(str(allowed_root))}",
@@ -64,6 +101,11 @@ def _run_guard(path: Path, allowed_root: Path) -> subprocess.CompletedProcess[st
     )
     return subprocess.run(
         ["bash", "-c", command, "guard", str(path)],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "STAGE1_PATHS_SH": str(PATHS_SCRIPT),
+            "STAGE1_PATHS_SHA256": hashlib.sha256(PATHS_SCRIPT.read_bytes()).hexdigest(),
+        },
         text=True,
         capture_output=True,
         check=False,
@@ -97,6 +139,8 @@ def test_eval_selection_job_owns_eval_materialization() -> None:
     assert "select_eval" in text
     assert '"$PRIME_ENV/bin/python" -m experiments.atomistic.stage1.select_eval' in text
     assert 'sha256sum "$SELECTED_EVAL"' in text
+    assert 'source "$STAGE1_PATHS_SH"' in text
+    assert 'STAGE1_PATHS_SHA256' in text
 
 
 def test_runbook_login_blocks_do_not_execute_compute_commands() -> None:
@@ -106,3 +150,5 @@ def test_runbook_login_blocks_do_not_execute_compute_commands() -> None:
     assert code_blocks
     forbidden = re.compile(r"(?m)^\s*(?:\S*/)?(?:python|uv)(?:\s|$)|git\s+clone|\brender(?:\s|$)")
     assert not [block for block in code_blocks if forbidden.search(block)]
+    assert not [block for block in code_blocks if re.search(r"(?m)^\s*mkdir(?:\s|$)", block)]
+    assert not [block for block in code_blocks if re.search(r"(?m)^\s*sha256sum(?:\s|$)", block)]

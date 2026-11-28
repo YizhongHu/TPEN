@@ -12,7 +12,8 @@ set -Eeuo pipefail
 
 RESULTS_PREFIX="/eagle/HetRxnEnergy/rhu/"
 RESULTS_PREFIX_CANONICAL=""
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+STAGE1_PATHS_SH="${STAGE1_PATHS_SH:-}"
+STAGE1_PATHS_SHA256="${STAGE1_PATHS_SHA256:-}"
 SOURCE_SHA="${SOURCE_SHA:-}"
 RESULTS_ROOT="${RESULTS_ROOT:-}"
 SYSTEM="${SYSTEM:-}"
@@ -27,7 +28,18 @@ die() {
   exit 2
 }
 
-source "$SCRIPT_DIR/pbs_paths.sh"
+[[ -n "$STAGE1_PATHS_SH" ]] ||
+  die "STAGE1_PATHS_SH is required; PBS may spool this script away from its inputs"
+[[ "$STAGE1_PATHS_SH" == /* ]] ||
+  die "STAGE1_PATHS_SH must be an absolute path: $STAGE1_PATHS_SH"
+[[ -f "$STAGE1_PATHS_SH" && ! -L "$STAGE1_PATHS_SH" ]] ||
+  die "STAGE1_PATHS_SH is not a regular file: $STAGE1_PATHS_SH"
+[[ "$STAGE1_PATHS_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+  die "STAGE1_PATHS_SHA256 must be a recorded lowercase SHA-256"
+STAGE1_PATHS_ACTUAL_SHA256="$(sha256sum "$STAGE1_PATHS_SH")"
+[[ "${STAGE1_PATHS_ACTUAL_SHA256%% *}" == "$STAGE1_PATHS_SHA256" ]] ||
+  die "STAGE1_PATHS_SH SHA-256 mismatch: $STAGE1_PATHS_SH"
+source "$STAGE1_PATHS_SH"
 
 require_value() {
   local name="$1"

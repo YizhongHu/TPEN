@@ -73,11 +73,14 @@ PRIME_ENV=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/prim
 PYBIN=/soft/applications/conda/2025-09-25/mconda3/bin/python
 ```
 
-The run root must be created before any `qsub` so PBS can open its `-o` and
-`-e` files.  Assert it is below `/eagle/HetRxnEnergy/rhu/`, create `logs/`,
-`plan/`, `launch/`, and `inputs/`, copy the four scripts there, and record
-their SHA-256 values.  Do not copy a git tree with `cp -a` from `/home` to Eagle;
-the current Polaris note records that this fails while preserving ownership.
+The debug preparation job creates `RESULTS_ROOT` and its `logs/`, `plan/`,
+`launch/`, and `inputs/` children after the containment check.  The login node
+does not create result or log directories.  Stage the four named scripts into
+the already-existing `/eagle/HetRxnEnergy/rhu/` prefix with a unique
+operator-chosen token; the job copies them into the retained input directory
+and records their SHA-256 values.  Do not copy a git tree with `cp -a` from
+`/home` to Eagle; the current Polaris note records that this fails while
+preserving ownership.
 
 The login node does not clone, run Python, or invoke uv.  Submit exactly one
 short debug preparation job.  Inside that allocation the script performs a
@@ -87,17 +90,25 @@ non-promisor/non-partial checkout, primes the cache with the facility
 the Eagle results root:
 
 ```bash
-mkdir -p "$RESULTS_ROOT"/{inputs,logs,plan}
-scp -p experiments/atomistic/stage1/polaris/pbs_stage1.sh "$WRAPPER"
-scp -p experiments/atomistic/stage1/polaris/pbs_prepare.sh "$PREP_SCRIPT"
-scp -p experiments/atomistic/stage1/polaris/pbs_select_eval.sh "$EVAL_PREP_SCRIPT"
-scp -p experiments/atomistic/stage1/polaris/pbs_paths.sh "$RESULTS_ROOT/inputs/pbs_paths.sh"
+STAGING_PREFIX=/eagle/HetRxnEnergy/rhu
+STAGE_TOKEN=stage1-prep-${SYSTEM}-${SOURCE_SHA:0:8}-<unique-utc-token>
+PREP_STAGE="$STAGING_PREFIX/${STAGE_TOKEN}-pbs_prepare.sh"
+WRAPPER_STAGE="$STAGING_PREFIX/${STAGE_TOKEN}-pbs_stage1.sh"
+EVAL_PREP_STAGE="$STAGING_PREFIX/${STAGE_TOKEN}-pbs_select_eval.sh"
+STAGE1_PATHS_SH="$STAGING_PREFIX/${STAGE_TOKEN}-pbs_paths.sh"
+# Recorded from pbs_paths.sh at this source revision; do not recompute on login.
+STAGE1_PATHS_SHA256=3bd3461524bbbd782f0a8d1be61de8f51bc3bd8c56c6de18692f81417932477a
+scp -p experiments/atomistic/stage1/polaris/pbs_stage1.sh "$WRAPPER_STAGE"
+scp -p experiments/atomistic/stage1/polaris/pbs_prepare.sh "$PREP_STAGE"
+scp -p experiments/atomistic/stage1/polaris/pbs_select_eval.sh "$EVAL_PREP_STAGE"
+scp -p experiments/atomistic/stage1/polaris/pbs_paths.sh "$STAGE1_PATHS_SH"
 PREP_JOB_ID="$(qsub -N "stage1-prep-${SYSTEM}-${SOURCE_SHA:0:8}" \
   -A HetRxnEnergy -q debug \
   -l select=1:system=polaris:ncpus=4,walltime=00:20:00,filesystems=home:eagle,place=scatter \
-  -o "$RESULTS_ROOT/logs/prep.pbs.out" -e "$RESULTS_ROOT/logs/prep.pbs.err" \
-  -v SOURCE_REPO="$SOURCE_REPO",SOURCE_SHA="$SOURCE_SHA",RESULTS_ROOT="$RESULTS_ROOT",SYSTEM="$SYSTEM",LINEAGE_SEEDS="1:2:3",PYBIN="$PYBIN",WRAPPER_PATH="$WRAPPER",EVAL_PREP_PATH="$EVAL_PREP_SCRIPT",SMOKE_RESULTS_ROOT="$RESULTS_ROOT/ramp-up-r1",SMOKE_SELECTED_ROW="$RESULTS_ROOT/ramp-up-r1/plan/selected-train.json" \
-  "$PREP_SCRIPT")"
+  -o "$STAGING_PREFIX/${STAGE_TOKEN}-prep.pbs.out" \
+  -e "$STAGING_PREFIX/${STAGE_TOKEN}-prep.pbs.err" \
+  -v SOURCE_REPO="$SOURCE_REPO",SOURCE_SHA="$SOURCE_SHA",RESULTS_ROOT="$RESULTS_ROOT",SYSTEM="$SYSTEM",LINEAGE_SEEDS="1:2:3",PYBIN="$PYBIN",WRAPPER_PATH="$WRAPPER",EVAL_PREP_PATH="$EVAL_PREP_SCRIPT",SMOKE_RESULTS_ROOT="$RESULTS_ROOT/ramp-up-r1",SMOKE_SELECTED_ROW="$RESULTS_ROOT/ramp-up-r1/plan/selected-train.json",STAGE1_PATHS_SH="$STAGE1_PATHS_SH",STAGE1_PATHS_SHA256="$STAGE1_PATHS_SHA256",STAGED_PREP_PATH="$PREP_STAGE",STAGED_WRAPPER_PATH="$WRAPPER_STAGE",STAGED_EVAL_PREP_PATH="$EVAL_PREP_STAGE" \
+  "$PREP_STAGE")"
 printf 'submitted prep job %s\n' "$PREP_JOB_ID"
 qstat -xf "$PREP_JOB_ID"
 ```
@@ -159,7 +170,6 @@ route and for a bounded qualification; only the latter adds the
 already-approved `execution.stop_at` datum in its separate request file.
 
 ```bash
-mkdir -p "$RESULTS_ROOT"/{inputs,logs,plan,launch}
 ls -l "$RESULTS_ROOT/plan/phase1-manifest.json" "$RESULTS_ROOT/plan/selected-train.json"
 ls -l "$RESULTS_ROOT/launch/render-receipt.json"
 ```
@@ -251,7 +261,7 @@ EVAL_JOB_ID="$(qsub -N "stage1-eval-prep-${SYSTEM}-${SOURCE_SHA:0:8}" \
   -A HetRxnEnergy -q debug \
   -l select=1:system=polaris:ncpus=4,walltime=00:10:00,filesystems=home:eagle,place=scatter \
   -o "$RESULTS_ROOT/logs/eval-prep.pbs.out" -e "$RESULTS_ROOT/logs/eval-prep.pbs.err" \
-  -v SOURCE_SHA="$SOURCE_SHA",RESULTS_ROOT="$RESULTS_ROOT",SYSTEM="$SYSTEM",CHECKOUT_ROOT="$CHECKOUT_ROOT",PRIME_ENV="$PRIME_ENV",PHASE2_MANIFEST="$RESULTS_ROOT/plan/phase2-manifest.json",SELECTED_EVAL="$EVAL_SELECTED_ROW" \
+  -v SOURCE_SHA="$SOURCE_SHA",RESULTS_ROOT="$RESULTS_ROOT",SYSTEM="$SYSTEM",CHECKOUT_ROOT="$CHECKOUT_ROOT",PRIME_ENV="$PRIME_ENV",PHASE2_MANIFEST="$RESULTS_ROOT/plan/phase2-manifest.json",SELECTED_EVAL="$EVAL_SELECTED_ROW",STAGE1_PATHS_SH="$STAGE1_PATHS_SH",STAGE1_PATHS_SHA256="$STAGE1_PATHS_SHA256" \
   "$EVAL_PREP_SCRIPT")"
 printf 'submitted eval-prep job %s\n' "$EVAL_JOB_ID"
 qstat -xf "$EVAL_JOB_ID"
@@ -286,6 +296,17 @@ qsub -A HetRxnEnergy -q debug \
 Collection is a product/result verdict only if the manifest, row statuses,
 checkpoint evidence, per-row assertions, and collection JSON reconcile.  PBS
 completion alone is not a scientific result.
+
+## Login-node audit
+
+The Polaris login node performs only scheduler submission/observation and
+named-file staging or inspection.  The allowed command surface is `qsub`,
+`qstat`, named-file `ls`/`stat`/`head`, named-file `scp`, pure variable
+assignment, and shell builtins such as `printf`, `test`, and `:`.  In
+particular, no login-node `mkdir`, Python, `uv`, `git clone`, row rendering,
+hashing, or data reduction is allowed.  The prep allocation creates its own
+results/log roots after the shared-helper containment check; the eval-prep
+allocation creates its selected-row parent inside that same retained root.
 
 ## Dry-exec and guard evidence
 
