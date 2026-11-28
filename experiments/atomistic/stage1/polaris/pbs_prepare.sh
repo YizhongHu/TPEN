@@ -31,6 +31,7 @@ CHECKOUT_ROOT="${CHECKOUT_ROOT:-${RESULTS_ROOT}/checkout}"
 UV_CACHE_DIR="${UV_CACHE_DIR:-${RESULTS_ROOT}/uv-cache}"
 PRIME_ENV="${PRIME_ENV:-${RESULTS_ROOT}/prime-env}"
 BUNDLE_INPUT_PATH="${BUNDLE_INPUT_PATH:-${RESULTS_ROOT}/inputs/TPEN-${SOURCE_SHA}.bundle}"
+BUNDLE_VERIFY_ROOT="${BUNDLE_VERIFY_ROOT:-${RESULTS_ROOT}/bundle-verify}"
 PHASE1_MANIFEST="${PHASE1_MANIFEST:-${RESULTS_ROOT}/plan/phase1-manifest.json}"
 SELECTED_ROW="${SELECTED_ROW:-${RESULTS_ROOT}/plan/selected-train.json}"
 LAUNCH_ROOT="${LAUNCH_ROOT:-${RESULTS_ROOT}/launch}"
@@ -82,6 +83,7 @@ assert_results_path "$RESULTS_PREFIX_CANONICAL" "$SELECTED_ROW" SELECTED_ROW "$R
 assert_results_path "$RESULTS_PREFIX_CANONICAL" "$LAUNCH_ROOT" LAUNCH_ROOT "$RESULTS_PREFIX"
 assert_results_path "$RESULTS_PREFIX_CANONICAL" "$WRAPPER_PATH" WRAPPER_PATH "$RESULTS_PREFIX"
 assert_results_path "$RESULTS_PREFIX_CANONICAL" "$BUNDLE_INPUT_PATH" BUNDLE_INPUT_PATH "$RESULTS_PREFIX"
+assert_results_path "$RESULTS_PREFIX_CANONICAL" "$BUNDLE_VERIFY_ROOT" BUNDLE_VERIFY_ROOT "$RESULTS_PREFIX"
 if [[ -n "$SMOKE_RESULTS_ROOT" || -n "$SMOKE_SELECTED_ROW" ]]; then
   [[ -n "$SMOKE_RESULTS_ROOT" && -n "$SMOKE_SELECTED_ROW" ]] ||
     die "SMOKE_RESULTS_ROOT and SMOKE_SELECTED_ROW must be supplied together"
@@ -93,6 +95,7 @@ if [[ -n "$EVAL_PREP_PATH" ]]; then
 fi
 
 [[ ! -e "$CHECKOUT_ROOT" && ! -L "$CHECKOUT_ROOT" ]] || die "CHECKOUT_ROOT already exists: $CHECKOUT_ROOT"
+[[ ! -e "$BUNDLE_VERIFY_ROOT" && ! -L "$BUNDLE_VERIFY_ROOT" ]] || die "BUNDLE_VERIFY_ROOT already exists: $BUNDLE_VERIFY_ROOT"
 [[ ! -e "$PRIME_ENV" && ! -L "$PRIME_ENV" ]] || die "PRIME_ENV already exists: $PRIME_ENV"
 [[ -f "$SOURCE_BUNDLE_PATH" && ! -L "$SOURCE_BUNDLE_PATH" ]] ||
   die "staged source bundle is missing or not a regular file: $SOURCE_BUNDLE_PATH"
@@ -104,12 +107,15 @@ if [[ -n "$STAGED_PREP_PATH" ]]; then
   [[ -f "$STAGED_PREP_PATH" ]] || die "staged preparation script is missing: $STAGED_PREP_PATH"
   cp -- "$STAGED_PREP_PATH" "$RESULTS_ROOT/inputs/pbs_prepare.sh"
 fi
+# BEGIN BUNDLE CLONE VERIFY
+mkdir -p -- "$BUNDLE_VERIFY_ROOT"
 cp -- "$SOURCE_BUNDLE_PATH" "$BUNDLE_INPUT_PATH"
 SOURCE_BUNDLE_ACTUAL_SHA256="$(sha256sum "$BUNDLE_INPUT_PATH")"
 [[ "${SOURCE_BUNDLE_ACTUAL_SHA256%% *}" == "$SOURCE_BUNDLE_SHA256" ]] ||
   die "source bundle SHA-256 mismatch: $SOURCE_BUNDLE_PATH"
 sha256sum "$BUNDLE_INPUT_PATH" > "$RESULTS_ROOT/inputs/TPEN-${SOURCE_SHA}.bundle.sha256"
-git bundle verify "$BUNDLE_INPUT_PATH" > "$RESULTS_ROOT/inputs/TPEN-${SOURCE_SHA}.bundle.verify"
+git init --quiet "$BUNDLE_VERIFY_ROOT"
+git -C "$BUNDLE_VERIFY_ROOT" bundle verify "$BUNDLE_INPUT_PATH" > "$RESULTS_ROOT/inputs/TPEN-${SOURCE_SHA}.bundle.verify"
 if [[ -n "$STAGED_WRAPPER_PATH" ]]; then
   [[ -f "$STAGED_WRAPPER_PATH" ]] || die "staged execution wrapper is missing: $STAGED_WRAPPER_PATH"
   cp -- "$STAGED_WRAPPER_PATH" "$WRAPPER_PATH"
@@ -142,6 +148,7 @@ git -C "$CHECKOUT_ROOT" checkout --detach "$SOURCE_SHA"
 [[ "$(git -C "$CHECKOUT_ROOT" rev-parse --is-shallow-repository)" == false ]] || die "checkout must be a full clone"
 [[ -z "$(git -C "$CHECKOUT_ROOT" config --local --get-regexp '^remote\..*\.promisor$' || true)" ]] || die "checkout has a promisor remote"
 [[ -z "$(git -C "$CHECKOUT_ROOT" config --local --get extensions.partialclone || true)" ]] || die "checkout is a partial clone"
+# END BUNDLE CLONE VERIFY
 
 # ALCF Polaris Running Jobs guide, accessed 2026-11-28, documents this exact
 # proxy set for compute-node internet access. SOAP E1 measured it working for

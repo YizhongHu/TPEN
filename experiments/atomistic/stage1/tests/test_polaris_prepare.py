@@ -31,7 +31,8 @@ def test_prepare_job_owns_clone_uv_prime_and_row_rendering() -> None:
     assert "SOURCE_REPO" not in text
     assert "SOURCE_BUNDLE_PATH" in text
     assert "SOURCE_BUNDLE_SHA256" in text
-    assert 'git bundle verify "$BUNDLE_INPUT_PATH"' in text
+    assert 'git -C "$BUNDLE_VERIFY_ROOT" bundle verify "$BUNDLE_INPUT_PATH"' in text
+    assert 'git bundle verify "$BUNDLE_INPUT_PATH"' not in text
     assert 'git -C "$CHECKOUT_ROOT" checkout --detach "$SOURCE_SHA"' in text
     assert 'rev-parse HEAD)" == "$SOURCE_SHA"' in text
     assert '"$PYBIN" -m uv lock --check --project "$CHECKOUT_ROOT"' in text
@@ -44,6 +45,88 @@ def test_prepare_job_owns_clone_uv_prime_and_row_rendering() -> None:
     assert 'SMOKE_SELECTED_ROW' in text
     assert 'pbs_select_eval.sh.sha256' in text
     assert 'pbs_paths.sh.sha256' in text
+
+
+def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args], cwd=cwd, text=True, capture_output=True, check=True
+    )
+
+
+def _make_bundle_fixture(root: Path) -> tuple[Path, str, str]:
+    root.mkdir()
+    source = root / "source"
+    source.mkdir()
+    _git("init", "-q", cwd=source)
+    _git("config", "user.email", "tpen-tests@example.com", cwd=source)
+    _git("config", "user.name", "TPEN tests", cwd=source)
+    (source / "marker.txt").write_text("bundle\n", encoding="utf-8")
+    _git("add", "marker.txt", cwd=source)
+    _git("commit", "-qm", "bundle fixture", cwd=source)
+    source_sha = _git("rev-parse", "HEAD", cwd=source).stdout.strip()
+    bundle = root / "fixture.bundle"
+    _git("bundle", "create", str(bundle), "--all", cwd=source)
+    return bundle, source_sha, hashlib.sha256(bundle.read_bytes()).hexdigest()
+
+
+def _bundle_verify_block() -> str:
+    text = SCRIPT.read_text(encoding="utf-8")
+    start = text.index("# BEGIN BUNDLE CLONE VERIFY")
+    end = text.index("# END BUNDLE CLONE VERIFY", start)
+    return text[start:end]
+
+
+def _run_bundle_verify_block(
+    root: Path, bundle: Path, source_sha: str, expected_sha256: str
+) -> subprocess.CompletedProcess[str]:
+    root.mkdir()
+    results_root = root / "results"
+    command = f"""
+set -Eeuo pipefail
+die() {{ printf 'TEST PREP FAIL %s\\n' "$*" >&2; exit 2; }}
+RESULTS_ROOT={shlex.quote(str(results_root))}
+SOURCE_BUNDLE_PATH={shlex.quote(str(bundle))}
+SOURCE_BUNDLE_SHA256={shlex.quote(expected_sha256)}
+SOURCE_SHA={shlex.quote(source_sha)}
+BUNDLE_INPUT_PATH="$RESULTS_ROOT/inputs/TPEN-$SOURCE_SHA.bundle"
+BUNDLE_VERIFY_ROOT="$RESULTS_ROOT/bundle-verify"
+CHECKOUT_ROOT="$RESULTS_ROOT/checkout"
+STAGED_PREP_PATH=""
+STAGED_WRAPPER_PATH=""
+STAGED_EVAL_PREP_PATH=""
+EVAL_PREP_PATH=""
+WRAPPER_PATH="$RESULTS_ROOT/inputs/pbs_stage1.sh"
+mkdir -p -- "$RESULTS_ROOT/inputs"
+printf '%s\\n' '# helper' > "$RESULTS_ROOT/paths.sh"
+printf '%s\\n' '# wrapper' > "$WRAPPER_PATH"
+STAGE1_PATHS_SH="$RESULTS_ROOT/paths.sh"
+{_bundle_verify_block()}
+"""
+    return subprocess.run(
+        ["bash", "-c", command],
+        cwd=root,
+        env={"PATH": "/usr/bin:/bin"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_prepare_bundle_clone_verify_executes_without_surrounding_repository(
+    tmp_path: Path,
+) -> None:
+    bundle, source_sha, digest = _make_bundle_fixture(tmp_path / "fixture")
+
+    result = _run_bundle_verify_block(tmp_path / "success", bundle, source_sha, digest)
+    assert result.returncode == 0, result.stderr
+    checkout = tmp_path / "success" / "results" / "checkout"
+    assert (checkout / "marker.txt").read_text(encoding="utf-8") == "bundle\n"
+
+    wrong = _run_bundle_verify_block(
+        tmp_path / "wrong", bundle, source_sha, "0" * 64
+    )
+    assert wrong.returncode != 0
+    assert "source bundle SHA-256 mismatch" in wrong.stderr
 
 
 def test_prepare_job_never_submits_or_transfers_from_the_allocation() -> None:

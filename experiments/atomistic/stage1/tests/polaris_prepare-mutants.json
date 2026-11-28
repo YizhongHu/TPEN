@@ -29,6 +29,13 @@
       "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_prepare_job_owns_clone_uv_prime_and_row_rendering"
     },
     {
+      "id": "prep-bundle-verify-repositoryless",
+      "target": "experiments/atomistic/stage1/polaris/pbs_prepare.sh",
+      "old": "git -C \"$BUNDLE_VERIFY_ROOT\" bundle verify \"$BUNDLE_INPUT_PATH\"",
+      "new": "git bundle verify \"$BUNDLE_INPUT_PATH\"",
+      "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_prepare_bundle_clone_verify_executes_without_surrounding_repository"
+    },
+    {
       "id": "prep-lexical-containment-restored",
       "target": "experiments/atomistic/stage1/polaris/pbs_paths.sh",
       "old": "canonical=\"$(canonicalize_path \"$path\")\"",

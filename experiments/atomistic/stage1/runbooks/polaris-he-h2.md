@@ -98,10 +98,12 @@ the named bundle in the staging transfers below.
 The source is transported as a git bundle, not fetched from GitHub by the
 compute node. Create the bundle from the exact `SOURCE_SHA` in the controlling
 checkout, record its SHA-256, and stage that named file beside the four scripts.
-The prep job copies the bundle into `inputs/`, verifies the recorded hash and
-`git bundle verify`, then clones from that local Eagle bundle and checks out the
-exact SHA. This removes any dependency on compute-node access to GitHub while
-preserving a full, non-promisor checkout.
+The prep job copies the bundle into `inputs/`, verifies the recorded hash,
+initializes an empty per-run repository solely for `git bundle verify`, then
+clones from that local Eagle bundle and checks out the exact SHA. This keeps
+bundle verification independent of PBS's spooled working directory, removes
+any dependency on compute-node access to GitHub, and preserves a full,
+non-promisor checkout.
 
 The debug preparation job creates `RESULTS_ROOT` and its `logs/`, `plan/`,
 `launch/`, and `inputs/` children after the containment check.  The login node
