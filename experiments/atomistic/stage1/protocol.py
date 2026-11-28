@@ -30,6 +30,12 @@ SYSTEMS = ("hooke1", "hooke2", "qho2e", "he", "h2")
 KINDS = ("smoke", "train", "eval")
 CONFIG_IDENTITY_RULE = "stage1-config-v1"
 LEGACY_CONFIG_IDENTITY_RULE = "legacy-config-sha256"
+_HOOKEE2_VARIANT_EVAL_CONFIGS = {
+    "configs/hooke2/positive_singlet_tail.yaml":
+        "configs/hooke2/positive_singlet_tail_eval.yaml",
+    "configs/hooke2/positive_singlet_comparator.yaml":
+        "configs/hooke2/positive_singlet_comparator_eval.yaml",
+}
 HOOKE_SCIENCE_PROFILE = "hooke-hv2-v1"
 HOOKE_TRAINING_SEED_RULE = "stage1-training-seeds-v1"
 HOOKE_EVAL_SELECTION = "A37"
@@ -507,8 +513,14 @@ def _validate_extension_shape(row: Mapping[str, Any], *, expected_kind: str | No
     if not isinstance(row.get("config"), str):
         raise ProtocolError("materialized row config is invalid")
     expected_config = f"configs/{row['system']}/{kind}.yaml"
-    if row["config"] != expected_config:
-        raise ProtocolError("materialized row config is not the canonical system config")
+    allowed_configs = {expected_config}
+    if row["system"] == "hooke2":
+        allowed_configs.update(
+            _HOOKEE2_VARIANT_EVAL_CONFIGS
+            if kind == "train" else _HOOKEE2_VARIANT_EVAL_CONFIGS.values()
+        )
+    if row["config"] not in allowed_configs:
+        raise ProtocolError("materialized row config is not an admitted system config")
     _require_sha(row.get("source_sha"), length=40, field="source_sha")
     _require_sha(row.get("config_sha256"), length=64, field="config_sha256")
     for key in ("row_id", "experiment_name", "sector", "run_id", "depends_on"):
@@ -1150,7 +1162,62 @@ def compose_train_overlay(
     return cfg
 
 
-def _config_files_for_system(system: str, config_root: str | Path) -> tuple[Path, ...]:
+def evaluation_config_for_train_config(config: str) -> str:
+    """Return the native eval config paired with one train config.
+
+    The generic Stage-1 train rows retain the historical Pfaffian eval config.
+    The two opt-in Hooke-2 positive-singlet arms carry their own eval graph so
+    model-only checkpoint loading remains strict.
+    """
+
+    if not isinstance(config, str):
+        raise ProtocolError("train config must be a string")
+    variant = _HOOKEE2_VARIANT_EVAL_CONFIGS.get(config)
+    if variant is not None:
+        return variant
+    path = Path(config)
+    if path.name != "train.yaml" or len(path.parts) < 3:
+        raise ProtocolError(f"unsupported Stage-1 train config {config!r}")
+    return f"{path.parent.as_posix()}/eval.yaml"
+
+
+def config_variant_for_train_config(config: str) -> str | None:
+    """Return the explicit arm name for a variant train config, if any."""
+
+    if not isinstance(config, str):
+        raise ProtocolError("train config must be a string")
+    if config in _HOOKEE2_VARIANT_EVAL_CONFIGS:
+        return Path(config).stem
+    return None
+
+
+def _train_config_for_eval_config(config: str) -> str:
+    """Return the train config paired with one native eval config."""
+
+    for train_config, eval_config in _HOOKEE2_VARIANT_EVAL_CONFIGS.items():
+        if config == eval_config:
+            return train_config
+    path = Path(config)
+    if path.name != "eval.yaml" or len(path.parts) < 3:
+        raise ProtocolError(f"unsupported Stage-1 eval config {config!r}")
+    return f"{path.parent.as_posix()}/train.yaml"
+
+
+def validate_eval_config_for_row(config: str, system: str) -> None:
+    """Validate that an eval row selects the eval graph for its system arm."""
+
+    if not isinstance(system, str) or system not in SYSTEMS:
+        raise ProtocolError("eval row has an unknown system")
+    train_config = _train_config_for_eval_config(config)
+    if train_config.split("/", 2)[1:] != [system, train_config.rsplit("/", 1)[1]]:
+        raise ProtocolError("eval config is bound to a different Stage-1 system")
+    if evaluation_config_for_train_config(train_config) != config:
+        raise ProtocolError("eval config is not paired with its Stage-1 train config")
+
+
+def _config_files_for_system(
+    system: str, config_root: str | Path, *, config_variant: str | None = None,
+) -> tuple[Path, ...]:
     """Return the canonical config inputs owned by one Stage-1 system.
 
     Stage-1 configs currently have empty Hydra defaults, so the two explicit
@@ -1162,7 +1229,17 @@ def _config_files_for_system(system: str, config_root: str | Path) -> tuple[Path
     if system not in SYSTEMS:
         raise ProtocolError(f"unknown Stage-1 system {system!r}")
     root = Path(config_root).resolve()
-    paths = tuple((root / system / f"{kind}.yaml").resolve() for kind in ("train", "eval"))
+    if config_variant is None:
+        paths = tuple((root / system / f"{kind}.yaml").resolve() for kind in ("train", "eval"))
+    else:
+        if system != "hooke2" or config_variant not in {
+            "positive_singlet_tail", "positive_singlet_comparator",
+        }:
+            raise ProtocolError(f"unsupported config variant {config_variant!r}")
+        paths = (
+            (root / system / f"{config_variant}.yaml").resolve(),
+            (root / system / f"{config_variant}_eval.yaml").resolve(),
+        )
     if any(not path.is_file() for path in paths):
         missing = next(path for path in paths if not path.is_file())
         raise ProtocolError(f"missing Stage-1 config input {missing}")
@@ -1170,7 +1247,8 @@ def _config_files_for_system(system: str, config_root: str | Path) -> tuple[Path
 
 
 def config_identity(*, config_root: str | Path, systems: tuple[str, ...] | list[str] | None = None,
-                    science_profile: str | None = None) -> dict[str, Any]:
+                    science_profile: str | None = None,
+                    config_variant: str | None = None) -> dict[str, Any]:
     """Compute the versioned, canonical identity of selected config inputs.
 
     The digest covers a sorted path list and each file's canonical bytes.  It
@@ -1181,7 +1259,9 @@ def config_identity(*, config_root: str | Path, systems: tuple[str, ...] | list[
     selected = tuple(SYSTEMS if systems is None else systems)
     if not selected or len(set(selected)) != len(selected):
         raise ProtocolError("systems must contain one or more distinct systems")
-    files = sorted({path for system in selected for path in _config_files_for_system(system, config_root)},
+    files = sorted({path for system in selected for path in _config_files_for_system(
+        system, config_root, config_variant=config_variant,
+    )},
                    key=lambda path: path.relative_to(Path(config_root).resolve()).as_posix())
     digest = hashlib.sha256()
     entries: list[str] = []
@@ -1195,6 +1275,16 @@ def config_identity(*, config_root: str | Path, systems: tuple[str, ...] | list[
         digest.update(b"\0")
         digest.update(raw)
         entries.append(relative)
+    if config_variant is not None:
+        marker = json.dumps(
+            ["stage1-config-variant-v1", config_variant],
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        digest.update(b"config-variant\0")
+        digest.update(str(len(marker)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(marker)
+        entries.append(f"config-variant:{config_variant}")
     if science_profile is not None:
         if not is_model_profile(science_profile):
             raise ProtocolError(f"unknown science profile {science_profile!r}")
@@ -1219,7 +1309,8 @@ def config_identity(*, config_root: str | Path, systems: tuple[str, ...] | list[
 
 
 def config_identities(*, config_root: str | Path, systems: tuple[str, ...] | list[str] | None = None,
-                      science_profile: str | None = None) -> dict[str, str]:
+                      science_profile: str | None = None,
+                      config_variant: str | None = None) -> dict[str, str]:
     """Return one computed config digest per selected system."""
 
     selected = tuple(SYSTEMS if systems is None else systems)
@@ -1227,6 +1318,7 @@ def config_identities(*, config_root: str | Path, systems: tuple[str, ...] | lis
         raise ProtocolError("systems must contain distinct known Stage-1 systems")
     return {system: str(config_identity(
         config_root=config_root, systems=(system,), science_profile=science_profile,
+        config_variant=config_variant,
     )["sha256"])
             for system in selected}
 
@@ -1240,15 +1332,28 @@ def _validate_config_identity_for_row(row: Mapping[str, Any], config_path: str |
     if not isinstance(system, str) or system not in SYSTEMS:
         raise ProtocolError("computed config identity requires a known system")
     path = Path(config_path).resolve()
-    expected_name = "eval.yaml" if row.get("kind") == "eval" else "train.yaml"
-    expected_path = path.parent / expected_name
-    if path != expected_path or path.parent.name != system:
+    relative = path.relative_to(Path(__file__).resolve().parent / "configs").as_posix()
+    expected_generic = {
+        f"{system}/train.yaml", f"{system}/eval.yaml",
+    }
+    variant_by_train = {
+        train.removeprefix("configs/"): eval.removeprefix("configs/")
+        for train, eval in _HOOKEE2_VARIANT_EVAL_CONFIGS.items()
+    }
+    allowed = expected_generic | set(variant_by_train) | set(variant_by_train.values())
+    if relative not in allowed or path.parent.name != system:
         raise ProtocolError("config path does not match the bound Stage-1 system")
+    variant = next((Path(train).stem for train, eval in _HOOKEE2_VARIANT_EVAL_CONFIGS.items()
+                    if relative in {train.removeprefix("configs/"), eval.removeprefix("configs/")}), None)
+    if row.get("kind") == "eval":
+        validate_eval_config_for_row(f"configs/{relative}", system)
+    elif variant is None and relative != f"{system}/train.yaml":
+        raise ProtocolError("train config is not a canonical Stage-1 train config")
     actual = config_identity(
         config_root=path.parent.parent, systems=(system,),
         science_profile=row.get("science_profile") if is_model_profile(
             row.get("science_profile")
-        ) else None,
+        ) else None, config_variant=variant,
     )["sha256"]
     if actual != row.get("config_sha256"):
         raise ProtocolError("executed config identity does not match binding")
@@ -2468,6 +2573,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                    overlay: str | Path | None = None,
                    overlay_sha256: str | None = None,
                    science_profile: str | None = None,
+                   config_variant: str | None = None,
                    evaluation_selection: str | None = None,
                    overlay_profile: str = OVERLAY_PROFILE_V1,
                    include_smoke: bool = True,
@@ -2499,6 +2605,12 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         None, HOOKE_SCIENCE_PROFILE, HE_SIGMOID_PROFILE, *HOOKE2_ACT50_ALL_PROFILES,
     }:
         raise ProtocolError("unknown science profile")
+    if config_variant is not None and (set(selected) != {"hooke2"}
+                                       or config_variant not in {
+                                           "positive_singlet_tail",
+                                           "positive_singlet_comparator",
+                                       }):
+        raise ProtocolError("positive-singlet config variants only admit hooke2")
     if science_profile in HOOKE2_ACT50_SEGMENTED_PROFILES:
         if overlay_profile not in {OVERLAY_PROFILE_V1, OVERLAY_PROFILE_V3}:
             raise ProtocolError("segmented ACT50 requires diagnostics-v3")
@@ -2689,6 +2801,14 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
         if hooke_science_profile and effective_protocol.retention_cadence is not None
         else list(checkpoints)
     )
+    train_config = (
+        f"configs/hooke2/{config_variant}.yaml"
+        if config_variant is not None else None
+    )
+    eval_config = (
+        evaluation_config_for_train_config(train_config)
+        if train_config is not None else None
+    )
     for spec in SYSTEM_SPECS:
         if spec.name not in selected:
             continue
@@ -2705,7 +2825,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                 "config_identity_rule": config_identity_rule,
                 # v3 compatibility only. New qualification requests are
                 # derived from a train row and retain its full recipe.
-                "config": f"configs/{spec.name}/train.yaml", "results_root": root,
+                "config": train_config or f"configs/{spec.name}/train.yaml", "results_root": root,
                 "experiment_name": "stage1", "sector": spec.name, "run_id": "smoke",
                 "updates": protocol.smoke_updates,
                 "walkers": protocol.smoke_walkers,
@@ -2728,7 +2848,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                 "kind": "train", "lineage": lineage, "seed": train_seed,
                 "source_sha": source_sha, "config_sha256": config_ids[spec.name],
                 "config_identity_rule": config_identity_rule,
-                "config": f"configs/{spec.name}/train.yaml", "results_root": root,
+                "config": train_config or f"configs/{spec.name}/train.yaml", "results_root": root,
                 "experiment_name": "stage1", "sector": spec.name,
                 "run_id": f"train-lineage-{lineage}",
                 "updates": effective_protocol.lineage_updates if hooke_science_profile else protocol.lineage_updates,
@@ -2801,7 +2921,7 @@ def build_manifest(*, protocol: Protocol, source_sha: str,
                         "walkers": protocol.eval_walkers, "draws": protocol.eval_draws,
                         "source_sha": source_sha, "config_sha256": config_ids[spec.name],
                         "config_identity_rule": config_identity_rule,
-                        "config": f"configs/{spec.name}/eval.yaml", "results_root": root,
+                        "config": eval_config or f"configs/{spec.name}/eval.yaml", "results_root": root,
                         "expected_physical_system_id": physical_ids[spec.name],
                         "experiment_name": "stage1", "sector": spec.name, "run_id": eval_id,
                         "checkpoint_dir": str(checkpoint_dir), "checkpoint_file": str(checkpoint_file),
@@ -3105,7 +3225,8 @@ def bind_evaluation_manifest(*, phase1_rows: list[Mapping[str, Any]],
                     "config_identity_rule": CONFIG_IDENTITY_RULE,
                     "phase1_manifest_hash": phase1_manifest_hash,
                     "phase1_train_row_hash": manifest_hash([train_row]),
-                    "config": f"configs/{system}/eval.yaml", "results_root": train_row["results_root"],
+                    "config": evaluation_config_for_train_config(str(train_row["config"])),
+                    "results_root": train_row["results_root"],
                     "expected_physical_system_id": physical_ids[system],
                     "experiment_name": train_row["experiment_name"], "sector": train_row["sector"],
                     "run_id": f"{system}-lineage-{lineage}-checkpoint-{checkpoint}-stream-{stream}",
