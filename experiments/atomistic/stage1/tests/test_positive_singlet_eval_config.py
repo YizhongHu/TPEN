@@ -17,9 +17,9 @@ from experiments.atomistic.stage1.launch import _binding_token, command_for_row
 from experiments.atomistic.stage1.protocol import (
     Protocol,
     build_manifest,
+    bind_evaluation_manifest,
     config_identities,
     decode_binding,
-    evaluation_config_for_train_config,
     manifest_hash,
     physical_system_id_from_config,
     resolve_run_dir,
@@ -41,10 +41,8 @@ def _phase2_rows(
         lineage_walkers=2, lineages=1, eval_streams=1, eval_walkers=2,
         eval_draws=2,
     )
-    config_sha = config_identities(
-        config_root=ROOT, systems=("hooke2",), config_variant=config_variant,
-    )
-    return build_manifest(
+    config_sha = config_identities(config_root=ROOT, systems=("hooke2",))
+    rows = build_manifest(
         protocol=protocol, source_sha="a" * 40, config_sha256=config_sha,
         checkpoints=[0, 3], lineage_seeds=[11],
         checkpoint_sha256={("hooke2", 0, 0): "b" * 64,
@@ -52,8 +50,56 @@ def _phase2_rows(
         results_root=results_root, systems=("hooke2",), phase=2,
         expected_physical_system_id={
             "hooke2": physical_system_id_from_config(HOOKE2 / "eval.yaml"),
-        }, config_variant=config_variant,
+        },
     )
+    if config_variant is not None:
+        for row in rows:
+            row["config_identity_rule"] = "legacy-config-sha256"
+            row["config"] = (
+                f"configs/hooke2/{config_variant}.yaml"
+                if row["kind"] == "train"
+                else f"configs/hooke2/{config_variant}_eval.yaml"
+            )
+            row["row_id"] = manifest_hash([
+                {key: value for key, value in row.items() if key != "row_id"}
+            ])
+    return rows
+
+
+def _bound_variant_eval_row() -> dict[str, object]:
+    """Bind one variant train row through the native phase-2 adapter."""
+
+    protocol = Protocol(
+        smoke_updates=1, smoke_walkers=2, lineage_updates=3,
+        lineage_walkers=2, lineages=1, eval_streams=1, eval_walkers=2,
+        eval_draws=2,
+    )
+    phase1 = build_manifest(
+        protocol=protocol, source_sha="a" * 40,
+        config_sha256=config_identities(config_root=ROOT, systems=("hooke2",)),
+        checkpoints=[0, 3], lineage_seeds=[11], checkpoint_sha256={},
+        results_root="/external/stage1", systems=("hooke2",), phase=1,
+    )
+    train = next(row for row in phase1 if row["kind"] == "train")
+    train["config"] = "configs/hooke2/positive_singlet_tail.yaml"
+    train["row_id"] = manifest_hash([
+        {key: value for key, value in train.items() if key != "row_id"}
+    ])
+    phase1_hash = manifest_hash(phase1)
+    evidence = {
+        "schema": "stage1-checkpoint-evidence/v1",
+        "phase1_manifest_hash": phase1_hash,
+        "phase1_train_row_hashes": {
+            "hooke2:0": manifest_hash([train]),
+        },
+        "checkpoints": {"hooke2:0:3": "c" * 64},
+    }
+    return next(row for row in bind_evaluation_manifest(
+        phase1_rows=phase1, checkpoints=[3], checkpoint_evidence=evidence,
+        expected_physical_system_id={"hooke2": "d" * 64},
+        config_sha256=config_identities(config_root=ROOT, systems=("hooke2",)),
+        protocol=protocol, phase1_manifest_hash=phase1_hash,
+    ) if row["kind"] == "eval")
 
 
 def test_positive_singlet_train_and_eval_graphs_strictly_match() -> None:
@@ -103,6 +149,14 @@ def test_native_eval_rows_and_launch_preserve_positive_singlet_selection() -> No
         assert decode_binding(token)["config"] == evaluation["config"]
 
 
+def test_native_phase2_binding_selects_tail_eval_config() -> None:
+    """The native phase-1-to-phase-2 adapter follows the selected train arm."""
+
+    assert _bound_variant_eval_row()["config"] == (
+        "configs/hooke2/positive_singlet_tail_eval.yaml"
+    )
+
+
 def test_native_tail_train_checkpoint_eval_has_finite_local_energy(
     tmp_path: Path, monkeypatch,
 ) -> None:
@@ -145,6 +199,3 @@ def test_generic_pfaffian_eval_selection_is_unchanged() -> None:
     generic = load_config(str(HOOKE2 / "eval.yaml"))
     assert generic.model.embedding.include_spins is True
     assert generic.model.readout._target_ == "tpen.nn.readout.PfaffianReadout"
-    assert evaluation_config_for_train_config("configs/hooke2/train.yaml") == (
-        "configs/hooke2/eval.yaml"
-    )
