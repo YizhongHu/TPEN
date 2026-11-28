@@ -31,6 +31,7 @@ if str(CONTROL_SOURCE) not in sys.path:
     sys.path.insert(0, str(CONTROL_SOURCE))
 
 from tpen_balsam_control.application import BalsamControlAmbiguous  # noqa: E402
+from tpen_balsam_control.application import BalsamGroupAmbiguous  # noqa: E402
 from tpen_balsam_control.sdk_adapter import DocumentedSDKOperations  # noqa: E402
 
 

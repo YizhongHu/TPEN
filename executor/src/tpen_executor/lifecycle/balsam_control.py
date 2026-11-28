@@ -195,6 +195,9 @@ def submit_fresh_batch(
         raise TypeError("store and authority callback are required")
     if registration.intent.group_id != intent.group_id or registration.backend_job_id != intent.backend_job_id:
         raise BalsamGroupRefusal("BatchJob intent crosses the registered group or Job")
+    intent_path, receipt_path, refusal_path = _record_paths(store, intent)
+    if os.path.lexists(intent_path):
+        authority = lambda: None
     authority()
     intent_path, receipt_path, refusal_path = _record_paths(store, intent)
     if any(path.is_symlink() for path in (intent_path, receipt_path, refusal_path)):
