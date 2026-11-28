@@ -192,7 +192,9 @@ def test_validated_association_passes_only_the_s6_one_host_scope(tmp_path: Path)
     )
     assignment = assign_full_node(
         parent, host="node-a", allowed_cpus=range(8),
-        device_uuids=tuple(f"GPU-{index:032x}" for index in range(2)),
+        device_uuids=tuple(
+            f"GPU-{index:08x}-0000-0000-0000-000000000000" for index in range(2)
+        ),
         node_layout=PackedNodeLayout(4, 8, 2, ("0-3", "4-7")),
     )
     allocation = associate_full_node(assignment, _registration(), observed_job_id=BackendJobId("job-7"))
