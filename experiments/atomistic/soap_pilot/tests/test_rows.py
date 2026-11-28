@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 import hashlib
@@ -13,7 +15,9 @@ import yaml
 from experiments.atomistic.soap_pilot.composer import (
     R2_PROFILES,
     TARGET_PROFILES,
+    _TRAIN_BASE,
     _OVERLAY_BASE,
+    _resolve,
     render_eval,
     render_profile,
 )
@@ -129,6 +133,73 @@ def test_every_roster_train_profile_has_golden_render_and_callback_policy(tmp_pa
     assert run_timing["accelerator_synchronize"] is True
 
 
+_INTENTIONAL_TOP_LEVEL_TRANSFORMATIONS = {
+    # Protocol: “The overlay owns train-side runtime/sampler/optimizer/trainer
+    # leaves plus diagnostic callbacks and loggers.”
+    "runtime",
+    "sampler",
+    "optimizer",
+    "trainer",
+    # Protocol: “Base callbacks are retained and the diagnostics are appended
+    # explicitly; checkpoint retention therefore stays manifest-owned.”
+    "callbacks",
+    # Protocol: “base-config -> recorder-before-checkpoint diagnostics-v2
+    # overlay -> manifest overrides”.
+    "run",
+    # Protocol: “base-config -> recorder-before-checkpoint diagnostics-v2
+    # overlay -> manifest overrides”. — profile optimizer/trainer bindings.
+    "runner",
+    "checkpoint_steps",
+    "stage1_overlay",
+}
+
+
+def _resolved_overlay_union(rendered: Mapping[str, object]) -> dict[str, object]:
+    """Resolve base+overlay references against one rendered config."""
+
+    base = yaml.safe_load(_TRAIN_BASE.read_text(encoding="utf-8"))
+    overlay = yaml.safe_load(_OVERLAY_BASE.read_text(encoding="utf-8"))
+    expected = {**deepcopy(base), **deepcopy(overlay)}
+    return {key: _resolve(value, rendered) for key, value in expected.items()}
+
+
+@pytest.mark.parametrize("profile", [*R2_PROFILES, *TARGET_PROFILES], ids=lambda profile: profile.name)
+def test_every_rendered_train_top_level_section_matches_base_overlay_or_literal_transform(
+    tmp_path: Path, profile,
+) -> None:
+    """Fail closed on any dropped/added top-level base+overlay section."""
+
+    results = tmp_path / "results"
+    rendered = render_profile(
+        profile,
+        output_dir=results / "inputs",
+        results_root=str(results),
+        source_sha="7b88f833babcb82148c8f975a08b53970838be6a",
+        device="cpu",
+    )
+    actual = rendered.rendered.values
+    expected = _resolved_overlay_union(actual)
+    expected_keys = set(expected)
+    actual_keys = set(actual)
+    dropped = sorted(expected_keys - actual_keys)
+    added = sorted(actual_keys - expected_keys)
+    unexpected_added = [key for key in added if key != "stage1_overlay"]
+    assert not dropped and not unexpected_added, (
+        "unexpected top-level section drift: "
+        f"dropped={dropped}, added={unexpected_added}"
+    )
+
+    # Every non-transformed section is compared byte-for-byte after resolving
+    # only the references that the composer itself resolves.
+    for section in sorted(expected_keys - _INTENTIONAL_TOP_LEVEL_TRANSFORMATIONS):
+        assert actual[section] == expected[section], (
+            f"unenumerated top-level section change in {section!r}"
+        )
+
+    overlay = yaml.safe_load(_OVERLAY_BASE.read_text(encoding="utf-8"))
+    assert actual["loggers"] == _resolve(overlay["loggers"], actual)
+
+
 @pytest.mark.parametrize("profile", [*R2_PROFILES, *TARGET_PROFILES], ids=lambda profile: profile.name)
 def test_every_rendered_train_callback_hydra_instantiates_on_cpu(tmp_path: Path, profile) -> None:
     """Every rendered callback has a constructible Hydra configuration."""
@@ -161,6 +232,29 @@ def test_every_rendered_train_callback_hydra_instantiates_on_cpu(tmp_path: Path,
             item for item in callbacks if item["_target_"] == "tpen.callback.OptimizerState"
         )
         assert rendered_optimizer_state["groups"] == overlay_optimizer_state["groups"]
+
+
+@pytest.mark.parametrize("profile", [*R2_PROFILES, *TARGET_PROFILES], ids=lambda profile: profile.name)
+def test_every_rendered_train_logger_hydra_instantiates_on_cpu(tmp_path: Path, profile) -> None:
+    """Every derived diagnostics logger is constructible without training."""
+
+    results = tmp_path / "results"
+    rendered = render_profile(
+        profile,
+        output_dir=results / "inputs",
+        results_root=str(results),
+        source_sha="7b88f833babcb82148c8f975a08b53970838be6a",
+        device="cpu",
+    )
+    loggers = rendered.rendered.values["loggers"]
+    assert loggers == [{"_target_": "tpen.logging.JSONL", "path": str(results / "stage1_hooke2" / "atomistic" / profile.name.replace("-", "_") / "metrics.jsonl")}]
+    for index, logger in enumerate(loggers):
+        try:
+            instance = instantiate(OmegaConf.create(logger))
+        except Exception as exc:
+            target = logger.get("_target_", "<missing target>")
+            raise AssertionError(f"{profile.name} logger {index} ({target}) failed to instantiate") from exc
+        assert instance is not None
 
 
 def test_r2_20_is_distinct_unsynchronized_cross_check(tmp_path: Path) -> None:

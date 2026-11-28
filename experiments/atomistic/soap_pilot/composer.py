@@ -205,6 +205,9 @@ def _materialize_train(profile: PilotProfile, *, results_root: str, run_id: str,
     # profile.  The renderer only changes the explicitly declared pilot knobs;
     # it does not invent a second smoke callback set.
     _set(config, "callbacks", _callbacks(config.get("callbacks", []) + diagnostics.get("callbacks", []), profile.family, profile.diagnostics_profile, synchronize=profile.train_timing_synchronize))
+    # Loggers are overlay-owned diagnostics, so carry the committed payload
+    # through the same derived composition path as callbacks.
+    _set(config, "loggers", deepcopy(diagnostics["loggers"]))
     # Materialized admission compares this provenance object byte-for-byte
     # with the row-owned overlay basis.  Keep the rendered YAML self-contained
     # while preserving the v2 recorder-before-checkpoint composition contract.
