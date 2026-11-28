@@ -105,7 +105,7 @@ STAGE1_PATHS_SH="$RESULTS_ROOT/paths.sh"
     return subprocess.run(
         ["bash", "-c", command, str(SCRIPT)],
         cwd=root,
-        env={"PATH": "/usr/bin:/bin"},
+        env={"PATH": "/usr/bin:/bin", "SYSTEM": "he"},
         text=True,
         capture_output=True,
         check=False,
