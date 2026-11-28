@@ -252,24 +252,42 @@ def check_seed_domain(rows: Sequence[Mapping[str, Any]] | None, *, matched_group
     return _ok(name, "seed/domain membership has no undeclared collision")
 
 
-def check_metric_integrity(metrics: Mapping[str, Any] | None, *, expected_dtypes: Mapping[str, str] | None = None) -> CheckResult:
-    """Reject NaN/Inf and dtype drift before any numerical comparison.
+def check_metric_integrity(metrics: Mapping[str, Any] | None) -> CheckResult:
+    """Reject non-finite persisted JSONL metric values.
 
     # Rev3 §3.1 sentence: “All floating model tensors must retain the
     # configured float64 dtype. Compare EVERY non-floating model state value exactly.”
+    # JSONL records contain scalar values without dtype metadata, so this
+    # consumer checks finiteness only; model-tensor dtype is enforced by
+    # ``check_model_float64`` below.
     """
 
-    name = "metric-finite-dtype"
+    name = "metric-finite"
     if metrics is None:
         return _missing(name, "metric evidence is required")
-    expected_dtypes = expected_dtypes or {}
-    for key, value in metrics.items():
-        if isinstance(value, float) and not math.isfinite(value):
-            return _failure(name, f"metric {key!r} is non-finite")
-        dtype = getattr(value, "dtype", None)
-        if key in expected_dtypes and dtype is not None and str(dtype).replace("torch.", "") != expected_dtypes[key]:
-            return _failure(name, f"metric {key!r} dtype drifted")
-    return _ok(name, "metrics are finite and have the configured dtypes")
+    if not isinstance(metrics, Mapping):
+        return _invalid(name, "metric evidence must be a mapping")
+
+    def first_nonfinite(value: Any, path: str) -> str | None:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                found = first_nonfinite(child, f"{path}.{key}")
+                if found is not None:
+                    return found
+        elif isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                found = first_nonfinite(child, f"{path}[{index}]")
+                if found is not None:
+                    return found
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            if not math.isfinite(float(value)):
+                return path
+        return None
+
+    nonfinite = first_nonfinite(metrics, "metrics")
+    if nonfinite is not None:
+        return _failure(name, f"metric {nonfinite!r} is non-finite")
+    return _ok(name, "JSONL metrics are finite; scalar dtype is not claimed")
 
 
 def check_state_cursor_tolerance(actual: Mapping[str, Any] | None, expected: Mapping[str, Any] | None,
@@ -413,6 +431,8 @@ def check_model_float64(config: Mapping[str, Any] | None, checkpoints: Mapping[A
 
     # Rev3 §4.2 sentence: “Derive configured dtype and checkpoint steps from
     # each rendered run; require all named checkpoint model tensors to be float64.”
+    # This is the model-tensor dtype gate; JSONL scalar metrics have no dtype
+    # metadata and are checked for finiteness only by ``check_metric_integrity``.
     name = "rendered-config-model-float64"
     if config is None or checkpoints is None:
         return _missing(name, "rendered config and named checkpoint tensors are required")
@@ -435,21 +455,69 @@ def check_model_float64(config: Mapping[str, Any] | None, checkpoints: Mapping[A
     return _ok(name, "configured dtype and all named model checkpoint tensors are float64", {"steps": steps})
 
 
-def check_disconnected_optimizer_state(state: Mapping[str, Any] | None, *, expected_tensors: int = 16, expected_elements: int = 492000) -> CheckResult:
-    """Check disconnected parameters are absent from Adam/SOAP state."""
+def check_disconnected_optimizer_state(
+    records: Sequence[Any] | None,
+    *,
+    groups: Iterable[str] | Mapping[str, Any] | None = None,
+    terminal_step: int | None = None,
+    expected_tensors: int = 16,
+) -> CheckResult:
+    """Aggregate the terminal-step tensor-count evidence across groups.
 
     # Protocol sentence: “n_no_optimizer_state is a TENSOR count (16 tensors =
-    # 492,000 elements),” not an element count.
+    # 492,000 elements),” not an element count.  The 492,000-element value is
+    # architecture context, not a runtime assertion; the consumer therefore
+    # checks only the tensor count and ignores any element-context field.
+    """
+
     name = "disconnected-optimizer-state"
-    if state is None:
-        return _missing(name, "optimizer-state evidence is required")
-    tensors = state.get("n_no_optimizer_state")
-    elements = state.get("n_no_optimizer_state_elements")
-    if type(tensors) is not int or type(elements) is not int:
-        return _invalid(name, "optimizer-state absence counts must be integers")
-    if tensors != expected_tensors or elements != expected_elements:
-        return _failure(name, f"expected {expected_tensors} tensors/{expected_elements} elements, got {tensors}/{elements}")
-    return _ok(name, "disconnected optimizer state is absent with the contract tensor/element counts")
+    if records is None:
+        return _missing(name, "optimizer-state JSONL evidence is required")
+    if groups is None:
+        return _missing(name, "rendered OptimizerState groups are required")
+    if terminal_step is None or type(terminal_step) is not int:
+        return _missing(name, "terminal checkpoint step is required")
+    group_names = tuple(groups) if not isinstance(groups, Mapping) else tuple(groups)
+    if not group_names or any(not isinstance(group, str) or not group for group in group_names):
+        return _invalid(name, "rendered OptimizerState groups must be non-empty names")
+    if len(set(group_names)) != len(group_names):
+        return _invalid(name, "rendered OptimizerState groups must be unique")
+
+    def unpack(record: Any) -> tuple[int | None, str, Mapping[str, Any]] | None:
+        if isinstance(record, Mapping):
+            step, namespace, metrics = record.get("step"), record.get("namespace"), record.get("metrics")
+        else:
+            step = getattr(record, "step", None)
+            namespace = getattr(record, "namespace", None)
+            metrics = getattr(record, "metrics", None)
+        if (step is not None and type(step) is not int) or not isinstance(namespace, str) or not isinstance(metrics, Mapping):
+            return None
+        return step, namespace, metrics
+
+    counts: dict[str, int] = {}
+    for group in group_names:
+        namespace = f"train/optimizer_state/{group}"
+        matches = []
+        for record in records:
+            unpacked = unpack(record)
+            if unpacked is None:
+                return _invalid(name, "optimizer-state record envelope is malformed")
+            step, record_namespace, metrics = unpacked
+            if step == terminal_step and record_namespace == namespace:
+                matches.append(metrics)
+        if not matches:
+            return _missing(name, f"missing terminal-step optimizer-state record for group {group!r}")
+        if len(matches) != 1:
+            return _invalid(name, f"duplicate terminal-step optimizer-state records for group {group!r}")
+        tensors = matches[0].get("n_no_optimizer_state")
+        if type(tensors) is not int or tensors < 0:
+            return _invalid(name, f"group {group!r} tensor count must be a non-negative integer")
+        counts[group] = tensors
+
+    total = sum(counts.values())
+    if total != expected_tensors:
+        return _failure(name, f"expected {expected_tensors} disconnected tensors, got {total}", {"groups": counts, "step": terminal_step})
+    return _ok(name, f"terminal step {terminal_step} has {total} disconnected tensors across all groups", {"groups": counts, "step": terminal_step})
 
 
 def check_rendered_diff(config: Mapping[str, Any] | None, observed: Mapping[str, Any] | None) -> CheckResult:
@@ -555,12 +623,21 @@ def check_path_containment(path: str | Path | None, root: str | Path | None) -> 
 def run_rung1_checks(evidence: Mapping[str, Any], *, config: Mapping[str, Any] | None = None) -> list[CheckResult]:
     """Run all offline checks available from one named evidence packet."""
 
+    optimizer_evidence = evidence.get("optimizer_state")
+    if isinstance(optimizer_evidence, Mapping) and "records" in optimizer_evidence:
+        optimizer_result = check_disconnected_optimizer_state(
+            optimizer_evidence.get("records"),
+            groups=optimizer_evidence.get("groups"),
+            terminal_step=optimizer_evidence.get("terminal_step"),
+        )
+    else:
+        optimizer_result = check_disconnected_optimizer_state(None)
     return [
         check_resume_metric_keys(evidence.get("uninterrupted"), evidence.get("resumed")),
         check_resume_parity(evidence.get("uninterrupted"), evidence.get("resumed"), tolerances=evidence.get("tolerances")),
         check_step_zero(evidence.get("step_zero")),
         check_model_float64(config or evidence.get("config"), evidence.get("checkpoints")),
-        check_disconnected_optimizer_state(evidence.get("optimizer_state")),
+        optimizer_result,
         check_rendered_diff(config or evidence.get("config"), evidence.get("rendered_diff")),
         check_named_outputs(evidence.get("outputs"), evidence.get("outputs_root")),
         check_evaluation(evidence.get("evaluation")),

@@ -76,8 +76,13 @@ def test_step_zero_requires_exact_families_and_constructions() -> None:
 
 
 def test_disconnected_count_is_tensor_count() -> None:
-    assert check_disconnected_optimizer_state({"n_no_optimizer_state": 16, "n_no_optimizer_state_elements": 492000}).passed
-    assert check_disconnected_optimizer_state({"n_no_optimizer_state": 492000, "n_no_optimizer_state_elements": 16}).verdict is Verdict.PRODUCT_FAILURE
+    records = [
+        {"step": 100, "namespace": "train/optimizer_state/embedding", "metrics": {"n_no_optimizer_state": 8, "n_no_optimizer_state_elements": 492000}},
+        {"step": 100, "namespace": "train/optimizer_state/readout", "metrics": {"n_no_optimizer_state": 8, "n_no_optimizer_state_elements": 1}},
+    ]
+    assert check_disconnected_optimizer_state(records, groups=("embedding", "readout"), terminal_step=100).passed
+    wrong = [dict(record, metrics={"n_no_optimizer_state": 492000}) for record in records]
+    assert check_disconnected_optimizer_state(wrong, groups=("embedding", "readout"), terminal_step=100).verdict is Verdict.PRODUCT_FAILURE
 
 
 def test_named_output_hash_and_complete(tmp_path: Path) -> None:
