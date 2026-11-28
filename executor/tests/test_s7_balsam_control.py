@@ -30,7 +30,7 @@ CONTROL_SOURCE = Path(__file__).parents[1] / "control" / "balsam" / "src"
 if str(CONTROL_SOURCE) not in sys.path:
     sys.path.insert(0, str(CONTROL_SOURCE))
 
-from tpen_balsam_control.application import BalsamControlAmbiguous  # noqa: E402
+from tpen_balsam_control.application import BalsamControlAmbiguous, BalsamControlRefusal  # noqa: E402
 from tpen_balsam_control.sdk_adapter import DocumentedSDKOperations  # noqa: E402
 
 
@@ -124,6 +124,25 @@ def test_control_batch_create_prepares_both_parent_directories_before_sole_mutat
     assert stdout.parent.is_dir() and stderr.parent.is_dir()
     assert calls == [{"job_id": "job-7", "tpen_stdout": str(stdout), "tpen_stderr": str(stderr)}]
 
+    blocked_parent = tmp_path / "blocked"
+    blocked_parent.write_text("regular file")
+    blocked_stdout = blocked_parent / "stdout.log"
+    blocked_stderr = tmp_path / "other" / "stderr.log"
+
+    # Keep this focused on the adapter's explicit is_dir guard.  A real mkdir
+    # against a regular file would fail first and only exercise the OSError
+    # wrapper, making the guard-removal mutant indistinguishable.
+    original_mkdir = Path.mkdir
+    Path.mkdir = lambda self, *args, **kwargs: None
+    try:
+        with pytest.raises(BalsamControlRefusal, match="not a directory"):
+            DocumentedSDKOperations(api).submit(
+                "group", "job-8", _sha("batch-2"), str(blocked_stdout), str(blocked_stderr),
+            )
+    finally:
+        Path.mkdir = original_mkdir
+    assert calls == [{"job_id": "job-7", "tpen_stdout": str(stdout), "tpen_stderr": str(stderr)}]
+
 
 def test_control_batch_create_without_ack_is_ambiguous_and_never_rearmed(tmp_path: Path) -> None:
     """An absent BatchJob identity is an ambiguous mutation, not a retry."""
@@ -138,6 +157,18 @@ def test_control_batch_create_without_ack_is_ambiguous_and_never_rearmed(tmp_pat
         DocumentedSDKOperations(api).submit(
             "group", "job-7", _sha("batch"), str(tmp_path / "out"), str(tmp_path / "err"),
         )
+
+    class AcknowledgingManager:
+        def create(self, **kwargs):
+            del kwargs
+            return SimpleNamespace(id="batch-ack")
+
+    acknowledging_api = SimpleNamespace(
+        BatchJob=SimpleNamespace(objects=AcknowledgingManager()),
+    )
+    assert DocumentedSDKOperations(acknowledging_api).submit(
+        "group", "job-8", _sha("batch-2"), str(tmp_path / "out-2"), str(tmp_path / "err-2"),
+    ) == "batch-ack"
 
 
 def test_association_rejects_crossed_job_before_s2_scope_is_built(tmp_path: Path) -> None:
