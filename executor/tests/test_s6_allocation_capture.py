@@ -9,6 +9,7 @@ import pytest
 
 from tpen_executor.lifecycle.allocation_capture import (
     AllocationCaptureRefusal,
+    AllocationSlot,
     FullNodeAssignment,
     SchedulerAllocationSnapshot,
     assign_full_node,
@@ -63,6 +64,20 @@ def test_capture_preserves_parent_and_routes_only_assigned_host() -> None:
         assert {slot.node for slot in routed_slots_from_allocation(allocation)} == {assignment.host}
         assert len(assignment.slots) == 4
 
+    with pytest.raises(AllocationCaptureRefusal, match="packing count"):
+        assign_full_node(parent, host="node-a", allowed_cpus=range(16), device_uuids=_devices("A"), node_layout=layout,
+                         outer_packing_count=2)
+    with pytest.raises(AllocationCaptureRefusal, match="controller rank"):
+        assign_full_node(parent, host="node-a", allowed_cpus=range(16), device_uuids=_devices("A"), node_layout=layout,
+                         controller_rank_count=2)
+
+    base = assign_full_node(parent, host="node-a", allowed_cpus=range(16), device_uuids=_devices("A"), node_layout=layout)
+    wrong_device_slots = (AllocationSlot(base.slots[0].slot_id, "node-a", (_devices("B")[0],),
+                                         base.slots[0].cpus, (), ()), *base.slots[1:])
+    with pytest.raises(AllocationCaptureRefusal, match="device order"):
+        FullNodeAssignment(parent, "node-a", tuple(range(16)), _devices("A"), layout,
+                           wrong_device_slots, 1, 1)
+
 
 def test_capture_requires_full_node_and_exact_association() -> None:
     """Under-granted resources, crossed hosts, and wrong topology refuse."""
@@ -77,6 +92,20 @@ def test_capture_requires_full_node_and_exact_association() -> None:
             undergrant, host="node-a", allowed_cpus=range(16), device_uuids=_devices("A"),
             node_layout=PackedNodeLayout(8, 16, 4, ("0-3", "4-7", "8-11", "12-15")),
         )
+
+    gpu_undergrant = _snapshot()
+    object.__setattr__(gpu_undergrant, "requested_gpus_per_node", 2)
+    with pytest.raises(AllocationCaptureRefusal, match="full-node"):
+        assign_full_node(gpu_undergrant, host="node-a", allowed_cpus=range(16), device_uuids=_devices("A"), node_layout=_layout())
+
+    empty_parent = _snapshot()
+    object.__setattr__(empty_parent, "requested_nodes", 0)
+    object.__setattr__(empty_parent, "delivered_nodes", 0)
+    with pytest.raises(AllocationCaptureRefusal, match="no delivered node"):
+        assign_full_node(empty_parent, host="node-a", allowed_cpus=range(16), device_uuids=_devices("A"), node_layout=_layout())
+
+    with pytest.raises(AllocationCaptureRefusal, match="affinity"):
+        assign_full_node(_snapshot(), host="node-a", allowed_cpus=range(8), device_uuids=_devices("A"), node_layout=_layout())
 
     delivered_undergrant = SchedulerAllocationSnapshot.capture(
         AllocationId("parent-allocation"), BatchJobId("parent-batch"), BackendJobId("group-job"), "node-a\n",
