@@ -1355,7 +1355,7 @@ def _validate_config_identity_for_row(row: Mapping[str, Any], config_path: str |
                     if relative in {train.removeprefix("configs/"), eval.removeprefix("configs/")}), None)
     if row.get("kind") == "eval":
         validate_eval_config_for_row(f"configs/{relative}", system)
-    elif row.get("kind") == "train":
+    elif row.get("kind") in {"train", "smoke"}:
         if relative in set(variant_by_train.values()):
             raise ProtocolError("train row cannot bind an eval config")
         if variant is None and relative != f"{system}/train.yaml":

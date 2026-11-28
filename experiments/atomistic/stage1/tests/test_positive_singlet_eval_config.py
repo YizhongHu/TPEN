@@ -190,21 +190,29 @@ def test_legacy_eval_row_with_absolute_canonical_path_still_renders() -> None:
     assert decode_binding(command.rsplit(" ", 1)[-1])["config"] == config
 
 
-def test_variant_identity_rejects_cross_kind_config_names() -> None:
+@pytest.mark.parametrize("config_variant", [None, *ARMS], ids=lambda value: value or "generic")
+@pytest.mark.parametrize("kind", ["train", "smoke"])
+def test_non_eval_rows_reject_paired_eval_config_names(
+    config_variant: str | None, kind: str,
+) -> None:
     """Computed variant identities bind train and eval filenames to their kinds."""
 
-    rows = _phase2_rows(config_variant="positive_singlet_tail")
-    train = next(row for row in rows if row["kind"] == "train")
-    evaluation = next(row for row in rows if row["kind"] == "eval")
-    train_with_eval_name = dict(train, config=evaluation["config"])
-    eval_with_train_name = dict(evaluation, config=train["config"])
-    with pytest.raises(ProtocolError, match="train row cannot bind an eval config"):
+    rows = _phase2_rows(config_variant=config_variant)
+    non_eval = next(row for row in rows if row["kind"] == kind)
+    eval_config = (
+        f"configs/hooke2/{config_variant}_eval.yaml"
+        if config_variant is not None else "configs/hooke2/eval.yaml"
+    )
+    assert non_eval["config"] != eval_config
+    if kind == "smoke":
+        # The unmodified producer-smoke row remains a valid training route.
+        assert validate_gateway_binding(
+            binding=_binding_token(non_eval), expected_kinds={"smoke", "train"},
+        ) == non_eval
+    with pytest.raises(ProtocolError):
         validate_gateway_binding(
-            binding=_binding_token(train_with_eval_name), kind="train",
-        )
-    with pytest.raises(ProtocolError, match="unsupported Stage-1 eval config"):
-        validate_gateway_binding(
-            binding=_binding_token(eval_with_train_name), kind="eval",
+            binding=_binding_token(dict(non_eval, config=eval_config)),
+            expected_kinds={"smoke", "train"},
         )
 
 
