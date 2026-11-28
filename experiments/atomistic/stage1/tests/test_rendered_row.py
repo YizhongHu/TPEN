@@ -110,6 +110,10 @@ def _v3_materialized_train_row(
         "science_profile": protocol.HOOKE2_ACT50_SEGMENTED_PROFILES[0],
         "variant": "sigmoid",
     })
+    row["config_sha256"] = protocol.config_identities(
+        config_root=ROOT / "configs", systems=("hooke2",),
+        science_profile=protocol.HOOKE2_ACT50_SEGMENTED_PROFILES[0],
+    )["hooke2"]
     if resume:
         row["resume_profile"] = protocol.CHAIN_RESUME_PROFILE
     row["row_extension"]["diagnostics_profile"] = protocol.OVERLAY_PROFILE_V3  # type: ignore[index]
