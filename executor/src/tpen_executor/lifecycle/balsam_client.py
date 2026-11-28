@@ -181,9 +181,13 @@ class BalsamProcessClient:
         """Reject unbound observation handles rather than guessing a group."""
         raise BalsamGroupRefusal("observe_job requires the bound group identity")
 
-    def submit_batch(self, group_id: GroupId, backend_job_id: BackendJobId, batch_digest: str) -> BatchJobId:
+    def submit_batch(self, group_id: GroupId, backend_job_id: BackendJobId, batch_digest: str,
+                     *, stdout_path: str | None = None, stderr_path: str | None = None) -> BatchJobId:
         """Submit one explicitly authorized batch, with no automatic retry."""
-        request = BalsamWireRequest.submit(group_id, backend_job_id, batch_digest)
+        request = BalsamWireRequest.submit(
+            group_id, backend_job_id, batch_digest,
+            stdout_path=stdout_path, stderr_path=stderr_path,
+        )
         result = self._mutate(request)
         if not isinstance(result.batch_job_id, BatchJobId):
             raise BalsamGroupParked("submission acknowledgement has no typed BatchJob identity")

@@ -7,9 +7,15 @@ deployment work; this module only provides injected model-shaped operations.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
-from .application import BalsamControlRefusal, InjectedSDKOperations
+from .application import (
+    BalsamControlAmbiguous,
+    BalsamControlRefusal,
+    InjectedSDKOperations,
+    fixed_batch_output_paths,
+)
 
 
 PINNED_BALSAM_VERSION = "0.7.0.a24"
@@ -70,11 +76,41 @@ class DocumentedSDKOperations:
             raise BalsamControlRefusal("SDK returned a non-primitive Job state")
         return state
 
-    def submit(self, group_id: str, backend_job_id: str, batch_digest: str) -> str:
-        """Refuse until a typed deployment supplies the documented model fields."""
+    def submit(self, group_id: str, backend_job_id: str, batch_digest: str,
+               stdout_path: str | None = None, stderr_path: str | None = None) -> str:
+        """Create one BatchJob from the finite carrier fields.
 
-        del group_id, backend_job_id, batch_digest
-        raise BalsamControlRefusal("batch submission requires a typed deployment adapter")
+        Parameters are intentionally primitive and closed at the bridge.  The
+        parent directories are made visible and checked before calling the
+        model's create operation so a rejected path cannot be mistaken for a
+        successful external acknowledgement.
+        """
+
+        del group_id, batch_digest
+        if stdout_path is None or stderr_path is None:
+            raise BalsamControlRefusal("batch submission requires generated output paths")
+        paths = fixed_batch_output_paths({"tpen_stdout": stdout_path, "tpen_stderr": stderr_path})
+        parents = {Path(paths.stdout).parent, Path(paths.stderr).parent}
+        try:
+            for parent in parents:
+                parent.mkdir(parents=True, exist_ok=True)
+                if not parent.is_dir():
+                    raise BalsamControlRefusal("BatchJob output parent is not a directory")
+        except OSError as error:
+            raise BalsamControlRefusal("BatchJob output parent is unavailable") from error
+        batch_type = getattr(self._api, "BatchJob", None)
+        manager = getattr(batch_type, "objects", None)
+        create = getattr(manager, "create", None)
+        if not callable(create):
+            raise BalsamControlRefusal("SDK API lacks BatchJob.objects.create")
+        try:
+            record = create(job_id=backend_job_id, **paths.as_optional_params())
+            identity = getattr(record, "id", None)
+        except (AttributeError, LookupError, OSError, TypeError, ValueError) as error:
+            raise BalsamControlAmbiguous("BatchJob create acknowledgement is unknown") from error
+        if identity is None or not str(identity).strip():
+            raise BalsamControlAmbiguous("BatchJob create returned no identity")
+        return str(identity)
 
     def rearm(self, group_id: str, backend_job_id: str, recovery_digest: str) -> str:
         """Refuse until recovery admission supplies an explicit rearm adapter."""
