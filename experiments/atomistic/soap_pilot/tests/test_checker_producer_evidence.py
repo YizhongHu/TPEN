@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,7 @@ from omegaconf import OmegaConf
 
 from experiments.atomistic.soap_pilot.checks import Verdict, check_disconnected_optimizer_state, run_rung1_checks
 from experiments.atomistic.soap_pilot.composer import R2_PROFILES, PilotProfile, render_profile
-from experiments.atomistic.soap_pilot.evidence import load_metric_records
+from experiments.atomistic.soap_pilot import evidence as soap_evidence
 from tpen.callback import OptimizerState
 from tpen.logging import JSONL, LogRecord
 from tpen.parameter_groups import resolve_parameter_groups
@@ -82,11 +83,11 @@ def _rendered_optimizer_fixture(tmp_path: Path, profile: PilotProfile):
     assert set(inventory) == set(declared) - {"factors"}
 
     assert not optimizer.state, "no optimizer step is run by this synthetic wire fixture"
-    return model, optimizer, declared, resolved, inventory, callback_config
+    return rendered, model, optimizer, declared, resolved, inventory, callback_config
 
 
 def _emit_optimizer_records(tmp_path: Path, profile: PilotProfile):
-    model, optimizer, declared, resolved, inventory, callback_config = _rendered_optimizer_fixture(
+    rendered, model, optimizer, declared, resolved, inventory, callback_config = _rendered_optimizer_fixture(
         tmp_path, profile
     )
     metrics_path = tmp_path / "metrics.jsonl"
@@ -94,7 +95,7 @@ def _emit_optimizer_records(tmp_path: Path, profile: PilotProfile):
     context = _LoggerContext(logger)
     callback = OptimizerState(callback_config["groups"])
     deliver_completed_iteration(callback, context, _state(model, optimizer), step=99)
-    records = load_metric_records(tmp_path)
+    records = soap_evidence.load_metric_records(tmp_path)
     assert records is not None
     assert all(record.step == 99 for record in records)
     assert {record.namespace.rsplit("/", 1)[-1] for record in records} == set(resolved)
@@ -104,7 +105,7 @@ def _emit_optimizer_records(tmp_path: Path, profile: PilotProfile):
         int(record.metrics["n_no_optimizer_state"]) for record in records
     )
     group_inventory = {**inventory, "factors": {"parameters": 0, "elements": 0}}
-    return records, declared, resolved, expected_tensors, group_inventory
+    return rendered, records, declared, resolved, expected_tensors, group_inventory
 
 
 @pytest.mark.parametrize("profile", [R2_PROFILES[0]], ids=lambda profile: profile.name)
@@ -113,7 +114,7 @@ def test_real_optimizer_callback_group_detector_is_explicitly_red(
 ) -> None:
     """Declared parameter-free groups expose the producer/consumer mismatch."""
 
-    records, declared, resolved, expected_tensors, inventory = _emit_optimizer_records(tmp_path, profile)
+    _, records, declared, resolved, expected_tensors, inventory = _emit_optimizer_records(tmp_path, profile)
     assert check_disconnected_optimizer_state(
         records, groups=tuple(resolved), terminal_step=99, expected_tensors=expected_tensors
     ).passed
@@ -135,8 +136,109 @@ def test_real_optimizer_callback_checkpoint_coordinate_detector_is_explicitly_re
 ) -> None:
     """Completed iteration 99 must not be treated as terminal checkpoint 100."""
 
-    records, _, resolved, expected_tensors, _ = _emit_optimizer_records(tmp_path, profile)
+    _, records, _, resolved, expected_tensors, _ = _emit_optimizer_records(tmp_path, profile)
     # Independent coordinate detector: completed iteration 99 vs checkpoint 100.
     assert check_disconnected_optimizer_state(
         records, groups=tuple(resolved), terminal_step=100, expected_tensors=expected_tensors
     ).passed
+
+
+@pytest.mark.parametrize("profile", [R2_PROFILES[0]], ids=lambda profile: profile.name)
+def test_run_rung1_uses_real_rendered_inventory_and_reconciles_jsonl(
+    tmp_path: Path, profile: PilotProfile
+) -> None:
+    """The production checker derives groups from rendered config, not a fixture inventory."""
+
+    rendered, records, declared, resolved, expected_tensors, _ = _emit_optimizer_records(
+        tmp_path, profile
+    )
+    groups, inventory = soap_evidence.build_optimizer_group_inventory(rendered.rendered.path)
+    assert groups == declared
+    assert set(inventory) == set(declared)
+    assert inventory["factors"]["parameters"] == 0
+    assert set(inventory) >= set(resolved)
+
+    results = {
+        result.name: result
+        for result in run_rung1_checks(
+            {
+                "run_dir": tmp_path,
+                "optimizer_state": {
+                    "rendered_config_path": rendered.rendered.path,
+                    "checkpoint_step": 100,
+                },
+            }
+        )
+    }
+    assert results["disconnected-optimizer-state"].passed
+    assert results["disconnected-optimizer-state"].evidence["empty_groups"] == ["factors"]
+    assert sum(
+        int(record.metrics["n_no_optimizer_state"])
+        for record in records
+    ) == expected_tensors
+
+
+@pytest.mark.parametrize("profile", [R2_PROFILES[0]], ids=lambda profile: profile.name)
+def test_run_rung1_missing_nonempty_group_is_unmeasured(
+    tmp_path: Path, profile: PilotProfile
+) -> None:
+    """A real producer record removed for a parameter-bearing group cannot pass."""
+
+    rendered, _, _, _, _, _ = _emit_optimizer_records(tmp_path, profile)
+    metrics_path = tmp_path / "metrics.jsonl"
+    records = soap_evidence.load_metric_records(tmp_path)
+    assert records is not None
+    metrics_path.write_text(
+        "".join(
+            json.dumps(record._asdict()) + "\n"
+            for record in records
+            if not record.namespace.endswith("/readout")
+        ),
+        encoding="utf-8",
+    )
+    results = {
+        result.name: result
+        for result in run_rung1_checks(
+            {
+                "run_dir": tmp_path,
+                "optimizer_state": {
+                    "rendered_config_path": rendered.rendered.path,
+                    "checkpoint_step": 100,
+                },
+            }
+        )
+    }
+    assert results["disconnected-optimizer-state"].verdict is Verdict.UNMEASURED
+
+
+@pytest.mark.parametrize("profile", [R2_PROFILES[0]], ids=lambda profile: profile.name)
+def test_run_rung1_rejects_inventory_contradicting_jsonl_parameter_count(
+    tmp_path: Path, profile: PilotProfile
+) -> None:
+    """The selected producer n_parameters must agree with rendered ownership."""
+
+    rendered, _, _, _, _, _ = _emit_optimizer_records(tmp_path, profile)
+    records = soap_evidence.load_metric_records(tmp_path)
+    assert records is not None
+    payloads = []
+    for record in records:
+        payload = record._asdict()
+        if record.namespace.endswith("/embedding"):
+            payload["metrics"] = {**record.metrics, "n_parameters": record.metrics["n_parameters"] + 1}
+        payloads.append(json.dumps(payload))
+    (tmp_path / "metrics.jsonl").write_text("\n".join(payloads) + "\n", encoding="utf-8")
+    results = {
+        result.name: result
+        for result in run_rung1_checks(
+            {
+                "run_dir": tmp_path,
+                "optimizer_state": {
+                    "rendered_config_path": rendered.rendered.path,
+                    "checkpoint_step": 100,
+                },
+            }
+        )
+    }
+    optimizer = results["disconnected-optimizer-state"]
+    assert optimizer.verdict is Verdict.HARNESS_INVALID
+    assert "contradicts" in optimizer.detail

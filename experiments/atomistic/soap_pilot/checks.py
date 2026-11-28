@@ -482,12 +482,14 @@ def check_disconnected_optimizer_state(
 
     The rendered callback declaration is not itself an emitting inventory:
     ``resolve_parameter_groups`` drops empty assignments
-    (``tpen/parameter_groups.py:111-118``).  A declared group may therefore be
-    omitted only when a complete ``group_inventory`` proves ``parameters == 0``;
-    every other missing group remains ``UNMEASURED``.  A caller-supplied
-    ``empty_groups`` claim is accepted only as an exact cross-check against that
-    inventory, never as proof by itself, because parameter-bearing groups must
-    not be allowed to vacuously pass when the producer omits empty assignments.
+    (``tpen/parameter_groups.py:111-118``).  The pilot-owned adapter in
+    :mod:`.evidence` therefore derives a complete inventory from the rendered
+    model using that same core resolver.  A declared group may be omitted only
+    when that inventory proves ``parameters == 0``; every other missing group
+    remains ``UNMEASURED``.  A caller-supplied ``empty_groups`` claim is accepted
+    only as an exact cross-check against the inventory, never as proof by itself,
+    because parameter-bearing groups must not be allowed to vacuously pass when
+    the producer omits empty assignments.
     """
 
     name = "disconnected-optimizer-state"
@@ -561,17 +563,32 @@ def check_disconnected_optimizer_state(
         }
 
     # The callback coordinate is the primary, explicit contract.  The exact
-    # checkpoint coordinate is retained only as a compatibility path for
-    # pre-contract evidence; accepting both would make the join ambiguous.
+    # checkpoint coordinate is retained only as an explicitly documented
+    # compatibility path for pre-contract evidence, and is eligible only when
+    # no converted record exists.  A partial converted record is evidence of a
+    # broken/incomplete join, not permission to fall forward to checkpoint N.
     metric_step = terminal_step - 1
     converted = matches_at(metric_step) if terminal_step > 0 else {}
     exact = matches_at(terminal_step)
+    for coordinate, candidate in ((metric_step, converted), (terminal_step, exact)):
+        for group, matches in candidate.items():
+            if len(matches) > 1:
+                return _invalid(
+                    name,
+                    f"duplicate optimizer-state records for group {group!r} at metric step {coordinate}",
+                )
     converted_complete = all(len(matches) == 1 for matches in converted.values())
     exact_complete = all(len(matches) == 1 for matches in exact.values())
     if converted_complete and exact_complete:
         return _invalid(name, f"checkpoint step {terminal_step} has ambiguous metric coordinates {metric_step} and {terminal_step}")
     if converted_complete:
         selected_step, selected = metric_step, converted
+    elif any(converted.values()):
+        missing = next(group for group, matches in converted.items() if not matches)
+        return _missing(
+            name,
+            f"partial optimizer-state evidence at metric step {metric_step}: missing non-empty group {missing!r}; exact-step fallback is forbidden",
+        )
     elif exact_complete:
         selected_step, selected = terminal_step, exact
     else:
@@ -582,6 +599,19 @@ def check_disconnected_optimizer_state(
     for group, matches in selected.items():
         if len(matches) != 1:
             return _invalid(name, f"duplicate optimizer-state records for group {group!r} at metric step {selected_step}")
+        if group_inventory is not None:
+            observed_parameters = matches[0].get("n_parameters")
+            expected_parameters = group_inventory[group]["parameters"]
+            if type(observed_parameters) is not int or observed_parameters < 0:
+                return _invalid(
+                    name,
+                    f"group {group!r} selected JSONL record must contain non-negative integer n_parameters for inventory reconciliation",
+                )
+            if observed_parameters != expected_parameters:
+                return _invalid(
+                    name,
+                    f"group inventory contradicts selected JSONL n_parameters for {group!r}: inventory={expected_parameters}, record={observed_parameters}",
+                )
         tensors = matches[0].get("n_no_optimizer_state")
         if type(tensors) is not int or tensors < 0:
             return _invalid(name, f"group {group!r} tensor count must be a non-negative integer")
@@ -699,10 +729,18 @@ def run_rung1_checks(evidence: Mapping[str, Any], *, config: Mapping[str, Any] |
     ``run_dir`` is a declared evidence boundary: the consumer opens exactly
     ``run_dir/metrics.jsonl`` through :mod:`.evidence`.  It does not discover a
     sibling or "latest" file.  Missing/empty evidence is ``UNMEASURED``;
-    malformed JSONL is an explicit ``HARNESS_INVALID`` result.
+    malformed JSONL is an explicit ``HARNESS_INVALID`` result.  Optimizer group
+    names and inventory are likewise derived only from the declared
+    ``optimizer_state.rendered_config_path``.  A caller cannot make a missing
+    parameter-bearing group pass by hand-building ``groups`` or ``group_inventory``.
     """
 
-    from .evidence import EvidenceFormatError, check_metric_records, load_metric_records
+    from .evidence import (
+        EvidenceFormatError,
+        build_optimizer_group_inventory,
+        check_metric_records,
+        load_metric_records,
+    )
 
     run_dir = evidence.get("run_dir")
     if run_dir is None:
@@ -725,25 +763,32 @@ def run_rung1_checks(evidence: Mapping[str, Any], *, config: Mapping[str, Any] |
             metric_result = check_metric_records(metric_records)
 
     optimizer_evidence = evidence.get("optimizer_state")
-    if isinstance(optimizer_evidence, Mapping) and "records" in optimizer_evidence:
-        optimizer_records = optimizer_evidence.get("records")
-        optimizer_result = check_disconnected_optimizer_state(
-            optimizer_records,
-            groups=optimizer_evidence.get("groups"),
-            terminal_step=optimizer_evidence.get("checkpoint_step", optimizer_evidence.get("terminal_step")),
-            group_inventory=optimizer_evidence.get("group_inventory"),
-            empty_groups=optimizer_evidence.get("empty_groups"),
-        )
-    elif isinstance(optimizer_evidence, Mapping):
-        optimizer_result = check_disconnected_optimizer_state(
-            metric_records,
-            groups=optimizer_evidence.get("groups"),
-            terminal_step=optimizer_evidence.get("checkpoint_step", optimizer_evidence.get("terminal_step")),
-            group_inventory=optimizer_evidence.get("group_inventory"),
-            empty_groups=optimizer_evidence.get("empty_groups"),
-        )
-    else:
+    if not isinstance(optimizer_evidence, Mapping):
         optimizer_result = check_disconnected_optimizer_state(None)
+    else:
+        rendered_config_path = optimizer_evidence.get("rendered_config_path")
+        if not isinstance(rendered_config_path, (str, Path)):
+            optimizer_result = _missing(
+                "disconnected-optimizer-state",
+                "declared optimizer_state.rendered_config_path is required",
+            )
+        else:
+            try:
+                rendered_groups, rendered_inventory = build_optimizer_group_inventory(
+                    rendered_config_path
+                )
+            except EvidenceFormatError as exc:
+                optimizer_result = _invalid("disconnected-optimizer-state", str(exc))
+            else:
+                optimizer_result = check_disconnected_optimizer_state(
+                    metric_records,
+                    groups=rendered_groups,
+                    terminal_step=optimizer_evidence.get(
+                        "checkpoint_step", optimizer_evidence.get("terminal_step")
+                    ),
+                    group_inventory=rendered_inventory,
+                    empty_groups=optimizer_evidence.get("empty_groups"),
+                )
     return [
         metric_result,
         check_resume_metric_keys(evidence.get("uninterrupted"), evidence.get("resumed")),

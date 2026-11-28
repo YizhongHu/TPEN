@@ -10,7 +10,7 @@ import yaml
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
-from experiments.atomistic.soap_pilot.checks import Verdict
+from experiments.atomistic.soap_pilot.checks import Verdict, run_rung1_checks
 from experiments.atomistic.soap_pilot.evidence import (
     EvidenceFormatError,
     MetricRecord,
@@ -81,6 +81,35 @@ def test_nonfinite_jsonl_metric_fails_the_finite_only_consumer_check(tmp_path: P
     result = check_metric_records(load_metric_records(tmp_path))
     assert result.verdict is Verdict.PRODUCT_FAILURE
     assert "non-finite" in result.detail
+
+
+def _run_metric_result(run_dir: Path):
+    return next(
+        result
+        for result in run_rung1_checks({"run_dir": run_dir})
+        if result.name == "metric-jsonl-evidence"
+    )
+
+
+def test_run_rung1_declared_run_dir_reads_finite_jsonl(tmp_path: Path) -> None:
+    (tmp_path / "metrics.jsonl").write_text(
+        '{"step": 100, "namespace": "run", "metrics": {"loss": 1.0}}\n',
+        encoding="utf-8",
+    )
+    assert _run_metric_result(tmp_path).passed
+
+
+def test_run_rung1_declared_run_dir_rejects_nonfinite_jsonl(tmp_path: Path) -> None:
+    (tmp_path / "metrics.jsonl").write_text(
+        '{"step": 100, "namespace": "run", "metrics": {"loss": NaN}}\n',
+        encoding="utf-8",
+    )
+    assert _run_metric_result(tmp_path).verdict is Verdict.PRODUCT_FAILURE
+
+
+def test_run_rung1_declared_run_dir_rejects_malformed_jsonl(tmp_path: Path) -> None:
+    (tmp_path / "metrics.jsonl").write_text('{"step":\n', encoding="utf-8")
+    assert _run_metric_result(tmp_path).verdict is Verdict.HARNESS_INVALID
 
 
 @pytest.mark.parametrize(

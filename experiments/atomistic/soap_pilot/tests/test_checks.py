@@ -120,6 +120,54 @@ def test_empty_group_claims_cannot_prove_parameter_bearing_group_empty() -> None
     assert against_inventory.verdict is not Verdict.PASS
 
 
+def _optimizer_records(step: int, *, groups: tuple[str, ...] = ("embedding", "readout")) -> list[dict[str, object]]:
+    """Make compact tensor-count records for coordinate and duplicate controls."""
+
+    return [
+        {
+            "step": step,
+            "namespace": f"train/optimizer_state/{group}",
+            "metrics": {"n_no_optimizer_state": 8},
+        }
+        for group in groups
+    ]
+
+
+def test_partial_converted_records_never_fall_forward_to_exact_step() -> None:
+    partial = [
+        _optimizer_records(99, groups=("embedding",))[0],
+        *_optimizer_records(100),
+    ]
+    result = check_disconnected_optimizer_state(
+        partial, groups=("embedding", "readout"), terminal_step=100
+    )
+    assert result.verdict is Verdict.UNMEASURED
+    assert "fallback is forbidden" in result.detail
+
+    assert check_disconnected_optimizer_state(
+        _optimizer_records(99), groups=("embedding", "readout"), terminal_step=100
+    ).passed
+
+    both = [*_optimizer_records(99), *_optimizer_records(100)]
+    assert check_disconnected_optimizer_state(
+        both, groups=("embedding", "readout"), terminal_step=100
+    ).verdict is Verdict.HARNESS_INVALID
+
+
+def test_duplicate_optimizer_records_are_harness_invalid_before_selection() -> None:
+    duplicate_and_missing = [
+        *_optimizer_records(99, groups=("embedding",)),
+        *_optimizer_records(99, groups=("embedding",)),
+    ]
+    result = check_disconnected_optimizer_state(
+        duplicate_and_missing,
+        groups=("embedding", "readout"),
+        terminal_step=100,
+    )
+    assert result.verdict is Verdict.HARNESS_INVALID
+    assert "duplicate" in result.detail
+
+
 def test_named_output_hash_and_complete(tmp_path: Path) -> None:
     output = tmp_path / "metrics.jsonl"
     output.write_text("step=1\n", encoding="utf-8")

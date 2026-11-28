@@ -28,6 +28,87 @@ class MetricRecord(NamedTuple):
     metrics: Mapping[str, Any]
 
 
+def build_optimizer_group_inventory(
+    rendered_config_path: str | Path,
+) -> tuple[tuple[str, ...], dict[str, dict[str, int]]]:
+    """Build the complete optimizer-group inventory from rendered bytes.
+
+    The producer and this adapter deliberately share the core authority:
+    ``OptimizerState`` calls ``tpen.parameter_groups.resolve_parameter_groups``
+    on the live model (``tpen/callback/optimizer_state.py:92-98``).  We read
+    the named, already-resolved rendered config, instantiate its model, and
+    call that same resolver with its callback groups.  The resolver omits
+    empty groups (``tpen/parameter_groups.py:111-118``), so this adapter puts
+    those declared groups back with zero counts rather than inventing ownership
+    from parameter names or a static policy.
+
+    Parameters
+    ----------
+    rendered_config_path : str or pathlib.Path
+        The exact rendered YAML named by the evidence packet.
+
+    Returns
+    -------
+    tuple[tuple[str, ...], dict[str, dict[str, int]]]
+        Declared group names and a complete ``parameters``/``elements``
+        inventory, including explicitly empty groups.
+
+    Raises
+    ------
+    EvidenceFormatError
+        If the named file, model, or OptimizerState declaration is malformed.
+    """
+
+    path = Path(rendered_config_path)
+    if not path.is_file():
+        raise EvidenceFormatError(f"rendered config is absent: {path}")
+    try:
+        import yaml
+        from hydra.utils import instantiate
+        from omegaconf import OmegaConf
+        from tpen.parameter_groups import resolve_parameter_groups
+
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(document, Mapping):
+            raise EvidenceFormatError("rendered config must be a mapping")
+        model_config = document.get("model")
+        callbacks = document.get("callbacks")
+        if not isinstance(model_config, Mapping) or not isinstance(callbacks, list):
+            raise EvidenceFormatError("rendered config must contain model and callbacks")
+        optimizer_callbacks = [
+            callback
+            for callback in callbacks
+            if isinstance(callback, Mapping)
+            and callback.get("_target_") == "tpen.callback.OptimizerState"
+        ]
+        if len(optimizer_callbacks) != 1:
+            raise EvidenceFormatError(
+                "rendered config must contain exactly one OptimizerState callback"
+            )
+        declared = optimizer_callbacks[0].get("groups")
+        if not isinstance(declared, Mapping) or not declared:
+            raise EvidenceFormatError("OptimizerState groups must be a non-empty mapping")
+        if any(not isinstance(group, str) or not group for group in declared):
+            raise EvidenceFormatError("OptimizerState group names must be non-empty strings")
+
+        model = instantiate(OmegaConf.create(model_config))
+        resolved = resolve_parameter_groups(model, declared)
+    except EvidenceFormatError:
+        raise
+    except Exception as exc:
+        raise EvidenceFormatError(f"could not build optimizer group inventory: {exc}") from exc
+
+    group_names = tuple(declared)
+    inventory = {
+        group: {
+            "parameters": len(resolved.get(group, ())),
+            "elements": sum(int(parameter.numel()) for _, parameter in resolved.get(group, ())),
+        }
+        for group in group_names
+    }
+    return group_names, inventory
+
+
 def load_metric_records(run_dir: str | Path) -> tuple[MetricRecord, ...] | None:
     """Load only ``<run_dir>/metrics.jsonl``.
 
@@ -128,6 +209,7 @@ check_metric_evidence = check_metric_records
 
 
 __all__ = [
+    "build_optimizer_group_inventory",
     "EvidenceFormatError",
     "MetricRecord",
     "check_metric_evidence",
