@@ -83,7 +83,9 @@ def test_nonfinite_jsonl_metric_fails_the_finite_only_consumer_check(tmp_path: P
     assert "non-finite" in result.detail
 
 
-@pytest.mark.parametrize("value", [[{"loss": float("inf")}], {"nested": {"loss": float("-inf")}}])
+@pytest.mark.parametrize(
+    "value", [{"nested": {"loss": float("inf")}}, {"nested": {"inner": {"loss": float("-inf")}}}]
+)
 def test_nested_nonfinite_jsonl_metric_fails_the_finite_only_consumer_check(
     tmp_path: Path, value: object
 ) -> None:
