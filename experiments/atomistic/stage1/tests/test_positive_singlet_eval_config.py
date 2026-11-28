@@ -115,6 +115,7 @@ def test_positive_singlet_train_and_eval_graphs_strictly_match() -> None:
 
     for arm in ARMS:
         train = load_config(str(HOOKE2 / f"{arm}.yaml"))
+        assert (HOOKE2 / f"{arm}_eval.yaml").is_file()
         evaluation = load_config(str(HOOKE2 / f"{arm}_eval.yaml"))
         assert OmegaConf.to_container(train.model, resolve=True) == OmegaConf.to_container(
             evaluation.model, resolve=True,
