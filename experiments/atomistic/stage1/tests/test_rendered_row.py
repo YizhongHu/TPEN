@@ -867,7 +867,7 @@ def test_extended_resume_and_direct_restart_refuse_before_effect(tmp_path: Path)
 
     row, rendered_path = _train_row(tmp_path)
     cfg, admission = protocol.load_materialized_config(row, expected_kind="train")
-    with pytest.raises(restart.RestartRefusal, match="nonexistent run directory"):
+    with pytest.raises(restart.RestartRefusal, match="fresh-only"):
         restart.execute_restart(
             cfg=cfg, row=row, config_path=rendered_path, run=lambda *_a, **_k: pytest.fail(),
         )
@@ -892,7 +892,7 @@ def test_materialized_v3_resume_requires_opt_in(tmp_path: Path) -> None:
     cfg, admission = protocol.load_materialized_config(row, expected_kind="train")
     before = rendered_path.read_bytes()
     protocol.resolve_run_dir(row).mkdir(parents=True)
-    with pytest.raises(restart.RestartRefusal, match="fresh-only"):
+    with pytest.raises(restart.RestartRefusal, match="nonexistent run directory"):
         restart.execute_train(
             cfg=cfg, row=row, config_path=rendered_path, admission=admission,
             run=lambda *_a, **_k: pytest.fail(),
