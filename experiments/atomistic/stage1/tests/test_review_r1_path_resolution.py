@@ -14,7 +14,12 @@ import pytest
 
 from experiments.atomistic.stage1 import eval as stage1_eval
 from experiments.atomistic.stage1 import train as stage1_train
-from experiments.atomistic.stage1.launch import command_for_row, render, row_overrides
+from experiments.atomistic.stage1.launch import (
+    command_for_row,
+    command_from_rendered,
+    render,
+    row_overrides,
+)
 from experiments.atomistic.stage1.protocol import (
     HOOKE_SCIENCE_PROFILE,
     STAGE1_PROTOCOL,
@@ -239,7 +244,7 @@ def _rendered_argv(
         results_root=RESULTS_ROOT,
         scratch_base=str(tmp_path / "scratch"),
     )
-    return shlex.split(script.splitlines()[-1])
+    return shlex.split(command_from_rendered(script))
 
 
 def _make_probe_checkout(source: Path, destination: Path, marker: str) -> Path:
