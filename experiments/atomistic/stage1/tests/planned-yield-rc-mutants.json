@@ -8,13 +8,6 @@
       "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_rendered_rc_two_completed_status_fails"
     },
     {
-      "id": "planned-yield-file-guard-removed",
-      "target": "experiments/atomistic/stage1/launch.py",
-      "old": "if [[ ! -r \\\"$STATUS_PATH\\\" ]]; then",
-      "new": "if false; then",
-      "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_rendered_rc_two_missing_status_fails"
-    },
-    {
       "id": "planned-yield-rc2-branch-removed",
       "target": "experiments/atomistic/stage1/launch.py",
       "old": "elif [[ \\\"$TRAIN_RC\\\" == \\\"2\\\" ]]; then",

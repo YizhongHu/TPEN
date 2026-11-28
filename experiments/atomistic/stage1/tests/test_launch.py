@@ -560,6 +560,19 @@ def test_rendered_rc_two_missing_status_fails(tmp_path: Path) -> None:
     assert "status.json unreadable" in result.stderr
 
 
+def test_rendered_rc_two_unreadable_status_fails(tmp_path: Path) -> None:
+    script, next_step = _rendered_train_outcome_script(tmp_path, 2, "planned_yield")
+    status_path = tmp_path / "status.json"
+    status_path.chmod(0)
+    try:
+        result = _run(script, tmp_path, SLURM_JOB_ID="123", SLURM_JOB_PARTITION="test")
+    finally:
+        status_path.chmod(0o600)
+    assert result.returncode == 2
+    assert not next_step.exists()
+    assert "status.json unreadable" in result.stderr
+
+
 def test_rendered_rc_two_malformed_status_fails(tmp_path: Path) -> None:
     script, next_step = _rendered_train_outcome_script(tmp_path, 2, None)
     status_path = tmp_path / "status.json"
