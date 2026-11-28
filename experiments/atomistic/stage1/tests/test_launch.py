@@ -516,7 +516,12 @@ def _rendered_eval_outcome_script(
     stub.write_text(f"#!/bin/sh\nexit {eval_rc}\n", encoding="utf-8")
     stub.chmod(0o750)
     script = script.replace(command, shlex.quote(str(stub)), 1)
+    rendered_status_path = (
+        Path(row["results_root"]) / row["experiment_name"] / row["sector"]
+        / row["run_id"] / "status.json"
+    )
     status_path = tmp_path / "status.json"
+    script = script.replace(str(rendered_status_path), str(status_path), 1)
     if status is not None:
         status_path.write_text(
             f'{{"status": "{status}"}}\n', encoding="utf-8",
