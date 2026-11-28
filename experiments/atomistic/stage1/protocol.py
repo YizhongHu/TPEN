@@ -114,7 +114,8 @@ OVERLAY_V2_COMPOSITION_ORDER = (
     "base-config -> recorder-before-checkpoint diagnostics-v2 overlay -> manifest overrides"
 )
 ROW_EXTENSION_VERSION = "stage1-rendered-config/v1"
-ROW_EXTENSION_PROFILES = frozenset((OVERLAY_PROFILE_V1, OVERLAY_PROFILE_V2))
+ROW_EXTENSION_PROFILES = frozenset((OVERLAY_PROFILE_V1, OVERLAY_PROFILE_V2, OVERLAY_PROFILE_V3))
+CHAIN_RESUME_PROFILE = "stage1-chain-resume/v1"
 CHECKPOINT_EVIDENCE_SCHEMA = "stage1-checkpoint-evidence/v1"
 MANIFEST_SCHEMA = "stage1/v4"
 LEGACY_MANIFEST_SCHEMA = "stage1/v3"
@@ -473,9 +474,13 @@ def _validate_extension_shape(row: Mapping[str, Any], *, expected_kind: str | No
          "phase1_manifest_hash", "phase1_train_row_hash"}
     )
     allowed = common | additions | ({"execution"} if kind == "train" else set())
-    if kind == "train" and profile == OVERLAY_PROFILE_V2:
+    if kind == "train" and profile == OVERLAY_PROFILE_V3:
+        allowed.update({"resume_profile", "science_profile", "variant"})
+    if kind == "train" and profile in {OVERLAY_PROFILE_V2, OVERLAY_PROFILE_V3}:
         allowed.add("overlay_profile")
     required = common | additions
+    if kind == "train" and profile == OVERLAY_PROFILE_V3:
+        required.update({"science_profile", "variant"})
     if set(row) - allowed:
         raise ProtocolError("materialized row contains unsupported top-level keys")
     if not set(row).issuperset(required):
@@ -483,11 +488,17 @@ def _validate_extension_shape(row: Mapping[str, Any], *, expected_kind: str | No
     row_without_id = {key: value for key, value in row.items() if key != "row_id"}
     if row.get("row_id") != manifest_hash([row_without_id]):
         raise ProtocolError("materialized row_id does not match the row content")
-    if kind == "train" and profile == OVERLAY_PROFILE_V2:
-        if row.get("overlay_profile") != OVERLAY_PROFILE_V2:
-            raise ProtocolError("diagnostics-v2 materialized train row needs overlay_profile")
+    if kind == "train" and profile in {OVERLAY_PROFILE_V2, OVERLAY_PROFILE_V3}:
+        if row.get("overlay_profile") != profile:
+            raise ProtocolError(f"{profile} materialized train row needs overlay_profile")
     elif "overlay_profile" in row:
-        raise ProtocolError("overlay_profile is only admitted for diagnostics-v2 train rows")
+        raise ProtocolError("overlay_profile is only admitted for diagnostics-v2/v3 train rows")
+    if profile == OVERLAY_PROFILE_V3:
+        if row.get("science_profile") not in HOOKE2_ACT50_SEGMENTED_PROFILES:
+            raise ProtocolError("diagnostics-v3 materialized train rows require a segmented ACT50 profile")
+        _validate_act50_variant(row)
+        if "resume_profile" in row and row["resume_profile"] != CHAIN_RESUME_PROFILE:
+            raise ProtocolError("materialized resume_profile is unsupported")
     if "execution" in row and (
         kind != "train" or not isinstance(row["execution"], Mapping)
         or set(row["execution"]) != {"stop_at"}
@@ -608,17 +619,21 @@ def _materialized_mapping(cfg: Any, row: Mapping[str, Any]) -> dict[str, Any]:
         profile = str(row["row_extension"]["diagnostics_profile"])
         overlay_path = str(row["overlay"])
         expected_overlay = {
-            "schema": "stage1-overlay/v1" if profile == OVERLAY_PROFILE_V1 else "stage1-overlay/v2",
+            "schema": {
+                OVERLAY_PROFILE_V1: "stage1-overlay/v1",
+                OVERLAY_PROFILE_V2: "stage1-overlay/v2",
+                OVERLAY_PROFILE_V3: "stage1-overlay/v3",
+            }[profile],
             "path": overlay_path,
             "sha256": row["overlay_sha256"],
             "composition_order": (
-                OVERLAY_COMPOSITION_ORDER if profile == OVERLAY_PROFILE_V1
-                else OVERLAY_V2_COMPOSITION_ORDER
+                OVERLAY_V2_COMPOSITION_ORDER if profile == OVERLAY_PROFILE_V2
+                else OVERLAY_COMPOSITION_ORDER
             ),
             "stream": "train",
         }
-        if profile == OVERLAY_PROFILE_V2:
-            expected_overlay["profile"] = OVERLAY_PROFILE_V2
+        if profile != OVERLAY_PROFILE_V1:
+            expected_overlay["profile"] = profile
         provenance = cfg.get("stage1_overlay")
         if not isinstance(provenance, Mapping) or dict(provenance) != expected_overlay:
             raise ProtocolError("materialized stage1 overlay provenance disagrees with row basis")
@@ -669,6 +684,23 @@ def _materialized_mapping(cfg: Any, row: Mapping[str, Any]) -> dict[str, Any]:
             checkpoint_index = callbacks.index(checkpoint)
             if recorder != [checkpoint_index - 1]:
                 raise ProtocolError("diagnostics-v2 recorder must immediately precede Checkpoint")
+        elif str(row["row_extension"]["diagnostics_profile"]) == OVERLAY_PROFILE_V3:
+            recorder = [
+                entry for entry in callbacks
+                if isinstance(entry, Mapping)
+                and entry.get("_target_") == "tpen.callback.RawTrainingBatchRecorder"
+            ]
+            if len(recorder) != 1:
+                raise ProtocolError("diagnostics-v3 materialized train requires one recorder")
+            recorder = recorder[0]
+            if (
+                recorder.get("format_version") != 3
+                or recorder.get("path") != "${run.dir}/training_history"
+                or recorder.get("every_n_steps") != 50
+                or recorder.get("partition_size_steps") != 1000
+                or callbacks.index(recorder) <= callbacks.index(checkpoint)
+            ):
+                raise ProtocolError("diagnostics-v3 recorder contract is not bound to the row")
     else:
         required_runner = {"_target_", "model", "load", "evaluator"}
         if set(runner) != required_runner or runner.get("_target_") != "tpen.runner.Evaluate":

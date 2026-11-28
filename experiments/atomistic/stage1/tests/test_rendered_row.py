@@ -96,6 +96,46 @@ def _train_row(tmp_path: Path) -> tuple[dict[str, object], Path]:
     return row, rendered_path
 
 
+def _v3_materialized_train_row(
+    tmp_path: Path, *, resume: bool = True,
+) -> tuple[dict[str, object], Path]:
+    """Build a compact rendered row with the committed v3 recorder contract."""
+
+    row, rendered_path = _train_row(tmp_path)
+    overlay = ROOT / protocol.HOOKE_OVERLAY_V3_RELATIVE_PATH
+    row.update({
+        "overlay": protocol.HOOKE_OVERLAY_V3_RELATIVE_PATH,
+        "overlay_sha256": protocol.overlay_sha256(overlay),
+        "overlay_profile": protocol.OVERLAY_PROFILE_V3,
+        "science_profile": protocol.HOOKE2_ACT50_SEGMENTED_PROFILES[0],
+        "variant": "sigmoid",
+    })
+    if resume:
+        row["resume_profile"] = protocol.CHAIN_RESUME_PROFILE
+    row["row_extension"]["diagnostics_profile"] = protocol.OVERLAY_PROFILE_V3  # type: ignore[index]
+    payload = yaml.safe_load(rendered_path.read_text(encoding="utf-8"))
+    payload["stage1_overlay"] = {
+        "schema": "stage1-overlay/v3",
+        "path": row["overlay"],
+        "sha256": row["overlay_sha256"],
+        "composition_order": protocol.OVERLAY_COMPOSITION_ORDER,
+        "stream": "train",
+        "profile": protocol.OVERLAY_PROFILE_V3,
+    }
+    payload["callbacks"].append({
+        "_target_": "tpen.callback.RawTrainingBatchRecorder",
+        "format_version": 3,
+        "path": "${run.dir}/training_history",
+        "every_n_steps": 50,
+        "partition_size_steps": 1000,
+    })
+    row["row_extension"]["rendered_config"]["sha256"] = _write_rendered(  # type: ignore[index]
+        rendered_path, payload,
+    )
+    _refreeze_row_id(row)
+    return row, rendered_path
+
+
 def _hooke_production_train_row(tmp_path: Path) -> dict[str, object]:
     """Build one committed Hooke science row for the real train gateway."""
 
@@ -784,6 +824,58 @@ def test_extended_resume_and_direct_restart_refuse_before_effect(tmp_path: Path)
     with pytest.raises(ValueError, match="do not accept native"):
         stage1_train.build_train_config(row, config_path=ROOT / "configs/hooke2/train.yaml")
     assert admission.rendered_path == rendered_path.resolve()
+
+
+def test_materialized_v3_train_admission(tmp_path: Path) -> None:
+    """The opt-in v3 row is admitted through the same rendered reader."""
+
+    row, rendered_path = _v3_materialized_train_row(tmp_path)
+    cfg, admission = protocol.load_materialized_config(row, expected_kind="train")
+    protocol.validate_materialized_admission(cfg, row, admission)
+    assert admission.rendered_path == rendered_path.resolve()
+
+
+def test_materialized_v3_resume_requires_opt_in(tmp_path: Path) -> None:
+    """A v3 recorder cannot turn on continuation by omission or mutation."""
+
+    row, rendered_path = _v3_materialized_train_row(tmp_path, resume=False)
+    cfg, admission = protocol.load_materialized_config(row, expected_kind="train")
+    before = rendered_path.read_bytes()
+    protocol.resolve_run_dir(row).mkdir(parents=True)
+    with pytest.raises(restart.RestartRefusal, match="fresh-only"):
+        restart.execute_train(
+            cfg=cfg, row=row, config_path=rendered_path, admission=admission,
+            run=lambda *_a, **_k: pytest.fail(),
+        )
+    assert rendered_path.read_bytes() == before
+
+
+def test_materialized_v3_recorder_contract_is_bound(tmp_path: Path) -> None:
+    """The reader refuses a v3 row whose recorder format or cadence drifts."""
+
+    row, rendered_path = _v3_materialized_train_row(tmp_path)
+    payload = yaml.safe_load(rendered_path.read_text(encoding="utf-8"))
+    recorder = next(
+        entry for entry in payload["callbacks"]
+        if entry.get("_target_") == "tpen.callback.RawTrainingBatchRecorder"
+    )
+    recorder["format_version"] = 2
+    row["row_extension"]["rendered_config"]["sha256"] = _write_rendered(  # type: ignore[index]
+        rendered_path, payload,
+    )
+    _refreeze_row_id(row)
+    with pytest.raises(ProtocolError, match="recorder contract"):
+        protocol.load_materialized_config(row, expected_kind="train")
+
+
+def test_materialized_v3_requires_segmented_identity(tmp_path: Path) -> None:
+    """A diagnostics-v3 row cannot borrow a non-segmented science identity."""
+
+    row, _ = _v3_materialized_train_row(tmp_path)
+    row["science_profile"] = protocol.HOOKE2_ACT50_SIGMOID_PROFILE
+    _refreeze_row_id(row)
+    with pytest.raises(ProtocolError, match="segmented ACT50"):
+        protocol.load_materialized_config(row, expected_kind="train")
 
 
 def test_extended_v2_basis_provenance_and_recorder_order_are_strict(tmp_path: Path) -> None:
