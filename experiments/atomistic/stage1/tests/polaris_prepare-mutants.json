@@ -28,6 +28,7 @@
       "new": "git clone --no-checkout https://github.com/YizhongHu/TPEN.git \"$CHECKOUT_ROOT\"",
       "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_prepare_job_owns_clone_uv_prime_and_row_rendering"
     },
+    {
       "id": "prep-lexical-containment-restored",
       "target": "experiments/atomistic/stage1/polaris/pbs_paths.sh",
       "old": "canonical=\"$(canonicalize_path \"$path\")\"",
