@@ -87,7 +87,7 @@ def _run_metric_result(run_dir: Path):
     return next(
         result
         for result in run_rung1_checks({"run_dir": run_dir})
-        if result.name == "metric-jsonl-evidence"
+        if result.name in {"metric-jsonl-evidence", "metric-finite"}
     )
 
 
