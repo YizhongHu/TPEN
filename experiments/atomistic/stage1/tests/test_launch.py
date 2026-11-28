@@ -14,6 +14,7 @@ import pytest
 
 from experiments.atomistic.stage1.launch import (
     _binding_token,
+    _train_outcome_handler,
     command_for_row,
     render as _render,
     row_overrides,
@@ -471,6 +472,110 @@ def _rendered_script(scratch_base: str = "/tmp/stage1") -> str:
                   head_sha="c" * 40,
                   results_root="/n/netscratch/kozinsky_lab/Lab/rhu/stage1",
                   scratch_base=scratch_base)
+
+
+def _rendered_train_outcome_script(
+    tmp_path: Path, train_rc: int, status: str | None,
+) -> tuple[str, Path]:
+    """Replace only the rendered train command with a controlled stub."""
+
+    python = sys.executable
+    script = render(row=ROW, python=python, head_sha="c" * 40,
+                    results_root=ROW["results_root"], scratch_base=str(tmp_path))
+    command = command_for_row(row=ROW, python=python, checkout_root=str(REPO_ROOT))
+    stub = tmp_path / "train-stub"
+    stub.write_text(f"#!/bin/sh\nexit {train_rc}\n", encoding="utf-8")
+    stub.chmod(0o750)
+    script = script.replace(command, shlex.quote(str(stub)), 1)
+    status_path = (
+        Path(ROW["results_root"]) / ROW["experiment_name"] / ROW["sector"]
+        / ROW["run_id"] / "status.json"
+    )
+    local_status_path = tmp_path / "status.json"
+    script = script.replace(str(status_path), str(local_status_path), 1)
+    if status is not None:
+        local_status_path.write_text(
+            f'{{"status": "{status}"}}\n', encoding="utf-8",
+        )
+    next_step = tmp_path / "next-step-ran"
+    script += f"touch {shlex.quote(str(next_step))}\n"
+    return script, next_step
+
+
+def test_rendered_train_handler_is_the_only_rendered_byte_change() -> None:
+    script = _rendered_script()
+    command = command_for_row(row=ROW, python="/usr/bin/true", checkout_root=str(REPO_ROOT))
+    status_path = (
+        Path(ROW["results_root"]) / ROW["experiment_name"] / ROW["sector"]
+        / ROW["run_id"] / "status.json"
+    )
+    handler = _train_outcome_handler(
+        command=command, python="/usr/bin/true", status_path=status_path,
+    )
+    template = (
+        Path(__file__).parents[1] / "templates" / "cannon.sbatch"
+    ).read_text(encoding="utf-8")
+    expected = template.replace("__GPU_THREAD_EXPORTS__", "")
+    for marker, value in {
+        "__PARTITION__": "test",
+        "__RESULTS_ROOT__": ROW["results_root"],
+        "__HEAD_SHA__": ROW["source_sha"],
+        "__JOB_NAME__": stage1_row_job_name(ROW),
+        "__SCRATCH_BASE__": "/tmp/stage1",
+        "__COMMAND__": command,
+    }.items():
+        expected = expected.replace(marker, value)
+    assert script.replace(handler, command, 1) == expected
+
+
+def test_rendered_rc_zero_continues_and_runs_next_step(tmp_path: Path) -> None:
+    script, next_step = _rendered_train_outcome_script(tmp_path, 0, None)
+    result = _run(script, tmp_path, SLURM_JOB_ID="123", SLURM_JOB_PARTITION="test")
+    assert result.returncode == 0, result.stderr
+    assert next_step.exists()
+    assert "train_rc=0 status=not-applicable decision=continue" in result.stdout
+
+
+def test_rendered_rc_two_planned_yield_continues_and_runs_next_step(tmp_path: Path) -> None:
+    script, next_step = _rendered_train_outcome_script(tmp_path, 2, "planned_yield")
+    result = _run(script, tmp_path, SLURM_JOB_ID="123", SLURM_JOB_PARTITION="test")
+    assert result.returncode == 0, result.stderr
+    assert next_step.exists()
+    assert "train_rc=2 status=planned_yield decision=continue" in result.stdout
+
+
+def test_rendered_rc_two_completed_status_fails(tmp_path: Path) -> None:
+    script, next_step = _rendered_train_outcome_script(tmp_path, 2, "completed")
+    result = _run(script, tmp_path, SLURM_JOB_ID="123", SLURM_JOB_PARTITION="test")
+    assert result.returncode == 2
+    assert not next_step.exists()
+    assert "expected=planned_yield decision=fail" in result.stderr
+
+
+def test_rendered_rc_two_missing_status_fails(tmp_path: Path) -> None:
+    script, next_step = _rendered_train_outcome_script(tmp_path, 2, None)
+    result = _run(script, tmp_path, SLURM_JOB_ID="123", SLURM_JOB_PARTITION="test")
+    assert result.returncode == 2
+    assert not next_step.exists()
+    assert "status.json unreadable" in result.stderr
+
+
+def test_rendered_rc_two_malformed_status_fails(tmp_path: Path) -> None:
+    script, next_step = _rendered_train_outcome_script(tmp_path, 2, None)
+    status_path = tmp_path / "status.json"
+    status_path.write_text("not-json\n", encoding="utf-8")
+    result = _run(script, tmp_path, SLURM_JOB_ID="123", SLURM_JOB_PARTITION="test")
+    assert result.returncode == 2
+    assert not next_step.exists()
+    assert "status.json unreadable" in result.stderr
+
+
+def test_rendered_rc_one_fails(tmp_path: Path) -> None:
+    script, next_step = _rendered_train_outcome_script(tmp_path, 1, None)
+    result = _run(script, tmp_path, SLURM_JOB_ID="123", SLURM_JOB_PARTITION="test")
+    assert result.returncode == 1
+    assert not next_step.exists()
+    assert "train_rc=1 decision=fail" in result.stderr
 
 
 def test_guard_fails_without_slurm_job_id(tmp_path: Path) -> None:

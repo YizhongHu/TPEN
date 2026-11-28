@@ -218,6 +218,43 @@ def _resolve_driver_path(driver: str, checkout_root: str) -> str:
     return str((Path(checkout_root) / path).resolve())
 
 
+def _train_outcome_handler(*, command: str, python: str, status_path: Path) -> str:
+    """Capture the train exit code and admit only a recorded planned yield."""
+
+    quoted_python = shlex.quote(python)
+    quoted_status_path = shlex.quote(str(status_path))
+    return (
+        "if " + command + "; then\n"
+        "  TRAIN_RC=0\n"
+        "else\n"
+        "  TRAIN_RC=$?\n"
+        "fi\n"
+        "if [[ \"$TRAIN_RC\" == \"0\" ]]; then\n"
+        "  printf 'STAGE1_GUARD train_rc=%s status=not-applicable decision=continue\\n' \"$TRAIN_RC\"\n"
+        "elif [[ \"$TRAIN_RC\" == \"2\" ]]; then\n"
+        f"  STATUS_PATH={quoted_status_path}\n"
+        "  if [[ ! -r \"$STATUS_PATH\" ]]; then\n"
+        "    echo \"STAGE1_GUARD train_rc=2 status.json unreadable path=$STATUS_PATH decision=fail\" >&2\n"
+        "    exit \"$TRAIN_RC\"\n"
+        "  fi\n"
+        "  if ! STATUS=$("
+        f"{quoted_python} -c 'import json,sys; print(json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"status\", \"\"))' \"$STATUS_PATH\""
+        "); then\n"
+        "    echo \"STAGE1_GUARD train_rc=2 status.json unreadable path=$STATUS_PATH decision=fail\" >&2\n"
+        "    exit \"$TRAIN_RC\"\n"
+        "  fi\n"
+        "  if [[ \"$STATUS\" != \"planned_yield\" ]]; then\n"
+        "    echo \"STAGE1_GUARD train_rc=2 status=$STATUS expected=planned_yield decision=fail\" >&2\n"
+        "    exit \"$TRAIN_RC\"\n"
+        "  fi\n"
+        "  printf 'STAGE1_GUARD train_rc=%s status=%s decision=continue\\n' \"$TRAIN_RC\" \"$STATUS\"\n"
+        "else\n"
+        "  echo \"STAGE1_GUARD train_rc=$TRAIN_RC decision=fail\" >&2\n"
+        "  exit \"$TRAIN_RC\"\n"
+        "fi\n"
+    )
+
+
 def render(*, row: Mapping[str, Any], checkout_root: str, python: str,
            partition: str = "test",
            scratch_base: str = "/scratch", cpus_per_task: int | None = None,
@@ -277,6 +314,10 @@ def render(*, row: Mapping[str, Any], checkout_root: str, python: str,
     for field in ("experiment_name", "sector", "run_id"):
         _require_path_component(row.get(field), field=field)
     command = command_for_row(row, python=python, checkout_root=checkout_root)
+    status_path = (
+        Path(results_root) / str(row["experiment_name"]) / str(row["sector"])
+        / str(row["run_id"]) / "status.json"
+    )
     from experiments.toolkit.job_names import stage1_row_job_name
 
     job_name = stage1_row_job_name(row)
@@ -322,7 +363,9 @@ def render(*, row: Mapping[str, Any], checkout_root: str, python: str,
         "__COMMAND__": command,
     }.items():
         template = template.replace(marker, value)
-    return template
+    return template.replace(command, _train_outcome_handler(
+        command=command, python=python, status_path=status_path,
+    ), 1)
 
 
 def main() -> int:
