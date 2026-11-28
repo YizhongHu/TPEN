@@ -136,7 +136,7 @@ def test_recipe_freeze_is_independent_of_composer_source_at_import(tmp_path: Pat
     spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec is not None and spec.loader is not None
     fresh = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = fresh
+    sys.modules[spec.name] = fresh
     try:
         spec.loader.exec_module(fresh)
         with pytest.raises(fresh.P3RenderError, match="recipe|drift|enumerated"):
@@ -148,7 +148,7 @@ def test_recipe_freeze_is_independent_of_composer_source_at_import(tmp_path: Pat
                 packet["r2-soap-100"].row, python="/usr/bin/python3", checkout_root=str(ROOT)
             )
     finally:
-        sys.modules.pop(module_name, None)
+        sys.modules.pop(spec.name, None)
 
 
 def test_eval_publication_is_bound_to_train_output_when_optional_metadata_absent(tmp_path: Path) -> None:
