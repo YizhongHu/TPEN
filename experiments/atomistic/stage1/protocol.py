@@ -1208,10 +1208,18 @@ def validate_eval_config_for_row(config: str, system: str) -> None:
 
     if not isinstance(system, str) or system not in SYSTEMS:
         raise ProtocolError("eval row has an unknown system")
-    train_config = _train_config_for_eval_config(config)
+    config_reference = config
+    if Path(config).is_absolute():
+        configs_root = Path(__file__).resolve().parent / "configs"
+        try:
+            config_reference = Path(config).resolve().relative_to(configs_root).as_posix()
+        except ValueError as exc:
+            raise ProtocolError("eval config is not a canonical Stage-1 config path") from exc
+        config_reference = f"configs/{config_reference}"
+    train_config = _train_config_for_eval_config(config_reference)
     if train_config.split("/", 2)[1:] != [system, train_config.rsplit("/", 1)[1]]:
         raise ProtocolError("eval config is bound to a different Stage-1 system")
-    if evaluation_config_for_train_config(train_config) != config:
+    if evaluation_config_for_train_config(train_config) != config_reference:
         raise ProtocolError("eval config is not paired with its Stage-1 train config")
 
 
@@ -1347,8 +1355,11 @@ def _validate_config_identity_for_row(row: Mapping[str, Any], config_path: str |
                     if relative in {train.removeprefix("configs/"), eval.removeprefix("configs/")}), None)
     if row.get("kind") == "eval":
         validate_eval_config_for_row(f"configs/{relative}", system)
-    elif variant is None and relative != f"{system}/train.yaml":
-        raise ProtocolError("train config is not a canonical Stage-1 train config")
+    elif row.get("kind") == "train":
+        if relative in set(variant_by_train.values()):
+            raise ProtocolError("train row cannot bind an eval config")
+        if variant is None and relative != f"{system}/train.yaml":
+            raise ProtocolError("train config is not a canonical Stage-1 train config")
     actual = config_identity(
         config_root=path.parent.parent, systems=(system,),
         science_profile=row.get("science_profile") if is_model_profile(

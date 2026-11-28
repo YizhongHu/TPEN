@@ -16,6 +16,7 @@ from experiments.atomistic.stage1 import train as stage1_train
 from experiments.atomistic.stage1.launch import _binding_token, command_for_row
 from experiments.atomistic.stage1.protocol import (
     Protocol,
+    ProtocolError,
     build_manifest,
     bind_evaluation_manifest,
     config_identities,
@@ -23,6 +24,7 @@ from experiments.atomistic.stage1.protocol import (
     manifest_hash,
     physical_system_id_from_config,
     resolve_run_dir,
+    validate_gateway_binding,
 )
 
 
@@ -42,7 +44,9 @@ def _phase2_rows(
         lineage_walkers=2, lineages=3, eval_streams=4, eval_walkers=2,
         eval_draws=2,
     )
-    config_sha = config_identities(config_root=ROOT, systems=("hooke2",))
+    config_sha = config_identities(
+        config_root=ROOT, systems=("hooke2",), config_variant=config_variant,
+    )
     rows = build_manifest(
         protocol=protocol, source_sha="a" * 40, config_sha256=config_sha,
         checkpoints=[0, 3], lineage_seeds=[11, 12, 13],
@@ -54,19 +58,8 @@ def _phase2_rows(
         results_root=results_root, systems=("hooke2",), phase=2,
         expected_physical_system_id={
             "hooke2": physical_system_id_from_config(HOOKE2 / "eval.yaml"),
-        },
+        }, config_variant=config_variant,
     )
-    if config_variant is not None:
-        for row in rows:
-            row["config_identity_rule"] = "legacy-config-sha256"
-            row["config"] = (
-                f"configs/hooke2/{config_variant}.yaml"
-                if row["kind"] == "train"
-                else f"configs/hooke2/{config_variant}_eval.yaml"
-            )
-            row["row_id"] = manifest_hash([
-                {key: value for key, value in row.items() if key != "row_id"}
-            ])
     return rows
 
 
@@ -80,15 +73,15 @@ def _bound_variant_eval_row() -> dict[str, object]:
     )
     phase1 = build_manifest(
         protocol=protocol, source_sha="a" * 40,
-        config_sha256=config_identities(config_root=ROOT, systems=("hooke2",)),
+        config_sha256=config_identities(
+            config_root=ROOT, systems=("hooke2",),
+            config_variant="positive_singlet_tail",
+        ),
         checkpoints=[0, 3], lineage_seeds=[11, 12, 13], checkpoint_sha256={},
         results_root="/external/stage1", systems=("hooke2",), phase=1,
+        config_variant="positive_singlet_tail",
     )
     train = next(row for row in phase1 if row["kind"] == "train")
-    train["config"] = "configs/hooke2/positive_singlet_tail.yaml"
-    train["row_id"] = manifest_hash([
-        {key: value for key, value in train.items() if key != "row_id"}
-    ])
     phase1_hash = manifest_hash(phase1)
     evidence = {
         "schema": "stage1-checkpoint-evidence/v1",
@@ -105,7 +98,10 @@ def _bound_variant_eval_row() -> dict[str, object]:
     return next(row for row in bind_evaluation_manifest(
         phase1_rows=phase1, checkpoints=[3], checkpoint_evidence=evidence,
         expected_physical_system_id={"hooke2": "d" * 64},
-        config_sha256=config_identities(config_root=ROOT, systems=("hooke2",)),
+        config_sha256=config_identities(
+            config_root=ROOT, systems=("hooke2",),
+            config_variant="positive_singlet_tail",
+        ),
         protocol=protocol, phase1_manifest_hash=phase1_hash,
     ) if row["kind"] == "eval")
 
@@ -151,6 +147,8 @@ def test_native_eval_rows_and_launch_preserve_positive_singlet_selection() -> No
         evaluation = next(row for row in rows if row["kind"] == "eval")
         assert train["config"] == f"configs/hooke2/{arm}.yaml"
         assert evaluation["config"] == f"configs/hooke2/{arm}_eval.yaml"
+        assert validate_gateway_binding(binding=_binding_token(train)) == train
+        assert validate_gateway_binding(binding=_binding_token(evaluation)) == evaluation
         command = command_for_row(
             evaluation, python="/usr/bin/python3", driver="driver.py",
         )
@@ -176,6 +174,37 @@ def test_legacy_eval_row_without_system_still_renders() -> None:
     }
     command = command_for_row(row, python="/usr/bin/python3", driver="driver.py")
     assert decode_binding(command.rsplit(" ", 1)[-1])["config"] == row["config"]
+
+
+def test_legacy_eval_row_with_absolute_canonical_path_still_renders() -> None:
+    """Legacy/default rows preserve an absolute canonical eval binding."""
+
+    config = str((ROOT / "he" / "eval.yaml").resolve())
+    row = {
+        "kind": "eval", "system": "he", "source_sha": "a" * 40,
+        "config_sha256": "b" * 64, "config": config,
+        "row_id": "legacy-absolute-eval",
+    }
+    command = command_for_row(row, python="/usr/bin/python3", driver="driver.py")
+    assert decode_binding(command.rsplit(" ", 1)[-1])["config"] == config
+
+
+def test_variant_identity_rejects_cross_kind_config_names() -> None:
+    """Computed variant identities bind train and eval filenames to their kinds."""
+
+    rows = _phase2_rows(config_variant="positive_singlet_tail")
+    train = next(row for row in rows if row["kind"] == "train")
+    evaluation = next(row for row in rows if row["kind"] == "eval")
+    train_with_eval_name = dict(train, config=evaluation["config"])
+    eval_with_train_name = dict(evaluation, config=train["config"])
+    with pytest.raises(ProtocolError, match="train row cannot bind an eval config"):
+        validate_gateway_binding(
+            binding=_binding_token(train_with_eval_name), kind="train",
+        )
+    with pytest.raises(ProtocolError, match="unsupported Stage-1 eval config"):
+        validate_gateway_binding(
+            binding=_binding_token(eval_with_train_name), kind="eval",
+        )
 
 
 def test_native_tail_train_checkpoint_eval_has_finite_local_energy(
