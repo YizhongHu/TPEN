@@ -103,7 +103,8 @@ def _emit_optimizer_records(tmp_path: Path, profile: PilotProfile):
     assert expected_tensors == sum(
         int(record.metrics["n_no_optimizer_state"]) for record in records
     )
-    return records, declared, resolved, expected_tensors
+    group_inventory = {**inventory, "factors": {"parameters": 0, "elements": 0}}
+    return records, declared, resolved, expected_tensors, group_inventory
 
 
 @pytest.mark.parametrize("profile", [R2_PROFILES[0]], ids=lambda profile: profile.name)
@@ -112,7 +113,7 @@ def test_real_optimizer_callback_group_detector_is_explicitly_red(
 ) -> None:
     """Declared parameter-free groups expose the producer/consumer mismatch."""
 
-    records, declared, resolved, expected_tensors = _emit_optimizer_records(tmp_path, profile)
+    records, declared, resolved, expected_tensors, inventory = _emit_optimizer_records(tmp_path, profile)
     assert check_disconnected_optimizer_state(
         records, groups=tuple(resolved), terminal_step=99, expected_tensors=expected_tensors
     ).passed
@@ -120,7 +121,11 @@ def test_real_optimizer_callback_group_detector_is_explicitly_red(
     # Compatibility detector: the declaration includes parameter-free factors,
     # but the real producer emits only resolved groups.
     assert check_disconnected_optimizer_state(
-        records, groups=declared, terminal_step=99, expected_tensors=expected_tensors
+        records,
+        groups=declared,
+        terminal_step=99,
+        expected_tensors=expected_tensors,
+        group_inventory=inventory,
     ).passed
 
 
@@ -130,7 +135,7 @@ def test_real_optimizer_callback_checkpoint_coordinate_detector_is_explicitly_re
 ) -> None:
     """Completed iteration 99 must not be treated as terminal checkpoint 100."""
 
-    records, _, resolved, expected_tensors = _emit_optimizer_records(tmp_path, profile)
+    records, _, resolved, expected_tensors, _ = _emit_optimizer_records(tmp_path, profile)
     # Independent coordinate detector: completed iteration 99 vs checkpoint 100.
     assert check_disconnected_optimizer_state(
         records, groups=tuple(resolved), terminal_step=100, expected_tensors=expected_tensors
