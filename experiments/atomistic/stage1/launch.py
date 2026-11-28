@@ -251,6 +251,19 @@ def _train_outcome_handler(*, command: str, python: str, status_path: Path) -> s
     )
 
 
+def command_from_rendered(script: str) -> str:
+    """Extract the identity-bound driver command from a rendered script."""
+
+    for raw_line in script.splitlines():
+        line = raw_line.strip()
+        if "--binding" not in line:
+            continue
+        if line.startswith("if ") and line.endswith("; then"):
+            line = line[3:-len("; then")].strip()
+        return line
+    raise ValueError("rendered script does not contain a driver command")
+
+
 def render(*, row: Mapping[str, Any], checkout_root: str, python: str,
            partition: str = "test",
            scratch_base: str = "/scratch", cpus_per_task: int | None = None,

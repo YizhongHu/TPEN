@@ -27,6 +27,13 @@
       "old": "if row.get(\"kind\") in {\"smoke\", \"train\"}:",
       "new": "if True:",
       "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_rendered_eval_rc_two_planned_yield_fails_without_next_step"
+    },
+    {
+      "id": "rendered-command-parser-skipped",
+      "target": "experiments/atomistic/stage1/launch.py",
+      "old": "if \"--binding\" not in line:",
+      "new": "if False: # mutant: skip rendered driver command",
+      "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_command_from_rendered_extracts_driver_command[smoke]"
     }
   ]
 }

@@ -16,6 +16,7 @@ from experiments.atomistic.stage1.launch import (
     _binding_token,
     _train_outcome_handler,
     command_for_row,
+    command_from_rendered,
     render as _render,
     row_overrides,
 )
@@ -578,6 +579,22 @@ def test_rendered_eval_is_byte_identical_to_pre_pr_render() -> None:
     }.items():
         expected = expected.replace(marker, value)
     assert script == expected
+
+
+@pytest.mark.parametrize("kind", ["smoke", "train", "eval"])
+def test_command_from_rendered_extracts_driver_command(kind: str, tmp_path: Path) -> None:
+    row = _thread_env_row(kind)
+    script = render(
+        row=row,
+        python="/usr/bin/python3",
+        head_sha="c" * 40,
+        results_root=row["results_root"],
+        scratch_base=str(tmp_path),
+    )
+    expected = command_for_row(
+        row=row, python="/usr/bin/python3", checkout_root=str(REPO_ROOT),
+    )
+    assert command_from_rendered(script) == expected
 
 
 def test_rendered_rc_zero_continues_and_runs_next_step(tmp_path: Path) -> None:
