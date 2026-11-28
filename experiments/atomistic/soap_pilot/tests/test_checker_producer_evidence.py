@@ -147,7 +147,13 @@ def test_real_optimizer_callback_checkpoint_coordinate_detector_is_explicitly_re
 def test_run_rung1_uses_real_rendered_inventory_and_reconciles_jsonl(
     tmp_path: Path, profile: PilotProfile
 ) -> None:
-    """The production checker derives groups from rendered config, not a fixture inventory."""
+    """A no-update wire fixture is rejected by the production 16-tensor gate.
+
+    This fixture intentionally constructs a fresh optimizer, so its rendered
+    inventory emits 40 disconnected tensors rather than the B2 acceptance
+    value of 16.  The test therefore checks the correct negative verdict while
+    still exercising the rendered-inventory/JSONL reconciliation path.
+    """
 
     rendered, records, declared, resolved, expected_tensors, _ = _emit_optimizer_records(
         tmp_path, profile
@@ -170,8 +176,15 @@ def test_run_rung1_uses_real_rendered_inventory_and_reconciles_jsonl(
             }
         )
     }
-    assert results["disconnected-optimizer-state"].passed
-    assert results["disconnected-optimizer-state"].evidence["empty_groups"] == ["factors"]
+    optimizer = results["disconnected-optimizer-state"]
+    assert optimizer.verdict is Verdict.PRODUCT_FAILURE
+    assert optimizer.detail == "expected 16 disconnected tensors, got 40"
+    assert optimizer.evidence["groups"] == {
+        "embedding": 8,
+        "readout": 1,
+        "layer_0_mixing": 29,
+        "layer_0_path_aggregation": 2,
+    }
     assert sum(
         int(record.metrics["n_no_optimizer_state"])
         for record in records
