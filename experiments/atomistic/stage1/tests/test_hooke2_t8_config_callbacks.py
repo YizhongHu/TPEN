@@ -10,8 +10,15 @@ from omegaconf import OmegaConf
 
 from experiments.atomistic.stage1 import train as stage1_train
 from experiments.atomistic.stage1.launch import _binding_token
-from experiments.atomistic.stage1.protocol import resolve_config_path
+from experiments.atomistic.stage1.protocol import (
+    Protocol,
+    build_manifest,
+    derive_smoke_request,
+    resolve_config_path,
+)
 from experiments.toolkit.run_paths import resolve_run_dir
+from tpen.checkpoint import deserialize_checkpoint_ref
+from tpen.run import PLANNED_YIELD_EXIT_CODE
 
 
 CONFIG_ROOT = Path(__file__).parents[1] / "configs" / "hooke2"
@@ -20,6 +27,41 @@ ARMS = ("positive_singlet_tail", "positive_singlet_comparator")
 
 def _config(name: str):
     return OmegaConf.load(CONFIG_ROOT / f"{name}.yaml")
+
+
+def _planned_train_row(tmp_path: Path, arm: str) -> dict[str, object]:
+    """Build one production-shaped train row and derive its bounded smoke."""
+
+    planned = build_manifest(
+        protocol=Protocol(
+            smoke_updates=1,
+            smoke_walkers=2,
+            lineage_updates=3,
+            lineage_walkers=2,
+            lineages=3,
+            eval_streams=4,
+            eval_walkers=2,
+            eval_draws=2,
+        ),
+        source_sha="a" * 40,
+        # This callback contract test intentionally uses the legacy digest
+        # shape: the opt-in arm is not the canonical Stage-1 train.yaml.
+        config_sha256="b" * 64,
+        checkpoints=[0, 1, 2, 3],
+        lineage_seeds=[11, 12, 13],
+        checkpoint_sha256={},
+        results_root=str(tmp_path / "planned"),
+        systems=("hooke2",),
+        phase=1,
+        include_smoke=False,
+    )
+    source = next(row for row in planned if row["kind"] == "train")
+    source["config"] = f"configs/hooke2/{arm}.yaml"
+    return derive_smoke_request(
+        source,
+        results_root=str(tmp_path / f"smoke-{arm}"),
+        stop_at=1,
+    )
 
 
 def test_t8_arms_match_train_checkpoint_contract() -> None:
@@ -63,20 +105,7 @@ def test_native_train_planned_yield_publishes_train_resume_checkpoint(
 ) -> None:
     """The native train gateway must yield only after a full checkpoint is published."""
 
-    row = {
-        "kind": "train",
-        "system": "hooke2",
-        "seed": 17,
-        "config": f"configs/hooke2/{arm}.yaml",
-        "results_root": str(tmp_path / "results"),
-        "experiment_name": "stage1_hooke2",
-        "sector": "atomistic",
-        "run_id": f"native-{arm}",
-        "walkers": 2,
-        "updates": 3,
-        "checkpoint_steps": [0, 1, 2, 3],
-        "device": "cpu",
-    }
+    row = _planned_train_row(tmp_path, arm)
     assert resolve_config_path(row["config"]).is_file()
 
     monkeypatch.setattr(
@@ -84,17 +113,27 @@ def test_native_train_planned_yield_publishes_train_resume_checkpoint(
         "argv",
         ["stage1-train", "--binding", _binding_token(row)],
     )
-    # The native gateway records planned_yield in its durable outcome while
-    # returning the normal successful process code for this in-process path.
-    assert stage1_train.main() == 0
-
+    exit_code = stage1_train.main()
     run_dir = resolve_run_dir(row)
     outcome = json.loads((run_dir / "run-outcome.json").read_text(encoding="utf-8"))
+    assert PLANNED_YIELD_EXIT_CODE == 2  # tpen.run._status_to_exit_code convention
+    # At the unfixed head, the same correctly bounded row reaches PlannedYield
+    # without a publisher and must expose this exact refusal to the control.
+    if exit_code != PLANNED_YIELD_EXIT_CODE:
+        assert outcome["error"] == (
+            "planned yield boundary lacks a published full-state checkpoint"
+        )
+    assert exit_code == PLANNED_YIELD_EXIT_CODE, outcome
     assert outcome["status"] == "planned_yield"
-    assert outcome["next_iteration"] == 1
-    assert outcome["completed_updates"] == 1
-    assert outcome["checkpoint_ref"]["profile"] == "train_resume"
-    checkpoint = run_dir / "checkpoints" / "step_000001"
+    stop_at = int(row["execution"]["stop_at"])
+    assert outcome["next_iteration"] == stop_at
+    assert outcome["completed_updates"] == stop_at
+    checkpoint_ref = deserialize_checkpoint_ref(outcome["checkpoint_ref"])
+    checkpoint = run_dir / "checkpoints" / f"step_{stop_at:06d}"
+    assert checkpoint_ref.next_iteration == stop_at
+    assert checkpoint_ref.completed_updates == stop_at
+    assert checkpoint_ref.checkpoint_dir == checkpoint
+    assert checkpoint.is_dir()
     manifest = json.loads((checkpoint / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["payload"]["profile"] == "train_resume"
     assert (checkpoint / "COMPLETE").is_file()
