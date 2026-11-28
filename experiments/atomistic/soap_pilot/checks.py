@@ -483,8 +483,11 @@ def check_disconnected_optimizer_state(
     The rendered callback declaration is not itself an emitting inventory:
     ``resolve_parameter_groups`` drops empty assignments
     (``tpen/parameter_groups.py:111-118``).  A declared group may therefore be
-    omitted only when ``empty_groups`` or ``group_inventory`` proves it empty;
-    every other missing group remains ``UNMEASURED``.
+    omitted only when a complete ``group_inventory`` proves ``parameters == 0``;
+    every other missing group remains ``UNMEASURED``.  A caller-supplied
+    ``empty_groups`` claim is accepted only as an exact cross-check against that
+    inventory, never as proof by itself, because parameter-bearing groups must
+    not be allowed to vacuously pass when the producer omits empty assignments.
     """
 
     name = "disconnected-optimizer-state"
@@ -503,11 +506,14 @@ def check_disconnected_optimizer_state(
     if isinstance(empty_groups, (str, bytes)):
         return _invalid(name, "empty-group evidence must be an iterable of group names")
     try:
-        proven_empty: set[str] = set(empty_groups or ())
+        claimed_empty: set[str] = set(empty_groups or ())
     except TypeError:
         return _invalid(name, "empty-group evidence must be an iterable of group names")
-    if any(group not in group_names for group in proven_empty):
+    if any(group not in group_names for group in claimed_empty):
         return _invalid(name, "empty-group evidence names an undeclared OptimizerState group")
+    if claimed_empty and group_inventory is None:
+        return _invalid(name, "empty-group claims require a complete group inventory")
+    proven_empty: set[str] = set()
     if group_inventory is not None:
         if not isinstance(group_inventory, Mapping) or set(group_inventory) != set(group_names):
             return _invalid(name, "group inventory must cover every rendered OptimizerState group")
@@ -519,8 +525,8 @@ def check_disconnected_optimizer_state(
                 return _invalid(name, f"group inventory for {group!r} must name a non-negative parameter count")
             if parameters == 0:
                 proven_empty.add(group)
-            else:
-                proven_empty.discard(group)
+        if claimed_empty and claimed_empty != proven_empty:
+            return _invalid(name, "empty-group claims contradict the complete group inventory")
     emitting_groups = tuple(group for group in group_names if group not in proven_empty)
     if not emitting_groups:
         return _missing(name, "all rendered OptimizerState groups are proven empty")
