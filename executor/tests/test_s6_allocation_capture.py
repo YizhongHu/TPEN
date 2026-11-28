@@ -104,7 +104,7 @@ def test_capture_requires_full_node_and_exact_association() -> None:
     with pytest.raises(AllocationCaptureRefusal, match="no delivered node"):
         assign_full_node(empty_parent, host="node-a", allowed_cpus=range(16), device_uuids=_devices("A"), node_layout=_layout())
 
-    with pytest.raises(AllocationCaptureRefusal, match="affinity"):
+    with pytest.raises(AllocationCaptureRefusal, match="controller affinity does not cover"):
         assign_full_node(_snapshot(), host="node-a", allowed_cpus=range(8), device_uuids=_devices("A"), node_layout=_layout())
 
     with pytest.raises(AllocationCaptureRefusal, match="full-node CPU domain"):

@@ -320,8 +320,6 @@ class FullNodeAssignment:
             expected_slot_cpus = self.node_layout.cpu_ids(index)
             if slot.cpus != expected_slot_cpus:
                 raise AllocationCaptureRefusal("cpu-topology-mismatch", "slot CPU set differs from declared node topology")
-            if not set(slot.cpus).issubset(expected_cpus):
-                raise AllocationCaptureRefusal("affinity-outside-entitlement", "declared slot CPUs exceed controller affinity")
             if seen_cpus & set(slot.cpus):
                 raise AllocationCaptureRefusal("overlapping-cpu-entitlement", "slot CPU entitlements overlap")
             seen_cpus.update(slot.cpus)
