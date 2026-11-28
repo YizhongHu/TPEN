@@ -1,0 +1,60 @@
+{
+  "mutants": [
+    {
+      "id": "s7-intent-conflict-ignored",
+      "target": "executor/src/tpen_executor/lifecycle/balsam_control.py",
+      "old": "if stored != intent:\n            raise BalsamGroupRefusal(\"BatchJob intent conflicts with the immutable group\")",
+      "new": "if False:\n            raise BalsamGroupRefusal(\"BatchJob intent conflicts with the immutable group\")",
+      "killer": "executor/tests/test_s7_balsam_control.py::test_conflict_and_unknown_ack_park_without_a_second_external_mutation"
+    },
+    {
+      "id": "s7-parked-intent-resubmitted",
+      "target": "executor/src/tpen_executor/lifecycle/balsam_control.py",
+      "old": "if os.path.lexists(refusal_path):\n            if not refusal_path.is_file():\n                raise BalsamGroupRefusal(\"Balsam BatchJob refusal is not a regular file\")\n            raise BalsamGroupRefusal(\"BatchJob submission was refused\")\n        raise BalsamGroupParked(\"BatchJob acknowledgement is unknown; no second submission\")",
+      "new": "if os.path.lexists(refusal_path):\n            if not refusal_path.is_file():\n                raise BalsamGroupRefusal(\"Balsam BatchJob refusal is not a regular file\")\n            raise BalsamGroupRefusal(\"BatchJob submission was refused\")\n        return BalsamBatchReceipt(intent, BatchJobId(\"mutant\"))",
+      "killer": "executor/tests/test_s7_balsam_control.py::test_conflict_and_unknown_ack_park_without_a_second_external_mutation"
+    },
+    {
+      "id": "s7-registration-job-crossed",
+      "target": "executor/src/tpen_executor/lifecycle/balsam_control.py",
+      "old": "if registration.intent.group_id != intent.group_id or registration.backend_job_id != intent.backend_job_id:",
+      "new": "if False:",
+      "killer": "executor/tests/test_s7_balsam_control.py::test_registration_identity_is_required_before_batch_mutation"
+    },
+    {
+      "id": "s7-authority-after-journal-only",
+      "target": "executor/src/tpen_executor/lifecycle/balsam_control.py",
+      "old": "authority()\n    intent_path, receipt_path, refusal_path = _record_paths(store, intent)",
+      "new": "intent_path, receipt_path, refusal_path = _record_paths(store, intent)",
+      "killer": "executor/tests/test_s7_balsam_control.py::test_fresh_batch_journals_once_replays_receipt_and_uses_persisted_paths"
+    },
+    {
+      "id": "s7-output-paths-not-forwarded",
+      "target": "executor/src/tpen_executor/lifecycle/balsam_control.py",
+      "old": "stdout_path=stdout_path, stderr_path=stderr_path,",
+      "new": "stdout_path=\"/tmp/mutant-out\", stderr_path=\"/tmp/mutant-err\",",
+      "killer": "executor/tests/test_s7_balsam_control.py::test_fresh_batch_journals_once_replays_receipt_and_uses_persisted_paths"
+    },
+    {
+      "id": "s7-batch-parent-check-removed",
+      "target": "executor/control/balsam/src/tpen_balsam_control/sdk_adapter.py",
+      "old": "if not parent.is_dir():\n                    raise BalsamControlRefusal(\"BatchJob output parent is not a directory\")",
+      "new": "if False:\n                    raise BalsamControlRefusal(\"BatchJob output parent is not a directory\")",
+      "killer": "executor/tests/test_s7_balsam_control.py::test_control_batch_create_prepares_both_parent_directories_before_sole_mutation"
+    },
+    {
+      "id": "s7-batch-create-ack-dropped",
+      "target": "executor/control/balsam/src/tpen_balsam_control/sdk_adapter.py",
+      "old": "return str(identity)",
+      "new": "return \"\"",
+      "killer": "executor/tests/test_s7_balsam_control.py::test_control_batch_create_without_ack_is_ambiguous_and_never_rearmed"
+    },
+    {
+      "id": "s7-batch-output-params-dropped",
+      "target": "executor/control/balsam/src/tpen_balsam_control/sdk_adapter.py",
+      "old": "                optional_params=paths.as_optional_params(),\n                filter_tags={",
+      "new": "                optional_params={},\n                filter_tags={",
+      "killer": "executor/tests/test_s7_balsam_control.py::test_control_batch_create_prepares_both_parent_directories_before_sole_mutation"
+    }
+  ]
+}

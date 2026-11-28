@@ -101,6 +101,7 @@ class BalsamDeployment:
     site_name: str
     site_directory: str
     control_environment: LockedControlEnvironment
+    site_id: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.venue, PbsVenue):
@@ -114,6 +115,8 @@ class BalsamDeployment:
             raise BalsamDeploymentRefusal("site_directory must end with the exact site_name")
         if not isinstance(self.control_environment, LockedControlEnvironment):
             raise TypeError("control_environment must be LockedControlEnvironment")
+        if type(self.site_id) is not int or self.site_id <= 0:
+            raise BalsamDeploymentRefusal("site_id must be a positive integer")
         object.__setattr__(self, "site_directory", site_directory)
 
     @property
@@ -126,7 +129,7 @@ class BalsamDeployment:
         return {"schema": self.schema, "venue": self.venue.to_dict(), "site_template": self.site_template,
                 "api_root": self.api_root, "credential_file": self.credential_file,
                 "site_name": self.site_name, "site_directory": self.site_directory,
-                "control_environment": self.control_environment.to_dict()}
+                "control_environment": self.control_environment.to_dict(), "site_id": self.site_id}
 
     def encode(self) -> bytes:
         """Encode the canonical deployment description."""
@@ -135,6 +138,31 @@ class BalsamDeployment:
     def render(self, resources: PbsBatchResources | None = None) -> "DeploymentRender":
         """Render this descriptor without performing an external effect."""
         return render_deployment(self, resources)
+
+    def batch_submission_fields(self, resources: PbsBatchResources) -> dict[str, int | str]:
+        """Return the finite pinned-Balsam BatchJob fields for this site.
+
+        Parameters
+        ----------
+        resources : PbsBatchResources
+            Approved PBS carrier request.
+
+        Returns
+        -------
+        dict[str, object]
+            Exact ``BatchJobManager.create`` allocation/site fields.
+        """
+        if not isinstance(resources, PbsBatchResources):
+            raise TypeError("resources must be PbsBatchResources")
+        resources.validate(self.venue)
+        return {
+            "num_nodes": resources.num_nodes,
+            "wall_time_min": resources.wall_time_min,
+            "job_mode": resources.job_mode,
+            "site_id": self.site_id,
+            "project": resources.project,
+            "queue": resources.queue,
+        }
 
     def deploy(self, backend: "DeploymentBackend",
                resources: PbsBatchResources | None = None) -> tuple["DeploymentRender", "DeploymentReadback"]:
@@ -145,12 +173,12 @@ class BalsamDeployment:
     def from_mapping(cls, value: Any) -> "BalsamDeployment":
         """Decode one strict deployment description."""
         data = fields(value, {"schema", "venue", "site_template", "api_root", "credential_file",
-                              "site_name", "site_directory", "control_environment"}, cls.schema, cls.__name__)
+                              "site_name", "site_directory", "control_environment", "site_id"}, cls.schema, cls.__name__)
         venue = data["venue"] if isinstance(data["venue"], PbsVenue) else PbsVenue.from_mapping(data["venue"])
         return cls(venue,
                    data["site_template"], data["api_root"], data["credential_file"],
                    data["site_name"], data["site_directory"],
-                   LockedControlEnvironment.from_mapping(data["control_environment"]))
+                   LockedControlEnvironment.from_mapping(data["control_environment"]), data["site_id"])
 
     @classmethod
     def decode(cls, value: bytes | str | Mapping[str, Any]) -> "BalsamDeployment":
@@ -353,6 +381,7 @@ def render_deployment(spec: BalsamDeployment, resources: PbsBatchResources | Non
         "site_template": spec.site_template,
         "api_root": spec.api_root,
         "credential_file": spec.credential_file,
+        "site_id": spec.site_id,
         "control_python": spec.control_environment.environment.python,
         "deployment_digest": spec.deployment_digest,
     }, sort_keys=True, separators=(",", ":"))

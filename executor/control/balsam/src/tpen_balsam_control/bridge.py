@@ -60,9 +60,22 @@ def dispatch(request: BalsamWireRequest, operations: InjectedSDKOperations) -> B
             state = operations.observe(str(request.group_id), str(request.backend_job_id))
             return BalsamWireResult.ack(request, backend_job_id=request.backend_job_id, state=state)
         if request.operation == "submit":
-            batch_id = operations.submit(
-                str(request.group_id), str(request.backend_job_id), request.batch_digest or ""
-            )
+            if request.stdout_path is None:
+                batch_id = operations.submit(
+                    str(request.group_id), str(request.backend_job_id), request.batch_digest or ""
+                )
+            elif request.num_nodes is None:
+                batch_id = operations.submit(
+                    str(request.group_id), str(request.backend_job_id), request.batch_digest or "",
+                    request.stdout_path, request.stderr_path or "",
+                )
+            else:
+                batch_id = operations.submit(
+                    str(request.group_id), str(request.backend_job_id), request.batch_digest or "",
+                    request.stdout_path, request.stderr_path or "",
+                    request.num_nodes, request.wall_time_min or 0, request.job_mode or "",
+                    request.site_id or 0, request.project or "", request.queue or "",
+                )
             from tpen_executor.contracts import BatchJobId
 
             return BalsamWireResult.ack(

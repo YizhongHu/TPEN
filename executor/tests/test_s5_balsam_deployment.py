@@ -55,6 +55,7 @@ def _spec(tmp_path: Path) -> BalsamDeployment:
             str(prefix),
             PreparedPythonEnvironment(str(prefix / "bin" / "python"), SourceScript(str(tmp_path / "setup.sh"))),
         ),
+        7,
     )
 
 
@@ -102,6 +103,10 @@ class _Backend:
 def test_render_is_deterministic_and_effect_free(tmp_path: Path) -> None:
     spec = _spec(tmp_path)
     resources = PbsBatchResources("account", "short", 1, 15)
+    assert spec.batch_submission_fields(resources) == {
+        "num_nodes": 1, "wall_time_min": 15, "job_mode": "serial",
+        "site_id": 7, "project": "account", "queue": "short",
+    }
     first = render_deployment(spec, resources)
     second = render_deployment(spec, resources)
     assert first == second

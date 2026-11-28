@@ -8,6 +8,7 @@ cross the process boundary accidentally.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 from .._codec import canonical_bytes, decode_json, fields, sha256_text, text
@@ -15,7 +16,7 @@ from .._records import frozen_record
 from ..contracts import BackendJobId, BatchJobId, GroupId
 
 
-WIRE_VERSION = "tpen-executor/balsam-wire-v1"
+WIRE_VERSION = "tpen-executor/balsam-wire-v2"
 Operation = Literal["register", "observe", "submit", "rearm", "readback"]
 Status = Literal["ack", "refused", "ambiguous"]
 _OPERATIONS = frozenset(("register", "observe", "submit", "rearm", "readback"))
@@ -54,6 +55,14 @@ class BalsamWireRequest:
     deployment_digest: str | None = None
     batch_digest: str | None = None
     recovery_digest: str | None = None
+    stdout_path: str | None = None
+    stderr_path: str | None = None
+    num_nodes: int | None = None
+    wall_time_min: int | None = None
+    job_mode: str | None = None
+    site_id: int | None = None
+    project: str | None = None
+    queue: str | None = None
 
     def __post_init__(self) -> None:
         op = _operation(self.operation)
@@ -65,6 +74,29 @@ class BalsamWireRequest:
             value = getattr(self, name)
             if value is not None:
                 sha256_text(value, name)
+        if self.stdout_path is not None or self.stderr_path is not None:
+            if op != "submit" or self.stdout_path is None or self.stderr_path is None:
+                raise BalsamWireError("output paths are submit-only and must be paired")
+            for name in ("stdout_path", "stderr_path"):
+                value = getattr(self, name)
+                if type(value) is not str or not Path(value).is_absolute():
+                    raise BalsamWireError(f"{name} must be absolute")
+        allocation_fields = (self.num_nodes, self.wall_time_min, self.job_mode,
+                             self.site_id, self.project, self.queue)
+        if op != "submit" and any(value is not None for value in allocation_fields):
+            raise BalsamWireError("allocation fields are submit-only")
+        if any(value is not None for value in allocation_fields) and any(value is None for value in allocation_fields):
+            raise BalsamWireError("submit allocation fields must be complete")
+        if self.num_nodes is not None:
+            if self.stdout_path is None or self.stderr_path is None:
+                raise BalsamWireError("submit allocation fields require output paths")
+            for name in ("num_nodes", "wall_time_min", "site_id"):
+                value = getattr(self, name)
+                if type(value) is not int or value <= 0:
+                    raise BalsamWireError(f"{name} must be a positive integer")
+            for name in ("job_mode", "project", "queue"):
+                if type(getattr(self, name)) is not str or not getattr(self, name).strip():
+                    raise BalsamWireError(f"{name} must be non-empty text")
         required = {
             "register": (self.backend_job_id is None and self.group_digest is not None and self.deployment_digest is not None
                          and self.batch_digest is None and self.recovery_digest is None),
@@ -91,9 +123,16 @@ class BalsamWireRequest:
         return cls("observe", group_id, backend_job_id=backend_job_id)
 
     @classmethod
-    def submit(cls, group_id: GroupId, backend_job_id: BackendJobId, batch_digest: str) -> "BalsamWireRequest":
+    def submit(cls, group_id: GroupId, backend_job_id: BackendJobId, batch_digest: str,
+               *, stdout_path: str | None = None, stderr_path: str | None = None,
+               num_nodes: int | None = None, wall_time_min: int | None = None,
+               job_mode: str | None = None, site_id: int | None = None,
+               project: str | None = None, queue: str | None = None) -> "BalsamWireRequest":
         """Build the explicitly authorized batch-submission request."""
-        return cls("submit", group_id, backend_job_id=backend_job_id, batch_digest=batch_digest)
+        return cls("submit", group_id, backend_job_id=backend_job_id, batch_digest=batch_digest,
+                   stdout_path=stdout_path, stderr_path=stderr_path,
+                   num_nodes=num_nodes, wall_time_min=wall_time_min, job_mode=job_mode,
+                   site_id=site_id, project=project, queue=queue)
 
     @classmethod
     def rearm(cls, group_id: GroupId, backend_job_id: BackendJobId, recovery_digest: str) -> "BalsamWireRequest":
@@ -110,7 +149,11 @@ class BalsamWireRequest:
         return {"schema": self.schema, "operation": self.operation, "group_id": self.group_id.to_dict(),
                 "backend_job_id": None if self.backend_job_id is None else self.backend_job_id.to_dict(),
                 "group_digest": self.group_digest, "deployment_digest": self.deployment_digest,
-                "batch_digest": self.batch_digest, "recovery_digest": self.recovery_digest}
+                "batch_digest": self.batch_digest, "recovery_digest": self.recovery_digest,
+                "stdout_path": self.stdout_path, "stderr_path": self.stderr_path,
+                "num_nodes": self.num_nodes, "wall_time_min": self.wall_time_min,
+                "job_mode": self.job_mode, "site_id": self.site_id,
+                "project": self.project, "queue": self.queue}
 
     def encode(self) -> bytes:
         """Return canonical request bytes."""
@@ -121,12 +164,16 @@ class BalsamWireRequest:
         """Decode and validate a closed request."""
         data = decode_json(payload)
         fields(data, {"schema", "operation", "group_id", "backend_job_id", "group_digest", "deployment_digest",
-                      "batch_digest", "recovery_digest"}, cls.schema, cls.__name__)
+                      "batch_digest", "recovery_digest", "stdout_path", "stderr_path", "num_nodes", "wall_time_min",
+                      "job_mode", "site_id", "project", "queue"}, cls.schema, cls.__name__)
         backend = data["backend_job_id"]
         if backend is not None:
             backend = BackendJobId.from_mapping(backend)
         return cls(data["operation"], GroupId.from_mapping(data["group_id"]), backend,
-                   data["group_digest"], data["deployment_digest"], data["batch_digest"], data["recovery_digest"])
+                   data["group_digest"], data["deployment_digest"], data["batch_digest"], data["recovery_digest"],
+                   data.get("stdout_path"), data.get("stderr_path"), data.get("num_nodes"),
+                   data.get("wall_time_min"), data.get("job_mode"), data.get("site_id"),
+                   data.get("project"), data.get("queue"))
 
 
 @frozen_record

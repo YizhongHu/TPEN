@@ -118,7 +118,11 @@ class InjectedSDKOperations(Protocol):
         """Observe one bound backend job and return its primitive state."""
         ...
 
-    def submit(self, group_id: str, backend_job_id: str, batch_digest: str) -> str:
+    def submit(self, group_id: str, backend_job_id: str, batch_digest: str,
+               stdout_path: str | None = None, stderr_path: str | None = None,
+               num_nodes: int | None = None, wall_time_min: int | None = None,
+               job_mode: str | None = None, site_id: int | None = None,
+               project: str | None = None, queue: str | None = None) -> str:
         """Submit one explicitly authorized batch and return its identity."""
         ...
 
