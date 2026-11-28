@@ -58,7 +58,7 @@ def test_capture_preserves_parent_and_routes_only_assigned_host() -> None:
 
     for assignment in (first, second):
         allocation = assignment.to_configured_allocation()
-        assert allocation.facts["parent_provenance"]["parent_hosts"] == ["node-a", "node-b"]
+        assert allocation.facts["parent_provenance"]["parent_hosts"] == ("node-a", "node-b")
         assert routed_slots_from_allocation(allocation)
         assert {slot.node for slot in routed_slots_from_allocation(allocation)} == {assignment.host}
         assert len(assignment.slots) == 4
@@ -126,8 +126,9 @@ def test_s6_mutants_are_exact_once_and_compile_valid() -> None:
 
     source = MODULE.read_text(encoding="utf-8")
     manifest = json.loads(MUTANTS.read_text(encoding="utf-8"))
-    assert manifest["schema"] == "tpen-executor/mutant-spec-v1"
     for mutant in manifest["mutants"]:
-        assert mutant["file"] == MODULE_NAME
+        assert mutant["target"] == MODULE_NAME
+        assert mutant["killer"].startswith("executor/tests/")
+        assert "::" in mutant["killer"]
         assert source.count(mutant["old"]) == 1
         compile(source.replace(mutant["old"], mutant["new"], 1), MODULE_NAME, "exec")
