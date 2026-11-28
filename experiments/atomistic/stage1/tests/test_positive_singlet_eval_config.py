@@ -7,6 +7,7 @@ import hashlib
 import math
 from pathlib import Path
 
+import pytest
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
