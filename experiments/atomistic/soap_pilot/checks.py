@@ -252,24 +252,42 @@ def check_seed_domain(rows: Sequence[Mapping[str, Any]] | None, *, matched_group
     return _ok(name, "seed/domain membership has no undeclared collision")
 
 
-def check_metric_integrity(metrics: Mapping[str, Any] | None, *, expected_dtypes: Mapping[str, str] | None = None) -> CheckResult:
-    """Reject NaN/Inf and dtype drift before any numerical comparison.
+def check_metric_integrity(metrics: Mapping[str, Any] | None) -> CheckResult:
+    """Reject non-finite persisted JSONL metric values.
 
     # Rev3 §3.1 sentence: “All floating model tensors must retain the
     # configured float64 dtype. Compare EVERY non-floating model state value exactly.”
+    # JSONL records contain scalar values without dtype metadata, so this
+    # consumer checks finiteness only; model-tensor dtype is enforced by
+    # ``check_model_float64`` below.
     """
 
-    name = "metric-finite-dtype"
+    name = "metric-finite"
     if metrics is None:
         return _missing(name, "metric evidence is required")
-    expected_dtypes = expected_dtypes or {}
-    for key, value in metrics.items():
-        if isinstance(value, float) and not math.isfinite(value):
-            return _failure(name, f"metric {key!r} is non-finite")
-        dtype = getattr(value, "dtype", None)
-        if key in expected_dtypes and dtype is not None and str(dtype).replace("torch.", "") != expected_dtypes[key]:
-            return _failure(name, f"metric {key!r} dtype drifted")
-    return _ok(name, "metrics are finite and have the configured dtypes")
+    if not isinstance(metrics, Mapping):
+        return _invalid(name, "metric evidence must be a mapping")
+
+    def first_nonfinite(value: Any, path: str) -> str | None:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                found = first_nonfinite(child, f"{path}.{key}")
+                if found is not None:
+                    return found
+        elif isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                found = first_nonfinite(child, f"{path}[{index}]")
+                if found is not None:
+                    return found
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            if not math.isfinite(float(value)):
+                return path
+        return None
+
+    nonfinite = first_nonfinite(metrics, "metrics")
+    if nonfinite is not None:
+        return _failure(name, f"metric {nonfinite!r} is non-finite")
+    return _ok(name, "JSONL metrics are finite; scalar dtype is not claimed")
 
 
 def check_state_cursor_tolerance(actual: Mapping[str, Any] | None, expected: Mapping[str, Any] | None,
@@ -413,6 +431,8 @@ def check_model_float64(config: Mapping[str, Any] | None, checkpoints: Mapping[A
 
     # Rev3 §4.2 sentence: “Derive configured dtype and checkpoint steps from
     # each rendered run; require all named checkpoint model tensors to be float64.”
+    # This is the model-tensor dtype gate; JSONL scalar metrics have no dtype
+    # metadata and are checked for finiteness only by ``check_metric_integrity``.
     name = "rendered-config-model-float64"
     if config is None or checkpoints is None:
         return _missing(name, "rendered config and named checkpoint tensors are required")
@@ -435,21 +455,172 @@ def check_model_float64(config: Mapping[str, Any] | None, checkpoints: Mapping[A
     return _ok(name, "configured dtype and all named model checkpoint tensors are float64", {"steps": steps})
 
 
-def check_disconnected_optimizer_state(state: Mapping[str, Any] | None, *, expected_tensors: int = 16, expected_elements: int = 492000) -> CheckResult:
-    """Check disconnected parameters are absent from Adam/SOAP state."""
+def check_disconnected_optimizer_state(
+    records: Sequence[Any] | None,
+    *,
+    groups: Iterable[str] | Mapping[str, Any] | None = None,
+    terminal_step: int | None = None,
+    expected_tensors: int = 16,
+    group_inventory: Mapping[str, Any] | None = None,
+    empty_groups: Iterable[str] | None = None,
+) -> CheckResult:
+    """Aggregate terminal-checkpoint tensor-count evidence across groups.
 
     # Protocol sentence: “n_no_optimizer_state is a TENSOR count (16 tensors =
-    # 492,000 elements),” not an element count.
+    # 492,000 elements),” not an element count.  The 492,000-element value is
+    # architecture context, not a runtime assertion; the consumer therefore
+    # checks only the tensor count and ignores any element-context field.
+
+    ``terminal_step`` is the named checkpoint step, not the JSONL envelope
+    step.  ``OptimizerState`` receives ``event.iteration.step`` from the
+    trainer (``trainer.py:1358-1361,1525-1526``), while checkpoint publication
+    uses the resume cursor ``next_iteration`` (``checkpoint.py:274-311``).
+    Therefore a completed checkpoint at ``N`` emits optimizer metrics at
+    ``N - 1``.  The checker accepts an exact-step legacy record only when no
+    converted record exists, and refuses evidence that completes both
+    coordinates as ambiguous.
+
+    The rendered callback declaration is not itself an emitting inventory:
+    ``resolve_parameter_groups`` drops empty assignments
+    (``tpen/parameter_groups.py:111-118``).  The pilot-owned adapter in
+    :mod:`.evidence` therefore derives a complete inventory from the rendered
+    model using that same core resolver.  A declared group may be omitted only
+    when that inventory proves ``parameters == 0``; every other missing group
+    remains ``UNMEASURED``.  A caller-supplied ``empty_groups`` claim is accepted
+    only as an exact cross-check against the inventory, never as proof by itself,
+    because parameter-bearing groups must not be allowed to vacuously pass when
+    the producer omits empty assignments.
+    """
+
     name = "disconnected-optimizer-state"
-    if state is None:
-        return _missing(name, "optimizer-state evidence is required")
-    tensors = state.get("n_no_optimizer_state")
-    elements = state.get("n_no_optimizer_state_elements")
-    if type(tensors) is not int or type(elements) is not int:
-        return _invalid(name, "optimizer-state absence counts must be integers")
-    if tensors != expected_tensors or elements != expected_elements:
-        return _failure(name, f"expected {expected_tensors} tensors/{expected_elements} elements, got {tensors}/{elements}")
-    return _ok(name, "disconnected optimizer state is absent with the contract tensor/element counts")
+    if records is None:
+        return _missing(name, "optimizer-state JSONL evidence is required")
+    if groups is None:
+        return _missing(name, "rendered OptimizerState groups are required")
+    if terminal_step is None or type(terminal_step) is not int:
+        return _missing(name, "terminal checkpoint step is required")
+    group_names = tuple(groups) if not isinstance(groups, Mapping) else tuple(groups)
+    if not group_names or any(not isinstance(group, str) or not group for group in group_names):
+        return _invalid(name, "rendered OptimizerState groups must be non-empty names")
+    if len(set(group_names)) != len(group_names):
+        return _invalid(name, "rendered OptimizerState groups must be unique")
+
+    if isinstance(empty_groups, (str, bytes)):
+        return _invalid(name, "empty-group evidence must be an iterable of group names")
+    try:
+        claimed_empty: set[str] = set(empty_groups or ())
+    except TypeError:
+        return _invalid(name, "empty-group evidence must be an iterable of group names")
+    if any(group not in group_names for group in claimed_empty):
+        return _invalid(name, "empty-group evidence names an undeclared OptimizerState group")
+    if claimed_empty and group_inventory is None:
+        return _invalid(name, "empty-group claims require a complete group inventory")
+    proven_empty: set[str] = set()
+    if group_inventory is not None:
+        if not isinstance(group_inventory, Mapping) or set(group_inventory) != set(group_names):
+            return _invalid(name, "group inventory must cover every rendered OptimizerState group")
+        for group, inventory in group_inventory.items():
+            if not isinstance(inventory, Mapping):
+                return _invalid(name, f"group inventory for {group!r} must be a mapping")
+            parameters = inventory.get("parameters")
+            if type(parameters) is not int or parameters < 0:
+                return _invalid(name, f"group inventory for {group!r} must name a non-negative parameter count")
+            if parameters == 0:
+                proven_empty.add(group)
+        if claimed_empty and claimed_empty != proven_empty:
+            return _invalid(name, "empty-group claims contradict the complete group inventory")
+    emitting_groups = tuple(group for group in group_names if group not in proven_empty)
+    if not emitting_groups:
+        return _missing(name, "all rendered OptimizerState groups are proven empty")
+
+    def unpack(record: Any) -> tuple[int | None, str, Mapping[str, Any]] | None:
+        if isinstance(record, Mapping):
+            step, namespace, metrics = record.get("step"), record.get("namespace"), record.get("metrics")
+        else:
+            step = getattr(record, "step", None)
+            namespace = getattr(record, "namespace", None)
+            metrics = getattr(record, "metrics", None)
+        if (step is not None and type(step) is not int) or not isinstance(namespace, str) or not isinstance(metrics, Mapping):
+            return None
+        return step, namespace, metrics
+
+    unpacked_records: list[tuple[int | None, str, Mapping[str, Any]]] = []
+    for record in records:
+        unpacked = unpack(record)
+        if unpacked is None:
+            return _invalid(name, "optimizer-state record envelope is malformed")
+        unpacked_records.append(unpacked)
+
+    def matches_at(step: int) -> dict[str, list[Mapping[str, Any]]]:
+        return {
+            group: [
+                metrics
+                for record_step, record_namespace, metrics in unpacked_records
+                if record_step == step
+                and record_namespace == f"train/optimizer_state/{group}"
+            ]
+            for group in emitting_groups
+        }
+
+    # The callback coordinate is the primary, explicit contract.  The exact
+    # checkpoint coordinate is retained only as an explicitly documented
+    # compatibility path for pre-contract evidence, and is eligible only when
+    # no converted record exists.  A partial converted record is evidence of a
+    # broken/incomplete join, not permission to fall forward to checkpoint N.
+    metric_step = terminal_step - 1
+    converted = matches_at(metric_step) if terminal_step > 0 else {}
+    exact = matches_at(terminal_step)
+    for coordinate, candidate in ((metric_step, converted), (terminal_step, exact)):
+        for group, matches in candidate.items():
+            if len(matches) > 1:
+                return _invalid(
+                    name,
+                    f"duplicate optimizer-state records for group {group!r} at metric step {coordinate}",
+                )
+    converted_complete = all(len(matches) == 1 for matches in converted.values())
+    exact_complete = all(len(matches) == 1 for matches in exact.values())
+    if converted_complete and exact_complete:
+        return _invalid(name, f"checkpoint step {terminal_step} has ambiguous metric coordinates {metric_step} and {terminal_step}")
+    if converted_complete:
+        selected_step, selected = metric_step, converted
+    elif any(converted.values()):
+        missing = next(group for group, matches in converted.items() if not matches)
+        return _missing(
+            name,
+            f"partial optimizer-state evidence at metric step {metric_step}: missing non-empty group {missing!r}; exact-step fallback is forbidden",
+        )
+    elif exact_complete:
+        selected_step, selected = terminal_step, exact
+    else:
+        missing = next(group for group, matches in converted.items() if not matches) if converted else emitting_groups[0]
+        return _missing(name, f"missing optimizer-state record for non-empty group {missing!r} at checkpoint step {terminal_step} (expected metric step {metric_step})")
+
+    counts: dict[str, int] = {}
+    for group, matches in selected.items():
+        if len(matches) != 1:
+            return _invalid(name, f"duplicate optimizer-state records for group {group!r} at metric step {selected_step}")
+        if group_inventory is not None:
+            observed_parameters = matches[0].get("n_parameters")
+            expected_parameters = group_inventory[group]["parameters"]
+            if type(observed_parameters) is not int or observed_parameters < 0:
+                return _invalid(
+                    name,
+                    f"group {group!r} selected JSONL record must contain non-negative integer n_parameters for inventory reconciliation",
+                )
+            if observed_parameters != expected_parameters:
+                return _invalid(
+                    name,
+                    f"group inventory contradicts selected JSONL n_parameters for {group!r}: inventory={expected_parameters}, record={observed_parameters}",
+                )
+        tensors = matches[0].get("n_no_optimizer_state")
+        if type(tensors) is not int or tensors < 0:
+            return _invalid(name, f"group {group!r} tensor count must be a non-negative integer")
+        counts[group] = tensors
+
+    total = sum(counts.values())
+    if total != expected_tensors:
+        return _failure(name, f"expected {expected_tensors} disconnected tensors, got {total}", {"groups": counts, "checkpoint_step": terminal_step, "metric_step": selected_step})
+    return _ok(name, f"checkpoint step {terminal_step} has {total} disconnected tensors across non-empty groups", {"groups": counts, "checkpoint_step": terminal_step, "metric_step": selected_step, "empty_groups": sorted(proven_empty)})
 
 
 def check_rendered_diff(config: Mapping[str, Any] | None, observed: Mapping[str, Any] | None) -> CheckResult:
@@ -553,14 +724,78 @@ def check_path_containment(path: str | Path | None, root: str | Path | None) -> 
 
 
 def run_rung1_checks(evidence: Mapping[str, Any], *, config: Mapping[str, Any] | None = None) -> list[CheckResult]:
-    """Run all offline checks available from one named evidence packet."""
+    """Run all offline checks available from one named evidence packet.
 
+    ``run_dir`` is a declared evidence boundary: the consumer opens exactly
+    ``run_dir/metrics.jsonl`` through :mod:`.evidence`.  It does not discover a
+    sibling or "latest" file.  Missing/empty evidence is ``UNMEASURED``;
+    malformed JSONL is an explicit ``HARNESS_INVALID`` result.  Optimizer group
+    names and inventory are likewise derived only from the declared
+    ``optimizer_state.rendered_config_path``.  A caller cannot make a missing
+    parameter-bearing group pass by hand-building ``groups`` or ``group_inventory``.
+    """
+
+    from .evidence import (
+        EvidenceFormatError,
+        build_optimizer_group_inventory,
+        check_metric_records,
+        load_metric_records,
+    )
+
+    run_dir = evidence.get("run_dir")
+    if run_dir is None:
+        metric_result = check_metric_records(None)
+        metric_records = None
+    elif not isinstance(run_dir, (str, Path)):
+        metric_result = CheckResult(
+            "metric-jsonl-evidence",
+            Verdict.HARNESS_INVALID,
+            "declared run_dir must be a path",
+        )
+        metric_records = None
+    else:
+        try:
+            metric_records = load_metric_records(run_dir)
+        except EvidenceFormatError as exc:
+            metric_result = CheckResult("metric-jsonl-evidence", Verdict.HARNESS_INVALID, str(exc))
+            metric_records = None
+        else:
+            metric_result = check_metric_records(metric_records)
+
+    optimizer_evidence = evidence.get("optimizer_state")
+    if not isinstance(optimizer_evidence, Mapping):
+        optimizer_result = check_disconnected_optimizer_state(None)
+    else:
+        rendered_config_path = optimizer_evidence.get("rendered_config_path")
+        if not isinstance(rendered_config_path, (str, Path)):
+            optimizer_result = _missing(
+                "disconnected-optimizer-state",
+                "declared optimizer_state.rendered_config_path is required",
+            )
+        else:
+            try:
+                rendered_groups, rendered_inventory = build_optimizer_group_inventory(
+                    rendered_config_path
+                )
+            except EvidenceFormatError as exc:
+                optimizer_result = _invalid("disconnected-optimizer-state", str(exc))
+            else:
+                optimizer_result = check_disconnected_optimizer_state(
+                    metric_records,
+                    groups=rendered_groups,
+                    terminal_step=optimizer_evidence.get(
+                        "checkpoint_step", optimizer_evidence.get("terminal_step")
+                    ),
+                    group_inventory=rendered_inventory,
+                    empty_groups=optimizer_evidence.get("empty_groups"),
+                )
     return [
+        metric_result,
         check_resume_metric_keys(evidence.get("uninterrupted"), evidence.get("resumed")),
         check_resume_parity(evidence.get("uninterrupted"), evidence.get("resumed"), tolerances=evidence.get("tolerances")),
         check_step_zero(evidence.get("step_zero")),
         check_model_float64(config or evidence.get("config"), evidence.get("checkpoints")),
-        check_disconnected_optimizer_state(evidence.get("optimizer_state")),
+        optimizer_result,
         check_rendered_diff(config or evidence.get("config"), evidence.get("rendered_diff")),
         check_named_outputs(evidence.get("outputs"), evidence.get("outputs_root")),
         check_evaluation(evidence.get("evaluation")),

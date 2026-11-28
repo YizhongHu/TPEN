@@ -76,8 +76,96 @@ def test_step_zero_requires_exact_families_and_constructions() -> None:
 
 
 def test_disconnected_count_is_tensor_count() -> None:
-    assert check_disconnected_optimizer_state({"n_no_optimizer_state": 16, "n_no_optimizer_state_elements": 492000}).passed
-    assert check_disconnected_optimizer_state({"n_no_optimizer_state": 492000, "n_no_optimizer_state_elements": 16}).verdict is Verdict.PRODUCT_FAILURE
+    records = [
+        {"step": 100, "namespace": "train/optimizer_state/embedding", "metrics": {"n_no_optimizer_state": 8, "n_no_optimizer_state_elements": 492000}},
+        {"step": 100, "namespace": "train/optimizer_state/readout", "metrics": {"n_no_optimizer_state": 8, "n_no_optimizer_state_elements": 1}},
+    ]
+    assert check_disconnected_optimizer_state(records, groups=("embedding", "readout"), terminal_step=100).passed
+    wrong = [dict(record, metrics={"n_no_optimizer_state": 492000}) for record in records]
+    assert check_disconnected_optimizer_state(wrong, groups=("embedding", "readout"), terminal_step=100).verdict is Verdict.PRODUCT_FAILURE
+
+
+def test_empty_group_claims_cannot_prove_parameter_bearing_group_empty() -> None:
+    records = [
+        {
+            "step": 100,
+            "namespace": "train/optimizer_state/embedding",
+            "metrics": {"n_no_optimizer_state": 16},
+        }
+    ]
+    groups = ("embedding", "factors")
+
+    # Without a complete inventory, the caller's claim must not turn an
+    # omitted parameter-bearing group into a vacuous PASS.
+    without_inventory = check_disconnected_optimizer_state(
+        records,
+        groups=groups,
+        terminal_step=100,
+        empty_groups=("factors",),
+    )
+    assert without_inventory.verdict is not Verdict.PASS
+
+    # A complete inventory that says the claimed group has parameters must
+    # reject the contradictory empty-group claim as well.
+    against_inventory = check_disconnected_optimizer_state(
+        records,
+        groups=groups,
+        terminal_step=100,
+        group_inventory={
+            "embedding": {"parameters": 1},
+            "factors": {"parameters": 1},
+        },
+        empty_groups=("factors",),
+    )
+    assert against_inventory.verdict is not Verdict.PASS
+
+
+def _optimizer_records(step: int, *, groups: tuple[str, ...] = ("embedding", "readout")) -> list[dict[str, object]]:
+    """Make compact tensor-count records for coordinate and duplicate controls."""
+
+    return [
+        {
+            "step": step,
+            "namespace": f"train/optimizer_state/{group}",
+            "metrics": {"n_no_optimizer_state": 8},
+        }
+        for group in groups
+    ]
+
+
+def test_partial_converted_records_never_fall_forward_to_exact_step() -> None:
+    partial = [
+        _optimizer_records(99, groups=("embedding",))[0],
+        *_optimizer_records(100),
+    ]
+    result = check_disconnected_optimizer_state(
+        partial, groups=("embedding", "readout"), terminal_step=100
+    )
+    assert result.verdict is Verdict.UNMEASURED
+    assert "fallback is forbidden" in result.detail
+
+    assert check_disconnected_optimizer_state(
+        _optimizer_records(99), groups=("embedding", "readout"), terminal_step=100
+    ).passed
+
+    both = [*_optimizer_records(99), *_optimizer_records(100)]
+    assert check_disconnected_optimizer_state(
+        both, groups=("embedding", "readout"), terminal_step=100
+    ).verdict is Verdict.HARNESS_INVALID
+
+
+def test_duplicate_optimizer_records_are_harness_invalid_before_selection() -> None:
+    duplicate_and_missing = [
+        *_optimizer_records(99, groups=("embedding",)),
+        *_optimizer_records(99, groups=("embedding",)),
+    ]
+    result = check_disconnected_optimizer_state(
+        duplicate_and_missing,
+        groups=("embedding", "readout"),
+        terminal_step=100,
+    )
+    assert result.verdict is Verdict.HARNESS_INVALID
+    assert "duplicate" in result.detail
 
 
 def test_named_output_hash_and_complete(tmp_path: Path) -> None:
