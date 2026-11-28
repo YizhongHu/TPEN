@@ -55,6 +55,18 @@ def test_loader_rejects_malformed_envelopes(tmp_path: Path, payload: str) -> Non
         load_metric_records(tmp_path)
 
 
+def test_loader_rejects_truncated_last_jsonl_record(tmp_path: Path) -> None:
+    """A partial final line is format loss, not an empty evidence set."""
+
+    (tmp_path / "metrics.jsonl").write_text(
+        '{"step": 1, "namespace": "run", "metrics": {"loss": 1.0}}\n'
+        '{"step": 2, "namespace": "run", "metrics": {"loss": ',
+        encoding="utf-8",
+    )
+    with pytest.raises(EvidenceFormatError, match="invalid JSON"):
+        load_metric_records(tmp_path)
+
+
 def test_missing_or_empty_metrics_are_unmeasured(tmp_path: Path) -> None:
     assert check_metric_records(load_metric_records(tmp_path)).verdict is Verdict.UNMEASURED
     (tmp_path / "metrics.jsonl").write_text("", encoding="utf-8")
@@ -64,6 +76,19 @@ def test_missing_or_empty_metrics_are_unmeasured(tmp_path: Path) -> None:
 def test_nonfinite_jsonl_metric_fails_the_finite_only_consumer_check(tmp_path: Path) -> None:
     (tmp_path / "metrics.jsonl").write_text(
         '{"step": 1, "namespace": "run", "metrics": {"loss": NaN}}\n',
+        encoding="utf-8",
+    )
+    result = check_metric_records(load_metric_records(tmp_path))
+    assert result.verdict is Verdict.PRODUCT_FAILURE
+    assert "non-finite" in result.detail
+
+
+@pytest.mark.parametrize("value", [[{"loss": float("inf")}], {"nested": {"loss": float("-inf")}}])
+def test_nested_nonfinite_jsonl_metric_fails_the_finite_only_consumer_check(
+    tmp_path: Path, value: object
+) -> None:
+    (tmp_path / "metrics.jsonl").write_text(
+        json.dumps({"step": 1, "namespace": "run", "metrics": value}, allow_nan=True) + "\n",
         encoding="utf-8",
     )
     result = check_metric_records(load_metric_records(tmp_path))
