@@ -45,7 +45,8 @@ def test_prepare_job_never_submits_or_transfers_from_the_allocation() -> None:
     assert "qsub" not in text
     assert "scp" not in text
     assert 'RESULTS_PREFIX="/eagle/HetRxnEnergy/rhu/"' in text
-    assert 'realpath -m -- "$path"' in text
+    assert 'source "$SCRIPT_DIR/pbs_paths.sh"' in text
+    assert 'realpath -m -- "$1"' in PATHS_SCRIPT.read_text(encoding="utf-8")
 
 
 def _run_guard(path: Path, allowed_root: Path) -> subprocess.CompletedProcess[str]:
