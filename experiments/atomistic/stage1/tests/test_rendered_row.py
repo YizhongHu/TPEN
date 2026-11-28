@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -93,6 +94,95 @@ def _train_row(tmp_path: Path) -> tuple[dict[str, object], Path]:
     row["row_id"] = protocol.manifest_hash([
         {key: value for key, value in row.items() if key != "row_id"}
     ])
+    return row, rendered_path
+
+
+def _v3_materialized_train_row(
+    tmp_path: Path, *, resume: bool = True,
+) -> tuple[dict[str, object], Path]:
+    """Build a compact rendered row with the committed v3 recorder contract."""
+
+    row, rendered_path = _train_row(tmp_path)
+    overlay = ROOT / protocol.HOOKE_OVERLAY_V3_RELATIVE_PATH
+    row.update({
+        "overlay": protocol.HOOKE_OVERLAY_V3_RELATIVE_PATH,
+        "overlay_sha256": protocol.overlay_sha256(overlay),
+        "overlay_profile": protocol.OVERLAY_PROFILE_V3,
+        "science_profile": protocol.HOOKE2_ACT50_SEGMENTED_PROFILES[0],
+        "variant": "sigmoid",
+    })
+    row["config_sha256"] = protocol.config_identities(
+        config_root=ROOT / "configs", systems=("hooke2",),
+        science_profile=protocol.HOOKE2_ACT50_SEGMENTED_PROFILES[0],
+    )["hooke2"]
+    if resume:
+        row["resume_profile"] = protocol.CHAIN_RESUME_PROFILE
+    row["row_extension"]["diagnostics_profile"] = protocol.OVERLAY_PROFILE_V3  # type: ignore[index]
+    payload = yaml.safe_load(rendered_path.read_text(encoding="utf-8"))
+    payload["stage1_overlay"] = {
+        "schema": "stage1-overlay/v3",
+        "path": row["overlay"],
+        "sha256": row["overlay_sha256"],
+        "composition_order": protocol.OVERLAY_COMPOSITION_ORDER,
+        "stream": "train",
+        "profile": protocol.OVERLAY_PROFILE_V3,
+    }
+    payload["callbacks"].append({
+        "_target_": "tpen.callback.RawTrainingBatchRecorder",
+        "format_version": 3,
+        "path": str(protocol.resolve_run_dir(row) / "training_history"),
+        "every_n_steps": 50,
+        "partition_size_steps": 1000,
+    })
+    row["row_extension"]["rendered_config"]["sha256"] = _write_rendered(  # type: ignore[index]
+        rendered_path, payload,
+    )
+    _refreeze_row_id(row)
+    return row, rendered_path
+
+
+def _real_v3_materialized_train_row(tmp_path: Path) -> tuple[dict[str, object], Path]:
+    """Materialize one producer-built v3 row with resolved callback paths."""
+
+    profile = protocol.HOOKE2_ACT50_SEGMENTED_PROFILES[0]
+    source_row = protocol.build_manifest(
+        protocol=protocol.STAGE1_PROTOCOL,
+        source_sha="a" * 40,
+        config_sha256=protocol.config_identities(
+            config_root=ROOT / "configs", systems=("hooke2",),
+            science_profile=profile,
+        ),
+        checkpoints=list(range(0, 50_001, 1_000)),
+        lineage_seeds=[11, 12, 13], checkpoint_sha256={},
+        results_root=str(tmp_path / "results"), systems=("hooke2",), phase=1,
+        device="cuda", science_profile=profile, include_smoke=False,
+        auto_overlay=True,
+    )[0]
+    cfg = stage1_train.build_train_config(source_row)
+    run_dir = protocol.resolve_run_dir(source_row)
+    cfg.run.dir = str(run_dir)
+    rendered_path = Path(str(source_row["results_root"])) / "inputs" / "train.yaml"
+    rendered_path.parent.mkdir(parents=True)
+    rendered_path.write_text(OmegaConf.to_yaml(cfg, resolve=True), encoding="utf-8")
+    row = {
+        key: source_row[key]
+        for key in (
+            "row_id", "system", "system_id", "kind", "lineage", "seed",
+            "source_sha", "config_sha256", "config_identity_rule", "config",
+            "results_root", "experiment_name", "sector", "run_id", "updates",
+            "walkers", "device", "sampler_seed", "checkpoint_steps", "overlay",
+            "overlay_sha256", "overlay_profile", "science_profile", "variant",
+        )
+    }
+    row["resume_profile"] = protocol.CHAIN_RESUME_PROFILE
+    row["row_extension"] = {
+        "version": protocol.ROW_EXTENSION_VERSION,
+        "rendered_config": {"path": str(rendered_path), "sha256": hashlib.sha256(
+            rendered_path.read_bytes()
+        ).hexdigest()},
+        "diagnostics_profile": protocol.OVERLAY_PROFILE_V3,
+    }
+    _refreeze_row_id(row)
     return row, rendered_path
 
 
@@ -784,6 +874,105 @@ def test_extended_resume_and_direct_restart_refuse_before_effect(tmp_path: Path)
     with pytest.raises(ValueError, match="do not accept native"):
         stage1_train.build_train_config(row, config_path=ROOT / "configs/hooke2/train.yaml")
     assert admission.rendered_path == rendered_path.resolve()
+
+
+def test_materialized_v3_train_admission(tmp_path: Path) -> None:
+    """The opt-in v3 row is admitted through the same rendered reader."""
+
+    row, rendered_path = _v3_materialized_train_row(tmp_path)
+    cfg, admission = protocol.load_materialized_config(row, expected_kind="train")
+    protocol.validate_materialized_admission(cfg, row, admission)
+    assert admission.rendered_path == rendered_path.resolve()
+
+
+def test_materialized_v3_resume_requires_opt_in(tmp_path: Path) -> None:
+    """A v3 recorder cannot turn on continuation by omission or mutation."""
+
+    row, rendered_path = _v3_materialized_train_row(tmp_path, resume=False)
+    cfg, admission = protocol.load_materialized_config(row, expected_kind="train")
+    before = rendered_path.read_bytes()
+    protocol.resolve_run_dir(row).mkdir(parents=True)
+    with pytest.raises(restart.RestartRefusal, match="nonexistent run directory"):
+        restart.execute_train(
+            cfg=cfg, row=row, config_path=rendered_path, admission=admission,
+            run=lambda *_a, **_k: pytest.fail(),
+        )
+    assert rendered_path.read_bytes() == before
+
+
+def test_materialized_v3_recorder_contract_is_bound(tmp_path: Path) -> None:
+    """The reader refuses a v3 row whose recorder format or cadence drifts."""
+
+    row, rendered_path = _v3_materialized_train_row(tmp_path)
+    payload = yaml.safe_load(rendered_path.read_text(encoding="utf-8"))
+    recorder = next(
+        entry for entry in payload["callbacks"]
+        if entry.get("_target_") == "tpen.callback.RawTrainingBatchRecorder"
+    )
+    recorder["format_version"] = 2
+    row["row_extension"]["rendered_config"]["sha256"] = _write_rendered(  # type: ignore[index]
+        rendered_path, payload,
+    )
+    _refreeze_row_id(row)
+    with pytest.raises(ProtocolError, match="recorder contract"):
+        protocol.load_materialized_config(row, expected_kind="train")
+
+
+def test_materialized_v3_requires_segmented_identity(tmp_path: Path) -> None:
+    """A diagnostics-v3 row cannot borrow a non-segmented science identity."""
+
+    row, _ = _v3_materialized_train_row(tmp_path)
+    row["science_profile"] = protocol.HOOKE2_ACT50_SIGMOID_PROFILE
+    _refreeze_row_id(row)
+    with pytest.raises(ProtocolError, match="segmented ACT50"):
+        protocol.load_materialized_config(row, expected_kind="train")
+
+
+def test_real_v3_materialization_round_trips_to_continuation_planning(
+    tmp_path: Path,
+) -> None:
+    """A resolved producer row reaches the opted-in continuation planner."""
+
+    row, rendered_path = _real_v3_materialized_train_row(tmp_path)
+    assert "${" not in rendered_path.read_text(encoding="utf-8")
+    cfg, admission = protocol.load_materialized_config(row, expected_kind="train")
+    protocol.validate_materialized_admission(cfg, row, admission)
+
+    run_dir = protocol.resolve_run_dir(row)
+    checkpoint_dir = run_dir / "checkpoints" / "step_001000"
+    checkpoint_dir.mkdir(parents=True)
+    observed: dict[str, object] = {}
+
+    def inspect(path: str | Path) -> SimpleNamespace:
+        observed["inspect_path"] = Path(path)
+        return SimpleNamespace(
+            verdict="incomplete", refusal=None,
+            checkpoint={
+                "checkpoint_dir": str(checkpoint_dir),
+                "next_iteration": 1000,
+                "completed_updates": 1000,
+            },
+            checkpoint_ref=None, run_dir=str(run_dir),
+        )
+
+    def run(run_cfg: object, **kwargs: object) -> int:
+        observed["cfg"] = run_cfg
+        observed["kwargs"] = kwargs
+        return 2
+
+    assert restart.execute_train(
+        cfg=cfg, row=row, config_path=rendered_path,
+        admission=admission, inspector=inspect, run=run,
+    ) == 2
+    assert observed["inspect_path"] == run_dir
+    resumed_cfg = observed["cfg"]
+    assert resumed_cfg.runner.load.mode == "train_resume"  # type: ignore[union-attr]
+    assert resumed_cfg.runner.load.path == str(checkpoint_dir)  # type: ignore[union-attr]
+    recorder = next(
+        callback for callback in resumed_cfg.callbacks  # type: ignore[union-attr]
+        if callback.get("_target_") == "tpen.callback.RawTrainingBatchRecorder"
+    )
+    assert recorder.path == str(run_dir / "training_history")
 
 
 def test_extended_v2_basis_provenance_and_recorder_order_are_strict(tmp_path: Path) -> None:

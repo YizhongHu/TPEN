@@ -1,0 +1,25 @@
+{
+  "mutants": [
+    {
+      "id": "materialized-v3-profile-gate",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "ROW_EXTENSION_PROFILES = frozenset((OVERLAY_PROFILE_V1, OVERLAY_PROFILE_V2, OVERLAY_PROFILE_V3))",
+      "new": "ROW_EXTENSION_PROFILES = frozenset((OVERLAY_PROFILE_V1, OVERLAY_PROFILE_V2))",
+      "killer": "experiments/atomistic/stage1/tests/test_rendered_row.py::test_materialized_v3_train_admission"
+    },
+    {
+      "id": "chain-resume-default-off",
+      "target": "experiments/atomistic/stage1/restart.py",
+      "old": "        if not _materialized_chain_resume_enabled(row):",
+      "new": "        if False:",
+      "killer": "experiments/atomistic/stage1/tests/test_rendered_row.py::test_materialized_v3_resume_requires_opt_in"
+    },
+    {
+      "id": "v3-recorder-contract-guard",
+      "target": "experiments/atomistic/stage1/protocol.py",
+      "old": "                recorder.get(\"format_version\") != 3",
+      "new": "                False",
+      "killer": "experiments/atomistic/stage1/tests/test_rendered_row.py::test_materialized_v3_recorder_contract_is_bound"
+    }
+  ]
+}

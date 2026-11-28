@@ -16,9 +16,12 @@ from typing import Any, Callable, Mapping
 from omegaconf import OmegaConf
 
 from experiments.atomistic.stage1.protocol import (
+    CHAIN_RESUME_PROFILE,
     MaterializedConfigAdmission,
+    OVERLAY_PROFILE_V3,
     ProtocolError,
     SYSTEM_SPECS,
+    load_materialized_config,
     validate_materialized_admission,
     validate_gateway_binding,
     validate_resolved_train_config,
@@ -140,6 +143,17 @@ def _refuse_unsupported_resume_callbacks(cfg: Any, overlay: str | None) -> None:
             f"refusing overlay {configured_overlay}",
             cause=RestartCause.INVALID_RESUME,
         )
+
+
+def _materialized_chain_resume_enabled(row: Mapping[str, Any]) -> bool:
+    """Return whether a materialized v3 row explicitly opts into continuation."""
+
+    extension = row.get("row_extension")
+    return (
+        isinstance(extension, Mapping)
+        and extension.get("diagnostics_profile") == OVERLAY_PROFILE_V3
+        and row.get("resume_profile") == CHAIN_RESUME_PROFILE
+    )
 
 
 def _target_iterations(cfg: Any, row: Mapping[str, Any]) -> int:
@@ -361,6 +375,7 @@ def execute_restart(
     run: Callable[..., int] | None = None,
     run_dir: str | Path | None = None,
     inspector: Callable[[str | Path], RunEvidence] = inspect_run,
+    admission: MaterializedConfigAdmission | None = None,
 ) -> RestartResult:
     """Run one approved configured resume through the ordinary gateway."""
 
@@ -370,11 +385,22 @@ def execute_restart(
             overlay=overlay, overlay_sha256=overlay_sha256,
         )
     if "row_extension" in row:
-        raise RestartRefusal(
-            "materialized Stage-1 rows are fresh-only; restart is unsupported",
-            cause=RestartCause.INVALID_RESUME,
-        )
-    validate_resolved_train_config(cfg, row)
+        if not _materialized_chain_resume_enabled(row):
+            raise RestartRefusal(
+                "materialized Stage-1 rows are fresh-only unless stage1-chain-resume/v1 is selected",
+                cause=RestartCause.INVALID_RESUME,
+            )
+        if admission is None:
+            try:
+                _, admission = load_materialized_config(row, expected_kind="train")
+            except ProtocolError as exc:
+                raise RestartRefusal(str(exc), cause=RestartCause.INVALID_RESUME) from exc
+        try:
+            validate_materialized_admission(cfg, row, admission)
+        except ProtocolError as exc:
+            raise RestartRefusal(str(exc), cause=RestartCause.INVALID_RESUME) from exc
+    else:
+        validate_resolved_train_config(cfg, row)
     target = _target_iterations(cfg, row)
     _refuse_unsupported_resume_callbacks(cfg, overlay)
     selection = select_restart(cfg=cfg, row=row, run_dir=run_dir, inspector=inspector)
@@ -431,6 +457,11 @@ def execute_train(
             raise RestartRefusal(str(exc), cause=RestartCause.INVALID_RESUME) from exc
         admitted = _admitted_run_dir(cfg, row, None)
         if admitted.exists() or admitted.is_symlink():
+            if _materialized_chain_resume_enabled(row):
+                return execute_restart(
+                    cfg=cfg, row=row, config_path=config_path, command=command,
+                    run=run, inspector=inspector, admission=admission,
+                ).exit_code
             raise RestartRefusal(
                 "materialized train requires a nonexistent run directory",
                 cause=RestartCause.RUN_DIRECTORY_MISMATCH,

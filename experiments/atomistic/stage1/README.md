@@ -138,6 +138,18 @@ retained `execution.stop_at`), and unsupported resume/load or native smoke
 derivation requests refuse before core effects. Existing rows have no extension
 and retain their native byte shape and composition path.
 
+Materialized segmented Hooke train rows may declare
+`row_extension.diagnostics_profile: diagnostics-v3`,
+`overlay_profile: diagnostics-v3`, and the existing segmented science profile.
+They remain fresh-only by default. The versioned opt-in
+`resume_profile: stage1-chain-resume/v1` enables continuation through the
+existing v3 checkpoint and `TrainingHistoryReader` admission path. The row and
+each segment remain bound to the run/science/config identity, recorder cadence
+and contract, parent prefix, and train-resume checkpoint reference. This is a
+tolerance-based resume contract, not a bit-exact promise; the current measured
+Polaris noise-floor caveat is approximately `1e-14` fp64 drift from the first
+post-resume step.
+
 Qualification requests use the same train row and `configs/<system>/train.yaml`
 recipe as science. Their only application difference is the isolated output
 root plus `execution.stop_at`, which is translated to the public
