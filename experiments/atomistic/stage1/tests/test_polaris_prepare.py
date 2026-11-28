@@ -103,7 +103,7 @@ STAGE1_PATHS_SH="$RESULTS_ROOT/paths.sh"
 {_bundle_verify_block()}
 """
     return subprocess.run(
-        ["bash", "-c", command],
+        ["bash", "-c", command, str(SCRIPT)],
         cwd=root,
         env={"PATH": "/usr/bin:/bin"},
         text=True,
