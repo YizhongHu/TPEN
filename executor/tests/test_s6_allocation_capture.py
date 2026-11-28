@@ -107,6 +107,21 @@ def test_capture_requires_full_node_and_exact_association() -> None:
     with pytest.raises(AllocationCaptureRefusal, match="affinity"):
         assign_full_node(_snapshot(), host="node-a", allowed_cpus=range(8), device_uuids=_devices("A"), node_layout=_layout())
 
+    with pytest.raises(AllocationCaptureRefusal, match="full-node CPU domain"):
+        assign_full_node(
+            _snapshot(), host="node-a", allowed_cpus=(0, 1, 2, 3), device_uuids=_devices("A"),
+            node_layout=PackedNodeLayout(8, 16, 4, ("0", "1", "2", "3")),
+        )
+
+    with pytest.raises(AllocationCaptureRefusal, match="packing count"):
+        assign_full_node(_snapshot(), host="node-a", allowed_cpus=range(16), device_uuids=_devices("A"), node_layout=_layout(), outer_packing_count=True)
+    with pytest.raises(AllocationCaptureRefusal, match="packing count"):
+        assign_full_node(_snapshot(), host="node-a", allowed_cpus=range(16), device_uuids=_devices("A"), node_layout=_layout(), outer_packing_count=1.0)
+    with pytest.raises(AllocationCaptureRefusal, match="controller rank"):
+        assign_full_node(_snapshot(), host="node-a", allowed_cpus=range(16), device_uuids=_devices("A"), node_layout=_layout(), controller_rank_count=True)
+    with pytest.raises(AllocationCaptureRefusal, match="controller rank"):
+        assign_full_node(_snapshot(), host="node-a", allowed_cpus=range(16), device_uuids=_devices("A"), node_layout=_layout(), controller_rank_count=1.0)
+
     delivered_undergrant = SchedulerAllocationSnapshot.capture(
         AllocationId("parent-allocation"), BatchJobId("parent-batch"), BackendJobId("group-job"), "node-a\n",
         requested_nodes=1, requested_cpus_per_node=16, requested_gpus_per_node=4,

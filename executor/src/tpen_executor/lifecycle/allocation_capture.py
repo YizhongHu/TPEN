@@ -250,7 +250,25 @@ class SchedulerAllocationSnapshot:
 
 @frozen_record
 class FullNodeAssignment:
-    """Validated one-host assignment and its four physical row slots."""
+    """Validated one-host assignment and its physical row slots.
+
+    Parameters
+    ----------
+    parent : SchedulerAllocationSnapshot
+        Immutable parent scheduler provenance.
+    host : str
+        Assigned host, which must be present in ``parent``.
+    allowed_cpus, device_uuids, node_layout, slots
+        Caller-supplied host-local evidence and the declared topology.
+    outer_packing_count, controller_rank_count : int
+        Node-group cardinality evidence; both must equal one.
+
+    Raises
+    ------
+    AllocationCaptureRefusal
+        If caller-supplied host-local evidence does not establish the declared
+        full-node topology. Identity cross-checks are optional.
+    """
 
     schema: ClassVar[str] = "tpen-executor/full-node-assignment-v1"
     parent: SchedulerAllocationSnapshot
@@ -286,11 +304,13 @@ class FullNodeAssignment:
             raise AllocationCaptureRefusal("device-count-mismatch", "device inventory count differs from node layout")
         if len(self.slots) != self.node_layout.gpus_per_node:
             raise AllocationCaptureRefusal("slot-count-mismatch", "slot count differs from node layout")
-        if self.outer_packing_count != 1:
+        if isinstance(self.outer_packing_count, bool) or not isinstance(self.outer_packing_count, int) or self.outer_packing_count != 1:
             raise AllocationCaptureRefusal("packing-mismatch", "node-group outer packing count must be one")
-        if self.controller_rank_count != 1:
+        if isinstance(self.controller_rank_count, bool) or not isinstance(self.controller_rank_count, int) or self.controller_rank_count != 1:
             raise AllocationCaptureRefusal("rank-mismatch", "node-group controller rank count must be one")
         expected_cpus = set(allowed)
+        if not set(range(self.node_layout.hardware_threads)).issubset(expected_cpus):
+            raise AllocationCaptureRefusal("incomplete-node-affinity", "controller affinity does not cover the declared full-node CPU domain")
         seen_cpus: set[int] = set()
         for index, slot in enumerate(self.slots):
             if not isinstance(slot, AllocationSlot) or slot.node != host:
@@ -409,7 +429,27 @@ def assign_full_node(
     outer_packing_count: int = 1,
     controller_rank_count: int = 1,
 ) -> FullNodeAssignment:
-    """Validate observed full-node evidence and derive physical row slots."""
+    """Validate observed full-node evidence and derive physical row slots.
+
+    Parameters
+    ----------
+    parent : SchedulerAllocationSnapshot
+        Immutable parent scheduler provenance.
+    host, allowed_cpus, device_uuids, node_layout
+        Assigned host and host-local observed evidence plus declared topology.
+        The caller must supply this evidence; identity cross-checks are optional.
+
+    Returns
+    -------
+    FullNodeAssignment
+        Validated one-host assignment with derived physical row slots.
+
+    Raises
+    ------
+    AllocationCaptureRefusal
+        If host-local affinity, topology, inventory, cardinality, or optional
+        identity evidence is not admissible.
+    """
 
     if venue is not None:
         if not isinstance(venue, PbsVenue):
