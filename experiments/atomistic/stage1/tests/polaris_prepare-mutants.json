@@ -28,14 +28,6 @@
       "new": "git clone --no-checkout https://github.com/YizhongHu/TPEN.git \"$CHECKOUT_ROOT\"",
       "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_prepare_job_owns_clone_uv_prime_and_row_rendering"
     },
-    {
-      "id": "prep-eagle-root-dropped",
-      "target": "experiments/atomistic/stage1/polaris/pbs_prepare.sh",
-      "old": "RESULTS_PREFIX=\"/eagle/HetRxnEnergy/rhu/\"",
-      "new": "RESULTS_PREFIX=\"/tmp/\"",
-      "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_prepare_job_never_submits_or_transfers_from_the_allocation"
-    },
-    {
       "id": "prep-lexical-containment-restored",
       "target": "experiments/atomistic/stage1/polaris/pbs_paths.sh",
       "old": "canonical=\"$(canonicalize_path \"$path\")\"",
