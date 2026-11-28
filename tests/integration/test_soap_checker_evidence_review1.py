@@ -5,59 +5,74 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import torch
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
-from experiments.atomistic.soap_pilot.checks import Verdict, run_rung1_checks
-from experiments.atomistic.soap_pilot.composer import R2_PROFILES, render_profile
-from experiments.atomistic.soap_pilot.evidence import MetricRecord
+from experiments.atomistic.soap_pilot.checks import Verdict, check_disconnected_optimizer_state, run_rung1_checks
+from experiments.atomistic.soap_pilot.composer import R2_PROFILES, PilotProfile, render_profile
+from experiments.atomistic.soap_pilot.evidence import load_metric_records
+from tpen.callback import OptimizerState
+from tpen.logging import JSONL, LogRecord
 from tpen.parameter_groups import resolve_parameter_groups
+from tpen.training.state import TrainerState
+from tpen.training.update import ModelParameterBinding, VMCUpdateState
+from tests.unit.callback.support import deliver_completed_iteration
 
 
-def test_run_rung1_checks_exposes_metric_finite_gate_and_empty_is_unmeasured() -> None:
+class _LoggerContext:
+    """Minimal callback context that writes the production JSONL envelopes."""
+
+    def __init__(self, logger: JSONL) -> None:
+        self.logger = logger
+
+    def log(self, metrics, *, step=None, namespace="run") -> None:
+        self.logger.log(LogRecord(step=step, namespace=namespace, metrics=dict(metrics)))
+
+
+def _state(model: torch.nn.Module, optimizer: torch.optim.Optimizer) -> TrainerState:
+    binding = ModelParameterBinding.from_parameters(tuple(model.parameters()))
+    return TrainerState(
+        model=model,
+        optimizer=optimizer,
+        update_state=VMCUpdateState(optimizer=optimizer, model_parameters=binding),
+    )
+
+
+def test_run_rung1_checks_exposes_metric_evidence_gate_and_empty_is_unmeasured() -> None:
     """No metric records must be visible as an explicit UNMEASURED gate."""
 
     results = {result.name: result for result in run_rung1_checks({})}
-    assert "metric-finite" in results
-    assert results["metric-finite"].verdict is Verdict.UNMEASURED
-
-
-def test_terminal_checkpoint_and_iteration_steps_are_distinct_controls() -> None:
-    """A step-99 iteration must not satisfy a step-100 checkpoint assertion."""
-
-    from experiments.atomistic.soap_pilot.checks import check_disconnected_optimizer_state
-
-    records = [
-        MetricRecord(99, "train/optimizer_state/embedding", {"n_no_optimizer_state": 8}),
-        MetricRecord(99, "train/optimizer_state/readout", {"n_no_optimizer_state": 8}),
-    ]
-    result = check_disconnected_optimizer_state(
-        records, groups=("embedding", "readout"), terminal_step=100
+    metric = next(
+        (results[name] for name in ("metric-jsonl-evidence", "metric-finite") if name in results),
+        None,
     )
-    assert result.verdict is Verdict.UNMEASURED
+    assert metric is not None
+    assert metric.verdict is Verdict.UNMEASURED
 
 
 @pytest.mark.parametrize("profile", [R2_PROFILES[0]], ids=lambda profile: profile.name)
-def test_rendered_hooke_optimizer_group_inventory_is_explicit(
-    tmp_path: Path, profile: object
+def test_real_optimizer_callback_emits_only_parameterized_rendered_groups(
+    tmp_path: Path, profile: PilotProfile
 ) -> None:
-    """Record actual model group inventory; parameter-free groups must not vanish silently."""
+    """Wire real callback JSONL into the consumer and keep both controls explicit."""
 
     rendered = render_profile(
         profile,
         output_dir=tmp_path / "inputs",
         results_root=str(tmp_path / "results"),
-        source_sha="7b88f833babcb82148c8f975a08b53970838be6a",
+        source_sha="42687973d4319dbd6f533bb5b067857f12b73d83",
         device="cpu",
     )
     model = instantiate(OmegaConf.create(rendered.rendered.values["model"]))
-    callback = next(
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    callback_config = next(
         item
         for item in rendered.rendered.values["callbacks"]
         if item["_target_"] == "tpen.callback.OptimizerState"
     )
-    declared = tuple(callback["groups"])
-    resolved = resolve_parameter_groups(model, callback["groups"])
+    declared = tuple(callback_config["groups"])
+    resolved = resolve_parameter_groups(model, callback_config["groups"])
     inventory = {
         group: {
             "parameters": len(parameters),
@@ -65,8 +80,32 @@ def test_rendered_hooke_optimizer_group_inventory_is_explicit(
         }
         for group, parameters in resolved.items()
     }
-    # Keep this assertion deliberately about the actual rendered model.  It
-    # fails if a declared parameter-free group (currently factors) is silently
-    # dropped before the callback emits JSONL evidence.
-    missing = [group for group in declared if group not in inventory]
-    assert not missing, f"declared={declared!r}; actual_inventory={inventory!r}; missing={missing!r}"
+    assert "factors" not in inventory
+    assert set(inventory) == set(declared) - {"factors"}
+
+    metrics_path = tmp_path / "metrics.jsonl"
+    logger = JSONL(metrics_path)
+    context = _LoggerContext(logger)
+    callback = OptimizerState(callback_config["groups"])
+    deliver_completed_iteration(callback, context, _state(model, optimizer), step=99)
+    records = load_metric_records(tmp_path)
+    assert records is not None
+    assert all(record.step == 99 for record in records)
+    assert {record.namespace.rsplit("/", 1)[-1] for record in records} == set(resolved)
+
+    resolved_total = sum(int(record.metrics["n_no_optimizer_state"]) for record in records)
+    resolved_result = check_disconnected_optimizer_state(
+        records, groups=tuple(resolved), terminal_step=99, expected_tensors=resolved_total
+    )
+    assert resolved_result.passed
+
+    # Compatibility detector: the declaration includes parameter-free factors,
+    # but the real producer emits only resolved groups.
+    assert check_disconnected_optimizer_state(
+        records, groups=declared, terminal_step=99, expected_tensors=resolved_total
+    ).passed
+
+    # Independent coordinate detector: completed iteration 99 vs checkpoint 100.
+    assert check_disconnected_optimizer_state(
+        records, groups=tuple(resolved), terminal_step=100, expected_tensors=resolved_total
+    ).passed
