@@ -57,7 +57,7 @@ def _rendered_optimizer_fixture(tmp_path: Path, profile: PilotProfile):
 
     rendered = render_profile(
         profile,
-        output_dir=tmp_path / "inputs",
+        output_dir=tmp_path / "results" / "inputs",
         results_root=str(tmp_path / "results"),
         source_sha="42687973d4319dbd6f533bb5b067857f12b73d83",
         device="cpu",
