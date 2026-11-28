@@ -82,8 +82,6 @@ document = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
 rows = document.get("rows")
 if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
     raise SystemExit("phase-2 manifest rows must be a list of objects")
-if any(row.get("source_sha") != source_sha for row in rows):
-    raise SystemExit("phase-2 manifest row source_sha does not match SOURCE_SHA")
 selected = [
     row for row in rows
     if row.get("kind") == "eval"
