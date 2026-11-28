@@ -695,7 +695,7 @@ def _materialized_mapping(cfg: Any, row: Mapping[str, Any]) -> dict[str, Any]:
             recorder = recorder[0]
             if (
                 recorder.get("format_version") != 3
-                or recorder.get("path") != "${run.dir}/training_history"
+                    or recorder.get("path") != f"{expected_root}/training_history"
                 or recorder.get("every_n_steps") != 50
                 or recorder.get("partition_size_steps") != 1000
                 or callbacks.index(recorder) <= callbacks.index(checkpoint)
