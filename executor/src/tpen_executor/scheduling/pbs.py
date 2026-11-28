@@ -256,21 +256,39 @@ class PbsBatchResources:
     queue: str
     nodes: int
     walltime_minutes: int
+    job_mode: str = "serial"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "account", text(self.account, "account"))
         object.__setattr__(self, "queue", _identifier(self.queue, "queue"))
         object.__setattr__(self, "nodes", _positive_int(self.nodes, "nodes"))
         object.__setattr__(self, "walltime_minutes", _positive_int(self.walltime_minutes, "walltime_minutes"))
+        object.__setattr__(self, "job_mode", _identifier(self.job_mode, "job_mode"))
 
     def validate(self, venue: PbsVenue) -> None:
         """Validate this request against a typed venue."""
         venue.validate_resources(self)
 
+    @property
+    def num_nodes(self) -> int:
+        """Return the Balsam BatchJob spelling of ``nodes``."""
+        return self.nodes
+
+    @property
+    def wall_time_min(self) -> int:
+        """Return the Balsam BatchJob spelling of ``walltime_minutes``."""
+        return self.walltime_minutes
+
+    @property
+    def project(self) -> str:
+        """Return the Balsam project/allocation spelling of ``account``."""
+        return self.account
+
     def to_dict(self) -> dict[str, Any]:
         """Return the strict wire representation."""
         return {"schema": self.schema, "account": self.account, "queue": self.queue,
-                "nodes": self.nodes, "walltime_minutes": self.walltime_minutes}
+                "nodes": self.nodes, "walltime_minutes": self.walltime_minutes,
+                "job_mode": self.job_mode}
 
     def encode(self) -> bytes:
         """Encode the canonical request."""
@@ -279,9 +297,9 @@ class PbsBatchResources:
     @classmethod
     def from_mapping(cls, value: Any) -> "PbsBatchResources":
         """Decode one strict resource record."""
-        data = fields(value, {"schema", "account", "queue", "nodes", "walltime_minutes"},
+        data = fields(value, {"schema", "account", "queue", "nodes", "walltime_minutes", "job_mode"},
                       cls.schema, cls.__name__)
-        return cls(data["account"], data["queue"], data["nodes"], data["walltime_minutes"])
+        return cls(data["account"], data["queue"], data["nodes"], data["walltime_minutes"], data["job_mode"])
 
     @classmethod
     def decode(cls, value: bytes | str | dict[str, Any]) -> "PbsBatchResources":

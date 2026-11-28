@@ -77,7 +77,10 @@ class DocumentedSDKOperations:
         return state
 
     def submit(self, group_id: str, backend_job_id: str, batch_digest: str,
-               stdout_path: str | None = None, stderr_path: str | None = None) -> str:
+               stdout_path: str | None = None, stderr_path: str | None = None,
+               num_nodes: int | None = None, wall_time_min: int | None = None,
+               job_mode: str | None = None, site_id: int | None = None,
+               project: str | None = None, queue: str | None = None) -> str:
         """Create one BatchJob from the finite carrier fields.
 
         Parameters are intentionally primitive and closed at the bridge.  The
@@ -86,9 +89,18 @@ class DocumentedSDKOperations:
         successful external acknowledgement.
         """
 
-        del group_id, batch_digest
+        del batch_digest
         if stdout_path is None or stderr_path is None:
             raise BalsamControlRefusal("batch submission requires generated output paths")
+        allocation = (num_nodes, wall_time_min, job_mode, site_id, project, queue)
+        if any(value is None for value in allocation):
+            raise BalsamControlRefusal("batch submission requires complete allocation fields")
+        if type(num_nodes) is not int or num_nodes <= 0 or type(wall_time_min) is not int or wall_time_min <= 0:
+            raise BalsamControlRefusal("batch allocation sizes must be positive integers")
+        if type(site_id) is not int or site_id <= 0:
+            raise BalsamControlRefusal("site_id must be a positive integer")
+        if any(type(value) is not str or not value.strip() for value in (job_mode, project, queue)):
+            raise BalsamControlRefusal("batch allocation names must be non-empty text")
         paths = fixed_batch_output_paths({"tpen_stdout": stdout_path, "tpen_stderr": stderr_path})
         parents = {Path(paths.stdout).parent, Path(paths.stderr).parent}
         try:
@@ -104,7 +116,19 @@ class DocumentedSDKOperations:
         if not callable(create):
             raise BalsamControlRefusal("SDK API lacks BatchJob.objects.create")
         try:
-            record = create(job_id=backend_job_id, **paths.as_optional_params())
+            record = create(
+                num_nodes=num_nodes,
+                wall_time_min=wall_time_min,
+                job_mode=job_mode,
+                site_id=site_id,
+                project=project,
+                queue=queue,
+                optional_params=paths.as_optional_params(),
+                filter_tags={
+                    "tpen_group_id": group_id,
+                    "tpen_backend_job_id": backend_job_id,
+                },
+            )
             identity = getattr(record, "id", None)
         except (AttributeError, LookupError, OSError, TypeError, ValueError) as error:
             raise BalsamControlAmbiguous("BatchJob create acknowledgement is unknown") from error

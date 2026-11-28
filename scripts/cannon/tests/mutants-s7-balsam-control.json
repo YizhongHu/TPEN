@@ -48,6 +48,13 @@
       "old": "return str(identity)",
       "new": "return \"\"",
       "killer": "executor/tests/test_s7_balsam_control.py::test_control_batch_create_without_ack_is_ambiguous_and_never_rearmed"
+    },
+    {
+      "id": "s7-batch-output-params-dropped",
+      "target": "executor/control/balsam/src/tpen_balsam_control/sdk_adapter.py",
+      "old": "                optional_params=paths.as_optional_params(),\n                filter_tags={",
+      "new": "                optional_params={},\n                filter_tags={",
+      "killer": "executor/tests/test_s7_balsam_control.py::test_control_batch_create_prepares_both_parent_directories_before_sole_mutation"
     }
   ]
 }

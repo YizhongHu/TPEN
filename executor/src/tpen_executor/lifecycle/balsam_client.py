@@ -182,11 +182,16 @@ class BalsamProcessClient:
         raise BalsamGroupRefusal("observe_job requires the bound group identity")
 
     def submit_batch(self, group_id: GroupId, backend_job_id: BackendJobId, batch_digest: str,
-                     *, stdout_path: str | None = None, stderr_path: str | None = None) -> BatchJobId:
+                     *, stdout_path: str | None = None, stderr_path: str | None = None,
+                     num_nodes: int | None = None, wall_time_min: int | None = None,
+                     job_mode: str | None = None, site_id: int | None = None,
+                     project: str | None = None, queue: str | None = None) -> BatchJobId:
         """Submit one explicitly authorized batch, with no automatic retry."""
         request = BalsamWireRequest.submit(
             group_id, backend_job_id, batch_digest,
             stdout_path=stdout_path, stderr_path=stderr_path,
+            num_nodes=num_nodes, wall_time_min=wall_time_min, job_mode=job_mode,
+            site_id=site_id, project=project, queue=queue,
         )
         result = self._mutate(request)
         if not isinstance(result.batch_job_id, BatchJobId):
