@@ -285,6 +285,15 @@ def test_four_cpu_rows_cross_s6_s2_with_fences_deltas_and_final_reconciliation(t
     ]
     assert {task_id for kind, task_id in executor.calls if kind == "submit"} == set(member.task_id for member in group.members)
     assert {task_id for kind, task_id in executor.calls if kind == "collect"} == set(member.task_id for member in group.members)
+    assert result.member_outcomes == tuple((member.task_id, "collected") for member in group.members)
+    for member in group.members:
+        fence = executor.fences[member.task_id]
+        delta = executor.contexts[member.task_id].request.attempt_delta
+        assert delta is not None
+        assert delta.group_digest == group.identity
+        assert delta.task_id == member.task_id
+        assert delta.attempt_id == fence.attempt_id.value
+        assert delta.attempt_core_dir == str(Path(fence.output_dir) / "core")
     assert len({fence.attempt_id for fence in executor.fences.values()}) == 4
     assert {fence.allocation_id for fence in executor.fences.values()} == {allocation.allocation_id.value}
     assert all(member.action == "preserve_completed" for member in result.reconciliation.members)
