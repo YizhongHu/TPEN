@@ -867,7 +867,7 @@ def test_extended_resume_and_direct_restart_refuse_before_effect(tmp_path: Path)
 
     row, rendered_path = _train_row(tmp_path)
     cfg, admission = protocol.load_materialized_config(row, expected_kind="train")
-    with pytest.raises(restart.RestartRefusal, match="fresh-only"):
+    with pytest.raises(restart.RestartRefusal, match="nonexistent run directory"):
         restart.execute_restart(
             cfg=cfg, row=row, config_path=rendered_path, run=lambda *_a, **_k: pytest.fail(),
         )
