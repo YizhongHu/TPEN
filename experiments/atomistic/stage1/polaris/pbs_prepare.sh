@@ -94,6 +94,9 @@ if [[ -n "$EVAL_PREP_PATH" ]]; then
   assert_results_path "$RESULTS_PREFIX_CANONICAL" "$EVAL_PREP_PATH" EVAL_PREP_PATH "$RESULTS_PREFIX"
 fi
 
+# BEGIN RESULTS ROOT GUARD
+[[ ! -e "$RESULTS_ROOT" && ! -L "$RESULTS_ROOT" ]] || die "RESULTS_ROOT already exists: $RESULTS_ROOT"
+# END RESULTS ROOT GUARD
 [[ ! -e "$CHECKOUT_ROOT" && ! -L "$CHECKOUT_ROOT" ]] || die "CHECKOUT_ROOT already exists: $CHECKOUT_ROOT"
 [[ ! -e "$BUNDLE_VERIFY_ROOT" && ! -L "$BUNDLE_VERIFY_ROOT" ]] || die "BUNDLE_VERIFY_ROOT already exists: $BUNDLE_VERIFY_ROOT"
 [[ ! -e "$PRIME_ENV" && ! -L "$PRIME_ENV" ]] || die "PRIME_ENV already exists: $PRIME_ENV"

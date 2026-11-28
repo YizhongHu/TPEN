@@ -48,6 +48,20 @@
       "old": "source \"$STAGE1_PATHS_SH\"",
       "new": "source \"$SCRIPT_DIR/pbs_paths.sh\"",
       "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_prepare_spooling_requires_and_uses_explicit_helper_path"
+    },
+    {
+      "id": "prep-results-root-reuse",
+      "target": "experiments/atomistic/stage1/polaris/pbs_prepare.sh",
+      "old": "[[ ! -e \"$RESULTS_ROOT\" && ! -L \"$RESULTS_ROOT\" ]]",
+      "new": "true",
+      "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_prepare_job_refuses_pre_existing_results_root_before_writes"
+    },
+    {
+      "id": "prep-eval-source-sha-unbound",
+      "target": "experiments/atomistic/stage1/polaris/pbs_select_eval.sh",
+      "old": "if not (manifest_source_ok and selected_source_ok):",
+      "new": "if False:",
+      "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_eval_selection_binds_manifest_and_selected_row_to_source_sha"
     }
   ]
 }

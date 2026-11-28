@@ -71,6 +71,35 @@ assert_results_path "$RESULTS_PREFIX_CANONICAL" "$SELECTED_EVAL" SELECTED_EVAL "
   die "checkout does not match SOURCE_SHA"
 
 cd "$CHECKOUT_ROOT"
+# BEGIN SOURCE SHA CHECK
+"$PRIME_ENV/bin/python" - "$PHASE2_MANIFEST" "$SOURCE_SHA" "$SYSTEM" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest_path, source_sha, system = sys.argv[1:]
+document = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+rows = document.get("rows")
+if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+    raise SystemExit("phase-2 manifest rows must be a list of objects")
+if any(row.get("source_sha") != source_sha for row in rows):
+    raise SystemExit("phase-2 manifest row source_sha does not match SOURCE_SHA")
+selected = [
+    row for row in rows
+    if row.get("kind") == "eval"
+    and row.get("system") == system
+    and row.get("lineage") == 0
+    and row.get("checkpoint") == 100000
+    and row.get("stream") == 0
+]
+if not selected:
+    raise SystemExit("no matching eval rows")
+manifest_source_ok = all(row.get("source_sha") == source_sha for row in rows)
+selected_source_ok = all(row.get("source_sha") == source_sha for row in selected)
+if not (manifest_source_ok and selected_source_ok):
+    raise SystemExit("phase-2 manifest or selected eval row source_sha does not match SOURCE_SHA")
+PY
+# END SOURCE SHA CHECK
 mkdir -p -- "$(dirname -- "$SELECTED_EVAL")"
 "$PRIME_ENV/bin/python" -m experiments.atomistic.stage1.select_eval \
   --manifest "$PHASE2_MANIFEST" --system "$SYSTEM" --lineage 0 --checkpoint 100000 \

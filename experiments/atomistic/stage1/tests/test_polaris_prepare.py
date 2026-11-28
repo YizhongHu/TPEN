@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -185,6 +187,112 @@ def test_prepare_spooling_requires_and_uses_explicit_helper_path(tmp_path: Path)
         {"STAGE1_PATHS_SH": str(helper), "STAGE1_PATHS_SHA256": helper_sha},
     )
     assert supplied.returncode == 0, supplied.stderr
+
+
+def _run_results_root_guard(root: Path) -> subprocess.CompletedProcess[str]:
+    text = SCRIPT.read_text(encoding="utf-8")
+    guard = text.split("# BEGIN RESULTS ROOT GUARD\n", 1)[1].split(
+        "# END RESULTS ROOT GUARD", 1
+    )[0]
+    command = f'''\
+set -Eeuo pipefail
+die() {{ printf 'TEST PREP FAIL %s\\n' "$*" >&2; exit 2; }}
+RESULTS_ROOT={shlex.quote(str(root))}
+{guard}
+'''
+    return subprocess.run(
+        ["bash", "-c", command],
+        env={"PATH": "/usr/bin:/bin"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_prepare_job_refuses_pre_existing_results_root_before_writes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "results"
+    root.mkdir()
+    sentinel = root / "sentinel.txt"
+    sentinel.write_text("preserve\n", encoding="utf-8")
+    before = sorted(path.relative_to(root) for path in root.rglob("*"))
+
+    result = _run_results_root_guard(root)
+
+    assert result.returncode != 0
+    assert "RESULTS_ROOT already exists" in result.stderr
+    assert sentinel.read_text(encoding="utf-8") == "preserve\n"
+    assert sorted(path.relative_to(root) for path in root.rglob("*")) == before
+
+    target = tmp_path / "symlink-target"
+    target.mkdir()
+    symlink_sentinel = target / "sentinel.txt"
+    symlink_sentinel.write_text("preserve\n", encoding="utf-8")
+    root_link = tmp_path / "results-link"
+    root_link.symlink_to(target, target_is_directory=True)
+    result = _run_results_root_guard(root_link)
+    assert result.returncode != 0
+    assert symlink_sentinel.read_text(encoding="utf-8") == "preserve\n"
+    assert sorted(path.relative_to(target) for path in target.rglob("*")) == [
+        Path("sentinel.txt")
+    ]
+
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert text.index("# BEGIN RESULTS ROOT GUARD") < text.index("mkdir -p")
+
+
+def _run_source_sha_check(
+    tmp_path: Path, rows: list[dict[str, object]], source_sha: str
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    tmp_path.mkdir(parents=True)
+    text = EVAL_SCRIPT.read_text(encoding="utf-8")
+    check = text.split("# BEGIN SOURCE SHA CHECK\n", 1)[1].split(
+        "# END SOURCE SHA CHECK", 1
+    )[0]
+    manifest = tmp_path / "phase2.json"
+    manifest.write_text(json.dumps({"rows": rows}) + "\n", encoding="utf-8")
+    prime_env = tmp_path / "prime-env"
+    (prime_env / "bin").mkdir(parents=True)
+    (prime_env / "bin" / "python").symlink_to(sys.executable)
+    command = f'''\
+set -Eeuo pipefail
+PRIME_ENV={shlex.quote(str(prime_env))}
+PHASE2_MANIFEST={shlex.quote(str(manifest))}
+SOURCE_SHA={shlex.quote(source_sha)}
+SYSTEM=he
+{check}
+'''
+    result = subprocess.run(
+        ["bash", "-c", command],
+        env={"PATH": "/usr/bin:/bin"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result, tmp_path / "selected-eval.json"
+
+
+def test_eval_selection_binds_manifest_and_selected_row_to_source_sha(
+    tmp_path: Path,
+) -> None:
+    source_sha = "a" * 40
+    row = {
+        "kind": "eval",
+        "system": "he",
+        "lineage": 0,
+        "checkpoint": 100000,
+        "stream": 0,
+        "source_sha": "b" * 40,
+    }
+    mismatch, output = _run_source_sha_check(tmp_path / "mismatch", [row], source_sha)
+    assert mismatch.returncode != 0
+    assert "source_sha" in mismatch.stderr
+    assert not output.exists()
+
+    row["source_sha"] = source_sha
+    matching, _ = _run_source_sha_check(tmp_path / "matching", [row], source_sha)
+    assert matching.returncode == 0, matching.stderr
 
 
 def _run_guard(path: Path, allowed_root: Path) -> subprocess.CompletedProcess[str]:
