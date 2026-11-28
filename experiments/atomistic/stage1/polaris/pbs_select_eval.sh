@@ -11,6 +11,8 @@
 set -Eeuo pipefail
 
 RESULTS_PREFIX="/eagle/HetRxnEnergy/rhu/"
+RESULTS_PREFIX_CANONICAL=""
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 SOURCE_SHA="${SOURCE_SHA:-}"
 RESULTS_ROOT="${RESULTS_ROOT:-}"
 SYSTEM="${SYSTEM:-}"
@@ -25,17 +27,11 @@ die() {
   exit 2
 }
 
+source "$SCRIPT_DIR/pbs_paths.sh"
+
 require_value() {
   local name="$1"
   [[ -n "${!name:-}" ]] || die "$name is required"
-}
-
-assert_results_path() {
-  local path="$1" label="$2" canonical prefix
-  prefix="$(realpath -m -- "$RESULTS_PREFIX")" || die "could not canonicalize results prefix"
-  canonical="$(realpath -m -- "$path")" || die "could not canonicalize $label: $path"
-  [[ "$canonical" != "$prefix" && "$canonical" == "$prefix"/* ]] ||
-    die "$label is outside $RESULTS_PREFIX: $path"
 }
 
 require_value SOURCE_SHA
@@ -50,11 +46,13 @@ require_value SELECTED_EVAL
   die "delivered queue is not debug: ${PBS_QUEUE}"
 [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || die "SOURCE_SHA must be a full lowercase SHA"
 [[ "$SYSTEM" == he || "$SYSTEM" == h2 ]] || die "SYSTEM must be he or h2"
-assert_results_path "$RESULTS_ROOT" RESULTS_ROOT
-assert_results_path "$CHECKOUT_ROOT" CHECKOUT_ROOT
-assert_results_path "$PRIME_ENV" PRIME_ENV
-assert_results_path "$PHASE2_MANIFEST" PHASE2_MANIFEST
-assert_results_path "$SELECTED_EVAL" SELECTED_EVAL
+RESULTS_PREFIX_CANONICAL="$(canonicalize_path "$RESULTS_PREFIX")" ||
+  die "could not canonicalize results prefix: $RESULTS_PREFIX"
+assert_results_path "$RESULTS_PREFIX_CANONICAL" "$RESULTS_ROOT" RESULTS_ROOT "$RESULTS_PREFIX"
+assert_results_path "$RESULTS_PREFIX_CANONICAL" "$CHECKOUT_ROOT" CHECKOUT_ROOT "$RESULTS_PREFIX"
+assert_results_path "$RESULTS_PREFIX_CANONICAL" "$PRIME_ENV" PRIME_ENV "$RESULTS_PREFIX"
+assert_results_path "$RESULTS_PREFIX_CANONICAL" "$PHASE2_MANIFEST" PHASE2_MANIFEST "$RESULTS_PREFIX"
+assert_results_path "$RESULTS_PREFIX_CANONICAL" "$SELECTED_EVAL" SELECTED_EVAL "$RESULTS_PREFIX"
 [[ -x "$PRIME_ENV/bin/python" ]] || die "prime environment interpreter is missing: $PRIME_ENV/bin/python"
 [[ -f "$PHASE2_MANIFEST" ]] || die "phase-2 manifest is missing: $PHASE2_MANIFEST"
 [[ "$(git -C "$CHECKOUT_ROOT" rev-parse HEAD)" == "$SOURCE_SHA" ]] ||

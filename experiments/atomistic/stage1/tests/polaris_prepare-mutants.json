@@ -30,8 +30,8 @@
     },
     {
       "id": "prep-lexical-containment-restored",
-      "target": "experiments/atomistic/stage1/polaris/pbs_prepare.sh",
-      "old": "canonical=\"$(realpath -m -- \"$path\")\"",
+      "target": "experiments/atomistic/stage1/polaris/pbs_paths.sh",
+      "old": "canonical=\"$(canonicalize_path \"$path\")\"",
       "new": "canonical=\"$path\"",
       "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_prepare_path_guard_accepts_alias_and_canonical_roots_and_refuses_escapes"
     }

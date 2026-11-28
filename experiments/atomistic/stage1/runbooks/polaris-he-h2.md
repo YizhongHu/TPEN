@@ -2,9 +2,10 @@
 
 This is the optional direct PBS route for the He and H2 Stage-1 rows.  It is
 independent of the Cannon runbooks and does not authorize a science
-allocation.  The implementation is the three scripts
+allocation.  The implementation is the four scripts
 `experiments/atomistic/stage1/polaris/pbs_prepare.sh` and
 `experiments/atomistic/stage1/polaris/pbs_select_eval.sh` and
+`experiments/atomistic/stage1/polaris/pbs_paths.sh` and
 `experiments/atomistic/stage1/polaris/pbs_stage1.sh`.  One short debug
 preparation job owns source checkout, uv cache priming, and row rendering;
 later submissions use the complete execution wrapper with an explicit mode.
@@ -74,7 +75,7 @@ PYBIN=/soft/applications/conda/2025-09-25/mconda3/bin/python
 
 The run root must be created before any `qsub` so PBS can open its `-o` and
 `-e` files.  Assert it is below `/eagle/HetRxnEnergy/rhu/`, create `logs/`,
-`plan/`, `launch/`, and `inputs/`, copy the three scripts there, and record
+`plan/`, `launch/`, and `inputs/`, copy the four scripts there, and record
 their SHA-256 values.  Do not copy a git tree with `cp -a` from `/home` to Eagle;
 the current Polaris note records that this fails while preserving ownership.
 
@@ -90,6 +91,7 @@ mkdir -p "$RESULTS_ROOT"/{inputs,logs,plan}
 scp -p experiments/atomistic/stage1/polaris/pbs_stage1.sh "$WRAPPER"
 scp -p experiments/atomistic/stage1/polaris/pbs_prepare.sh "$PREP_SCRIPT"
 scp -p experiments/atomistic/stage1/polaris/pbs_select_eval.sh "$EVAL_PREP_SCRIPT"
+scp -p experiments/atomistic/stage1/polaris/pbs_paths.sh "$RESULTS_ROOT/inputs/pbs_paths.sh"
 PREP_JOB_ID="$(qsub -N "stage1-prep-${SYSTEM}-${SOURCE_SHA:0:8}" \
   -A HetRxnEnergy -q debug \
   -l select=1:system=polaris:ncpus=4,walltime=00:20:00,filesystems=home:eagle,place=scatter \
@@ -151,7 +153,7 @@ Planning and full roster/grid reconciliation remain S0-B/S1-RC-owned.  The
 preparation job writes `plan/phase1-manifest.json`, the exact first
 `plan/selected-train.json`, the bounded `ramp-up-r1/plan/selected-train.json`
 and its hash, one JSON file per train row under `launch/`, and a
-`launch/render-receipt.json`, and the three input-script hashes.  Inspect those named files only; do not recreate
+`launch/render-receipt.json`, and the four input-script hashes.  Inspect those named files only; do not recreate
 or edit rows on the login node.  The same row shape is used for an unbounded
 route and for a bounded qualification; only the latter adds the
 already-approved `execution.stop_at` datum in its separate request file.

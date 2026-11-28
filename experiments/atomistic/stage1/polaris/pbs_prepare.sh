@@ -12,6 +12,7 @@ set -Eeuo pipefail
 
 RESULTS_PREFIX="/eagle/HetRxnEnergy/rhu/"
 RESULTS_PREFIX_CANONICAL=""
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 SOURCE_REPO="${SOURCE_REPO:-}"
 SOURCE_SHA="${SOURCE_SHA:-}"
 RESULTS_ROOT="${RESULTS_ROOT:-}"
@@ -34,19 +35,11 @@ die() {
   exit 2
 }
 
+source "$SCRIPT_DIR/pbs_paths.sh"
+
 require_value() {
   local name="$1"
   [[ -n "${!name:-}" ]] || die "$name is required"
-}
-
-assert_results_path() {
-  local path="$1" label="$2"
-  local canonical
-  canonical="$(realpath -m -- "$path")" || die "could not canonicalize $label: $path"
-  [[ "$canonical" != "$RESULTS_PREFIX_CANONICAL" ]] ||
-    die "$label must name a child path"
-  [[ "$canonical" == "$RESULTS_PREFIX_CANONICAL"/* ]] ||
-    die "$label is outside $RESULTS_PREFIX: $path"
 }
 
 require_value SOURCE_REPO
@@ -58,24 +51,24 @@ require_value LINEAGE_SEEDS
 [[ -z "${PBS_QUEUE:-}" || "$PBS_QUEUE" == debug ]] || die "delivered queue is not debug: ${PBS_QUEUE}"
 [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || die "SOURCE_SHA must be a full lowercase SHA"
 [[ "$SYSTEM" == he || "$SYSTEM" == h2 ]] || die "SYSTEM must be he or h2"
-RESULTS_PREFIX_CANONICAL="$(realpath -m -- "$RESULTS_PREFIX")" ||
+RESULTS_PREFIX_CANONICAL="$(canonicalize_path "$RESULTS_PREFIX")" ||
   die "could not canonicalize results prefix: $RESULTS_PREFIX"
-assert_results_path "$RESULTS_ROOT" RESULTS_ROOT
-assert_results_path "$CHECKOUT_ROOT" CHECKOUT_ROOT
-assert_results_path "$UV_CACHE_DIR" UV_CACHE_DIR
-assert_results_path "$PRIME_ENV" PRIME_ENV
-assert_results_path "$PHASE1_MANIFEST" PHASE1_MANIFEST
-assert_results_path "$SELECTED_ROW" SELECTED_ROW
-assert_results_path "$LAUNCH_ROOT" LAUNCH_ROOT
-assert_results_path "$WRAPPER_PATH" WRAPPER_PATH
+assert_results_path "$RESULTS_PREFIX_CANONICAL" "$RESULTS_ROOT" RESULTS_ROOT "$RESULTS_PREFIX"
+assert_results_path "$RESULTS_PREFIX_CANONICAL" "$CHECKOUT_ROOT" CHECKOUT_ROOT "$RESULTS_PREFIX"
+assert_results_path "$RESULTS_PREFIX_CANONICAL" "$UV_CACHE_DIR" UV_CACHE_DIR "$RESULTS_PREFIX"
+assert_results_path "$RESULTS_PREFIX_CANONICAL" "$PRIME_ENV" PRIME_ENV "$RESULTS_PREFIX"
+assert_results_path "$RESULTS_PREFIX_CANONICAL" "$PHASE1_MANIFEST" PHASE1_MANIFEST "$RESULTS_PREFIX"
+assert_results_path "$RESULTS_PREFIX_CANONICAL" "$SELECTED_ROW" SELECTED_ROW "$RESULTS_PREFIX"
+assert_results_path "$RESULTS_PREFIX_CANONICAL" "$LAUNCH_ROOT" LAUNCH_ROOT "$RESULTS_PREFIX"
+assert_results_path "$RESULTS_PREFIX_CANONICAL" "$WRAPPER_PATH" WRAPPER_PATH "$RESULTS_PREFIX"
 if [[ -n "$SMOKE_RESULTS_ROOT" || -n "$SMOKE_SELECTED_ROW" ]]; then
   [[ -n "$SMOKE_RESULTS_ROOT" && -n "$SMOKE_SELECTED_ROW" ]] ||
     die "SMOKE_RESULTS_ROOT and SMOKE_SELECTED_ROW must be supplied together"
-  assert_results_path "$SMOKE_RESULTS_ROOT" SMOKE_RESULTS_ROOT
-  assert_results_path "$SMOKE_SELECTED_ROW" SMOKE_SELECTED_ROW
+  assert_results_path "$RESULTS_PREFIX_CANONICAL" "$SMOKE_RESULTS_ROOT" SMOKE_RESULTS_ROOT "$RESULTS_PREFIX"
+  assert_results_path "$RESULTS_PREFIX_CANONICAL" "$SMOKE_SELECTED_ROW" SMOKE_SELECTED_ROW "$RESULTS_PREFIX"
 fi
 if [[ -n "$EVAL_PREP_PATH" ]]; then
-  assert_results_path "$EVAL_PREP_PATH" EVAL_PREP_PATH
+  assert_results_path "$RESULTS_PREFIX_CANONICAL" "$EVAL_PREP_PATH" EVAL_PREP_PATH "$RESULTS_PREFIX"
 fi
 
 [[ ! -e "$CHECKOUT_ROOT" && ! -L "$CHECKOUT_ROOT" ]] || die "CHECKOUT_ROOT already exists: $CHECKOUT_ROOT"
@@ -83,6 +76,7 @@ fi
 mkdir -p -- "$RESULTS_ROOT"/inputs "$RESULTS_ROOT"/logs "$RESULTS_ROOT"/plan "$LAUNCH_ROOT" "$UV_CACHE_DIR"
 [[ -f "$WRAPPER_PATH" ]] || die "execution wrapper is missing: $WRAPPER_PATH"
 sha256sum "$0" > "$RESULTS_ROOT/inputs/pbs_prepare.sh.sha256"
+sha256sum "$SCRIPT_DIR/pbs_paths.sh" > "$RESULTS_ROOT/inputs/pbs_paths.sh.sha256"
 sha256sum "$WRAPPER_PATH" > "$RESULTS_ROOT/inputs/pbs_stage1.sh.sha256"
 if [[ -n "$EVAL_PREP_PATH" ]]; then
   [[ -f "$EVAL_PREP_PATH" ]] || die "evaluation preparation script is missing: $EVAL_PREP_PATH"

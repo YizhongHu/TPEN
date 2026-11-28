@@ -10,6 +10,7 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).parents[1] / "polaris" / "pbs_prepare.sh"
 EVAL_SCRIPT = Path(__file__).parents[1] / "polaris" / "pbs_select_eval.sh"
+PATHS_SCRIPT = Path(__file__).parents[1] / "polaris" / "pbs_paths.sh"
 RUNBOOK = Path(__file__).parents[1] / "runbooks" / "polaris-he-h2.md"
 
 
@@ -36,6 +37,7 @@ def test_prepare_job_owns_clone_uv_prime_and_row_rendering() -> None:
     assert 'derive_smoke_request' in text
     assert 'SMOKE_SELECTED_ROW' in text
     assert 'pbs_select_eval.sh.sha256' in text
+    assert 'pbs_paths.sh.sha256' in text
 
 
 def test_prepare_job_never_submits_or_transfers_from_the_allocation() -> None:
@@ -49,14 +51,15 @@ def test_prepare_job_never_submits_or_transfers_from_the_allocation() -> None:
 def _run_guard(path: Path, allowed_root: Path) -> subprocess.CompletedProcess[str]:
     text = SCRIPT.read_text(encoding="utf-8")
     prefix = text.split("require_value SOURCE_REPO", 1)[0]
+    prefix = prefix.replace('source "$SCRIPT_DIR/pbs_paths.sh"', PATHS_SCRIPT.read_text(encoding="utf-8"))
     prefix = prefix.replace(
         'RESULTS_PREFIX="/eagle/HetRxnEnergy/rhu/"',
         f"RESULTS_PREFIX={shlex.quote(str(allowed_root))}",
     )
     command = (
         f'{prefix}\n'
-        'RESULTS_PREFIX_CANONICAL="$(realpath -m -- "$RESULTS_PREFIX")"\n'
-        'assert_results_path "$1" TEST_PATH\n'
+        'RESULTS_PREFIX_CANONICAL="$(canonicalize_path "$RESULTS_PREFIX")"\n'
+        'assert_results_path "$RESULTS_PREFIX_CANONICAL" "$1" TEST_PATH "$RESULTS_PREFIX"\n'
     )
     return subprocess.run(
         ["bash", "-c", command, "guard", str(path)],
@@ -78,12 +81,13 @@ def test_prepare_path_guard_accepts_alias_and_canonical_roots_and_refuses_escape
     assert _run_guard(alias / "run", allowed).returncode == 0
     assert _run_guard(tmp_path / "outside", allowed).returncode != 0
     assert _run_guard(allowed / ".." / "outside", allowed).returncode != 0
+    assert _run_guard(allowed.parent / "rhu-other" / "run", allowed).returncode != 0
 
 
 def test_prepare_uses_canonical_containment_not_lexical_prefix() -> None:
-    text = SCRIPT.read_text(encoding="utf-8")
-    assert 'canonical="$(realpath -m -- "$path")"' in text
-    assert '"$canonical" == "$RESULTS_PREFIX_CANONICAL"/*' in text
+    text = PATHS_SCRIPT.read_text(encoding="utf-8")
+    assert 'canonical="$(canonicalize_path "$path")"' in text
+    assert '"$canonical" == "$allowed_canonical"/*' in text
 
 
 def test_eval_selection_job_owns_eval_materialization() -> None:
