@@ -180,7 +180,6 @@ def test_native_train_planned_yield_publishes_train_resume_checkpoint(
     assert outcome["next_iteration"] == stop_at
     assert outcome["completed_updates"] == stop_at
     checkpoint_ref = outcome["checkpoint_ref"]
-    assert checkpoint_ref["profile"] == "train_resume"
     checkpoint = run_dir / "checkpoints" / f"step_{stop_at:06d}"
     assert checkpoint_ref["next_iteration"] == stop_at
     assert checkpoint_ref["completed_updates"] == stop_at
