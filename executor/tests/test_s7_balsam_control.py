@@ -267,7 +267,7 @@ def test_four_cpu_rows_cross_s6_s2_with_fences_deltas_and_final_reconciliation(t
     binding = _s7_binding(group)
     inputs = tuple(MemberRecoveryInputV2(member.task_id, member.lineage_id) for member in group.members)
     allocation = assignment.to_configured_allocation()
-    executor = EventExecutor(group, allocation, capacity=2)
+    executor = EventExecutor(group, allocation, capacity=4)
     admission = DurableAdmission()
     result = run_validated_association(
         binding, BackendJobId("job-7"), binding, assignment, group,
@@ -319,7 +319,7 @@ def test_backend_success_alone_cannot_establish_full_h(tmp_path: Path) -> None:
     binding = _s7_binding(group)
     inputs = tuple(MemberRecoveryInputV2(member.task_id, member.lineage_id) for member in group.members)
     allocation = assignment.to_configured_allocation()
-    executor = EventExecutor(group, allocation, capacity=2)
+    executor = EventExecutor(group, allocation, capacity=4)
     admission = _BackendSuccessOnly()
     result = run_validated_association(
         binding, BackendJobId("job-7"), binding, assignment, group,
