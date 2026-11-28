@@ -23,6 +23,8 @@ from tpen_executor.lifecycle.balsam_control import (
     run_validated_association,
     submit_fresh_batch,
 )
+from tpen_executor.lifecycle.balsam_client import BalsamProcessClient
+from tpen_executor.lifecycle.balsam_wire import decode_request, encode_result
 from tpen_executor.lifecycle.allocation_capture import SchedulerAllocationSnapshot, assign_full_node
 from tpen_executor.recovery import CoreAdmissionVerdictV2, MemberRecoveryInputV2
 from tpen_executor.scheduling.pbs import PackedNodeLayout
@@ -36,6 +38,7 @@ if str(CONTROL_SOURCE) not in sys.path:
     sys.path.insert(0, str(CONTROL_SOURCE))
 
 from tpen_balsam_control.application import BalsamControlAmbiguous, BalsamControlRefusal  # noqa: E402
+from tpen_balsam_control.bridge import dispatch  # noqa: E402
 from tpen_balsam_control.sdk_adapter import DocumentedSDKOperations  # noqa: E402
 
 
@@ -307,8 +310,10 @@ class _BackendSuccessOnly:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def admit(self, member: MemberRecoveryInputV2) -> CoreAdmissionVerdictV2:
+    def admit(self, member: MemberRecoveryInputV2) -> CoreAdmissionVerdictV2 | None:
         self.calls.append(member.task_id)
+        if member.start_receipt is None and member.outcome_receipt is None:
+            return None
         return CoreAdmissionVerdictV2("unknown", "unknown", "unknown", "unknown", None, "backend-only")
 
 
@@ -329,9 +334,59 @@ def test_backend_success_alone_cannot_establish_full_h(tmp_path: Path) -> None:
         store=DirectoryStore(tmp_path / "store"), admission_port=admission, executor=executor,
     )
 
+    assert [kind for kind, _ in executor.calls].count("submit") == 4
+    assert [kind for kind, _ in executor.calls].count("collect") == 4
+    assert result.member_outcomes == tuple((member.task_id, "collected") for member in group.members)
     assert result.exit_code == 2
     assert all(member.action != "preserve_completed" for member in result.reconciliation.members)
     assert set(admission.calls) == {member.task_id for member in group.members}
+
+
+def test_process_client_complete_submit_request_reaches_real_bridge_dispatch(tmp_path: Path) -> None:
+    """The expanded client request is consumed by the production bridge path."""
+
+    class _SignatureFaithfulBatchManager:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, object] = {}
+
+        def create(self, num_nodes, wall_time_min, job_mode, site_id, project, queue,
+                   optional_params=None, filter_tags=None):
+            self.kwargs = {
+                "num_nodes": num_nodes, "wall_time_min": wall_time_min, "job_mode": job_mode,
+                "site_id": site_id, "project": project, "queue": queue,
+                "optional_params": optional_params, "filter_tags": filter_tags,
+            }
+            return SimpleNamespace(id="batch-wire-7")
+
+    manager = _SignatureFaithfulBatchManager()
+    api = SimpleNamespace(BatchJob=SimpleNamespace(objects=manager))
+    operations = DocumentedSDKOperations(api)
+
+    class _Bridge:
+        def call(self, payload: bytes, *, timeout: float) -> bytes:
+            del timeout
+            request = decode_request(payload)
+            response = dispatch(request, operations)
+            return encode_result(response)
+
+    client_file = tmp_path / "client.yml"
+    client_file.write_text("api_root: https://example.invalid\n", encoding="utf-8")
+    client_file.chmod(0o600)
+    stdout = tmp_path / "stdout.log"
+    stderr = tmp_path / "stderr.log"
+    batch_id = BalsamProcessClient("/bin/sh", client_path=client_file, bridge=_Bridge()).submit_batch(
+        GroupId("group-wire"), BackendJobId("job-wire"), _sha("wire"),
+        stdout_path=str(stdout), stderr_path=str(stderr), num_nodes=2, wall_time_min=30,
+        job_mode="serial", site_id=7, project="project-wire", queue="debug",
+    )
+
+    assert batch_id == BatchJobId("batch-wire-7")
+    assert manager.kwargs == {
+        "num_nodes": 2, "wall_time_min": 30, "job_mode": "serial", "site_id": 7,
+        "project": "project-wire", "queue": "debug",
+        "optional_params": {"tpen_stdout": str(stdout), "tpen_stderr": str(stderr)},
+        "filter_tags": {"tpen_group_id": "group-wire", "tpen_backend_job_id": "job-wire"},
+    }
 
 
 @pytest.mark.parametrize("crossing", ["assignment", "observed"])
