@@ -154,6 +154,8 @@ def _record_paths(store: DirectoryStore, intent: BalsamBatchIntent) -> tuple[Pat
     """Return the one-group carrier journal paths."""
 
     root = Path(store.root) / "balsam-batches" / digest(intent.group_id.to_dict())
+    ensure_durable_directory(store.root)
+    ensure_durable_directory(str(root.parent.parent))
     ensure_durable_directory(str(root.parent))
     ensure_durable_directory(str(root))
     return root / "intent.json", root / "receipt.json", root / "refusal.json"
