@@ -17,8 +17,15 @@
     {
       "id": "prep-full-clone-dropped",
       "target": "experiments/atomistic/stage1/polaris/pbs_prepare.sh",
-      "old": "git clone \"$SOURCE_REPO\" \"$CHECKOUT_ROOT\"",
-      "new": "git clone --filter=blob:none \"$SOURCE_REPO\" \"$CHECKOUT_ROOT\"",
+      "old": "git clone --no-checkout \"$BUNDLE_INPUT_PATH\" \"$CHECKOUT_ROOT\"",
+      "new": "git clone --no-checkout --filter=blob:none \"$BUNDLE_INPUT_PATH\" \"$CHECKOUT_ROOT\"",
+      "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_prepare_job_owns_clone_uv_prime_and_row_rendering"
+    },
+    {
+      "id": "prep-github-clone-restored",
+      "target": "experiments/atomistic/stage1/polaris/pbs_prepare.sh",
+      "old": "git clone --no-checkout \"$BUNDLE_INPUT_PATH\" \"$CHECKOUT_ROOT\"",
+      "new": "git clone --no-checkout https://github.com/YizhongHu/TPEN.git \"$CHECKOUT_ROOT\"",
       "killer": "experiments/atomistic/stage1/tests/test_polaris_prepare.py::test_prepare_job_owns_clone_uv_prime_and_row_rendering"
     },
     {

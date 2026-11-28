@@ -26,7 +26,12 @@ def test_prepare_job_is_short_debug_cpu_allocation() -> None:
 
 def test_prepare_job_owns_clone_uv_prime_and_row_rendering() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
-    assert 'git clone "$SOURCE_REPO" "$CHECKOUT_ROOT"' in text
+    assert 'git clone --no-checkout "$BUNDLE_INPUT_PATH" "$CHECKOUT_ROOT"' in text
+    assert "github.com" not in text
+    assert "SOURCE_REPO" not in text
+    assert "SOURCE_BUNDLE_PATH" in text
+    assert "SOURCE_BUNDLE_SHA256" in text
+    assert 'git bundle verify "$BUNDLE_INPUT_PATH"' in text
     assert 'git -C "$CHECKOUT_ROOT" checkout --detach "$SOURCE_SHA"' in text
     assert 'rev-parse HEAD)" == "$SOURCE_SHA"' in text
     assert '"$PYBIN" -m uv lock --check --project "$CHECKOUT_ROOT"' in text
@@ -51,9 +56,21 @@ def test_prepare_job_never_submits_or_transfers_from_the_allocation() -> None:
     assert 'realpath -m -- "$1"' in PATHS_SCRIPT.read_text(encoding="utf-8")
 
 
+def test_prepare_job_uses_staged_bundle_and_documented_proxy_set() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert 'cp -- "$SOURCE_BUNDLE_PATH" "$BUNDLE_INPUT_PATH"' in text
+    assert 'SOURCE_BUNDLE_ACTUAL_SHA256=' in text
+    assert 'export HTTP_PROXY="http://proxy.alcf.anl.gov:3128"' in text
+    assert 'export HTTPS_PROXY="http://proxy.alcf.anl.gov:3128"' in text
+    assert 'export http_proxy="http://proxy.alcf.anl.gov:3128"' in text
+    assert 'export https_proxy="http://proxy.alcf.anl.gov:3128"' in text
+    assert 'export ftp_proxy="http://proxy.alcf.anl.gov:3128"' in text
+    assert 'export no_proxy="admin,polaris-adminvm-01,localhost,*.cm.polaris.alcf.anl.gov,polaris-*,*.polaris.alcf.anl.gov,*.alcf.anl.gov"' in text
+
+
 def _run_spooled_preamble(script: Path, environ: dict[str, str]) -> subprocess.CompletedProcess[str]:
     text = script.read_text(encoding="utf-8")
-    prefix = text.split("require_value SOURCE_REPO", 1)[0]
+    prefix = text.split("require_value SOURCE_BUNDLE_PATH", 1)[0]
     env = {"PATH": "/usr/bin:/bin", **environ}
     return subprocess.run(
         ["bash", "-c", prefix],
@@ -89,7 +106,7 @@ def test_prepare_spooling_requires_and_uses_explicit_helper_path(tmp_path: Path)
 
 def _run_guard(path: Path, allowed_root: Path) -> subprocess.CompletedProcess[str]:
     text = SCRIPT.read_text(encoding="utf-8")
-    prefix = text.split("require_value SOURCE_REPO", 1)[0]
+    prefix = text.split("require_value SOURCE_BUNDLE_PATH", 1)[0]
     prefix = prefix.replace(
         'RESULTS_PREFIX="/eagle/HetRxnEnergy/rhu/"',
         f"RESULTS_PREFIX={shlex.quote(str(allowed_root))}",

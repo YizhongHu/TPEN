@@ -17,7 +17,8 @@ STAGE1_PATHS_SHA256="${STAGE1_PATHS_SHA256:-}"
 STAGED_PREP_PATH="${STAGED_PREP_PATH:-}"
 STAGED_WRAPPER_PATH="${STAGED_WRAPPER_PATH:-}"
 STAGED_EVAL_PREP_PATH="${STAGED_EVAL_PREP_PATH:-}"
-SOURCE_REPO="${SOURCE_REPO:-}"
+SOURCE_BUNDLE_PATH="${SOURCE_BUNDLE_PATH:-}"
+SOURCE_BUNDLE_SHA256="${SOURCE_BUNDLE_SHA256:-}"
 SOURCE_SHA="${SOURCE_SHA:-}"
 RESULTS_ROOT="${RESULTS_ROOT:-}"
 SYSTEM="${SYSTEM:-}"
@@ -29,6 +30,7 @@ PYBIN="${PYBIN:-/soft/applications/conda/2025-09-25/mconda3/bin/python}"
 CHECKOUT_ROOT="${CHECKOUT_ROOT:-${RESULTS_ROOT}/checkout}"
 UV_CACHE_DIR="${UV_CACHE_DIR:-${RESULTS_ROOT}/uv-cache}"
 PRIME_ENV="${PRIME_ENV:-${RESULTS_ROOT}/prime-env}"
+BUNDLE_INPUT_PATH="${BUNDLE_INPUT_PATH:-${RESULTS_ROOT}/inputs/TPEN-${SOURCE_SHA}.bundle}"
 PHASE1_MANIFEST="${PHASE1_MANIFEST:-${RESULTS_ROOT}/plan/phase1-manifest.json}"
 SELECTED_ROW="${SELECTED_ROW:-${RESULTS_ROOT}/plan/selected-train.json}"
 LAUNCH_ROOT="${LAUNCH_ROOT:-${RESULTS_ROOT}/launch}"
@@ -57,7 +59,8 @@ require_value() {
   [[ -n "${!name:-}" ]] || die "$name is required"
 }
 
-require_value SOURCE_REPO
+require_value SOURCE_BUNDLE_PATH
+require_value SOURCE_BUNDLE_SHA256
 require_value SOURCE_SHA
 require_value RESULTS_ROOT
 require_value SYSTEM
@@ -65,6 +68,8 @@ require_value LINEAGE_SEEDS
 [[ -n "${PBS_JOBID:-}" ]] || die "PBS_JOBID is required inside the prep allocation"
 [[ -z "${PBS_QUEUE:-}" || "$PBS_QUEUE" == debug ]] || die "delivered queue is not debug: ${PBS_QUEUE}"
 [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || die "SOURCE_SHA must be a full lowercase SHA"
+[[ "$SOURCE_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+  die "SOURCE_BUNDLE_SHA256 must be a recorded lowercase SHA-256"
 [[ "$SYSTEM" == he || "$SYSTEM" == h2 ]] || die "SYSTEM must be he or h2"
 RESULTS_PREFIX_CANONICAL="$(canonicalize_path "$RESULTS_PREFIX")" ||
   die "could not canonicalize results prefix: $RESULTS_PREFIX"
@@ -76,6 +81,7 @@ assert_results_path "$RESULTS_PREFIX_CANONICAL" "$PHASE1_MANIFEST" PHASE1_MANIFE
 assert_results_path "$RESULTS_PREFIX_CANONICAL" "$SELECTED_ROW" SELECTED_ROW "$RESULTS_PREFIX"
 assert_results_path "$RESULTS_PREFIX_CANONICAL" "$LAUNCH_ROOT" LAUNCH_ROOT "$RESULTS_PREFIX"
 assert_results_path "$RESULTS_PREFIX_CANONICAL" "$WRAPPER_PATH" WRAPPER_PATH "$RESULTS_PREFIX"
+assert_results_path "$RESULTS_PREFIX_CANONICAL" "$BUNDLE_INPUT_PATH" BUNDLE_INPUT_PATH "$RESULTS_PREFIX"
 if [[ -n "$SMOKE_RESULTS_ROOT" || -n "$SMOKE_SELECTED_ROW" ]]; then
   [[ -n "$SMOKE_RESULTS_ROOT" && -n "$SMOKE_SELECTED_ROW" ]] ||
     die "SMOKE_RESULTS_ROOT and SMOKE_SELECTED_ROW must be supplied together"
@@ -88,6 +94,8 @@ fi
 
 [[ ! -e "$CHECKOUT_ROOT" && ! -L "$CHECKOUT_ROOT" ]] || die "CHECKOUT_ROOT already exists: $CHECKOUT_ROOT"
 [[ ! -e "$PRIME_ENV" && ! -L "$PRIME_ENV" ]] || die "PRIME_ENV already exists: $PRIME_ENV"
+[[ -f "$SOURCE_BUNDLE_PATH" && ! -L "$SOURCE_BUNDLE_PATH" ]] ||
+  die "staged source bundle is missing or not a regular file: $SOURCE_BUNDLE_PATH"
 mkdir -p -- "$RESULTS_ROOT"/inputs "$RESULTS_ROOT"/logs "$RESULTS_ROOT"/plan "$LAUNCH_ROOT" "$UV_CACHE_DIR"
 if [[ -n "$SMOKE_RESULTS_ROOT" ]]; then
   mkdir -p -- "$SMOKE_RESULTS_ROOT"/logs "$SMOKE_RESULTS_ROOT"/plan
@@ -96,6 +104,12 @@ if [[ -n "$STAGED_PREP_PATH" ]]; then
   [[ -f "$STAGED_PREP_PATH" ]] || die "staged preparation script is missing: $STAGED_PREP_PATH"
   cp -- "$STAGED_PREP_PATH" "$RESULTS_ROOT/inputs/pbs_prepare.sh"
 fi
+cp -- "$SOURCE_BUNDLE_PATH" "$BUNDLE_INPUT_PATH"
+SOURCE_BUNDLE_ACTUAL_SHA256="$(sha256sum "$BUNDLE_INPUT_PATH")"
+[[ "${SOURCE_BUNDLE_ACTUAL_SHA256%% *}" == "$SOURCE_BUNDLE_SHA256" ]] ||
+  die "source bundle SHA-256 mismatch: $SOURCE_BUNDLE_PATH"
+sha256sum "$BUNDLE_INPUT_PATH" > "$RESULTS_ROOT/inputs/TPEN-${SOURCE_SHA}.bundle.sha256"
+git bundle verify "$BUNDLE_INPUT_PATH" > "$RESULTS_ROOT/inputs/TPEN-${SOURCE_SHA}.bundle.verify"
 if [[ -n "$STAGED_WRAPPER_PATH" ]]; then
   [[ -f "$STAGED_WRAPPER_PATH" ]] || die "staged execution wrapper is missing: $STAGED_WRAPPER_PATH"
   cp -- "$STAGED_WRAPPER_PATH" "$WRAPPER_PATH"
@@ -121,7 +135,7 @@ printf 'POLARIS_PREP PBS_JOBID=%s PBS_QUEUE=%s HOST=%s UTC=%s\n' \
   "${PBS_JOBID:-}" "${PBS_QUEUE:-}" "$(hostname -f 2>/dev/null || hostname)" "$(date -u +%FT%TZ)"
 printf 'POLARIS_PREP SOURCE_SHA=%s RESULTS_ROOT=%s SYSTEM=%s\n' "$SOURCE_SHA" "$RESULTS_ROOT" "$SYSTEM"
 
-git clone "$SOURCE_REPO" "$CHECKOUT_ROOT"
+git clone --no-checkout "$BUNDLE_INPUT_PATH" "$CHECKOUT_ROOT"
 git -C "$CHECKOUT_ROOT" checkout --detach "$SOURCE_SHA"
 [[ "$(git -C "$CHECKOUT_ROOT" rev-parse HEAD)" == "$SOURCE_SHA" ]] || die "detached checkout does not match SOURCE_SHA"
 [[ -z "$(git -C "$CHECKOUT_ROOT" status --porcelain)" ]] || die "checkout is dirty"
@@ -129,6 +143,18 @@ git -C "$CHECKOUT_ROOT" checkout --detach "$SOURCE_SHA"
 [[ -z "$(git -C "$CHECKOUT_ROOT" config --local --get-regexp '^remote\..*\.promisor$' || true)" ]] || die "checkout has a promisor remote"
 [[ -z "$(git -C "$CHECKOUT_ROOT" config --local --get extensions.partialclone || true)" ]] || die "checkout is a partial clone"
 
+# ALCF Polaris Running Jobs guide, accessed 2026-11-28, documents this exact
+# proxy set for compute-node internet access. SOAP E1 measured it working for
+# the facility Python/uv path; do not inherit stale proxy values.
+export HTTP_PROXY="http://proxy.alcf.anl.gov:3128"
+export HTTPS_PROXY="http://proxy.alcf.anl.gov:3128"
+export http_proxy="http://proxy.alcf.anl.gov:3128"
+export https_proxy="http://proxy.alcf.anl.gov:3128"
+export ftp_proxy="http://proxy.alcf.anl.gov:3128"
+export no_proxy="admin,polaris-adminvm-01,localhost,*.cm.polaris.alcf.anl.gov,polaris-*,*.polaris.alcf.anl.gov,*.alcf.anl.gov"
+printf 'HTTP_PROXY=%s\nHTTPS_PROXY=%s\nhttp_proxy=%s\nhttps_proxy=%s\nftp_proxy=%s\nno_proxy=%s\n' \
+  "$HTTP_PROXY" "$HTTPS_PROXY" "$http_proxy" "$https_proxy" "$ftp_proxy" "$no_proxy" \
+  > "$RESULTS_ROOT/inputs/proxy.env"
 export UV_CACHE_DIR
 export UV_PYTHON="$PYBIN" UV_NO_MANAGED_PYTHON=1
 export UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy

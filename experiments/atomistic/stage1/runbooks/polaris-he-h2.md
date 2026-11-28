@@ -61,8 +61,9 @@ Set these once for one retained run root.  `SOURCE_SHA` is a full released
 
 ```bash
 SOURCE_SHA=<released-main-sha>
-SOURCE_REPO=https://github.com/YizhongHu/TPEN.git   # passed only to the prep job
 SYSTEM=he                         # repeat the complete sequence with h2
+SOURCE_BUNDLE_PATH=/eagle/HetRxnEnergy/rhu/stage1-prep-${SYSTEM}-${SOURCE_SHA:0:8}-<unique-utc-token>-TPEN.bundle
+SOURCE_BUNDLE_SHA256=<sha256 recorded when the bundle was staged>
 RESULTS_ROOT=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>
 WRAPPER=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/inputs/pbs_stage1.sh
 PREP_SCRIPT=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/inputs/pbs_prepare.sh
@@ -73,9 +74,39 @@ PRIME_ENV=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/prim
 PYBIN=/soft/applications/conda/2025-09-25/mconda3/bin/python
 ```
 
+## Source bundle staging (controller-side, before the Polaris login shell)
+
+This is the only source acquisition step. It runs in the controlling checkout,
+not on the Polaris login or compute node. The temporary ref gives the bundle a
+cloneable default branch while retaining the exact full history.
+
+```bash
+SOURCE_BUNDLE_LOCAL="TPEN-${SOURCE_SHA}.bundle"
+BUNDLE_REF="refs/heads/tpen-polaris-bundle-${SOURCE_SHA}"
+git show-ref --verify --quiet "$BUNDLE_REF" && { echo "bundle ref already exists" >&2; exit 2; }
+git update-ref "$BUNDLE_REF" "$SOURCE_SHA"
+trap 'git update-ref -d "$BUNDLE_REF"' EXIT
+git bundle create "$SOURCE_BUNDLE_LOCAL" "$BUNDLE_REF"
+git bundle verify "$SOURCE_BUNDLE_LOCAL"
+SOURCE_BUNDLE_SHA256="$(sha256sum "$SOURCE_BUNDLE_LOCAL" | awk '{print $1}')"
+```
+
+Enter the Polaris login shell only after this bundle hash is recorded. Set
+`SOURCE_BUNDLE_PATH="$STAGING_PREFIX/${STAGE_TOKEN}-TPEN.bundle"`, then include
+the named bundle in the staging transfers below.
+
+The source is transported as a git bundle, not fetched from GitHub by the
+compute node. Create the bundle from the exact `SOURCE_SHA` in the controlling
+checkout, record its SHA-256, and stage that named file beside the four scripts.
+The prep job copies the bundle into `inputs/`, verifies the recorded hash and
+`git bundle verify`, then clones from that local Eagle bundle and checks out the
+exact SHA. This removes any dependency on compute-node access to GitHub while
+preserving a full, non-promisor checkout.
+
 The debug preparation job creates `RESULTS_ROOT` and its `logs/`, `plan/`,
 `launch/`, and `inputs/` children after the containment check.  The login node
-does not create result or log directories.  Stage the four named scripts into
+does not create result or log directories.  Stage the four named scripts and
+the source bundle into
 the already-existing `/eagle/HetRxnEnergy/rhu/` prefix with a unique
 operator-chosen token; the job copies them into the retained input directory
 and records their SHA-256 values.  Do not copy a git tree with `cp -a` from
@@ -96,8 +127,10 @@ PREP_STAGE="$STAGING_PREFIX/${STAGE_TOKEN}-pbs_prepare.sh"
 WRAPPER_STAGE="$STAGING_PREFIX/${STAGE_TOKEN}-pbs_stage1.sh"
 EVAL_PREP_STAGE="$STAGING_PREFIX/${STAGE_TOKEN}-pbs_select_eval.sh"
 STAGE1_PATHS_SH="$STAGING_PREFIX/${STAGE_TOKEN}-pbs_paths.sh"
+BUNDLE_STAGE="$STAGING_PREFIX/${STAGE_TOKEN}-TPEN.bundle"
 # Recorded from pbs_paths.sh at this source revision; do not recompute on login.
 STAGE1_PATHS_SHA256=3bd3461524bbbd782f0a8d1be61de8f51bc3bd8c56c6de18692f81417932477a
+scp -p "$SOURCE_BUNDLE_LOCAL" "$BUNDLE_STAGE"
 scp -p experiments/atomistic/stage1/polaris/pbs_stage1.sh "$WRAPPER_STAGE"
 scp -p experiments/atomistic/stage1/polaris/pbs_prepare.sh "$PREP_STAGE"
 scp -p experiments/atomistic/stage1/polaris/pbs_select_eval.sh "$EVAL_PREP_STAGE"
@@ -107,7 +140,7 @@ PREP_JOB_ID="$(qsub -N "stage1-prep-${SYSTEM}-${SOURCE_SHA:0:8}" \
   -l select=1:system=polaris:ncpus=4,walltime=00:20:00,filesystems=home:eagle,place=scatter \
   -o "$STAGING_PREFIX/${STAGE_TOKEN}-prep.pbs.out" \
   -e "$STAGING_PREFIX/${STAGE_TOKEN}-prep.pbs.err" \
-  -v SOURCE_REPO="$SOURCE_REPO",SOURCE_SHA="$SOURCE_SHA",RESULTS_ROOT="$RESULTS_ROOT",SYSTEM="$SYSTEM",LINEAGE_SEEDS="1:2:3",PYBIN="$PYBIN",WRAPPER_PATH="$WRAPPER",EVAL_PREP_PATH="$EVAL_PREP_SCRIPT",SMOKE_RESULTS_ROOT="$RESULTS_ROOT/ramp-up-r1",SMOKE_SELECTED_ROW="$RESULTS_ROOT/ramp-up-r1/plan/selected-train.json",STAGE1_PATHS_SH="$STAGE1_PATHS_SH",STAGE1_PATHS_SHA256="$STAGE1_PATHS_SHA256",STAGED_PREP_PATH="$PREP_STAGE",STAGED_WRAPPER_PATH="$WRAPPER_STAGE",STAGED_EVAL_PREP_PATH="$EVAL_PREP_STAGE" \
+  -v SOURCE_BUNDLE_PATH="$BUNDLE_STAGE",SOURCE_BUNDLE_SHA256="$SOURCE_BUNDLE_SHA256",SOURCE_SHA="$SOURCE_SHA",RESULTS_ROOT="$RESULTS_ROOT",SYSTEM="$SYSTEM",LINEAGE_SEEDS="1:2:3",PYBIN="$PYBIN",WRAPPER_PATH="$WRAPPER",EVAL_PREP_PATH="$EVAL_PREP_SCRIPT",SMOKE_RESULTS_ROOT="$RESULTS_ROOT/ramp-up-r1",SMOKE_SELECTED_ROW="$RESULTS_ROOT/ramp-up-r1/plan/selected-train.json",STAGE1_PATHS_SH="$STAGE1_PATHS_SH",STAGE1_PATHS_SHA256="$STAGE1_PATHS_SHA256",STAGED_PREP_PATH="$PREP_STAGE",STAGED_WRAPPER_PATH="$WRAPPER_STAGE",STAGED_EVAL_PREP_PATH="$EVAL_PREP_STAGE" \
   "$PREP_STAGE")"
 printf 'submitted prep job %s\n' "$PREP_JOB_ID"
 qstat -xf "$PREP_JOB_ID"
@@ -119,8 +152,12 @@ the named preparation outputs.  A nonzero job or missing output is
 a new approval.  The preparation job's `$PYBIN -m uv` invocation sets
 `UV_PYTHON=$PYBIN`, `UV_NO_MANAGED_PYTHON=1`, `UV_PYTHON_DOWNLOADS=never`, and
 `UV_LINK_MODE=copy`; it primes `UV_CACHE_DIR` and writes `prime-env` only as a
-reproducible preparation artifact.  The run wrapper later creates its own
-job-local environment from that cache.  Never use bare `uv`.
+reproducible preparation artifact. For outbound package access, the prep job
+sets exactly the current ALCF Polaris documented proxy variables:
+`HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy`, `ftp_proxy`, and
+`no_proxy`, all with the documented values. The same recipe was measured
+working in the SOAP E1 prep evidence (uv 0.8.23, locked cu128 sync). The run
+wrapper later creates its own job-local environment from that cache. Never use bare `uv`.
 
 ## Wrapper boundary
 
