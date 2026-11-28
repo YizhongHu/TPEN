@@ -17,13 +17,14 @@ from tpen.logging import JSONL, LogRecord
 from tpen.parameter_groups import resolve_parameter_groups
 from tpen.training.state import TrainerState
 from tpen.training.update import ModelParameterBinding, VMCUpdateState
-from tests.unit.callback.support import deliver_completed_iteration
+from tests.unit.callback.support import RecordingContext, deliver_completed_iteration
 
 
-class _LoggerContext:
+class _LoggerContext(RecordingContext):
     """Minimal callback context that writes the production JSONL envelopes."""
 
     def __init__(self, logger: JSONL) -> None:
+        super().__init__()
         self.logger = logger
 
     def log(self, metrics, *, step=None, namespace="run") -> None:
@@ -51,11 +52,8 @@ def test_run_rung1_checks_exposes_metric_evidence_gate_and_empty_is_unmeasured()
     assert metric.verdict is Verdict.UNMEASURED
 
 
-@pytest.mark.parametrize("profile", [R2_PROFILES[0]], ids=lambda profile: profile.name)
-def test_real_optimizer_callback_emits_only_parameterized_rendered_groups(
-    tmp_path: Path, profile: PilotProfile
-) -> None:
-    """Wire real callback JSONL into the consumer and keep both controls explicit."""
+def _rendered_optimizer_fixture(tmp_path: Path, profile: PilotProfile):
+    """Build the rendered model and report actual parameter inventory only."""
 
     rendered = render_profile(
         profile,
@@ -83,6 +81,14 @@ def test_real_optimizer_callback_emits_only_parameterized_rendered_groups(
     assert "factors" not in inventory
     assert set(inventory) == set(declared) - {"factors"}
 
+    assert not optimizer.state, "no optimizer step is run by this synthetic wire fixture"
+    return model, optimizer, declared, resolved, inventory, callback_config
+
+
+def _emit_optimizer_records(tmp_path: Path, profile: PilotProfile):
+    model, optimizer, declared, resolved, inventory, callback_config = _rendered_optimizer_fixture(
+        tmp_path, profile
+    )
     metrics_path = tmp_path / "metrics.jsonl"
     logger = JSONL(metrics_path)
     context = _LoggerContext(logger)
@@ -93,19 +99,39 @@ def test_real_optimizer_callback_emits_only_parameterized_rendered_groups(
     assert all(record.step == 99 for record in records)
     assert {record.namespace.rsplit("/", 1)[-1] for record in records} == set(resolved)
 
-    resolved_total = sum(int(record.metrics["n_no_optimizer_state"]) for record in records)
-    resolved_result = check_disconnected_optimizer_state(
-        records, groups=tuple(resolved), terminal_step=99, expected_tensors=resolved_total
+    expected_tensors = sum(item["parameters"] for item in inventory.values())
+    assert expected_tensors == sum(
+        int(record.metrics["n_no_optimizer_state"]) for record in records
     )
-    assert resolved_result.passed
+    return records, declared, resolved, expected_tensors
+
+
+@pytest.mark.parametrize("profile", [R2_PROFILES[0]], ids=lambda profile: profile.name)
+def test_real_optimizer_callback_group_detector_is_explicitly_red(
+    tmp_path: Path, profile: PilotProfile
+) -> None:
+    """Declared parameter-free groups expose the producer/consumer mismatch."""
+
+    records, declared, resolved, expected_tensors = _emit_optimizer_records(tmp_path, profile)
+    assert check_disconnected_optimizer_state(
+        records, groups=tuple(resolved), terminal_step=99, expected_tensors=expected_tensors
+    ).passed
 
     # Compatibility detector: the declaration includes parameter-free factors,
     # but the real producer emits only resolved groups.
     assert check_disconnected_optimizer_state(
-        records, groups=declared, terminal_step=99, expected_tensors=resolved_total
+        records, groups=declared, terminal_step=99, expected_tensors=expected_tensors
     ).passed
 
+
+@pytest.mark.parametrize("profile", [R2_PROFILES[0]], ids=lambda profile: profile.name)
+def test_real_optimizer_callback_checkpoint_coordinate_detector_is_explicitly_red(
+    tmp_path: Path, profile: PilotProfile
+) -> None:
+    """Completed iteration 99 must not be treated as terminal checkpoint 100."""
+
+    records, _, resolved, expected_tensors = _emit_optimizer_records(tmp_path, profile)
     # Independent coordinate detector: completed iteration 99 vs checkpoint 100.
     assert check_disconnected_optimizer_state(
-        records, groups=tuple(resolved), terminal_step=100, expected_tensors=resolved_total
+        records, groups=tuple(resolved), terminal_step=100, expected_tensors=expected_tensors
     ).passed
