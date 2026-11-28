@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import shutil
 from pathlib import Path
@@ -133,6 +134,19 @@ def test_new_runnable_arm_without_callbacks_fails_contract(tmp_path: Path) -> No
 
     with pytest.raises(AssertionError, match="new_arm.yaml is missing callbacks"):
         _assert_arm_checkpoint_contract(config_root)
+
+
+def test_experiment_test_respects_core_import_boundary() -> None:
+    """This experiments test uses only the documented public execution boundary."""
+
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    forbidden = {"tpen.checkpoint", "tpen.run"}
+    direct_core_imports = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module in forbidden
+    }
+    assert direct_core_imports == set()
 
 
 @pytest.mark.parametrize(
