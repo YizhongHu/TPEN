@@ -45,7 +45,7 @@ def _phase2_rows(
     config_sha = config_identities(config_root=ROOT, systems=("hooke2",))
     rows = build_manifest(
         protocol=protocol, source_sha="a" * 40, config_sha256=config_sha,
-        checkpoints=[0, 3], lineage_seeds=[11],
+        checkpoints=[0, 3], lineage_seeds=[11, 12, 13],
         checkpoint_sha256={
             ("hooke2", lineage, checkpoint): "b" * 64
             for lineage in range(protocol.lineages)
@@ -81,7 +81,7 @@ def _bound_variant_eval_row() -> dict[str, object]:
     phase1 = build_manifest(
         protocol=protocol, source_sha="a" * 40,
         config_sha256=config_identities(config_root=ROOT, systems=("hooke2",)),
-        checkpoints=[0, 3], lineage_seeds=[11], checkpoint_sha256={},
+        checkpoints=[0, 3], lineage_seeds=[11, 12, 13], checkpoint_sha256={},
         results_root="/external/stage1", systems=("hooke2",), phase=1,
     )
     train = next(row for row in phase1 if row["kind"] == "train")
