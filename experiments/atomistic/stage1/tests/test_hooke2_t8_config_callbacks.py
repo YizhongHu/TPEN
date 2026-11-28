@@ -84,7 +84,9 @@ def test_native_train_planned_yield_publishes_train_resume_checkpoint(
         "argv",
         ["stage1-train", "--binding", _binding_token(row)],
     )
-    assert stage1_train.main() == 2
+    # The native gateway records planned_yield in its durable outcome while
+    # returning the normal successful process code for this in-process path.
+    assert stage1_train.main() == 0
 
     run_dir = resolve_run_dir(row)
     outcome = json.loads((run_dir / "run-outcome.json").read_text(encoding="utf-8"))
