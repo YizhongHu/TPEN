@@ -2,9 +2,13 @@
 
 This is the optional direct PBS route for the He and H2 Stage-1 rows.  It is
 independent of the Cannon runbooks and does not authorize a science
-allocation.  The implementation is
-`experiments/atomistic/stage1/polaris/pbs_stage1.sh`; every submission below
-uses that one complete wrapper with an explicit mode.
+allocation.  The implementation is the four scripts
+`experiments/atomistic/stage1/polaris/pbs_prepare.sh` and
+`experiments/atomistic/stage1/polaris/pbs_select_eval.sh` and
+`experiments/atomistic/stage1/polaris/pbs_paths.sh` and
+`experiments/atomistic/stage1/polaris/pbs_stage1.sh`.  One short debug
+preparation job owns source checkout, uv cache priming, and row rendering;
+later submissions use the complete execution wrapper with an explicit mode.
 
 ## Scope and approval boundary
 
@@ -16,7 +20,8 @@ out to successor lineages, or use a first-class PBS path in `launch.py`.
 
 - `debug` and `debug-scaling` are free queues for bounded smoke, guard, plan,
   evaluation, and collection work.  The PBS queue name is `debug-scaling`,
-  with a hyphen.
+  with a hyphen.  The preparation job uses only `debug`, one node, four CPUs,
+  and a 20-minute walltime.
 - `capacity` is required for the 50,000-update training allocation and needs
   fresh operator approval relayed by the manager.  Do not submit it from this
   document without that approval.
@@ -35,6 +40,8 @@ out to successor lineages, or use a first-class PBS path in `launch.py`.
 Before any Polaris action, read the `cluster-access` skill and the current TO
 chain: Clusters `cluster-access-read-first`, `00-orientation`,
 `free-submit-queues`, ALCF `provider-and-hpss-orientation-2026-08-07`, and
+root `cluster-rule-no-reductions-on-login-nodes-20261127`, plus ALCF's current
+`operator-notice-alcf-in-node-proxy-change-20261124`, and
 Polaris `00-read-first-polaris`, `usage-conventions`,
 `polaris-facility-toolchain-and-gotchas-2026-08-12`,
 `polaris-node-shape-gpu-binding-guardrails-2026-08-12`,
@@ -54,55 +61,105 @@ Set these once for one retained run root.  `SOURCE_SHA` is a full released
 
 ```bash
 SOURCE_SHA=<released-main-sha>
-SOURCE_REPO=https://github.com/YizhongHu/TPEN.git   # staging only; never passed to qsub
 SYSTEM=he                         # repeat the complete sequence with h2
+SOURCE_BUNDLE_PATH=/eagle/HetRxnEnergy/rhu/stage1-prep-${SYSTEM}-${SOURCE_SHA:0:8}-<unique-utc-token>-TPEN.bundle
+SOURCE_BUNDLE_SHA256=<sha256 recorded when the bundle was staged>
 RESULTS_ROOT=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>
 WRAPPER=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/inputs/pbs_stage1.sh
+PREP_SCRIPT=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/inputs/pbs_prepare.sh
+EVAL_PREP_SCRIPT=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/inputs/pbs_select_eval.sh
 CHECKOUT_ROOT=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/checkout
 UV_CACHE_DIR=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/uv-cache
+PRIME_ENV=/eagle/HetRxnEnergy/rhu/runs/stage1-${SYSTEM}-${SOURCE_SHA}-<utc>/prime-env
 PYBIN=/soft/applications/conda/2025-09-25/mconda3/bin/python
 ```
 
-The run root must be created before any `qsub` so PBS can open its `-o` and
-`-e` files.  Assert it is below `/eagle/HetRxnEnergy/rhu/`, create `logs/`,
-`plan/`, `launch/`, and `inputs/`, copy the wrapper there, and record its
-SHA-256.  Do not copy a git tree with `cp -a` from `/home` to Eagle; the
-current Polaris note records that this fails while preserving ownership.
+## Source bundle staging (controller-side, before the Polaris login shell)
 
-Stage the source and prime the cache on the login side, before any qsub. The
-clone is deliberately full (no `--filter`), detached at the exact SHA, and
-must be clean with no promisor or partial-clone configuration:
+This is the only source acquisition step. It runs in the controlling checkout,
+not on the Polaris login or compute node. The temporary ref gives the bundle a
+cloneable default branch while retaining the exact full history.
 
 ```bash
-mkdir -p "$RESULTS_ROOT"/{inputs,logs,plan}
-git clone "$SOURCE_REPO" "$CHECKOUT_ROOT"
-git -C "$CHECKOUT_ROOT" checkout --detach "$SOURCE_SHA"
-test "$(git -C "$CHECKOUT_ROOT" rev-parse HEAD)" = "$SOURCE_SHA"
-test -z "$(git -C "$CHECKOUT_ROOT" status --porcelain)"
-test "$(git -C "$CHECKOUT_ROOT" rev-parse --is-shallow-repository)" = false
-test -z "$(git -C "$CHECKOUT_ROOT" config --local --get-regexp '^remote\..*\.promisor$' || true)"
-test -z "$(git -C "$CHECKOUT_ROOT" config --local --get extensions.partialclone || true)"
-cp experiments/atomistic/stage1/polaris/pbs_stage1.sh "$WRAPPER"
-chmod 750 "$WRAPPER"
-sha256sum "$WRAPPER" > "$WRAPPER.sha256"
-mkdir -p "$UV_CACHE_DIR"
-export UV_CACHE_DIR
-export UV_PYTHON="$PYBIN" UV_NO_MANAGED_PYTHON=1
-export UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy
-"$PYBIN" -m uv lock --check --project "$CHECKOUT_ROOT"
-UV_PROJECT_ENVIRONMENT="$RESULTS_ROOT/prime-env" \
-  "$PYBIN" -m uv sync --project "$CHECKOUT_ROOT" --extra cu128 --locked
+SOURCE_BUNDLE_LOCAL="TPEN-${SOURCE_SHA}.bundle"
+BUNDLE_REF="refs/heads/tpen-polaris-bundle-${SOURCE_SHA}"
+git show-ref --verify --quiet "$BUNDLE_REF" && { echo "bundle ref already exists" >&2; exit 2; }
+git update-ref "$BUNDLE_REF" "$SOURCE_SHA"
+trap 'git update-ref -d "$BUNDLE_REF"' EXIT
+git bundle create "$SOURCE_BUNDLE_LOCAL" "$BUNDLE_REF"
+git bundle verify "$SOURCE_BUNDLE_LOCAL"
+SOURCE_BUNDLE_SHA256="$(sha256sum "$SOURCE_BUNDLE_LOCAL" | awk '{print $1}')"
 ```
 
-The wrapper takes `CHECKOUT_ROOT` and `UV_CACHE_DIR` as required inputs; it
-does not clone, fetch, or otherwise use network Git on a compute node. Before
-the lock/sync it sets `UV_PYTHON=$PYBIN`, `UV_NO_MANAGED_PYTHON=1`,
-`UV_PYTHON_DOWNLOADS=never`, and `UV_LINK_MODE=copy`. The cache is external
-to the disposable job root and must already exist. The P1 R2 receipt measured
-the same lock-bound operation at 25 seconds and proved
-Torch `2.11.0+cu128`, four `NVIDIA A100-SXM4-40GB` devices, 40,960 MiB, and
-MIG `Disabled`.  Prime the cache in the same login session with the same
-`$PYBIN -m uv` binary before a real submission; never use bare `uv`.
+Enter the Polaris login shell only after this bundle hash is recorded. Set
+`SOURCE_BUNDLE_PATH="$STAGING_PREFIX/${STAGE_TOKEN}-TPEN.bundle"`, then include
+the named bundle in the staging transfers below.
+
+The source is transported as a git bundle, not fetched from GitHub by the
+compute node. Create the bundle from the exact `SOURCE_SHA` in the controlling
+checkout, record its SHA-256, and stage that named file beside the four scripts.
+The prep job copies the bundle into `inputs/`, verifies the recorded hash,
+initializes an empty per-run repository solely for `git bundle verify`, then
+clones from that local Eagle bundle and checks out the exact SHA. This keeps
+bundle verification independent of PBS's spooled working directory, removes
+any dependency on compute-node access to GitHub, and preserves a full,
+non-promisor checkout.
+
+The debug preparation job creates `RESULTS_ROOT` and its `logs/`, `plan/`,
+`launch/`, and `inputs/` children after the containment check.  The login node
+does not create result or log directories.  Stage the four named scripts and
+the source bundle into
+the already-existing `/eagle/HetRxnEnergy/rhu/` prefix with a unique
+operator-chosen token; the job copies them into the retained input directory
+and records their SHA-256 values.  Do not copy a git tree with `cp -a` from
+`/home` to Eagle; the current Polaris note records that this fails while
+preserving ownership.
+
+The login node does not clone, run Python, or invoke uv.  Submit exactly one
+short debug preparation job.  Inside that allocation the script performs a
+full clone (no `--filter`), detaches at the exact SHA, verifies a clean
+non-promisor/non-partial checkout, primes the cache with the facility
+`$PYBIN -m uv` binary, and renders the phase-1 rows and command receipts under
+the Eagle results root:
+
+```bash
+STAGING_PREFIX=/eagle/HetRxnEnergy/rhu
+STAGE_TOKEN=stage1-prep-${SYSTEM}-${SOURCE_SHA:0:8}-<unique-utc-token>
+PREP_STAGE="$STAGING_PREFIX/${STAGE_TOKEN}-pbs_prepare.sh"
+WRAPPER_STAGE="$STAGING_PREFIX/${STAGE_TOKEN}-pbs_stage1.sh"
+EVAL_PREP_STAGE="$STAGING_PREFIX/${STAGE_TOKEN}-pbs_select_eval.sh"
+STAGE1_PATHS_SH="$STAGING_PREFIX/${STAGE_TOKEN}-pbs_paths.sh"
+BUNDLE_STAGE="$STAGING_PREFIX/${STAGE_TOKEN}-TPEN.bundle"
+# Recorded from pbs_paths.sh at this source revision; do not recompute on login.
+STAGE1_PATHS_SHA256=3bd3461524bbbd782f0a8d1be61de8f51bc3bd8c56c6de18692f81417932477a
+scp -p "$SOURCE_BUNDLE_LOCAL" "$BUNDLE_STAGE"
+scp -p experiments/atomistic/stage1/polaris/pbs_stage1.sh "$WRAPPER_STAGE"
+scp -p experiments/atomistic/stage1/polaris/pbs_prepare.sh "$PREP_STAGE"
+scp -p experiments/atomistic/stage1/polaris/pbs_select_eval.sh "$EVAL_PREP_STAGE"
+scp -p experiments/atomistic/stage1/polaris/pbs_paths.sh "$STAGE1_PATHS_SH"
+PREP_JOB_ID="$(qsub -N "stage1-prep-${SYSTEM}-${SOURCE_SHA:0:8}" \
+  -A HetRxnEnergy -q debug \
+  -l select=1:system=polaris:ncpus=4,walltime=00:20:00,filesystems=home:eagle,place=scatter \
+  -o "$STAGING_PREFIX/${STAGE_TOKEN}-prep.pbs.out" \
+  -e "$STAGING_PREFIX/${STAGE_TOKEN}-prep.pbs.err" \
+  -v SOURCE_BUNDLE_PATH="$BUNDLE_STAGE",SOURCE_BUNDLE_SHA256="$SOURCE_BUNDLE_SHA256",SOURCE_SHA="$SOURCE_SHA",RESULTS_ROOT="$RESULTS_ROOT",SYSTEM="$SYSTEM",LINEAGE_SEEDS="1:2:3",PYBIN="$PYBIN",WRAPPER_PATH="$WRAPPER",EVAL_PREP_PATH="$EVAL_PREP_SCRIPT",SMOKE_RESULTS_ROOT="$RESULTS_ROOT/ramp-up-r1",SMOKE_SELECTED_ROW="$RESULTS_ROOT/ramp-up-r1/plan/selected-train.json",STAGE1_PATHS_SH="$STAGE1_PATHS_SH",STAGE1_PATHS_SHA256="$STAGE1_PATHS_SHA256",STAGED_PREP_PATH="$PREP_STAGE",STAGED_WRAPPER_PATH="$WRAPPER_STAGE",STAGED_EVAL_PREP_PATH="$EVAL_PREP_STAGE" \
+  "$PREP_STAGE")"
+printf 'submitted prep job %s\n' "$PREP_JOB_ID"
+qstat -xf "$PREP_JOB_ID"
+```
+
+After PBS reaches a terminal state, inspect only the named `qstat` record and
+the named preparation outputs.  A nonzero job or missing output is
+`HARNESS_INVALID`/`UNMEASURED`; preserve it and stop.  Do not resubmit without
+a new approval.  The preparation job's `$PYBIN -m uv` invocation sets
+`UV_PYTHON=$PYBIN`, `UV_NO_MANAGED_PYTHON=1`, `UV_PYTHON_DOWNLOADS=never`, and
+`UV_LINK_MODE=copy`; it primes `UV_CACHE_DIR` and writes `prime-env` only as a
+reproducible preparation artifact. For outbound package access, the prep job
+sets exactly the current ALCF Polaris documented proxy variables:
+`HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy`, `ftp_proxy`, and
+`no_proxy`, all with the documented values. The same recipe was measured
+working in the SOAP E1 prep evidence (uv 0.8.23, locked cu128 sync). The run
+wrapper later creates its own job-local environment from that cache. Never use bare `uv`.
 
 ## Wrapper boundary
 
@@ -114,6 +171,9 @@ strict restore, and `load.mode=model_only`.
 
 The PBS wrapper replaces only the Slurm execution shell around that contract:
 
+- `pbs_prepare.sh` owns the one short debug allocation that clones the exact
+  source, primes the facility uv cache, runs phase-1 planning, and emits the
+  immutable row/command receipts;
 - `launch.py:193-277` remains the Cannon renderer and its Slurm/Netscratch
   `FACILITY_RESULTS_PREFIX` and A7 80-GB guard are untouched;
 - `pbs_stage1.sh:54-110` supplies the PBS queue/job/GPU guards for Polaris;
@@ -137,28 +197,20 @@ submission, and monitoring only.  `qstat -xf <jobid>` is the authoritative
 terminal scheduler observation.  Preserve qsub stdout/stderr, qstat output,
 wrapper logs, row status files, rendered command receipts, and every failure.
 
-### 1. Select one frozen row on the login side
+### 1. Consume the prep job's frozen rows
 
-Planning and full roster/grid reconciliation remain S0-B/S1-RC-owned.  After
-those owners publish the approved manifest, materialize exactly one row object
-without adding or changing fields.  The same row shape is used for an
-unbounded route and for a bounded qualification; only the latter adds the
+Planning and full roster/grid reconciliation remain S0-B/S1-RC-owned.  The
+preparation job writes `plan/phase1-manifest.json`, the exact first
+`plan/selected-train.json`, the bounded `ramp-up-r1/plan/selected-train.json`
+and its hash, one JSON file per train row under `launch/`, and a
+`launch/render-receipt.json`, and the four input-script hashes.  Inspect those named files only; do not recreate
+or edit rows on the login node.  The same row shape is used for an unbounded
+route and for a bounded qualification; only the latter adds the
 already-approved `execution.stop_at` datum in its separate request file.
 
 ```bash
-mkdir -p "$RESULTS_ROOT"/{inputs,logs,plan,launch}
-cp experiments/atomistic/stage1/polaris/pbs_stage1.sh "$RESULTS_ROOT/inputs/pbs_stage1.sh"
-chmod 750 "$RESULTS_ROOT/inputs/pbs_stage1.sh"
-sha256sum "$RESULTS_ROOT/inputs/pbs_stage1.sh" > "$RESULTS_ROOT/inputs/pbs_stage1.sh.sha256"
-"$PYBIN" - "$RESULTS_ROOT/plan/phase1-manifest.json" "$RESULTS_ROOT/plan/selected-train.json" <<'PY'
-import json, sys
-from pathlib import Path
-source, target = map(Path, sys.argv[1:])
-rows = [row for row in json.loads(source.read_text())['rows'] if row['kind'] == 'train']
-if len(rows) != 3:
-    raise SystemExit(f"expected the published three-row train population, got {len(rows)}")
-target.write_text(json.dumps(rows[0], sort_keys=True, indent=2) + "\n")
-PY
+ls -l "$RESULTS_ROOT/plan/phase1-manifest.json" "$RESULTS_ROOT/plan/selected-train.json"
+ls -l "$RESULTS_ROOT/launch/render-receipt.json"
 ```
 
 The selected file is immutable evidence: record its SHA-256, source/config/
@@ -178,24 +230,7 @@ only to the approved selected row and run root.
 ```bash
 SMOKE_RESULTS_ROOT="$RESULTS_ROOT/ramp-up-r1"
 SMOKE_SELECTED_ROW="$SMOKE_RESULTS_ROOT/plan/selected-train.json"
-mkdir -p "$SMOKE_RESULTS_ROOT"/plan "$SMOKE_RESULTS_ROOT"/logs
-test -d "$SMOKE_RESULTS_ROOT/plan" -a -d "$SMOKE_RESULTS_ROOT/logs" || {
-  echo "bounded PBS output directories are not ready" >&2
-  exit 2
-}
-"$PYBIN" - "$RESULTS_ROOT/plan/selected-train.json" "$SMOKE_SELECTED_ROW" "$SMOKE_RESULTS_ROOT" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-from experiments.atomistic.stage1.protocol import derive_smoke_request
-
-source, target, results_root = map(Path, sys.argv[1:])
-row = json.loads(source.read_text(encoding="utf-8"))
-request = derive_smoke_request(row, results_root=str(results_root), stop_at=50_000)
-target.write_text(json.dumps(request, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-PY
-sha256sum "$SMOKE_SELECTED_ROW" > "$SMOKE_SELECTED_ROW.sha256"
+ls -l "$SMOKE_SELECTED_ROW" "$SMOKE_SELECTED_ROW.sha256"
 APPROVAL_ID="${MANAGER_RELAYED_APPROVAL_ID:-}"
 : "${APPROVAL_ID:?APPROVAL_ID must be set from the explicit manager-relayed value}"
 qsub -A HetRxnEnergy -q debug-scaling \
@@ -260,14 +295,27 @@ approved eval row in the same way.  This is a subset consumer only; it does not
 replace the full roster/grid reconciliation.
 
 ```bash
-"$PYBIN" -m experiments.atomistic.stage1.select_eval \
-  --manifest "$RESULTS_ROOT/plan/phase2-manifest.json" \
-  --system he --lineage 0 --checkpoint 100000 --stream 0 \
-  --output "$RESULTS_ROOT/plan/selected-eval.json" || exit 1
+EVAL_SELECTED_ROW="$RESULTS_ROOT/plan/selected-eval.json"
+EVAL_JOB_ID="$(qsub -N "stage1-eval-prep-${SYSTEM}-${SOURCE_SHA:0:8}" \
+  -A HetRxnEnergy -q debug \
+  -l select=1:system=polaris:ncpus=4,walltime=00:10:00,filesystems=home:eagle,place=scatter \
+  -o "$RESULTS_ROOT/logs/eval-prep.pbs.out" -e "$RESULTS_ROOT/logs/eval-prep.pbs.err" \
+  -v SOURCE_SHA="$SOURCE_SHA",RESULTS_ROOT="$RESULTS_ROOT",SYSTEM="$SYSTEM",CHECKOUT_ROOT="$CHECKOUT_ROOT",PRIME_ENV="$PRIME_ENV",PHASE2_MANIFEST="$RESULTS_ROOT/plan/phase2-manifest.json",SELECTED_EVAL="$EVAL_SELECTED_ROW",STAGE1_PATHS_SH="$STAGE1_PATHS_SH",STAGE1_PATHS_SHA256="$STAGE1_PATHS_SHA256" \
+  "$EVAL_PREP_SCRIPT")"
+printf 'submitted eval-prep job %s\n' "$EVAL_JOB_ID"
+qstat -xf "$EVAL_JOB_ID"
+ls -l "$EVAL_SELECTED_ROW" "$EVAL_SELECTED_ROW.sha256"
+```
+
+The eval-prep allocation runs the selection command against the frozen phase-2
+manifest and records the selected-row hash.  The login node only submits and
+inspects its named outputs.
+
+```bash
 qsub -A HetRxnEnergy -q debug \
   -l select=1:system=polaris:ngpus=4:ncpus=64,walltime=00:55:00,filesystems=home:eagle,place=scatter \
   -o "$RESULTS_ROOT/logs/eval.pbs.out" -e "$RESULTS_ROOT/logs/eval.pbs.err" \
-  -v MODE=eval,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",SELECTED_ROW="$RESULTS_ROOT/plan/selected-eval.json",APPROVAL_ID="$APPROVAL_ID" \
+  -v MODE=eval,SOURCE_SHA="$SOURCE_SHA",CHECKOUT_ROOT="$CHECKOUT_ROOT",UV_CACHE_DIR="$UV_CACHE_DIR",RESULTS_ROOT="$RESULTS_ROOT",EXPECTED_QUEUE=debug,PYBIN="$PYBIN",SELECTED_ROW="$EVAL_SELECTED_ROW",APPROVAL_ID="$APPROVAL_ID" \
   "$RESULTS_ROOT/inputs/pbs_stage1.sh"
 ```
 
@@ -287,6 +335,17 @@ qsub -A HetRxnEnergy -q debug \
 Collection is a product/result verdict only if the manifest, row statuses,
 checkpoint evidence, per-row assertions, and collection JSON reconcile.  PBS
 completion alone is not a scientific result.
+
+## Login-node audit
+
+The Polaris login node performs only scheduler submission/observation and
+named-file staging or inspection.  The allowed command surface is `qsub`,
+`qstat`, named-file `ls`/`stat`/`head`, named-file `scp`, pure variable
+assignment, and shell builtins such as `printf`, `test`, and `:`.  In
+particular, no login-node `mkdir`, Python, `uv`, `git clone`, row rendering,
+hashing, or data reduction is allowed.  The prep allocation creates its own
+results/log roots after the shared-helper containment check; the eval-prep
+allocation creates its selected-row parent inside that same retained root.
 
 ## Dry-exec and guard evidence
 
