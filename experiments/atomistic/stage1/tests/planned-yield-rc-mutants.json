@@ -3,29 +3,29 @@
     {
       "id": "planned-yield-status-guard-removed",
       "target": "experiments/atomistic/stage1/launch.py",
-      "old": "        \"  if [[ \\\"$STATUS\\\" != \\\"planned_yield\\\" ]]; then\n\"",
-      "new": "        \"  if false; then\n\"",
+      "old": "if [[ \\\"$STATUS\\\" != \\\"planned_yield\\\" ]]; then",
+      "new": "if false; then",
       "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_rendered_rc_two_completed_status_fails"
     },
     {
       "id": "planned-yield-file-guard-removed",
       "target": "experiments/atomistic/stage1/launch.py",
-      "old": "        \"  if [[ ! -r \\\"$STATUS_PATH\\\" ]]; then\n\"",
-      "new": "        \"  if false; then\n\"",
+      "old": "if [[ ! -r \\\"$STATUS_PATH\\\" ]]; then",
+      "new": "if false; then",
       "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_rendered_rc_two_missing_status_fails"
     },
     {
       "id": "planned-yield-rc2-branch-removed",
       "target": "experiments/atomistic/stage1/launch.py",
-      "old": "        \"elif [[ \\\"$TRAIN_RC\\\" == \\\"2\\\" ]]; then\n\"",
-      "new": "        \"elif false; then\n\"",
+      "old": "elif [[ \\\"$TRAIN_RC\\\" == \\\"2\\\" ]]; then",
+      "new": "elif false; then",
       "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_rendered_rc_two_planned_yield_continues_and_runs_next_step"
     },
     {
       "id": "planned-yield-nonzero-exit-swallowed",
       "target": "experiments/atomistic/stage1/launch.py",
-      "old": "        \"  echo \\\"STAGE1_GUARD train_rc=$TRAIN_RC decision=fail\\\" >&2\n\"\n        \"  exit \\\"$TRAIN_RC\\\"\n\"",
-      "new": "        \"  echo \\\"STAGE1_GUARD train_rc=$TRAIN_RC decision=fail\\\" >&2\n\"\n        \"  : # mutant: swallow nonzero train status\n\"",
+      "old": "TRAIN_RC=$?",
+      "new": "TRAIN_RC=0 # mutant: swallow nonzero train status",
       "killer": "experiments/atomistic/stage1/tests/test_launch.py::test_rendered_rc_one_fails"
     }
   ]
