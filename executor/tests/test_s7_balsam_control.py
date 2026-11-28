@@ -374,7 +374,9 @@ def test_process_client_complete_submit_request_reaches_real_bridge_dispatch(tmp
     client_file.chmod(0o600)
     stdout = tmp_path / "stdout.log"
     stderr = tmp_path / "stderr.log"
-    batch_id = BalsamProcessClient("/bin/sh", client_path=client_file, bridge=_Bridge()).submit_batch(
+    batch_id = BalsamProcessClient(
+        "/bin/sh", client_path=client_file, state_dir=tmp_path / "journal", bridge=_Bridge()
+    ).submit_batch(
         GroupId("group-wire"), BackendJobId("job-wire"), _sha("wire"),
         stdout_path=str(stdout), stderr_path=str(stderr), num_nodes=2, wall_time_min=30,
         job_mode="serial", site_id=7, project="project-wire", queue="debug",
