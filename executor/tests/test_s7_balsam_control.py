@@ -31,7 +31,6 @@ if str(CONTROL_SOURCE) not in sys.path:
     sys.path.insert(0, str(CONTROL_SOURCE))
 
 from tpen_balsam_control.application import BalsamControlAmbiguous  # noqa: E402
-from tpen_balsam_control.application import BalsamGroupAmbiguous  # noqa: E402
 from tpen_balsam_control.sdk_adapter import DocumentedSDKOperations  # noqa: E402
 
 
@@ -82,7 +81,7 @@ def test_conflict_and_unknown_ack_park_without_a_second_external_mutation(tmp_pa
     """A changed intent conflicts and a missing acknowledgement parks."""
 
     registration = _registration()
-    client = FakeClient(error=BalsamGroupAmbiguous("lost acknowledgement"))
+    client = FakeClient(error=BalsamControlAmbiguous("lost acknowledgement"))
     store = DirectoryStore(tmp_path / "store")
     intent = _batch(tmp_path)
     with pytest.raises(BalsamGroupParked):
