@@ -198,7 +198,13 @@ def command_for_row(
         raise ValueError("manifest row has an invalid kind")
     _require_sha(row.get("source_sha"), length=40, field="source_sha")
     _require_sha(row.get("config_sha256"), length=64, field="config_sha256")
-    if row["kind"] == "eval":
+    if row["kind"] == "eval" and (
+        row.get("system") is not None
+        or str(row.get("config", "")) in {
+            "configs/hooke2/positive_singlet_tail_eval.yaml",
+            "configs/hooke2/positive_singlet_comparator_eval.yaml",
+        }
+    ):
         validate_eval_config_for_row(str(row.get("config")), str(row.get("system")))
     if checkout_root is not None:
         driver = _resolve_driver_path(_DRIVER_BY_KIND[row["kind"]], checkout_root)

@@ -36,17 +36,21 @@ def _phase2_rows(
 ) -> list[dict[str, object]]:
     """Build the smallest native phase-2 manifest for one Hooke-2 arm."""
 
+    # Protocol.validate() enforces lineages >= 3 and eval_streams >= 4.
     protocol = Protocol(
         smoke_updates=1, smoke_walkers=2, lineage_updates=3,
-        lineage_walkers=2, lineages=1, eval_streams=1, eval_walkers=2,
+        lineage_walkers=2, lineages=3, eval_streams=4, eval_walkers=2,
         eval_draws=2,
     )
     config_sha = config_identities(config_root=ROOT, systems=("hooke2",))
     rows = build_manifest(
         protocol=protocol, source_sha="a" * 40, config_sha256=config_sha,
         checkpoints=[0, 3], lineage_seeds=[11],
-        checkpoint_sha256={("hooke2", 0, 0): "b" * 64,
-                           ("hooke2", 0, 3): "c" * 64},
+        checkpoint_sha256={
+            ("hooke2", lineage, checkpoint): "b" * 64
+            for lineage in range(protocol.lineages)
+            for checkpoint in (0, 3)
+        },
         results_root=results_root, systems=("hooke2",), phase=2,
         expected_physical_system_id={
             "hooke2": physical_system_id_from_config(HOOKE2 / "eval.yaml"),
@@ -71,7 +75,7 @@ def _bound_variant_eval_row() -> dict[str, object]:
 
     protocol = Protocol(
         smoke_updates=1, smoke_walkers=2, lineage_updates=3,
-        lineage_walkers=2, lineages=1, eval_streams=1, eval_walkers=2,
+        lineage_walkers=2, lineages=3, eval_streams=4, eval_walkers=2,
         eval_draws=2,
     )
     phase1 = build_manifest(
@@ -90,9 +94,13 @@ def _bound_variant_eval_row() -> dict[str, object]:
         "schema": "stage1-checkpoint-evidence/v1",
         "phase1_manifest_hash": phase1_hash,
         "phase1_train_row_hashes": {
-            "hooke2:0": manifest_hash([train]),
+            f"{row['system']}:{row['lineage']}": manifest_hash([row])
+            for row in phase1 if row["kind"] == "train"
         },
-        "checkpoints": {"hooke2:0:3": "c" * 64},
+        "checkpoints": {
+            f"hooke2:{lineage}:3": "c" * 64
+            for lineage in range(protocol.lineages)
+        },
     }
     return next(row for row in bind_evaluation_manifest(
         phase1_rows=phase1, checkpoints=[3], checkpoint_evidence=evidence,
@@ -155,6 +163,18 @@ def test_native_phase2_binding_selects_tail_eval_config() -> None:
     assert _bound_variant_eval_row()["config"] == (
         "configs/hooke2/positive_singlet_tail_eval.yaml"
     )
+
+
+def test_legacy_eval_row_without_system_still_renders() -> None:
+    """Legacy launcher rows without system retain their pre-arm behavior."""
+
+    row = {
+        "kind": "eval", "source_sha": "a" * 40,
+        "config_sha256": "b" * 64, "config": "configs/he/eval.yaml",
+        "row_id": "legacy-eval",
+    }
+    command = command_for_row(row, python="/usr/bin/python3", driver="driver.py")
+    assert decode_binding(command.rsplit(" ", 1)[-1])["config"] == row["config"]
 
 
 def test_native_tail_train_checkpoint_eval_has_finite_local_energy(
