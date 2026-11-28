@@ -359,9 +359,11 @@ def render(*, row: Mapping[str, Any], checkout_root: str, python: str,
         "__COMMAND__": command,
     }.items():
         template = template.replace(marker, value)
-    return template.replace(command, _train_outcome_handler(
-        command=command, python=python, status_path=status_path,
-    ), 1)
+    if row.get("kind") in {"smoke", "train"}:
+        return template.replace(command, _train_outcome_handler(
+            command=command, python=python, status_path=status_path,
+        ), 1)
+    return template
 
 
 def main() -> int:
